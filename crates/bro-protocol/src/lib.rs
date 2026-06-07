@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 mod dispatch;
 mod transcript;
 
-pub use dispatch::{DispatchSpec, ResumeSpec};
+pub use dispatch::{CloseoutErrorClass, CloseoutOutcome, CloseoutPhase, CloseoutRequest, DispatchSpec, PhaseResult, ResumeSpec};
 pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

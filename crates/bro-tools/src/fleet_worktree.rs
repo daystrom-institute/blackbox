@@ -250,6 +250,7 @@ impl Tool for ExitWorktree {
 
 /// One of the discrete phases of the closeout sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CloseoutPhase {
     /// Disposition-specific readiness checks (worktree clean / dirty,
     /// commit_message present, base on target, unsafe pathspecs, etc.).
@@ -275,6 +276,7 @@ pub enum CloseoutPhase {
 /// escalate to the operator or a base-reconcile step). The mapping back to the
 /// repo cwd lives on `PhaseResult.repo_cwd` (Gap A).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CloseoutErrorClass {
     /// Phase succeeded.
     None,
@@ -304,7 +306,7 @@ pub enum CloseoutErrorClass {
 /// checkout for ff-base/ff-merge/push/remove). `content` carries
 /// disposition-specific details the renderer needs to build the existing tool
 /// JSON contract (e.g. `head`, `branch_commits_ahead`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseResult {
     pub phase: CloseoutPhase,
     pub repo_cwd: PathBuf,
@@ -317,9 +319,10 @@ pub struct PhaseResult {
 /// (each `PhaseResult.ok = true`); on failure, the failing `PhaseResult` with
 /// `ok = false` and the structured `error_class` (and a `content["error"]`
 /// string for the renderer to bubble up verbatim).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CloseoutOutcome {
-    Success(Vec<PhaseResult>),
+    Success { phases: Vec<PhaseResult> },
     Failed(PhaseResult),
 }
 
@@ -337,6 +340,94 @@ pub struct CloseoutRequest {
     pub confirm: bool,
     pub commit_message: Option<String>,
     pub paths: Vec<String>,
+}
+
+/// Resolved target for the closeout driver: either the caller-supplied
+/// non-empty `target`, or the supplied default when the caller passed
+/// `None`/empty. Trimmed before the empty check.
+pub fn resolve_target_or(target: Option<&str>, default: &str) -> String {
+    target
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+/// Read the current branch of `repo` via `git symbolic-ref`. Used by the
+/// daemon endpoint to default `target` to the base repo's current branch
+/// (the operator-decided default; the tool keeps "main" as its default —
+/// only the endpoint uses this resolver).
+pub fn current_branch(repo: &Path) -> anyhow::Result<String> {
+    let raw = git_capture(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .or_else(|_| git_capture(repo, &["rev-parse", "--abbrev-ref", "HEAD"]))?;
+    Ok(raw.trim().to_string())
+}
+
+/// Pre-driver guard + resolver used by BOTH `exit_worktree` and the
+/// daemon's `/control/closeout` endpoint. Performs (in order):
+///
+/// 1. Canonicalize the worktree path (using `worktree_arg` if given, else
+///    `cx_root`).
+/// 2. Validate it is a managed worktree (`ensure_managed_worktree`).
+/// 3. Resolve the base repo from `cx_root` (`fleet_base_repo`).
+/// 4. Read the worktree's current branch (`git rev-parse --abbrev-ref HEAD`).
+/// 5. Resolve `target` via `target_resolver` (tool default "main"; endpoint
+///    default = base repo's current branch).
+/// 6. Validate `allow_branch_prefixes` (default `["bro-fleet/"]`; empty list
+///    rejected).
+/// 7. Refuse detached HEAD (always — even if "HEAD" is in the allowed
+///    prefixes list, because the branch is not actually anchored).
+/// 8. Refuse any branch not under an allowed prefix.
+///
+/// The returned `CloseoutRequest` is ready for `run_closeout_phases` (the
+/// caller still owns the `disposition` / `confirm` / `commit_message` /
+/// `paths` fields — they depend on the caller's intent, not the guard).
+pub fn prepare_closeout_request(
+    cx_root: &Path,
+    worktree_arg: Option<&str>,
+    target_resolver: impl FnOnce(&Path) -> String,
+    allow_branch_prefixes: Option<Vec<String>>,
+) -> anyhow::Result<CloseoutRequest> {
+    let worktree = worktree_arg
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cx_root.to_path_buf())
+        .canonicalize()?;
+    ensure_managed_worktree(&worktree)?;
+    let base_repo = fleet_base_repo(cx_root)?;
+    let branch = git_capture(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let target = target_resolver(&base_repo);
+    let allowed_prefixes: Vec<String> = allow_branch_prefixes
+        .unwrap_or_else(|| vec!["bro-fleet/".to_string()])
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if allowed_prefixes.is_empty() {
+        anyhow::bail!("allow_branch_prefixes must contain at least one non-empty prefix");
+    }
+    // Detached HEAD: `git rev-parse --abbrev-ref HEAD` returns the literal
+    // string "HEAD". Detached HEAD must always refuse, even if "HEAD" is
+    // listed in allow_branch_prefixes, because the worktree's branch is
+    // not actually anchored.
+    if branch == "HEAD" {
+        anyhow::bail!("refusing to exit worktree in detached HEAD state");
+    }
+    if !allowed_prefixes.iter().any(|p| branch.starts_with(p.as_str())) {
+        anyhow::bail!(
+            "refusing to exit branch {branch}: not under any allowed branch prefix ({})",
+            allowed_prefixes.join(", ")
+        );
+    }
+    Ok(CloseoutRequest {
+        worktree,
+        base_repo,
+        branch,
+        target,
+        disposition: String::new(),
+        confirm: false,
+        commit_message: None,
+        paths: Vec::new(),
+    })
 }
 
 /// Run the closeout sequence as discrete phases. Each phase records a
@@ -398,7 +489,7 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
     results.push(remove);
     // ---- post_success hook SEAM (no-op in Phase 1) ----
 
-    CloseoutOutcome::Success(results)
+    CloseoutOutcome::Success { phases: results }
 }
 
 /// Render a `CloseoutOutcome` into the existing `exit_worktree` tool JSON
@@ -422,7 +513,7 @@ fn render_closeout_outcome(
                 .unwrap_or("closeout phase failed");
             Err(anyhow::anyhow!("{err}"))
         }
-        CloseoutOutcome::Success(results) => {
+        CloseoutOutcome::Success { phases: results } => {
             // The ff_merge phase records the post-merge head; the preflight
             // phase (for merge/adopt) records the branch_commits_ahead count.
             let head = results
@@ -942,46 +1033,18 @@ Initial git status:\n```text\n{}\n```",
 }
 
 fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Value> {
-    let worktree = args
-        .worktree
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cx_root.to_path_buf())
-        .canonicalize()?;
-    ensure_managed_worktree(&worktree)?;
-    let base_repo = fleet_base_repo(cx_root)?;
-    let branch = git_capture(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let target = args
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("main")
-        .to_string();
-    let allowed_prefixes: Vec<String> = args
-        .allow_branch_prefixes
-        .clone()
-        .unwrap_or_else(|| vec!["bro-fleet/".to_string()])
-        .into_iter()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .collect();
-    if allowed_prefixes.is_empty() {
-        anyhow::bail!("allow_branch_prefixes must contain at least one non-empty prefix");
-    }
-    // Detached HEAD: `git rev-parse --abbrev-ref HEAD` returns the literal
-    // string "HEAD". Detached HEAD must always refuse, even if "HEAD" is
-    // listed in allow_branch_prefixes, because the worktree's branch is
-    // not actually anchored.
-    if branch == "HEAD" {
-        anyhow::bail!("refusing to exit worktree in detached HEAD state");
-    }
-    if !allowed_prefixes.iter().any(|p| branch.starts_with(p.as_str())) {
-        anyhow::bail!(
-            "refusing to exit branch {branch}: not under any allowed branch prefix ({})",
-            allowed_prefixes.join(", ")
-        );
-    }
+    // Shared pre-driver guard: managed-worktree, branch-prefix eligibility,
+    // detached-HEAD refusal, target resolution (tool default "main").
+    let mut req = prepare_closeout_request(
+        cx_root,
+        args.worktree.as_deref(),
+        |_| resolve_target_or(args.target.as_deref(), "main"),
+        args.allow_branch_prefixes.clone(),
+    )?;
+    let worktree = req.worktree.clone();
+    let base_repo = req.base_repo.clone();
+    let branch = req.branch.clone();
+    let target = req.target.clone();
     let disposition = args.disposition.as_deref().unwrap_or("keep");
     let status = git_capture(&worktree, &["status", "--short", "--branch"]).unwrap_or_default();
     match disposition {
@@ -1005,48 +1068,33 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             if !args.confirm {
                 anyhow::bail!("discard requires confirm=true");
             }
-            let outcome = run_closeout_phases(&CloseoutRequest {
-                worktree: worktree.clone(),
-                base_repo: base_repo.clone(),
-                branch: branch.clone(),
-                target: target.clone(),
-                disposition: "discard".to_string(),
-                confirm: args.confirm,
-                commit_message: args.commit_message.clone(),
-                paths: args.paths.clone(),
-            });
+            req.disposition = "discard".to_string();
+            req.confirm = args.confirm;
+            req.commit_message = args.commit_message.clone();
+            req.paths = args.paths.clone();
+            let outcome = run_closeout_phases(&req);
             render_closeout_outcome(outcome, "discard", &branch, &target, &worktree)
         }
         "publish" => {
             if !args.confirm {
                 anyhow::bail!("publish requires confirm=true");
             }
-            let outcome = run_closeout_phases(&CloseoutRequest {
-                worktree: worktree.clone(),
-                base_repo: base_repo.clone(),
-                branch: branch.clone(),
-                target: target.clone(),
-                disposition: "publish".to_string(),
-                confirm: args.confirm,
-                commit_message: args.commit_message.clone(),
-                paths: args.paths.clone(),
-            });
+            req.disposition = "publish".to_string();
+            req.confirm = args.confirm;
+            req.commit_message = args.commit_message.clone();
+            req.paths = args.paths.clone();
+            let outcome = run_closeout_phases(&req);
             render_closeout_outcome(outcome, "publish", &branch, &target, &worktree)
         }
         "merge" | "adopt" => {
             if !args.confirm {
                 anyhow::bail!("{disposition} requires confirm=true");
             }
-            let outcome = run_closeout_phases(&CloseoutRequest {
-                worktree: worktree.clone(),
-                base_repo: base_repo.clone(),
-                branch: branch.clone(),
-                target: target.clone(),
-                disposition: disposition.to_string(),
-                confirm: args.confirm,
-                commit_message: args.commit_message.clone(),
-                paths: args.paths.clone(),
-            });
+            req.disposition = disposition.to_string();
+            req.confirm = args.confirm;
+            req.commit_message = args.commit_message.clone();
+            req.paths = args.paths.clone();
+            let outcome = run_closeout_phases(&req);
             render_closeout_outcome(outcome, disposition, &branch, &target, &worktree)
         }
         other => {
@@ -1324,6 +1372,60 @@ mod tests {
     use super::*;
     use crate::tool::ToolCx;
     use std::sync::{Arc, Mutex};
+
+    /// Process-env serialization lock for tests that mutate `BRO_FLEET_*`
+    /// env vars. `std::env::set_var` is process-global; two parallel
+    /// tests stepping on the same vars corrupt each other. The daemon
+    /// crate has `crate::util::test_env_lock`; bro-tools doesn't, so we
+    /// declare a local one. Poison-tolerant: a panicking env test must
+    /// not cascade into every later env test failing with a poisoned
+    /// mutex panic.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Drop-guard for env mutations: holds the `ENV_LOCK` and restores
+    /// every touched var to its prior value on drop. Mirrors the
+    /// `TestEnvGuard` pattern in the daemon crate.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                _lock: ENV_LOCK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                saved: Vec::new(),
+            }
+        }
+        fn save(&mut self, key: &str) {
+            let prior = std::env::var_os(key);
+            self.saved.push((key.to_string(), prior));
+        }
+        /// Save the current value (if any), then `remove_var` so the test
+        /// sees a clean slate.
+        fn clear(&mut self, key: &str) {
+            self.save(key);
+            // SAFETY: ENV_LOCK guarantees no other test mutates env
+            // concurrently. `set_var`/`remove_var` are `unsafe` in
+            // Rust 2024 because the env is shared with libc; the lock
+            // restores the invariant.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, prior) in self.saved.drain(..) {
+                // SAFETY: see `clear` above.
+                unsafe {
+                    match prior {
+                        Some(v) => std::env::set_var(&key, v),
+                        None => std::env::remove_var(&key),
+                    }
+                }
+            }
+        }
+    }
 
     fn cx(root: &Path) -> ToolCx {
         ToolCx {
@@ -1909,7 +2011,7 @@ mod tests {
         };
         let outcome = run_closeout_phases(&req);
         let results = match outcome {
-            CloseoutOutcome::Success(r) => r,
+            CloseoutOutcome::Success { phases: r } => r,
             CloseoutOutcome::Failed(r) => panic!(
                 "expected success, got failed phase {:?} with error_class {:?}: {}",
                 r.phase,
@@ -2022,7 +2124,7 @@ mod tests {
         let outcome = run_closeout_phases(&req);
         let failed = match outcome {
             CloseoutOutcome::Failed(r) => r,
-            CloseoutOutcome::Success(rs) => panic!(
+            CloseoutOutcome::Success { phases: rs } => panic!(
                 "expected rebase failure, got success with phases: {:?}",
                 rs.iter().map(|r| r.phase).collect::<Vec<_>>()
             ),
@@ -2044,5 +2146,151 @@ mod tests {
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
         );
         std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    /// REGRESSION (prod-breaking bug, found in Phase 3a review).
+    ///
+    /// The daemon `/control/closeout` handler's base-repo resolution must
+    /// anchor on the **worktree** path, not the daemon CWD. In prod the
+    /// daemon is launched from `WorkingDirectory=/Users/invidious` (the
+    /// launchd plist — NOT a git repo), and `BRO_FLEET_BASE_REPO` is not
+    /// in the plist env. If the handler passes `current_dir()` as
+    /// `cx_root`, `fleet_base_repo` → `primary_worktree` →
+    /// `git -C <cwd> worktree list` → "not a git repository" → every
+    /// git-touching closeout (publish/merge/adopt/discard/preflight)
+    /// errors. The fix: pass the request's `worktree` as `cx_root`. The
+    /// worktree is always a valid git worktree, so `primary_worktree` of
+    /// the worktree itself returns the base repo.
+    ///
+    /// This deterministic test exercises the public surface
+    /// `prepare_closeout_request` directly:
+    ///
+    /// * **FIX behavior** — `cx_root = <worktree_path>` returns `Ok`:
+    ///   base resolves from the worktree.
+    /// * **OLD-BUG behavior** — `cx_root = <non_repo_tempdir>` (the
+    ///   pre-fix handler pattern) returns `Err` from
+    ///   `primary_worktree` (which tries `git -C <non_repo> worktree
+    ///   list` and fails).
+    ///
+    /// Determinism: the test holds the `ENV_LOCK` and explicitly clears
+    /// `BRO_FLEET_BASE_REPO` and `BRO_FLEET_WORKTREE_ROOT` for its
+    /// duration (with a drop-guard restore). This sidesteps both
+    /// parallel-test env pollution and the daemon CWD-mutation hazard
+    /// that the previous handler-level test design ran into.
+    #[test]
+    fn prepare_closeout_request_anchors_base_repo_on_worktree_path() {
+        let mut _env = EnvGuard::new();
+        // Force the env-var-free path: the test asserts on
+        // `primary_worktree` / `fleet_worktree_root` / `ensure_managed_worktree`
+        // behavior, not on whatever the test runner inherited.
+        _env.clear("BRO_FLEET_BASE_REPO");
+        _env.clear("BRO_FLEET_WORKTREE_ROOT");
+
+        // 1. Seed a base repo at `<sandbox>/<repo_name>/` and a commit so
+        //    `git worktree list` and `branch_ahead_count` have something
+        //    to chew on.
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo_name = "managed-repo";
+        let base_repo = sandbox.path().join(repo_name);
+        std::fs::create_dir_all(&base_repo).unwrap();
+        run_git(&base_repo, &["init", "-b", "main"]);
+        run_git(&base_repo, &["config", "user.email", "test@example.com"]);
+        run_git(&base_repo, &["config", "user.name", "Test User"]);
+        std::fs::write(base_repo.join("README.md"), "base\n").unwrap();
+        run_git(&base_repo, &["add", "."]);
+        run_git(&base_repo, &["commit", "-m", "init"]);
+
+        // 2. Create a managed worktree at
+        //    `<sandbox>/.bro-fleet-worktrees/<repo_name>/<slug>/` so
+        //    `ensure_managed_worktree` accepts it under the env-free path
+        //    (it derives the worktree root from
+        //    `fleet_worktree_root(fleet_base_repo(worktree))`).
+        let worktree = sandbox
+            .path()
+            .join(".bro-fleet-worktrees")
+            .join(repo_name)
+            .join("regression-test");
+        std::fs::create_dir_all(&worktree).unwrap();
+        run_git(
+            &base_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/regression-test",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        // ----- FIX behavior -----
+        //
+        // `cx_root = worktree` (the daemon handler's post-fix pattern):
+        // `primary_worktree(worktree)` returns the base repo; the request
+        // resolves cleanly. This is the happy path the prod daemon needs.
+        let fix = prepare_closeout_request(
+            &worktree,
+            Some(worktree.to_str().unwrap()),
+            |_| "main".to_string(),
+            None,
+        );
+        assert!(
+            fix.is_ok(),
+            "FIX: prepare_closeout_request(cx_root=worktree, ...) must return Ok; \
+             got Err({})",
+            fix.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default()
+        );
+        let req = fix.expect("FIX returns Ok");
+        assert_eq!(
+            req.worktree.canonicalize().unwrap(),
+            worktree.canonicalize().unwrap(),
+            "FIX: prepared request's worktree must equal the requested worktree"
+        );
+        assert_eq!(
+            req.base_repo.canonicalize().unwrap(),
+            base_repo.canonicalize().unwrap(),
+            "FIX: prepared request's base_repo must equal the seeded base repo"
+        );
+        assert_eq!(req.branch, "bro-fleet/regression-test");
+        assert_eq!(req.target, "main");
+
+        // ----- OLD-BUG behavior (must be caught) -----
+        //
+        // `cx_root = <non_repo_tempdir>` (the daemon handler's PRE-FIX
+        // pattern — `std::env::current_dir()` of the prod daemon is
+        // `/Users/invidious`, NOT a git repo). `primary_worktree`
+        // runs `git -C <non_repo> worktree list` and fails. This is
+        // exactly the prod error the fix prevents.
+        let non_repo_cwd = tempfile::tempdir().unwrap();
+        let old_bug = prepare_closeout_request(
+            non_repo_cwd.path(),
+            Some(worktree.to_str().unwrap()),
+            |_| "main".to_string(),
+            None,
+        );
+        assert!(
+            old_bug.is_err(),
+            "OLD-BUG: prepare_closeout_request(cx_root=<non-repo dir>, ...) must \
+             return Err (this is the prod launchd WorkingDirectory=/Users/invidious \
+             path the bug fix prevents); got Ok({old_bug:?})"
+        );
+        let err = old_bug.expect_err("OLD-BUG returns Err").to_string();
+        // Sanity: the error must come from git, not from a guard
+        // mismatch (which would mean a different code path regressed).
+        assert!(
+            err.contains("git")
+                || err.contains("not a git")
+                || err.contains("worktree")
+                || err.contains("primary_worktree"),
+            "OLD-BUG: error must come from primary_worktree's git invocation, \
+             got: {err}"
+        );
+
+        // Cleanup.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&base_repo)
+            .args(["worktree", "remove", "--force", worktree.to_str().unwrap()])
+            .output();
     }
 }

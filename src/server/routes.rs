@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -881,6 +881,186 @@ pub(crate) async fn control_resume_handler(
     axum::Json(req): axum::Json<ResumeParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_resume(Parameters(req)).await)
+}
+
+// ── /control/closeout — phased closeout driver endpoint ────────────────────
+//
+// design/fleet-tui/closeout-command.md §4.1, Phase 3a (daemon-side). The
+// endpoint applies the SAME pre-driver safety guards `exit_worktree` applies
+// (managed-worktree, branch-prefix eligibility, detached-HEAD refusal,
+// confirm gate) by reusing `bro_tools::fleet_worktree::prepare_closeout_request`
+// (the shared entry extracted in Phase 1) — no silent duplication-with-drift.
+// It then resolves `target` to the base repo's CURRENT BRANCH when the caller
+// omits it (operator-decided default; the tool's default stays "main").
+// Finally it calls `run_closeout_phases` and returns the STRUCTURED
+// `CloseoutOutcome` directly (§4.3 — NOT a collapsed/rendered legacy tool
+// JSON). Guard/validation failures return a 4xx with a clear error body.
+pub(crate) async fn control_closeout_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<bro_protocol::CloseoutRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use bro_tools::fleet_worktree::{
+        CloseoutOutcome as ToolOutcome, prepare_closeout_request, run_closeout_phases,
+    };
+    use serde_json::json;
+
+    let _ = state; // SharedState is reserved for future hooks/state; not needed today.
+
+    // Disposition whitelist (matches the existing tool's match arm).
+    let disposition = req.disposition.trim().to_string();
+    match disposition.as_str() {
+        "keep" | "preflight" | "discard" | "publish" | "merge" | "adopt" => {}
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error": format!(
+                        "disposition must be keep, preflight, discard, publish, merge, or adopt; got {other}"
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    }
+    // Mutating dispositions must carry confirm=true (same gate as the tool).
+    if matches!(disposition.as_str(), "discard" | "publish" | "merge" | "adopt") && !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": format!("{disposition} requires confirm=true"),
+            })),
+        )
+            .into_response();
+    }
+    // publish additionally needs a non-empty commit_message (preflight gate).
+    if disposition == "publish"
+        && req
+            .commit_message
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "publish requires commit_message",
+            })),
+        )
+            .into_response();
+    }
+
+    // Anchor base-repo resolution on the WORKTREE path, NOT the daemon CWD.
+    //
+    // In prod the daemon is launched from `WorkingDirectory=/Users/invidious`
+    // (the launchd plist — NOT a git repo), and `BRO_FLEET_BASE_REPO` is not
+    // in the plist env. If we passed the daemon CWD as `cx_root`,
+    // `fleet_base_repo` would fall through to `primary_worktree`, which runs
+    // `git -C <cx_root> worktree list` — that errors when `cx_root` is not
+    // a git checkout, and every git-touching closeout (publish/merge/adopt/
+    // discard/preflight) would fail in prod.
+    //
+    // The request's `worktree` is always a valid git worktree, so
+    // `primary_worktree(<worktree>)` correctly returns the base/main
+    // worktree regardless of where the daemon was launched. The tool path
+    // behaves the same way: its `cx_root` is the worktree.
+    let cx_root = PathBuf::from(&req.worktree);
+    let worktree_arg: Option<&str> = if req.worktree.trim().is_empty() {
+        None
+    } else {
+        Some(req.worktree.as_str())
+    };
+
+    // Shared pre-driver guard: managed-worktree, branch-prefix, detached-HEAD,
+    // target resolution. The endpoint's target default is the base repo's
+    // CURRENT branch (operator-decided) — the tool's default stays "main".
+    let mut driver_req = match prepare_closeout_request(
+        &cx_root,
+        worktree_arg,
+        |base_repo| match req.target.as_deref() {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => bro_tools::fleet_worktree::current_branch(base_repo)
+                .unwrap_or_else(|_| "main".to_string()),
+        },
+        req.allow_branch_prefixes.clone(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": format!("{e:#}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Stamp the caller-supplied intent (guard doesn't see disposition/confirm/etc.)
+    driver_req.disposition = disposition.clone();
+    driver_req.confirm = req.confirm;
+    driver_req.commit_message = req.commit_message.clone();
+    driver_req.paths = req.paths.clone();
+
+    let outcome = run_closeout_phases(&driver_req);
+
+    // Translate bro_tools::CloseoutOutcome into the bro_protocol wire shape.
+    // The two type families are intentionally distinct (bro_protocol is
+    // contract-bottom; bro_tools stays free of it). Each field maps 1:1;
+    // the daemon does the conversion. PathBuf serializes to a string under
+    // serde, and serde_json::Value passes through as embedded JSON.
+    let wire_outcome: bro_protocol::CloseoutOutcome = match &outcome {
+        ToolOutcome::Success { phases } => bro_protocol::CloseoutOutcome::Success {
+            phases: phases.iter().map(to_wire_phase).collect(),
+        },
+        ToolOutcome::Failed(r) => bro_protocol::CloseoutOutcome::Failed(to_wire_phase(r)),
+    };
+
+    // The status code reflects whether the endpoint reached the driver, not
+    // the success of the driver (which already failed above with 4xx). A
+    // failed phase is still a valid HTTP outcome — the structured error
+    // class is the signal the cockpit routes on, not the HTTP status.
+    let status = StatusCode::OK;
+    (status, axum::Json(json!(wire_outcome))).into_response()
+}
+
+/// Map `bro_tools::fleet_worktree::CloseoutPhase` →
+/// `bro_protocol::CloseoutPhase` by name (both are `Copy` + `Serialize` +
+/// `Deserialize` and use the same `snake_case` rename, so the numeric
+/// discriminants line up — but the type families are independent and the
+/// daemon bridges them, per the design).
+fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::PhaseResult {
+    use bro_protocol::CloseoutErrorClass as WireErr;
+    use bro_protocol::CloseoutPhase as WirePhase;
+    use bro_tools::fleet_worktree::{CloseoutErrorClass as ToolErr, CloseoutPhase as ToolPhase};
+    let phase = match r.phase {
+        ToolPhase::Preflight => WirePhase::Preflight,
+        ToolPhase::StageCommit => WirePhase::StageCommit,
+        ToolPhase::FfBase => WirePhase::FfBase,
+        ToolPhase::Rebase => WirePhase::Rebase,
+        ToolPhase::FfMerge => WirePhase::FfMerge,
+        ToolPhase::Push => WirePhase::Push,
+        ToolPhase::Remove => WirePhase::Remove,
+    };
+    let error_class = match r.error_class {
+        ToolErr::None => WireErr::None,
+        ToolErr::BaseNotReady => WireErr::BaseNotReady,
+        ToolErr::FfBaseFailed => WireErr::FfBaseFailed,
+        ToolErr::StageFailed => WireErr::StageFailed,
+        ToolErr::CommitFailed => WireErr::CommitFailed,
+        ToolErr::RebaseConflict => WireErr::RebaseConflict,
+        ToolErr::FfMergeFailed => WireErr::FfMergeFailed,
+        ToolErr::PushRejected => WireErr::PushRejected,
+        ToolErr::RemoveFailed => WireErr::RemoveFailed,
+        ToolErr::Other => WireErr::Other,
+    };
+    bro_protocol::PhaseResult {
+        phase,
+        repo_cwd: r.repo_cwd.clone(),
+        ok: r.ok,
+        error_class,
+        content: r.content.clone(),
+    }
 }
 
 pub(crate) async fn control_steer_handler(
@@ -2683,4 +2863,85 @@ mod tests {
             "thread-test1234"
         );
     }
+
+    /// /control/closeout (Phase 3a, design/fleet-tui/closeout-command.md §4.1)
+    /// validates the request before reaching the driver: a disposition not in
+    /// the keep/preflight/discard/publish/merge/adopt set returns 400 with a
+    /// clear error body. This is the cheapest guard-level assertion — the
+    /// other guards (unmanaged worktree, detached HEAD, branch prefix)
+    /// require git setup and are covered by the bro-tools unit tests.
+    #[tokio::test]
+    async fn control_closeout_rejects_unknown_disposition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let req = bro_protocol::CloseoutRequest {
+            worktree: tmp.path().to_string_lossy().into_owned(),
+            disposition: "definitely-not-a-real-disposition".to_string(),
+            confirm: true,
+            target: None,
+            commit_message: None,
+            paths: vec![],
+            allow_branch_prefixes: None,
+        };
+        let resp = control_closeout_handler(AxumState(state), axum::Json(req))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "unknown disposition must yield 400"
+        );
+    }
+
+    /// /control/closeout enforces the confirm gate on mutating dispositions
+    /// (discard/publish/merge/adopt), matching `exit_worktree` exactly.
+    /// publish without confirm returns 400.
+    #[tokio::test]
+    async fn control_closeout_publish_without_confirm_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let req = bro_protocol::CloseoutRequest {
+            worktree: tmp.path().to_string_lossy().into_owned(),
+            disposition: "publish".to_string(),
+            confirm: false,
+            target: None,
+            commit_message: Some("test commit".to_string()),
+            paths: vec![],
+            allow_branch_prefixes: None,
+        };
+        let resp = control_closeout_handler(AxumState(state), axum::Json(req))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "publish without confirm must yield 400"
+        );
+    }
+
+    /// /control/closeout also enforces publish's commit_message gate, matching
+    /// the tool's preflight bail ("publish requires commit_message").
+    #[tokio::test]
+    async fn control_closeout_publish_without_commit_message_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let req = bro_protocol::CloseoutRequest {
+            worktree: tmp.path().to_string_lossy().into_owned(),
+            disposition: "publish".to_string(),
+            confirm: true,
+            target: None,
+            commit_message: None,
+            paths: vec![],
+            allow_branch_prefixes: None,
+        };
+        let resp = control_closeout_handler(AxumState(state), axum::Json(req))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "publish without commit_message must yield 400"
+        );
+    }
+
 }

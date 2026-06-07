@@ -70,6 +70,10 @@ pub(super) fn build_http_app(
             "/control/resume",
             axum::routing::post(control_resume_handler),
         )
+        .route(
+            "/control/closeout",
+            axum::routing::post(control_closeout_handler),
+        )
         .route("/control/steer", axum::routing::post(control_steer_handler))
         .route(
             "/control/interrupt",
@@ -242,5 +246,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `/control/closeout` endpoint is mounted (Phase 3a, design
+    /// fleet-tui/closeout-command.md §4.1). It is a daemon-side-only
+    /// endpoint — there is no `/irc/closeout` alias, the namespace is
+    /// neutral and the cockpit calls it directly. A GET on the POST-only
+    /// route yields 405 (not 404) — proving the path exists with a
+    /// handler.
+    #[tokio::test]
+    async fn control_closeout_is_mounted() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/control/closeout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/control/closeout must be mounted (route table regression)"
+        );
     }
 }
