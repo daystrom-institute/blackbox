@@ -215,20 +215,25 @@ pub(super) fn render_table_block(lines: Vec<String>, max_width: Option<usize>) -
 pub(super) fn render_code_block(language: Option<String>, lines: Vec<String>) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let border = Style::default().fg(Color::DarkGray);
-    let body = Style::default().fg(Color::Gray);
-    let title = language
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| format!("┌─ {}", l.trim()))
-        .unwrap_or_else(|| "┌─ code".to_string());
+    let lang = language.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
+    let title = match &lang {
+        Some(l) => format!("┌─ {l}"),
+        None => "┌─ code".to_string(),
+    };
     out.push(Line::from(Span::styled(title, border)));
     if lines.is_empty() {
         out.push(Line::from(Span::styled("│", border)));
     } else {
-        out.extend(
-            lines
-                .into_iter()
-                .map(|line| Line::from(vec![Span::styled("│ ", border), Span::styled(line, body)])),
-        );
+        // Syntect-highlight the whole block (needs full context), then prefix
+        // each rendered line with the `│ ` gutter. Unknown/oversize input falls
+        // back to plain lines inside highlight_code_to_lines.
+        let code = lines.join("\n");
+        let highlighted = highlight_code_to_lines(&code, lang.as_deref().unwrap_or(""));
+        for hl in highlighted {
+            let mut spans = vec![Span::styled("│ ", border)];
+            spans.extend(hl.spans);
+            out.push(Line::from(spans));
+        }
     }
     out.push(Line::from(Span::styled("└─", border)));
     out

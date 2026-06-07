@@ -19,9 +19,9 @@ Some [b]bold[/] and [i]italic[/] and [White]inline code[/] prose that runs on a 
 [DarkGray]│[/][Gray] gamma [/][DarkGray]│[/][Gray] delta [/][DarkGray]│[/][Gray] 12    [/][DarkGray]│[/]
 [DarkGray]└───────┴───────┴───────┘[/]
 [DarkGray]┌─ rust[/]
-[DarkGray]│ [/][Gray]fn main() {[/]
-[DarkGray]│ [/][Gray]    println!("hello");[/]
-[DarkGray]│ [/][Gray]}[/]
+[DarkGray]│ [/][Rgb(203, 166, 247)]fn[/][Rgb(205, 214, 244)] [/][Rgb(137, 180, 250)]main[/][Rgb(147, 153, 178)]([/][Rgb(147, 153, 178)])[/][Rgb(205, 214, 244)] [/][Rgb(147, 153, 178)]{[/]
+[DarkGray]│ [/][Rgb(205, 214, 244)]    [/][Rgb(137, 180, 250)]println![/][Rgb(147, 153, 178)]([/][Rgb(166, 227, 161)]"[/][Rgb(166, 227, 161)]hello[/][Rgb(166, 227, 161)]"[/][Rgb(147, 153, 178)])[/][Rgb(147, 153, 178)];[/]
+[DarkGray]│ [/][Rgb(147, 153, 178)]}[/]
 [DarkGray]└─[/]
 [DarkGray]────────────────────────────────────────────────[/]
 Trailing paragraph.

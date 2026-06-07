@@ -36,6 +36,12 @@ tui-markdown = "0.3"
 # Style-preserving word wrapping (codex wrapping.rs technique). flatten -> wrap
 # -> re-slice spans by byte range so styles survive wrap boundaries.
 textwrap = "0.16"
+# Syntax highlighting for fenced code blocks (codex render/highlight.rs
+# technique). Pure-Rust fancy-regex backend (not codex's oniguruma/C) keeps the
+# thin `bro` client C-toolchain-free. two-face bundles bat's ~250 syntaxes +
+# themes.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

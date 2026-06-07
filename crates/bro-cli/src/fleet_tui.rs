@@ -62,6 +62,7 @@ use transcript::*;
 use view::*;
 use dispatch::*;
 use wrapping::*;
+use highlight::*;
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
@@ -3375,3 +3376,4 @@ mod transcript;
 mod view;
 mod dispatch;
 mod wrapping;
+mod highlight;
