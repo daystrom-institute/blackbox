@@ -375,8 +375,13 @@ struct App {
     cached_total_lines: usize,
     transcript_y_range: Option<(u16, u16)>,
     last_transcript_height: u16,
-    committed: usize,
-    committed_initial: bool,
+    /// Per-agent inline-flow commit cursors, keyed by task id. Tracks how much of
+    /// each agent's transcript has already been flushed to the terminal's real
+    /// scrollback (committed) so the inline viewport renders only the un-committed
+    /// tail. Per-agent so the cockpit's zoomed view can flow a different agent
+    /// into scrollback without inheriting the previous agent's cursor; the
+    /// standalone (`bro agent`) view uses a single entry.
+    inline_commits: HashMap<String, InlineCommit>,
 
     /// True while the /help overlay is visible. Toggled by typing `/help`+Enter
     /// or `?`; dismissed by Esc / any key.
@@ -430,6 +435,15 @@ struct App {
 struct ActivityClock {
     active_since_ms: Option<u64>,
     last_duration_ms: Option<u64>,
+}
+
+/// Inline-flow commit cursor for one agent (see [`App::inline_commits`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct InlineCommit {
+    /// Count of transcript items already flushed to scrollback.
+    committed: usize,
+    /// Whether the agent's initial prompt has been flushed to scrollback.
+    committed_initial: bool,
 }
 
 impl App {
@@ -495,8 +509,7 @@ impl App {
             cached_total_lines: 0,
             transcript_y_range: None,
             last_transcript_height: 0,
-            committed: 0,
-            committed_initial: false,
+            inline_commits: HashMap::new(),
             status: None,
             status_until: None,
             quit: false,
@@ -1085,7 +1098,7 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
     let result = if app.mode.is_standalone() {
         run_tui_inner_inline(app, signals)
     } else {
-        run_tui_inner(app, signals)
+        run_tui_cockpit(app, signals)
     };
     if app.mode.is_standalone() {
         forget_standalone_agents(app, true);
@@ -1095,31 +1108,88 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
     result
 }
 
-fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
+/// Cockpit driver: a loop-of-loops alternating between the alt-screen roster and
+/// the inline-flow zoomed agent view (codex's enter/leave-alt-screen pattern,
+/// `design/fleet-tui/`). The roster is a live dashboard that owns the alternate
+/// screen; zooming into an agent (`→`) leaves the alt screen and runs the inline
+/// view so that agent's transcript flows into the terminal's real scrollback
+/// (tmux/mouse/copy-mode scroll natively); zooming back out (`←`) restores the
+/// alt-screen roster. Raw mode is owned here for the whole session so the two
+/// inner views can swap the alternate screen between them without re-toggling it.
+fn run_tui_cockpit(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
     enable_raw_mode()?;
+    let result = (|| -> anyhow::Result<()> {
+        loop {
+            match run_roster_view(app, &signals)? {
+                RosterExit::Quit => break,
+                RosterExit::ZoomIn => {}
+            }
+            if app.quit {
+                break;
+            }
+            // Inline-flow zoomed view on the main screen (no alt screen), so the
+            // focused agent's transcript flows into real scrollback.
+            let backend = CrosstermBackend::new(io::stdout());
+            let mut terminal = custom_terminal::Terminal::with_options(backend)?;
+            let iexit = run_inline_view(app, &signals, &mut terminal, true);
+            // Drop the cursor below the live viewport before the next alt-screen
+            // enter, so the roster does not paint over a dangling viewport row.
+            let _ = write!(terminal.backend_mut(), "\r\n");
+            let _ = std::io::Write::flush(terminal.backend_mut());
+            match iexit? {
+                InlineExit::Quit => break,
+                InlineExit::ZoomOut => {}
+            }
+            if app.quit {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    disable_raw_mode()?;
+    result
+}
+
+/// Why the roster (alt-screen) view returned: the user quit, or zoomed into an
+/// agent (`→`), handing off to the inline-flow view.
+enum RosterExit {
+    Quit,
+    ZoomIn,
+}
+
+/// The alt-screen roster/dashboard loop (plus the provider/model/effort selectors
+/// and `/config` panel). Returns [`RosterExit::ZoomIn`] when the user enters an
+/// agent (`Zone::SingleAgent`) so the cockpit driver can switch to inline flow.
+fn run_roster_view(
+    app: &mut App,
+    signals: &mpsc::Receiver<TailEvent>,
+) -> anyhow::Result<RosterExit> {
     let mut stdout = io::stdout();
-    // Do not enable terminal mouse capture: in the single-agent view the
-    // transcript and composer are plain text surfaces that operators need to
-    // select/copy with the native terminal mouse selection. Keyboard scrolling
-    // (PgUp/PgDn, Home/End, Ctrl+↑/↓ while editing) remains available.
+    // Do not enable terminal mouse capture: the zoomed agent view (inline flow)
+    // is a plain-text scrollback surface operators select/copy with the native
+    // terminal mouse. Keyboard scrolling stays available.
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<RosterExit> {
         // `None` forces a clear on the first iteration. Updated only when we
-        // clear, so any later divergence — from handle_key (e.g. zoom_left) or
-        // from an in-draw fallback (draw_single_agent dropping to Roster) —
+        // clear, so any later divergence — from handle_key (e.g. zoom_left) —
         // triggers a clear on the next iteration.
         let mut drawn_zone: Option<Zone> = None;
         loop {
+            drain_tui_events(app, signals);
+            if app.quit {
+                return Ok(RosterExit::Quit);
+            }
+            // Zoom-into-agent: hand off to the inline-flow view.
+            if app.zone == Zone::SingleAgent {
+                return Ok(RosterExit::ZoomIn);
+            }
             // Force a full repaint on a zone transition. Ratatui only repaints
-            // cells it diffs as changed; transcript text can contain glyphs
-            // whose terminal width disagrees with ratatui's unicode-width model,
-            // which desyncs the real terminal from the cell model. The roster
-            // paints only a short table over a large blank body, so it never
-            // overwrites the desynced region — leaving single-agent remnants in
-            // the blank space. terminal.clear() resets the back buffer so the
+            // cells it diffs as changed; the roster paints a short table over a
+            // large blank body, so without a clear, stale cells from a selector
+            // panel can linger. terminal.clear() resets the back buffer so the
             // next draw repaints every cell.
             if drawn_zone != Some(app.zone) {
                 terminal.clear()?;
@@ -1132,17 +1202,72 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
             terminal.draw(|f| draw(f, app))?;
 
             if poll_tui_input(app)? {
-                break;
+                return Ok(RosterExit::Quit);
             }
-
-            drain_tui_events(app, &signals);
         }
-        Ok(())
     })();
 
-    disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     result
+}
+
+/// Why an inline-view loop returned: the user quit the whole TUI, or zoomed back
+/// out to the roster (cockpit only — the standalone view never zooms out).
+enum InlineExit {
+    Quit,
+    ZoomOut,
+}
+
+/// Resolve the agent the inline view should render. Standalone: the single
+/// installed agent. Cockpit (zoomed): the focused agent by stable task id.
+/// `None` means "nothing to flow" — the standalone intro screen, or (in the
+/// cockpit) a vanished focus that should bounce back to the roster.
+fn inline_focus_idx(app: &App) -> Option<usize> {
+    if app.mode.is_standalone() {
+        (app.agents.len() == 1).then_some(0)
+    } else {
+        app.focused_agent_id
+            .as_deref()
+            .and_then(|id| app.agents.iter().position(|a| a.task.id() == id))
+    }
+}
+
+/// Compute the inline view's bottom viewport (composer + live active tail) for
+/// the focused agent at the given screen size — mirrors the per-frame sizing in
+/// [`run_inline_view`]. Used to seed a correct viewport before the cockpit's
+/// first commit so `insert_history` never writes into the viewport rows. Falls
+/// back to a composer-height viewport when there is no focused agent.
+fn inline_seed_viewport(app: &mut App, screen_w: u16, screen_h: u16) -> Rect {
+    let composer_h =
+        composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
+    let active_lines = if let Some(idx) = inline_focus_idx(app) {
+        let transcript = app.agents[idx].task.transcript();
+        let turn_active = app.agents[idx].task.snapshot().turn_active;
+        let stable_end = inline_stable_end(transcript.len(), turn_active);
+        let queued = queued_user_turns(&mut app.agents[idx], &transcript);
+        let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
+        let active = &transcript[stable_end..];
+        if active.is_empty() && queued.is_empty() {
+            Vec::new()
+        } else {
+            render_transcript(active, "", &queued, screen_w as usize)
+        }
+    } else {
+        Vec::new()
+    };
+    let active_h = if active_lines.is_empty() {
+        0
+    } else {
+        Paragraph::new(active_lines)
+            .wrap(Wrap { trim: false })
+            .line_count(screen_w)
+            .min(u16::MAX as usize) as u16
+    };
+    let live_h = active_h
+        .saturating_add(composer_h)
+        .min(screen_h)
+        .max(composer_h);
+    Rect::new(0, screen_h.saturating_sub(live_h), screen_w, live_h)
 }
 
 fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
@@ -1150,113 +1275,170 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = custom_terminal::Terminal::with_options(backend)?;
 
-    let result = (|| -> anyhow::Result<()> {
-        let mut prev_vp: Option<Rect> = None;
-        loop {
-            drain_tui_events(app, &signals);
-            if app.quit {
-                break;
-            }
-
-            terminal.autoresize()?;
-            let screen = terminal.last_known_screen_size;
-            let screen_w = screen.width.max(1);
-            let screen_h = screen.height.max(1);
-            let width = screen_w as usize;
-            let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
-
-            let mut committed_now = false;
-            let active_lines = if app.agents.len() == 1 {
-                let idx = 0;
-                let transcript = app.agents[idx].task.transcript();
-                let turn_active = app.agents[idx].task.snapshot().turn_active;
-                let stable_end = inline_stable_end(transcript.len(), turn_active);
-                committed_now =
-                    commit_inline_history(app, &mut terminal, idx, &transcript, stable_end, width)?;
-
-                let queued = queued_user_turns(&mut app.agents[idx], &transcript);
-                let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
-                let active = &transcript[stable_end..];
-                // Everything is committed to scrollback and nothing is queued:
-                // the live area is just the composer — render no transcript body
-                // (render_transcript would emit its "(no output yet)" placeholder
-                // for an all-empty input, which is wrong here).
-                if active.is_empty() && queued.is_empty() {
-                    Vec::new()
-                } else {
-                    render_transcript(active, "", &queued, width)
-                }
-            } else {
-                standalone_intro_lines(app)
-            };
-
-            let active_h = if active_lines.is_empty() {
-                0
-            } else {
-                Paragraph::new(active_lines.clone())
-                    .wrap(Wrap { trim: false })
-                    .line_count(screen_w)
-                    .min(u16::MAX as usize) as u16
-            };
-            let live_h = active_h.saturating_add(composer_h).min(screen_h).max(composer_h);
-            let viewport = Rect::new(0, screen_h.saturating_sub(live_h), screen_w, live_h);
-            let vp_changed = prev_vp.is_some_and(|p| p != viewport);
-            let prev_top = prev_vp.map(|p| p.y);
-            prev_vp = Some(viewport);
-            terminal.set_viewport_area(viewport);
-            if vp_changed {
-                // Viewport moved/resized: clear stale terminal rows it no longer
-                // occupies / now covers. When history was committed THIS frame,
-                // insert_history wrote it into rows above the new top, so clear
-                // only from the new top down (never wipe that history). On a pure
-                // shrink with no commit, the vacated band above the new top holds
-                // only old composer/active rows — clear from the OLD top so the
-                // stale rows (e.g. a leftover composer border) are wiped too.
-                let clear_y = if committed_now {
-                    viewport.y
-                } else {
-                    prev_top.map_or(viewport.y, |t| t.min(viewport.y))
-                };
-                terminal.clear_after_position(Position { x: 0, y: clear_y })?;
-            }
-            terminal.draw(|f| {
-                let area = f.area();
-                let composer_h = composer_h.min(area.height);
-                let transcript_h = area.height.saturating_sub(composer_h);
-                let transcript_area = Rect::new(area.x, area.y, area.width, transcript_h);
-                let composer_area = Rect::new(
-                    area.x,
-                    area.y.saturating_add(transcript_h),
-                    area.width,
-                    composer_h,
-                );
-                if transcript_area.height > 0 {
-                    let para = Paragraph::new(active_lines)
-                        .wrap(Wrap { trim: false })
-                        .scroll((active_h.saturating_sub(transcript_area.height) as u16, 0));
-                    f.render_widget_ref(para, transcript_area);
-                }
-                let views: Vec<AgentView> = app.agents.iter().map(Agent::view).collect();
-                let order: Vec<usize> = (0..views.len()).collect();
-                let top_titles = app
-                    .rename_target
-                    .is_none()
-                    .then(|| single_agent_composer_top_titles(app, &views, &order));
-                let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
-                draw_composer_inline(f, composer_area, app, top_titles, bottom_title);
-            })?;
-
-            if poll_tui_input(app)? {
-                break;
-            }
-        }
-        Ok(())
-    })();
+    let result = run_inline_view(app, &signals, &mut terminal, false);
 
     disable_raw_mode()?;
     write!(terminal.backend_mut(), "\r\n")?;
     std::io::Write::flush(terminal.backend_mut())?;
-    result
+    result.map(|_| ())
+}
+
+/// The inline-flow render loop, shared by the standalone (`bro agent`) view and
+/// the cockpit's zoomed single-agent view. It commits stable transcript items to
+/// the terminal's real scrollback and keeps only the live tail + composer in a
+/// dynamic bottom viewport (see `custom_terminal` / `insert_history`).
+///
+/// `exit_on_zoom_out` distinguishes the two callers: the standalone view runs
+/// until quit (`false`); the cockpit runs one zoom session and returns
+/// [`InlineExit::ZoomOut`] when the user leaves `Zone::SingleAgent`, so the
+/// caller can restore the alt-screen roster. In cockpit mode the screen is
+/// cleared and the focused agent's commit cursor reset on entry, so each zoom
+/// flows that agent's transcript fresh without interleaving a prior agent's
+/// scrollback.
+fn run_inline_view<B>(
+    app: &mut App,
+    signals: &mpsc::Receiver<TailEvent>,
+    terminal: &mut custom_terminal::Terminal<B>,
+    exit_on_zoom_out: bool,
+) -> anyhow::Result<InlineExit>
+where
+    B: ratatui::backend::Backend + Write,
+{
+    // Cockpit entry: hard-purge the screen + scrollback and re-flow the focused
+    // agent from the top, so a previous zoom's agent history never interleaves
+    // with this one in the real scrollback. The standalone view skips this (it
+    // flows below the launch cwd). The clear helpers no-op on an empty viewport,
+    // so seed a full-screen viewport first; the loop sets the real one below.
+    if exit_on_zoom_out {
+        if let Some(idx) = inline_focus_idx(app) {
+            app.inline_commits.remove(&app.agents[idx].task.id());
+        }
+        terminal.autoresize()?;
+        let s = terminal.last_known_screen_size;
+        if s.width > 0 && s.height > 0 {
+            terminal.set_viewport_area(Rect::new(0, 0, s.width, s.height));
+            terminal.clear_scrollback_and_visible_screen_ansi()?;
+            // Seed the viewport at its real first-frame size before the loop's
+            // first (possibly whole-transcript) commit. The loop commits BEFORE
+            // it sets the frame's viewport, so the initial insert_history runs
+            // against whatever viewport is current — if that's the full screen
+            // (top()==0 → degenerate `\x1b[1;0r` region) or merely too short, the
+            // committed tail lands in rows the composer then overlaps, leaving
+            // residue. Sizing the seed to the final viewport (composer + active
+            // tail) keeps insert_history strictly above it.
+            let seed = inline_seed_viewport(app, s.width, s.height);
+            terminal.set_viewport_area(seed);
+        }
+    }
+
+    let mut prev_vp: Option<Rect> = None;
+    loop {
+        drain_tui_events(app, signals);
+        if app.quit {
+            return Ok(InlineExit::Quit);
+        }
+        if exit_on_zoom_out && app.zone != Zone::SingleAgent {
+            return Ok(InlineExit::ZoomOut);
+        }
+
+        terminal.autoresize()?;
+        let screen = terminal.last_known_screen_size;
+        let screen_w = screen.width.max(1);
+        let screen_h = screen.height.max(1);
+        let width = screen_w as usize;
+        let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
+
+        let focus = inline_focus_idx(app);
+        // Cockpit focus vanished mid-session (agent deleted while zoomed): bounce
+        // back to the roster rather than fall through to the standalone intro.
+        if exit_on_zoom_out && focus.is_none() {
+            return Ok(InlineExit::ZoomOut);
+        }
+
+        let mut committed_now = false;
+        let active_lines = if let Some(idx) = focus {
+            let transcript = app.agents[idx].task.transcript();
+            let turn_active = app.agents[idx].task.snapshot().turn_active;
+            let stable_end = inline_stable_end(transcript.len(), turn_active);
+            committed_now =
+                commit_inline_history(app, terminal, idx, &transcript, stable_end, width)?;
+
+            let queued = queued_user_turns(&mut app.agents[idx], &transcript);
+            let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
+            let active = &transcript[stable_end..];
+            // Everything is committed to scrollback and nothing is queued:
+            // the live area is just the composer — render no transcript body
+            // (render_transcript would emit its "(no output yet)" placeholder
+            // for an all-empty input, which is wrong here).
+            if active.is_empty() && queued.is_empty() {
+                Vec::new()
+            } else {
+                render_transcript(active, "", &queued, width)
+            }
+        } else {
+            standalone_intro_lines(app)
+        };
+
+        let active_h = if active_lines.is_empty() {
+            0
+        } else {
+            Paragraph::new(active_lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(screen_w)
+                .min(u16::MAX as usize) as u16
+        };
+        let live_h = active_h.saturating_add(composer_h).min(screen_h).max(composer_h);
+        let viewport = Rect::new(0, screen_h.saturating_sub(live_h), screen_w, live_h);
+        let vp_changed = prev_vp.is_some_and(|p| p != viewport);
+        let prev_top = prev_vp.map(|p| p.y);
+        prev_vp = Some(viewport);
+        terminal.set_viewport_area(viewport);
+        if vp_changed {
+            // Viewport moved/resized: clear stale terminal rows it no longer
+            // occupies / now covers. When history was committed THIS frame,
+            // insert_history wrote it into rows above the new top, so clear
+            // only from the new top down (never wipe that history). On a pure
+            // shrink with no commit, the vacated band above the new top holds
+            // only old composer/active rows — clear from the OLD top so the
+            // stale rows (e.g. a leftover composer border) are wiped too.
+            let clear_y = if committed_now {
+                viewport.y
+            } else {
+                prev_top.map_or(viewport.y, |t| t.min(viewport.y))
+            };
+            terminal.clear_after_position(Position { x: 0, y: clear_y })?;
+        }
+        terminal.draw(|f| {
+            let area = f.area();
+            let composer_h = composer_h.min(area.height);
+            let transcript_h = area.height.saturating_sub(composer_h);
+            let transcript_area = Rect::new(area.x, area.y, area.width, transcript_h);
+            let composer_area = Rect::new(
+                area.x,
+                area.y.saturating_add(transcript_h),
+                area.width,
+                composer_h,
+            );
+            if transcript_area.height > 0 {
+                let para = Paragraph::new(active_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((active_h.saturating_sub(transcript_area.height) as u16, 0));
+                f.render_widget_ref(para, transcript_area);
+            }
+            let views: Vec<AgentView> = app.agents.iter().map(Agent::view).collect();
+            let order: Vec<usize> = (0..views.len()).collect();
+            let top_titles = app
+                .rename_target
+                .is_none()
+                .then(|| single_agent_composer_top_titles(app, &views, &order));
+            let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
+            draw_composer_inline(f, composer_area, app, top_titles, bottom_title);
+        })?;
+
+        if poll_tui_input(app)? {
+            return Ok(InlineExit::Quit);
+        }
+    }
 }
 
 fn poll_tui_input(app: &mut App) -> anyhow::Result<bool> {
@@ -1326,9 +1508,11 @@ fn inline_stable_end(total_items: usize, turn_active: bool) -> usize {
     }
 }
 
+/// Drop every per-agent commit cursor — used when the standalone view installs a
+/// fresh agent (the one agent's transcript must re-flow from the top). In the
+/// cockpit, per-agent cursors persist across zoom switches; prune individually.
 fn reset_inline_commit_state(app: &mut App) {
-    app.committed = 0;
-    app.committed_initial = false;
+    app.inline_commits.clear();
 }
 
 fn commit_inline_history<B>(
@@ -1342,8 +1526,11 @@ fn commit_inline_history<B>(
 where
     B: ratatui::backend::Backend + Write,
 {
+    let id = app.agents[idx].task.id();
+    let cursor = app.inline_commits.get(&id).copied().unwrap_or_default();
+
     let mut lines = Vec::new();
-    if !app.committed_initial {
+    if !cursor.committed_initial {
         let initial = initial_prompt(&app.agents[idx]);
         if !initial.is_empty() {
             lines.extend(render_steer_with_status(
@@ -1353,11 +1540,10 @@ where
             ));
             lines.push(Line::from(""));
         }
-        app.committed_initial = true;
     }
-    if stable_end > app.committed {
+    if stable_end > cursor.committed {
         lines.extend(render_committed_items(
-            &transcript[app.committed..stable_end],
+            &transcript[cursor.committed..stable_end],
             width,
         ));
     }
@@ -1365,7 +1551,13 @@ where
     if committed_now {
         insert_history::insert_history_lines(terminal, lines)?;
     }
-    app.committed = stable_end;
+    app.inline_commits.insert(
+        id,
+        InlineCommit {
+            committed: stable_end,
+            committed_initial: true,
+        },
+    );
     Ok(committed_now)
 }
 
