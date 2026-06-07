@@ -6,7 +6,7 @@
 use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -226,6 +226,614 @@ impl Tool for ExitWorktree {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phased closeout driver (Phase 1 of design/fleet-tui/closeout-command.md)
+//
+// Decomposes the closeout git sequence (the operator-accepted decomposition)
+// into discrete phases with hook seams and a structured per-phase result:
+//
+//   preflight → stage/commit (publish only) → ff-base(origin/<target>)
+//   → rebase(<target>) → ff-merge(branch→<target>)
+//   → [pre_push hook SEAM] → push → [pre_remove hook SEAM] → remove
+//   → [post_success hook SEAM]
+//
+// The hook SEAMS are NAMED PLACEHOLDER BOUNDARIES ONLY in Phase 1 — no hook
+// execution, no fleet.json/config reading. They are marked with comments so a
+// later phase can plug real hook dispatch in without touching the phase
+// functions or the driver.
+//
+// `run_closeout_phases` is `pub` so a future daemon /control/closeout endpoint
+// can call it directly. Existing tool dispositions (publish/merge/adopt/
+// discard) delegate here; their external JSON contract is preserved by
+// `render_closeout_outcome`.
+// ---------------------------------------------------------------------------
+
+/// One of the discrete phases of the closeout sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloseoutPhase {
+    /// Disposition-specific readiness checks (worktree clean / dirty,
+    /// commit_message present, base on target, unsafe pathspecs, etc.).
+    Preflight,
+    /// `git add` + `git commit` in the managed worktree. Publish only.
+    StageCommit,
+    /// `git fetch origin <target>` + `git merge --ff-only origin/<target>` in
+    /// the base/target checkout.
+    FfBase,
+    /// `git rebase <target>` in the managed worktree.
+    Rebase,
+    /// `git merge --ff-only <branch>` in the base/target checkout.
+    FfMerge,
+    /// `git push origin <target>` in the base/target checkout.
+    Push,
+    /// `git worktree remove` (+ `git branch -D <branch>`) in the base/target
+    /// checkout.
+    Remove,
+}
+
+/// Coarse classification of a phase failure. Callers route recovery by class
+/// (e.g. rebase conflicts steer the worktree's own agent; base/target failures
+/// escalate to the operator or a base-reconcile step). The mapping back to the
+/// repo cwd lives on `PhaseResult.repo_cwd` (Gap A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloseoutErrorClass {
+    /// Phase succeeded.
+    None,
+    /// Base/target checkout is not on `<target>` or has a dirty status.
+    BaseNotReady,
+    /// `git fetch` or `git merge --ff-only origin/<target>` failed in base.
+    FfBaseFailed,
+    /// `git add` failed in the worktree.
+    StageFailed,
+    /// `git commit` failed in the worktree.
+    CommitFailed,
+    /// `git rebase <target>` failed in the worktree (conflict or other).
+    RebaseConflict,
+    /// `git merge --ff-only <branch>` failed in base.
+    FfMergeFailed,
+    /// `git push` was rejected by the remote.
+    PushRejected,
+    /// `git worktree remove` failed in base.
+    RemoveFailed,
+    /// Disposition-not-applicable bail (e.g. publish with a clean branch ahead
+    /// of target → use adopt) or other unclassified preflight bail.
+    Other,
+}
+
+/// Structured per-phase result. `repo_cwd` is the working tree the failing or
+/// succeeding git step ran in (worktree for stage/rebase, base/target
+/// checkout for ff-base/ff-merge/push/remove). `content` carries
+/// disposition-specific details the renderer needs to build the existing tool
+/// JSON contract (e.g. `head`, `branch_commits_ahead`).
+#[derive(Debug, Clone)]
+pub struct PhaseResult {
+    pub phase: CloseoutPhase,
+    pub repo_cwd: PathBuf,
+    pub ok: bool,
+    pub error_class: CloseoutErrorClass,
+    pub content: Value,
+}
+
+/// Result of `run_closeout_phases`. On success, the full per-phase sequence
+/// (each `PhaseResult.ok = true`); on failure, the failing `PhaseResult` with
+/// `ok = false` and the structured `error_class` (and a `content["error"]`
+/// string for the renderer to bubble up verbatim).
+#[derive(Debug, Clone)]
+pub enum CloseoutOutcome {
+    Success(Vec<PhaseResult>),
+    Failed(PhaseResult),
+}
+
+/// Inputs to `run_closeout_phases`. Constructed by the tool from
+/// `ExitWorktreeInput` (or, later, by the daemon /control/closeout endpoint
+/// from a `CloseoutRequest` DTO). `disposition` is `"publish"`, `"merge"`,
+/// `"adopt"`, or `"discard"`.
+#[derive(Debug, Clone)]
+pub struct CloseoutRequest {
+    pub worktree: PathBuf,
+    pub base_repo: PathBuf,
+    pub branch: String,
+    pub target: String,
+    pub disposition: String,
+    pub confirm: bool,
+    pub commit_message: Option<String>,
+    pub paths: Vec<String>,
+}
+
+/// Run the closeout sequence as discrete phases. Each phase records a
+/// `PhaseResult`; the driver stops and returns `CloseoutOutcome::Failed` on
+/// the first failing phase, or `CloseoutOutcome::Success` with the full
+/// per-phase sequence if every phase completes.
+pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
+    let mut results: Vec<PhaseResult> = Vec::new();
+
+    // Phase 1: preflight (always runs; disposition-specific readiness).
+    let preflight = phase_preflight(req);
+    if !preflight.ok {
+        return CloseoutOutcome::Failed(preflight);
+    }
+    results.push(preflight);
+
+    // Phase 2: stage/commit (publish only).
+    if req.disposition == "publish" {
+        let stage = phase_stage_commit(req);
+        if !stage.ok {
+            return CloseoutOutcome::Failed(stage);
+        }
+        results.push(stage);
+    }
+
+    // Phases 3–6: ff-base → rebase → ff-merge → push. Skipped for `discard`.
+    if req.disposition != "discard" {
+        let ff_base = phase_ff_base(req);
+        if !ff_base.ok {
+            return CloseoutOutcome::Failed(ff_base);
+        }
+        results.push(ff_base);
+
+        let rebase = phase_rebase(req);
+        if !rebase.ok {
+            return CloseoutOutcome::Failed(rebase);
+        }
+        results.push(rebase);
+
+        let ff_merge = phase_ff_merge(req);
+        if !ff_merge.ok {
+            return CloseoutOutcome::Failed(ff_merge);
+        }
+        results.push(ff_merge);
+
+        // ---- pre_push hook SEAM (no-op in Phase 1) ----
+        let push = phase_push(req);
+        if !push.ok {
+            return CloseoutOutcome::Failed(push);
+        }
+        results.push(push);
+    }
+
+    // ---- pre_remove hook SEAM (no-op in Phase 1) ----
+    let remove = phase_remove(req);
+    if !remove.ok {
+        return CloseoutOutcome::Failed(remove);
+    }
+    results.push(remove);
+    // ---- post_success hook SEAM (no-op in Phase 1) ----
+
+    CloseoutOutcome::Success(results)
+}
+
+/// Render a `CloseoutOutcome` into the existing `exit_worktree` tool JSON
+/// contract. On failure, bubbles the failing phase's `content["error"]`
+/// string as an `anyhow::Error` (which `ToolResult::from_result` formats with
+/// `is_error = true`). On success, builds the per-disposition JSON from the
+/// per-phase content (head, merged_commits, removed_worktree, ...).
+fn render_closeout_outcome(
+    outcome: CloseoutOutcome,
+    disposition: &str,
+    branch: &str,
+    target: &str,
+    worktree: &Path,
+) -> anyhow::Result<Value> {
+    match outcome {
+        CloseoutOutcome::Failed(result) => {
+            let err = result
+                .content
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("closeout phase failed");
+            Err(anyhow::anyhow!("{err}"))
+        }
+        CloseoutOutcome::Success(results) => {
+            // The ff_merge phase records the post-merge head; the preflight
+            // phase (for merge/adopt) records the branch_commits_ahead count.
+            let head = results
+                .iter()
+                .rev()
+                .find_map(|r| r.content.get("head").and_then(Value::as_str))
+                .unwrap_or("");
+            let branch_commits = results
+                .iter()
+                .find_map(|r| {
+                    r.content
+                        .get("branch_commits_ahead")
+                        .and_then(Value::as_u64)
+                })
+                .unwrap_or(0);
+            match disposition {
+                "discard" => Ok(json!({
+                    "ok": true,
+                    "disposition": "discard",
+                    "branch": branch,
+                    "target": target,
+                })),
+                "publish" => Ok(json!({
+                    "ok": true,
+                    "disposition": "publish",
+                    "published_head": head,
+                    "branch": branch,
+                    "target": target,
+                    "removed_worktree": worktree,
+                })),
+                "merge" | "adopt" => Ok(json!({
+                    "ok": true,
+                    "disposition": disposition,
+                    "published_head": head,
+                    "branch": branch,
+                    "target": target,
+                    "merged_commits": branch_commits,
+                    "removed_worktree": worktree,
+                })),
+                other => Err(anyhow::anyhow!(
+                    "disposition must be keep, preflight, discard, publish, merge, or adopt; got {other}"
+                )),
+            }
+        }
+    }
+}
+
+fn phase_preflight(req: &CloseoutRequest) -> PhaseResult {
+    let worktree = &req.worktree;
+    let base_repo = &req.base_repo;
+    let target = &req.target;
+    let branch = &req.branch;
+
+    match req.disposition.as_str() {
+        "discard" => PhaseResult {
+            phase: CloseoutPhase::Preflight,
+            repo_cwd: worktree.clone(),
+            ok: true,
+            error_class: CloseoutErrorClass::None,
+            content: json!({"note": "no preflight checks for discard"}),
+        },
+        "publish" => {
+            // commit_message required for publish.
+            if req
+                .commit_message
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return PhaseResult {
+                    phase: CloseoutPhase::Preflight,
+                    repo_cwd: worktree.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::Other,
+                    content: json!({"error": "publish requires commit_message"}),
+                };
+            }
+            // changed paths: signpost adopt/merge, or bail with "no paths".
+            let changed = changed_paths(worktree).unwrap_or_default();
+            if changed.is_empty() {
+                let ahead = branch_ahead_count(base_repo, branch, target).unwrap_or(0);
+                if ahead > 0 {
+                    return PhaseResult {
+                        phase: CloseoutPhase::Preflight,
+                        repo_cwd: worktree.clone(),
+                        ok: false,
+                        error_class: CloseoutErrorClass::Other,
+                        content: json!({
+                            "error": format!(
+                                "publish found no uncommitted changes, but branch {branch} is already \
+                                 {ahead} commit(s) ahead of {target}; use disposition=adopt (or merge) to fold \
+                                 the committed branch into {target} and close out the worktree"
+                            ),
+                        }),
+                    };
+                }
+                return PhaseResult {
+                    phase: CloseoutPhase::Preflight,
+                    repo_cwd: worktree.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::Other,
+                    content: json!({"error": "publish found no changed paths to commit"}),
+                };
+            }
+            // unsafe pathspec check (precondition for `git add`).
+            let selected = if req.paths.is_empty() {
+                changed.clone()
+            } else {
+                req.paths.clone()
+            };
+            for p in &selected {
+                if !is_safe_pathspec(p) {
+                    return PhaseResult {
+                        phase: CloseoutPhase::Preflight,
+                        repo_cwd: worktree.clone(),
+                        ok: false,
+                        error_class: CloseoutErrorClass::Other,
+                        content: json!({"error": format!("refusing unsafe pathspec {p}")}),
+                    };
+                }
+            }
+            // base readiness (on <target>, clean).
+            if let Err(e) = ensure_base_ready_for_publish(base_repo, target) {
+                return PhaseResult {
+                    phase: CloseoutPhase::Preflight,
+                    repo_cwd: base_repo.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::BaseNotReady,
+                    content: json!({"error": format!("{e:#}")}),
+                };
+            }
+            PhaseResult {
+                phase: CloseoutPhase::Preflight,
+                repo_cwd: worktree.clone(),
+                ok: true,
+                error_class: CloseoutErrorClass::None,
+                content: json!({
+                    "changed_paths": changed,
+                    "selected_paths": selected,
+                }),
+            }
+        }
+        "merge" | "adopt" => {
+            // dirty worktree check.
+            let changed = changed_paths(worktree).unwrap_or_default();
+            if !changed.is_empty() {
+                return PhaseResult {
+                    phase: CloseoutPhase::Preflight,
+                    repo_cwd: worktree.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::Other,
+                    content: json!({
+                        "error": format!(
+                            "{} requires a clean worktree; use publish to commit dirty paths first. Dirty paths: {}",
+                            req.disposition,
+                            changed.join(", ")
+                        ),
+                    }),
+                };
+            }
+            // branch_commits > 0.
+            let branch_commits = match branch_ahead_count(base_repo, branch, target) {
+                Ok(n) => n,
+                Err(e) => {
+                    return PhaseResult {
+                        phase: CloseoutPhase::Preflight,
+                        repo_cwd: base_repo.clone(),
+                        ok: false,
+                        error_class: CloseoutErrorClass::BaseNotReady,
+                        content: json!({"error": format!("{e:#}")}),
+                    };
+                }
+            };
+            if branch_commits == 0 {
+                return PhaseResult {
+                    phase: CloseoutPhase::Preflight,
+                    repo_cwd: base_repo.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::BaseNotReady,
+                    content: json!({
+                        "error": format!(
+                            "{} found no branch commits to merge into {}",
+                            req.disposition, target
+                        ),
+                    }),
+                };
+            }
+            // base readiness.
+            if let Err(e) = ensure_base_ready_for_publish(base_repo, target) {
+                return PhaseResult {
+                    phase: CloseoutPhase::Preflight,
+                    repo_cwd: base_repo.clone(),
+                    ok: false,
+                    error_class: CloseoutErrorClass::BaseNotReady,
+                    content: json!({"error": format!("{e:#}")}),
+                };
+            }
+            PhaseResult {
+                phase: CloseoutPhase::Preflight,
+                repo_cwd: worktree.clone(),
+                ok: true,
+                error_class: CloseoutErrorClass::None,
+                content: json!({"branch_commits_ahead": branch_commits}),
+            }
+        }
+        other => PhaseResult {
+            phase: CloseoutPhase::Preflight,
+            repo_cwd: worktree.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::Other,
+            content: json!({
+                "error": format!(
+                    "disposition must be keep, preflight, discard, publish, merge, or adopt; got {other}"
+                ),
+            }),
+        },
+    }
+}
+
+fn phase_stage_commit(req: &CloseoutRequest) -> PhaseResult {
+    let worktree = &req.worktree;
+    let paths = if req.paths.is_empty() {
+        changed_paths(worktree).unwrap_or_default()
+    } else {
+        req.paths.clone()
+    };
+    let mut add_args: Vec<String> = vec!["add".to_string(), "--".to_string()];
+    add_args.extend(paths.iter().cloned());
+    if let Err(e) = git_run_owned(worktree, &add_args) {
+        return PhaseResult {
+            phase: CloseoutPhase::StageCommit,
+            repo_cwd: worktree.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::StageFailed,
+            content: json!({"error": format!("{e:#}"), "op": "add"}),
+        };
+    }
+    let message = req.commit_message.as_deref().unwrap_or("");
+    if let Err(e) = git_run(worktree, &["commit", "-m", message]) {
+        return PhaseResult {
+            phase: CloseoutPhase::StageCommit,
+            repo_cwd: worktree.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::CommitFailed,
+            content: json!({"error": format!("{e:#}"), "op": "commit"}),
+        };
+    }
+    // Post-commit sanity: refuse to continue if anything is still dirty.
+    let remaining = changed_paths(worktree).unwrap_or_default();
+    if !remaining.is_empty() {
+        return PhaseResult {
+            phase: CloseoutPhase::StageCommit,
+            repo_cwd: worktree.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::StageFailed,
+            content: json!({
+                "error": "publish left uncommitted changes in the worktree; refusing to remove it",
+                "remaining": remaining,
+            }),
+        };
+    }
+    PhaseResult {
+        phase: CloseoutPhase::StageCommit,
+        repo_cwd: worktree.clone(),
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({"staged_paths": paths, "message": message}),
+    }
+}
+
+fn phase_ff_base(req: &CloseoutRequest) -> PhaseResult {
+    let base_repo = &req.base_repo;
+    let target = &req.target;
+    if let Err(e) = git_run(base_repo, &["fetch", "origin", target]) {
+        return PhaseResult {
+            phase: CloseoutPhase::FfBase,
+            repo_cwd: base_repo.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::FfBaseFailed,
+            content: json!({"error": format!("{e:#}"), "op": "fetch"}),
+        };
+    }
+    let ff_ref = format!("origin/{target}");
+    if let Err(e) = git_run(base_repo, &["merge", "--ff-only", &ff_ref]) {
+        return PhaseResult {
+            phase: CloseoutPhase::FfBase,
+            repo_cwd: base_repo.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::FfBaseFailed,
+            content: json!({"error": format!("{e:#}"), "op": "ff-merge", "ref": ff_ref}),
+        };
+    }
+    PhaseResult {
+        phase: CloseoutPhase::FfBase,
+        repo_cwd: base_repo.clone(),
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({"fetched": ff_ref, "ff_merged": ff_ref}),
+    }
+}
+
+fn phase_rebase(req: &CloseoutRequest) -> PhaseResult {
+    let worktree = &req.worktree;
+    let target = &req.target;
+    if let Err(e) = git_run(worktree, &["rebase", target]) {
+        return PhaseResult {
+            phase: CloseoutPhase::Rebase,
+            repo_cwd: worktree.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::RebaseConflict,
+            content: json!({"error": format!("{e:#}"), "onto": target}),
+        };
+    }
+    PhaseResult {
+        phase: CloseoutPhase::Rebase,
+        repo_cwd: worktree.clone(),
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({"rebased_onto": target}),
+    }
+}
+
+fn phase_ff_merge(req: &CloseoutRequest) -> PhaseResult {
+    let base_repo = &req.base_repo;
+    let branch = &req.branch;
+    if let Err(e) = git_run(base_repo, &["merge", "--ff-only", branch]) {
+        return PhaseResult {
+            phase: CloseoutPhase::FfMerge,
+            repo_cwd: base_repo.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::FfMergeFailed,
+            content: json!({"error": format!("{e:#}"), "branch": branch}),
+        };
+    }
+    let head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
+    PhaseResult {
+        phase: CloseoutPhase::FfMerge,
+        repo_cwd: base_repo.clone(),
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({"merged_branch": branch, "head": head}),
+    }
+}
+
+fn phase_push(req: &CloseoutRequest) -> PhaseResult {
+    // ---- pre_push hook SEAM (no-op in Phase 1) ----
+    let base_repo = &req.base_repo;
+    let target = &req.target;
+    let push_ref = format!("origin/{target}");
+    if let Err(e) = git_run(base_repo, &["push", "origin", target]) {
+        return PhaseResult {
+            phase: CloseoutPhase::Push,
+            repo_cwd: base_repo.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::PushRejected,
+            content: json!({"error": format!("{e:#}"), "ref": push_ref}),
+        };
+    }
+    PhaseResult {
+        phase: CloseoutPhase::Push,
+        repo_cwd: base_repo.clone(),
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({"pushed": push_ref}),
+    }
+}
+
+fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
+    // ---- pre_remove hook SEAM (no-op in Phase 1) ----
+    let base_repo = &req.base_repo;
+    let worktree = &req.worktree;
+    let branch = &req.branch;
+    let force = req.disposition == "discard";
+    let mut remove_args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        remove_args.push("--force");
+    }
+    let worktree_str = match path_str(worktree) {
+        Ok(s) => s,
+        Err(e) => {
+            return PhaseResult {
+                phase: CloseoutPhase::Remove,
+                repo_cwd: base_repo.clone(),
+                ok: false,
+                error_class: CloseoutErrorClass::RemoveFailed,
+                content: json!({"error": format!("{e:#}")}),
+            };
+        }
+    };
+    remove_args.push(worktree_str);
+    if let Err(e) = git_run(base_repo, &remove_args) {
+        return PhaseResult {
+            phase: CloseoutPhase::Remove,
+            repo_cwd: base_repo.clone(),
+            ok: false,
+            error_class: CloseoutErrorClass::RemoveFailed,
+            content: json!({"error": format!("{e:#}"), "worktree": worktree_str}),
+        };
+    }
+    let _ = git_run(base_repo, &["branch", "-D", branch]);
+    // ---- post_success hook SEAM (no-op in Phase 1) ----
+    PhaseResult {
+        phase: CloseoutPhase::Remove,
+        repo_cwd: base_repo.clone(),
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({"removed_worktree": worktree, "deleted_branch": branch}),
+    }
+}
+
 fn enter_worktree(cx_root: &Path, args: EnterWorktreeInput) -> anyhow::Result<Value> {
     let parent_worktree = git_toplevel(cx_root)?;
     let base_repo = fleet_base_repo(cx_root)?;
@@ -397,137 +1005,56 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             if !args.confirm {
                 anyhow::bail!("discard requires confirm=true");
             }
-            git_run(
-                &base_repo,
-                &["worktree", "remove", "--force", path_str(&worktree)?],
-            )?;
-            let _ = git_run(&base_repo, &["branch", "-D", &branch]);
-            Ok(json!({
-                "ok": true,
-                "disposition": "discard",
-                "branch": branch,
-                "target": target,
-            }))
+            let outcome = run_closeout_phases(&CloseoutRequest {
+                worktree: worktree.clone(),
+                base_repo: base_repo.clone(),
+                branch: branch.clone(),
+                target: target.clone(),
+                disposition: "discard".to_string(),
+                confirm: args.confirm,
+                commit_message: args.commit_message.clone(),
+                paths: args.paths.clone(),
+            });
+            render_closeout_outcome(outcome, "discard", &branch, &target, &worktree)
         }
         "publish" => {
             if !args.confirm {
                 anyhow::bail!("publish requires confirm=true");
             }
-            let changed = changed_paths(&worktree)?;
-            if changed.is_empty() {
-                // A clean worktree whose branch already carries commits is the
-                // commit-then-close-out path: publish has nothing to stage, but
-                // the work is not lost — adopt folds the existing branch commits
-                // into <target>. Signpost it rather than dead-ending the agent.
-                let ahead = branch_ahead_count(&base_repo, &branch, &target).unwrap_or(0);
-                if ahead > 0 {
-                    anyhow::bail!(
-                        "publish found no uncommitted changes, but branch {branch} is already \
-                         {ahead} commit(s) ahead of {target}; use disposition=adopt (or merge) to fold \
-                         the committed branch into {target} and close out the worktree"
-                    );
-                }
-                anyhow::bail!("publish found no changed paths to commit");
-            }
-            let message = args
-                .commit_message
-                .as_deref()
-                .filter(|m| !m.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("publish requires commit_message"))?;
-            ensure_base_ready_for_publish(&base_repo, &target)?;
-            git_run(&base_repo, &["fetch", "origin", &target])?;
-            git_run(&base_repo, &["merge", "--ff-only", &format!("origin/{target}")])?;
-            let paths = if args.paths.is_empty() {
-                changed
-            } else {
-                args.paths
-            };
-            for p in &paths {
-                if !is_safe_pathspec(p) {
-                    anyhow::bail!("refusing unsafe pathspec {p}");
-                }
-            }
-            let mut add_args = vec!["add".to_string(), "--".to_string()];
-            add_args.extend(paths);
-            git_run_owned(&worktree, &add_args)?;
-            git_run(&worktree, &["commit", "-m", message])?;
-            let remaining = changed_paths(&worktree)?;
-            if !remaining.is_empty() {
-                anyhow::bail!(
-                    "publish left uncommitted changes in the worktree; refusing to remove it"
-                );
-            }
-            git_run(&worktree, &["rebase", &target])?;
-            git_run(&base_repo, &["merge", "--ff-only", &branch])?;
-            git_run(&base_repo, &["push", "origin", &target])?;
-            let head = git_capture(&base_repo, &["rev-parse", "--short=12", "HEAD"])?;
-            git_run(&base_repo, &["worktree", "remove", path_str(&worktree)?])?;
-            let _ = git_run(&base_repo, &["branch", "-D", &branch]);
-            Ok(json!({
-                "ok": true,
-                "disposition": "publish",
-                "published_head": head,
-                "branch": branch,
-                "target": target,
-                "removed_worktree": worktree,
-            }))
+            let outcome = run_closeout_phases(&CloseoutRequest {
+                worktree: worktree.clone(),
+                base_repo: base_repo.clone(),
+                branch: branch.clone(),
+                target: target.clone(),
+                disposition: "publish".to_string(),
+                confirm: args.confirm,
+                commit_message: args.commit_message.clone(),
+                paths: args.paths.clone(),
+            });
+            render_closeout_outcome(outcome, "publish", &branch, &target, &worktree)
         }
-        "merge" | "adopt" => merge_committed_worktree(
-            &base_repo,
-            &worktree,
-            &branch,
-            disposition,
-            args.confirm,
-            &target,
-        ),
+        "merge" | "adopt" => {
+            if !args.confirm {
+                anyhow::bail!("{disposition} requires confirm=true");
+            }
+            let outcome = run_closeout_phases(&CloseoutRequest {
+                worktree: worktree.clone(),
+                base_repo: base_repo.clone(),
+                branch: branch.clone(),
+                target: target.clone(),
+                disposition: disposition.to_string(),
+                confirm: args.confirm,
+                commit_message: args.commit_message.clone(),
+                paths: args.paths.clone(),
+            });
+            render_closeout_outcome(outcome, disposition, &branch, &target, &worktree)
+        }
         other => {
             anyhow::bail!(
                 "disposition must be keep, preflight, discard, publish, merge, or adopt; got {other}"
             )
         }
     }
-}
-
-fn merge_committed_worktree(
-    base_repo: &Path,
-    worktree: &Path,
-    branch: &str,
-    disposition: &str,
-    confirm: bool,
-    target: &str,
-) -> anyhow::Result<Value> {
-    if !confirm {
-        anyhow::bail!("{disposition} requires confirm=true");
-    }
-    let changed = changed_paths(worktree)?;
-    if !changed.is_empty() {
-        anyhow::bail!(
-            "{disposition} requires a clean worktree; use publish to commit dirty paths first. Dirty paths: {}",
-            changed.join(", ")
-        );
-    }
-    ensure_base_ready_for_publish(base_repo, target)?;
-    git_run(base_repo, &["fetch", "origin", target])?;
-    git_run(base_repo, &["merge", "--ff-only", &format!("origin/{target}")])?;
-    git_run(worktree, &["rebase", target])?;
-    let branch_commits = branch_ahead_count(base_repo, branch, target)?;
-    if branch_commits == 0 {
-        anyhow::bail!("{disposition} found no branch commits to merge into {target}");
-    }
-    git_run(base_repo, &["merge", "--ff-only", branch])?;
-    git_run(base_repo, &["push", "origin", target])?;
-    let head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"])?;
-    git_run(base_repo, &["worktree", "remove", path_str(worktree)?])?;
-    let _ = git_run(base_repo, &["branch", "-D", branch]);
-    Ok(json!({
-        "ok": true,
-        "disposition": disposition,
-        "published_head": head,
-        "branch": branch,
-        "target": target,
-        "merged_commits": branch_commits,
-        "removed_worktree": worktree,
-    }))
 }
 
 fn publish_preflight(
@@ -1334,6 +1861,184 @@ mod tests {
         // Cleanup: restore the original worktree branch so the test repo
         // can be torn down without an in-use branch warning.
         let _ = run_git(&cwd, &["checkout", &worktree_branch]);
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Phased closeout driver — new tests (Phase 1 of design/fleet-tui/closeout-command.md)
+    //
+    // These call `run_closeout_phases` directly (not through the `exit_worktree`
+    // tool) and assert on the structured per-phase result. They prove the
+    // decomposition without depending on the tool's JSON contract.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn closeout_phased_driver_merge_adopt_returns_full_phase_sequence() {
+        // Reuse the merge flow's setup, but call the phased driver directly
+        // and assert on the per-phase sequence. merge/adopt must skip the
+        // StageCommit phase (publish-only) and run Preflight → FfBase →
+        // Rebase → FfMerge → Push → Remove.
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        let branch = value["branch"].as_str().unwrap().to_string();
+        std::fs::write(cwd.join("README.md"), "base\ncommitted\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: branch.clone(),
+            target: "main".to_string(),
+            disposition: "merge".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+        };
+        let outcome = run_closeout_phases(&req);
+        let results = match outcome {
+            CloseoutOutcome::Success(r) => r,
+            CloseoutOutcome::Failed(r) => panic!(
+                "expected success, got failed phase {:?} with error_class {:?}: {}",
+                r.phase,
+                r.error_class,
+                r.content.get("error").and_then(Value::as_str).unwrap_or("?")
+            ),
+        };
+
+        // Every phase must be ok.
+        for r in &results {
+            assert!(r.ok, "phase {:?} should be ok; got {:?}", r.phase, r.content);
+        }
+        // merge/adopt must skip StageCommit.
+        assert!(
+            !results
+                .iter()
+                .any(|r| r.phase == CloseoutPhase::StageCommit),
+            "merge/adopt must skip StageCommit; got phases: {:?}",
+            results.iter().map(|r| r.phase).collect::<Vec<_>>()
+        );
+        // Assert the full ordered sequence.
+        let phases: Vec<CloseoutPhase> = results.iter().map(|r| r.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                CloseoutPhase::Preflight,
+                CloseoutPhase::FfBase,
+                CloseoutPhase::Rebase,
+                CloseoutPhase::FfMerge,
+                CloseoutPhase::Push,
+                CloseoutPhase::Remove,
+            ]
+        );
+        // Preflight runs in the worktree (dirty check); ff-base / ff-merge /
+        // push / remove run in the base repo; rebase runs in the worktree.
+        let repo_of = |p: CloseoutPhase| -> &PathBuf {
+            &results
+                .iter()
+                .find(|r| r.phase == p)
+                .expect("phase present")
+                .repo_cwd
+        };
+        assert_eq!(repo_of(CloseoutPhase::Preflight), &cwd);
+        assert_eq!(repo_of(CloseoutPhase::FfBase), &repo.path().canonicalize().unwrap());
+        assert_eq!(repo_of(CloseoutPhase::Rebase), &cwd);
+        assert_eq!(repo_of(CloseoutPhase::FfMerge), &repo.path().canonicalize().unwrap());
+        assert_eq!(repo_of(CloseoutPhase::Push), &repo.path().canonicalize().unwrap());
+        assert_eq!(repo_of(CloseoutPhase::Remove), &repo.path().canonicalize().unwrap());
+        // Preflight must surface the branch_commits_ahead count (consumed by
+        // the renderer for the `merged_commits` JSON field).
+        let preflight = results
+            .iter()
+            .find(|r| r.phase == CloseoutPhase::Preflight)
+            .unwrap();
+        assert_eq!(preflight.content["branch_commits_ahead"], json!(1));
+        // FfMerge must record the post-merge head.
+        let ff_merge = results
+            .iter()
+            .find(|r| r.phase == CloseoutPhase::FfMerge)
+            .unwrap();
+        assert!(
+            ff_merge.content["head"].as_str().is_some_and(|h| !h.is_empty()),
+            "ff_merge should record post-merge head; got: {:?}",
+            ff_merge.content
+        );
+        // Driver must have removed the worktree (Remove phase succeeded).
+        assert!(!cwd.exists(), "Remove phase should have removed the worktree");
+
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn closeout_phased_driver_returns_rebase_conflict_phase_result() {
+        // Force a rebase conflict: commit on main in the base repo (and push to
+        // origin) that conflicts with the worktree branch's commit. The
+        // driver's Rebase phase must fail with phase=Rebase, repo_cwd=worktree,
+        // error_class=RebaseConflict. Earlier phases (Preflight, FfBase) must
+        // have succeeded.
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        let branch = value["branch"].as_str().unwrap().to_string();
+        // Worktree commit: change README.md line.
+        std::fs::write(cwd.join("README.md"), "base\nworktree-change\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+        // Base-repo conflicting commit on main, pushed to origin.
+        std::fs::write(repo.path().join("README.md"), "base\nbase-conflict\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-m", "base conflict commit"]);
+        run_git(repo.path(), &["push", "origin", "main"]);
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: branch.clone(),
+            target: "main".to_string(),
+            disposition: "merge".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+        };
+        let outcome = run_closeout_phases(&req);
+        let failed = match outcome {
+            CloseoutOutcome::Failed(r) => r,
+            CloseoutOutcome::Success(rs) => panic!(
+                "expected rebase failure, got success with phases: {:?}",
+                rs.iter().map(|r| r.phase).collect::<Vec<_>>()
+            ),
+        };
+
+        assert_eq!(failed.phase, CloseoutPhase::Rebase);
+        assert_eq!(failed.error_class, CloseoutErrorClass::RebaseConflict);
+        // repo_cwd must be the managed worktree (Gap A: rebase failures are
+        // repo_cwd=worktree, not the base/target checkout).
+        assert_eq!(failed.repo_cwd, cwd);
+
+        // The worktree should still be on disk (Remove phase didn't run).
+        assert!(cwd.exists(), "worktree must still exist after rebase conflict");
+
+        // Cleanup: abort the in-progress rebase, then tear down.
+        let _ = run_git(&cwd, &["rebase", "--abort"]);
         run_git(
             repo.path(),
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
