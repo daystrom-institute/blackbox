@@ -312,6 +312,8 @@ pub(super) fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[Age
     // composer frame it). In provider-selector mode the selector to the left
     // carries its own separator.
     let inner = area;
+    // Record the body height so PgUp/PgDn can move the selection a real half-page.
+    app.roster_rows = inner.height;
 
     if app.agents.is_empty() {
         let hint = Paragraph::new(vec![

@@ -375,6 +375,9 @@ struct App {
     cached_total_lines: usize,
     transcript_y_range: Option<(u16, u16)>,
     last_transcript_height: u16,
+    /// Height (rows) of the roster body area, captured each draw so PgUp/PgDn can
+    /// move the selection by a real half-page (0 until the first roster draw).
+    roster_rows: u16,
     /// Per-agent inline-flow commit cursors, keyed by task id. Tracks how much of
     /// each agent's transcript has already been flushed to the terminal's real
     /// scrollback (committed) so the inline viewport renders only the un-committed
@@ -509,6 +512,7 @@ impl App {
             cached_total_lines: 0,
             transcript_y_range: None,
             last_transcript_height: 0,
+            roster_rows: 0,
             inline_commits: HashMap::new(),
             status: None,
             status_until: None,
@@ -1735,6 +1739,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Home if app.zone == Zone::SingleAgent => app.scroll_from_bottom = usize::MAX / 2,
         KeyCode::End if app.zone == Zone::SingleAgent => app.scroll_from_bottom = 0,
 
+        // Roster: half-page paging (clamped) + jump to first/last agent.
+        KeyCode::PageUp if app.zone == Zone::Roster => roster_page(app, -1, false),
+        KeyCode::PageDown if app.zone == Zone::Roster => roster_page(app, 1, false),
+        KeyCode::Home if app.zone == Zone::Roster && !editing => roster_page(app, -1, true),
+        KeyCode::End if app.zone == Zone::Roster && !editing => roster_page(app, 1, true),
+
         KeyCode::Enter if shift => {
             app.input.push('\n');
             app.cursor_pos = app.input.len();
@@ -2872,6 +2882,30 @@ fn vertical(app: &mut App, delta: isize) {
     }
 }
 
+/// Move the roster selection by a half-page (PgUp/PgDn). Unlike [`vertical`] this
+/// clamps to the ends instead of wrapping — paging past the last agent should
+/// rest on it, not jump to the top. `dir` is -1 (up) or +1 (down). `to_end`
+/// jumps straight to the first/last agent (Home/End).
+fn roster_page(app: &mut App, dir: isize, to_end: bool) {
+    if app.zone != Zone::Roster {
+        return;
+    }
+    let n = app.agents.len();
+    if n == 0 {
+        return;
+    }
+    let last = (n - 1) as isize;
+    let cur = app.roster_selected as isize;
+    let next = if to_end {
+        if dir < 0 { 0 } else { last }
+    } else {
+        let step = (app.roster_rows / 2).max(1) as isize;
+        (cur + dir * step).clamp(0, last)
+    };
+    app.roster_selected = next as usize;
+    app.anchor_roster_selection();
+}
+
 fn cycle_provider(app: &mut App, delta: isize) {
     let n = FLEET_PROVIDERS.len() as isize;
     let cur = app.provider_cursor as isize;
@@ -3086,6 +3120,24 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
         Span::styled("-", dim),
         Span::styled(format!(" {waiting} waiting "), byline),
     ];
+    // Scroll affordance: only when the roster overflows its visible body, so the
+    // list reads as scrollable (the Table auto-scrolls to the selection; this
+    // gives the position). Conservative — roster_rows includes header/bucket
+    // rows, so it triggers slightly before the list strictly overflows.
+    let total = views.len();
+    if app.roster_rows > 0 && total > app.roster_rows as usize {
+        let pos = (app.roster_selected + 1).min(total);
+        let pct = if total > 1 {
+            (app.roster_selected * 100) / (total - 1)
+        } else {
+            0
+        };
+        spans.push(Span::styled("──", dim));
+        spans.push(Span::styled(
+            format!(" ▾ {pos}/{total} · {pct}% "),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     if app.pending_dispatches > 0 {
         spans.push(Span::styled("──", dim));
         spans.push(Span::styled(
