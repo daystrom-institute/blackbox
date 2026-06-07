@@ -1151,6 +1151,7 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
     let mut terminal = custom_terminal::Terminal::with_options(backend)?;
 
     let result = (|| -> anyhow::Result<()> {
+        let mut prev_vp: Option<Rect> = None;
         loop {
             drain_tui_events(app, &signals);
             if app.quit {
@@ -1164,12 +1165,14 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
             let width = screen_w as usize;
             let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
 
+            let mut committed_now = false;
             let active_lines = if app.agents.len() == 1 {
                 let idx = 0;
                 let transcript = app.agents[idx].task.transcript();
                 let turn_active = app.agents[idx].task.snapshot().turn_active;
                 let stable_end = inline_stable_end(transcript.len(), turn_active);
-                commit_inline_history(app, &mut terminal, idx, &transcript, stable_end, width)?;
+                committed_now =
+                    commit_inline_history(app, &mut terminal, idx, &transcript, stable_end, width)?;
 
                 let queued = queued_user_turns(&mut app.agents[idx], &transcript);
                 let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
@@ -1197,7 +1200,25 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
             };
             let live_h = active_h.saturating_add(composer_h).min(screen_h).max(composer_h);
             let viewport = Rect::new(0, screen_h.saturating_sub(live_h), screen_w, live_h);
+            let vp_changed = prev_vp.is_some_and(|p| p != viewport);
+            let prev_top = prev_vp.map(|p| p.y);
+            prev_vp = Some(viewport);
             terminal.set_viewport_area(viewport);
+            if vp_changed {
+                // Viewport moved/resized: clear stale terminal rows it no longer
+                // occupies / now covers. When history was committed THIS frame,
+                // insert_history wrote it into rows above the new top, so clear
+                // only from the new top down (never wipe that history). On a pure
+                // shrink with no commit, the vacated band above the new top holds
+                // only old composer/active rows — clear from the OLD top so the
+                // stale rows (e.g. a leftover composer border) are wiped too.
+                let clear_y = if committed_now {
+                    viewport.y
+                } else {
+                    prev_top.map_or(viewport.y, |t| t.min(viewport.y))
+                };
+                terminal.clear_after_position(Position { x: 0, y: clear_y })?;
+            }
             terminal.draw(|f| {
                 let area = f.area();
                 let composer_h = composer_h.min(area.height);
@@ -1317,7 +1338,7 @@ fn commit_inline_history<B>(
     transcript: &[TranscriptItem],
     stable_end: usize,
     width: usize,
-) -> anyhow::Result<()>
+) -> anyhow::Result<bool>
 where
     B: ratatui::backend::Backend + Write,
 {
@@ -1340,11 +1361,12 @@ where
             width,
         ));
     }
-    if !lines.is_empty() {
+    let committed_now = !lines.is_empty();
+    if committed_now {
         insert_history::insert_history_lines(terminal, lines)?;
     }
     app.committed = stable_end;
-    Ok(())
+    Ok(committed_now)
 }
 
 fn standalone_intro_lines(app: &App) -> Vec<Line<'static>> {
@@ -3046,12 +3068,11 @@ fn activity_segment(
     } else if state == FleetState::Interrupted {
         format!("↻ {label} interrupted")
     } else if state == FleetState::Finished {
-        format!(
-            "✓ {label} finished{}",
-            since_compact(last_activity_ms, now_ms)
-                .map(|s| format!(" {s}"))
-                .unwrap_or_default()
-        )
+        // Show the STATIC turn duration, not a count-up since last activity.
+        match clock.last_duration_ms {
+            Some(duration) => format!("✓ {label} took {}", duration_compact(duration)),
+            None => format!("✓ {label} finished"),
+        }
     } else if let Some(duration) = clock.last_duration_ms {
         format!("✓ {label} complete took {}", duration_compact(duration))
     } else {

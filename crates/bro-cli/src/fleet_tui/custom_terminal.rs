@@ -313,8 +313,20 @@ where
 
     /// Sets the viewport area.
     pub fn set_viewport_area(&mut self, area: Rect) {
+        let changed = area != self.viewport_area;
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
+        if changed {
+            // The dynamic viewport moved/resized. Buffer::resize preserves cell
+            // content, so after a move the current/previous buffers are
+            // misaligned and the diff leaves stale symbols behind (e.g. composer
+            // residue once the input shrinks, or old active-turn rows). Reset
+            // both so the next frame fully repaints the viewport. These buffers
+            // span only the viewport area — scrollback above is never touched
+            // (unlike clearing screen rows, which would wipe committed history).
+            self.current_buffer_mut().reset();
+            self.previous_buffer_mut().reset();
+        }
         self.viewport_area = area;
         self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
