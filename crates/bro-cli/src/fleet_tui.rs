@@ -35,6 +35,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -374,6 +375,8 @@ struct App {
     cached_total_lines: usize,
     transcript_y_range: Option<(u16, u16)>,
     last_transcript_height: u16,
+    committed: usize,
+    committed_initial: bool,
 
     /// True while the /help overlay is visible. Toggled by typing `/help`+Enter
     /// or `?`; dismissed by Esc / any key.
@@ -492,6 +495,8 @@ impl App {
             cached_total_lines: 0,
             transcript_y_range: None,
             last_transcript_height: 0,
+            committed: 0,
+            committed_initial: false,
             status: None,
             status_until: None,
             quit: false,
@@ -1077,7 +1082,11 @@ pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
 }
 
 fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
-    let result = run_tui_inner(app, signals);
+    let result = if app.mode.is_standalone() {
+        run_tui_inner_inline(app, signals)
+    } else {
+        run_tui_inner(app, signals)
+    };
     if app.mode.is_standalone() {
         forget_standalone_agents(app, true);
         app.agents.clear();
@@ -1122,65 +1131,11 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
             app.reconcile_roster_selection();
             terminal.draw(|f| draw(f, app))?;
 
-            if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        handle_key(app, key);
-                        if app.quit {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+            if poll_tui_input(app)? {
+                break;
             }
 
-            while let Ok(ev) = signals.try_recv() {
-                handle_tail(app, ev);
-            }
-            // Drain classifier suggestions (collect first to avoid borrowing
-            // app.classifier_rx while mutating app for the status flash).
-            let mut notes = Vec::new();
-            while let Ok(note) = app.classifier_rx.try_recv() {
-                notes.push(note);
-            }
-            for note in notes {
-                app.ingest_classifier_note(note);
-            }
-            // Install agents whose off-thread dispatch finished this tick
-            // (collect first to avoid borrowing app.dispatch_rx while mutating).
-            let mut dispatched = Vec::new();
-            while let Ok(outcome) = app.dispatch_rx.try_recv() {
-                dispatched.push(outcome);
-            }
-            for outcome in dispatched {
-                install_dispatch(app, outcome);
-            }
-            // Swap in handles whose off-thread resume finished this tick.
-            let mut resumed = Vec::new();
-            while let Ok(outcome) = app.resume_rx.try_recv() {
-                resumed.push(outcome);
-            }
-            for outcome in resumed {
-                install_resume(app, outcome);
-            }
-            // Apply steer/interrupt results that landed this tick.
-            let mut ctrls = Vec::new();
-            while let Ok(outcome) = app.ctrl_rx.try_recv() {
-                ctrls.push(outcome);
-            }
-            for outcome in ctrls {
-                install_ctrl(app, outcome);
-            }
-            // Install the standalone (`bro agent`) agent once its start landed.
-            let mut standalones = Vec::new();
-            while let Ok(outcome) = app.standalone_rx.try_recv() {
-                standalones.push(outcome);
-            }
-            for outcome in standalones {
-                install_standalone(app, outcome);
-            }
-            app.maybe_clear_status();
-            app.activity_frame = app.activity_frame.wrapping_add(1);
+            drain_tui_events(app, &signals);
         }
         Ok(())
     })();
@@ -1188,6 +1143,223 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     result
+}
+
+fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = custom_terminal::Terminal::with_options(backend)?;
+
+    let result = (|| -> anyhow::Result<()> {
+        loop {
+            drain_tui_events(app, &signals);
+            if app.quit {
+                break;
+            }
+
+            terminal.autoresize()?;
+            let screen = terminal.last_known_screen_size;
+            let screen_w = screen.width.max(1);
+            let screen_h = screen.height.max(1);
+            let width = screen_w as usize;
+            let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
+
+            let active_lines = if app.agents.len() == 1 {
+                let idx = 0;
+                let transcript = app.agents[idx].task.transcript();
+                let turn_active = app.agents[idx].task.snapshot().turn_active;
+                let stable_end = inline_stable_end(transcript.len(), turn_active);
+                commit_inline_history(app, &mut terminal, idx, &transcript, stable_end, width)?;
+
+                let queued = queued_user_turns(&mut app.agents[idx], &transcript);
+                let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
+                render_transcript(&transcript[stable_end..], "", &queued, width)
+            } else {
+                standalone_intro_lines(app)
+            };
+
+            let active_h = if active_lines.is_empty() {
+                0
+            } else {
+                Paragraph::new(active_lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(screen_w)
+                    .min(u16::MAX as usize) as u16
+            };
+            let live_h = active_h.saturating_add(composer_h).min(screen_h).max(composer_h);
+            let viewport = Rect::new(0, screen_h.saturating_sub(live_h), screen_w, live_h);
+            terminal.set_viewport_area(viewport);
+            terminal.draw(|f| {
+                let area = f.area();
+                let composer_h = composer_h.min(area.height);
+                let transcript_h = area.height.saturating_sub(composer_h);
+                let transcript_area = Rect::new(area.x, area.y, area.width, transcript_h);
+                let composer_area = Rect::new(
+                    area.x,
+                    area.y.saturating_add(transcript_h),
+                    area.width,
+                    composer_h,
+                );
+                if transcript_area.height > 0 {
+                    let para = Paragraph::new(active_lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((active_h.saturating_sub(transcript_area.height) as u16, 0));
+                    f.render_widget_ref(para, transcript_area);
+                }
+                let views: Vec<AgentView> = app.agents.iter().map(Agent::view).collect();
+                let order: Vec<usize> = (0..views.len()).collect();
+                let top_titles = app
+                    .rename_target
+                    .is_none()
+                    .then(|| single_agent_composer_top_titles(app, &views, &order));
+                let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
+                draw_composer_inline(f, composer_area, app, top_titles, bottom_title);
+            })?;
+
+            if poll_tui_input(app)? {
+                break;
+            }
+        }
+        Ok(())
+    })();
+
+    disable_raw_mode()?;
+    write!(terminal.backend_mut(), "\r\n")?;
+    std::io::Write::flush(terminal.backend_mut())?;
+    result
+}
+
+fn poll_tui_input(app: &mut App) -> anyhow::Result<bool> {
+    if event::poll(Duration::from_millis(100))? {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                handle_key(app, key);
+                if app.quit {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
+    while let Ok(ev) = signals.try_recv() {
+        handle_tail(app, ev);
+    }
+    let mut notes = Vec::new();
+    while let Ok(note) = app.classifier_rx.try_recv() {
+        notes.push(note);
+    }
+    for note in notes {
+        app.ingest_classifier_note(note);
+    }
+    let mut dispatched = Vec::new();
+    while let Ok(outcome) = app.dispatch_rx.try_recv() {
+        dispatched.push(outcome);
+    }
+    for outcome in dispatched {
+        install_dispatch(app, outcome);
+    }
+    let mut resumed = Vec::new();
+    while let Ok(outcome) = app.resume_rx.try_recv() {
+        resumed.push(outcome);
+    }
+    for outcome in resumed {
+        install_resume(app, outcome);
+    }
+    let mut ctrls = Vec::new();
+    while let Ok(outcome) = app.ctrl_rx.try_recv() {
+        ctrls.push(outcome);
+    }
+    for outcome in ctrls {
+        install_ctrl(app, outcome);
+    }
+    let mut standalones = Vec::new();
+    while let Ok(outcome) = app.standalone_rx.try_recv() {
+        standalones.push(outcome);
+    }
+    for outcome in standalones {
+        install_standalone(app, outcome);
+        reset_inline_commit_state(app);
+    }
+    app.maybe_clear_status();
+    app.activity_frame = app.activity_frame.wrapping_add(1);
+}
+
+fn inline_stable_end(total_items: usize, turn_active: bool) -> usize {
+    if turn_active && total_items > 0 {
+        total_items - 1
+    } else {
+        total_items
+    }
+}
+
+fn reset_inline_commit_state(app: &mut App) {
+    app.committed = 0;
+    app.committed_initial = false;
+}
+
+fn commit_inline_history<B>(
+    app: &mut App,
+    terminal: &mut custom_terminal::Terminal<B>,
+    idx: usize,
+    transcript: &[TranscriptItem],
+    stable_end: usize,
+    width: usize,
+) -> anyhow::Result<()>
+where
+    B: ratatui::backend::Backend + Write,
+{
+    let mut lines = Vec::new();
+    if !app.committed_initial {
+        let initial = initial_prompt(&app.agents[idx]);
+        if !initial.is_empty() {
+            lines.extend(render_steer_with_status(
+                initial,
+                width,
+                TurnRenderStatus::Normal,
+            ));
+            lines.push(Line::from(""));
+        }
+        app.committed_initial = true;
+    }
+    if stable_end > app.committed {
+        lines.extend(render_committed_items(
+            &transcript[app.committed..stable_end],
+            width,
+        ));
+    }
+    if !lines.is_empty() {
+        insert_history::insert_history_lines(terminal, lines)?;
+    }
+    app.committed = stable_end;
+    Ok(())
+}
+
+fn standalone_intro_lines(app: &App) -> Vec<Line<'static>> {
+    let target = app
+        .mode
+        .pending_resume()
+        .map(|id| format!("resume session {id}"))
+        .unwrap_or_else(|| "start a fresh session".to_string());
+    vec![
+        Line::from(Span::styled(
+            "bro agent",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Type a prompt and press Enter to {target}.")),
+        Line::from(format!("Next: {}", next_tuple(app))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Slash commands: /config, /model, /effort, /resume <session_id> [turn], /clear",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
 }
 
 fn page_scroll_step(app: &App) -> usize {
@@ -1851,6 +2023,7 @@ fn clear_standalone(app: &mut App) {
     app.clear_input();
     app.history_cursor = None;
     app.scroll_from_bottom = 0;
+    reset_inline_commit_state(app);
     app.orch.persist();
     app.set_status(
         "cleared — next input starts a fresh session",
@@ -1867,6 +2040,7 @@ fn resume_standalone(app: &mut App, arg: &str) {
     }
     let (session_id, prompt) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
     app.mode.set_pending_resume(Some(session_id.to_string()));
+    reset_inline_commit_state(app);
     if prompt.trim().is_empty() {
         forget_standalone_agents(app, true);
         app.agents.clear();
@@ -3377,7 +3551,8 @@ mod view;
 mod dispatch;
 mod wrapping;
 mod highlight;
-#[allow(dead_code)] // wired in by the standalone inline-flow loop (incremental)
+// Vendored ratatui Terminal reimpl: legitimately exposes a fuller API (extra
+// clear/cursor/viewport methods) than the standalone inline loop consumes.
+#[allow(dead_code)]
 mod custom_terminal;
-#[allow(dead_code)] // wired in by the standalone inline-flow loop (incremental)
 mod insert_history;

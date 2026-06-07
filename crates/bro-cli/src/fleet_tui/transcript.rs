@@ -1,5 +1,10 @@
 use super::*;
 
+/// Soft caps for non-harness providers (the harness already spills oversized
+/// results, §2.3); a render-side backstop so one huge block can't dominate.
+const ARG_MAX_LINES: usize = 15;
+const RESULT_MAX_LINES: usize = 25;
+
 /// Verbose inline transcript (§5.4): render the parsed [`TranscriptItem`]s in
 /// temporal order, structure carried by markers + color rather than folding.
 pub(super) fn render_transcript(
@@ -8,11 +13,6 @@ pub(super) fn render_transcript(
     queued_turns: &[&str],
     width: usize,
 ) -> Vec<Line<'static>> {
-    /// Soft caps for non-harness providers (the harness already spills oversized
-    /// results, §2.3); a render-side backstop so one huge block can't dominate.
-    const ARG_MAX_LINES: usize = 15;
-    const RESULT_MAX_LINES: usize = 25;
-
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !initial_prompt.is_empty() {
         let status = if items.is_empty() {
@@ -31,130 +31,15 @@ pub(super) fn render_transcript(
     }
 
     for (idx, item) in items.iter().enumerate() {
-        let before = lines.len();
-        let mut compact_tool_call = false;
-        match item {
-            TranscriptItem::UserSteer(t) => {
-                lines.extend(render_steer_with_status(
-                    t,
-                    width,
-                    turn_render_status(items, idx),
-                ));
-            }
-            TranscriptItem::AssistantText(t) => lines.extend(render_markdown_with_width(t, width)),
-            TranscriptItem::Thinking(t) => {
-                for l in t.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("✻ {l}"),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                }
-            }
-            TranscriptItem::ToolCall { name, args } => {
-                if is_internal_tool(name) {
-                    continue;
-                }
-                if let Some(edit_lines) = render_file_edit_call(name, args, width) {
-                    compact_tool_call = true;
-                    lines.extend(edit_lines);
-                } else if let Some(line) = compact_tool_call_line(name, args, width) {
-                    compact_tool_call = true;
-                    lines.push(Line::from(Span::styled(line, tool_call_style())));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("{TOOL_CALL_GLYPH} {name}"),
-                        tool_call_style(),
-                    )));
-                    lines.extend(monospace_block(args, ARG_MAX_LINES, Color::DarkGray));
-                }
-            }
-            TranscriptItem::ToolResult {
-                tool,
-                content,
-                is_error,
-                rider,
-            } => {
-                if tool.as_deref().is_some_and(is_internal_tool) {
-                    continue;
-                }
-                // Errors always show. Otherwise, show the body only for
-                // change-making / opaque tools (Edit/Write/MCP) where the
-                // result matters; suppress noisy output (Bash, Read, Grep).
-                if shell_result_tool(tool.as_deref()) {
-                    lines.extend(shell_result_block(content, *is_error, RESULT_MAX_LINES));
-                } else if *is_error {
-                    lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Red));
-                } else if tool_result_suppress_ok(tool.as_deref()) {
-                    // quiet success → nothing; the diff block already shows the edit.
-                } else if tool_result_is_verbose(tool.as_deref()) {
-                    lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Gray));
-                }
-                // quiet success → nothing; the tool call line above stands alone.
-
-                // Window-0 diagnostics ALWAYS surface, distinct from the tool
-                // body — summary bold-flagged, detail lines yellow — so the
-                // operator sees what each edit produced and whether the agent
-                // then acts on it.
-                if let Some(r) = rider {
-                    let mut rl = r.lines();
-                    if let Some(summary) = rl.next() {
-                        lines.push(Line::from(Span::styled(
-                            format!("⚠ {summary}"),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        )));
-                    }
-                    for l in rl {
-                        lines.push(Line::from(Span::styled(
-                            l.to_string(),
-                            Style::default().fg(Color::Yellow),
-                        )));
-                    }
-                }
-            }
-            TranscriptItem::Report {
-                message,
-                needs_input,
-            } => {
-                let color = if *needs_input {
-                    Color::Yellow
-                } else {
-                    Color::LightYellow
-                };
-                let tag = if *needs_input { " (needs input)" } else { "" };
-                lines.push(Line::from(Span::styled(
-                    format!("◆ {message}{tag}"),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )));
-            }
-            TranscriptItem::TodoState(todo) => {
-                let text = if todo.items.is_empty() {
-                    "☑ todo cleared".to_string()
-                } else {
-                    format!("☑ todo {} / {} updated", todo.completed, todo.total)
-                };
-                lines.push(Line::from(Span::styled(
-                    text,
-                    Style::default().fg(Color::LightYellow),
-                )));
-            }
-            TranscriptItem::CompactBoundary { trigger } => {
-                lines.push(Line::from(Span::styled(
-                    format!("── compacted ({trigger}) ──"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            // The end-of-turn result footer renders nothing — its stats live
-            // under the composer.
-            TranscriptItem::TurnFooter { .. } => {}
-        }
+        let rendered = render_item(item, width, turn_render_status(items, idx));
         // Only space items that actually rendered (a suppressed quiet result
         // adds nothing — no blank line either).
-        if lines.len() > before && !compact_tool_call {
-            lines.push(Line::from(""));
+        if !rendered.is_empty() {
+            let compact_tool_call = item_is_compact_tool_call(item, width);
+            lines.extend(rendered);
+            if !compact_tool_call {
+                lines.push(Line::from(""));
+            }
         }
     }
     for queued in queued_turns {
@@ -168,6 +53,142 @@ pub(super) fn render_transcript(
         ));
     }
     lines
+}
+
+pub(super) fn render_committed_items(items: &[TranscriptItem], width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for item in items {
+        let rendered = render_item(item, width, TurnRenderStatus::Normal);
+        if !rendered.is_empty() {
+            let compact_tool_call = item_is_compact_tool_call(item, width);
+            lines.extend(rendered);
+            if !compact_tool_call {
+                lines.push(Line::from(""));
+            }
+        }
+    }
+    lines
+}
+
+pub(super) fn render_item(
+    item: &TranscriptItem,
+    width: usize,
+    status: TurnRenderStatus,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match item {
+        TranscriptItem::UserSteer(t) => lines.extend(render_steer_with_status(t, width, status)),
+        TranscriptItem::AssistantText(t) => lines.extend(render_markdown_with_width(t, width)),
+        TranscriptItem::Thinking(t) => {
+            for l in t.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("✻ {l}"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
+        }
+        TranscriptItem::ToolCall { name, args } => {
+            if is_internal_tool(name) {
+                return Vec::new();
+            }
+            if let Some(edit_lines) = render_file_edit_call(name, args, width) {
+                lines.extend(edit_lines);
+            } else if let Some(line) = compact_tool_call_line(name, args, width) {
+                lines.push(Line::from(Span::styled(line, tool_call_style())));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("{TOOL_CALL_GLYPH} {name}"),
+                    tool_call_style(),
+                )));
+                lines.extend(monospace_block(args, ARG_MAX_LINES, Color::DarkGray));
+            }
+        }
+        TranscriptItem::ToolResult {
+            tool,
+            content,
+            is_error,
+            rider,
+        } => {
+            if tool.as_deref().is_some_and(is_internal_tool) {
+                return Vec::new();
+            }
+            // Errors always show. Otherwise, show the body only for change-making
+            // / opaque tools; suppress noisy output and quiet successes.
+            if shell_result_tool(tool.as_deref()) {
+                lines.extend(shell_result_block(content, *is_error, RESULT_MAX_LINES));
+            } else if *is_error {
+                lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Red));
+            } else if !tool_result_suppress_ok(tool.as_deref())
+                && tool_result_is_verbose(tool.as_deref())
+            {
+                lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Gray));
+            }
+
+            if let Some(r) = rider {
+                let mut rl = r.lines();
+                if let Some(summary) = rl.next() {
+                    lines.push(Line::from(Span::styled(
+                        format!("⚠ {summary}"),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                }
+                for l in rl {
+                    lines.push(Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+            }
+        }
+        TranscriptItem::Report {
+            message,
+            needs_input,
+        } => {
+            let color = if *needs_input {
+                Color::Yellow
+            } else {
+                Color::LightYellow
+            };
+            let tag = if *needs_input { " (needs input)" } else { "" };
+            lines.push(Line::from(Span::styled(
+                format!("◆ {message}{tag}"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+        }
+        TranscriptItem::TodoState(todo) => {
+            let text = if todo.items.is_empty() {
+                "☑ todo cleared".to_string()
+            } else {
+                format!("☑ todo {} / {} updated", todo.completed, todo.total)
+            };
+            lines.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::LightYellow),
+            )));
+        }
+        TranscriptItem::CompactBoundary { trigger } => {
+            lines.push(Line::from(Span::styled(
+                format!("── compacted ({trigger}) ──"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        TranscriptItem::TurnFooter { .. } => {}
+    }
+    lines
+}
+
+fn item_is_compact_tool_call(item: &TranscriptItem, width: usize) -> bool {
+    match item {
+        TranscriptItem::ToolCall { name, args } if !is_internal_tool(name) => {
+            render_file_edit_call(name, args, width).is_some()
+                || compact_tool_call_line(name, args, width).is_some()
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn turn_render_status(items: &[TranscriptItem], idx: usize) -> TurnRenderStatus {

@@ -246,6 +246,29 @@ Trailing paragraph.";
     }
 
     #[test]
+    fn inline_stable_end_holds_back_only_active_last_item() {
+        assert_eq!(inline_stable_end(0, true), 0);
+        assert_eq!(inline_stable_end(1, true), 0);
+        assert_eq!(inline_stable_end(3, true), 2);
+        assert_eq!(inline_stable_end(0, false), 0);
+        assert_eq!(inline_stable_end(1, false), 1);
+        assert_eq!(inline_stable_end(3, false), 3);
+    }
+
+    #[test]
+    fn render_committed_items_uses_normal_item_rendering() {
+        let items = vec![
+            TranscriptItem::UserSteer("hello".into()),
+            TranscriptItem::AssistantText("answer".into()),
+        ];
+        let rendered: Vec<String> = render_committed_items(&items, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(rendered, vec!["▌ hello", "", "answer", ""]);
+    }
+
+    #[test]
     fn render_markdown_loose_bullet_marker_stitched_to_content() {
         // A loose list item (bullet followed by a paragraph) must not leave the
         // `-` marker orphaned on its own line.

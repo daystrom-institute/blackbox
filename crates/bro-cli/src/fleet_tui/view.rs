@@ -728,6 +728,39 @@ pub(super) fn draw_composer(
     top_titles: Option<Vec<Line<'static>>>,
     bottom_title: Option<Line<'static>>,
 ) {
+    let (block, padded) = composer_block_and_padded_area(area, app, top_titles, bottom_title);
+    f.render_widget(block, area);
+    let (buf, scroll_y) = composer_buffer_and_scroll(app, padded);
+    f.render_widget(
+        Paragraph::new(buf)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y, 0)),
+        padded,
+    );
+}
+
+pub(super) fn draw_composer_inline(
+    f: &mut custom_terminal::Frame<'_>,
+    area: Rect,
+    app: &App,
+    top_titles: Option<Vec<Line<'static>>>,
+    bottom_title: Option<Line<'static>>,
+) {
+    let (block, padded) = composer_block_and_padded_area(area, app, top_titles, bottom_title);
+    f.render_widget_ref(block, area);
+    let (buf, scroll_y) = composer_buffer_and_scroll(app, padded);
+    let para = Paragraph::new(buf)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+    f.render_widget_ref(para, padded);
+}
+
+fn composer_block_and_padded_area(
+    area: Rect,
+    app: &App,
+    top_titles: Option<Vec<Line<'static>>>,
+    bottom_title: Option<Line<'static>>,
+) -> (Block<'static>, Rect) {
     let (title, color) = if app.rename_target.is_some() {
         (" rename (Enter=save · Esc=cancel) ", Color::Magenta)
     } else {
@@ -757,25 +790,22 @@ pub(super) fn draw_composer(
         block = block.title_bottom(bottom_title);
     }
     let inner = block.inner(area);
-    f.render_widget(block, area);
     let padded = Rect {
         x: inner.x.saturating_add(1),
         y: inner.y.saturating_add(1),
         width: inner.width.saturating_sub(2).max(1),
         height: inner.height.saturating_sub(2).max(1),
     };
+    (block, padded)
+}
 
+fn composer_buffer_and_scroll(app: &App, padded: Rect) -> (String, u16) {
     let buf = composer_display_text(&app.input, app.cursor_pos);
     let lines = Paragraph::new(buf.clone())
         .wrap(Wrap { trim: false })
         .line_count(padded.width.max(1));
     let scroll_y = lines.saturating_sub(padded.height as usize) as u16;
-    f.render_widget(
-        Paragraph::new(buf)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0)),
-        padded,
-    );
+    (buf, scroll_y)
 }
 
 /// Return a `Rect` centered in `r` with the given width and height.
