@@ -1308,6 +1308,16 @@ fn run_inline_view<B>(
 where
     B: ratatui::backend::Backend + Write,
 {
+    // Screen size the visible transcript was last laid out at. Committed lines
+    // are wrapped at commit-time width and live in the terminal's own scrollback,
+    // which we no longer repaint (the terminal owns it). A width change needs a
+    // rewrap; a height change shifts what the terminal keeps visible and the
+    // per-row clear math can't reliably patch it. Rather than chase each case, on
+    // ANY size change the loop re-flows the whole transcript from a clean purge
+    // (see below) — bulletproof across window/device/aspect switches. `None`
+    // until the first layout.
+    let mut commit_size: Option<(u16, u16)> = None;
+
     // Cockpit entry: hard-purge the screen + scrollback and re-flow the focused
     // agent from the top, so a previous zoom's agent history never interleaves
     // with this one in the real scrollback. The standalone view skips this (it
@@ -1332,6 +1342,7 @@ where
             // tail) keeps insert_history strictly above it.
             let seed = inline_seed_viewport(app, s.width, s.height);
             terminal.set_viewport_area(seed);
+            commit_size = Some((s.width, s.height));
         }
     }
 
@@ -1350,6 +1361,29 @@ where
         let screen_w = screen.width.max(1);
         let screen_h = screen.height.max(1);
         let width = screen_w as usize;
+
+        // Resize reflow. Committed lines were laid out at the old size and already
+        // handed to the terminal's scrollback, so they can't be patched in place.
+        // On ANY size change, purge screen + scrollback, reset the commit cursor,
+        // and let the loop re-flow the whole transcript at the new size —
+        // scrollback is rebuilt correctly and stays natively scrollable, with no
+        // residue from the old layout. Costs one full re-emit per resize, which is
+        // fine for the discrete window/device/aspect switches this targets.
+        if let Some(prev) = commit_size
+            && prev != (screen_w, screen_h)
+        {
+            if let Some(idx) = inline_focus_idx(app) {
+                app.inline_commits.remove(&app.agents[idx].task.id());
+            } else {
+                app.inline_commits.clear();
+            }
+            let seed = inline_seed_viewport(app, screen_w, screen_h);
+            terminal.set_viewport_area(seed);
+            terminal.clear_scrollback_and_visible_screen_ansi()?;
+            prev_vp = None;
+        }
+        commit_size = Some((screen_w, screen_h));
+
         let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
 
         let focus = inline_focus_idx(app);
