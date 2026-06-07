@@ -1725,8 +1725,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let editing = !app.input.is_empty();
 
     match key.code {
-        // `?` toggles the help overlay (when not typing).
-        KeyCode::Char('?') if app.input.is_empty() => {
+        // `?` toggles the help overlay (when not typing). Not in the single-agent
+        // view: it's the inline-flow surface (no full-screen frame to host the
+        // overlay), so `?` there is a normal composer character — toggling an
+        // unrenderable overlay would just eat the next keystroke dismissing it.
+        KeyCode::Char('?') if app.input.is_empty() && app.zone != Zone::SingleAgent => {
             app.help_visible = !app.help_visible;
         }
         // Esc cancels a pending rename, else interrupts the running turn in the
@@ -1736,6 +1739,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.clear_input();
         }
         KeyCode::Esc if app.zone == Zone::SingleAgent => interrupt_selected(app),
+        // In the provider/model/effort selectors, Esc cancels the drill-down back
+        // to the roster (a habitual Esc shouldn't nuke the whole cockpit). Esc
+        // still quits from the roster home below.
+        KeyCode::Esc
+            if matches!(
+                app.zone,
+                Zone::ProviderSelector | Zone::ModelSelector | Zone::EffortSelector
+            ) =>
+        {
+            app.zone = Zone::Roster;
+        }
         KeyCode::Esc => app.quit = true,
 
         // Slash menu owns ↑/↓ while it's up.

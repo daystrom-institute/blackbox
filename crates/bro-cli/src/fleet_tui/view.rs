@@ -153,20 +153,22 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
     let shortcut_lines: Vec<Line<'static>> = match app.zone {
         Zone::Roster => vec![
             Line::from("  ↑/↓           navigate agents"),
+            Line::from("  PgUp/PgDn     page agents (half-page)"),
+            Line::from("  Home/End      first / last agent"),
             Line::from("  →             open agent (zoom in)"),
             Line::from("  ←             provider selector"),
             Line::from("  @project Tab  dispatch from project alias"),
             Line::from("  Ctrl+R        rename agent"),
             Line::from("  Ctrl+X        stop / delete agent"),
-            Line::from("  Ctrl+Q        quit"),
+            Line::from("  Ctrl+Q / Esc  quit"),
         ],
         Zone::SingleAgent => vec![
             Line::from("  ←             back to roster"),
             Line::from("  Esc           interrupt running turn"),
             Line::from("  Ctrl+X        stop / delete agent"),
             Line::from("  ↑/↓           recall input history"),
-            Line::from("  PgUp/PgDn     scroll transcript"),
-            Line::from("  mouse drag    select/copy transcript or composer text"),
+            Line::from("  scroll        native — tmux / mouse / trackpad"),
+            Line::from("  mouse drag    select / copy transcript text"),
             Line::from("  Ctrl+Q        quit"),
         ],
         Zone::Config => vec![
@@ -195,7 +197,16 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
         ],
     };
     let h = (shortcut_lines.len() as u16 + 2).min(f.area().height);
-    let w = 42u16.min(f.area().width);
+    // Auto-fit width to the longest shortcut line (and the title), so no row is
+    // truncated regardless of zone. +4 = borders + trailing breathing room.
+    let title = " shortcuts — Esc to dismiss ";
+    let content_w = shortcut_lines
+        .iter()
+        .map(ratatui::text::Line::width)
+        .max()
+        .unwrap_or(40)
+        .max(title.chars().count());
+    let w = (content_w as u16 + 4).min(f.area().width);
     let area = centered_rect(w, h, f.area());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -470,7 +481,9 @@ pub(super) fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
         };
         lines.push(Line::from(vec![
             Span::raw(marker),
-            Span::styled(format!("{:<8}", p.as_str()), style),
+            // Pad to 9: the longest provider name ("deepseek") is 8 chars, so a
+            // <8 field leaves no gap before the model. 9 guarantees ≥1 space.
+            Span::styled(format!("{:<9}", p.as_str()), style),
             Span::styled(truncate(model, 18), Style::default().fg(Color::Gray)),
             Span::styled(" ", Style::default().fg(Color::DarkGray)),
             Span::styled(
