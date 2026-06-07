@@ -179,6 +179,19 @@ struct ExitWorktreeInput {
     /// Required for publish and discard.
     #[serde(default)]
     confirm: bool,
+    /// Target branch to close out into. Defaults to "main". Affects the
+    /// base-ready check, the `origin/<target>` fetch/merge, the worktree
+    /// rebase, the local ff-merge, the push, the ahead-of-target count, the
+    /// preflight base gate, and the preflight plan text. Detached HEAD on
+    /// the worktree always refuses.
+    #[serde(default)]
+    target: Option<String>,
+    /// Branch-name prefixes allowed for the worktree branch. The worktree
+    /// must be on a branch whose name starts with one of these prefixes.
+    /// Defaults to `["bro-fleet/"]`. Detached HEAD always refuses, and an
+    /// empty list is rejected.
+    #[serde(default)]
+    allow_branch_prefixes: Option<Vec<String>>,
 }
 
 pub struct ExitWorktree;
@@ -190,7 +203,7 @@ impl Tool for ExitWorktree {
     }
 
     fn description(&self) -> &str {
-        "Finish a managed fleet worktree. disposition=keep reports status only. disposition=preflight reports the exact closeout readiness without mutating. disposition=discard removes a clean/confirmed managed worktree. disposition=publish commits selected changes, fetches/rebases onto origin/main, fast-forwards main, pushes main, and removes the worktree. disposition=merge/adopt folds down an already-committed clean worktree branch, pushes main, and removes the worktree. Mutating dispositions require confirm=true."
+        "Finish a managed fleet worktree. disposition=keep reports status only. disposition=preflight reports the exact closeout readiness without mutating. disposition=discard removes a clean/confirmed managed worktree. disposition=publish commits selected changes, fetches/rebases onto origin/<target> (default main), fast-forwards <target>, pushes <target>, and removes the worktree. disposition=merge/adopt folds down an already-committed clean worktree branch, pushes <target>, and removes the worktree. Mutating dispositions require confirm=true. The `target` parameter (default \"main\") selects the branch to close out into; `allow_branch_prefixes` (default [\"bro-fleet/\"]) selects which worktree-branch prefixes are eligible. Detached HEAD always refuses."
     }
 
     fn input_schema(&self) -> Value {
@@ -330,8 +343,36 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
     ensure_managed_worktree(&worktree)?;
     let base_repo = fleet_base_repo(cx_root)?;
     let branch = git_capture(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if !branch.starts_with("bro-fleet/") {
-        anyhow::bail!("refusing to exit non-fleet branch {branch}");
+    let target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("main")
+        .to_string();
+    let allowed_prefixes: Vec<String> = args
+        .allow_branch_prefixes
+        .clone()
+        .unwrap_or_else(|| vec!["bro-fleet/".to_string()])
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if allowed_prefixes.is_empty() {
+        anyhow::bail!("allow_branch_prefixes must contain at least one non-empty prefix");
+    }
+    // Detached HEAD: `git rev-parse --abbrev-ref HEAD` returns the literal
+    // string "HEAD". Detached HEAD must always refuse, even if "HEAD" is
+    // listed in allow_branch_prefixes, because the worktree's branch is
+    // not actually anchored.
+    if branch == "HEAD" {
+        anyhow::bail!("refusing to exit worktree in detached HEAD state");
+    }
+    if !allowed_prefixes.iter().any(|p| branch.starts_with(p.as_str())) {
+        anyhow::bail!(
+            "refusing to exit branch {branch}: not under any allowed branch prefix ({})",
+            allowed_prefixes.join(", ")
+        );
     }
     let disposition = args.disposition.as_deref().unwrap_or("keep");
     let status = git_capture(&worktree, &["status", "--short", "--branch"]).unwrap_or_default();
@@ -341,9 +382,17 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             "disposition": "keep",
             "worktree": worktree,
             "branch": branch,
+            "target": target,
             "status": status,
         })),
-        "preflight" => publish_preflight(&base_repo, &worktree, &branch, &status, &args.paths),
+        "preflight" => publish_preflight(
+            &base_repo,
+            &worktree,
+            &branch,
+            &status,
+            &args.paths,
+            &target,
+        ),
         "discard" => {
             if !args.confirm {
                 anyhow::bail!("discard requires confirm=true");
@@ -353,7 +402,12 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
                 &["worktree", "remove", "--force", path_str(&worktree)?],
             )?;
             let _ = git_run(&base_repo, &["branch", "-D", &branch]);
-            Ok(json!({"ok": true, "disposition": "discard", "branch": branch}))
+            Ok(json!({
+                "ok": true,
+                "disposition": "discard",
+                "branch": branch,
+                "target": target,
+            }))
         }
         "publish" => {
             if !args.confirm {
@@ -364,13 +418,13 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
                 // A clean worktree whose branch already carries commits is the
                 // commit-then-close-out path: publish has nothing to stage, but
                 // the work is not lost — adopt folds the existing branch commits
-                // into main. Signpost it rather than dead-ending the agent.
-                let ahead = branch_ahead_count(&base_repo, &branch).unwrap_or(0);
+                // into <target>. Signpost it rather than dead-ending the agent.
+                let ahead = branch_ahead_count(&base_repo, &branch, &target).unwrap_or(0);
                 if ahead > 0 {
                     anyhow::bail!(
                         "publish found no uncommitted changes, but branch {branch} is already \
-                         {ahead} commit(s) ahead of main; use disposition=adopt (or merge) to fold \
-                         the committed branch into main and close out the worktree"
+                         {ahead} commit(s) ahead of {target}; use disposition=adopt (or merge) to fold \
+                         the committed branch into {target} and close out the worktree"
                     );
                 }
                 anyhow::bail!("publish found no changed paths to commit");
@@ -380,9 +434,9 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
                 .as_deref()
                 .filter(|m| !m.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("publish requires commit_message"))?;
-            ensure_base_ready_for_publish(&base_repo)?;
-            git_run(&base_repo, &["fetch", "origin", "main"])?;
-            git_run(&base_repo, &["merge", "--ff-only", "origin/main"])?;
+            ensure_base_ready_for_publish(&base_repo, &target)?;
+            git_run(&base_repo, &["fetch", "origin", &target])?;
+            git_run(&base_repo, &["merge", "--ff-only", &format!("origin/{target}")])?;
             let paths = if args.paths.is_empty() {
                 changed
             } else {
@@ -403,9 +457,9 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
                     "publish left uncommitted changes in the worktree; refusing to remove it"
                 );
             }
-            git_run(&worktree, &["rebase", "main"])?;
+            git_run(&worktree, &["rebase", &target])?;
             git_run(&base_repo, &["merge", "--ff-only", &branch])?;
-            git_run(&base_repo, &["push", "origin", "main"])?;
+            git_run(&base_repo, &["push", "origin", &target])?;
             let head = git_capture(&base_repo, &["rev-parse", "--short=12", "HEAD"])?;
             git_run(&base_repo, &["worktree", "remove", path_str(&worktree)?])?;
             let _ = git_run(&base_repo, &["branch", "-D", &branch]);
@@ -414,12 +468,18 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
                 "disposition": "publish",
                 "published_head": head,
                 "branch": branch,
+                "target": target,
                 "removed_worktree": worktree,
             }))
         }
-        "merge" | "adopt" => {
-            merge_committed_worktree(&base_repo, &worktree, &branch, disposition, args.confirm)
-        }
+        "merge" | "adopt" => merge_committed_worktree(
+            &base_repo,
+            &worktree,
+            &branch,
+            disposition,
+            args.confirm,
+            &target,
+        ),
         other => {
             anyhow::bail!(
                 "disposition must be keep, preflight, discard, publish, merge, or adopt; got {other}"
@@ -434,6 +494,7 @@ fn merge_committed_worktree(
     branch: &str,
     disposition: &str,
     confirm: bool,
+    target: &str,
 ) -> anyhow::Result<Value> {
     if !confirm {
         anyhow::bail!("{disposition} requires confirm=true");
@@ -445,16 +506,16 @@ fn merge_committed_worktree(
             changed.join(", ")
         );
     }
-    ensure_base_ready_for_publish(base_repo)?;
-    git_run(base_repo, &["fetch", "origin", "main"])?;
-    git_run(base_repo, &["merge", "--ff-only", "origin/main"])?;
-    git_run(worktree, &["rebase", "main"])?;
-    let branch_commits = branch_ahead_count(base_repo, branch)?;
+    ensure_base_ready_for_publish(base_repo, target)?;
+    git_run(base_repo, &["fetch", "origin", target])?;
+    git_run(base_repo, &["merge", "--ff-only", &format!("origin/{target}")])?;
+    git_run(worktree, &["rebase", target])?;
+    let branch_commits = branch_ahead_count(base_repo, branch, target)?;
     if branch_commits == 0 {
-        anyhow::bail!("{disposition} found no branch commits to merge into main");
+        anyhow::bail!("{disposition} found no branch commits to merge into {target}");
     }
     git_run(base_repo, &["merge", "--ff-only", branch])?;
-    git_run(base_repo, &["push", "origin", "main"])?;
+    git_run(base_repo, &["push", "origin", target])?;
     let head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"])?;
     git_run(base_repo, &["worktree", "remove", path_str(worktree)?])?;
     let _ = git_run(base_repo, &["branch", "-D", branch]);
@@ -463,6 +524,7 @@ fn merge_committed_worktree(
         "disposition": disposition,
         "published_head": head,
         "branch": branch,
+        "target": target,
         "merged_commits": branch_commits,
         "removed_worktree": worktree,
     }))
@@ -474,6 +536,7 @@ fn publish_preflight(
     branch: &str,
     status: &str,
     requested_paths: &[String],
+    target: &str,
 ) -> anyhow::Result<Value> {
     let changed = changed_paths(worktree)?;
     let selected_paths = if requested_paths.is_empty() {
@@ -490,19 +553,19 @@ fn publish_preflight(
         .unwrap_or_else(|e| format!("unavailable: {e}"));
     let base_dirty = git_capture(base_repo, &["status", "--porcelain=v1"])
         .unwrap_or_else(|e| format!("unavailable: {e}"));
-    let base_ready = base_branch.trim() == "main" && base_dirty.trim().is_empty();
-    let branch_commits = branch_ahead_count(base_repo, branch).ok();
+    let base_ready = base_branch.trim() == target && base_dirty.trim().is_empty();
+    let branch_commits = branch_ahead_count(base_repo, branch, target).ok();
     let merge_ready = base_ready && changed.is_empty() && branch_commits.unwrap_or(0) > 0;
     let publish_ready = base_ready && unsafe_paths.is_empty() && !changed.is_empty();
-    let origin_main = git_capture(
+    let origin_target = git_capture(
         base_repo,
-        &["rev-parse", "--verify", "--short=12", "origin/main"],
+        &["rev-parse", "--verify", "--short=12", &format!("origin/{target}")],
     )
     .ok();
-    let main_head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"]).ok();
-    let main_vs_origin = git_capture(
+    let target_head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"]).ok();
+    let target_vs_origin = git_capture(
         base_repo,
-        &["rev-list", "--left-right", "--count", "HEAD...origin/main"],
+        &["rev-list", "--left-right", "--count", &format!("HEAD...origin/{target}")],
     )
     .ok();
 
@@ -511,6 +574,7 @@ fn publish_preflight(
         "disposition": "preflight",
         "worktree": worktree,
         "branch": branch,
+        "target": target,
         "worktree_status": status,
         "changed_paths": changed,
         "selected_paths": selected_paths,
@@ -522,31 +586,31 @@ fn publish_preflight(
         "base_branch": base_branch,
         "base_dirty": base_dirty,
         "base_ready": base_ready,
-        "main_head": main_head,
-        "origin_main_head": origin_main,
-        "main_vs_origin": main_vs_origin,
+        "main_head": target_head,
+        "origin_main_head": origin_target,
+        "main_vs_origin": target_vs_origin,
         "publish_plan": [
             "require confirm=true",
-            "ensure base repo is clean and on main",
-            "git fetch origin main",
-            "git merge --ff-only origin/main in base repo",
+            &format!("ensure base repo is clean and on {target}"),
+            &format!("git fetch origin {target}"),
+            &format!("git merge --ff-only origin/{target} in base repo"),
             "git add -- selected paths in managed worktree",
             "git commit in managed worktree",
-            "git rebase main in managed worktree",
-            "git merge --ff-only branch into main",
-            "git push origin main",
-            "git worktree remove and delete bro-fleet branch"
+            &format!("git rebase {target} in managed worktree"),
+            &format!("git merge --ff-only branch into {target}"),
+            &format!("git push origin {target}"),
+            "git worktree remove and delete the worktree branch"
         ],
         "merge_plan": [
             "require confirm=true",
             "require clean managed worktree",
-            "ensure base repo is clean and on main",
-            "git fetch origin main",
-            "git merge --ff-only origin/main in base repo",
-            "git rebase main in managed worktree",
-            "git merge --ff-only branch into main",
-            "git push origin main",
-            "git worktree remove and delete bro-fleet branch"
+            &format!("ensure base repo is clean and on {target}"),
+            &format!("git fetch origin {target}"),
+            &format!("git merge --ff-only origin/{target} in base repo"),
+            &format!("git rebase {target} in managed worktree"),
+            &format!("git merge --ff-only branch into {target}"),
+            &format!("git push origin {target}"),
+            "git worktree remove and delete the worktree branch"
         ],
     }))
 }
@@ -593,10 +657,10 @@ fn ensure_managed_worktree(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_base_ready_for_publish(base_repo: &Path) -> anyhow::Result<()> {
+fn ensure_base_ready_for_publish(base_repo: &Path, target: &str) -> anyhow::Result<()> {
     let branch = git_capture(base_repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-    if branch.trim() != "main" {
-        anyhow::bail!("publish requires base repository to be on main; currently {branch}");
+    if branch.trim() != target {
+        anyhow::bail!("publish requires base repository to be on {target}; currently {branch}");
     }
     let dirty = git_capture(base_repo, &["status", "--porcelain=v1"])?;
     if !dirty.trim().is_empty() {
@@ -615,10 +679,10 @@ fn changed_paths(repo: &Path) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-fn branch_ahead_count(base_repo: &Path, branch: &str) -> anyhow::Result<usize> {
+fn branch_ahead_count(base_repo: &Path, branch: &str, target: &str) -> anyhow::Result<usize> {
     let raw = git_capture(
         base_repo,
-        &["rev-list", "--count", &format!("main..{branch}")],
+        &["rev-list", "--count", &format!("{target}..{branch}")],
     )?;
     Ok(raw.trim().parse()?)
 }
@@ -1053,6 +1117,223 @@ mod tests {
         // Refusal must not mutate: the worktree is still on disk.
         assert!(cwd.exists());
 
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_merge_with_custom_target_folds_into_non_main_branch() {
+        // target=develop: base repo is on develop, the closeout folds the
+        // worktree's bro-fleet branch into develop, pushes origin/develop,
+        // and leaves origin/main untouched.
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        run_git(repo.path(), &["branch", "develop"]);
+        run_git(repo.path(), &["push", "-u", "origin", "develop"]);
+        // Base repo must be on the requested target for ensure_base_ready_for_publish.
+        run_git(repo.path(), &["checkout", "develop"]);
+
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        let branch = value["branch"].as_str().unwrap().to_string();
+        std::fs::write(cwd.join("README.md"), "base\ncommitted\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "merge",
+                    "confirm": true,
+                    "target": "develop"
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let report: Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(report["disposition"], "merge");
+        assert_eq!(report["target"], "develop");
+        assert_eq!(report["merged_commits"], 1);
+        assert!(!cwd.exists());
+        // The work landed on develop locally and remotely; main is untouched.
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+            "base\ncommitted\n"
+        );
+        let develop_head = git_capture(repo.path(), &["rev-parse", "develop"]).unwrap();
+        let origin_develop_head = git_capture(origin.path(), &["rev-parse", "develop"]).unwrap();
+        assert_eq!(develop_head, origin_develop_head);
+        let main_head = git_capture(repo.path(), &["rev-parse", "main"]).unwrap();
+        let origin_main_head = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
+        assert_eq!(main_head, origin_main_head);
+        assert!(!git_ok(repo.path(), &["rev-parse", "--verify", &branch]));
+
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_preflight_with_custom_target_uses_target_in_plan_and_ahead_count() {
+        // The preflight key names (branch_commits_ahead_main, main_head,
+        // origin_main_head, main_vs_origin) are preserved for back-compat,
+        // but their values must be computed against <target> when one is
+        // supplied.
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        run_git(repo.path(), &["branch", "develop"]);
+        run_git(repo.path(), &["push", "-u", "origin", "develop"]);
+        run_git(repo.path(), &["checkout", "develop"]);
+
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        std::fs::write(cwd.join("README.md"), "base\ncommitted\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "preflight",
+                    "target": "develop"
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let report: Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(report["disposition"], "preflight");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["target"], "develop");
+        assert_eq!(report["merge_ready"], true);
+        // Back-compat key names; values are computed against <target>.
+        assert_eq!(report["branch_commits_ahead_main"], 1);
+        // Plan strings reflect the target, not literal "main".
+        let publish_plan = report["publish_plan"].as_array().unwrap();
+        let publish_plan_strs: Vec<&str> =
+            publish_plan.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            publish_plan_strs.iter().any(|s| s.contains("on develop")),
+            "publish_plan should reference the develop target; got: {publish_plan_strs:?}"
+        );
+        assert!(
+            !publish_plan_strs
+                .iter()
+                .any(|s| s == &"ensure base repo is clean and on main"
+                    || s == &"git fetch origin main"
+                    || s == &"git push origin main"
+                    || s == &"git rebase main in managed worktree"
+                    || s == &"git merge --ff-only branch into main"
+                    || s == &"git merge --ff-only origin/main in base repo"),
+            "publish_plan should not contain literal main lines; got: {publish_plan_strs:?}"
+        );
+        let merge_plan = report["merge_plan"].as_array().unwrap();
+        let merge_plan_strs: Vec<&str> =
+            merge_plan.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            merge_plan_strs.iter().any(|s| s.contains("on develop")),
+            "merge_plan should reference the develop target; got: {merge_plan_strs:?}"
+        );
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_refuses_to_exit_non_allowed_branch_prefix() {
+        // The bro-fleet/ default is the safety rail; loosening it via
+        // allow_branch_prefixes is opt-in, and detached HEAD (which yields
+        // the literal string "HEAD" from rev-parse --abbrev-ref) must
+        // always refuse.
+        let repo = seed_repo();
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        let worktree_branch = value["branch"].as_str().unwrap().to_string();
+
+        // Manually create a non-bro-fleet branch in the worktree to test the
+        // explicit-prefixes path.
+        run_git(&cwd, &["checkout", "-b", "feature/test-exit"]);
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "keep"
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(is_error, "default guard must reject non-bro-fleet branches");
+        assert!(
+            content.contains("not under any allowed branch prefix"),
+            "expected guard message; got: {content}"
+        );
+
+        // With allow_branch_prefixes set, the same branch is accepted for keep.
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "keep",
+                    "allow_branch_prefixes": ["bro-fleet/", "feature/"]
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let report: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(report["disposition"], "keep");
+        assert_eq!(report["branch"], "feature/test-exit");
+
+        // Detached HEAD: the literal "HEAD" string never matches any prefix.
+        run_git(&cwd, &["checkout", "--detach"]);
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "keep",
+                    "allow_branch_prefixes": ["bro-fleet/", "feature/", "HEAD"]
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(is_error, "detached HEAD must remain fail-closed");
+        assert!(
+            content.contains("detached HEAD"),
+            "expected detached-HEAD refusal; got: {content}"
+        );
+
+        // Cleanup: restore the original worktree branch so the test repo
+        // can be torn down without an in-use branch warning.
+        let _ = run_git(&cwd, &["checkout", &worktree_branch]);
         run_git(
             repo.path(),
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
