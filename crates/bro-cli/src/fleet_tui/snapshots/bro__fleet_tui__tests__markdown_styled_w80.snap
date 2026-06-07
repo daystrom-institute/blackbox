@@ -1,0 +1,27 @@
+---
+source: crates/bro-cli/src/fleet_tui/tests.rs
+expression: dump_lines(&lines)
+---
+[b,u]Heading One[/]
+
+Some [b]bold[/] and [i]italic[/] and [White]inline code[/] prose that runs on a bit so it has a chance to wrap at narrower widths.
+
+- first bullet
+- second bullet with a link ([Blue,u]https://example.com/some/long/path[/])
+
+[LightBlue]1. [/]ordered one
+[LightBlue]2. [/]ordered two
+[DarkGray]▌ [/]a blockquote line spanning two lines
+[DarkGray]┌───────┬───────┬───────┐[/]
+[DarkGray]│[/][White,b] Col A [/][DarkGray]│[/][White,b] Col B [/][DarkGray]│[/][White,b] Count [/][DarkGray]│[/]
+[DarkGray]├───────┼───────┼───────┤[/]
+[DarkGray]│[/][Gray] alpha [/][DarkGray]│[/][Gray] beta  [/][DarkGray]│[/][Gray] 3     [/][DarkGray]│[/]
+[DarkGray]│[/][Gray] gamma [/][DarkGray]│[/][Gray] delta [/][DarkGray]│[/][Gray] 12    [/][DarkGray]│[/]
+[DarkGray]└───────┴───────┴───────┘[/]
+[DarkGray]┌─ rust[/]
+[DarkGray]│ [/][Gray]fn main() {[/]
+[DarkGray]│ [/][Gray]    println!("hello");[/]
+[DarkGray]│ [/][Gray]}[/]
+[DarkGray]└─[/]
+[DarkGray]────────────────────────────────────────────────[/]
+Trailing paragraph.

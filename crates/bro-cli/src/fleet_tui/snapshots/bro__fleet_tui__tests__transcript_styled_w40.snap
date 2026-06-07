@@ -1,0 +1,23 @@
+---
+source: crates/bro-cli/src/fleet_tui/tests.rs
+expression: dump_lines(&lines)
+---
+[LightBlue,b]▌ [/]initial prompt
+
+Here is a plan with [b]emphasis[/] and a [White]code[/] token.
+
+[DarkGray,i]✻ considering the edge cases[/]
+[DarkGray,i]✻ and the wrapping[/]
+
+[Rgb(118, 150, 124)]▸ file_edit(src/lib.rs)[/]
+[Red]- let x = 1;[/]
+[Green]+ let x = 2;[/]
+[Rgb(118, 150, 124)]▸ shell_run(cmd: "cargo test")[/]
+[Red]    error[E0001]: something broke[/]
+[Red]      --> src/lib.rs:1[/]
+
+Done. See the docs ([Blue,u]https://example.com/docs[/]) for details.
+
+
+[LightBlue,b]▌ [/]a queued turn
+[LightBlue,b]▌ [/][DarkGray]queued to stdin; waiting for harness echo[/]

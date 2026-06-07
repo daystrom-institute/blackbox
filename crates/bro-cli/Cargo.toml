@@ -37,3 +37,10 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Render snapshot harness (Phase 0 safety net for the fleet_tui split).
+# insta captures rendered output as reviewable golden snapshots. We render
+# headlessly into a cell grid (codex's VT100Backend technique) using ratatui's
+# built-in TestBackend rather than vt100, because vt100 0.16 requires
+# unicode-width ^0.2.1 and the workspace lock pins 0.2.0 — TestBackend gives the
+# same grid snapshot with no extra transitive deps.
+insta = "1.46"
