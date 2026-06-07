@@ -26,6 +26,9 @@ pub use fleet::{
     TodoItem, TodoItemStatus, TodoState, TranscriptItem, intern_rider, parse_transcript,
     provider_supports_bidi,
 };
+pub use bro_protocol::{
+    CloseoutErrorClass, CloseoutOutcome, CloseoutPhase, CloseoutRequest, PhaseResult,
+};
 pub use mcp::McpServerConfig;
 pub use tail::TailEvent;
 

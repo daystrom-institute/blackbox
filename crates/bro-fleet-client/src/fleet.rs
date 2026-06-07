@@ -26,9 +26,7 @@ use crate::task::{Task, TaskInner, TaskStore, format_elapsed, now_ms};
 // is the wire `bro_protocol::TaskStatus` directly — there is no daemon-internal
 // enum on the client side.
 pub use bro_core::Provider;
-pub use bro_protocol::{
-    DispatchSpec, ResumeSpec, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptItem,
-};
+pub use bro_protocol::{CloseoutOutcome, CloseoutRequest, DispatchSpec, ResumeSpec, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 
 /// TUI-local fleet config — `fleet.json` beside the selected blackbox
 /// `config.toml` but read entirely daemon-free. Deliberately
@@ -853,6 +851,27 @@ impl DaemonFleetClient {
         parse_tool_result_json(outer)
     }
 
+    /// POST raw JSON to a `/control/*` endpoint that returns the wire DTO
+    /// directly (no tool-result envelope). The Phase 3a `/control/closeout`
+    /// handler returns the structured `CloseoutOutcome` as `axum::Json` —
+    /// distinct from `/control/exec` and friends, which return
+    /// `CallToolResult` envelopes that `post_json` unwraps. Guard/validation
+    /// failures still come back as non-2xx with a plain `{"error": "..."}`
+    /// body (the handler uses `axum::response::IntoResponse`); those are
+    /// surfaced as `Err` from `error_for_status`, so the caller can match
+    /// the daemon's structured outcome on `Ok` and treat HTTP failures
+    /// uniformly.
+    async fn post_json_value(&self, path: &str, body: Value) -> anyhow::Result<Value> {
+        let resp = self
+            .http
+            .post(self.endpoint(path))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
     async fn get_json(&self, path: &str) -> anyhow::Result<Value> {
         let outer: Value = self
             .http
@@ -877,6 +896,18 @@ impl DaemonFleetClient {
         let value = block_on_fleet_http(self.post_json("/control/resume", body))
             .unwrap_or_else(|err| json!({ "error": err.to_string() }));
         self.handle_from_response(value, spec.provider, spec.cwd, spec.name, tail_tx)
+    }
+
+    /// Drive `/control/closeout` for a focused fleet agent. The endpoint
+    /// returns the structured `CloseoutOutcome` directly (no transcript
+    /// parsing — design/fleet-tui/closeout-command.md §4.3). Used by the
+    /// cockpit `/closeout <disposition> [--dry-run]` command (Phase 3b).
+    fn closeout(&self, req: &CloseoutRequest) -> anyhow::Result<CloseoutOutcome> {
+        let value: Value = block_on_fleet_http(self.post_json_value(
+            "/control/closeout",
+            serde_json::to_value(req)?,
+        ))?;
+        Ok(serde_json::from_value(value)?)
     }
 
     fn handle_from_response(
@@ -1338,6 +1369,16 @@ impl FleetOrchestrator {
             .write()
             .insert(handle.id(), handle.task.clone());
         handle
+    }
+
+    /// Drive `/control/closeout` for a focused fleet agent. The daemon returns
+    /// the structured `CloseoutOutcome` directly (no transcript parsing —
+    /// design/fleet-tui/closeout-command.md §4.3). Used by the cockpit
+    /// `/closeout <disposition> [--dry-run]` command (Phase 3b). The
+    /// orchestrator doesn't manage any new task state here: closeout is a
+    /// single-fire HTTP call, not a registered agent.
+    pub fn closeout(&self, req: &CloseoutRequest) -> anyhow::Result<CloseoutOutcome> {
+        self.daemon.closeout(req)
     }
 
     /// Drop a task from the store (used after a resume supersedes the old

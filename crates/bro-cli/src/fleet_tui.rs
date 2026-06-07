@@ -64,6 +64,7 @@ use view::*;
 use dispatch::*;
 use wrapping::*;
 use highlight::*;
+use closeout::*;
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
@@ -429,6 +430,14 @@ struct App {
     standalone_tx: mpsc::Sender<StandaloneOutcome>,
     /// Drained each tick: installs the single standalone agent.
     standalone_rx: mpsc::Receiver<StandaloneOutcome>,
+    /// Cloned into the off-thread `/closeout` worker; the worker POSTs
+    /// `/control/closeout` and reports the structured `CloseoutOutcome` (or
+    /// transport error) back here so the render loop never blocks on the
+    /// phased git steps. Drains in `drain_tui_events` → `install_closeout`
+    /// (§4.1, §4.3 of design/fleet-tui/closeout-command.md).
+    closeout_tx: mpsc::Sender<CloseoutMsg>,
+    /// Drained each tick: surfaces a closeout result as a status flash.
+    closeout_rx: mpsc::Receiver<CloseoutMsg>,
     /// Local clocks for the focused executor/classifier activity strip.
     activity_clocks: HashMap<String, ActivityClock>,
     activity_frame: usize,
@@ -469,6 +478,7 @@ impl App {
         let (resume_tx, resume_rx) = mpsc::channel();
         let (ctrl_tx, ctrl_rx) = mpsc::channel();
         let (standalone_tx, standalone_rx) = mpsc::channel();
+        let (closeout_tx, closeout_rx) = mpsc::channel();
         let default_provider = DEFAULT_FLEET_PROVIDER;
         let provider_cursor = default_fleet_provider_cursor();
         let model_cursor = default_provider
@@ -531,6 +541,8 @@ impl App {
             ctrl_rx,
             standalone_tx,
             standalone_rx,
+            closeout_tx,
+            closeout_rx,
             activity_clocks: HashMap::new(),
             activity_frame: 0,
         }
@@ -873,6 +885,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
                 desc: "open an existing provider session id",
             },
             SlashCmd {
+                name: "/closeout",
+                desc: "fold the focused worktree back to the target branch",
+            },
+            SlashCmd {
                 name: "/help",
                 desc: "show keyboard shortcuts",
             },
@@ -897,6 +913,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
             SlashCmd {
                 name: "/rename",
                 desc: "rename this agent (TUI-local)",
+            },
+            SlashCmd {
+                name: "/closeout",
+                desc: "fold the focused worktree back to the target branch",
             },
             SlashCmd {
                 name: "/help",
@@ -1534,6 +1554,13 @@ fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
         install_standalone(app, outcome);
         reset_inline_commit_state(app);
     }
+    let mut closeouts = Vec::new();
+    while let Ok(msg) = app.closeout_rx.try_recv() {
+        closeouts.push(msg);
+    }
+    for msg in closeouts {
+        install_closeout(app, msg);
+    }
     app.maybe_clear_status();
     app.activity_frame = app.activity_frame.wrapping_add(1);
 }
@@ -1999,6 +2026,10 @@ fn run_local_slash(app: &mut App) -> bool {
         }
         "/config" => {
             open_config(app);
+            true
+        }
+        "/closeout" if app.zone == Zone::SingleAgent => {
+            run_closeout(app, arg);
             true
         }
         _ => false,
@@ -3894,3 +3925,4 @@ mod highlight;
 #[allow(dead_code)]
 mod custom_terminal;
 mod insert_history;
+mod closeout;
