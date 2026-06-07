@@ -1173,7 +1173,16 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
 
                 let queued = queued_user_turns(&mut app.agents[idx], &transcript);
                 let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
-                render_transcript(&transcript[stable_end..], "", &queued, width)
+                let active = &transcript[stable_end..];
+                // Everything is committed to scrollback and nothing is queued:
+                // the live area is just the composer — render no transcript body
+                // (render_transcript would emit its "(no output yet)" placeholder
+                // for an all-empty input, which is wrong here).
+                if active.is_empty() && queued.is_empty() {
+                    Vec::new()
+                } else {
+                    render_transcript(active, "", &queued, width)
+                }
             } else {
                 standalone_intro_lines(app)
             };
