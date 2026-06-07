@@ -550,24 +550,46 @@ fn parse_copilot_mcp_pattern(pattern: &str) -> Option<(&str, &str)> {
     Some((server, tool))
 }
 
-/// Simple recursive glob matcher: `*` = any sequence (incl. empty),
-/// `?` = exactly one char, everything else literal. No character
-/// classes or escapes — adequate for tool-name patterns we ship.
+/// Glob matcher: `*` = any sequence (incl. empty), `?` = exactly one
+/// char, everything else literal. No character classes or escapes —
+/// adequate for tool-name patterns we ship.
+///
+/// Iterative two-pointer algorithm with backtrack pointers — O(n·m)
+/// worst case, no recursion. This MUST NOT regress to a recursive
+/// matcher that recurses per `*` split point: that is exponential, and
+/// because it runs while the per-dispatch tool-surface lock is held, a
+/// pathological multi-`*` pattern wedges the WHOLE daemon (every
+/// notes/thread/knowledge op stalls for minutes). Surfaced by the
+/// closeout dogfooding run — see
+/// design/fleet-tui/closeout-command.md §6 and thread-de03a2c5 Note 5.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    glob_match_inner(&p, 0, &t, 0)
-}
-
-fn glob_match_inner(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
-    if pi == p.len() {
-        return ti == t.len();
+    // pi/ti walk pattern/text; (star, mark) remember the last '*' and
+    // the text position to backtrack to when a literal run mismatches.
+    let (mut pi, mut ti, mut star, mut mark): (usize, usize, Option<usize>, usize) =
+        (0, 0, None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Mismatch under an open '*': extend the '*' by one char.
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
     }
-    match p[pi] {
-        '*' => (ti..=t.len()).any(|k| glob_match_inner(p, pi + 1, t, k)),
-        '?' => ti < t.len() && glob_match_inner(p, pi + 1, t, ti + 1),
-        c => ti < t.len() && t[ti] == c && glob_match_inner(p, pi + 1, t, ti + 1),
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
     }
+    pi == p.len()
 }
 
 /// Default timeout for provider CLI invocations. MCP CRUD calls
@@ -1764,5 +1786,36 @@ mod tests {
         store.save(&path).unwrap();
         let loaded = McpStore::load(&path).unwrap();
         assert_eq!(loaded.servers.len(), 1);
+    }
+
+    #[test]
+    fn glob_match_semantics_and_no_exponential_blowup() {
+        // Core `*` / `?` / literal semantics (unchanged from the prior matcher).
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("?", "a"));
+        assert!(!glob_match("?", "ab"));
+        assert!(glob_match("mcp__blackbox__bro_*", "mcp__blackbox__bro_exec"));
+        assert!(!glob_match("mcp__blackbox__bro_*", "mcp__blackbox__bbox_search"));
+        assert!(glob_match("*bbox*", "mcp__blackbox__bbox_search"));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+        assert!(!glob_match("a*b*c", "axxbyy"));
+        assert!(glob_match("Bash(git push *)", "Bash(git push origin)"));
+
+        // Regression guard: a multi-`*` pattern against a long non-matching
+        // text is EXPONENTIAL under a recursive backtracking matcher and, run
+        // while the dispatch tool-surface lock is held, wedges the whole daemon
+        // (closeout dogfooding finding). The iterative matcher returns
+        // ~instantly. If this test ever hangs or trips the time bound,
+        // glob_match has regressed to recursive backtracking.
+        let patho_pat = "*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let patho_txt = "a".repeat(64);
+        let start = std::time::Instant::now();
+        assert!(!glob_match(patho_pat, &patho_txt));
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "glob_match is not linear — recursive backtracking regression"
+        );
     }
 }
