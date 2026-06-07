@@ -336,6 +336,34 @@ surfaces as a cockpit status flash via the structured result.
 
 Phases 1–3 are independently shippable.
 
+**Status (as of the dogfooding run):** Phases **1–3 ✅** implemented, landed on
+`beta/blackbox-v2`, deployed, and validated (3a HTTP probe; 3b tmux). Phases **4
+and 5 REMAIN — not started.**
+
+A dogfooding attempt to build Phases 4/5 *via `bro fleet`* (an MM bro driving the
+cockpit, two levels up) was **aborted** — it surfaced daemon/cockpit defects that
+blocked it. Findings, sifted into verified vs. the bro's unverified narration:
+
+- **VERIFIED — `orchestration::mcp::glob_match` exponential-backtracking wedge
+  (PRIORITY).** The recursive glob matcher (`src/orchestration/mcp.rs:556`/`:562`),
+  used to filter the tool surface per dispatch (`:492`), hot-loops on a
+  pathological pattern×text, holding an RwLock and stalling ALL
+  `bbox_notes`/`bbox_thread`/`bbox_knowledge` ops to multi-minute latency (and
+  hanging the in-process bro). Same class/signature as the prior wedge
+  (thread-de03a2c5 Note 5) but a **different code path** the `hardened_walk` fix
+  (`64fd627`) never covered. *This can take down the whole daemon — everything
+  else is moot until it's fixed.*
+- **VERIFIED — dispatch-composer paste → mass-dispatch.** Pasting a multi-line
+  prompt submits one dispatch per `LF` (16 phantom agents spawned); no
+  bracketed-paste handling, and no bulk-cancel to recover.
+- **VERIFIED — in-process starvation.** Fleet agents run in-process in
+  `blackboxd`, so a dispatch storm starves the operator's own session/driver.
+- **NOT VERIFIED (bro misdiagnosis, recorded for hygiene):** "tmux server died"
+  (it was on a separate isolated socket, server confirmed alive) and "96% CPU
+  idle daemon" (that was the in-process agents' legitimate load, not a spin).
+
+Phases 4/5 are deferred until the `glob_match` wedge is fixed.
+
 ## 7. Open questions
 
 - Should `closeout_hooks` inherit the dispatch env (`resolve_provider_env`
