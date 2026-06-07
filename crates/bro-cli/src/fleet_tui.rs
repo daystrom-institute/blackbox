@@ -3377,3 +3377,7 @@ mod view;
 mod dispatch;
 mod wrapping;
 mod highlight;
+#[allow(dead_code)] // wired in by the standalone inline-flow loop (incremental)
+mod custom_terminal;
+#[allow(dead_code)] // wired in by the standalone inline-flow loop (incremental)
+mod insert_history;
