@@ -142,7 +142,7 @@ Trailing paragraph.";
     fn snapshot_transcript_styled_multi_width() {
         let items = transcript_fixture();
         for width in [40usize, 80, 120] {
-            let lines = render_transcript(&items, "initial prompt", &["a queued turn"], width);
+            let lines = render_transcript(&items, "this is a fairly long initial steer prompt that should word-wrap across several lines at the narrow forty-column width", &["a queued turn"], width);
             insta::assert_snapshot!(format!("transcript_styled_w{width}"), dump_lines(&lines));
         }
     }
@@ -151,7 +151,7 @@ Trailing paragraph.";
     fn snapshot_transcript_grid_multi_width() {
         let items = transcript_fixture();
         for width in [40u16, 80] {
-            let lines = render_transcript(&items, "initial prompt", &["a queued turn"], width as usize);
+            let lines = render_transcript(&items, "this is a fairly long initial steer prompt that should word-wrap across several lines at the narrow forty-column width", &["a queued turn"], width as usize);
             let grid = crate::test_backend::render_lines_to_grid(width, 60, lines);
             insta::assert_snapshot!(format!("transcript_grid_w{width}"), grid);
         }

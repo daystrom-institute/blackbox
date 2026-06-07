@@ -2,7 +2,8 @@
 source: crates/bro-cli/src/fleet_tui/tests.rs
 expression: dump_lines(&lines)
 ---
-[LightBlue,b]▌ [/]initial prompt
+[LightBlue,b]▌ [/]this is a fairly long initial steer prompt that should word-wrap across
+[LightBlue,b]▌ [/]several lines at the narrow forty-column width
 
 Here is a plan with [b]emphasis[/] and a [White]code[/] token.
 

@@ -2,7 +2,10 @@
 source: crates/bro-cli/src/fleet_tui/tests.rs
 expression: grid
 ---
-"▌ initial prompt                        "
+"▌ this is a fairly long initial         "
+"▌ steer prompt that should word-wrap    "
+"▌ across several lines at the narrow    "
+"▌ forty-column width                    "
 "                                        "
 "Here is a plan with emphasis and a code "
 "token.                                  "
@@ -24,9 +27,6 @@ expression: grid
 "▌ a queued turn                         "
 "▌ queued to stdin; waiting for harness  "
 "echo                                    "
-"                                        "
-"                                        "
-"                                        "
 "                                        "
 "                                        "
 "                                        "

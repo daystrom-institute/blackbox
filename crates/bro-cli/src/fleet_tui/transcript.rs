@@ -733,11 +733,13 @@ pub(super) fn render_steer_with_status(
         .bg(user_bg)
         .add_modifier(Modifier::BOLD);
     let bg = Style::default().bg(user_bg);
-    let content_width = width.saturating_sub(2).max(1);
+    // Reserve 2 cols for the "▌ " gutter; fall back to 1 col if width is tiny
+    // rather than wrapping at zero width.
+    let content_width = usable_content_width(width, 2).unwrap_or(1);
     let mut out: Vec<Line<'static>> =
         render_markdown_with_width(text.trim_matches('\n'), content_width)
             .into_iter()
-            .flat_map(|line| wrap_line_by_chars(line, content_width))
+            .flat_map(|line| word_wrap_line(&line, content_width))
             .map(|line| prepend_line_prefix(line, "▌ ", gutter, bg))
             .collect();
     let Some(label) = turn_status_label(status) else {

@@ -33,6 +33,9 @@ ratatui-core = "0.1"
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 tracing = "0.1"
 tui-markdown = "0.3"
+# Style-preserving word wrapping (codex wrapping.rs technique). flatten -> wrap
+# -> re-slice spans by byte range so styles survive wrap boundaries.
+textwrap = "0.16"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

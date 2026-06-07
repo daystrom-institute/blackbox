@@ -61,6 +61,7 @@ use markdown::*;
 use transcript::*;
 use view::*;
 use dispatch::*;
+use wrapping::*;
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
@@ -2942,39 +2943,6 @@ enum TurnRenderStatus {
     EmptyResult,
 }
 
-fn wrap_line_by_chars(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    let mut current = Vec::new();
-    let mut used = 0usize;
-
-    for span in line.spans {
-        let style = span.style;
-        let mut chunk = String::new();
-        for ch in span.content.chars() {
-            if used >= width {
-                if !chunk.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut chunk), style));
-                }
-                out.push(Line::from(std::mem::take(&mut current)));
-                used = 0;
-            }
-            chunk.push(ch);
-            used += 1;
-        }
-        if !chunk.is_empty() {
-            current.push(Span::styled(chunk, style));
-        }
-    }
-
-    if current.is_empty() && out.is_empty() {
-        out.push(Line::from(""));
-    } else if !current.is_empty() {
-        out.push(Line::from(current));
-    }
-    out
-}
-
 /// Rewrite GitHub task-list syntax (`- [ ]` / `- [x]`) into checkbox glyphs so
 /// tui-markdown renders `☐` / `☑` instead of literal brackets. Operates only on
 /// list-item lines; other `[...]` text is left untouched.
@@ -3406,3 +3374,4 @@ mod markdown;
 mod transcript;
 mod view;
 mod dispatch;
+mod wrapping;
