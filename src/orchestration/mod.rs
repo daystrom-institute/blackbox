@@ -2991,13 +2991,32 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
     let event_count = observed_event_count(&inner);
     obj["eventCount"] = Value::from(event_count);
     if tail > 0 && !inner.events.is_empty() {
-        let mut recent: Vec<Value> = inner
+        // Bound `recentEvents` by SERIALIZED SIZE as well as by `tail` count, so
+        // the whole status response stays under the 80KB MCP response cap
+        // (`server/response.rs::cap_response_text`). That cap BYTE-truncates an
+        // over-limit response mid-JSON-string — producing invalid JSON that the
+        // fleet poller can't parse, so the agent's row silently freezes (the
+        // root cause of the "poller stall"). Per-string content is already
+        // capped at 2KB by `compact_status_event`; this caps the array total.
+        // Walk newest→oldest and keep events until the budget is hit (always
+        // keeping at least one), so the response is valid regardless of `tail`.
+        const RECENT_EVENTS_BUDGET_BYTES: usize = 56 * 1024;
+        let mut recent: Vec<Value> = Vec::new();
+        let mut bytes = 0usize;
+        for ev in inner
             .events
             .iter()
             .rev()
             .filter_map(compact_status_event)
             .take(tail)
-            .collect();
+        {
+            let sz = serde_json::to_string(&ev).map(|s| s.len()).unwrap_or(0);
+            if !recent.is_empty() && bytes + sz > RECENT_EVENTS_BUDGET_BYTES {
+                break;
+            }
+            bytes += sz;
+            recent.push(ev);
+        }
         recent.reverse();
         obj["recentEvents"] = Value::Array(recent);
     }
