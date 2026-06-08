@@ -361,6 +361,10 @@ pub struct TaskInner {
     pub recoverable: bool,
     pub transcript_location: Option<TranscriptLocation>,
     pub transcript_cursor: Option<TranscriptCursor>,
+    /// Monotonic per-task cursor for live tail events. This is distinct from
+    /// provider transcript-file cursors because `tail_tx` carries task summary
+    /// events, not raw provider transcript records.
+    pub live_cursor: u64,
     pub supervision: SupervisionState,
     /// Where this task was spawned FROM (Slice 1b of the daemon roster
     /// design). Persisted via `PersistedTask` so the origin survives a
@@ -427,6 +431,12 @@ pub struct Task {
 impl Task {
     pub fn id(&self) -> String {
         self.inner.lock().id.clone()
+    }
+
+    fn next_live_cursor(&self) -> u64 {
+        let mut inner = self.inner.lock();
+        inner.live_cursor += 1;
+        inner.live_cursor
     }
 
     /// PID of the spawned provider child while the task is running.
@@ -524,6 +534,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
         }),
@@ -661,6 +672,8 @@ struct PersistedTask {
     #[serde(default)]
     transcript_cursor: Option<TranscriptCursor>,
     #[serde(default)]
+    live_cursor: u64,
+    #[serde(default)]
     supervision: SupervisionState,
     /// Origin is back-compat default `Unknown` when absent on disk —
     /// pre-Slice-1b records have no `origin` field, and a daemon
@@ -735,6 +748,7 @@ impl TaskStore {
                     recoverable: inner.recoverable,
                     transcript_location: inner.transcript_location.clone(),
                     transcript_cursor: inner.transcript_cursor.clone(),
+                    live_cursor: inner.live_cursor,
                     supervision: inner.supervision.clone(),
                     origin: inner.origin,
                 }
@@ -805,6 +819,7 @@ impl TaskStore {
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
                     transcript_cursor: rec.transcript_cursor,
+                    live_cursor: rec.live_cursor,
                     supervision: rec.supervision,
                     origin: rec.origin,
                 }),
@@ -1396,6 +1411,7 @@ fn failed_duplicate_task(
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin,
         }),
@@ -1466,6 +1482,7 @@ pub fn spawn_in_process_task(
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin,
         }),
@@ -1497,7 +1514,9 @@ pub fn spawn_in_process_task(
     let task_id_ev = task_id.clone();
     let bro_ev = task.inner.lock().bro_label.clone();
     let provider_str = provider.to_string();
+    let cursor = task.next_live_cursor();
     let _ = tail_tx.send(tail::TailEvent::TaskStarted {
+        cursor,
         task_id,
         provider,
         bro_name: None,
@@ -1562,12 +1581,15 @@ pub fn finish_in_process_task(
     let source_session = inner.session_id.clone();
     let task_kind = inner.bro_label.clone();
     let error: String = inner.stderr.chars().take(200).collect();
+    inner.live_cursor += 1;
+    let cursor = inner.live_cursor;
     drop(inner);
     task.emit_roster_updated();
 
     match status {
         TaskStatus::Completed => {
             let _ = tail_tx.send(tail::TailEvent::TaskCompleted {
+                cursor,
                 task_id: task_id.clone(),
                 elapsed: elapsed.clone(),
                 cost,
@@ -1577,6 +1599,7 @@ pub fn finish_in_process_task(
         }
         TaskStatus::Failed => {
             let _ = tail_tx.send(tail::TailEvent::TaskFailed {
+                cursor,
                 task_id: task_id.clone(),
                 elapsed: elapsed.clone(),
                 error: error.clone(),
@@ -1584,6 +1607,7 @@ pub fn finish_in_process_task(
         }
         TaskStatus::Cancelled => {
             let _ = tail_tx.send(tail::TailEvent::TaskCancelled {
+                cursor,
                 task_id: task_id.clone(),
                 elapsed: elapsed.clone(),
             });
@@ -1960,20 +1984,32 @@ fn ingest_harness_event(
                 })
             })
             .flatten()
-            .map(|snippet| (snippet, session_id_observed))
-            .or_else(|| session_id_observed.then(|| (String::new(), true)))
+            .map(|snippet| {
+                let cursor = if snippet.is_empty() {
+                    None
+                } else {
+                    inner.live_cursor += 1;
+                    Some(inner.live_cursor)
+                };
+                (snippet, session_id_observed, cursor)
+            })
+            .or_else(|| session_id_observed.then(|| (String::new(), true, None)))
     };
 
     task.emit_roster_updated();
 
-    if let Some((snippet, session_id_observed)) = snippet_to_emit {
+    if let Some((snippet, session_id_observed, cursor)) = snippet_to_emit {
         if session_id_observed {
             task.notify.notify_waiters();
         }
         if snippet.is_empty() {
             return;
         }
+        let Some(cursor) = cursor else {
+            return;
+        };
         let _ = tail_tx.send(tail::TailEvent::TaskProgress {
+            cursor,
             task_id: task_id.to_string(),
             activity: snippet.clone(),
         });
@@ -2336,6 +2372,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     recoverable: false,
                     transcript_location: None,
                     transcript_cursor: None,
+                    live_cursor: 0,
                     supervision: SupervisionState::default(),
                     origin,
                 }),
@@ -2389,6 +2426,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin,
         }),
@@ -2419,7 +2457,9 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
     task.emit_roster_added();
 
     // Emit tail event
+    let cursor = task.next_live_cursor();
     let _ = tail_tx.send(tail::TailEvent::TaskStarted {
+        cursor,
         task_id: id.clone(),
         provider,
         bro_name: None,
@@ -2553,20 +2593,29 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                                 })
                             })
                             .flatten()
-                            .map(|snippet| (snippet, session_id_observed))
-                            .or_else(|| session_id_observed.then(|| (String::new(), true)))
+                            .map(|snippet| {
+                                let should_emit = !snippet.is_empty()
+                                    && last_emitted_snippet.as_deref() != Some(snippet.as_str());
+                                let cursor = if should_emit {
+                                    inner.live_cursor += 1;
+                                    Some(inner.live_cursor)
+                                } else {
+                                    None
+                                };
+                                (snippet, session_id_observed, cursor)
+                            })
+                            .or_else(|| session_id_observed.then(|| (String::new(), true, None)))
                     };
 
                     task_ref.emit_roster_updated();
 
-                    if let Some((snippet, session_id_observed)) = snippet_to_emit {
+                    if let Some((snippet, session_id_observed, cursor)) = snippet_to_emit {
                         if session_id_observed {
                             task_ref.notify.notify_waiters();
                         }
-                        if !snippet.is_empty()
-                            && last_emitted_snippet.as_deref() != Some(snippet.as_str())
-                        {
+                        if let Some(cursor) = cursor {
                             let _ = tail_tx_clone.send(tail::TailEvent::TaskProgress {
+                                cursor,
                                 task_id: task_id_clone.clone(),
                                 activity: snippet.clone(),
                             });
@@ -2677,7 +2726,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         let _ = stderr_done_rx.await;
         let code = status.ok().and_then(|s| s.code());
 
-        let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind) = {
+        let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind, cursor) = {
             let mut inner = task_ref_wait.inner.lock();
             inner.exit_code = code;
             // Preserve terminal states set during stream parsing (Cancelled
@@ -2697,6 +2746,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             let error_snippet: String = inner.stderr.chars().take(200).collect();
             let source_session = inner.session_id.clone();
             let task_kind = inner.bro_label.clone();
+            inner.live_cursor += 1;
+            let cursor = inner.live_cursor;
             (
                 terminal_status,
                 elapsed,
@@ -2704,12 +2755,14 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                 error_snippet,
                 source_session,
                 task_kind,
+                cursor,
             )
         };
         task_ref_wait.emit_roster_updated();
         match terminal_status {
             TaskStatus::Completed => {
                 let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
+                    cursor,
                     task_id: task_id_wait.clone(),
                     elapsed: elapsed.clone(),
                     cost,
@@ -2719,6 +2772,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             }
             TaskStatus::Failed => {
                 let _ = tail_tx_wait.send(tail::TailEvent::TaskFailed {
+                    cursor,
                     task_id: task_id_wait.clone(),
                     elapsed: elapsed.clone(),
                     error: error_snippet.clone(),
@@ -3531,6 +3585,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -3857,6 +3912,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -3886,6 +3942,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -3933,6 +3990,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -3981,6 +4039,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4373,6 +4432,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4414,6 +4474,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4459,6 +4520,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4506,6 +4568,7 @@ mod tests {
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
         };
@@ -4555,6 +4618,7 @@ mod tests {
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
         };
@@ -4616,6 +4680,7 @@ mod tests {
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
         };
@@ -4665,6 +4730,7 @@ mod tests {
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
         };
@@ -4717,6 +4783,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4752,6 +4819,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4793,6 +4861,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4830,6 +4899,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),
@@ -4879,6 +4949,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
             }),

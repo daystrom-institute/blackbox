@@ -1923,8 +1923,10 @@ impl BlackboxServer {
         let _ = self.state.cancel_arc(&p.task_id);
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
             Ok(()) => {
-                let inner = task.inner.lock();
+                let mut inner = task.inner.lock();
+                inner.live_cursor += 1;
                 let _ = self.state.tail_tx.send(TailEvent::TaskCancelled {
+                    cursor: inner.live_cursor,
                     task_id: inner.id.clone(),
                     elapsed: orch::format_elapsed(inner.started_at, inner.completed_at),
                 });

@@ -1,5 +1,8 @@
 use crate::server::routes::*;
-use crate::server::tail::{roster_stream_handler, tail_handler};
+use crate::server::tail::{
+    focused_transcript_history_handler, focused_transcript_stream_handler, roster_stream_handler,
+    tail_handler,
+};
 use crate::server::{BlackboxServer, SharedState};
 use crate::{config, council};
 use rmcp::transport::streamable_http_server::{
@@ -94,6 +97,14 @@ pub(super) fn build_http_app(
         .route(
             "/control/roster/stream",
             axum::routing::get(roster_stream_handler),
+        )
+        .route(
+            "/control/transcript/{task_id}",
+            axum::routing::get(focused_transcript_history_handler),
+        )
+        .route(
+            "/control/transcript/{task_id}/stream",
+            axum::routing::get(focused_transcript_stream_handler),
         )
         .route(
             "/control/dashboard",

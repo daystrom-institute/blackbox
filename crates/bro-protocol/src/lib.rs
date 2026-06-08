@@ -5,6 +5,7 @@
 
 use bro_core::{BroError, Origin, Provider, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 mod dispatch;
 mod transcript;
@@ -131,6 +132,61 @@ impl RosterDelta {
             | RosterDelta::Removed { seq, .. } => *seq,
         }
     }
+}
+
+/// One raw provider event from the task's current in-memory event buffer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FocusedTranscriptMemoryEventV1 {
+    /// Zero-based cursor within the daemon's current in-memory event window.
+    pub cursor: u64,
+    pub event: Value,
+}
+
+/// Initial SSE payload for `GET /control/transcript/{task_id}/stream`.
+///
+/// `live_cursor` is the daemon tail cursor through which the snapshot is
+/// current. The stream sends only live events with `cursor > live_cursor`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FocusedTranscriptSnapshotV1 {
+    pub task_id: TaskId,
+    pub session_id: Option<SessionId>,
+    pub provider: Provider,
+    pub status: TaskStatus,
+    pub live_cursor: u64,
+    pub memory_start_cursor: u64,
+    pub next_memory_cursor: u64,
+    pub events: Vec<FocusedTranscriptMemoryEventV1>,
+    pub history_jsonl_path: Option<String>,
+}
+
+/// One live tail event for a focused transcript subscription.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FocusedTranscriptLiveEventV1 {
+    pub task_id: TaskId,
+    pub cursor: u64,
+    pub event: Value,
+}
+
+/// One provider transcript-file JSONL record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptHistoryEventV1 {
+    /// Zero-based JSONL record index in the provider transcript file.
+    pub cursor: u64,
+    pub byte_offset: u64,
+    pub event: Value,
+}
+
+/// Bounded page from the provider transcript file source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptHistoryPageV1 {
+    pub task_id: TaskId,
+    pub session_id: SessionId,
+    pub history_jsonl_path: String,
+    pub from_cursor: u64,
+    pub limit: usize,
+    pub next_cursor: u64,
+    pub reached_end: bool,
+    pub events: Vec<TranscriptHistoryEventV1>,
 }
 
 #[cfg(test)]
