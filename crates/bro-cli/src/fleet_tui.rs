@@ -897,6 +897,14 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
                 desc: "fold the focused worktree back to the target branch",
             },
             SlashCmd {
+                name: "/prune",
+                desc: "remove all terminal agents from the roster",
+            },
+            SlashCmd {
+                name: "/stop-running",
+                desc: "interrupt all running agents",
+            },
+            SlashCmd {
                 name: "/help",
                 desc: "show keyboard shortcuts",
             },
@@ -927,6 +935,14 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
                 desc: "fold the focused worktree back to the target branch",
             },
             SlashCmd {
+                name: "/prune",
+                desc: "remove all terminal agents from the roster",
+            },
+            SlashCmd {
+                name: "/stop-running",
+                desc: "interrupt all running agents",
+            },
+            SlashCmd {
                 name: "/help",
                 desc: "show keyboard shortcuts",
             },
@@ -947,6 +963,14 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
             SlashCmd {
                 name: "/closeout",
                 desc: "fold the selected worktree back to the target branch",
+            },
+            SlashCmd {
+                name: "/prune",
+                desc: "remove all terminal agents from the roster",
+            },
+            SlashCmd {
+                name: "/stop-running",
+                desc: "interrupt all running agents",
             },
             SlashCmd {
                 name: "/help",
@@ -1765,6 +1789,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         stop_or_delete_selected(app);
         return;
     }
+    // Ctrl+K: prune all terminal rows from the roster in one action.
+    if ctrl && key.code == KeyCode::Char('k') {
+        prune_terminal_agents(app);
+        return;
+    }
     // Completion carveouts: slash commands and roster @project aliases own Tab
     // and ↑/↓ while their menus are up. Otherwise Tab cycles the current
     // sub-selector level (provider / model / effort).
@@ -1995,6 +2024,91 @@ fn stop_or_delete_selected(app: &mut App) {
     }
 }
 
+fn stop_all_running_agents(app: &mut App) {
+    let mut stopped = 0usize;
+    let mut failed = 0usize;
+    for agent in &mut app.agents {
+        if agent.task.snapshot().status != TaskStatus::Running {
+            continue;
+        }
+        match app.orch.stop(&agent.task) {
+            Ok(()) => {
+                if let Some(classifier) = &agent.classifier {
+                    let _ = app.orch.stop(classifier);
+                }
+                agent.task = agent.task.without_stdin();
+                stopped += 1;
+            }
+            Err(e) => {
+                tracing::warn!("fleet stop-running failed for {}: {e:#}", agent.task.id());
+                failed += 1;
+            }
+        }
+    }
+
+    app.clear_input();
+    if failed > 0 {
+        app.set_status(
+            format!("stopped {stopped} running agents ({failed} failed)"),
+            Duration::from_secs(5),
+        );
+    } else {
+        app.set_status(
+            format!("stopped {stopped} running agents"),
+            Duration::from_secs(3),
+        );
+    }
+}
+
+fn prune_terminal_agents(app: &mut App) {
+    let terminal: Vec<usize> = app
+        .agents
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, agent)| agent.task.snapshot().status.is_terminal().then_some(idx))
+        .collect();
+    let pruned = terminal.len();
+    if pruned == 0 {
+        app.clear_input();
+        app.set_status("no terminal agents to prune", Duration::from_secs(3));
+        return;
+    }
+
+    let mut focused_removed = false;
+    for idx in terminal.into_iter().rev() {
+        let id = app.agents[idx].task.id();
+        if app.focused_agent_id.as_deref() == Some(id.as_str()) {
+            focused_removed = true;
+        }
+        if let Some(classifier) = &app.agents[idx].classifier {
+            let classifier_id = classifier.id();
+            let _ = app.orch.stop(classifier);
+            app.orch.forget(&classifier_id);
+            app.activity_clocks
+                .remove(&activity_key("classifier", &classifier_id));
+        }
+        app.activity_clocks.remove(&activity_key("agent", &id));
+        app.orch.forget(&id);
+        app.agents.remove(idx);
+    }
+
+    if focused_removed {
+        app.focused_agent_id = None;
+        if app.zone == Zone::SingleAgent {
+            app.zone = Zone::Roster;
+        }
+    }
+    let n = app.agents.len();
+    if n == 0 || app.roster_selected >= n {
+        app.roster_selected = n.saturating_sub(1);
+    }
+    app.clear_input();
+    app.set_status(
+        format!("pruned {pruned} terminal agents"),
+        Duration::from_secs(3),
+    );
+}
+
 /// Begin renaming the selected roster agent with a blank composer; Enter
 /// commits, Esc cancels (§5).
 fn start_rename(app: &mut App) {
@@ -2090,6 +2204,14 @@ fn run_local_slash(app: &mut App) -> bool {
         // rather than acting on the wrong tree.
         "/closeout" => {
             run_closeout(app, arg);
+            true
+        }
+        "/prune" => {
+            prune_terminal_agents(app);
+            true
+        }
+        "/stop-running" => {
+            stop_all_running_agents(app);
             true
         }
         _ => false,
