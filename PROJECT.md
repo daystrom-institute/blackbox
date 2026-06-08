@@ -231,6 +231,8 @@ or system memories and link/pointer from here.
   `system-defaults/` artifacts and `.claude` skills.
 - `docs/getting-started.md`, `docs/operating-blackbox.md`,
   `docs/operations.md` - operational setup and day-2 runbooks.
+- `docs/operations-isolated-dev-daemon.md` - running a lightweight throwaway
+  blackboxd for live validation without touching prod state.
 - `docs/internals.md`, `docs/index-embedding-internals.md`,
   `docs/graph-retrieval-internals.md` - architecture internals.
 - `docs/transcript-retrieval.md`, `docs/knowledge-store.md`,
