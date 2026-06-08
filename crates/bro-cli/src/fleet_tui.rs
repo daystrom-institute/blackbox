@@ -1069,7 +1069,8 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
     let orch = Arc::new(FleetOrchestrator::from_config_with_daemon_url(daemon_url)?);
     // File-only logging + terminal-restoring panic hook before we take the
     // terminal. The status poller and the reload reconcile pass below log here.
-    crate::logging::init_cockpit_logging(orch.store_dir());
+    // Hold the guard for the whole cockpit lifetime (drop = flush + stop worker).
+    let _log_guard = crate::logging::init_cockpit_logging(orch.store_dir());
     let mut app = App::new(orch.clone(), cwd, tokio::runtime::Handle::current());
 
     // Repopulate from prior fleet sessions persisted on disk. `load` flips every
@@ -1128,7 +1129,7 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
 
 pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_agent_config()?);
-    crate::logging::init_cockpit_logging(orch.store_dir());
+    let _log_guard = crate::logging::init_cockpit_logging(orch.store_dir());
     orch.spawn_poller_supervisor();
     let mut app = App::new_with_mode(
         orch.clone(),

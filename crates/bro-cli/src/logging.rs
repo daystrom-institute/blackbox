@@ -14,57 +14,62 @@
 //! on the floor for want of a subscriber.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Once;
 
-static INIT: Once = Once::new();
+static PANIC_HOOK: Once = Once::new();
 
 /// Initialise the cockpit's file-only tracing subscriber and terminal-restoring
-/// panic hook. Idempotent (guarded by a `Once`) and best-effort: a logging
-/// failure must never stop the cockpit from launching. Returns the log directory
-/// when initialised so the caller can surface it on exit.
-pub fn init_cockpit_logging(store_dir: &Path) -> Option<PathBuf> {
+/// panic hook. Best-effort: a logging failure must never stop the cockpit from
+/// launching. Returns a [`WorkerGuard`] the caller MUST hold for the cockpit's
+/// lifetime — dropping it stops (and flushes) the non-blocking log worker.
+///
+/// The writer is `tracing_appender::non_blocking`, NOT a plain blocking file
+/// appender: the cockpit emits only a handful of lines per run, which a blocking
+/// `BufWriter` keeps buffered until the buffer fills or the process exits — so
+/// the log appears effectively write-on-exit and is useless for live tailing
+/// while debugging (the exact failure mode that made this session's poller-stall
+/// chase so hard). The non-blocking worker flushes promptly on its own thread.
+#[must_use = "hold the returned WorkerGuard for the cockpit's lifetime, or logs are lost"]
+pub fn init_cockpit_logging(store_dir: &Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = store_dir.join("logs");
-    let mut out = None;
-    INIT.call_once(|| {
-        if std::fs::create_dir_all(&log_dir).is_err() {
-            return;
-        }
-        let appender = match tracing_appender::rolling::Builder::new()
-            .max_log_files(5)
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("cockpit")
-            .filename_suffix("log")
-            .build(&log_dir)
-        {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+    if std::fs::create_dir_all(&log_dir).is_err() {
+        return None;
+    }
+    let appender = match tracing_appender::rolling::Builder::new()
+        .max_log_files(5)
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("cockpit")
+        .filename_suffix("log")
+        .build(&log_dir)
+    {
+        Ok(a) => a,
+        Err(_) => return None,
+    };
+    let (writer, guard) = tracing_appender::non_blocking(appender);
 
-        // Scope the default to our own crates so dependency chatter (reqwest,
-        // hyper, rustls) stays out; RUST_LOG overrides wholesale.
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "bro_cli=info,bro_fleet_client=info".into());
+    // Scope the default to our own crates so dependency chatter (reqwest, hyper,
+    // rustls) stays out; RUST_LOG overrides wholesale.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "bro_cli=info,bro_fleet_client=info".into());
 
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        // File only — no stderr layer (it would corrupt the alt-screen). ANSI off
-        // so the log file is plain text. `try_init` so a second cockpit invocation
-        // in the same process (or a test) is a no-op rather than a panic.
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(appender)
-                    .with_ansi(false),
-            )
-            .try_init();
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    // File only — no stderr layer (it would corrupt the alt-screen). ANSI off so
+    // the log file is plain text. `try_init` so a second invocation in the same
+    // process (or a test) is a no-op rather than a panic.
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false),
+        )
+        .try_init();
 
-        install_panic_hook();
-        tracing::info!(log_dir = %log_dir.display(), "cockpit logging initialised");
-        out = Some(log_dir.clone());
-    });
-    out
+    PANIC_HOOK.call_once(install_panic_hook);
+    tracing::info!(log_dir = %log_dir.display(), "cockpit logging initialised");
+    Some(guard)
 }
 
 /// Wrap the existing panic hook so a panic in the cockpit (TUI thread, a status
