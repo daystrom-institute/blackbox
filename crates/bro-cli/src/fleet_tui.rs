@@ -1100,6 +1100,12 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
         });
     }
 
+    // Liveness backstop: respawn any per-task status poller that silently wedges
+    // under load (pollers have been observed to freeze while the daemon stays
+    // healthy, leaving stale "Active" rows). One watchdog, started after the
+    // initial reconcile.
+    orch.spawn_poller_supervisor();
+
     // Forward tail events into the sync TUI loop (mirrors council_tui's SSE
     // fan-in). State is derived by polling the task Arcs each tick; tail events
     // drive status flashes and ensure prompt redraws on completion.
@@ -1123,6 +1129,7 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
 pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_agent_config()?);
     crate::logging::init_cockpit_logging(orch.store_dir());
+    orch.spawn_poller_supervisor();
     let mut app = App::new_with_mode(
         orch.clone(),
         launch.cwd.clone(),

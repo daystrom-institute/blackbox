@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -1083,6 +1084,7 @@ fn daemon_task(
             model,
         }),
         notify: Arc::new(Notify::new()),
+        last_poll_ms: AtomicU64::new(now_ms()),
     })
 }
 
@@ -1110,6 +1112,10 @@ fn spawn_daemon_status_poller(
             let status = client
                 .get_json(&format!("/control/status/{task_id}?tail=200"))
                 .await;
+            // Liveness heartbeat: this poll cycle completed (ok or error), so the
+            // poller task is demonstrably alive. The supervisor reads this to
+            // distinguish a live-but-quiet poller from a silently-wedged one.
+            task.mark_polled();
             match status {
                 Ok(value) => {
                     consecutive_failures = 0;
@@ -1461,6 +1467,56 @@ impl FleetOrchestrator {
             .into_iter()
             .map(|task| AgentHandle { task, daemon: None })
             .collect()
+    }
+
+    /// Spawn the poller-supervisor: ONE long-lived watchdog task that respawns
+    /// any per-task status poller that has silently wedged.
+    ///
+    /// The per-task pollers can stop making progress under load WITHOUT
+    /// panicking or erroring — observed live: pollers frozen ~10min while the
+    /// daemon stayed healthy (15ms `/control/status`) and the render thread
+    /// stayed alive, so the cockpit showed a finished agent as still "Active"
+    /// and a running agent as frozen. A panic-isolated, logging poller (the A2
+    /// hardening) does nothing when the task simply stops being driven; this
+    /// liveness backstop is what actually keeps the roster honest. (The deeper
+    /// fix — a single daemon-authoritative reconciling pull / SSE instead of N
+    /// fragile client pollers — is the eventual architecture; this watchdog is
+    /// the robust, low-risk first cut.) Call once, after the initial reconcile.
+    pub fn spawn_poller_supervisor(&self) {
+        let task_store = self.task_store.clone();
+        let daemon = self.daemon.clone();
+        let tail_tx = self.tail_tx.clone();
+        tokio::spawn(async move {
+            // Heartbeat staleness past which a poller is presumed wedged. The
+            // poller beats every ~750ms (up to ~15s on a timed-out poll), so 30s
+            // is clear of a healthy slow poll yet catches a true stall fast.
+            const STALL_MS: u64 = 30_000;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // Snapshot the stalled non-terminal tasks under a brief read lock.
+                let stalled: Vec<Arc<Task>> = {
+                    let store = task_store.read();
+                    store
+                        .all_tasks()
+                        .into_iter()
+                        .filter(|t| !t.inner.lock().status.is_terminal())
+                        .filter(|t| t.since_last_poll_ms() > STALL_MS)
+                        .collect()
+                };
+                for task in stalled {
+                    let id = task.id();
+                    tracing::warn!(
+                        task_id = %id,
+                        stalled_ms = task.since_last_poll_ms(),
+                        "poller-supervisor: status poller heartbeat stale; respawning poller"
+                    );
+                    // Reset the heartbeat so we don't respawn again on the next
+                    // tick before the fresh poller has had a chance to beat.
+                    task.mark_polled();
+                    spawn_daemon_status_poller(daemon.clone(), task.clone(), tail_tx.clone(), id);
+                }
+            }
+        });
     }
 
     pub fn store_dir(&self) -> &std::path::Path {

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use bro_core::Provider;
 use bro_protocol::TaskStatus;
@@ -67,11 +68,30 @@ pub struct TaskInner {
 pub struct Task {
     pub inner: Mutex<TaskInner>,
     pub notify: Arc<Notify>,
+    /// Wall-clock (ms) the status poller last completed a poll cycle (success OR
+    /// handled error) for this task — a liveness heartbeat, distinct from
+    /// `last_event_at_ms` (which only advances on new daemon events). The
+    /// poller-supervisor watches this: if a non-terminal task's heartbeat goes
+    /// stale, its poller has silently wedged and the supervisor respawns it.
+    /// Seeded to "now" at construction so a freshly-attached poller gets a grace
+    /// window before the supervisor would consider it stalled.
+    pub last_poll_ms: AtomicU64,
 }
 
 impl Task {
     pub fn id(&self) -> String {
         self.inner.lock().id.clone()
+    }
+
+    /// Stamp the poll-liveness heartbeat (called by the poller each cycle).
+    pub fn mark_polled(&self) {
+        self.last_poll_ms
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last poll-liveness heartbeat.
+    pub fn since_last_poll_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.last_poll_ms.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -228,6 +248,7 @@ impl TaskStore {
                     model: rec.model,
                 }),
                 notify: Arc::new(Notify::new()),
+                last_poll_ms: AtomicU64::new(now_ms()),
             });
             store.tasks.insert(rec.id, task);
         }
