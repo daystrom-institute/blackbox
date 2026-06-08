@@ -1095,8 +1095,12 @@ fn daemon_task(
 /// parse the status and the row silently freezes (the root cause of the observed
 /// "poller stall"). 80 events keeps the response valid for the verbose agents
 /// seen in practice; the daemon-side fix is to bound per-event content so the
-/// status JSON is always valid regardless of tail.
-const POLL_TAIL: usize = 80;
+/// status JSON is always valid regardless of tail. Empirically a very verbose
+/// agent (deepseek-v4, ~1.2KB/event) truncates at tail=80 (88KB) but is clean at
+/// tail=40 (47KB), so 40 is the conservative client cap until the daemon fix
+/// lands. (An agent verbose enough to blow 80KB at tail=40 would still break —
+/// only the daemon-side per-event content bound fully closes this.)
+const POLL_TAIL: usize = 40;
 
 fn spawn_daemon_status_poller(
     client: DaemonFleetClient,
