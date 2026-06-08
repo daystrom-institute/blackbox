@@ -42,6 +42,7 @@ mod council_tui;
 mod fleet_classifier;
 mod fleet_tui;
 mod logging;
+mod mcp_call;
 #[cfg(test)]
 mod test_backend;
 use bro_transcript::{
@@ -92,6 +93,8 @@ enum BroCommand {
     Orchestrate(OrchestrateArgs),
     /// Multi-peer chat councils — convene a team into a deliberation
     Council(CouncilArgs),
+    /// MCP helpers - call daemon tools over streamable HTTP
+    Mcp(mcp_call::McpArgs),
     /// Fleet cockpit — dispatch and live-drive many top-level agents
     Fleet(FleetArgs),
     /// Single-agent cockpit — launch one agent into the Fleet transcript view
@@ -1487,6 +1490,11 @@ fn main() -> anyhow::Result<()> {
         }
         BroCommand::Council(args) => {
             let result = rt.block_on(run_council(args));
+            drop(rt);
+            return result;
+        }
+        BroCommand::Mcp(args) => {
+            let result = rt.block_on(mcp_call::run(args));
             drop(rt);
             return result;
         }
