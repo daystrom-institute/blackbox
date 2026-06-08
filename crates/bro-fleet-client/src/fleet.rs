@@ -1088,6 +1088,16 @@ fn daemon_task(
     })
 }
 
+/// How many recent events the status poll requests. Kept well below the count
+/// at which a verbose agent's `/control/status` response (the per-event payloads
+/// can be large) exceeds the daemon's 80KB response cap (`server/response.rs`),
+/// which BYTE-truncates the body and corrupts the JSON — the cockpit then can't
+/// parse the status and the row silently freezes (the root cause of the observed
+/// "poller stall"). 80 events keeps the response valid for the verbose agents
+/// seen in practice; the daemon-side fix is to bound per-event content so the
+/// status JSON is always valid regardless of tail.
+const POLL_TAIL: usize = 80;
+
 fn spawn_daemon_status_poller(
     client: DaemonFleetClient,
     task: Arc<Task>,
@@ -1106,11 +1116,16 @@ fn spawn_daemon_status_poller(
         // briefly CPU-starved by an in-process build, short enough not to 404 in
         // a tight loop indefinitely.
         let mut consecutive_failures: u32 = 0;
+        // Polls that returned HTTP-OK but carried NO parseable status — the
+        // signature of an 80KB-cap-truncated (corrupt-JSON) response for a very
+        // verbose agent. The status can't be updated from such a response; make
+        // it LOUD (log + the agent's own stderr) instead of silently freezing.
+        let mut unparseable_polls: u32 = 0;
         const MAX_CONSECUTIVE_FAILURES: u32 = 240;
         tracing::debug!(task_id = %task_id, "fleet status poller started");
         loop {
             let status = client
-                .get_json(&format!("/control/status/{task_id}?tail=200"))
+                .get_json(&format!("/control/status/{task_id}?tail={POLL_TAIL}"))
                 .await;
             // Liveness heartbeat: this poll cycle completed (ok or error), so the
             // poller task is demonstrably alive. The supervisor reads this to
@@ -1119,6 +1134,28 @@ fn spawn_daemon_status_poller(
             match status {
                 Ok(value) => {
                     consecutive_failures = 0;
+                    // An HTTP-OK response that carries no parseable status is the
+                    // 80KB-truncation signature — surface it loudly rather than
+                    // letting update_daemon_task silently no-op the status.
+                    if parse_daemon_status(&value).is_none() {
+                        unparseable_polls += 1;
+                        if unparseable_polls == 1 || unparseable_polls.is_multiple_of(40) {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                count = unparseable_polls,
+                                "fleet status poller: /control/status returned no parseable \
+                                 status (likely an 80KB-cap-truncated response for a verbose \
+                                 agent); status not updated this poll"
+                            );
+                            let mut inner = task.inner.lock();
+                            inner.stderr = format!(
+                                "[poller] daemon status response unparseable/truncated ×{unparseable_polls}; \
+                                 displayed status may be stale"
+                            );
+                        }
+                    } else {
+                        unparseable_polls = 0;
+                    }
                     // The parse walks untrusted daemon JSON (arbitrary event
                     // shapes from any provider). A panic here used to kill the
                     // poller task silently and freeze THIS agent's roster row
@@ -1558,7 +1595,7 @@ impl FleetOrchestrator {
                 probes.spawn(async move {
                     let id = task.id();
                     let status = client
-                        .get_json(&format!("/control/status/{id}?tail=200"))
+                        .get_json(&format!("/control/status/{id}?tail={POLL_TAIL}"))
                         .await;
                     (task, status)
                 });
