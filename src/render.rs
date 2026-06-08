@@ -195,7 +195,11 @@ pub fn plan_managed_patch(file_path: &Path, managed_body: &str) -> Result<PatchP
 /// Apply a `PatchPlan`. Snapshots the original (when a file already exists
 /// and we're actually changing it) to the backup directory before writing.
 /// Returns the backup path, if a snapshot was taken.
-pub fn apply_managed_patch(plan: &PatchPlan) -> Result<Option<PathBuf>> {
+///
+/// By default (`allow_empty=false`), refuses to replace a non-empty
+/// managed region with an empty one (a typical symptom of path-vs-repo_id
+/// scoping mismatches). Pass `allow_empty=true` to override.
+pub fn apply_managed_patch(plan: &PatchPlan, allow_empty: bool) -> Result<Option<PathBuf>> {
     match plan {
         // Nothing to do — and no empty backup dir, either.
         PatchPlan::Unchanged { .. } => Ok(None),
@@ -229,9 +233,23 @@ pub fn apply_managed_patch(plan: &PatchPlan) -> Result<Option<PathBuf>> {
 
         PatchPlan::Replace {
             path,
+            existing_block,
             managed_block,
-            ..
         } => {
+            if !allow_empty {
+                let new_body = managed_body_trimmed(managed_block);
+                let existing_body = managed_body_trimmed(existing_block);
+                if new_body.is_empty() && !existing_body.is_empty() {
+                    anyhow::bail!(
+                        "Refusing to clobber non-empty managed region in {} with an \
+                         empty render. This typically happens when the render path \
+                         does not match the path knowledge entries were stored under \
+                         (path vs repo_id scoping mismatch). \
+                         Pass allow_empty=true to override.",
+                        path.display()
+                    );
+                }
+            }
             let backup = Some(snapshot_file(path)?);
             let full = fs::read_to_string(path)?;
             let (s, e) = find_marker_positions(&full)?;
@@ -269,6 +287,19 @@ fn find_marker_positions(text: &str) -> Result<(Option<usize>, Option<usize>)> {
         starts.first().map(|(i, _)| *i),
         ends.first().map(|(i, _)| *i),
     ))
+}
+
+/// Extract the content between `<!-- bb:managed-start -->` and
+/// `<!-- bb:managed-end -->` markers, trimmed. Returns the empty
+/// string when the block is malformed or missing markers.
+fn managed_body_trimmed(block: &str) -> &str {
+    block
+        .strip_prefix(MANAGED_START)
+        .and_then(|s| s.strip_prefix('\n'))
+        .and_then(|s| s.strip_suffix(MANAGED_END))
+        .map(|s| s.strip_suffix('\n').unwrap_or(s))
+        .map(|s| s.trim())
+        .unwrap_or("")
 }
 
 /// Snapshot a file to `~/.local/state/blackbox/backups/<ISO-ts>/<filename>`.
@@ -397,7 +428,7 @@ mod tests {
         .unwrap();
 
         let plan = plan_managed_patch(&p, "fresh").unwrap();
-        let backup = apply_managed_patch(&plan).unwrap();
+        let backup = apply_managed_patch(&plan, false).unwrap();
         assert!(backup.is_some(), "backup should be taken when file existed");
 
         let result = std::fs::read_to_string(&p).unwrap();
@@ -419,5 +450,117 @@ mod tests {
         assert!(global_target_path("codex").is_some());
         assert!(global_target_path("gemini").is_some());
         assert!(global_target_path("agents").is_some());
+    }
+
+    // ── clobber-guard tests ──
+
+    #[test]
+    fn test_empty_render_over_populated_managed_region_is_refused() {
+        let _env = crate::util::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backup_dir = root.join("backups");
+        unsafe {
+            std::env::set_var("BLACKBOX_BACKUP_DIR", &backup_dir);
+        }
+
+        let p = root.join("CLAUDE.md");
+        let existing_body = "# convention: use rustls, not openssl";
+        std::fs::write(
+            &p,
+            format!("preface\n\n{MANAGED_START}\n{existing_body}\n{MANAGED_END}\n\nepilogue\n"),
+        )
+        .unwrap();
+
+        // plan a Replace with an empty body (0 entries)
+        let plan = plan_managed_patch(&p, "").unwrap();
+        assert!(
+            matches!(plan, PatchPlan::Replace { .. }),
+            "should be a Replace, not {plan:?}"
+        );
+
+        // default (allow_empty=false) → refused
+        let err = apply_managed_patch(&plan, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Refusing to clobber"),
+            "error should mention clobber refusal: {msg}"
+        );
+        assert!(
+            msg.contains("CLAUDE.md"),
+            "error should name the file: {msg}"
+        );
+
+        // file must be unmodified
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains(existing_body), "managed body preserved");
+        assert!(after.contains("epilogue"), "user content preserved");
+
+        unsafe {
+            std::env::remove_var("BLACKBOX_BACKUP_DIR");
+        }
+    }
+
+    #[test]
+    fn test_allow_empty_overrides_clobber_guard() {
+        let _env = crate::util::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backup_dir = root.join("backups");
+        unsafe {
+            std::env::set_var("BLACKBOX_BACKUP_DIR", &backup_dir);
+        }
+
+        let p = root.join("CLAUDE.md");
+        std::fs::write(
+            &p,
+            format!("{MANAGED_START}\nold body\n{MANAGED_END}\n"),
+        )
+        .unwrap();
+
+        let plan = plan_managed_patch(&p, "").unwrap();
+        // allow_empty=true bypasses the guard
+        let backup = apply_managed_patch(&plan, true).unwrap();
+        assert!(backup.is_some());
+
+        let result = std::fs::read_to_string(&p).unwrap();
+        assert!(!result.contains("old body"), "old managed body replaced");
+        // The new block should have empty body between markers
+        assert!(result.contains(&format!("{MANAGED_START}\n\n{MANAGED_END}")));
+
+        unsafe {
+            std::env::remove_var("BLACKBOX_BACKUP_DIR");
+        }
+    }
+
+    #[test]
+    fn test_nonempty_render_still_succeeds() {
+        let _env = crate::util::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backup_dir = root.join("backups");
+        unsafe {
+            std::env::set_var("BLACKBOX_BACKUP_DIR", &backup_dir);
+        }
+
+        let p = root.join("CLAUDE.md");
+        std::fs::write(
+            &p,
+            format!("{MANAGED_START}\nold\n{MANAGED_END}\n"),
+        )
+        .unwrap();
+
+        // non-empty body → guard does not fire
+        let plan = plan_managed_patch(&p, "new content").unwrap();
+        let backup = apply_managed_patch(&plan, false).unwrap();
+        assert!(backup.is_some());
+
+        let result = std::fs::read_to_string(&p).unwrap();
+        assert!(result.contains("new content"));
+        assert!(!result.contains("\nold\n"));
+
+        unsafe {
+            std::env::remove_var("BLACKBOX_BACKUP_DIR");
+        }
     }
 }

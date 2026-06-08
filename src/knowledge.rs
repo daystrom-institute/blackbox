@@ -1854,7 +1854,7 @@ impl Knowledge {
                     common_plan.managed_block().unwrap_or("<no change>"),
                 ));
             } else {
-                let backup = crate::render::apply_managed_patch(&common_plan)?;
+                let backup = crate::render::apply_managed_patch(&common_plan, false)?;
                 let backup_str = backup
                     .map(|p| format!(" (backup: {})", p.display()))
                     .unwrap_or_default();
@@ -1902,7 +1902,7 @@ impl Knowledge {
                         plan.managed_block().unwrap_or("<no change>"),
                     ));
                 } else {
-                    let backup = crate::render::apply_managed_patch(&plan)?;
+                    let backup = crate::render::apply_managed_patch(&plan, false)?;
                     let backup_str = backup
                         .map(|p| format!(" (backup: {})", p.display()))
                         .unwrap_or_default();
