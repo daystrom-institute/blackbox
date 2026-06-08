@@ -42,7 +42,10 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -937,6 +940,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
                 desc: "select effort for next dispatch",
             },
             SlashCmd {
+                name: "/closeout",
+                desc: "fold the selected worktree back to the target branch",
+            },
+            SlashCmd {
                 name: "/help",
                 desc: "show keyboard shortcuts",
             },
@@ -1142,6 +1149,12 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
 /// inner views can swap the alternate screen between them without re-toggling it.
 fn run_tui_cockpit(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
     enable_raw_mode()?;
+    // Bracketed paste: a multi-line paste arrives as one `Event::Paste(text)`
+    // instead of a key-per-char stream punctuated by `Enter` keys — so pasting a
+    // prompt no longer fires one dispatch per embedded newline (the 16-phantom
+    // -agent storm). Best-effort: a terminal without bracketed-paste support just
+    // never emits the event.
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let result = (|| -> anyhow::Result<()> {
         loop {
             match run_roster_view(app, &signals)? {
@@ -1170,6 +1183,7 @@ fn run_tui_cockpit(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow:
         }
         Ok(())
     })();
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     disable_raw_mode()?;
     result
 }
@@ -1296,11 +1310,13 @@ fn inline_seed_viewport(app: &mut App, screen_w: u16, screen_h: u16) -> Rect {
 
 fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
     enable_raw_mode()?;
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = custom_terminal::Terminal::with_options(backend)?;
 
     let result = run_inline_view(app, &signals, &mut terminal, false);
 
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     disable_raw_mode()?;
     write!(terminal.backend_mut(), "\r\n")?;
     std::io::Write::flush(terminal.backend_mut())?;
@@ -1508,10 +1524,43 @@ fn poll_tui_input(app: &mut App) -> anyhow::Result<bool> {
                     return Ok(true);
                 }
             }
+            Event::Paste(text) => handle_paste(app, text),
             _ => {}
         }
     }
     Ok(false)
+}
+
+/// Insert bracketed-paste content into the composer as literal text. Newlines
+/// become soft newlines in the prompt (normalized to `\n`), NOT one dispatch per
+/// line — the whole point of enabling bracketed paste. Mirrors the slash/project
+/// cursor + history resets the per-char `KeyCode::Char` path does.
+fn handle_paste(app: &mut App, text: String) {
+    // A paste while the /help overlay is up just dismisses it (consistent with
+    // "any key dismisses help"); don't dump the paste into a hidden composer.
+    if app.help_visible {
+        app.help_visible = false;
+        return;
+    }
+    if splice_paste(&mut app.input, &mut app.cursor_pos, &text) {
+        app.history_cursor = None;
+        app.slash_cursor = 0;
+        app.project_cursor = 0;
+    }
+}
+
+/// Splice pasted `text` into a composer buffer at `cursor` (a byte index),
+/// normalizing `\r\n`/`\r` to `\n` so embedded newlines become soft newlines in
+/// the prompt rather than dispatch boundaries. Returns whether anything was
+/// inserted. Pure (no `App`) so the no-mass-dispatch invariant is unit-testable.
+fn splice_paste(input: &mut String, cursor: &mut usize, text: &str) -> bool {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.is_empty() {
+        return false;
+    }
+    input.insert_str(*cursor, &normalized);
+    *cursor += normalized.len();
+    true
 }
 
 fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
@@ -2028,7 +2077,12 @@ fn run_local_slash(app: &mut App) -> bool {
             open_config(app);
             true
         }
-        "/closeout" if app.zone == Zone::SingleAgent => {
+        // `/closeout` works from any zone: it folds the *selected* worktree, and
+        // `selected_agent()` resolves to the roster cursor outside SingleAgent. The
+        // daemon's managed-worktree guard fails closed if the selection isn't a
+        // managed fleet worktree, so an errant invocation surfaces a clear error
+        // rather than acting on the wrong tree.
+        "/closeout" => {
             run_closeout(app, arg);
             true
         }

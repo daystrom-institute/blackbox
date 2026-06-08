@@ -495,6 +495,37 @@ Trailing paragraph.";
     }
 
     #[test]
+    fn splice_paste_keeps_multiline_as_one_buffer() {
+        // The 16-phantom-dispatch regression: a multi-line paste must land as a
+        // single composer buffer with embedded soft newlines, NOT one dispatch
+        // per LF. We assert the buffer keeps every newline (the submit boundary
+        // is a separate Enter key, never a pasted newline) and the cursor lands
+        // at the end of the spliced text.
+        let mut input = String::new();
+        let mut cursor = 0usize;
+        let pasted = "line one\nline two\nline three";
+        assert!(super::splice_paste(&mut input, &mut cursor, pasted));
+        assert_eq!(input, pasted);
+        assert_eq!(input.matches('\n').count(), 2);
+        assert_eq!(cursor, pasted.len());
+
+        // CRLF / lone-CR normalize to LF (Windows clipboards / odd terminals).
+        let mut crlf = String::new();
+        let mut c2 = 0usize;
+        assert!(super::splice_paste(&mut crlf, &mut c2, "a\r\nb\rc"));
+        assert_eq!(crlf, "a\nb\nc");
+
+        // Splice respects the cursor position and an empty paste is a no-op.
+        let mut mid = "AZ".to_string();
+        let mut c3 = 1usize;
+        assert!(super::splice_paste(&mut mid, &mut c3, "BCD"));
+        assert_eq!(mid, "ABCDZ");
+        assert_eq!(c3, 4);
+        assert!(!super::splice_paste(&mut mid, &mut c3, ""));
+        assert_eq!(mid, "ABCDZ");
+    }
+
+    #[test]
     fn control_write_error_classes_are_detected() {
         // Broken-pipe class: local stdin gone.
         assert!(err_is_broken_pipe("steer: Broken pipe (os error 32)"));
