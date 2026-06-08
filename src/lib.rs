@@ -48,6 +48,7 @@ mod knowledge;
 mod lsp;
 pub(crate) mod macros;
 mod manifest;
+mod managed_worktrees;
 mod mcp_client;
 mod mcp_tools;
 mod migration;

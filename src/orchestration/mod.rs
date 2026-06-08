@@ -25,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Notify;
 
+use crate::managed_worktrees;
 use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{TranscriptCursor, TranscriptLocation};
 use providers::dispatch_prelude::*;
@@ -333,6 +334,9 @@ pub struct TaskInner {
     pub completed_at: Option<u64>,
     pub exit_code: Option<i32>,
     pub cwd: Option<String>,
+    /// Concrete cockpit-managed worktree root for this task, if its cwd sits
+    /// under a daemon-recognized managed worktree parent.
+    pub managed_worktree: Option<String>,
     /// Caller-supplied identity for the dispatched bro. Format:
     /// `<team>::<member>` for ensemble dispatch (carries which member
     /// of which team this task belongs to), bare `<brofile>` for
@@ -371,6 +375,9 @@ pub struct TaskInner {
     /// daemon restart and the fleet roster can group/tab tasks by
     /// source. See `bro_core::Origin` for the taxonomy.
     pub origin: bro_core::Origin,
+    /// True when a live workflow/atom owns this task's lifecycle and operator
+    /// closeout/interrupt should be confirm-gated.
+    pub workflow_owned: bool,
 }
 
 #[derive(Clone)]
@@ -482,6 +489,7 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         cost: inner.cost_usd,
         turns: inner.num_turns,
         cwd: inner.cwd.clone(),
+        managed_worktree: inner.managed_worktree.clone(),
         label: inner.bro_label.clone().or_else(|| inner.agent_label.clone()),
         session_id: (!inner.session_id.is_empty())
             .then(|| bro_core::SessionId::new(inner.session_id.clone())),
@@ -492,6 +500,7 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         model: model_from_events(&inner.events),
         last_event_at: Some(last_event_at),
         origin: inner.origin,
+        workflow_owned: inner.workflow_owned,
     }
 }
 
@@ -505,6 +514,10 @@ fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
             .and_then(|model| model.as_str())
             .map(|model| model.to_string())
     })
+}
+
+pub(crate) fn workflow_owned_for_origin(origin: bro_core::Origin) -> bool {
+    matches!(origin, bro_core::Origin::Workflow | bro_core::Origin::Atom)
 }
 
 /// Test-only Task constructor for store/prune unit tests. Private fields
@@ -528,6 +541,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             completed_at: Some(now_ms()),
             exit_code: Some(0),
             cwd: None,
+            managed_worktree: None,
             bro_label: None,
             agent_label: None,
             report: None,
@@ -537,6 +551,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
+            workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -654,6 +669,8 @@ struct PersistedTask {
     exit_code: Option<i32>,
     cwd: Option<String>,
     #[serde(default)]
+    managed_worktree: Option<String>,
+    #[serde(default)]
     bro_label: Option<String>,
     #[serde(default)]
     agent_label: Option<String>,
@@ -681,6 +698,8 @@ struct PersistedTask {
     /// failing to load.
     #[serde(default)]
     origin: bro_core::Origin,
+    #[serde(default)]
+    workflow_owned: Option<bool>,
 }
 
 impl TaskStore {
@@ -742,6 +761,7 @@ impl TaskStore {
                     completed_at: inner.completed_at,
                     exit_code: inner.exit_code,
                     cwd: inner.cwd.clone(),
+                    managed_worktree: inner.managed_worktree.clone(),
                     bro_label: inner.bro_label.clone(),
                     agent_label: inner.agent_label.clone(),
                     report: inner.report.clone(),
@@ -751,6 +771,7 @@ impl TaskStore {
                     live_cursor: inner.live_cursor,
                     supervision: inner.supervision.clone(),
                     origin: inner.origin,
+                    workflow_owned: Some(inner.workflow_owned),
                 }
             })
             .collect();
@@ -813,6 +834,7 @@ impl TaskStore {
                     completed_at: rec.completed_at,
                     exit_code: rec.exit_code,
                     cwd: rec.cwd,
+                    managed_worktree: rec.managed_worktree,
                     bro_label: rec.bro_label,
                     agent_label: rec.agent_label,
                     report: rec.report,
@@ -822,6 +844,9 @@ impl TaskStore {
                     live_cursor: rec.live_cursor,
                     supervision: rec.supervision,
                     origin: rec.origin,
+                    workflow_owned: rec
+                        .workflow_owned
+                        .unwrap_or_else(|| workflow_owned_for_origin(rec.origin)),
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -1404,6 +1429,7 @@ fn failed_duplicate_task(
             started_at: now_ms(),
             completed_at: Some(now_ms()),
             exit_code: None,
+            managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             cwd,
             bro_label,
             agent_label,
@@ -1414,6 +1440,7 @@ fn failed_duplicate_task(
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin,
+            workflow_owned: workflow_owned_for_origin(origin),
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -1475,6 +1502,7 @@ pub fn spawn_in_process_task(
             started_at: now_ms(),
             completed_at: None,
             exit_code: None,
+            managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             cwd,
             bro_label,
             agent_label,
@@ -1485,6 +1513,7 @@ pub fn spawn_in_process_task(
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin,
+            workflow_owned: workflow_owned_for_origin(origin),
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -2365,6 +2394,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     started_at: now_ms(),
                     completed_at: Some(now_ms()),
                     exit_code: None,
+                    managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
                     cwd,
                     bro_label: bro_label.clone(),
                     agent_label: agent_label.clone(),
@@ -2375,6 +2405,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     live_cursor: 0,
                     supervision: SupervisionState::default(),
                     origin,
+                    workflow_owned: workflow_owned_for_origin(origin),
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -2420,6 +2451,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             completed_at: None,
             exit_code: None,
             cwd: cwd.clone(),
+            managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             bro_label,
             agent_label,
             report: None,
@@ -2429,6 +2461,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin,
+            workflow_owned: workflow_owned_for_origin(origin),
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(pid),
@@ -3229,6 +3262,8 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
         last_message: inner.last_assistant_message.clone(),
         error,
         origin: inner.origin,
+        managed_worktree: inner.managed_worktree.clone(),
+        workflow_owned: inner.workflow_owned,
     }
 }
 
@@ -3562,6 +3597,112 @@ mod tests {
         assert!(TaskStatus::Cancelled.is_terminal());
     }
 
+    #[test]
+    fn spawn_in_process_task_sets_managed_worktree_metadata_from_cwd() {
+        let mut env = crate::util::TestEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let bro_home = root.join("bro-home");
+        env.set("BRO_HOME", &bro_home);
+
+        let managed = bro_home.join("fleet").join("worktrees").join("task-wt");
+        let managed_cwd = managed.join("src");
+        let unmanaged_cwd = root.join("outside").join("repo");
+        std::fs::create_dir_all(&managed_cwd).unwrap();
+        std::fs::create_dir_all(&unmanaged_cwd).unwrap();
+
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _) = tokio::sync::broadcast::channel(8);
+        let managed_task = spawn_in_process_task(
+            "task-managed".to_string(),
+            Provider::Glm,
+            "session-managed".to_string(),
+            Some(managed_cwd.to_string_lossy().into_owned()),
+            root.join("store"),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::Cockpit,
+        );
+        let managed_string = managed.to_string_lossy().into_owned();
+        assert_eq!(
+            managed_task.inner.lock().managed_worktree.as_deref(),
+            Some(managed_string.as_str())
+        );
+
+        let unmanaged_task = spawn_in_process_task(
+            "task-unmanaged".to_string(),
+            Provider::Glm,
+            "session-unmanaged".to_string(),
+            Some(unmanaged_cwd.to_string_lossy().into_owned()),
+            root.join("store"),
+            store,
+            tail_tx,
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::Cockpit,
+        );
+        assert!(unmanaged_task.inner.lock().managed_worktree.is_none());
+    }
+
+    #[test]
+    fn workflow_owned_metadata_reflects_origin() {
+        assert!(workflow_owned_for_origin(bro_core::Origin::Workflow));
+        assert!(workflow_owned_for_origin(bro_core::Origin::Atom));
+        assert!(!workflow_owned_for_origin(bro_core::Origin::Cockpit));
+        assert!(!workflow_owned_for_origin(bro_core::Origin::AgentDispatch));
+        assert!(!workflow_owned_for_origin(bro_core::Origin::Unknown));
+
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _) = tokio::sync::broadcast::channel(8);
+        let task = spawn_in_process_task(
+            "task-workflow-owned".to_string(),
+            Provider::Workflow,
+            "session-workflow-owned".to_string(),
+            None,
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            store,
+            tail_tx,
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::Workflow,
+        );
+        assert!(task.inner.lock().workflow_owned);
+    }
+
+    #[test]
+    fn task_metadata_survives_persist_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = TaskStore::new();
+        let task = test_task("task-meta", TaskStatus::Completed, Provider::Glm);
+        {
+            let mut inner = task.inner.lock();
+            inner.managed_worktree = Some("/tmp/managed/task-meta".to_string());
+            inner.origin = bro_core::Origin::Atom;
+            inner.workflow_owned = workflow_owned_for_origin(inner.origin);
+        }
+        store.insert("task-meta".to_string(), task).unwrap();
+        store.persist(&root);
+
+        let loaded = TaskStore::load(&root, u64::MAX);
+        let task = loaded.get("task-meta").expect("task should load");
+        let inner = task.inner.lock();
+        assert_eq!(
+            inner.managed_worktree.as_deref(),
+            Some("/tmp/managed/task-meta")
+        );
+        assert_eq!(inner.origin, bro_core::Origin::Atom);
+        assert!(inner.workflow_owned);
+    }
+
     fn task_with(status: TaskStatus, stderr: &str, events: Vec<Value>) -> Task {
         Task {
             inner: Mutex::new(TaskInner {
@@ -3579,6 +3720,7 @@ mod tests {
                 completed_at: Some(now_ms()),
                 exit_code: Some(1),
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -3588,6 +3730,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3906,6 +4049,7 @@ mod tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -3915,6 +4059,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3936,6 +4081,7 @@ mod tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -3945,6 +4091,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3984,6 +4131,7 @@ mod tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -3993,6 +4141,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4033,6 +4182,7 @@ mod tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4042,6 +4192,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4426,6 +4577,7 @@ mod tests {
                 completed_at: Some(5000),
                 exit_code: Some(0),
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4435,6 +4587,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4468,6 +4621,7 @@ mod tests {
                 completed_at: Some(2000),
                 exit_code: Some(1),
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4477,6 +4631,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4514,6 +4669,7 @@ mod tests {
                 completed_at: Some(2000),
                 exit_code: Some(0),
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4523,6 +4679,7 @@ mod tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4562,6 +4719,7 @@ mod tests {
             completed_at: None,
             exit_code: None,
             cwd: None,
+            managed_worktree: None,
             bro_label: None,
             agent_label: None,
             report: None,
@@ -4571,6 +4729,7 @@ mod tests {
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
+            workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
         };
 
         reject_forked_session(&mut inner, "forked-session");
@@ -4612,6 +4771,7 @@ mod tests {
             completed_at: None,
             exit_code: None,
             cwd: None,
+            managed_worktree: None,
             bro_label: None,
             agent_label: None,
             report: None,
@@ -4621,6 +4781,7 @@ mod tests {
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
+            workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
         };
 
         let sink = EventSink {
@@ -4674,6 +4835,7 @@ mod tests {
             completed_at: None,
             exit_code: None,
             cwd: Some("/repo/base".into()),
+            managed_worktree: None,
             bro_label: None,
             agent_label: None,
             report: None,
@@ -4683,6 +4845,7 @@ mod tests {
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
+            workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
         };
         let evt = serde_json::json!({
             "type": "user",
@@ -4724,6 +4887,7 @@ mod tests {
             completed_at: None,
             exit_code: None,
             cwd: Some("/repo/.bro-fleet-worktrees/wt".into()),
+            managed_worktree: None,
             bro_label: None,
             agent_label: None,
             report: None,
@@ -4733,6 +4897,7 @@ mod tests {
             live_cursor: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
+            workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
         };
         let evt = serde_json::json!({
             "type": "user",
@@ -4777,6 +4942,7 @@ mod async_tests {
                 completed_at: Some(now_ms()),
                 exit_code: Some(0),
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4786,6 +4952,7 @@ mod async_tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4813,6 +4980,7 @@ mod async_tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4822,6 +4990,7 @@ mod async_tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4855,6 +5024,7 @@ mod async_tests {
                 completed_at: Some(now_ms()),
                 exit_code: Some(0),
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4864,6 +5034,7 @@ mod async_tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4893,6 +5064,7 @@ mod async_tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4902,6 +5074,7 @@ mod async_tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4943,6 +5116,7 @@ mod async_tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                managed_worktree: None,
                 bro_label: None,
                 agent_label: None,
                 report: None,
@@ -4952,6 +5126,7 @@ mod async_tests {
                 live_cursor: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),

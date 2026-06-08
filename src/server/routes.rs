@@ -990,11 +990,7 @@ pub(crate) async fn control_closeout_handler(
     // Pass those store roots so the managed-worktree guard accepts the
     // worktrees the cockpit actually produces (without them, `/closeout`
     // refuses every real fleet worktree — dogfooding finding).
-    let bro_home = crate::util::bro_home_dir(&dirs::home_dir().unwrap_or_default());
-    let extra_managed_roots = [
-        bro_home.join("fleet").join("worktrees"),
-        bro_home.join("agent").join("worktrees"),
-    ];
+    let extra_managed_roots = crate::managed_worktrees::cockpit_managed_worktree_roots();
 
     // Shared pre-driver guard: managed-worktree, branch-prefix, detached-HEAD,
     // target resolution. The endpoint's target default is the base repo's
@@ -3262,7 +3258,11 @@ mod tests {
                 orchestration::TaskStatus::Running,
                 Provider::Glm,
             );
-            task_b.inner.lock().origin = bro_core::Origin::Workflow;
+            {
+                let mut inner = task_b.inner.lock();
+                inner.origin = bro_core::Origin::Workflow;
+                inner.workflow_owned = orchestration::workflow_owned_for_origin(inner.origin);
+            }
             store
                 .insert("task-workflow".to_string(), task_b)
                 .expect("insert task-workflow");
@@ -3310,5 +3310,50 @@ mod tests {
             Some("workflow"),
             "workflow-origin task must project as \"workflow\" on the roster"
         );
+    }
+
+    #[tokio::test]
+    async fn control_roster_surfaces_worktree_and_workflow_owned_metadata() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use bro_protocol::RosterSnapshotV1;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let task = orchestration::test_task(
+            "task-meta",
+            orchestration::TaskStatus::Running,
+            Provider::Workflow,
+        );
+        {
+            let mut inner = task.inner.lock();
+            inner.managed_worktree = Some("/tmp/managed/task-meta".to_string());
+            inner.origin = bro_core::Origin::Workflow;
+            inner.workflow_owned = orchestration::workflow_owned_for_origin(inner.origin);
+        }
+        state
+            .task_store
+            .write()
+            .insert("task-meta".to_string(), task)
+            .expect("insert task-meta");
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let snapshot: RosterSnapshotV1 = serde_json::from_slice(&body_bytes)
+            .expect("roster body must decode as RosterSnapshotV1");
+        let summary = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id.as_str() == "task-meta")
+            .expect("task-meta should be present");
+        assert_eq!(
+            summary.managed_worktree.as_deref(),
+            Some("/tmp/managed/task-meta")
+        );
+        assert!(summary.workflow_owned);
     }
 }

@@ -55,6 +55,13 @@ pub struct TaskSnapshot {
     /// snapshots serialized before the field existed.
     #[serde(default)]
     pub origin: Origin,
+    /// Concrete cockpit-managed worktree root for this task, when the task's cwd
+    /// is under one of the daemon-recognized managed worktree roots.
+    #[serde(default)]
+    pub managed_worktree: Option<String>,
+    /// True when a workflow or atom owns this task's lifecycle.
+    #[serde(default)]
+    pub workflow_owned: bool,
 }
 
 /// Summary DTO for one fleet task, projected by the daemon for the
@@ -101,6 +108,12 @@ pub struct RosterSummaryV1 {
     /// vs Dispatched vs Workflow vs Atom without re-deriving from labels.
     #[serde(default)]
     pub origin: Origin,
+    /// Concrete cockpit-managed worktree root for this task, when present.
+    #[serde(default)]
+    pub managed_worktree: Option<String>,
+    /// True when a workflow or atom owns this task's lifecycle.
+    #[serde(default)]
+    pub workflow_owned: bool,
 }
 
 /// Wire envelope for the `GET /control/roster` snapshot. The
@@ -207,12 +220,14 @@ mod tests {
             cost: Some(0.42),
             turns: Some(3),
             cwd: Some("/tmp/repo".to_string()),
+            managed_worktree: Some("/tmp/repo".to_string()),
             label: Some("team-x::member-y".to_string()),
             session_id: Some(SessionId::new("sess-1")),
             last_message_snippet: Some("Looking at the file…".to_string()),
             model: Some("claude-opus-4-6".to_string()),
             last_event_at: Some(1_700_000_000_000),
             origin: Origin::AgentDispatch,
+            workflow_owned: false,
         };
         let value = serde_json::to_value(&summary).unwrap();
         let obj = value.as_object().expect("summary must serialize as object");
@@ -225,12 +240,14 @@ mod tests {
             "cost",
             "turns",
             "cwd",
+            "managed_worktree",
             "label",
             "session_id",
             "last_message_snippet",
             "model",
             "last_event_at",
             "origin",
+            "workflow_owned",
         ] {
             assert!(
                 obj.contains_key(key),
