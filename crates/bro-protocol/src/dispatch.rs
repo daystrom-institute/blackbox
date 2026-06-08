@@ -206,6 +206,16 @@ pub enum CloseoutOutcome {
 ///   every changed path in the managed worktree (mirrors the tool's default).
 /// * `allow_branch_prefixes` — optional; the daemon defaults to
 ///   `["bro-fleet/"]` when absent. Detached HEAD always refuses.
+/// * `dry_run` — optional (`#[serde(default)]`, default `false`). When
+///   `true`, the driver runs `phase_preflight` for the supplied disposition
+///   and STOPS — no mutation. This replaces the older pattern of overloading
+///   `disposition = "preflight"`, which the phased driver did not recognize
+///   (caught every `--dry-run` in the cockpit with a `got preflight`
+///   failure). The cockpit's `/closeout <disposition> --dry-run` sends the
+///   REAL disposition (e.g. `publish`) with `dry_run = true`; the daemon
+///   runs preflight for that disposition, surfaces readiness without
+///   committing/pushing/merging, and returns. The non-dry-run path is
+///   byte-identical (default `false` ⇒ unchanged behavior).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloseoutRequest {
     pub worktree: String,
@@ -219,4 +229,8 @@ pub struct CloseoutRequest {
     pub paths: Vec<String>,
     #[serde(default)]
     pub allow_branch_prefixes: Option<Vec<String>>,
+    /// Non-mutating preflight for the supplied disposition. See struct
+    /// doc for the full contract.
+    #[serde(default)]
+    pub dry_run: bool,
 }

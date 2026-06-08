@@ -1014,6 +1014,7 @@ pub(crate) async fn control_closeout_handler(
     driver_req.confirm = req.confirm;
     driver_req.commit_message = req.commit_message.clone();
     driver_req.paths = req.paths.clone();
+    driver_req.dry_run = req.dry_run;
 
     let outcome = run_closeout_phases(&driver_req);
 
@@ -2895,6 +2896,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             allow_branch_prefixes: None,
+            dry_run: false,
         };
         let resp = control_closeout_handler(AxumState(state), axum::Json(req))
             .await
@@ -2921,6 +2923,7 @@ mod tests {
             commit_message: Some("test commit".to_string()),
             paths: vec![],
             allow_branch_prefixes: None,
+            dry_run: false,
         };
         let resp = control_closeout_handler(AxumState(state), axum::Json(req))
             .await
@@ -2946,6 +2949,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             allow_branch_prefixes: None,
+            dry_run: false,
         };
         let resp = control_closeout_handler(AxumState(state), axum::Json(req))
             .await

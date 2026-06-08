@@ -22,10 +22,15 @@ use bro_fleet_client::{CloseoutErrorClass, CloseoutOutcome, CloseoutPhase};
 #[derive(Debug, Clone)]
 pub(super) struct ParsedCloseout {
     pub disposition: String,
-    /// `--dry-run` ⇒ disposition is overridden to `"preflight"` (never
-    /// mutates) and `confirm` is forced to `false`; the user-supplied
-    /// disposition is preserved for the result message so the operator
-    /// sees what they asked for.
+    /// `--dry-run` ⇒ the daemon runs preflight for the typed `disposition`
+    /// and stops (no mutation). The operator's typed disposition is sent
+    /// verbatim (e.g. `publish`); the request also carries `dry_run: true`.
+    /// This replaces the older pattern of overloading `disposition =
+    /// "preflight"`, which the phased driver did not recognize (Phase 1 of
+    /// the closeout-command decomposition dropped the `preflight` arm from
+    /// `phase_preflight`; the legacy `exit_worktree` tool still maps it to
+    /// its own publish-only readiness report, but the daemon /control/closeout
+    /// handler runs the phased driver).
     pub dry_run: bool,
     /// `Some(branch)` if `--target <branch>` was supplied; `None` lets the
     /// daemon default to the base repo's CURRENT branch.
@@ -33,7 +38,10 @@ pub(super) struct ParsedCloseout {
     /// `true` for any mutating disposition (`discard`/`publish`/`merge`/
     /// `adopt`). The typed `/closeout` command IS the confirmation, so the
     /// `confirm` flag is set automatically — matches the daemon handler's
-    /// gate (`control_closeout_handler`).
+    /// gate (`control_closeout_handler`). `confirm` is independent of
+    /// `dry_run`: both are required so the daemon's mutation gate passes
+    /// and the dry-run short-circuit still runs preflight for the typed
+    /// disposition.
     pub confirm: bool,
 }
 
@@ -136,23 +144,21 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
         ));
     }
 
-    // `--dry-run` overrides disposition to the non-mutating preflight read.
-    // We deliberately keep the operator's typed disposition on the parsed
-    // result so the render-thread status line shows what they asked for
-    // (e.g. "preflight of publish: ready"), and stamp `sent_disposition`
-    // with the actual preflight at install time.
-    let effective_disposition = if dry_run {
-        "preflight".to_string()
-    } else {
-        disposition.clone()
-    };
+    // `--dry-run` keeps the operator's typed disposition on the parsed
+    // result (so the wire DTO sends `publish`/`adopt`/... with
+    // `dry_run: true`) and stamps `dry_run = true`. The phased driver
+    // runs preflight for the typed disposition and stops; non-dry-run
+    // path is byte-identical. The render-thread status line uses the
+    // local `verb` (`"preflight"` on dry-run) so the operator still
+    // sees `/closeout preflight on <worktree>…` regardless of what
+    // disposition they typed.
     let confirm = matches!(
-        effective_disposition.as_str(),
+        disposition.as_str(),
         "discard" | "publish" | "merge" | "adopt"
     );
 
     Ok(ParsedCloseout {
-        disposition: effective_disposition,
+        disposition,
         dry_run,
         target,
         confirm,
@@ -184,6 +190,9 @@ fn build_request(parsed: &ParsedCloseout, worktree: &str) -> bro_fleet_client::C
         commit_message: None,
         paths: Vec::new(),
         allow_branch_prefixes: None,
+        // Stamped verbatim from the parsed command. The daemon's phased
+        // driver short-circuits to preflight-only when this is true.
+        dry_run: parsed.dry_run,
     }
 }
 
@@ -377,6 +386,9 @@ fn spawn_adopt_retry(app: &mut App, worktree: String, target: Option<String>) {
         commit_message: None,
         paths: Vec::new(),
         allow_branch_prefixes: None,
+        // The post-rebase-reconciliation retry is a real adopt run, not
+        // a dry-run; the daemon's phased driver runs the full sequence.
+        dry_run: false,
     };
     let orch = app.orch.clone();
     let tx = app.closeout_tx.clone();
@@ -539,11 +551,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_closeout_dry_run_overrides_disposition() {
+    fn parse_closeout_dry_run_preserves_disposition_and_stamps_dry_run() {
+        // The phased driver recognizes the REAL disposition (publish/merge/
+        // adopt/discard); we stamp dry_run=true on the wire DTO and let the
+        // daemon short-circuit to preflight. Replacing the older override-
+        // to-"preflight" pattern, which `phase_preflight` did not recognize
+        // (the Phase 1 decomposition dropped the `preflight` arm).
         let p = parsed("publish --dry-run");
-        assert_eq!(p.disposition, "preflight", "dry-run ⇒ preflight");
+        assert_eq!(p.disposition, "publish", "typed disposition is preserved");
         assert!(p.dry_run);
-        assert!(!p.confirm, "preflight is not mutating");
+        // confirm is based on the typed disposition, not on dry_run. The
+        // daemon's confirm gate (`publish requires confirm=true`) still
+        // needs to pass even on a dry-run; the dry-run flag is what stops
+        // mutation, not the confirm flag.
+        assert!(p.confirm, "publish is mutating; confirm stays true");
+    }
+
+    #[test]
+    fn parse_closeout_dry_run_adopt_preserves_adopt() {
+        let p = parsed("adopt --dry-run");
+        assert_eq!(p.disposition, "adopt");
+        assert!(p.dry_run);
+        assert!(p.confirm);
+    }
+
+    #[test]
+    fn parse_closeout_dry_run_discard_preserves_discard() {
+        let p = parsed("discard --dry-run");
+        assert_eq!(p.disposition, "discard");
+        assert!(p.dry_run);
+        assert!(p.confirm);
     }
 
     #[test]
@@ -611,6 +648,26 @@ mod tests {
             assert!(req.commit_message.is_none());
             assert!(req.paths.is_empty());
             assert!(req.allow_branch_prefixes.is_none());
+            assert!(!req.dry_run, "dry_run defaults to false on the non-dry-run path");
+        }
+    }
+
+    #[test]
+    fn build_request_stamps_dry_run_for_publish_adopt_discard() {
+        // `--dry-run` no longer overrides disposition — the typed disposition
+        // roundtrips, and the wire DTO carries `dry_run: true` to tell the
+        // daemon's phased driver to short-circuit to preflight-only.
+        for disp in ["publish", "merge", "adopt", "discard"] {
+            let parsed = ParsedCloseout {
+                disposition: disp.to_string(),
+                dry_run: true,
+                target: None,
+                confirm: true,
+            };
+            let req = build_request(&parsed, "/tmp/wt");
+            assert_eq!(req.disposition, disp, "disposition roundtrips for {disp} --dry-run");
+            assert!(req.dry_run, "dry_run is stamped for {disp} --dry-run");
+            assert!(req.confirm, "confirm stays true on dry-run for mutating {disp}");
         }
     }
 
@@ -631,10 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn render_outcome_dry_run_preflight_says_preflight() {
+    fn render_outcome_dry_run_says_preflight_of_typed_disposition() {
+        // The wire DTO now sends the typed disposition (e.g. "publish") with
+        // `dry_run: true`; the renderer prefixes the message so the operator
+        // sees what they asked for. No more "preflight of preflight".
         let outcome = CloseoutOutcome::Success { phases: vec![] };
-        let line = render_outcome("preflight", true, &outcome);
-        assert!(line.contains("preflight of preflight: ready"), "{line}");
+        let line = render_outcome("publish", true, &outcome);
+        assert!(line.contains("preflight of publish: ready"), "{line}");
     }
 
     #[test]

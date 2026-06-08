@@ -330,6 +330,14 @@ pub enum CloseoutOutcome {
 /// `ExitWorktreeInput` (or, later, by the daemon /control/closeout endpoint
 /// from a `CloseoutRequest` DTO). `disposition` is `"publish"`, `"merge"`,
 /// `"adopt"`, or `"discard"`.
+///
+/// `dry_run` short-circuits the driver to run `phase_preflight` for the
+/// supplied disposition and STOP — no `stage_commit`, no `ff_base`, no
+/// `rebase`, no `ff_merge`, no `push`, no `remove`. This replaces the
+/// pre-Phase-1 `disposition = "preflight"` overload, which the phased
+/// driver did not recognize (it was dropped with the rest of the Phase 1
+/// decomposition; the legacy `exit_worktree` tool still maps it to a
+/// publish-only readiness report). The non-`dry_run` path is unchanged.
 #[derive(Debug, Clone)]
 pub struct CloseoutRequest {
     pub worktree: PathBuf,
@@ -340,6 +348,9 @@ pub struct CloseoutRequest {
     pub confirm: bool,
     pub commit_message: Option<String>,
     pub paths: Vec<String>,
+    /// When `true`, run only `phase_preflight` for `disposition` and
+    /// return its result without mutating. See struct doc.
+    pub dry_run: bool,
 }
 
 /// Resolved target for the closeout driver: either the caller-supplied
@@ -435,6 +446,7 @@ pub fn prepare_closeout_request(
         confirm: false,
         commit_message: None,
         paths: Vec::new(),
+        dry_run: false,
     })
 }
 
@@ -442,7 +454,30 @@ pub fn prepare_closeout_request(
 /// `PhaseResult`; the driver stops and returns `CloseoutOutcome::Failed` on
 /// the first failing phase, or `CloseoutOutcome::Success` with the full
 /// per-phase sequence if every phase completes.
+///
+/// `req.dry_run == true` short-circuits to preflight-only: run
+/// `phase_preflight` for the supplied disposition and return that single
+/// `PhaseResult` (success or failure). No `stage_commit`, no `ff_base`, no
+/// `rebase`, no `ff_merge`, no `push`, no `remove`. The preflight for the
+/// real disposition IS the read-only readiness check the cockpit wants;
+/// this replaces the older `disposition = "preflight"` overload (which
+/// `phase_preflight` did not recognize after the Phase 1 decomposition and
+/// which caused every `/closeout --dry-run` to fail with
+/// `disposition must be keep, preflight, discard, publish, merge, or
+/// adopt; got preflight`).
 pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
+    // Dry-run: run preflight for the real disposition and STOP. Return as a
+    // single-phase result so the cockpit's renderer can still surface the
+    // phase label and content. Non-dry-run path below is byte-identical.
+    if req.dry_run {
+        let preflight = phase_preflight(req);
+        return if preflight.ok {
+            CloseoutOutcome::Success { phases: vec![preflight] }
+        } else {
+            CloseoutOutcome::Failed(preflight)
+        };
+    }
+
     let mut results: Vec<PhaseResult> = Vec::new();
 
     // Phase 1: preflight (always runs; disposition-specific readiness).
@@ -1188,6 +1223,7 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             req.confirm = args.confirm;
             req.commit_message = args.commit_message.clone();
             req.paths = args.paths.clone();
+            req.dry_run = false;
             let outcome = run_closeout_phases(&req);
             render_closeout_outcome(outcome, "discard", &branch, &target, &worktree)
         }
@@ -1199,6 +1235,7 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             req.confirm = args.confirm;
             req.commit_message = args.commit_message.clone();
             req.paths = args.paths.clone();
+            req.dry_run = false;
             let outcome = run_closeout_phases(&req);
             render_closeout_outcome(outcome, "publish", &branch, &target, &worktree)
         }
@@ -1210,6 +1247,7 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             req.confirm = args.confirm;
             req.commit_message = args.commit_message.clone();
             req.paths = args.paths.clone();
+            req.dry_run = false;
             let outcome = run_closeout_phases(&req);
             render_closeout_outcome(outcome, disposition, &branch, &target, &worktree)
         }
@@ -2154,6 +2192,7 @@ mod tests {
             confirm: true,
             commit_message: None,
             paths: vec![],
+            dry_run: false,
         };
         let outcome = run_closeout_phases(&req);
         let results = match outcome {
@@ -2290,6 +2329,7 @@ mod tests {
             confirm: true,
             commit_message: None,
             paths: vec![],
+            dry_run: false,
         };
         let outcome = run_closeout_phases(&req);
         let failed = match outcome {
@@ -2314,6 +2354,189 @@ mod tests {
 
         // Cleanup: abort the in-progress rebase, then tear down.
         let _ = run_git(&cwd, &["rebase", "--abort"]);
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    /// Regression (cockpit `/closeout --dry-run` is broken without this).
+    ///
+    /// The Phase 1 closeout-command decomposition dropped the `preflight`
+    /// arm from `phase_preflight` (the phased driver only knows about
+    /// `discard | publish | merge | adopt`), but the cockpit's
+    /// `parse_closeout` was still overloading `disposition = "preflight"`
+    /// to signal a dry-run. Result: every `/closeout <real> --dry-run`
+    /// hit `phase_preflight`'s catch-all and returned
+    /// `disposition must be keep, preflight, discard, publish, merge, or
+    /// adopt; got preflight`.
+    ///
+    /// The fix: the wire DTO carries a dedicated `dry_run: bool`. The
+    /// phased driver short-circuits to preflight-only for the typed
+    /// disposition and stops — no `stage_commit`, no `ff_base`, no
+    /// `rebase`, no `ff_merge`, no `push`, no `remove`. This test
+    /// exercises that path end-to-end on a real worktree with a
+    /// committed branch ahead of target: the driver must return
+    /// `Success` with a single `Preflight` phase (carrying
+    /// `branch_commits_ahead = 1`), the worktree must still exist, and
+    /// the base/target must not have moved (no `ff_base`).
+    #[tokio::test]
+    async fn run_closeout_phases_dry_run_returns_preflight_only_and_mutates_nothing() {
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let branch = value["branch"].as_str().unwrap().to_string();
+        // Commit ahead of target on the worktree branch.
+        std::fs::write(cwd.join("README.md"), "base\nworktree-commit\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+        // Snapshot the base target head so we can prove it didn't move.
+        let base_head_before = git_capture(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: branch.clone(),
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: true,
+        };
+        let outcome = run_closeout_phases(&req);
+        let results = match outcome {
+            CloseoutOutcome::Success { phases: r } => r,
+            CloseoutOutcome::Failed(r) => panic!(
+                "dry-run preflight should succeed for a clean worktree ahead of target; \
+                 got failed phase {:?} with error_class {:?}: {}",
+                r.phase,
+                r.error_class,
+                r.content
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            ),
+        };
+
+        // Dry-run must return a SINGLE Preflight phase — no stage_commit,
+        // no ff_base, no rebase, no ff_merge, no push, no remove. This is
+        // the byte-level contract the cockpit's renderer relies on (one
+        // phase ⇒ it doesn't try to render a head / removed_worktree tail).
+        let phases: Vec<CloseoutPhase> = results.iter().map(|r| r.phase).collect();
+        assert_eq!(
+            phases,
+            vec![CloseoutPhase::Preflight],
+            "dry-run must run only preflight; got {phases:?}"
+        );
+        // Preflight must surface the branch_commits_ahead count (the
+        // same content the non-dry-run merge/adopt path returns).
+        let preflight = &results[0];
+        assert!(preflight.ok, "preflight must be ok: {:?}", preflight.content);
+        assert_eq!(preflight.content["branch_commits_ahead"], json!(1));
+
+        // Capture the worktree's new HEAD (the commit the dry-run would
+        // have pushed). After dry-run, origin's main MUST NOT match this
+        // — the dry-run is read-only.
+        let worktree_head = git_capture(&cwd, &["rev-parse", "HEAD"]).unwrap();
+
+        // MUTATION INVARIANTS — dry-run must not:
+        // 1. remove the worktree
+        assert!(cwd.exists(), "dry-run must not remove the worktree");
+        // 2. move the base target's head (no ff_base, no push)
+        let base_head_after = git_capture(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            base_head_before, base_head_after,
+            "dry-run must not fast-forward the base target branch"
+        );
+        // 3. push the worktree commit to origin (no push). The base and
+        //    origin were seeded to the same commit before the worktree
+        //    commit landed, so `origin_main == base_head_before` at start
+        //    and must still equal `base_head_before` after — the worktree
+        //    commit (`worktree_head`) must NOT have reached origin.
+        let origin_main = git_capture(origin.path(), &["rev-parse", "refs/heads/main"])
+            .unwrap_or_default();
+        assert_eq!(
+            origin_main, base_head_before,
+            "origin should still be on the pre-dry-run base head; the worktree commit must NOT have been pushed"
+        );
+        assert_ne!(
+            worktree_head, base_head_before,
+            "the worktree commit should not equal the base head (sanity check on test setup)"
+        );
+
+        // Cleanup.
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    /// Companion to the above: dry-run on publish without a
+    /// `commit_message` must surface the same preflight bail the
+    /// non-dry-run publish path returns. The driver still has to refuse
+    /// (with `publish requires commit_message`) — just without
+    /// progressing past preflight.
+    #[tokio::test]
+    async fn run_closeout_phases_dry_run_publish_without_message_fails_in_preflight() {
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let branch = value["branch"].as_str().unwrap().to_string();
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: branch.clone(),
+            target: "main".to_string(),
+            disposition: "publish".to_string(),
+            confirm: true,
+            // commit_message intentionally absent — preflight must refuse.
+            commit_message: None,
+            paths: vec![],
+            dry_run: true,
+        };
+        let outcome = run_closeout_phases(&req);
+        let failed = match outcome {
+            CloseoutOutcome::Failed(r) => r,
+            CloseoutOutcome::Success { phases: rs } => panic!(
+                "dry-run publish without commit_message must fail in preflight; got phases: {:?}",
+                rs.iter().map(|r| r.phase).collect::<Vec<_>>()
+            ),
+        };
+        assert_eq!(failed.phase, CloseoutPhase::Preflight);
+        assert_eq!(failed.error_class, CloseoutErrorClass::Other);
+        assert!(
+            failed.content["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("commit_message")),
+            "preflight must surface commit_message gate; got: {:?}",
+            failed.content
+        );
+        // Worktree must still exist (preflight is read-only on disk).
+        assert!(cwd.exists(), "dry-run failure must not remove the worktree");
+
+        // Cleanup.
         run_git(
             repo.path(),
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
@@ -2352,6 +2575,7 @@ mod tests {
             confirm: true,
             commit_message: None,
             paths: vec![],
+            dry_run: false,
         };
         let rebase = phase_rebase(&req);
         assert!(rebase.ok, "setup rebase failed: {:?}", rebase.content);
@@ -2441,6 +2665,7 @@ mod tests {
             confirm: true,
             commit_message: None,
             paths: vec![],
+            dry_run: false,
         };
         let rebase = phase_rebase(&req);
         assert!(rebase.ok, "setup rebase failed: {:?}", rebase.content);
