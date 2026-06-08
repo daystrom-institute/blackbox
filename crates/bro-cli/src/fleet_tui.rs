@@ -1067,12 +1067,18 @@ fn complete_project(app: &mut App) {
 
 pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_config_with_daemon_url(daemon_url)?);
+    // File-only logging + terminal-restoring panic hook before we take the
+    // terminal. The status poller and the reload reconcile pass below log here.
+    crate::logging::init_cockpit_logging(orch.store_dir());
     let mut app = App::new(orch.clone(), cwd, tokio::runtime::Handle::current());
 
-    // Repopulate from prior fleet sessions persisted on disk (crashed/orphaned
-    // ones came back as recoverable → Interrupted). Reloaded agents have no live
-    // stdin, so they're viewable but not steerable until resumed.
-    for handle in orch.tasks() {
+    // Repopulate from prior fleet sessions persisted on disk. `load` flips every
+    // prior `Running` task to recoverable/Interrupted, but the daemon may still
+    // be running it (only the cockpit restarted) — so reconcile each recoverable
+    // task against the daemon: still-live ones get their status restored and a
+    // fresh poller re-attached (steerable again); genuinely-orphaned ones stay
+    // Interrupted. This is the reload half of the poller-death fix.
+    for handle in orch.reconcile_reloaded().await {
         let snap = handle.snapshot();
         let name = snap.name.clone().unwrap_or_else(|| "(session)".to_string());
         // Hidden classifier-companion sessions never surface in the roster.
@@ -1116,6 +1122,7 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
 
 pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_agent_config()?);
+    crate::logging::init_cockpit_logging(orch.store_dir());
     let mut app = App::new_with_mode(
         orch.clone(),
         launch.cwd.clone(),

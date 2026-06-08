@@ -32,6 +32,10 @@ futures-util = "0.3"
 ratatui-core = "0.1"
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 tracing = "0.1"
+# Cockpit logging: file-only rolling subscriber (a TUI cannot log to stderr
+# without corrupting the alt-screen), mirroring the daemon's startup idiom.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 tui-markdown = "0.3"
 # Style-preserving word wrapping (codex wrapping.rs technique). flatten -> wrap
 # -> re-slice spans by byte range so styles survive wrap boundaries.

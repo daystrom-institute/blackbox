@@ -197,7 +197,7 @@ impl BlackboxServer {
             let mut inner = task.inner.lock();
             inner.report = Some(report.clone());
         }
-        self.state.task_store.read().persist(&self.state.store_dir);
+        crate::orchestration::request_persist(&self.state.task_store, &self.state.store_dir);
 
         Self::ok_json(&json!({
             "taskId": p.task_id,

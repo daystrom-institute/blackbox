@@ -237,6 +237,12 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         )),
     });
 
+    // Start the single-writer task-store persist actor (control-plane starvation
+    // fix). Hot paths now signal `request_persist` instead of doing a blocking
+    // `task_store.read().persist(dir)` on a tokio worker. Production only — tests
+    // build SharedState via `for_test` and keep the synchronous fallback.
+    orchestration::init_task_persister(shared.task_store.clone(), shared.store_dir.clone());
+
     Ok(OpenedServer {
         cfg,
         shared,

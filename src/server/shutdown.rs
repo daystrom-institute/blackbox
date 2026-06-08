@@ -103,7 +103,8 @@ fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
     // Tear down long-lived LSP sessions before persistence so JDTLS and friends
     // get a chance to write workspace caches and exit cleanly.
     shared.lsp_sessions.shutdown_all();
-    shared.task_store.read().persist(&store_dir);
+    // Block until durable: shutdown must not race the persist actor's thread.
+    crate::orchestration::flush_persist_blocking(&shared.task_store, &store_dir);
     flush_vectors_with_timeout();
 }
 

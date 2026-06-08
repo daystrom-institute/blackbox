@@ -489,6 +489,8 @@ dependencies = [
  "textwrap",
  "tokio",
  "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "tui-markdown",
  "two-face",
  "unicode-width 0.2.0",

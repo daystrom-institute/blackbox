@@ -41,6 +41,7 @@ use serde::Deserialize;
 mod council_tui;
 mod fleet_classifier;
 mod fleet_tui;
+mod logging;
 #[cfg(test)]
 mod test_backend;
 use bro_transcript::{

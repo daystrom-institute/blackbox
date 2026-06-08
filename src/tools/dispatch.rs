@@ -1583,14 +1583,21 @@ output_schema: None,
                 })
                 .collect()
         } else {
-            let mut store = self.state.task_store.write();
-            // retain_drop keeps tasks for which the predicate is true, so
-            // keep = NOT a prune match.
-            let dropped = store.retain_drop(|t| {
-                let inner = t.inner.lock();
-                !matches_filter(&inner)
-            });
-            store.persist(&self.state.store_dir);
+            let dropped = {
+                let mut store = self.state.task_store.write();
+                // retain_drop keeps tasks for which the predicate is true, so
+                // keep = NOT a prune match.
+                store.retain_drop(|t| {
+                    let inner = t.inner.lock();
+                    !matches_filter(&inner)
+                })
+            };
+            // Persist AFTER dropping the write guard, off the async worker —
+            // never hold the store write lock across the file write.
+            crate::orchestration::request_persist(
+                &self.state.task_store,
+                &self.state.store_dir,
+            );
             dropped
         };
 

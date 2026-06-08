@@ -1095,13 +1095,52 @@ fn spawn_daemon_status_poller(
     tokio::spawn(async move {
         let mut last_event_count = 0usize;
         let mut terminal_sent = false;
+        // Consecutive failed polls (transport error or status-parse panic) since
+        // the last good one. Bounds a zombie poller: if the daemon has genuinely
+        // lost the task (it restarted, or the task was pruned) every poll fails
+        // forever, so after a sustained window we stop and mark the mirror
+        // recoverable — a fresh launch's `reconcile_reloaded` pass is the
+        // recovery path. ~3 min at 750ms: long enough to ride out a daemon
+        // briefly CPU-starved by an in-process build, short enough not to 404 in
+        // a tight loop indefinitely.
+        let mut consecutive_failures: u32 = 0;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 240;
+        tracing::debug!(task_id = %task_id, "fleet status poller started");
         loop {
             let status = client
                 .get_json(&format!("/control/status/{task_id}?tail=200"))
                 .await;
             match status {
                 Ok(value) => {
-                    let terminal = update_daemon_task(&task, &value, &mut last_event_count);
+                    consecutive_failures = 0;
+                    // The parse walks untrusted daemon JSON (arbitrary event
+                    // shapes from any provider). A panic here used to kill the
+                    // poller task silently and freeze THIS agent's roster row
+                    // forever while the rest of the cockpit stayed live — the
+                    // "poller death" defect. Isolate it: a bad event costs one
+                    // poll, not the whole liveness loop. parking_lot does not
+                    // poison on unwind, so the next poll re-locks cleanly. (The
+                    // workspace pins `panic = "unwind"`, so catch_unwind works.)
+                    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        update_daemon_task(&task, &value, &mut last_event_count)
+                    }));
+                    let terminal = match parsed {
+                        Ok(terminal) => terminal,
+                        Err(_) => {
+                            tracing::error!(
+                                task_id = %task_id,
+                                "fleet status poller panicked parsing daemon status; \
+                                 skipped this poll, poller stays alive"
+                            );
+                            // Loud but TUI-safe: surface into the agent's own
+                            // stderr (rendered in the detail view).
+                            let mut inner = task.inner.lock();
+                            inner.stderr = "[poller] recovered from a panic parsing daemon \
+                                            status (this poll skipped; live tracking continues)"
+                                .to_string();
+                            false
+                        }
+                    };
                     if terminal && !terminal_sent {
                         terminal_sent = true;
                         let inner = task.inner.lock();
@@ -1136,12 +1175,44 @@ fn spawn_daemon_status_poller(
                     }
                 }
                 Err(err) => {
-                    let mut inner = task.inner.lock();
-                    inner.stderr = err.to_string();
+                    consecutive_failures += 1;
+                    // Loud on the first failure, then sparse — both to the log
+                    // and into the agent's own stderr (detail view).
+                    if consecutive_failures == 1 || consecutive_failures.is_multiple_of(40) {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            failures = consecutive_failures,
+                            "fleet status poller: /control/status failed: {err:#}"
+                        );
+                        let mut inner = task.inner.lock();
+                        inner.stderr =
+                            format!("[poller] /control/status failing ({consecutive_failures}×): {err}");
+                    }
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        tracing::error!(
+                            task_id = %task_id,
+                            failures = consecutive_failures,
+                            "fleet status poller giving up; daemon lost the task or is \
+                             unreachable. Marking recoverable."
+                        );
+                        let mut inner = task.inner.lock();
+                        inner.status = TaskStatus::Failed;
+                        inner.recoverable = true;
+                        inner.completed_at = Some(now_ms());
+                        inner.stderr = format!(
+                            "[poller] gave up after {consecutive_failures} consecutive \
+                             /control/status failures — daemon lost the task or is \
+                             unreachable. Resume to re-attach a live session."
+                        );
+                        drop(inner);
+                        task.notify.notify_waiters();
+                        break;
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(750)).await;
         }
+        tracing::debug!(task_id = %task_id, "fleet status poller exited");
     });
 }
 
@@ -1370,6 +1441,117 @@ impl FleetOrchestrator {
 
     pub fn store_dir(&self) -> &std::path::Path {
         &self.store_dir
+    }
+
+    /// Reconcile reloaded sessions against the daemon once at cockpit startup —
+    /// the live-tracking-aware replacement for a bare [`tasks`](Self::tasks)
+    /// enumeration on launch.
+    ///
+    /// [`TaskStore::load`] eagerly flips every persisted `Running` task to
+    /// `Failed`+recoverable ("Interrupted"). Under the in-process model that is
+    /// often wrong: the daemon may STILL be running the agent and only the
+    /// cockpit restarted. Without reconciliation those agents show frozen at
+    /// their last-persisted state forever and have no poller — the reload half
+    /// of the "poller death" defect. This pass asks the daemon for the truth of
+    /// each recoverable task:
+    ///
+    /// * daemon `Running`/`Pending` → restore the mirror to live (status back to
+    ///   running, `recoverable` cleared, `completed_at` cleared), attach a fresh
+    ///   status poller, and hand back a **steerable** handle (`daemon: Some`).
+    ///   This is what restores live tracking across a cockpit reload.
+    /// * daemon terminal → adopt that final status (it finished while the cockpit
+    ///   was down); not recoverable, not steerable.
+    /// * daemon unknown / unreachable → leave it Interrupted (genuinely orphaned
+    ///   — the daemon also restarted, or the task was pruned); resume to recover.
+    ///
+    /// Tasks already terminal at load are returned as-is with no round-trip.
+    pub async fn reconcile_reloaded(&self) -> Vec<AgentHandle> {
+        let all = self.task_store.read().all_tasks();
+        let mut out: Vec<AgentHandle> = Vec::with_capacity(all.len());
+        let mut probes = tokio::task::JoinSet::new();
+        for task in all {
+            // Only tasks the loader marked recoverable (i.e. were Running at
+            // persist) need a daemon round-trip; everything else is already a
+            // settled terminal/historical row.
+            if task.inner.lock().recoverable {
+                let client = self.daemon.clone();
+                probes.spawn(async move {
+                    let id = task.id();
+                    let status = client
+                        .get_json(&format!("/control/status/{id}?tail=200"))
+                        .await;
+                    (task, status)
+                });
+            } else {
+                out.push(AgentHandle { task, daemon: None });
+            }
+        }
+
+        while let Some(joined) = probes.join_next().await {
+            let Ok((task, status)) = joined else {
+                // A probe task itself panicked/cancelled — treat as unreachable.
+                continue;
+            };
+            let id = task.id();
+            match status {
+                Ok(value) => {
+                    // Same untrusted-JSON parse as the live poller; isolate it so
+                    // one bad reloaded snapshot can't abort the whole reconcile.
+                    let mut dummy = 0usize;
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        update_daemon_task(&task, &value, &mut dummy)
+                    }));
+                    let still_running = {
+                        let mut inner = task.inner.lock();
+                        // The daemon's verdict is authoritative now — this is no
+                        // longer an unknown-fate orphan either way.
+                        let running =
+                            matches!(inner.status, TaskStatus::Running | TaskStatus::Pending);
+                        inner.recoverable = false;
+                        if running {
+                            inner.completed_at = None;
+                        }
+                        running
+                    };
+                    if still_running {
+                        tracing::info!(
+                            task_id = %id,
+                            "reconcile: daemon still running this reloaded task; \
+                             re-attaching live poller"
+                        );
+                        spawn_daemon_status_poller(
+                            self.daemon.clone(),
+                            task.clone(),
+                            self.tail_tx.clone(),
+                            id.clone(),
+                        );
+                        out.push(AgentHandle {
+                            task,
+                            daemon: Some(DaemonAgentHandle {
+                                client: self.daemon.clone(),
+                                task_id: id,
+                            }),
+                        });
+                    } else {
+                        tracing::info!(
+                            task_id = %id,
+                            "reconcile: reloaded task is terminal on the daemon; \
+                             adopted final status"
+                        );
+                        out.push(AgentHandle { task, daemon: None });
+                    }
+                }
+                Err(err) => {
+                    tracing::info!(
+                        task_id = %id,
+                        "reconcile: daemon has no live status ({err:#}); leaving interrupted"
+                    );
+                    // Leave Failed+recoverable exactly as `load` set it.
+                    out.push(AgentHandle { task, daemon: None });
+                }
+            }
+        }
+        out
     }
 
     /// Spawn a new top-level entrypoint agent over the daemon control plane.

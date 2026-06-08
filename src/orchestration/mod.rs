@@ -14,6 +14,7 @@ pub mod tail;
 pub mod team;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
@@ -56,6 +57,134 @@ fn harness_controls()
         RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>>,
     > = OnceLock::new();
     CONTROLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+// ── Task-store persist actor (control-plane starvation fix) ─────────────────
+//
+// `tasks.json` writes used to run as a synchronous `std::fs::write` of the WHOLE
+// store directly on a tokio worker thread, while holding the store read guard
+// (`task_store.read().persist(dir)`). Under fleet load that blocked async
+// workers — starving unrelated control/knowledge-plane handlers (`bbox_note`,
+// MCP `bro_status`) — and blocked store writers for the whole write.
+//
+// The actor owns a dedicated OS thread (NOT a tokio task, so it never consumes
+// the async worker pool). Hot paths call `request_persist` — a non-blocking
+// signal that coalesces a burst into a single snapshot+write. The snapshot is
+// taken under a brief read lock ON the persist thread; the blocking file write
+// happens entirely off the runtime.
+
+/// Ack channel an explicit flush attaches so it can block until durable.
+type PersistAck = Option<std::sync::mpsc::Sender<()>>;
+
+struct TaskPersister {
+    store: Arc<RwLock<TaskStore>>,
+    store_dir: PathBuf,
+    tx: std::sync::mpsc::Sender<PersistAck>,
+}
+
+impl TaskPersister {
+    fn spawn(store: Arc<RwLock<TaskStore>>, store_dir: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistAck>();
+        let store_w = store.clone();
+        let dir_w = store_dir.clone();
+        let spawned = std::thread::Builder::new()
+            .name("task-persist".to_string())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    // Coalesce: drain everything already queued so a burst of N
+                    // requests collapses to ONE snapshot+write, collecting any
+                    // acks waiting on durability.
+                    let mut acks: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+                    if let Some(a) = first {
+                        acks.push(a);
+                    }
+                    while let Ok(next) = rx.try_recv() {
+                        if let Some(a) = next {
+                            acks.push(a);
+                        }
+                    }
+                    let data = store_w.read().serialize_snapshot(MAX_PERSISTED_EVENTS);
+                    if let Some(data) = data {
+                        TaskStore::write_snapshot_blocking(&dir_w, &data);
+                    }
+                    for a in acks {
+                        let _ = a.send(());
+                    }
+                }
+            });
+        if spawned.is_err() {
+            tracing::error!("failed to spawn task-persist thread; persistence falls back to synchronous writes");
+        }
+        Self {
+            store,
+            store_dir,
+            tx,
+        }
+    }
+
+    /// Non-blocking persist request, coalesced by the actor. If the actor thread
+    /// is gone, fall back to a direct synchronous write so state is never lost.
+    fn request(&self) {
+        if self.tx.send(None).is_err() {
+            self.write_now();
+        }
+    }
+
+    /// Block until the current state is durable on disk (shutdown path).
+    fn flush_blocking(&self) {
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if self.tx.send(Some(ack_tx)).is_ok() && ack_rx.recv().is_ok() {
+            return;
+        }
+        self.write_now();
+    }
+
+    fn write_now(&self) {
+        if let Some(data) = self.store.read().serialize_snapshot(MAX_PERSISTED_EVENTS) {
+            TaskStore::write_snapshot_blocking(&self.store_dir, &data);
+        }
+    }
+}
+
+fn task_persister() -> &'static OnceLock<TaskPersister> {
+    static P: OnceLock<TaskPersister> = OnceLock::new();
+    &P
+}
+
+/// Initialise the global task-store persist actor. Idempotent; called once when
+/// the production `SharedState` is built. Tests do NOT init it (so each test's
+/// `request_persist` falls back to a synchronous write of its OWN per-test store
+/// rather than routing to a global bound to a different store).
+pub(crate) fn init_task_persister(store: Arc<RwLock<TaskStore>>, store_dir: PathBuf) {
+    let _ = task_persister().set(TaskPersister::spawn(store, store_dir));
+}
+
+/// Request a coalesced, off-worker persist of the task store. Non-blocking on
+/// the hot path. Before the actor is initialised (unit tests, early startup) it
+/// falls back to a synchronous write of the passed store so on-disk state is
+/// never silently dropped.
+pub(crate) fn request_persist(store: &RwLock<TaskStore>, store_dir: &std::path::Path) {
+    match task_persister().get() {
+        Some(p) => p.request(),
+        None => {
+            if let Some(data) = store.read().serialize_snapshot(MAX_PERSISTED_EVENTS) {
+                TaskStore::write_snapshot_blocking(store_dir, &data);
+            }
+        }
+    }
+}
+
+/// Flush the task store and block until durable (shutdown). Synchronous fallback
+/// when the actor was never initialised.
+pub(crate) fn flush_persist_blocking(store: &RwLock<TaskStore>, store_dir: &std::path::Path) {
+    match task_persister().get() {
+        Some(p) => p.flush_blocking(),
+        None => {
+            if let Some(data) = store.read().serialize_snapshot(MAX_PERSISTED_EVENTS) {
+                TaskStore::write_snapshot_blocking(store_dir, &data);
+            }
+        }
+    }
 }
 
 /// Translate a `bro_protocol::SessionCommand` — the daemon↔client control-plane
@@ -422,6 +551,12 @@ struct PersistedTask {
 }
 
 impl TaskStore {
+    /// Synchronous full persist. The runtime hot paths now route through the
+    /// off-worker [`request_persist`] actor; this direct entry is retained for
+    /// the persistence-contract tests and as the synchronous-semantics
+    /// reference (it shares `serialize_snapshot` + `write_snapshot_blocking`
+    /// with the actor, so they can never diverge).
+    #[allow(dead_code)]
     pub fn persist(&self, store_dir: &std::path::Path) {
         self.persist_with_event_limit(store_dir, MAX_PERSISTED_EVENTS);
     }
@@ -436,6 +571,17 @@ impl TaskStore {
     }
 
     fn persist_with_event_limit(&self, store_dir: &std::path::Path, event_limit: usize) {
+        if let Some(data) = self.serialize_snapshot(event_limit) {
+            Self::write_snapshot_blocking(store_dir, &data);
+        }
+    }
+
+    /// Serialize a point-in-time persistence snapshot. CPU + per-task-lock only,
+    /// **no file I/O** — safe to take under the store read lock, then drop the
+    /// lock before handing the bytes to a writer. Shared by the synchronous
+    /// `persist` path and the off-worker [`TaskPersister`] actor so the two can
+    /// never diverge in what they write.
+    pub fn serialize_snapshot(&self, event_limit: usize) -> Option<String> {
         let records: Vec<PersistedTask> = self
             .tasks
             .values()
@@ -473,14 +619,19 @@ impl TaskStore {
                 }
             })
             .collect();
+        serde_json::to_string(&records).ok()
+    }
 
+    /// Atomically write a pre-serialized snapshot to `tasks.json` (tmp + rename).
+    /// **Blocking** file I/O — never call on a tokio worker. It runs on the
+    /// [`TaskPersister`] dedicated thread, or on a cold synchronous path
+    /// (shutdown, tests) where blocking is acceptable.
+    pub fn write_snapshot_blocking(store_dir: &std::path::Path, data: &str) {
         let file = store_dir.join("tasks.json");
         let tmp = store_dir.join("tasks.json.tmp");
-        if let Ok(data) = serde_json::to_string(&records) {
-            let _ = std::fs::create_dir_all(store_dir);
-            if std::fs::write(&tmp, &data).is_ok() {
-                let _ = std::fs::rename(&tmp, &file);
-            }
+        let _ = std::fs::create_dir_all(store_dir);
+        if std::fs::write(&tmp, data).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
         }
     }
 
@@ -1197,7 +1348,7 @@ pub fn spawn_in_process_task(
         failed.notify.notify_waiters();
         return failed;
     }
-    task_store.read().persist(&store_dir);
+    request_persist(&task_store, &store_dir);
     let task_id_ev = task_id.clone();
     let bro_ev = task.inner.lock().bro_label.clone();
     let provider_str = provider.to_string();
@@ -1309,7 +1460,7 @@ pub fn finish_in_process_task(
             ),
             TaskStatus::Running => {
                 // No terminal event for running state.
-                task_store.read().persist(store_dir);
+                request_persist(task_store, store_dir);
                 task.notify.notify_waiters();
                 return;
             }
@@ -1332,7 +1483,7 @@ pub fn finish_in_process_task(
             }
         });
     }
-    task_store.read().persist(store_dir);
+    request_persist(task_store, store_dir);
     task.notify.notify_waiters();
 }
 
@@ -2016,7 +2167,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                 child_id: Mutex::new(None),
             });
             let _ = task_store.write().insert_reserved(id, task.clone());
-            task_store.read().persist(&store_dir);
+            request_persist(&task_store, &store_dir);
             task.notify.notify_waiters();
             return SpawnedTask { task, stdin: None };
         }
@@ -2428,7 +2579,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         }
 
         // Persist and notify waiters
-        task_store.read().persist(&store_dir);
+        request_persist(&task_store, &store_dir);
         task_ref_wait.notify.notify_waiters();
     });
 
@@ -2541,7 +2692,7 @@ pub fn cancel_task(
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
     }
-    task_store.read().persist(store_dir);
+    request_persist(task_store, store_dir);
     task.notify.notify_waiters();
     Ok(())
 }

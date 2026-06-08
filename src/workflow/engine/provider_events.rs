@@ -68,11 +68,10 @@ impl WorkflowRunner<'_> {
                             let mut inner = task.inner.lock();
                             inner.transcript_cursor = Some(cursor.clone());
                         }
-                        self.server
-                            .state
-                            .task_store
-                            .read()
-                            .persist(&self.server.state.store_dir);
+                        crate::orchestration::request_persist(
+                            &self.server.state.task_store,
+                            &self.server.state.store_dir,
+                        );
                     }
                     if let Some(event) = events
                         .iter()
