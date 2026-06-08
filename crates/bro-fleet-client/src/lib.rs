@@ -19,7 +19,7 @@ mod mcp;
 mod tail;
 mod task;
 
-pub use config::daemon_port;
+pub use config::{bro_home, daemon_port};
 pub use fleet::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DEFAULT_CLASSIFIER_PROMPT, DispatchSpec,
     FleetConfig, FleetOrchestrator, INTERN_PREFIX, Provider, ResumeSpec, TaskSnapshot, TaskStatus,

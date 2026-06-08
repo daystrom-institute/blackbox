@@ -57,7 +57,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use bro_fleet_client::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DispatchSpec, FleetConfig,
     FleetOrchestrator, Provider, ResumeSpec, TailEvent, TaskStatus, TodoItemStatus, TodoState,
-    TranscriptItem, intern_rider, provider_supports_bidi,
+    TranscriptItem, bro_home, intern_rider, provider_supports_bidi,
 };
 
 use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
@@ -68,6 +68,7 @@ use dispatch::*;
 use wrapping::*;
 use highlight::*;
 use closeout::*;
+use composer_history::*;
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
@@ -154,9 +155,6 @@ struct Agent {
     selected_cwd: Option<String>,
     /// Display name: first N chars of the initial prompt, renamable (§5).
     name: String,
-    /// The initial dispatch prompt + every subsequent steer (§5.3). Recallable
-    /// in the single-agent view.
-    input_history: Vec<String>,
     /// Prompt rendered above the transcript for a fresh dispatch. Resume turns
     /// are synthesized into the event stream so they render after restored
     /// history instead of pretending to be turn 1.
@@ -454,6 +452,9 @@ struct App {
     /// Local clocks for the focused executor/classifier activity strip.
     activity_clocks: HashMap<String, ActivityClock>,
     activity_frame: usize,
+    /// Path to the shared composer histfile (`$BRO_HOME/composer_history.jsonl`).
+    /// Shared across all fleet instances and standalone sessions.
+    composer_history_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -560,6 +561,7 @@ impl App {
             pending_closeout_recovery: None,
             activity_clocks: HashMap::new(),
             activity_frame: 0,
+            composer_history_path: history_path(&bro_home()),
         }
     }
 
@@ -1107,7 +1109,6 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
             selected_service_tier: None,
             selected_cwd: project_display_cwd(snap.cwd.as_deref()),
             name,
-            input_history: Vec::new(),
             initial_prompt: None,
             pending_inputs: VecDeque::new(),
             seen_user_steers: 0,
@@ -2816,7 +2817,7 @@ fn resume_agent(app: &mut App, idx: usize, text: String) {
     // Show the steer immediately and run `/control/resume` off-thread; the
     // relaunched live handle is swapped in from `resume_rx` (`install_resume`).
     app.resuming.insert(old_id.clone());
-    app.agents[idx].input_history.push(text.clone());
+    let _ = append_history(&app.composer_history_path, &text);
     app.set_status("resuming session…", Duration::from_secs(4));
     app.rt.spawn(async move {
         let mut spec = ResumeSpec::new(provider, session_id, text);
@@ -2956,7 +2957,7 @@ fn install_ctrl(app: &mut App, outcome: CtrlOutcome) {
             };
             match result {
                 Ok(()) => {
-                    app.agents[idx].input_history.push(text.clone());
+                    let _ = append_history(&app.composer_history_path, &text);
                     app.agents[idx].pending_inputs.push_back(text);
                     app.set_status(
                         "steer queued — interleaves at next boundary",
@@ -2998,7 +2999,7 @@ fn install_ctrl(app: &mut App, outcome: CtrlOutcome) {
             match result {
                 Ok(()) => match redirect {
                     Some(text) => {
-                        app.agents[idx].input_history.push(text);
+                        let _ = append_history(&app.composer_history_path, &text);
                         app.set_status("interrupted — your turn runs now", Duration::from_secs(3));
                     }
                     None => app.set_status("interrupt sent", Duration::from_secs(2)),
@@ -3257,24 +3258,22 @@ fn cycle_provider(app: &mut App, delta: isize) {
 
 /// Readline-style input-history recall, single-agent view only (§5.3).
 fn recall_history(app: &mut App, delta: isize) {
-    let Some(idx) = app.selected_agent() else {
-        return;
-    };
-    let hist = &app.agents[idx].input_history;
-    if hist.is_empty() {
+    let entries = read_history(&app.composer_history_path);
+    if entries.is_empty() {
         return;
     }
+    let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
     // Up (delta<0) walks back into history; Down walks toward the live edit.
     let new_cursor = match app.history_cursor {
-        None if delta < 0 => Some(hist.len() - 1),
+        None if delta < 0 => Some(texts.len() - 1),
         None => None,
         Some(0) if delta < 0 => Some(0),
-        Some(c) if delta < 0 => Some(c - 1),
-        Some(c) if c + 1 >= hist.len() => None, // walked back to live
+        Some(c) if delta < 0 => Some(c.saturating_sub(1)),
+        Some(c) if c + 1 >= texts.len() => None, // walked back to live
         Some(c) => Some(c + 1),
     };
     app.history_cursor = new_cursor;
-    app.set_input(new_cursor.map(|c| hist[c].clone()).unwrap_or_default());
+    app.set_input(new_cursor.map(|c| texts[c].to_string()).unwrap_or_default());
 }
 
 /// Last two path components (keeps status flashes readable on one line).
@@ -3682,9 +3681,8 @@ fn since_compact(start_ms: Option<u64>, now_ms: u64) -> Option<String> {
     start_ms.map(|start| duration_compact(now_ms.saturating_sub(start)))
 }
 
-/// The dispatch prompt (input_history[0]) — the initial `-p` first turn isn't
-/// echoed on the stream (only stdin steers are replayed), so the renderer
-/// prepends it.
+/// The dispatch prompt — the initial `-p` first turn isn't echoed on the stream
+/// (only stdin steers are replayed), so the renderer prepends it.
 fn initial_prompt(a: &Agent) -> &str {
     a.initial_prompt.as_deref().unwrap_or("")
 }
@@ -4179,3 +4177,4 @@ mod highlight;
 mod custom_terminal;
 mod insert_history;
 mod closeout;
+mod composer_history;

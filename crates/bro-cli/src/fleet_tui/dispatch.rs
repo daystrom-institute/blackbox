@@ -168,12 +168,12 @@ pub(super) fn install_dispatch(app: &mut App, outcome: DispatchOutcome) {
         selected_service_tier: d.service_tier,
         selected_cwd: Some(d.project_cwd),
         name: d.name,
-        // Display the operator's own prompt, not the rider-wrapped first turn.
-        input_history: vec![d.prompt.clone()],
-        initial_prompt: Some(d.prompt),
+        initial_prompt: Some(d.prompt.clone()),
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
+    // Append the dispatch prompt to the shared composer histfile.
+    let _ = composer_history::append_history(&app.composer_history_path, &d.prompt);
     // Pin the roster cursor to the freshly dispatched agent so it stays selected
     // as it surfaces in (and later moves between) buckets.
     app.roster_anchor_id = Some(id.clone());
@@ -269,11 +269,12 @@ pub(super) fn install_standalone(app: &mut App, o: StandaloneOutcome) {
         selected_service_tier: None,
         selected_cwd: o.cwd,
         name: o.name,
-        input_history: vec![o.prompt.clone()],
         initial_prompt: (!o.is_resume).then(|| o.prompt.clone()),
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
+    // Append the prompt to the shared composer histfile.
+    let _ = composer_history::append_history(&app.composer_history_path, &o.prompt);
     app.focused_agent_id = Some(id.clone());
     app.zone = Zone::SingleAgent;
     app.orch.persist();
