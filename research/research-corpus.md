@@ -59,6 +59,76 @@ research-specific `status` lifecycle (see the harness charter), because a
 research leaf is never "proposed/archived" — it is `stub → researching →
 enriched → verified`, and its claims carry inline confidence tiers.
 
+## Frontmatter schema
+
+The full frontmatter contract — the chassis fields shared by `design/`,
+`research/`, and `specs/`, plus the per-corpus vocabulary matrix and the
+`topic[]` convention — lives in
+[`docs/corpus-frontmatter-schema.md`](../docs/corpus-frontmatter-schema.md).
+That doc is the single source of truth for the chassis. This section is a
+quick reference for the per-`research/` vocabulary only.
+
+```yaml
+# Hub (research-corpus.md, harness/harness-tracks.md)
+kind: research-hub
+corpus: blackbox-research
+track: harness                              # the track key
+topic: [<corpus-root-segment>, …]           # mirrors the directory path
+
+# Subject snapshot (one harness at one version)
+kind: research-subject
+corpus: blackbox-research
+track: harness
+harness: claude                             # one of: claude, codex, vibe, antigravity
+version: "2.1.160"
+platform: macos-aarch64
+captured: "2026-06-02"
+supersedes: null
+status: enriched
+
+# Axis (one axis across harnesses)
+kind: research-axis
+corpus: blackbox-research
+track: harness
+axis: builtin-tools                         # see the axis vocabulary below
+status: stub|enriched                       # default = no field, only the controlled value
+
+# Finding (one cell of the matrix: subject × axis)
+kind: research-finding
+corpus: blackbox-research
+track: harness
+harness: claude                             # the matrix row
+axis: builtin-tools                         # the matrix column
+version: "2.1.160"
+last_verified: "2.1.160"
+status: enriched
+confidence: high                            # high | medium | mixed
+```
+
+**Per-`research/` vocabulary (observed in the current corpus):**
+
+| Field | Hub | Subject | Axis | Finding | Notes |
+|---|---|---|---|---|---|
+| `kind` | `research-hub` | `research-subject` | `research-axis` | `research-finding` | required |
+| `corpus` | `blackbox-research` | `blackbox-research` | `blackbox-research` | `blackbox-research` | required |
+| `track` | required | required | required | required | the track key (only `harness` is seeded) |
+| `harness` | — | required | — | required | the matrix row: `claude`, `codex`, `vibe`, `antigravity` |
+| `axis` | — | — | required | required | the matrix column: `agent-loop`, `builtin-tools`, `compaction`, `context-management`, `hooks`, `mcp`, `memory-persistence`, `metatools`, `modes-personas`, `planning-goals`, `privilege-approvals`, `robustness`, `session-lifecycle`, `skills`, `subagents`, `transport` |
+| `version` | — | required | — | required | the harness version the leaf was mined against (e.g. `"2.1.160"`, `"0.136.0"`, `"2.9.6"`, `"1.0.4"`) |
+| `last_verified` | — | — | — | required | when the leaf was last re-verified against the live harness (same value as `version` when current) |
+| `status` | optional | required | required (often) | required | controlled lifecycle: `stub` → `researching` → `enriched` → `verified`; only `stub`, `researching`, and `enriched` are observed in the current seeded corpus |
+| `confidence` | — | — | — | required | one of `high`, `medium`, `mixed`; `high` on 53 of 60 findings |
+| `platform` | — | required (subject) | — | — | the host platform the snapshot was captured on (`linux-x86_64`, `macos-aarch64`) |
+| `captured` | — | required (subject) | — | — | the capture date (ISO-8601) |
+| `supersedes` / `replaces` | — | optional | — | — | predecessor snapshot; observed as `null` in the current four subjects (and `replaces: gemini` once) |
+| `generated_by` / `last_reviewed` | optional | — | — | — | provenance and review metadata; observed on the two research-hub outliers |
+| `topic` | required | required | required | required | list, mirrors the directory path minus the corpus root; see the shared chassis doc for the convention |
+
+The full lifecycle arrows for `status` (`stub` → `researching` → `enriched`
+→ `verified`) and the inline confidence tier rules are documented in the
+harness charter at
+[`harness/harness-tracks.md`](../harness/harness-tracks.md).
+
 ## Conventions (corpus-wide)
 
 - Hub-note filenames are descriptive, never generic `INDEX.md` — generic names

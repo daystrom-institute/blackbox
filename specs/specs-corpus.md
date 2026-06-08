@@ -90,6 +90,13 @@ tiering), knowledge-render (memory lanes + render invariants), orchestration
 
 ## Frontmatter schema
 
+The full frontmatter contract — the chassis fields shared by `design/`,
+`research/`, and `specs/`, plus the per-corpus vocabulary matrix and the
+`topic[]` convention — lives in
+[`docs/corpus-frontmatter-schema.md`](../docs/corpus-frontmatter-schema.md).
+That doc is the single source of truth for the chassis. This section is a
+quick reference for the per-`specs/` vocabulary only.
+
 ```yaml
 # Hub (specs-corpus.md, <domain>-spec.md)
 kind: spec-hub
@@ -109,3 +116,21 @@ sources:                   # the authorities this spec rests on
 supersedes: null
 last_reviewed: "YYYY-MM-DD"
 ```
+
+**Per-`specs/` vocabulary (observed in the seeded corpus):**
+
+| Field | Hub | Leaf | Notes |
+|---|---|---|---|
+| `kind` | `spec-hub` | `spec` | required |
+| `corpus` | `blackbox-spec` | `blackbox-spec` | required; matches the directory |
+| `domain` | required (e.g. `bro-harness`) | required (e.g. `bro-harness`) | the domain key |
+| `spec` | — | required (e.g. `agent-loop`, `transports`) | the contract key within the domain |
+| `status` | — | required | one of `draft`, `specified`, `ratified`; only `draft` is observed in the current seeded corpus |
+| `topic` | required | required | list, mirrors the directory path minus the corpus root; see the shared chassis doc for the convention |
+| `sources` | — | required | list of authority strings, one of `standard:…`, `vendor:…`, `research:<path>`, `derived:…` |
+| `supersedes` | — | optional | observed as `null` in the current seeded corpus |
+| `last_reviewed` | — | required (recommended) | ISO-8601 date |
+
+The full lifecycle arrows for `status` (`draft` → `specified` → `ratified`)
+and the source-tier grading for `sources` are documented in **Conventions
+(corpus-wide)** above.
