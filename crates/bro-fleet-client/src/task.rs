@@ -59,6 +59,9 @@ pub struct TaskInner {
     /// Wall-clock (ms) of the last observed stream event ("last interaction").
     /// Stamped by the status poller when the event count grows.
     pub last_event_at_ms: Option<u64>,
+    /// The model pinned at dispatch time - survives cockpit reload even when
+    /// stream events lack a top-level `model` field (e.g. brodex/Responses).
+    pub model: Option<String>,
 }
 
 pub struct Task {
@@ -100,6 +103,8 @@ struct PersistedTask {
     bro_label: Option<String>,
     #[serde(default)]
     recoverable: bool,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// The cockpit's task store: the agents it has dispatched or reloaded.
@@ -163,6 +168,7 @@ impl TaskStore {
                     cwd: inner.cwd.clone(),
                     bro_label: inner.bro_label.clone(),
                     recoverable: inner.recoverable,
+                    model: inner.model.clone(),
                 }
             })
             .collect();
@@ -219,6 +225,7 @@ impl TaskStore {
                     bro_label: rec.bro_label,
                     recoverable: rec.recoverable,
                     last_event_at_ms: None,
+                    model: rec.model,
                 }),
                 notify: Arc::new(Notify::new()),
             });

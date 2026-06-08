@@ -374,7 +374,9 @@ impl AgentHandle {
             last_event_at_ms: inner.last_event_at_ms,
             cwd: inner.cwd.clone(),
             stderr: inner.stderr.clone(),
-            model: model_from_events(&inner.events),
+            // Prefer the model persisted at dispatch time (survives reload for
+            // providers whose stream events lack a top-level `model` field).
+            model: inner.model.clone().or_else(|| model_from_events(&inner.events)),
             // The cockpit's durable display name (stored in bro_label, §5).
             name: inner.bro_label.clone(),
             recoverable: inner.recoverable,
@@ -906,14 +908,14 @@ impl DaemonFleetClient {
         let body = dispatch_body(&spec);
         let value = block_on_fleet_http(self.post_json("/control/exec", body))
             .unwrap_or_else(|err| json!({ "error": err.to_string() }));
-        self.handle_from_response(value, spec.provider, spec.cwd, spec.name, tail_tx)
+        self.handle_from_response(value, spec.provider, spec.cwd, spec.name, spec.model, tail_tx)
     }
 
     fn resume(&self, spec: ResumeSpec, tail_tx: broadcast::Sender<TailEvent>) -> AgentHandle {
         let body = resume_body(&spec);
         let value = block_on_fleet_http(self.post_json("/control/resume", body))
             .unwrap_or_else(|err| json!({ "error": err.to_string() }));
-        self.handle_from_response(value, spec.provider, spec.cwd, spec.name, tail_tx)
+        self.handle_from_response(value, spec.provider, spec.cwd, spec.name, spec.model, tail_tx)
     }
 
     /// Drive `/control/closeout` for a focused fleet agent. The endpoint
@@ -934,6 +936,7 @@ impl DaemonFleetClient {
         provider: Provider,
         cwd: Option<String>,
         name: Option<String>,
+        model: Option<String>,
         tail_tx: broadcast::Sender<TailEvent>,
     ) -> AgentHandle {
         if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
@@ -944,6 +947,7 @@ impl DaemonFleetClient {
                     "pending".to_string(),
                     cwd,
                     name,
+                    model,
                     TaskStatus::Failed,
                     error.to_string(),
                 ),
@@ -966,6 +970,7 @@ impl DaemonFleetClient {
             session_id,
             cwd,
             name,
+            model,
             TaskStatus::Running,
             String::new(),
         );
@@ -1047,12 +1052,14 @@ fn resume_body(spec: &ResumeSpec) -> Value {
     body
 }
 
+#[allow(clippy::too_many_arguments)]
 fn daemon_task(
     id: String,
     provider: Provider,
     session_id: String,
     cwd: Option<String>,
     name: Option<String>,
+    model: Option<String>,
     status: TaskStatus,
     stderr: String,
 ) -> Arc<Task> {
@@ -1073,6 +1080,7 @@ fn daemon_task(
             bro_label: name,
             recoverable: false,
             last_event_at_ms: None,
+            model,
         }),
         notify: Arc::new(Notify::new()),
     })
@@ -1190,6 +1198,11 @@ fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) 
     }
     if inner.status.is_terminal() && inner.completed_at.is_none() {
         inner.completed_at = Some(now_ms());
+    }
+    // Backfill model from events for tasks that predate the persisted-model
+    // field (or were created without a dispatch-time model pin).
+    if inner.model.is_none() {
+        inner.model = model_from_events(&inner.events);
     }
     let terminal = inner.status.is_terminal();
     drop(inner);
