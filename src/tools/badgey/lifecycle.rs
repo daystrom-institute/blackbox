@@ -197,6 +197,11 @@ impl BlackboxServer {
             bro_label.clone(),
             bro_label,
             Some(self.state.system_events.clone()),
+            // badgey_launch_exec is the badgey runtime's first-turn
+            // launch — operator-initiated persona. See the Slice 1b
+            // dispatch note: badgey is classed as AgentDispatch
+            // (user-driven tool that dispatches an agent context).
+            bro_core::Origin::AgentDispatch,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         Ok((task, provider, session_id, effective_filters))
@@ -632,6 +637,10 @@ impl BlackboxServer {
             Some("badgey".to_string()),
             Some("agent:badgey@v1".to_string()),
             Some(self.state.system_events.clone()),
+            // badgey_resume_internal is the badgey runtime's
+            // continuation dispatch; same source class as
+            // badgey_launch_exec (AgentDispatch).
+            bro_core::Origin::AgentDispatch,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         let completed = orch::wait_for_task_with_timeout(&task, timeout_seconds).await;

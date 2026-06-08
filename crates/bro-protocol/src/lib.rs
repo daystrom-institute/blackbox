@@ -3,7 +3,7 @@
 //! The contract crate is the schema. Transports may be stdio, in-process calls,
 //! or a future socket, but the payloads live here.
 
-use bro_core::{BroError, Provider, SessionId, TaskId};
+use bro_core::{BroError, Origin, Provider, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 
 mod dispatch;
@@ -50,6 +50,10 @@ pub struct TaskSnapshot {
     pub status: TaskStatus,
     pub last_message: Option<String>,
     pub error: Option<BroError>,
+    /// Source of the dispatch (Slice 1b). Defaults to `Unknown` on
+    /// snapshots serialized before the field existed.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 /// Summary DTO for one fleet task, projected by the daemon for the
@@ -92,6 +96,10 @@ pub struct RosterSummaryV1 {
     pub last_message_snippet: Option<String>,
     pub model: Option<String>,
     pub last_event_at: Option<u64>,
+    /// Source of the dispatch (Slice 1b). Lets the fleet roster tab Fleet
+    /// vs Dispatched vs Workflow vs Atom without re-deriving from labels.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 /// Wire envelope for the `GET /control/roster` snapshot. The
@@ -131,6 +139,7 @@ mod tests {
             last_message_snippet: Some("Looking at the file…".to_string()),
             model: Some("claude-opus-4-6".to_string()),
             last_event_at: Some(1_700_000_000_000),
+            origin: Origin::AgentDispatch,
         };
         let value = serde_json::to_value(&summary).unwrap();
         let obj = value.as_object().expect("summary must serialize as object");
@@ -148,6 +157,7 @@ mod tests {
             "last_message_snippet",
             "model",
             "last_event_at",
+            "origin",
         ] {
             assert!(
                 obj.contains_key(key),
@@ -155,6 +165,14 @@ mod tests {
                 obj.keys().collect::<Vec<_>>()
             );
         }
+
+        // `origin` is a lowercase variant name — must NOT be the Debug
+        // form (`AgentDispatch` becomes `agentdispatch` on the wire).
+        assert_eq!(
+            obj["origin"].as_str(),
+            Some("agentdispatch"),
+            "RosterSummaryV1.origin must serialize as lowercase variant"
+        );
 
         // No event-payload field, no Vec/array field that could carry one.
         assert!(

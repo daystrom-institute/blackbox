@@ -361,6 +361,11 @@ pub struct TaskInner {
     pub transcript_location: Option<TranscriptLocation>,
     pub transcript_cursor: Option<TranscriptCursor>,
     pub supervision: SupervisionState,
+    /// Where this task was spawned FROM (Slice 1b of the daemon roster
+    /// design). Persisted via `PersistedTask` so the origin survives a
+    /// daemon restart and the fleet roster can group/tab tasks by
+    /// source. See `bro_core::Origin` for the taxonomy.
+    pub origin: bro_core::Origin,
 }
 
 pub struct Task {
@@ -413,6 +418,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin: bro_core::Origin::Unknown,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -548,6 +554,12 @@ struct PersistedTask {
     transcript_cursor: Option<TranscriptCursor>,
     #[serde(default)]
     supervision: SupervisionState,
+    /// Origin is back-compat default `Unknown` when absent on disk —
+    /// pre-Slice-1b records have no `origin` field, and a daemon
+    /// rolling forward should treat those as `Unknown` rather than
+    /// failing to load.
+    #[serde(default)]
+    origin: bro_core::Origin,
 }
 
 impl TaskStore {
@@ -616,6 +628,7 @@ impl TaskStore {
                     transcript_location: inner.transcript_location.clone(),
                     transcript_cursor: inner.transcript_cursor.clone(),
                     supervision: inner.supervision.clone(),
+                    origin: inner.origin,
                 }
             })
             .collect();
@@ -685,6 +698,7 @@ impl TaskStore {
                     transcript_location: rec.transcript_location,
                     transcript_cursor: rec.transcript_cursor,
                     supervision: rec.supervision,
+                    origin: rec.origin,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -1212,6 +1226,13 @@ pub struct SpawnTaskParams {
     /// prompt, so the caller can drive successive user-turns and
     /// `control_request`s. One-shot dispatch leaves this false.
     pub interactive: bool,
+    /// Spawn-time origin classification (Slice 1b). Determines which
+    /// roster tab the task lands in. Defaults to `Unknown` at the field
+    /// boundary so test helpers that build `SpawnTaskParams` directly
+    /// don't have to spell it out — production spawn callers MUST set
+    /// the right variant (the audit log lives in the Slice 1b
+    /// dispatch note).
+    pub origin: bro_core::Origin,
 }
 
 /// Result of a spawn: the tracked task plus, in `interactive` mode, the writable
@@ -1241,6 +1262,7 @@ fn failed_duplicate_task(
     bro_label: Option<String>,
     agent_label: Option<String>,
     message: String,
+    origin: bro_core::Origin,
 ) -> Arc<Task> {
     Arc::new(Task {
         inner: Mutex::new(TaskInner {
@@ -1265,6 +1287,7 @@ fn failed_duplicate_task(
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -1274,6 +1297,10 @@ fn failed_duplicate_task(
 /// Create a tracked task for daemon-internal async work. This mirrors
 /// provider-backed tasks closely enough that `bro_status`, `bro_wait`,
 /// dashboards, persistence, and tail subscribers can observe it.
+///
+/// `origin` (Slice 1b) is propagated so the daemon-internal harness
+/// tasks (workflow executor / atom / council drain) carry the same
+/// origin label as the spawn site that called them.
 pub fn spawn_in_process_task(
     task_id: String,
     provider: Provider,
@@ -1285,6 +1312,7 @@ pub fn spawn_in_process_task(
     bro_label: Option<String>,
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
+    origin: bro_core::Origin,
 ) -> Arc<Task> {
     if let Err(err) = task_store.write().reserve_id(&task_id) {
         if let Some(existing) = task_store.read().get(&task_id) {
@@ -1298,6 +1326,7 @@ pub fn spawn_in_process_task(
             bro_label,
             agent_label,
             err.to_string(),
+            origin,
         );
         failed.notify.notify_waiters();
         return failed;
@@ -1326,6 +1355,7 @@ pub fn spawn_in_process_task(
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -1344,6 +1374,7 @@ pub fn spawn_in_process_task(
             None,
             None,
             err.to_string(),
+            origin,
         );
         failed.notify.notify_waiters();
         return failed;
@@ -1524,6 +1555,9 @@ pub(crate) fn emit_task_progress_event(
 /// the ambient `[scope]` block before the subprocess launches. That lets
 /// agents emit `bbox_note(task_id=...)` records correlated back to the
 /// dispatch regardless of when the provider emits its own session ID.
+///
+/// `origin` (Slice 1b) labels the spawn site so the fleet roster can
+/// tab tasks by source — see `bro_core::Origin` for the taxonomy.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_task(
     task_id: String,
@@ -1538,6 +1572,7 @@ pub fn spawn_task(
     bro_label: Option<String>,
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
+    origin: bro_core::Origin,
 ) -> Arc<Task> {
     spawn_task_with_tool_placement(
         task_id,
@@ -1553,6 +1588,7 @@ pub fn spawn_task(
         agent_label,
         None,
         system_events,
+        origin,
     )
 }
 
@@ -1571,6 +1607,7 @@ pub fn spawn_task_with_tool_placement(
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     system_events: Option<crate::system_events::SharedEventHub>,
+    origin: bro_core::Origin,
 ) -> Arc<Task> {
     if matches!(
         provider,
@@ -1594,6 +1631,7 @@ pub fn spawn_task_with_tool_placement(
             agent_label,
             tool_placement,
             system_events,
+            origin,
         );
     }
 
@@ -1609,6 +1647,7 @@ pub fn spawn_task_with_tool_placement(
             bro_label,
             agent_label,
             err.to_string(),
+            origin,
         );
     }
 
@@ -1625,6 +1664,7 @@ pub fn spawn_task_with_tool_placement(
         agent_label,
         system_events,
         interactive: false,
+        origin,
     };
 
     spawn_task_reserved(task_id, params).task
@@ -1645,6 +1685,7 @@ fn spawn_harness_in_process_task(
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     system_events: Option<crate::system_events::SharedEventHub>,
+    origin: bro_core::Origin,
 ) -> Arc<Task> {
     let task = spawn_in_process_task(
         task_id.clone(),
@@ -1657,6 +1698,7 @@ fn spawn_harness_in_process_task(
         bro_label,
         agent_label,
         system_events.clone(),
+        origin,
     );
     if task.inner.lock().status != TaskStatus::Running {
         return task;
@@ -1967,6 +2009,7 @@ pub fn spawn_task_interactive(
     bro_label: Option<String>,
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
+    origin: bro_core::Origin,
 ) -> SpawnedTask {
     if let Err(err) = task_store.write().reserve_id(&task_id) {
         if let Some(existing) = task_store.read().get(&task_id) {
@@ -1984,6 +2027,7 @@ pub fn spawn_task_interactive(
                 bro_label,
                 agent_label,
                 err.to_string(),
+                origin,
             ),
             stdin: None,
         };
@@ -2002,6 +2046,7 @@ pub fn spawn_task_interactive(
         agent_label,
         system_events,
         interactive: true,
+        origin,
     };
 
     spawn_task_reserved(task_id, params)
@@ -2085,6 +2130,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         agent_label,
         system_events,
         interactive,
+        origin,
     } = params;
     let id = task_id;
 
@@ -2162,6 +2208,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     transcript_location: None,
                     transcript_cursor: None,
                     supervision: SupervisionState::default(),
+                    origin,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -2212,6 +2259,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(pid),
@@ -2219,8 +2267,16 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
 
     if let Err(err) = task_store.write().insert_reserved(id.clone(), task.clone()) {
         task_store.write().release_reservation(&id);
-        let failed =
-            failed_duplicate_task(id, provider, session_id, cwd, None, None, err.to_string());
+        let failed = failed_duplicate_task(
+            id,
+            provider,
+            session_id,
+            cwd,
+            None,
+            None,
+            err.to_string(),
+            origin,
+        );
         failed.notify.notify_waiters();
         return SpawnedTask {
             task: failed,
@@ -2979,6 +3035,7 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
         status,
         last_message: inner.last_assistant_message.clone(),
         error,
+        origin: inner.origin,
     }
 }
 
@@ -3336,6 +3393,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3380,6 +3438,131 @@ mod tests {
         assert_eq!(
             persisted_event_count_after(events, |store, root| store.persist_all_events(root)),
             60
+        );
+    }
+
+    // Slice 1b — the spawn-time `origin` (bro_core::Origin) must
+    // SURVIVE the on-disk round-trip so a daemon restart doesn't
+    // reset every task's origin to `Unknown` and lose the
+    // Fleet-vs-Dispatched distinction. This is the restart-survival
+    // guard called out in the Slice 1b spec.
+    //
+    // Two-part check: (a) PersistedTask serializes origin (as the
+    // lowercase variant name, matching the wire DTO), and (b)
+    // `TaskStore::load` decodes the field back to the right enum
+    // variant for each task. A pre-Slice-1b record missing the
+    // `origin` field entirely must decode to `Unknown` for
+    // back-compat.
+    #[test]
+    fn origin_round_trips_through_persist_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().to_path_buf();
+
+        // Build a store with one task per representative origin so
+        // a cross-task regression (e.g. always-defaulting-to-Unknown)
+        // would be visible from a single test.
+        let mut store = TaskStore::new();
+        let variants = [
+            ("origin-cockpit", bro_core::Origin::Cockpit),
+            ("origin-workflow", bro_core::Origin::Workflow),
+            ("origin-atom", bro_core::Origin::Atom),
+            ("origin-agent", bro_core::Origin::AgentDispatch),
+            ("origin-unknown", bro_core::Origin::Unknown),
+        ];
+        for (id, origin) in variants {
+            let task = test_task(id, TaskStatus::Completed, Provider::Glm);
+            task.inner.lock().origin = origin;
+            store
+                .insert(id.to_string(), task)
+                .expect("insert origin-tagged task");
+        }
+        // Persist via the public entry that production uses
+        // (serialize_snapshot + write_snapshot_blocking).
+        store.persist(&store_dir);
+
+        // (a) Wire-shape guard: the on-disk JSON carries the
+        // lowercase variant name, so a peer's tooling or a future
+        // migration can read the field without knowing the Rust
+        // enum. The RosterSummaryV1 wire-form check is asserted
+        // separately in bro-protocol; this one pins the on-disk
+        // schema.
+        let raw = std::fs::read_to_string(store_dir.join("tasks.json")).unwrap();
+        for needle in [
+            "\"origin\":\"cockpit\"",
+            "\"origin\":\"workflow\"",
+            "\"origin\":\"atom\"",
+            "\"origin\":\"agentdispatch\"",
+            "\"origin\":\"unknown\"",
+        ] {
+            assert!(
+                raw.contains(needle),
+                "tasks.json must carry lowercase origin field for {needle}; raw={raw}"
+            );
+        }
+
+        // (b) Reload and assert each task decodes back to the right
+        // variant — restart-survival guard.
+        // Use a generous ttl_ms so the just-completed tasks aren't
+        // pruned by the running-task-only filter in `TaskStore::load`.
+        let reloaded = TaskStore::load(&store_dir, u64::MAX);
+        for (id, expected) in variants {
+            let task = reloaded
+                .get(id)
+                .unwrap_or_else(|| panic!("reloaded store must still carry {id}"));
+            assert_eq!(
+                task.inner.lock().origin,
+                expected,
+                "origin for {id} did not survive persist+load"
+            );
+        }
+    }
+
+    // Slice 1b back-compat: pre-Slice-1b on-disk records lack the
+    // `origin` field entirely (older daemons). `PersistedTask` has
+    // `#[serde(default)]` on the `origin` field, so a missing
+    // field must decode to `Origin::Unknown` (the enum's
+    // `#[default]` variant) rather than failing the load or
+    // losing the record. A regression that hard-codes `Unknown` to
+    // something else (e.g. AgentDispatch) would silently
+    // re-classify every old task; the assert here is the trip-wire.
+    #[test]
+    fn origin_missing_on_disk_decodes_to_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().to_path_buf();
+
+        // Hand-craft a pre-Slice-1b record: every field the
+        // `#[serde(default)]` mark on `PersistedTask` allows
+        // missing, AND no `origin` field.
+        let pre_slice_1b = serde_json::json!([{
+            "id": "legacy-task",
+            "provider": "glm",
+            "session_id": "sess-legacy",
+            "events": [],
+            "last_assistant_message": null,
+            "usage": null,
+            "cost_usd": null,
+            "num_turns": 1,
+            "stderr": "",
+            "status": "completed",
+            "started_at": 1_700_000_000_000u64,
+            "completed_at": 1_700_000_000_001u64,
+            "exit_code": 0
+            // NOTE: no `origin` field — pre-Slice-1b shape.
+        }]);
+        std::fs::write(
+            store_dir.join("tasks.json"),
+            serde_json::to_string(&pre_slice_1b).unwrap(),
+        )
+        .unwrap();
+
+        let reloaded = TaskStore::load(&store_dir, u64::MAX);
+        let task = reloaded
+            .get("legacy-task")
+            .expect("legacy record must load successfully");
+        assert_eq!(
+            task.inner.lock().origin,
+            bro_core::Origin::Unknown,
+            "pre-Slice-1b record (no origin field) must decode to Origin::Unknown"
         );
     }
 
@@ -3535,6 +3718,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3562,6 +3746,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3607,6 +3792,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3653,6 +3839,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -3692,6 +3879,12 @@ mod tests {
                 agent_label: None,
                 system_events: None,
                 interactive: false,
+                // The legacy `spawn_with_pre_minted_id_tracks_known_id`
+                // test predates Slice 1b; pin origin to a sentinel
+                // value so a regression that drops the origin on
+                // pre-minted paths would be visible from this test
+                // too.
+                origin: bro_core::Origin::AgentDispatch,
             },
         )
         .unwrap();
@@ -4036,6 +4229,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4075,6 +4269,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4118,6 +4313,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4163,6 +4359,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin: bro_core::Origin::Unknown,
         };
 
         reject_forked_session(&mut inner, "forked-session");
@@ -4211,6 +4408,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin: bro_core::Origin::Unknown,
         };
 
         let sink = EventSink {
@@ -4271,6 +4469,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin: bro_core::Origin::Unknown,
         };
         let evt = serde_json::json!({
             "type": "user",
@@ -4319,6 +4518,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             supervision: SupervisionState::default(),
+            origin: bro_core::Origin::Unknown,
         };
         let evt = serde_json::json!({
             "type": "user",
@@ -4370,6 +4570,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4403,6 +4604,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4442,6 +4644,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4477,6 +4680,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -4524,6 +4728,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),

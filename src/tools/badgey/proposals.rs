@@ -697,6 +697,10 @@ impl BlackboxServer {
                 agent_label: label,
                 system_events: Some(self.state.system_events.clone()),
                 interactive: false,
+                // badgey is a user-driven persona runtime; its
+                // privileged-task spawn is the same source class as
+                // bro_exec (operator-initiated agent dispatch).
+                origin: bro_core::Origin::AgentDispatch,
             },
         )
         .map_err(|e| e.to_string())?;

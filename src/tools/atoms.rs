@@ -749,6 +749,9 @@ impl BlackboxServer {
             Some(inv.atom_ref.clone()),
             Some(inv.atom_ref.clone()),
             Some(self.state.system_events.clone()),
+            // atom_resume_value is the resume half of atom
+            // dispatch — same source class as atom_invoke (Atom).
+            bro_core::Origin::Atom,
         );
         if let Some(lease) = &selected_lease {
             let inner = task.inner.lock();

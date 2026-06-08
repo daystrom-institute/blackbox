@@ -331,6 +331,9 @@ impl BlackboxServer {
                 code_mode: atom_code_mode,
                 service_tier: atom_service_tier,
                 output_schema: None,
+                // atom_invoke dispatches a catalog atom — that is the
+                // source class, not a generic agent dispatch.
+                origin: bro_core::Origin::Atom,
             })?;
         let (task_id, session_id, selected_provider) = {
             let inner = dispatched.task.inner.lock();

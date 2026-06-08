@@ -949,6 +949,10 @@ impl BlackboxServer {
                 code_mode: agent_code_mode,
                 service_tier: agent_service_tier,
                 output_schema: agent_output_schema,
+                // bro_agent_dispatch is the user-facing MCP tool that
+                // dispatches a registered agent — same source class as
+                // bro_exec, so it lands in the AgentDispatch tab.
+                origin: bro_core::Origin::AgentDispatch,
             }) {
                 Ok(result) => result,
                 Err(e) => return Self::err_text(&e),

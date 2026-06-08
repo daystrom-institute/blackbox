@@ -42,6 +42,12 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) spawn_bro_label: Option<String>,
     pub(crate) spawn_agent_label: Option<String>,
     pub(crate) record_to_bro: Option<String>,
+    /// Spawn-time origin (Slice 1b). Each caller of
+    /// `dispatch_fresh_bro_task` tags the dispatch with the source the
+    /// roster should tab it under (AgentDispatch for bro_* MCP tools,
+    /// Workflow for orchestrator-driven dispatches, Cockpit for the
+    /// control-plane handler at `/control/exec`).
+    pub(crate) origin: bro_core::Origin,
     /// Context-assembly policy from the resolved brofile (if any).
     /// Threaded through so post-allocator/lease provider swaps can
     /// be re-validated against the actual runtime provider — the
@@ -235,6 +241,7 @@ fn allocator_status_runtime_request(
         selection_policy: p.selection_policy.clone(),
         code_mode: None,
         service_tier: None,
+        origin_override: None,
     };
     exec_params_runtime_request(&exec_like, None)
 }
@@ -393,6 +400,7 @@ impl BlackboxServer {
             request.spawn_agent_label,
             request.tool_placement,
             Some(self.state.system_events.clone()),
+            request.origin,
         );
         if let Some(allocation) = &allocation {
             let (task_id, session_id, cwd) = {
@@ -527,6 +535,10 @@ impl BlackboxServer {
             // bro_exec carries no output schema (structured output is delivered
             // via agent dispatch from the manifest, not generic exec).
             output_schema: None,
+            // Default the bro_exec origin to AgentDispatch; the cockpit
+            // control handler overrides this to Cockpit via the
+            // `origin_override` slot on ExecParams.
+            origin: p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
         }) {
             Ok(result) => result,
             Err(e) => return Self::err_text(&e),
@@ -713,6 +725,9 @@ impl BlackboxServer {
             None,
             None,
             Some(self.state.system_events.clone()),
+            // bro_resume is the user-facing MCP tool for resuming
+            // an existing session — same source class as bro_exec.
+            bro_core::Origin::AgentDispatch,
         );
         if let Some(lease) = &runtime_lease {
             let inner = task.inner.lock();
@@ -1380,6 +1395,11 @@ impl BlackboxServer {
                         None,
                         None,
                         Some(self.state.system_events.clone()),
+                        // bro_broadcast fans out a single prompt to
+                        // every team member; each per-member spawn
+                        // is still driven by the operator's MCP call,
+                        // so they land in the AgentDispatch tab.
+                        bro_core::Origin::AgentDispatch,
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     release_resume_lease_when_done(t.clone(), resume_lease);
@@ -1425,6 +1445,9 @@ impl BlackboxServer {
                     None,
                     None,
                     Some(self.state.system_events.clone()),
+                    // bro_broadcast per-member fresh-spawn branch
+                    // — same source class as the resume branch above.
+                    bro_core::Origin::AgentDispatch,
                 );
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
                 updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
@@ -1749,6 +1772,10 @@ impl BlackboxServer {
             Some("workload-retro".to_string()),
             None,
             Some(self.state.system_events.clone()),
+            // bro_retro is a self-reflective resume — operator
+            // initiated, lands in AgentDispatch like other bro_*
+            // MCP tools.
+            bro_core::Origin::AgentDispatch,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task, resume_lease);
@@ -2554,6 +2581,7 @@ mod tests {
             selection_policy: None,
             code_mode: None,
             service_tier: None,
+            origin_override: None,
         }
     }
 

@@ -141,6 +141,9 @@ async fn system_events_task_lifecycle_started_and_terminal() {
         Some("test-bro".to_string()),
         None,
         Some(hub.clone()),
+        // Workflow origin — system_events lifecycle test exercises
+        // the same workflow harness-task path as orchestrate.rs.
+        bro_core::Origin::Workflow,
     );
 
     // Yield so the spawned emit task can run

@@ -273,6 +273,9 @@ async fn process_envelope(
         None,
         None,
         Some(shared.system_events.clone()),
+        // Council drain dispatches one team member per drained
+        // envelope — team-orchestration traffic, lands in Workflow.
+        bro_core::Origin::Workflow,
     );
     task.inner.lock().bro_label = Some(format!("{}::{}", council_id, bro_id));
     cleanup_policy_file_when_done(task.clone(), dispatch._policy_file);

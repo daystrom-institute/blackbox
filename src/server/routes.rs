@@ -871,8 +871,15 @@ pub(crate) struct IrcStatusQuery {
 
 pub(crate) async fn control_exec_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<ExecParams>,
+    axum::Json(mut req): axum::Json<ExecParams>,
 ) -> axum::Json<CallToolResult> {
+    // The HTTP control handlers (`/control/exec`, `/irc/exec`) bypass
+    // the MCP bro_exec tool surface but route through the same spawn
+    // funnel. Force the origin to Cockpit so the roster tab groups
+    // cockpit/IRC-launched tasks separately from peer-bros-launched
+    // ones (which carry AgentDispatch). The MCP bro_exec path itself
+    // defaults to AgentDispatch and ignores this override slot.
+    req.origin_override = Some(bro_core::Origin::Cockpit);
     axum::Json(BlackboxServer::new(state).bro_exec(Parameters(req)).await)
 }
 
@@ -1202,6 +1209,7 @@ pub(crate) async fn control_roster_handler(
                     .map(|s| s.chars().take(200).collect::<String>()),
                 model: model_from_events(&inner.events),
                 last_event_at: Some(last_event_at),
+                origin: inner.origin,
             });
         }
         out
@@ -3175,5 +3183,90 @@ mod tests {
         let obj = value.as_object().expect("envelope must be an object");
         assert!(obj.contains_key("version"), "envelope must carry `version`");
         assert_eq!(obj.len(), 2, "envelope must carry exactly `version` and `tasks`");
+    }
+
+    // Slice 1b — `/control/roster` must surface the spawn-time
+    // `origin` for every task so the roster UI can tab Fleet vs
+    // Dispatched vs Workflow vs Atom without re-deriving. The
+    // handler reads `inner.origin` (Slice 1b plumbing) and projects
+    // it onto `RosterSummaryV1.origin` (added in Slice 1b); this
+    // test seeds two tasks with explicit different origins and
+    // asserts the per-task summary carries the right one.
+    #[tokio::test]
+    async fn control_roster_projects_origin_per_task() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        // Seed two tasks with deliberately different origins so a
+        // mis-projection (e.g. always defaulting to `unknown` or
+        // always reading the same task) would be visible.
+        {
+            let mut store = state.task_store.write();
+            let task_a = orchestration::test_task(
+                "task-cockpit",
+                orchestration::TaskStatus::Running,
+                Provider::Glm,
+            );
+            task_a.inner.lock().origin = bro_core::Origin::Cockpit;
+            store
+                .insert("task-cockpit".to_string(), task_a)
+                .expect("insert task-cockpit");
+
+            let task_b = orchestration::test_task(
+                "task-workflow",
+                orchestration::TaskStatus::Running,
+                Provider::Glm,
+            );
+            task_b.inner.lock().origin = bro_core::Origin::Workflow;
+            store
+                .insert("task-workflow".to_string(), task_b)
+                .expect("insert task-workflow");
+        }
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let tasks = value
+            .get("tasks")
+            .and_then(|t| t.as_array())
+            .expect("envelope must carry a `tasks` array");
+        assert_eq!(tasks.len(), 2);
+
+        // Per-summary `origin` projection check. We index by
+        // task_id (stable) rather than array order (HashMap-iteration
+        // order).
+        let mut by_id = std::collections::HashMap::new();
+        for s in tasks {
+            let obj = s.as_object().expect("summary must be object");
+            let task_id = obj
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .expect("summary must carry task_id")
+                .to_string();
+            let origin = obj
+                .get("origin")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("summary[{task_id}] must carry lowercase origin"))
+                .to_string();
+            by_id.insert(task_id, origin);
+        }
+
+        assert_eq!(
+            by_id.get("task-cockpit").map(String::as_str),
+            Some("cockpit"),
+            "cockpit-origin task must project as \"cockpit\" on the roster"
+        );
+        assert_eq!(
+            by_id.get("task-workflow").map(String::as_str),
+            Some("workflow"),
+            "workflow-origin task must project as \"workflow\" on the roster"
+        );
     }
 }

@@ -899,6 +899,10 @@ Next step: <one concrete steering suggestion>\n",
                     None,
                     None,
                     Some(self.state.system_events.clone()),
+                    // dispatch_team_advisor_prompt — team advisor
+                    // resume branch, workflow origin (advisor
+                    // runtime is team-orchestration traffic).
+                    bro_core::Origin::Workflow,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 release_resume_lease_when_done(task.clone(), resume_lease);
@@ -959,6 +963,9 @@ Next step: <one concrete steering suggestion>\n",
                     None,
                     None,
                     Some(self.state.system_events.clone()),
+                    // dispatch_team_advisor_prompt — team advisor
+                    // fresh branch, workflow origin.
+                    bro_core::Origin::Workflow,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 task

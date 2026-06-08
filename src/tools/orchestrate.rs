@@ -177,6 +177,10 @@ Constraints:\n\
             Some(format!("workflow::{workflow_name}")),
             None,
             Some(self.state.system_events.clone()),
+            // orchestrate.rs is the workflow executor's harness-task
+            // spawn — same source class as the surrounding
+            // workflow_runtime.rs dispatch path.
+            bro_core::Origin::Workflow,
         );
         orch::push_in_process_event(
             &task,

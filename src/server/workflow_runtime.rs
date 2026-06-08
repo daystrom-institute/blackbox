@@ -161,6 +161,11 @@ impl BlackboxServer {
                     code_mode: wf_code_mode,
                     service_tier: None,
                     output_schema: None,
+                    // workflow executor dispatches a brofile-backed
+                    // sub-task on behalf of a workflow node — workflow
+                    // origin so the roster tab groups it under the
+                    // workflow it serves.
+                    origin: bro_core::Origin::Workflow,
                 })?;
             return Ok(dispatched.task);
         }
@@ -241,6 +246,10 @@ impl BlackboxServer {
             None,
             None,
             Some(self.state.system_events.clone()),
+            // workflow_dispatch_executor's resume branch — also
+            // workflow origin (matches the dispatch_fresh_bro_task
+            // path above).
+            bro_core::Origin::Workflow,
         );
         if let Some(lease) = &runtime_lease {
             let inner = task.inner.lock();
