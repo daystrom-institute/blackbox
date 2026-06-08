@@ -830,7 +830,19 @@ impl DaemonFleetClient {
         }
         Self {
             base_url: Arc::from(url),
-            http: reqwest::Client::new(),
+            // Bound every request so a saturated daemon can never hang a caller
+            // indefinitely. The status poller (`spawn_daemon_status_poller`) is
+            // the cockpit's liveness path: without a timeout a single stalled
+            // `/control/status` poll froze the whole roster at its last state
+            // (observed 28min stale during heavy in-process agent work). The
+            // global 180s backstop is generous enough for the longest control
+            // op (a `/control/closeout` rebase+push); the status poll adds a far
+            // shorter per-request timeout below so it recovers fast.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(180))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -873,9 +885,15 @@ impl DaemonFleetClient {
     }
 
     async fn get_json(&self, path: &str) -> anyhow::Result<Value> {
+        // A short per-request timeout (tighter than the client-wide backstop) so
+        // the status poller recovers fast: GETs here are cheap reads, so if one
+        // stalls on a half-open keepalive connection while the daemon is briefly
+        // CPU-starved by an in-process agent's build, it errors in ~15s and the
+        // poll loop retries on a fresh connection instead of freezing the roster.
         let outer: Value = self
             .http
             .get(self.endpoint(path))
+            .timeout(std::time::Duration::from_secs(15))
             .send()
             .await?
             .error_for_status()?
