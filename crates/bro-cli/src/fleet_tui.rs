@@ -2005,22 +2005,8 @@ fn stop_or_delete_selected(app: &mut App) {
     } else {
         // Delete: forget the cockpit's task record + drop the row. The provider
         // session jsonl persists for a future resume.
-        let id = app.agents[idx].task.id();
-        if let Some(classifier) = &app.agents[idx].classifier {
-            let classifier_id = classifier.id();
-            let _ = app.orch.stop(classifier);
-            app.orch.forget(&classifier_id);
-            app.activity_clocks
-                .remove(&activity_key("classifier", &classifier_id));
-        }
-        app.activity_clocks.remove(&activity_key("agent", &id));
-        app.orch.forget(&id);
-        app.agents.remove(idx);
+        remove_agent_row(app, idx);
         app.focused_agent_id = None;
-        let n = app.agents.len();
-        if n == 0 || app.roster_selected >= n {
-            app.roster_selected = n.saturating_sub(1);
-        }
         if app.zone == Zone::SingleAgent {
             app.zone = Zone::Roster;
         }
@@ -2514,6 +2500,29 @@ fn sync_classifier_monitors(app: &mut App) -> ClassifierSync {
 /// Toggle the `/help` overlay on.
 fn show_help_overlay(app: &mut App) {
     app.help_visible = true;
+}
+
+/// Forget an agent's cockpit record (+ its classifier) and drop its roster row,
+/// fixing up the selection. The provider session jsonl persists on disk. Shared
+/// by Ctrl+X delete and post-fold cleanup (a folded worktree is gone, so its row
+/// is a dead end). Caller handles any zone/focus/status changes. Private: the
+/// `closeout` child module reaches it through normal ancestor-visibility.
+fn remove_agent_row(app: &mut App, idx: usize) {
+    let id = app.agents[idx].task.id();
+    if let Some(classifier) = &app.agents[idx].classifier {
+        let classifier_id = classifier.id();
+        let _ = app.orch.stop(classifier);
+        app.orch.forget(&classifier_id);
+        app.activity_clocks
+            .remove(&activity_key("classifier", &classifier_id));
+    }
+    app.activity_clocks.remove(&activity_key("agent", &id));
+    app.orch.forget(&id);
+    app.agents.remove(idx);
+    let n = app.agents.len();
+    if n == 0 || app.roster_selected >= n {
+        app.roster_selected = n.saturating_sub(1);
+    }
 }
 
 fn forget_standalone_agents(app: &mut App, stop_running: bool) {

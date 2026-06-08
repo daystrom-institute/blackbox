@@ -318,6 +318,26 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
             }
             let line = render_outcome(&sent_disposition, dry_run, &outcome);
             app.set_status(line, Duration::from_secs(6));
+            // A SUCCESSFUL mutating fold removed the worktree, so the agent's row
+            // is now a dead end (re-running /closeout would fail "no worktree").
+            // Drop it from the roster so a folded agent doesn't linger looking
+            // re-foldable. keep/preflight/--dry-run leave the worktree intact, so
+            // they keep their row.
+            let mutating = matches!(
+                sent_disposition.as_str(),
+                "discard" | "publish" | "merge" | "adopt"
+            );
+            if !dry_run
+                && mutating
+                && matches!(outcome, CloseoutOutcome::Success { .. })
+                && let Some(idx) = agent_index_for_worktree(app, &worktree)
+            {
+                remove_agent_row(app, idx);
+                if app.zone == Zone::SingleAgent {
+                    app.focused_agent_id = None;
+                    app.zone = Zone::Roster;
+                }
+            }
         }
     }
 }
