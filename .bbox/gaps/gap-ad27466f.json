@@ -15,7 +15,9 @@
   "dedupe_key": "tooling/blackbox-mcp-surface/mcp-smoke-call-helper",
   "suggested_owner": "blackbox",
   "notes": "bbox_mcp_surface(action=\"replay\") shows tools visible under a surface packet, but there's no plain \"call this tool / list registered tools\" client for verifying a daemon redeploy from the shell. Recurs for anyone who rebuilds blackboxd and wants to confirm the tool surface before trusting it.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-02T02:16:53Z",
-  "updated_at": "2026-06-02T02:16:53Z"
+  "updated_at": "2026-06-08T06:06:08Z",
+  "resolved_at": "2026-06-08T06:06:08Z",
+  "resolution_note": "Implemented `bro mcp call <tool> '<json>'` (commit 7c2771a on beta/blackbox-v2, crates/bro-cli/src/mcp_call.rs + main.rs wiring). Does the streamable-HTTP MCP handshake (initialize → tools/call) against the local daemon, propagates Mcp-Session-Id, SSE-aware response decode, prints the tool result. Validated live: `bro mcp call bbox_stats '{}'` returned real corpus stats (105448 docs, 465MB index). Dispatched to a fleet bro (brodex) during the autonomous dogfood loop (thread-c38e005d)."
 }

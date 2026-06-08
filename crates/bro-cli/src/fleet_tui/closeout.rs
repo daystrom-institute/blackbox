@@ -99,7 +99,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     let trimmed = arg.trim();
     if trimmed.is_empty() {
         return Err(
-            "usage: /closeout <keep|preflight|discard|publish|merge|adopt> [--dry-run] [--target <branch>]"
+            "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>]"
                 .to_string(),
         );
     }
@@ -135,12 +135,12 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     }
 
     let disposition = disposition.ok_or_else(|| {
-        "usage: /closeout <keep|preflight|discard|publish|merge|adopt> [--dry-run] [--target <branch>]"
+        "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>]"
             .to_string()
     })?;
     if !is_valid_disposition(&disposition) {
         return Err(format!(
-            "/closeout: unknown disposition {disposition:?} (expected keep, preflight, discard, publish, merge, or adopt)"
+            "/closeout: unknown disposition {disposition:?} (expected discard, publish, merge, or adopt; add --dry-run to preview)"
         ));
     }
 
@@ -165,15 +165,16 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     })
 }
 
-/// Whitelist mirrored from the daemon's `control_closeout_handler` — kept
-/// in sync manually (the daemon is the source of truth, this is the
-/// client-side guard so a typo fails fast with a friendly message
-/// rather than a 400 round-trip).
+/// The dispositions the phased `/control/closeout` driver actually implements
+/// (`fleet_worktree.rs` `phase_*` / `phase_preflight`): the four worktree-folding
+/// operations. The legacy `keep`/`preflight` dispositions are NOT implemented by
+/// the phased endpoint (they were `exit_worktree`-tool-only and the daemon
+/// rejects them with `disposition must be …; got keep`). Preview is `--dry-run`
+/// on any of these, not a `preflight` disposition. Client-side guard so a typo —
+/// or a stale `keep`/`preflight` habit — fails fast with a friendly message
+/// instead of a confusing daemon round-trip.
 fn is_valid_disposition(d: &str) -> bool {
-    matches!(
-        d,
-        "keep" | "preflight" | "discard" | "publish" | "merge" | "adopt"
-    )
+    matches!(d, "discard" | "publish" | "merge" | "adopt")
 }
 
 /// Compose the wire DTO from the parsed command + the focused agent's
@@ -224,8 +225,8 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
         app.set_status(
             format!(
                 "/closeout {}: open the agent first (→) — a mutating fold runs only from the \
-                 focused view so it can't fold the wrong worktree. (preflight and --dry-run \
-                 work from the roster.)",
+                 focused view so it can't fold the wrong worktree. (Add --dry-run to preview \
+                 from the roster.)",
                 parsed.disposition
             ),
             Duration::from_secs(8),
@@ -628,10 +629,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_closeout_keeps_is_non_mutating() {
-        let p = parsed("keep");
-        assert_eq!(p.disposition, "keep");
-        assert!(!p.confirm);
+    fn parse_closeout_rejects_legacy_keep_and_preflight() {
+        // The phased /control/closeout driver implements only the four folding
+        // dispositions; `keep`/`preflight` are legacy `exit_worktree` verbs the
+        // daemon rejects. The cockpit guards them client-side so the operator
+        // gets a friendly "add --dry-run to preview" instead of a daemon 400.
+        for legacy in ["keep", "preflight"] {
+            let err = parse_closeout(legacy).unwrap_err();
+            assert!(err.contains("unknown disposition"), "{legacy}: {err}");
+            assert!(err.contains("--dry-run"), "{legacy}: {err}");
+        }
     }
 
     #[test]
@@ -671,8 +678,6 @@ mod tests {
     #[test]
     fn build_request_stamps_confirm_for_mutating_dispositions() {
         for (disp, expected_confirm) in [
-            ("keep", false),
-            ("preflight", false),
             ("discard", true),
             ("publish", true),
             ("merge", true),
