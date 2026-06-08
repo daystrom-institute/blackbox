@@ -417,7 +417,10 @@ pub fn prepare_closeout_request(
     if branch == "HEAD" {
         anyhow::bail!("refusing to exit worktree in detached HEAD state");
     }
-    if !allowed_prefixes.iter().any(|p| branch.starts_with(p.as_str())) {
+    if !allowed_prefixes
+        .iter()
+        .any(|p| branch.starts_with(p.as_str()))
+    {
         anyhow::bail!(
             "refusing to exit branch {branch}: not under any allowed branch prefix ({})",
             allowed_prefixes.join(", ")
@@ -481,9 +484,23 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
         // ---- pre_push hook SEAM (no-op in Phase 1) ----
         let push = phase_push(req);
         if !push.ok {
-            return CloseoutOutcome::Failed(push);
+            if push.error_class == CloseoutErrorClass::PushRejected
+                && push.repo_cwd == req.base_repo
+            {
+                match recover_push_reject(req) {
+                    PushRecoveryOutcome::Recovered(recovery_phases) => {
+                        results.extend(recovery_phases);
+                    }
+                    PushRecoveryOutcome::Failed(failure) => {
+                        return CloseoutOutcome::Failed(failure);
+                    }
+                }
+            } else {
+                return CloseoutOutcome::Failed(push);
+            }
+        } else {
+            results.push(push);
         }
-        results.push(push);
     }
 
     // ---- pre_remove hook SEAM (no-op in Phase 1) ----
@@ -875,7 +892,7 @@ fn phase_push(req: &CloseoutRequest) -> PhaseResult {
             repo_cwd: base_repo.clone(),
             ok: false,
             error_class: CloseoutErrorClass::PushRejected,
-            content: json!({"error": format!("{e:#}"), "ref": push_ref}),
+            content: json!({"error": format!("{e:#}"), "message": format!("{e:#}"), "ref": push_ref}),
         };
     }
     PhaseResult {
@@ -885,6 +902,99 @@ fn phase_push(req: &CloseoutRequest) -> PhaseResult {
         error_class: CloseoutErrorClass::None,
         content: json!({"pushed": push_ref}),
     }
+}
+
+enum PushRecoveryOutcome {
+    Recovered(Vec<PhaseResult>),
+    Failed(PhaseResult),
+}
+
+fn recover_push_reject(req: &CloseoutRequest) -> PushRecoveryOutcome {
+    let base_repo = &req.base_repo;
+    let target = &req.target;
+    let remote_ref = format!("origin/{target}");
+
+    if let Err(e) = git_run(base_repo, &["fetch", "origin", target]) {
+        return PushRecoveryOutcome::Failed(push_recovery_failure(
+            req,
+            "recovery_fetch",
+            format!("push was rejected and fetch origin/{target} failed: {e:#}"),
+        ));
+    }
+
+    if git_ok(
+        base_repo,
+        &["merge-base", "--is-ancestor", &remote_ref, "HEAD"],
+    ) {
+        let retry = tag_recovery(phase_push(req), "retry_after_fetch");
+        return if retry.ok {
+            PushRecoveryOutcome::Recovered(vec![retry])
+        } else {
+            PushRecoveryOutcome::Failed(push_recovery_retry_failed(
+                retry,
+                "push was still rejected after fetching origin; operator intervention required",
+            ))
+        };
+    }
+
+    if let Err(e) = git_run(base_repo, &["reset", "--hard", &remote_ref]) {
+        return PushRecoveryOutcome::Failed(push_recovery_failure(
+            req,
+            "reset_to_origin",
+            format!(
+                "push was rejected, origin/{target} moved, and resetting local {target} to {remote_ref} failed: {e:#}"
+            ),
+        ));
+    }
+
+    let rebase = tag_recovery(phase_rebase(req), "remote_moved_rebase");
+    if !rebase.ok {
+        return PushRecoveryOutcome::Failed(rebase);
+    }
+
+    let ff_merge = tag_recovery(phase_ff_merge(req), "remote_moved_ff_merge");
+    if !ff_merge.ok {
+        return PushRecoveryOutcome::Failed(ff_merge);
+    }
+
+    let retry = tag_recovery(phase_push(req), "remote_moved_retry_push");
+    if retry.ok {
+        PushRecoveryOutcome::Recovered(vec![rebase, ff_merge, retry])
+    } else {
+        PushRecoveryOutcome::Failed(push_recovery_retry_failed(
+            retry,
+            "push was still rejected after resetting to origin, rebasing, and ff-merging; operator intervention required",
+        ))
+    }
+}
+
+fn tag_recovery(mut result: PhaseResult, recovery: &str) -> PhaseResult {
+    if let Some(obj) = result.content.as_object_mut() {
+        obj.insert("recovery".to_string(), json!(recovery));
+    }
+    result
+}
+
+fn push_recovery_failure(req: &CloseoutRequest, recovery: &str, message: String) -> PhaseResult {
+    PhaseResult {
+        phase: CloseoutPhase::Push,
+        repo_cwd: req.base_repo.clone(),
+        ok: false,
+        error_class: CloseoutErrorClass::PushRejected,
+        content: json!({
+            "error": message,
+            "message": message,
+            "recovery": recovery,
+            "ref": format!("origin/{}", req.target),
+        }),
+    }
+}
+
+fn push_recovery_retry_failed(mut result: PhaseResult, message: &str) -> PhaseResult {
+    if let Some(obj) = result.content.as_object_mut() {
+        obj.insert("message".to_string(), json!(message));
+    }
+    result
 }
 
 fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
@@ -1140,13 +1250,23 @@ fn publish_preflight(
     let publish_ready = base_ready && unsafe_paths.is_empty() && !changed.is_empty();
     let origin_target = git_capture(
         base_repo,
-        &["rev-parse", "--verify", "--short=12", &format!("origin/{target}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--short=12",
+            &format!("origin/{target}"),
+        ],
     )
     .ok();
     let target_head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"]).ok();
     let target_vs_origin = git_capture(
         base_repo,
-        &["rev-list", "--left-right", "--count", &format!("HEAD...origin/{target}")],
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...origin/{target}"),
+        ],
     )
     .ok();
 
@@ -1906,8 +2026,7 @@ mod tests {
             "publish_plan should not contain literal main lines; got: {publish_plan_strs:?}"
         );
         let merge_plan = report["merge_plan"].as_array().unwrap();
-        let merge_plan_strs: Vec<&str> =
-            merge_plan.iter().map(|v| v.as_str().unwrap()).collect();
+        let merge_plan_strs: Vec<&str> = merge_plan.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(
             merge_plan_strs.iter().any(|s| s.contains("on develop")),
             "merge_plan should reference the develop target; got: {merge_plan_strs:?}"
@@ -2043,13 +2162,20 @@ mod tests {
                 "expected success, got failed phase {:?} with error_class {:?}: {}",
                 r.phase,
                 r.error_class,
-                r.content.get("error").and_then(Value::as_str).unwrap_or("?")
+                r.content
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
             ),
         };
 
         // Every phase must be ok.
         for r in &results {
-            assert!(r.ok, "phase {:?} should be ok; got {:?}", r.phase, r.content);
+            assert!(
+                r.ok,
+                "phase {:?} should be ok; got {:?}",
+                r.phase, r.content
+            );
         }
         // merge/adopt must skip StageCommit.
         assert!(
@@ -2082,11 +2208,23 @@ mod tests {
                 .repo_cwd
         };
         assert_eq!(repo_of(CloseoutPhase::Preflight), &cwd);
-        assert_eq!(repo_of(CloseoutPhase::FfBase), &repo.path().canonicalize().unwrap());
+        assert_eq!(
+            repo_of(CloseoutPhase::FfBase),
+            &repo.path().canonicalize().unwrap()
+        );
         assert_eq!(repo_of(CloseoutPhase::Rebase), &cwd);
-        assert_eq!(repo_of(CloseoutPhase::FfMerge), &repo.path().canonicalize().unwrap());
-        assert_eq!(repo_of(CloseoutPhase::Push), &repo.path().canonicalize().unwrap());
-        assert_eq!(repo_of(CloseoutPhase::Remove), &repo.path().canonicalize().unwrap());
+        assert_eq!(
+            repo_of(CloseoutPhase::FfMerge),
+            &repo.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            repo_of(CloseoutPhase::Push),
+            &repo.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            repo_of(CloseoutPhase::Remove),
+            &repo.path().canonicalize().unwrap()
+        );
         // Preflight must surface the branch_commits_ahead count (consumed by
         // the renderer for the `merged_commits` JSON field).
         let preflight = results
@@ -2100,12 +2238,17 @@ mod tests {
             .find(|r| r.phase == CloseoutPhase::FfMerge)
             .unwrap();
         assert!(
-            ff_merge.content["head"].as_str().is_some_and(|h| !h.is_empty()),
+            ff_merge.content["head"]
+                .as_str()
+                .is_some_and(|h| !h.is_empty()),
             "ff_merge should record post-merge head; got: {:?}",
             ff_merge.content
         );
         // Driver must have removed the worktree (Remove phase succeeded).
-        assert!(!cwd.exists(), "Remove phase should have removed the worktree");
+        assert!(
+            !cwd.exists(),
+            "Remove phase should have removed the worktree"
+        );
 
         std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
     }
@@ -2164,12 +2307,183 @@ mod tests {
         assert_eq!(failed.repo_cwd, cwd);
 
         // The worktree should still be on disk (Remove phase didn't run).
-        assert!(cwd.exists(), "worktree must still exist after rebase conflict");
+        assert!(
+            cwd.exists(),
+            "worktree must still exist after rebase conflict"
+        );
 
         // Cleanup: abort the in-progress rebase, then tear down.
         let _ = run_git(&cwd, &["rebase", "--abort"]);
         run_git(
             repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn push_recovery_handles_remote_move_without_force() {
+        let repo = seed_repo();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let origin_root = origin.path().canonicalize().unwrap();
+        run_git(&origin_root, &["init", "--bare"]);
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", origin_root.to_str().unwrap()],
+        );
+        run_git(&repo_root, &["push", "-u", "origin", "main"]);
+
+        let value = enter_test_worktree(&repo_root).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let branch = value["branch"].as_str().unwrap().to_string();
+        std::fs::write(cwd.join("README.md"), "base\nbranch\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo_root.clone(),
+            branch: branch.clone(),
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+        };
+        let rebase = phase_rebase(&req);
+        assert!(rebase.ok, "setup rebase failed: {:?}", rebase.content);
+        let ff_merge = phase_ff_merge(&req);
+        assert!(ff_merge.ok, "setup ff-merge failed: {:?}", ff_merge.content);
+
+        let peer = tempfile::tempdir().unwrap();
+        let peer_repo = peer.path().join("peer");
+        run_git(
+            peer.path(),
+            &[
+                "clone",
+                origin_root.to_str().unwrap(),
+                peer_repo.to_str().unwrap(),
+            ],
+        );
+        run_git(&peer_repo, &["config", "user.email", "test@example.com"]);
+        run_git(&peer_repo, &["config", "user.name", "Test User"]);
+        std::fs::write(peer_repo.join("OTHER.md"), "remote moved\n").unwrap();
+        run_git(&peer_repo, &["add", "OTHER.md"]);
+        run_git(&peer_repo, &["commit", "-m", "remote move"]);
+        run_git(&peer_repo, &["push", "origin", "main"]);
+
+        let phases = match recover_push_reject(&req) {
+            PushRecoveryOutcome::Recovered(phases) => phases,
+            PushRecoveryOutcome::Failed(result) => panic!(
+                "expected push recovery, got {:?} {:?}: {:?}",
+                result.phase, result.error_class, result.content
+            ),
+        };
+
+        assert_eq!(
+            phases.iter().map(|r| r.phase).collect::<Vec<_>>(),
+            vec![
+                CloseoutPhase::Rebase,
+                CloseoutPhase::FfMerge,
+                CloseoutPhase::Push,
+            ]
+        );
+        assert!(phases.iter().all(|r| r.ok), "all recovery phases succeed");
+        assert_eq!(
+            phases.last().unwrap().content["recovery"],
+            json!("remote_moved_retry_push")
+        );
+        assert_eq!(
+            git_capture(&repo_root, &["rev-parse", "main"]).unwrap(),
+            git_capture(&origin_root, &["rev-parse", "main"]).unwrap(),
+            "retry push should advance origin without force-pushing"
+        );
+        assert!(repo_root.join("OTHER.md").exists(), "origin move preserved");
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("README.md")).unwrap(),
+            "base\nbranch\n"
+        );
+
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn push_recovery_leaves_rebase_conflict_worktree_local() {
+        let repo = seed_repo();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let origin_root = origin.path().canonicalize().unwrap();
+        run_git(&origin_root, &["init", "--bare"]);
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", origin_root.to_str().unwrap()],
+        );
+        run_git(&repo_root, &["push", "-u", "origin", "main"]);
+
+        let value = enter_test_worktree(&repo_root).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let branch = value["branch"].as_str().unwrap().to_string();
+        std::fs::write(cwd.join("README.md"), "base\nbranch\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo_root.clone(),
+            branch: branch.clone(),
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+        };
+        let rebase = phase_rebase(&req);
+        assert!(rebase.ok, "setup rebase failed: {:?}", rebase.content);
+        let ff_merge = phase_ff_merge(&req);
+        assert!(ff_merge.ok, "setup ff-merge failed: {:?}", ff_merge.content);
+
+        let peer = tempfile::tempdir().unwrap();
+        let peer_repo = peer.path().join("peer");
+        run_git(
+            peer.path(),
+            &[
+                "clone",
+                origin_root.to_str().unwrap(),
+                peer_repo.to_str().unwrap(),
+            ],
+        );
+        run_git(&peer_repo, &["config", "user.email", "test@example.com"]);
+        run_git(&peer_repo, &["config", "user.name", "Test User"]);
+        std::fs::write(peer_repo.join("README.md"), "base\norigin\n").unwrap();
+        run_git(&peer_repo, &["add", "README.md"]);
+        run_git(&peer_repo, &["commit", "-m", "remote conflict"]);
+        run_git(&peer_repo, &["push", "origin", "main"]);
+
+        let failed = match recover_push_reject(&req) {
+            PushRecoveryOutcome::Failed(result) => result,
+            PushRecoveryOutcome::Recovered(phases) => panic!(
+                "expected rebase conflict, got recovery phases: {:?}",
+                phases.iter().map(|r| r.phase).collect::<Vec<_>>()
+            ),
+        };
+
+        assert_eq!(failed.phase, CloseoutPhase::Rebase);
+        assert_eq!(failed.error_class, CloseoutErrorClass::RebaseConflict);
+        assert_eq!(failed.repo_cwd, cwd, "conflict must remain worktree-local");
+        assert_eq!(failed.content["recovery"], json!("remote_moved_rebase"));
+
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(["rebase", "--abort"])
+            .output();
+        run_git(
+            &repo_root,
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
         );
         std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
@@ -2266,7 +2580,10 @@ mod tests {
             fix.is_ok(),
             "FIX: prepare_closeout_request(cx_root=worktree, ...) must return Ok; \
              got Err({})",
-            fix.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default()
+            fix.as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default()
         );
         let req = fix.expect("FIX returns Ok");
         assert_eq!(

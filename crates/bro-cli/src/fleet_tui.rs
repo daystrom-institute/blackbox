@@ -441,6 +441,10 @@ struct App {
     closeout_tx: mpsc::Sender<CloseoutMsg>,
     /// Drained each tick: surfaces a closeout result as a status flash.
     closeout_rx: mpsc::Receiver<CloseoutMsg>,
+    /// Worktree-local rebase conflict currently delegated back to the owning
+    /// agent. When the agent turn settles, closeout resumes as adopt/merge
+    /// from the structured driver path, never as a second publish.
+    pending_closeout_recovery: Option<PendingCloseoutRecovery>,
     /// Local clocks for the focused executor/classifier activity strip.
     activity_clocks: HashMap<String, ActivityClock>,
     activity_frame: usize,
@@ -546,6 +550,7 @@ impl App {
             standalone_rx,
             closeout_tx,
             closeout_rx,
+            pending_closeout_recovery: None,
             activity_clocks: HashMap::new(),
             activity_frame: 0,
         }
@@ -1610,6 +1615,7 @@ fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
     for msg in closeouts {
         install_closeout(app, msg);
     }
+    poll_pending_closeout_recovery(app);
     app.maybe_clear_status();
     app.activity_frame = app.activity_frame.wrapping_add(1);
 }
@@ -2656,6 +2662,11 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
     }
     if app.roster_anchor_id.as_deref() == Some(outcome.agent_id.as_str()) {
         app.roster_anchor_id = Some(new_id.clone());
+    }
+    if let Some(pending) = app.pending_closeout_recovery.as_mut()
+        && pending.agent_id == outcome.agent_id
+    {
+        pending.agent_id = new_id.clone();
     }
     let agent_task = app.agents[idx].task.clone();
     let agent_name = app.agents[idx].name.clone();

@@ -11,6 +11,7 @@
 //! `App::closeout_rx` and is installed by `install_closeout` on the UI thread.
 
 use super::*;
+use std::path::Path;
 use std::time::Duration;
 
 use bro_fleet_client::{CloseoutErrorClass, CloseoutOutcome, CloseoutPhase};
@@ -34,6 +35,17 @@ pub(super) struct ParsedCloseout {
     /// `confirm` flag is set automatically — matches the daemon handler's
     /// gate (`control_closeout_handler`).
     pub confirm: bool,
+}
+
+/// A worktree-local rebase conflict that has been handed back to the owning
+/// agent. Once that resumed turn goes idle, the cockpit reruns closeout as
+/// `adopt` for the same worktree/target; the agent never drives closeout itself.
+#[derive(Debug, Clone)]
+pub(super) struct PendingCloseoutRecovery {
+    pub agent_id: String,
+    pub worktree: String,
+    pub target: Option<String>,
+    pub observed_turn_active: bool,
 }
 
 /// One finished `/closeout` worker result, delivered from
@@ -60,6 +72,12 @@ pub(super) enum CloseoutMsg {
         /// `true` when the run was a `--dry-run` (so the renderer can
         /// prefix the message to make the non-mutating nature obvious).
         dry_run: bool,
+        /// Managed worktree the request targeted. Used to distinguish
+        /// worktree-local rebase conflicts from base/target checkout failures.
+        worktree: String,
+        /// Target branch the operator supplied, if any. Preserved across the
+        /// post-reconcile adopt retry.
+        target: Option<String>,
         outcome: CloseoutOutcome,
     },
 }
@@ -93,7 +111,9 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
                     .next()
                     .ok_or_else(|| "/closeout: --target requires a branch argument".to_string())?;
                 if value.is_empty() {
-                    return Err("/closeout: --target requires a non-empty branch argument".to_string());
+                    return Err(
+                        "/closeout: --target requires a non-empty branch argument".to_string()
+                    );
                 }
                 target = Some(value.to_string());
             }
@@ -191,10 +211,15 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
             return;
         }
     };
-    let verb = if parsed.dry_run { "preflight" } else { &parsed.disposition };
+    let verb = if parsed.dry_run {
+        "preflight"
+    } else {
+        &parsed.disposition
+    };
     let req = build_request(&parsed, &worktree);
     let sent_disposition = req.disposition.clone();
     let dry_run = parsed.dry_run;
+    let target = req.target.clone();
     let orch = app.orch.clone();
     let tx = app.closeout_tx.clone();
     app.set_status(
@@ -208,6 +233,8 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
             Ok(outcome) => CloseoutMsg::Outcome {
                 sent_disposition,
                 dry_run,
+                worktree,
+                target,
                 outcome,
             },
             Err(error) => CloseoutMsg::Failed {
@@ -231,8 +258,8 @@ fn focused_worktree(app: &App) -> Option<String> {
 }
 
 /// UI-thread half of a finished `/closeout` worker. Renders the
-/// structured `CloseoutOutcome` as a status flash; no auto-recovery
-/// (that's Phase 4 — escalation + push-reject recovery + agent reconcile).
+/// structured `CloseoutOutcome` as a status flash, except for a
+/// worktree-local rebase conflict, which is resumed back to the owning agent.
 pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
     match msg {
         CloseoutMsg::Failed {
@@ -241,17 +268,173 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
             error,
         } => {
             let prefix = if dry_run { "preflight" } else { &disposition };
-            app.set_status(format!("/closeout {prefix} failed: {error}"), Duration::from_secs(8));
+            app.set_status(
+                format!("/closeout {prefix} failed: {error}"),
+                Duration::from_secs(8),
+            );
         }
         CloseoutMsg::Outcome {
             sent_disposition,
             dry_run,
+            worktree,
+            target,
             outcome,
         } => {
+            if maybe_resume_rebase_recovery(app, &worktree, target.clone(), &outcome) {
+                return;
+            }
             let line = render_outcome(&sent_disposition, dry_run, &outcome);
             app.set_status(line, Duration::from_secs(6));
         }
     }
+}
+
+fn maybe_resume_rebase_recovery(
+    app: &mut App,
+    worktree: &str,
+    target: Option<String>,
+    outcome: &CloseoutOutcome,
+) -> bool {
+    let CloseoutOutcome::Failed(result) = outcome else {
+        return false;
+    };
+    if result.error_class != CloseoutErrorClass::RebaseConflict {
+        return false;
+    }
+    if !same_path(&result.repo_cwd, worktree) {
+        return false;
+    }
+    let Some(idx) = agent_index_for_worktree(app, worktree) else {
+        app.set_status(
+            format!(
+                "/closeout rebase conflict in {worktree}; no owning fleet agent is focused/known"
+            ),
+            Duration::from_secs(8),
+        );
+        return true;
+    };
+    let provider = app.agents[idx].provider;
+    if !provider_supports_bidi(provider) {
+        app.set_status(
+            format!("/closeout rebase conflict in {worktree}; {provider} cannot be resumed automatically"),
+            Duration::from_secs(8),
+        );
+        return true;
+    }
+
+    let agent_id = app.agents[idx].task.id();
+    app.pending_closeout_recovery = Some(PendingCloseoutRecovery {
+        agent_id,
+        worktree: worktree.to_string(),
+        target,
+        observed_turn_active: false,
+    });
+    let prompt = rebase_recovery_prompt(worktree, result);
+    resume_agent(app, idx, prompt);
+    true
+}
+
+pub(super) fn poll_pending_closeout_recovery(app: &mut App) {
+    let Some(pending) = app.pending_closeout_recovery.clone() else {
+        return;
+    };
+    if app.resuming.contains(&pending.agent_id) {
+        return;
+    }
+    let Some(idx) = app
+        .agents
+        .iter()
+        .position(|agent| agent.task.id() == pending.agent_id)
+    else {
+        app.pending_closeout_recovery = None;
+        app.set_status(
+            "/closeout recovery stopped: owning agent is no longer in the roster".to_string(),
+            Duration::from_secs(8),
+        );
+        return;
+    };
+    let snap = app.agents[idx].task.snapshot();
+    if snap.turn_active {
+        if let Some(pending) = app.pending_closeout_recovery.as_mut() {
+            pending.observed_turn_active = true;
+        }
+        return;
+    }
+    if !pending.observed_turn_active && !snap.status.is_terminal() {
+        return;
+    }
+
+    app.pending_closeout_recovery = None;
+    spawn_adopt_retry(app, pending.worktree, pending.target);
+}
+
+fn spawn_adopt_retry(app: &mut App, worktree: String, target: Option<String>) {
+    let req = bro_fleet_client::CloseoutRequest {
+        worktree: worktree.clone(),
+        disposition: "adopt".to_string(),
+        confirm: true,
+        target: target.clone(),
+        commit_message: None,
+        paths: Vec::new(),
+        allow_branch_prefixes: None,
+    };
+    let orch = app.orch.clone();
+    let tx = app.closeout_tx.clone();
+    app.set_status(
+        format!("/closeout adopt retry after rebase reconciliation on {worktree}…"),
+        Duration::from_secs(4),
+    );
+    app.rt.spawn(async move {
+        let result = orch.closeout(&req).map_err(|e| format!("{e:#}"));
+        let msg = match result {
+            Ok(outcome) => CloseoutMsg::Outcome {
+                sent_disposition: "adopt".to_string(),
+                dry_run: false,
+                worktree,
+                target,
+                outcome,
+            },
+            Err(error) => CloseoutMsg::Failed {
+                disposition: "adopt".to_string(),
+                dry_run: false,
+                error,
+            },
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+fn agent_index_for_worktree(app: &App, worktree: &str) -> Option<usize> {
+    app.agents.iter().position(|agent| {
+        agent
+            .task
+            .snapshot()
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| same_path(Path::new(cwd), worktree))
+    })
+}
+
+fn same_path(left: &Path, right: &str) -> bool {
+    let right = Path::new(right);
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+fn rebase_recovery_prompt(worktree: &str, result: &bro_fleet_client::PhaseResult) -> String {
+    let detail = result
+        .content
+        .as_object()
+        .and_then(|obj| obj.get("message").or_else(|| obj.get("error")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("git rebase failed");
+    format!(
+        "The /closeout driver hit a worktree-local rebase conflict in {worktree}. \
+Resolve the conflict in this worktree, stage and commit the reconciliation, then stop. \
+Do not run closeout, do not publish, and do not touch the base/target checkout; the cockpit will rerun closeout as adopt after your turn finishes.\n\nDriver failure: {detail}"
+    )
 }
 
 /// Render the structured outcome as a single human-readable line. On
@@ -260,23 +443,17 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
 /// discard lands the worktree name). On `Failed` we show phase +
 /// `error_class` + the carried message (the cockpit does not invent
 /// recovery steps in Phase 3b).
-fn render_outcome(
-    sent_disposition: &str,
-    dry_run: bool,
-    outcome: &CloseoutOutcome,
-) -> String {
+fn render_outcome(sent_disposition: &str, dry_run: bool, outcome: &CloseoutOutcome) -> String {
     match outcome {
         CloseoutOutcome::Success { phases } => {
             let tail = phases.last();
-            let detail = tail
-                .and_then(|p| p.content.as_object())
-                .and_then(|obj| {
-                    obj.get("head")
-                        .or_else(|| obj.get("removed_worktree"))
-                        .or_else(|| obj.get("worktree"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                });
+            let detail = tail.and_then(|p| p.content.as_object()).and_then(|obj| {
+                obj.get("head")
+                    .or_else(|| obj.get("removed_worktree"))
+                    .or_else(|| obj.get("worktree"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
             let prefix = if dry_run {
                 format!("preflight of {sent_disposition}: ready")
             } else {
@@ -293,9 +470,17 @@ fn render_outcome(
             let message = r
                 .content
                 .as_object()
-                .and_then(|obj| obj.get("message").and_then(|v| v.as_str()))
+                .and_then(|obj| {
+                    obj.get("message")
+                        .or_else(|| obj.get("error"))
+                        .and_then(|v| v.as_str())
+                })
                 .unwrap_or("");
-            let prefix = if dry_run { "preflight" } else { sent_disposition };
+            let prefix = if dry_run {
+                "preflight"
+            } else {
+                sent_disposition
+            };
             if message.is_empty() {
                 format!("/closeout {prefix} failed at {phase} ({class})")
             } else {
@@ -465,5 +650,41 @@ mod tests {
         assert!(line.contains("rebase"), "{line}");
         assert!(line.contains("rebase_conflict"), "{line}");
         assert!(line.contains("conflict on Cargo.toml"), "{line}");
+    }
+
+    #[test]
+    fn render_outcome_failed_uses_error_fallback() {
+        let outcome = CloseoutOutcome::Failed(bro_fleet_client::PhaseResult {
+            phase: bro_fleet_client::CloseoutPhase::FfBase,
+            repo_cwd: "/tmp/base".into(),
+            ok: false,
+            error_class: bro_fleet_client::CloseoutErrorClass::FfBaseFailed,
+            content: serde_json::json!({ "error": "target is not fast-forwardable" }),
+        });
+        let line = render_outcome("adopt", false, &outcome);
+        assert!(line.contains("ff_base"), "{line}");
+        assert!(line.contains("ff_base_failed"), "{line}");
+        assert!(line.contains("target is not fast-forwardable"), "{line}");
+    }
+
+    #[test]
+    fn rebase_recovery_prompt_keeps_closeout_owned_by_cockpit() {
+        let result = bro_fleet_client::PhaseResult {
+            phase: bro_fleet_client::CloseoutPhase::Rebase,
+            repo_cwd: "/tmp/wt".into(),
+            ok: false,
+            error_class: bro_fleet_client::CloseoutErrorClass::RebaseConflict,
+            content: serde_json::json!({ "error": "CONFLICT (content): README.md" }),
+        };
+
+        let prompt = rebase_recovery_prompt("/tmp/wt", &result);
+        assert!(prompt.contains("/tmp/wt"), "{prompt}");
+        assert!(prompt.contains("stage and commit"), "{prompt}");
+        assert!(prompt.contains("Do not run closeout"), "{prompt}");
+        assert!(
+            prompt.contains("the cockpit will rerun closeout as adopt"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("CONFLICT (content): README.md"), "{prompt}");
     }
 }
