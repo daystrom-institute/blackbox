@@ -209,6 +209,30 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
             return;
         }
     };
+    // Footgun gate: a MUTATING fold (discard/publish/merge/adopt) pushes to a
+    // real branch, so it must not fire from the roster against whatever agent
+    // the cursor happens to sit on — too easy to fold the wrong worktree. Run
+    // those only from the focused single-agent view, where the operator has
+    // explicitly zoomed into the agent being folded. Non-mutating dispositions
+    // (`keep`/`preflight`) and ANY `--dry-run` stay runnable from the roster so
+    // the command keeps its discoverability + safe preview there.
+    let mutating = matches!(
+        parsed.disposition.as_str(),
+        "discard" | "publish" | "merge" | "adopt"
+    );
+    if mutating && !parsed.dry_run && app.zone != Zone::SingleAgent {
+        app.set_status(
+            format!(
+                "/closeout {}: open the agent first (→) — a mutating fold runs only from the \
+                 focused view so it can't fold the wrong worktree. (preflight and --dry-run \
+                 work from the roster.)",
+                parsed.disposition
+            ),
+            Duration::from_secs(8),
+        );
+        app.clear_input();
+        return;
+    }
     let worktree = match focused_worktree(app) {
         Some(w) => w,
         None => {

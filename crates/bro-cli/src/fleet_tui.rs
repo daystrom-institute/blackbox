@@ -2204,11 +2204,12 @@ fn run_local_slash(app: &mut App) -> bool {
             open_config(app);
             true
         }
-        // `/closeout` works from any zone: it folds the *selected* worktree, and
-        // `selected_agent()` resolves to the roster cursor outside SingleAgent. The
-        // daemon's managed-worktree guard fails closed if the selection isn't a
-        // managed fleet worktree, so an errant invocation surfaces a clear error
-        // rather than acting on the wrong tree.
+        // `/closeout` is discoverable + previewable from any zone (`keep`,
+        // `preflight`, and any `--dry-run` run against the roster-selected
+        // agent), but `run_closeout` gates MUTATING folds (discard/publish/
+        // merge/adopt) to the focused single-agent view so a real push can't
+        // fire against whatever the roster cursor happens to sit on. The
+        // daemon's managed-worktree guard is the backstop, not the first line.
         "/closeout" => {
             run_closeout(app, arg);
             true
@@ -3422,27 +3423,10 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
             Style::default().fg(Color::Yellow),
         ));
     }
-    if !app.config.projects.is_empty() {
-        let aliases = app
-            .config
-            .projects
-            .keys()
-            .take(4)
-            .map(|key| format!("@{key}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let more = app.config.projects.len().saturating_sub(4);
-        let suffix = if more > 0 {
-            format!(" +{more}")
-        } else {
-            String::new()
-        };
-        spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(
-            format!(" projects {aliases}{suffix} "),
-            Style::default().fg(Color::LightGreen),
-        ));
-    }
+    // The project @alias list is intentionally NOT shown in the footer
+    // (operator: composer clutter). The `@`-prefix autocomplete overlay
+    // (drawn on demand when the input starts with `@`) is the discoverable
+    // surface for the same aliases without the persistent footer noise.
     spans
 }
 

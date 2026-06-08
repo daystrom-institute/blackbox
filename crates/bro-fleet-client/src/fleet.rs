@@ -1281,6 +1281,30 @@ fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) 
     terminal
 }
 
+/// Extract the daemon's authoritative task status from a `/control/status`
+/// response, mirroring [`update_daemon_task`]'s precedence: the typed wire
+/// snapshot (`bro_protocol::TaskSnapshot`) first, then the legacy top-level
+/// `status` string. Returns `None` when the response carried NO parseable
+/// status — e.g. a truncated/unwrapped envelope a saturated daemon returned, or
+/// the `{"text":...}` fallback from `parse_tool_result_json`. Callers MUST treat
+/// `None` as inconclusive (attach a poller), never as terminal.
+fn parse_daemon_status(value: &Value) -> Option<TaskStatus> {
+    if let Some(snap) = value
+        .get("snapshot")
+        .and_then(|s| serde_json::from_value::<bro_protocol::TaskSnapshot>(s.clone()).ok())
+    {
+        return Some(snap.status);
+    }
+    match value.get("status").and_then(|v| v.as_str()) {
+        Some("completed") => Some(TaskStatus::Completed),
+        Some("failed") => Some(TaskStatus::Failed),
+        Some("cancelled") => Some(TaskStatus::Cancelled),
+        Some("running") => Some(TaskStatus::Running),
+        Some("pending") => Some(TaskStatus::Pending),
+        _ => None,
+    }
+}
+
 /// Best-effort model id from an `init`/assistant event in the stream-json buffer.
 fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
     events.iter().find_map(|e| {
@@ -1495,29 +1519,45 @@ impl FleetOrchestrator {
             let id = task.id();
             match status {
                 Ok(value) => {
-                    // Same untrusted-JSON parse as the live poller; isolate it so
-                    // one bad reloaded snapshot can't abort the whole reconcile.
+                    // Extract the daemon's AUTHORITATIVE status explicitly,
+                    // BEFORE the side-effecting parse. Only an explicit terminal
+                    // verdict may retire the task; an explicit running verdict
+                    // restores it; and a MISSING/unparseable status is
+                    // INCONCLUSIVE — never terminal. Under load the daemon's
+                    // `/control/status` can time out or return a truncated
+                    // envelope, in which case `parse_tool_result_json` falls back
+                    // to `{"text":...}` with no status field. Treating that as
+                    // terminal once stranded a live brodex bro as Interrupted
+                    // forever: it set recoverable=false, which made every later
+                    // reconcile skip the task. Inconclusive ⇒ optimistic poller,
+                    // exactly like a failed probe.
+                    let daemon_status = parse_daemon_status(&value);
+                    // Still run the side-effecting parse to populate events /
+                    // model / message (it leaves status untouched when absent).
                     let mut dummy = 0usize;
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         update_daemon_task(&task, &value, &mut dummy)
                     }));
-                    let still_running = {
+                    let live = !matches!(daemon_status, Some(s) if s.is_terminal());
+                    {
                         let mut inner = task.inner.lock();
-                        // The daemon's verdict is authoritative now — this is no
-                        // longer an unknown-fate orphan either way.
-                        let running =
-                            matches!(inner.status, TaskStatus::Running | TaskStatus::Pending);
                         inner.recoverable = false;
-                        if running {
+                        // Clear the bogus reconcile-time `last_event_at_ms` stamp
+                        // (update_daemon_task saw the whole persisted backlog as
+                        // "new"); the re-attached poller re-stamps it on the next
+                        // genuine event, and a terminal row falls back to the real
+                        // start age in the "last" column.
+                        inner.last_event_at_ms = None;
+                        if live {
                             inner.completed_at = None;
                         }
-                        running
-                    };
-                    if still_running {
+                    }
+                    if live {
                         tracing::info!(
                             task_id = %id,
-                            "reconcile: daemon still running this reloaded task; \
-                             re-attaching live poller"
+                            terminal = false,
+                            "reconcile: reloaded task is live or inconclusive on the \
+                             daemon; attaching poller to settle true state"
                         );
                         spawn_daemon_status_poller(
                             self.daemon.clone(),
@@ -1542,12 +1582,36 @@ impl FleetOrchestrator {
                     }
                 }
                 Err(err) => {
+                    // The probe FAILED — but that does NOT mean the task is dead.
+                    // At cockpit relaunch the daemon is often momentarily slow
+                    // (many recoverable tasks probed at once + in-process build
+                    // load), so a single timed-out `/control/status` would
+                    // otherwise STRAND a still-running agent as Interrupted
+                    // forever (one-shot reconcile, no poller, no retry — observed:
+                    // a live brodex bro shown Interrupted while the daemon had it
+                    // running). Optimistically re-attach a poller: if the task is
+                    // alive its next successful poll restores Running + live
+                    // tracking; if it is genuinely gone the poller's bounded
+                    // give-up (consecutive-failure cap) retires it cleanly. Hand
+                    // back a steerable handle so it can be driven once restored.
                     tracing::info!(
                         task_id = %id,
-                        "reconcile: daemon has no live status ({err:#}); leaving interrupted"
+                        "reconcile: status probe failed ({err:#}); attaching a poller \
+                         optimistically (the task may still be live)"
                     );
-                    // Leave Failed+recoverable exactly as `load` set it.
-                    out.push(AgentHandle { task, daemon: None });
+                    spawn_daemon_status_poller(
+                        self.daemon.clone(),
+                        task.clone(),
+                        self.tail_tx.clone(),
+                        id.clone(),
+                    );
+                    out.push(AgentHandle {
+                        task,
+                        daemon: Some(DaemonAgentHandle {
+                            client: self.daemon.clone(),
+                            task_id: id,
+                        }),
+                    });
                 }
             }
         }
