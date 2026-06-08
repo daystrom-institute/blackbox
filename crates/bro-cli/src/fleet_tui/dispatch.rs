@@ -37,6 +37,7 @@ pub(super) fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String)
     let model = app.next_model.clone();
     let effort = app.next_effort.clone();
     let code_mode = app.config.code_mode.clone();
+    let service_tier = service_tier_for_next_dispatch(app, provider);
     let alias = project.alias.clone();
     let classifier_cfg = app.orch.classifier();
     let orch = app.orch.clone();
@@ -62,6 +63,7 @@ pub(super) fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String)
             model,
             effort,
             code_mode,
+            service_tier,
             classifier_cfg,
             alias,
         );
@@ -82,6 +84,7 @@ pub(super) fn build_fleet_dispatch(
     model: Option<String>,
     effort: Option<String>,
     code_mode: Option<String>,
+    service_tier: Option<String>,
     classifier_cfg: Option<ClassifierConfig>,
     alias: Option<String>,
 ) -> DispatchOutcome {
@@ -114,6 +117,7 @@ pub(super) fn build_fleet_dispatch(
     spec.name = Some(name.clone());
     // Fleet-wide code-mode default from /config carries to NEW roster sessions.
     spec.code_mode = code_mode;
+    spec.service_tier = service_tier.clone();
     let task = orch.dispatch(spec);
 
     DispatchOutcome::Ready(Box::new(DispatchedAgent {
@@ -121,6 +125,7 @@ pub(super) fn build_fleet_dispatch(
         provider,
         model,
         effort,
+        service_tier,
         project_cwd: worktree.project_cwd.clone(),
         name,
         prompt,
@@ -160,6 +165,7 @@ pub(super) fn install_dispatch(app: &mut App, outcome: DispatchOutcome) {
         provider: d.provider,
         selected_model: d.model,
         selected_effort: d.effort,
+        selected_service_tier: d.service_tier,
         selected_cwd: Some(d.project_cwd),
         name: d.name,
         // Display the operator's own prompt, not the rider-wrapped first turn.
@@ -260,6 +266,7 @@ pub(super) fn install_standalone(app: &mut App, o: StandaloneOutcome) {
         provider: o.provider,
         selected_model: o.model,
         selected_effort: o.effort,
+        selected_service_tier: None,
         selected_cwd: o.cwd,
         name: o.name,
         input_history: vec![o.prompt.clone()],

@@ -276,6 +276,7 @@ impl BlackboxServer {
                     runtime: None,
                     context: p.context.clone(),
                     code_mode: p.code_mode,
+                    service_tier: p.service_tier.clone(),
                 };
                 if let Err(e) =
                     brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref())
@@ -812,14 +813,18 @@ Next step: <one concrete steering suggestion>\n",
                 effort: lease.effort.clone(),
                 capabilities: lease.capabilities.clone(),
             })
-        } else if brofile.model.is_some() || brofile.effort.is_some() || brofile.code_mode.is_some()
+        } else if brofile.model.is_some()
+            || brofile.effort.is_some()
+            || brofile.code_mode.is_some()
+            || brofile.service_tier.is_some()
         {
             Some(ExecOpts {
                 model: brofile.model.clone(),
                 effort: brofile.effort.clone(),
                 provider_defaults: None,
                 code_mode: brofile.code_mode,
-output_schema: None,
+                service_tier: brofile.service_tier.clone(),
+                output_schema: None,
             })
         } else {
             None

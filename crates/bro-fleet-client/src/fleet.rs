@@ -1031,6 +1031,9 @@ fn dispatch_body(spec: &DispatchSpec) -> Value {
     if let Some(code_mode) = &spec.code_mode {
         body["code_mode"] = Value::String(code_mode.clone());
     }
+    if let Some(service_tier) = &spec.service_tier {
+        body["service_tier"] = Value::String(service_tier.clone());
+    }
     body
 }
 
@@ -1860,13 +1863,21 @@ mod tests {
     #[test]
     fn dispatch_body_carries_code_mode_only_when_set() {
         let mut spec = DispatchSpec::new(Provider::Glm, "hi");
-        // Absent ⇒ no code_mode key (harness applies its default).
+        // Absent ⇒ no code_mode/service_tier keys (harness applies defaults).
         assert!(dispatch_body(&spec).get("code_mode").is_none());
+        assert!(dispatch_body(&spec).get("service_tier").is_none());
         // Set ⇒ forwarded as ExecParams.code_mode.
         spec.code_mode = Some("only".to_string());
+        spec.service_tier = Some("priority".to_string());
         assert_eq!(
             dispatch_body(&spec).get("code_mode").and_then(|v| v.as_str()),
             Some("only")
+        );
+        assert_eq!(
+            dispatch_body(&spec)
+                .get("service_tier")
+                .and_then(|v| v.as_str()),
+            Some("priority")
         );
     }
 

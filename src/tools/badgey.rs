@@ -539,6 +539,7 @@ mod tests {
                 runtime: None,
                 context: None,
                 code_mode: None,
+                service_tier: None,
             },
             "global",
             &tmp.path().join("bro"),

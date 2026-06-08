@@ -99,6 +99,10 @@ pub struct ExecOpts {
     /// only). `None` ⇒ no flag emitted, so the harness applies its own
     /// precedence (persisted session value → env → default `optional`).
     pub code_mode: Option<CodeMode>,
+    /// Service tier passed to harness providers as `--service-tier`. Brodex
+    /// forwards `priority` to OpenAI Responses as Codex `/fast`; `default` is
+    /// persisted in session state but dropped from the request body.
+    pub service_tier: Option<String>,
     /// JSON schema for structured output. When set, emitted as
     /// `--output-schema <json>` to the harness, which registers a synthetic
     /// `final_result` terminal tool.
@@ -222,6 +226,7 @@ impl ProviderExec for Provider {
             .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let code_mode = opts.and_then(|o| o.code_mode);
+        let service_tier = opts.and_then(|o| o.service_tier.as_deref());
         let output_schema = opts.and_then(|o| o.output_schema.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
@@ -260,6 +265,9 @@ impl ProviderExec for Provider {
                 if let Some(cm) = code_mode {
                     args.extend(["--code-mode".into(), cm.as_str().into()]);
                 }
+                if let Some(tier) = service_tier {
+                    args.extend(["--service-tier".into(), tier.into()]);
+                }
                 if let Some(schema) = output_schema {
                     args.extend(["--output-schema".into(), schema.into()]);
                 }
@@ -281,6 +289,7 @@ impl ProviderExec for Provider {
             .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let code_mode = opts.and_then(|o| o.code_mode);
+        let service_tier = opts.and_then(|o| o.service_tier.as_deref());
         let output_schema = opts.and_then(|o| o.output_schema.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
@@ -320,6 +329,9 @@ impl ProviderExec for Provider {
                 // explicitly overrides it on resume.
                 if let Some(cm) = code_mode {
                     args.extend(["--code-mode".into(), cm.as_str().into()]);
+                }
+                if let Some(tier) = service_tier {
+                    args.extend(["--service-tier".into(), tier.into()]);
                 }
                 if let Some(schema) = output_schema {
                     args.extend(["--output-schema".into(), schema.into()]);

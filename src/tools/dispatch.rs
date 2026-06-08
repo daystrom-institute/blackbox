@@ -53,6 +53,10 @@ pub(crate) struct FreshDispatchRequest {
     /// `exec_opts` just before arg construction so it survives an allocator
     /// rebuild of `exec_opts`. `None` ⇒ no `--code-mode` flag (harness default).
     pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
+    /// Resolved service tier for this fresh dispatch (per-dispatch override
+    /// before brofile `service_tier`). Folded onto `exec_opts` after allocator
+    /// rebuild so support-provider priority survives lane selection.
+    pub(crate) service_tier: Option<String>,
     /// Resolved structured-output JSON schema for this fresh dispatch (from an
     /// agent manifest's `outputs.schema`). Like `code_mode`, folded onto
     /// `exec_opts` just before arg construction so it survives an allocator
@@ -230,6 +234,7 @@ fn allocator_status_runtime_request(
         durable: p.durable,
         selection_policy: p.selection_policy.clone(),
         code_mode: None,
+        service_tier: None,
     };
     exec_params_runtime_request(&exec_like, None)
 }
@@ -308,6 +313,11 @@ impl BlackboxServer {
         if let Some(cm) = request.code_mode {
             let mut o = request.exec_opts.take().unwrap_or_default();
             o.code_mode = Some(cm);
+            request.exec_opts = Some(o);
+        }
+        if let Some(service_tier) = request.service_tier.take() {
+            let mut o = request.exec_opts.take().unwrap_or_default();
+            o.service_tier = Some(service_tier);
             request.exec_opts = Some(o);
         }
         // Same for the structured-output schema: re-apply after any allocator
@@ -487,6 +497,10 @@ impl BlackboxServer {
         let resolved_code_mode = p
             .code_mode
             .or_else(|| exec_opts.as_ref().and_then(|o| o.code_mode));
+        let resolved_service_tier = p
+            .service_tier
+            .clone()
+            .or_else(|| exec_opts.as_ref().and_then(|o| o.service_tier.clone()));
         let lease_brofile_context = brofile_context.clone();
         let dispatched = match self.dispatch_fresh_bro_task(FreshDispatchRequest {
             prompt: p.prompt.clone(),
@@ -509,6 +523,7 @@ impl BlackboxServer {
             record_to_bro: p.bro.clone(),
             brofile_context,
             code_mode: resolved_code_mode,
+            service_tier: resolved_service_tier,
             // bro_exec carries no output schema (structured output is delivered
             // via agent dispatch from the manifest, not generic exec).
             output_schema: None,
@@ -1249,13 +1264,15 @@ impl BlackboxServer {
             } else if brofile.model.is_some()
                 || brofile.effort.is_some()
                 || brofile.code_mode.is_some()
+                || brofile.service_tier.is_some()
             {
                 Some(ExecOpts {
                     model: brofile.model.clone(),
                     effort: brofile.effort.clone(),
                     provider_defaults: None,
                     code_mode: brofile.code_mode,
-output_schema: None,
+                    service_tier: brofile.service_tier.clone(),
+                    output_schema: None,
                 })
             } else {
                 None
@@ -1594,10 +1611,7 @@ output_schema: None,
             };
             // Persist AFTER dropping the write guard, off the async worker —
             // never hold the store write lock across the file write.
-            crate::orchestration::request_persist(
-                &self.state.task_store,
-                &self.state.store_dir,
-            );
+            crate::orchestration::request_persist(&self.state.task_store, &self.state.store_dir);
             dropped
         };
 
@@ -1822,6 +1836,8 @@ output_schema: None,
                         // Resume restores the session's persisted code_mode; the
                         // daemon does not re-pass it (mirrors --model).
                         code_mode: None,
+                        // Resume restores the session's persisted service tier.
+                        service_tier: None,
                         // Resume does not re-pass the output schema.
                         output_schema: None,
                     })
@@ -2005,13 +2021,15 @@ output_schema: None,
                     let opts = if bf.model.is_some()
                         || bf.effort.is_some()
                         || bf.code_mode.is_some()
+                        || bf.service_tier.is_some()
                     {
                         Some(ExecOpts {
                             model: bf.model.clone(),
                             effort: bf.effort.clone(),
                             provider_defaults: None,
                             code_mode: bf.code_mode,
-output_schema: None,
+                            service_tier: bf.service_tier.clone(),
+                            output_schema: None,
                         })
                     } else {
                         None
@@ -2059,13 +2077,18 @@ output_schema: None,
                 store_dir,
                 bf.context.as_ref(),
             );
-            let opts = if bf.model.is_some() || bf.effort.is_some() || bf.code_mode.is_some() {
+            let opts = if bf.model.is_some()
+                || bf.effort.is_some()
+                || bf.code_mode.is_some()
+                || bf.service_tier.is_some()
+            {
                 Some(ExecOpts {
                     model: bf.model.clone(),
                     effort: bf.effort.clone(),
                     provider_defaults: None,
                     code_mode: bf.code_mode,
-output_schema: None,
+                    service_tier: bf.service_tier.clone(),
+                    output_schema: None,
                 })
             } else {
                 None
@@ -2218,6 +2241,8 @@ output_schema: None,
                         // Resume restores the session's persisted code_mode; the
                         // daemon does not re-pass it (mirrors --model).
                         code_mode: None,
+                        // Resume restores the session's persisted service tier.
+                        service_tier: None,
                         // Resume does not re-pass the output schema.
                         output_schema: None,
                     })
@@ -2493,6 +2518,7 @@ mod tests {
                 runtime: None,
                 context: None,
                 code_mode: None,
+                service_tier: None,
             },
             "global",
             &tmp.path().join("bro"),
@@ -2527,6 +2553,7 @@ mod tests {
             durable: None,
             selection_policy: None,
             code_mode: None,
+            service_tier: None,
         }
     }
 

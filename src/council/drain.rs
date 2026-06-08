@@ -482,14 +482,17 @@ fn build_dispatch(
             )
         })
         .or_else(|| {
-            (bf.model.is_some() || bf.effort.is_some() || bf.code_mode.is_some()).then(|| {
-                ExecOpts {
-                    model: bf.model.clone(),
-                    effort: bf.effort.clone(),
-                    provider_defaults: None,
-                    code_mode: bf.code_mode,
-output_schema: None,
-                }
+            (bf.model.is_some()
+                || bf.effort.is_some()
+                || bf.code_mode.is_some()
+                || bf.service_tier.is_some())
+            .then(|| ExecOpts {
+                model: bf.model.clone(),
+                effort: bf.effort.clone(),
+                provider_defaults: None,
+                code_mode: bf.code_mode,
+                service_tier: bf.service_tier.clone(),
+                output_schema: None,
             })
         });
     let exec_opts = crate::orchestration::providers::exec_opts_with_provider_defaults(

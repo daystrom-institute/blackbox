@@ -159,6 +159,7 @@ impl BlackboxServer {
                     record_to_bro: Some(brofile.to_string()),
                     brofile_context,
                     code_mode: wf_code_mode,
+                    service_tier: None,
                     output_schema: None,
                 })?;
             return Ok(dispatched.task);

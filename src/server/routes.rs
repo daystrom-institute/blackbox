@@ -925,7 +925,11 @@ pub(crate) async fn control_closeout_handler(
         }
     }
     // Mutating dispositions must carry confirm=true (same gate as the tool).
-    if matches!(disposition.as_str(), "discard" | "publish" | "merge" | "adopt") && !req.confirm {
+    if matches!(
+        disposition.as_str(),
+        "discard" | "publish" | "merge" | "adopt"
+    ) && !req.confirm
+    {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({
@@ -2388,6 +2392,8 @@ pub(crate) struct AdminBrofileUpsertReq {
     lens: Option<String>,
     #[serde(default)]
     account: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
 }
 
 pub(crate) async fn admin_brofile_upsert(
@@ -2418,6 +2424,7 @@ pub(crate) async fn admin_brofile_upsert(
         runtime: None,
         context: None,
         code_mode: None,
+        service_tier: req.service_tier,
     };
     if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
         return (
@@ -2960,5 +2967,4 @@ mod tests {
             "publish without commit_message must yield 400"
         );
     }
-
 }

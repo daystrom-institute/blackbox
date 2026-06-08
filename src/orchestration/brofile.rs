@@ -66,6 +66,11 @@ pub struct Brofile {
     /// `crate::orchestration::brofile::CodeMode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<CodeMode>,
+    /// Optional provider service tier. For Brodex/OpenAI Responses, `priority`
+    /// is Codex `/fast`; `default` clears back to the backend default. A
+    /// per-dispatch service-tier override wins over this brofile value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +682,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
@@ -708,6 +714,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: Some("priority".into()),
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(
@@ -738,6 +745,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
@@ -754,6 +762,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(
             &project_bf,
@@ -789,6 +798,7 @@ mod tests {
                 runtime: None,
                 context: None,
                 code_mode: None,
+                service_tier: None,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
@@ -814,6 +824,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -865,6 +876,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
@@ -890,6 +902,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("readonly-persona", dir.path(), None).unwrap();
@@ -1170,6 +1183,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
@@ -1193,19 +1207,25 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: Some(CodeMode::Only),
+            service_tier: Some("priority".into()),
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("coder", dir.path(), None).unwrap();
         assert_eq!(loaded.code_mode, Some(CodeMode::Only));
+        assert_eq!(loaded.service_tier.as_deref(), Some("priority"));
 
         // Absent in JSON ⇒ None (serde default), and the token is snake_case.
         let json = r#"{"name":"plain","provider":"glm"}"#;
         let plain: Brofile = serde_json::from_str(json).unwrap();
         assert_eq!(plain.code_mode, None);
+        assert_eq!(plain.service_tier, None);
         assert_eq!(CodeMode::Only.as_str(), "only");
-        let parsed: Brofile =
-            serde_json::from_str(r#"{"name":"x","provider":"glm","code_mode":"optional"}"#).unwrap();
+        let parsed: Brofile = serde_json::from_str(
+            r#"{"name":"x","provider":"glm","code_mode":"optional","service_tier":"priority"}"#,
+        )
+        .unwrap();
         assert_eq!(parsed.code_mode, Some(CodeMode::Optional));
+        assert_eq!(parsed.service_tier.as_deref(), Some("priority"));
     }
 
     #[test]
@@ -1224,6 +1244,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("ws-worker", dir.path(), None).unwrap();
@@ -1242,6 +1263,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
         let loaded_off = resolve_brofile("ws-off", dir.path(), None).unwrap();

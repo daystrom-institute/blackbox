@@ -80,6 +80,7 @@ const TOOL_CALL_GLYPH: &str = "▸";
 const ROSTER_SELECTED_MARKER: &str = "› ";
 const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
 const FINISHED_AFTER_IDLE_MS: u64 = 20 * 60 * 1000;
+const FAST_SERVICE_TIER: &str = "priority";
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -147,6 +148,7 @@ struct Agent {
     provider: Provider,
     selected_model: Option<String>,
     selected_effort: Option<String>,
+    selected_service_tier: Option<String>,
     /// Human-facing project cwd. For isolated fleet dispatches this is the
     /// original repository, not the generated worktree path.
     selected_cwd: Option<String>,
@@ -348,6 +350,10 @@ struct App {
     /// Sticky-next model and effort, scoped to [`next_provider`].
     next_model: Option<String>,
     next_effort: Option<String>,
+    /// TUI-session `/fast` toggle. Applies only to fresh roster dispatches for
+    /// providers that support service priority; existing/resumed sessions keep
+    /// their own persisted tier.
+    fast_mode: bool,
     /// Flash the footer `next:` value (yellow) until this instant, after the
     /// provider is cycled — instead of a duplicate status message.
     provider_flash_until: Option<Instant>,
@@ -513,6 +519,7 @@ impl App {
             next_provider: default_provider,
             next_model: default_model_for(default_provider).map(str::to_string),
             next_effort: default_effort_for(default_provider).map(str::to_string),
+            fast_mode: false,
             provider_flash_until: None,
             slash_cursor: 0,
             project_cursor: 0,
@@ -687,6 +694,7 @@ struct DispatchedAgent {
     provider: Provider,
     model: Option<String>,
     effort: Option<String>,
+    service_tier: Option<String>,
     project_cwd: String,
     name: String,
     /// The operator's own prompt (not the rider/grounding-wrapped first turn).
@@ -961,6 +969,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
                 desc: "select effort for next dispatch",
             },
             SlashCmd {
+                name: "/fast",
+                desc: "toggle priority service tier for new Brodex dispatches",
+            },
+            SlashCmd {
                 name: "/closeout",
                 desc: "fold the selected worktree back to the target branch",
             },
@@ -1092,6 +1104,7 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
             provider: snap.provider,
             selected_model: snap.model.clone(),
             selected_effort: None,
+            selected_service_tier: None,
             selected_cwd: project_display_cwd(snap.cwd.as_deref()),
             name,
             input_history: Vec::new(),
@@ -2198,6 +2211,10 @@ fn run_local_slash(app: &mut App) -> bool {
             open_config(app);
             true
         }
+        "/fast" if !app.mode.is_standalone() => {
+            toggle_fast_mode(app, arg);
+            true
+        }
         // `/closeout` is discoverable + previewable from any zone (`keep`,
         // `preflight`, and any `--dry-run` run against the roster-selected
         // agent), but `run_closeout` gates MUTATING folds (discard/publish/
@@ -2218,6 +2235,38 @@ fn run_local_slash(app: &mut App) -> bool {
         }
         _ => false,
     }
+}
+
+fn toggle_fast_mode(app: &mut App, arg: &str) {
+    let arg = arg.trim();
+    app.fast_mode = match arg {
+        "" => !app.fast_mode,
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        _ => {
+            app.set_status("usage: /fast [on|off]", Duration::from_secs(4));
+            return;
+        }
+    };
+    let state = if app.fast_mode { "on" } else { "off" };
+    app.clear_input();
+    app.set_status(
+        format!("fast priority {state} for new Brodex dispatches"),
+        Duration::from_secs(4),
+    );
+}
+
+fn provider_supports_service_priority(provider: Provider) -> bool {
+    matches!(provider, Provider::Brodex)
+}
+
+fn service_tier_for_next_dispatch(app: &App, provider: Provider) -> Option<String> {
+    service_tier_for_dispatch(app.fast_mode, provider)
+}
+
+fn service_tier_for_dispatch(fast_mode: bool, provider: Provider) -> Option<String> {
+    (fast_mode && provider_supports_service_priority(provider))
+        .then(|| FAST_SERVICE_TIER.to_string())
 }
 
 fn open_config(app: &mut App) {
@@ -3509,14 +3558,18 @@ fn provider_tuple(a: &Agent, v: &AgentView) -> String {
         .or(v.model.as_deref())
         .or_else(|| default_model_for(a.provider))
         .unwrap_or("—");
-    match a
+    let mut tuple = match a
         .selected_effort
         .as_deref()
         .or_else(|| default_effort_for(a.provider))
     {
         Some(effort) => format!("{} {model} {effort}", a.provider),
         None => format!("{} {model}", a.provider),
+    };
+    if a.selected_service_tier.as_deref() == Some(FAST_SERVICE_TIER) {
+        tuple.push_str(" fast");
     }
+    tuple
 }
 
 fn next_tuple(app: &App) -> String {
@@ -3525,14 +3578,19 @@ fn next_tuple(app: &App) -> String {
         .as_deref()
         .or_else(|| default_model_for(app.next_provider))
         .unwrap_or("—");
-    match app
+    let mut tuple = match app
         .next_effort
         .as_deref()
         .or_else(|| default_effort_for(app.next_provider))
     {
         Some(effort) => format!("{} {model} {effort}", app.next_provider),
         None => format!("{} {model}", app.next_provider),
+    };
+    if service_tier_for_next_dispatch(app, app.next_provider).as_deref() == Some(FAST_SERVICE_TIER)
+    {
+        tuple.push_str(" fast");
     }
+    tuple
 }
 
 #[derive(Debug, Clone, Copy)]

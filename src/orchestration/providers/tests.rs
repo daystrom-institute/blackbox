@@ -34,6 +34,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: Some("high".into()),
         provider_defaults: None,
         code_mode: Some(crate::orchestration::brofile::CodeMode::Only),
+        service_tier: Some("priority".into()),
         output_schema: Some(r#"{"type":"object"}"#.into()),
     };
     let glm = Provider::Glm.build_exec_args("hello", "sid-1", None, Some(&glm_opts));
@@ -49,6 +50,9 @@ fn harness_exec_and_resume_args_use_stream_json() {
     // code_mode is emitted as `--code-mode <value>` for harness providers.
     assert!(glm.contains(&"--code-mode".to_string()));
     assert!(glm.contains(&"only".to_string()));
+    // service_tier is emitted as `--service-tier <value>` for harness providers.
+    assert!(glm.contains(&"--service-tier".to_string()));
+    assert!(glm.contains(&"priority".to_string()));
     // output_schema is emitted as `--output-schema <json>` for harness providers.
     assert!(glm.contains(&"--output-schema".to_string()));
     assert!(glm.contains(&r#"{"type":"object"}"#.to_string()));
@@ -62,6 +66,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: None,
         provider_defaults: None,
         code_mode: None,
+        service_tier: None,
         output_schema: None,
     };
     let deepseek = Provider::Deepseek.build_resume_args("sid-2", "continue", Some(&deepseek_opts));
@@ -82,6 +87,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: Some("medium".into()),
         provider_defaults: None,
         code_mode: None,
+        service_tier: None,
         output_schema: None,
     };
     let minimax =

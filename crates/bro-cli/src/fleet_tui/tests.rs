@@ -495,6 +495,16 @@ Trailing paragraph.";
     }
 
     #[test]
+    fn fast_service_tier_only_applies_to_brodex_dispatches() {
+        assert_eq!(
+            service_tier_for_dispatch(true, Provider::Brodex).as_deref(),
+            Some(FAST_SERVICE_TIER)
+        );
+        assert_eq!(service_tier_for_dispatch(false, Provider::Brodex), None);
+        assert_eq!(service_tier_for_dispatch(true, Provider::Glm), None);
+    }
+
+    #[test]
     fn splice_paste_keeps_multiline_as_one_buffer() {
         // The 16-phantom-dispatch regression: a multi-line paste must land as a
         // single composer buffer with embedded soft newlines, NOT one dispatch

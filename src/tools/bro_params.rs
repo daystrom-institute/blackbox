@@ -101,6 +101,11 @@ pub(crate) struct ExecParams {
     /// lane the Fleet TUI `/config` toggle rides for new roster dispatches.
     #[serde(default)]
     pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
+    /// Per-dispatch service tier for support providers. `priority` is Codex
+    /// `/fast`; `default` clears back to backend default. Overrides the
+    /// resolved brofile's `service_tier`.
+    #[serde(default)]
+    pub(crate) service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -637,6 +642,10 @@ pub(crate) struct BrofileParams {
     /// harness default (`optional`).
     #[serde(default)]
     pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
+    /// Optional service tier embedded in the brofile. For Brodex, `priority`
+    /// is Codex `/fast`; `default` clears back to backend default.
+    #[serde(default)]
+    pub(crate) service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

@@ -642,13 +642,18 @@ impl BlackboxServer {
                 effort: lease.effort.clone(),
                 capabilities: lease.capabilities.clone(),
             })
-        } else if bf.model.is_some() || bf.effort.is_some() || bf.code_mode.is_some() {
+        } else if bf.model.is_some()
+            || bf.effort.is_some()
+            || bf.code_mode.is_some()
+            || bf.service_tier.is_some()
+        {
             Some(ExecOpts {
                 model: bf.model.clone(),
                 effort: bf.effort.clone(),
                 provider_defaults: None,
                 code_mode: bf.code_mode,
-output_schema: None,
+                service_tier: bf.service_tier.clone(),
+                output_schema: None,
             })
         } else {
             None

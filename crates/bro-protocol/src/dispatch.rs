@@ -44,6 +44,10 @@ pub struct DispatchSpec {
     /// dispatches from the cockpit's `/config` toggle; `None` ⇒ harness default.
     /// Resume does not carry this — the session restores its persisted value.
     pub code_mode: Option<String>,
+    /// Service tier for support providers. `priority` is the Codex `/fast`
+    /// tier; `default` clears back to backend default. Applies to fresh
+    /// dispatches only; resume relies on the session's persisted value.
+    pub service_tier: Option<String>,
 }
 
 impl DispatchSpec {
@@ -57,6 +61,7 @@ impl DispatchSpec {
             env_overrides: None,
             name: None,
             code_mode: None,
+            service_tier: None,
         }
     }
 }

@@ -717,6 +717,7 @@ impl BlackboxServer {
             let opts = if bf.model.is_some()
                 || bf.effort.is_some()
                 || bf.code_mode.is_some()
+                || bf.service_tier.is_some()
                 || agent_output_schema.is_some()
             {
                 Some(ExecOpts {
@@ -724,6 +725,7 @@ impl BlackboxServer {
                     effort: bf.effort.clone(),
                     provider_defaults: None,
                     code_mode: bf.code_mode,
+                    service_tier: bf.service_tier.clone(),
                     // Deliver the agent's declared output schema so a structured
                     // -output agent gets the harness `final_result` terminal tool.
                     output_schema: agent_output_schema,
@@ -798,6 +800,7 @@ impl BlackboxServer {
                     // Inline brofiles don't carry code_mode in v1 (parallels
                     // the inline-context rejection above).
                     code_mode: None,
+                    service_tier: None,
                     // Inline brofiles don't carry an output schema in v1.
                     output_schema: None,
                 })
@@ -917,9 +920,10 @@ impl BlackboxServer {
             exec_opts.as_ref().and_then(|o| o.model.clone()),
             exec_opts.as_ref().and_then(|o| o.effort.clone()),
         );
-        // Preserve the resolved code-mode + output schema across the allocator's
-        // exec_opts rebuild inside dispatch_fresh_bro_task.
+        // Preserve resolved per-dispatch knobs across the allocator's exec_opts
+        // rebuild inside dispatch_fresh_bro_task.
         let agent_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
+        let agent_service_tier = exec_opts.as_ref().and_then(|o| o.service_tier.clone());
         let agent_output_schema = exec_opts.as_ref().and_then(|o| o.output_schema.clone());
         let dispatched =
             match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
@@ -943,6 +947,7 @@ impl BlackboxServer {
                 record_to_bro: p.bro.clone(),
                 brofile_context,
                 code_mode: agent_code_mode,
+                service_tier: agent_service_tier,
                 output_schema: agent_output_schema,
             }) {
                 Ok(result) => result,
@@ -1574,6 +1579,7 @@ mod tests {
             runtime: None,
             context: None,
             code_mode: None,
+            service_tier: None,
         };
         let _ = orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
         let manifest = serde_json::json!({
