@@ -3264,6 +3264,10 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
         Span::styled("-", dim),
         Span::styled(format!(" {waiting} waiting "), byline),
     ];
+    if let Some(status) = &app.status {
+        spans.push(Span::styled("──", dim));
+        spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
+    }
     // Scroll affordance: only when the roster overflows its visible body, so the
     // list reads as scrollable (the Table auto-scrolls to the selection; this
     // gives the position). Conservative — roster_rows includes header/bucket
@@ -3309,10 +3313,6 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
             format!(" projects {aliases}{suffix} "),
             Style::default().fg(Color::LightGreen),
         ));
-    }
-    if let Some(status) = &app.status {
-        spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
     }
     spans
 }
