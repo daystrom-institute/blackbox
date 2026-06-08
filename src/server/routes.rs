@@ -1154,92 +1154,23 @@ pub(crate) async fn control_roster_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
 ) -> impl axum::response::IntoResponse {
     use axum::response::IntoResponse;
-    use bro_protocol::{RosterSnapshotV1, RosterSummaryV1};
+    use bro_protocol::RosterSnapshotV1;
 
-    // Snapshot under the store read lock, then drop it before doing
-    // any per-task lock work — same pattern tail_handler uses
-    // (src/server/tail.rs:135) and the same pattern
-    // `serialize_snapshot` (src/orchestration/mod.rs:584) follows.
-    // Even though this handler is not async, holding the parking_lot
-    // read guard across per-task mutex acquisitions would extend the
-    // critical section unnecessarily.
-    let summaries: Vec<RosterSummaryV1> = {
-        use bro_protocol::TaskStatus as Wire;
+    // Read the generation before the task snapshot. A concurrent delta may
+    // make the task data newer than `version`, which can produce a duplicate
+    // delta after the client connects, but it will not make the client miss one.
+    let version = state.roster_events().current_version();
+    let tasks = {
         let store = state.task_store.read();
-        let mut out = Vec::with_capacity(store.all_tasks().len());
-        for task in store.all_tasks() {
-            let inner = task.inner.lock();
-            let last_event_at = match inner.completed_at {
-                Some(done) => done.max(inner.started_at),
-                None => inner.started_at,
-            };
-            // `TaskInner::status` and the wire `TaskStatus` are
-            // distinct enums (orchestration owns the runtime one,
-            // bro-protocol owns the contract one). The conversion
-            // mirrors `protocol_task_snapshot` at
-            // `src/orchestration/mod.rs:2961` — same 1:1 mapping
-            // across the four shared variants; `Pending` is wire-only
-            // and `TaskInner` does not surface it.
-            let status = match inner.status {
-                orchestration::TaskStatus::Running => Wire::Running,
-                orchestration::TaskStatus::Completed => Wire::Completed,
-                orchestration::TaskStatus::Failed => Wire::Failed,
-                orchestration::TaskStatus::Cancelled => Wire::Cancelled,
-            };
-            out.push(RosterSummaryV1 {
-                task_id: bro_core::TaskId::new(inner.id.clone()),
-                status,
-                provider: inner.provider,
-                cost: inner.cost_usd,
-                turns: inner.num_turns,
-                cwd: inner.cwd.clone(),
-                // `bro_label` is the caller-supplied dispatch
-                // identity (`<team>::<member>` for ensembles); fall
-                // back to `agent_label` for brofile-only dispatches
-                // that never set bro_label.
-                label: inner
-                    .bro_label
-                    .clone()
-                    .or_else(|| inner.agent_label.clone()),
-                session_id: (!inner.session_id.is_empty())
-                    .then(|| bro_core::SessionId::new(inner.session_id.clone())),
-                last_message_snippet: inner
-                    .last_assistant_message
-                    .as_deref()
-                    .map(|s| s.chars().take(200).collect::<String>()),
-                model: model_from_events(&inner.events),
-                last_event_at: Some(last_event_at),
-                origin: inner.origin,
-            });
-        }
-        out
+        store
+            .all_tasks()
+            .into_iter()
+            .map(|task| orchestration::roster_summary_from_task(&task))
+            .collect()
     };
 
-    // V1 source for `version` is the wall-clock millis at read time —
-    // monotonic, no new SharedState counter. See the DTO doc-comment
-    // for the rationale and the Slice-2 follow-on.
-    let snapshot = RosterSnapshotV1 {
-        version: orchestration::now_ms(),
-        tasks: summaries,
-    };
+    let snapshot = RosterSnapshotV1 { version, tasks };
     axum::Json(snapshot).into_response()
-}
-
-/// Best-effort model id from a task's recorded event buffer, mirroring
-/// the client-side scan at
-/// `crates/bro-fleet-client/src/fleet.rs:1355-1363` so V1 and the
-/// client agree on what `model` is. Returns the first event that
-/// carries `event.model` or `event.message.model` as a string; `None`
-/// when no event in the buffer is model-bearing (common for tasks
-/// that haven't reached an `assistant`/`init` event yet, or whose
-/// provider stream-json never emits a model key).
-fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
-    events.iter().find_map(|e| {
-        e.get("model")
-            .or_else(|| e.get("message").and_then(|m| m.get("model")))
-            .and_then(|m| m.as_str())
-            .map(|s| s.to_string())
-    })
 }
 
 pub(crate) async fn control_dashboard_handler(
@@ -3177,12 +3108,123 @@ mod tests {
             }
         }
 
-        // Envelope shape: { version, tasks }. Version source is
-        // now_ms() — monotonic, but not asserted beyond presence in
-        // this test (DTO test owns the wire shape).
+        // Envelope shape: { version, tasks }. Version is the roster
+        // generation; this test asserts only presence, while the Slice 2
+        // delta test owns generation semantics.
         let obj = value.as_object().expect("envelope must be an object");
         assert!(obj.contains_key("version"), "envelope must carry `version`");
         assert_eq!(obj.len(), 2, "envelope must carry exactly `version` and `tasks`");
+    }
+
+    #[tokio::test]
+    async fn control_roster_generation_is_shared_by_snapshot_and_deltas() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use bro_protocol::{RosterDelta, RosterSnapshotV1};
+        use tokio::time::{Duration, timeout};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let mut rx = state.roster_tx.subscribe();
+
+        let task = orchestration::spawn_in_process_task(
+            "task-roster-generation".to_string(),
+            Provider::Workflow,
+            "session-roster-generation".to_string(),
+            None,
+            state.store_dir.clone(),
+            state.task_store.clone(),
+            state.tail_tx.clone(),
+            Some(state.roster_events()),
+            Some("roster-test".to_string()),
+            None,
+            Some(state.system_events.clone()),
+            bro_core::Origin::Workflow,
+        );
+
+        let added = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("added delta should arrive")
+            .expect("roster channel open");
+        let added_seq = added.seq();
+        match added {
+            RosterDelta::Added { seq, task } => {
+                assert_eq!(seq, 1, "first roster mutation should use generation 1");
+                assert_eq!(task.task_id.as_str(), "task-roster-generation");
+            }
+            other => panic!("expected Added delta, got {other:?}"),
+        }
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let snapshot: RosterSnapshotV1 = serde_json::from_slice(&body_bytes)
+            .expect("roster body must decode as RosterSnapshotV1");
+        assert_eq!(
+            snapshot.version, added_seq,
+            "snapshot version must read the same generation counter as deltas"
+        );
+
+        orchestration::push_in_process_event(
+            &task,
+            serde_json::json!({"type":"assistant","message":{"model":"test-model"}}),
+        );
+        let updated = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("updated delta should arrive")
+            .expect("roster channel open");
+        match updated {
+            RosterDelta::Updated { seq, task } => {
+                assert_eq!(seq, snapshot.version + 1);
+                assert_eq!(task.task_id.as_str(), "task-roster-generation");
+                assert_eq!(task.model.as_deref(), Some("test-model"));
+            }
+            other => panic!("expected Updated delta, got {other:?}"),
+        }
+
+        orchestration::finish_in_process_task(
+            &task,
+            orchestration::TaskStatus::Completed,
+            Some("done".to_string()),
+            None,
+            &state.task_store,
+            &state.store_dir,
+            &state.tail_tx,
+            Some(state.system_events.clone()),
+        );
+        let terminal_update = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("terminal update delta should arrive")
+            .expect("roster channel open");
+        assert!(
+            matches!(terminal_update, RosterDelta::Updated { .. }),
+            "terminal status transition should emit Updated, got {terminal_update:?}"
+        );
+
+        let server = BlackboxServer::new(state.clone());
+        server.bro_prune(Parameters(crate::tools::bro_params::PruneParams {
+            status: None,
+            provider: None,
+            older_than_hours: None,
+            dry_run: None,
+            task_ids: Some(vec!["task-roster-generation".to_string()]),
+            retro: None,
+            retro_min_turns: None,
+            retro_max: None,
+        }));
+        let removed = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("removed delta should arrive")
+            .expect("roster channel open");
+        match removed {
+            RosterDelta::Removed { seq, task_id } => {
+                assert!(seq > terminal_update.seq());
+                assert_eq!(task_id.as_str(), "task-roster-generation");
+            }
+            other => panic!("expected Removed delta, got {other:?}"),
+        }
     }
 
     // Slice 1b — `/control/roster` must surface the spawn-time

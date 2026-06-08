@@ -146,6 +146,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     )?);
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
+    let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(1024);
     // Shared reindex trigger. Initialized `true` so the first background pass
     // runs once after startup and indexes repo-owned `.bbox/knowledge` that may
     // have changed while the daemon was down (no watcher event fires for those,
@@ -185,6 +186,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx,
+        roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        roster_tx,
         store_dir: store_dir.clone(),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),

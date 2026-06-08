@@ -103,17 +103,34 @@ pub struct RosterSummaryV1 {
 }
 
 /// Wire envelope for the `GET /control/roster` snapshot. The
-/// monotonic `version` field gives Slice 2's roster SSE a way to
-/// re-fetch the snapshot and resume from a known baseline after a
-/// sequence gap or SSE-lag signal — V1 only sets the field and
-/// documents the source. The V1 source is the wall-clock millis at
-/// read time (monotonic, no new SharedState counter); Slice 2 can
-/// swap to a task-store generation counter if the delta protocol
-/// needs a tighter "generation N" contract.
+/// monotonic `version` field is the daemon roster generation. A client
+/// fetches this snapshot, then consumes `RosterDelta` events with
+/// `seq > version`; if it observes a gap or receives a resync signal,
+/// it re-fetches the snapshot and resumes from the new version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RosterSnapshotV1 {
     pub version: u64,
     pub tasks: Vec<RosterSummaryV1>,
+}
+
+/// Versioned roster membership/summary delta for
+/// `GET /control/roster/stream`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum RosterDelta {
+    Added { seq: u64, task: RosterSummaryV1 },
+    Updated { seq: u64, task: RosterSummaryV1 },
+    Removed { seq: u64, task_id: TaskId },
+}
+
+impl RosterDelta {
+    pub fn seq(&self) -> u64 {
+        match self {
+            RosterDelta::Added { seq, .. }
+            | RosterDelta::Updated { seq, .. }
+            | RosterDelta::Removed { seq, .. } => *seq,
+        }
+    }
 }
 
 #[cfg(test)]

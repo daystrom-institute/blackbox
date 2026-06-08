@@ -243,6 +243,7 @@ impl BlackboxServer {
             store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            Some(self.state.roster_events()),
             None,
             None,
             Some(self.state.system_events.clone()),

@@ -174,6 +174,7 @@ Constraints:\n\
             self.state.store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            Some(self.state.roster_events()),
             Some(format!("workflow::{workflow_name}")),
             None,
             Some(self.state.system_events.clone()),

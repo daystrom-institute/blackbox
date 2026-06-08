@@ -1,5 +1,5 @@
 use crate::server::routes::*;
-use crate::server::tail::tail_handler;
+use crate::server::tail::{roster_stream_handler, tail_handler};
 use crate::server::{BlackboxServer, SharedState};
 use crate::{config, council};
 use rmcp::transport::streamable_http_server::{
@@ -90,6 +90,10 @@ pub(super) fn build_http_app(
         .route(
             "/control/roster",
             axum::routing::get(control_roster_handler),
+        )
+        .route(
+            "/control/roster/stream",
+            axum::routing::get(roster_stream_handler),
         )
         .route(
             "/control/dashboard",
@@ -196,12 +200,16 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn test_app() -> axum::Router {
+    fn test_app_with_state() -> (axum::Router, Arc<SharedState>) {
         let dir = tempfile::tempdir().unwrap();
         let shared = Arc::new(SharedState::for_test(dir.path()));
         let cfg = shared.config.read().clone();
         let ct = CancellationToken::new();
-        build_http_app(shared.clone(), &cfg, &ct)
+        (build_http_app(shared.clone(), &cfg, &ct), shared)
+    }
+
+    fn test_app() -> axum::Router {
+        test_app_with_state().0
     }
 
     /// The generic control plane is reachable at the neutral `/control/*`
@@ -274,5 +282,41 @@ mod tests {
             StatusCode::NOT_FOUND,
             "/control/closeout must be mounted (route table regression)"
         );
+    }
+
+    #[tokio::test]
+    async fn control_roster_stream_is_mounted_and_yields_deltas() {
+        use futures::StreamExt;
+        use tokio::time::{Duration, timeout};
+
+        let (app, state) = test_app_with_state();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/control/roster/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let mut body = resp.into_body().into_data_stream();
+        state.roster_events().emit_removed("task-sse-mounted");
+
+        let chunk = timeout(Duration::from_secs(1), body.next())
+            .await
+            .expect("stream should yield a roster delta")
+            .expect("stream should remain open")
+            .expect("body chunk should be readable");
+        let text = std::str::from_utf8(&chunk).expect("SSE chunk must be UTF-8");
+        assert!(text.contains("event: removed"), "chunk: {text}");
+        assert!(text.contains("task-sse-mounted"), "chunk: {text}");
     }
 }

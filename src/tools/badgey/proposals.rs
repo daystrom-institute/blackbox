@@ -693,6 +693,7 @@ impl BlackboxServer {
                 store_dir: self.state.store_dir.clone(),
                 task_store: self.state.task_store.clone(),
                 tail_tx: self.state.tail_tx.clone(),
+                roster_events: Some(self.state.roster_events()),
                 bro_label: label.clone(),
                 agent_label: label,
                 system_events: Some(self.state.system_events.clone()),

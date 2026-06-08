@@ -247,3 +247,41 @@ pub(crate) async fn tail_handler(
 
     Sse::new(stream)
 }
+
+pub(crate) async fn roster_stream_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let mut rx = state.roster_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(delta) => {
+                    let event_name = match &delta {
+                        bro_protocol::RosterDelta::Added { .. } => "added",
+                        bro_protocol::RosterDelta::Updated { .. } => "updated",
+                        bro_protocol::RosterDelta::Removed { .. } => "removed",
+                    };
+                    match Event::default().event(event_name).json_data(&delta) {
+                        Ok(event) => yield Ok(event),
+                        Err(err) => tracing::warn!("failed to serialize roster delta: {err}"),
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("roster subscriber lagged by {n} events; signaling resync");
+                    let payload = serde_json::json!({
+                        "reason": "lagged",
+                        "skipped": n,
+                    });
+                    match Event::default().event("resync").json_data(&payload) {
+                        Ok(event) => yield Ok(event),
+                        Err(err) => tracing::warn!("failed to serialize roster resync event: {err}"),
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Sse::new(stream)
+}

@@ -270,6 +270,7 @@ async fn process_envelope(
         shared.store_dir.clone(),
         shared.task_store.clone(),
         shared.tail_tx.clone(),
+        Some(shared.roster_events()),
         None,
         None,
         Some(shared.system_events.clone()),

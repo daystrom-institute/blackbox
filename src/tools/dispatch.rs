@@ -396,6 +396,7 @@ impl BlackboxServer {
             store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            Some(self.state.roster_events()),
             request.spawn_bro_label,
             request.spawn_agent_label,
             request.tool_placement,
@@ -722,6 +723,7 @@ impl BlackboxServer {
             store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            Some(self.state.roster_events()),
             None,
             None,
             Some(self.state.system_events.clone()),
@@ -1392,6 +1394,7 @@ impl BlackboxServer {
                         store_dir.clone(),
                         self.state.task_store.clone(),
                         self.state.tail_tx.clone(),
+                        Some(self.state.roster_events()),
                         None,
                         None,
                         Some(self.state.system_events.clone()),
@@ -1442,6 +1445,7 @@ impl BlackboxServer {
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    Some(self.state.roster_events()),
                     None,
                     None,
                     Some(self.state.system_events.clone()),
@@ -1634,7 +1638,14 @@ impl BlackboxServer {
             };
             // Persist AFTER dropping the write guard, off the async worker —
             // never hold the store write lock across the file write.
-            crate::orchestration::request_persist(&self.state.task_store, &self.state.store_dir);
+            crate::orchestration::request_persist(
+                &self.state.task_store,
+                &self.state.store_dir,
+            );
+            let roster_events = self.state.roster_events();
+            for task_id in &dropped {
+                roster_events.emit_removed(task_id.clone());
+            }
             dropped
         };
 
@@ -1769,6 +1780,7 @@ impl BlackboxServer {
             self.state.store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            Some(self.state.roster_events()),
             Some("workload-retro".to_string()),
             None,
             Some(self.state.system_events.clone()),

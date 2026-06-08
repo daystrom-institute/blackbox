@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -54,6 +55,8 @@ pub(crate) struct SharedState {
     pub(crate) path_cache: RwLock<path_cache::PathCache>,
     pub(crate) task_store: Arc<RwLock<TaskStore>>,
     pub(crate) tail_tx: broadcast::Sender<TailEvent>,
+    pub(crate) roster_version: Arc<AtomicU64>,
+    pub(crate) roster_tx: broadcast::Sender<bro_protocol::RosterDelta>,
     pub(crate) store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
     /// In-flight workflow arcs keyed by `arc_thread_id`. Updated at
     /// every node boundary by the engine so /orchestrate/peek can
@@ -233,6 +236,10 @@ impl SharedState {
         log.push_back(d);
     }
 
+    pub(crate) fn roster_events(&self) -> orchestration::RosterEventSink {
+        orchestration::RosterEventSink::new(self.roster_version.clone(), self.roster_tx.clone())
+    }
+
     /// Register a cancel token for a freshly-spawned arc. Returns the
     /// token so the runner can hold a clone for `is_cancelled()`
     /// checks. Replaces any prior token for the same arc_id (e.g.
@@ -287,6 +294,7 @@ impl SharedState {
     pub(crate) fn for_test(store_dir: &std::path::Path) -> SharedState {
         use std::collections::VecDeque;
         let (tail_tx, _) = broadcast::channel(128);
+        let (roster_tx, _) = broadcast::channel(128);
         let idx = TranscriptIndex::open_or_create(
             &store_dir.join("idx"),
             Vec::new(),
@@ -329,6 +337,8 @@ impl SharedState {
             path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
+            roster_version: Arc::new(AtomicU64::new(0)),
+            roster_tx,
             store_dir: store_dir.to_path_buf(),
             running_arcs: RwLock::new(HashMap::new()),
             wait_store: Arc::new(workflow::wait::WaitStore::new()),

@@ -45,6 +45,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let packets = Packets::open(tmp.path()).unwrap();
     let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
     let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
+    let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(16);
     let state = Arc::new(SharedState {
         idx: RwLock::new(index),
         kb: RwLock::new(kb),
@@ -62,6 +63,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(TaskStore::new())),
         tail_tx,
+        roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        roster_tx,
         store_dir: tmp.path().join("bro"),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
@@ -138,6 +141,7 @@ async fn system_events_task_lifecycle_started_and_terminal() {
         tmp.path().join("bro"),
         server.state.task_store.clone(),
         tail_tx.clone(),
+        None,
         Some("test-bro".to_string()),
         None,
         Some(hub.clone()),

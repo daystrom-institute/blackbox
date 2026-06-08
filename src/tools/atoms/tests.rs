@@ -34,6 +34,7 @@ fn make_task(
         None,
         None,
         None,
+        None,
         // atoms test helper — atom-internal harness task. Classed
         // as Atom to match the production atom-invoke path.
         bro_core::Origin::Atom,

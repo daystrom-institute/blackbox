@@ -15,6 +15,7 @@ pub mod team;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
@@ -368,11 +369,59 @@ pub struct TaskInner {
     pub origin: bro_core::Origin,
 }
 
+#[derive(Clone)]
+pub struct RosterEventSink {
+    seq: Arc<AtomicU64>,
+    tx: tokio::sync::broadcast::Sender<bro_protocol::RosterDelta>,
+}
+
+impl RosterEventSink {
+    pub fn new(
+        seq: Arc<AtomicU64>,
+        tx: tokio::sync::broadcast::Sender<bro_protocol::RosterDelta>,
+    ) -> Self {
+        Self { seq, tx }
+    }
+
+    pub fn current_version(&self) -> u64 {
+        self.seq.load(Ordering::SeqCst)
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn emit_added(&self, task: &Task) {
+        let delta = bro_protocol::RosterDelta::Added {
+            seq: self.next_seq(),
+            task: roster_summary_from_task(task),
+        };
+        let _ = self.tx.send(delta);
+    }
+
+    pub fn emit_updated(&self, task: &Task) {
+        let delta = bro_protocol::RosterDelta::Updated {
+            seq: self.next_seq(),
+            task: roster_summary_from_task(task),
+        };
+        let _ = self.tx.send(delta);
+    }
+
+    pub fn emit_removed(&self, task_id: impl Into<String>) {
+        let delta = bro_protocol::RosterDelta::Removed {
+            seq: self.next_seq(),
+            task_id: bro_core::TaskId::new(task_id.into()),
+        };
+        let _ = self.tx.send(delta);
+    }
+}
+
 pub struct Task {
     pub inner: Mutex<TaskInner>,
     pub notify: Arc<Notify>,
     /// Handle to the child process for cancellation. Only set while running.
     child_id: Mutex<Option<u32>>, // PID
+    roster_events: Option<RosterEventSink>,
 }
 
 impl Task {
@@ -388,6 +437,64 @@ impl Task {
     pub fn child_pid(&self) -> Option<u32> {
         *self.child_id.lock()
     }
+
+    fn emit_roster_added(&self) {
+        if let Some(sink) = &self.roster_events {
+            sink.emit_added(self);
+        }
+    }
+
+    fn emit_roster_updated(&self) {
+        if let Some(sink) = &self.roster_events {
+            sink.emit_updated(self);
+        }
+    }
+}
+
+pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
+    use bro_protocol::TaskStatus as Wire;
+
+    let inner = task.inner.lock();
+    let last_event_at = match inner.completed_at {
+        Some(done) => done.max(inner.started_at),
+        None => inner.started_at,
+    };
+    let status = match inner.status {
+        TaskStatus::Running => Wire::Running,
+        TaskStatus::Completed => Wire::Completed,
+        TaskStatus::Failed => Wire::Failed,
+        TaskStatus::Cancelled => Wire::Cancelled,
+    };
+    bro_protocol::RosterSummaryV1 {
+        task_id: bro_core::TaskId::new(inner.id.clone()),
+        status,
+        provider: inner.provider,
+        cost: inner.cost_usd,
+        turns: inner.num_turns,
+        cwd: inner.cwd.clone(),
+        label: inner.bro_label.clone().or_else(|| inner.agent_label.clone()),
+        session_id: (!inner.session_id.is_empty())
+            .then(|| bro_core::SessionId::new(inner.session_id.clone())),
+        last_message_snippet: inner
+            .last_assistant_message
+            .as_deref()
+            .map(|s| s.chars().take(200).collect::<String>()),
+        model: model_from_events(&inner.events),
+        last_event_at: Some(last_event_at),
+        origin: inner.origin,
+    }
+}
+
+/// Best-effort model id from a task's recorded event buffer. Mirrors the fleet
+/// client scan so roster snapshots and deltas expose the same `model` value.
+fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().find_map(|event| {
+        event
+            .get("model")
+            .or_else(|| event.get("message").and_then(|message| message.get("model")))
+            .and_then(|model| model.as_str())
+            .map(|model| model.to_string())
+    })
 }
 
 /// Test-only Task constructor for store/prune unit tests. Private fields
@@ -422,6 +529,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
+        roster_events: None,
     })
 }
 
@@ -702,6 +810,7 @@ impl TaskStore {
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
+                roster_events: None,
             });
             store.insert_loaded(rec.id, task);
         }
@@ -1214,6 +1323,7 @@ pub struct SpawnTaskParams {
     pub store_dir: std::path::PathBuf,
     pub task_store: Arc<RwLock<TaskStore>>,
     pub tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    pub roster_events: Option<RosterEventSink>,
     pub bro_label: Option<String>,
     pub agent_label: Option<String>,
     /// System event hub for emitting task lifecycle events. Task events
@@ -1291,6 +1401,7 @@ fn failed_duplicate_task(
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
+        roster_events: None,
     })
 }
 
@@ -1309,6 +1420,7 @@ pub fn spawn_in_process_task(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
@@ -1359,6 +1471,7 @@ pub fn spawn_in_process_task(
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
+        roster_events: roster_events.clone(),
     });
 
     if let Err(err) = task_store
@@ -1379,6 +1492,7 @@ pub fn spawn_in_process_task(
         failed.notify.notify_waiters();
         return failed;
     }
+    task.emit_roster_added();
     request_persist(&task_store, &store_dir);
     let task_id_ev = task_id.clone();
     let bro_ev = task.inner.lock().bro_label.clone();
@@ -1416,8 +1530,11 @@ pub fn spawn_in_process_task(
 }
 
 pub fn push_in_process_event(task: &Task, event: Value) {
-    let mut inner = task.inner.lock();
-    inner.events.push(event);
+    {
+        let mut inner = task.inner.lock();
+        inner.events.push(event);
+    }
+    task.emit_roster_updated();
 }
 
 pub fn finish_in_process_task(
@@ -1446,6 +1563,7 @@ pub fn finish_in_process_task(
     let task_kind = inner.bro_label.clone();
     let error: String = inner.stderr.chars().take(200).collect();
     drop(inner);
+    task.emit_roster_updated();
 
     match status {
         TaskStatus::Completed => {
@@ -1569,6 +1687,7 @@ pub fn spawn_task(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
@@ -1584,6 +1703,7 @@ pub fn spawn_task(
         store_dir,
         task_store,
         tail_tx,
+        roster_events,
         bro_label,
         agent_label,
         None,
@@ -1603,6 +1723,7 @@ pub fn spawn_task_with_tool_placement(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
@@ -1627,6 +1748,7 @@ pub fn spawn_task_with_tool_placement(
             store_dir,
             task_store,
             tail_tx,
+            roster_events.clone(),
             bro_label,
             agent_label,
             tool_placement,
@@ -1660,6 +1782,7 @@ pub fn spawn_task_with_tool_placement(
         store_dir,
         task_store,
         tail_tx,
+        roster_events,
         bro_label,
         agent_label,
         system_events,
@@ -1681,6 +1804,7 @@ fn spawn_harness_in_process_task(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
@@ -1695,6 +1819,7 @@ fn spawn_harness_in_process_task(
         store_dir.clone(),
         task_store.clone(),
         tail_tx.clone(),
+        roster_events.clone(),
         bro_label,
         agent_label,
         system_events.clone(),
@@ -1838,6 +1963,8 @@ fn ingest_harness_event(
             .map(|snippet| (snippet, session_id_observed))
             .or_else(|| session_id_observed.then(|| (String::new(), true)))
     };
+
+    task.emit_roster_updated();
 
     if let Some((snippet, session_id_observed)) = snippet_to_emit {
         if session_id_observed {
@@ -2042,6 +2169,7 @@ pub fn spawn_task_interactive(
         store_dir,
         task_store,
         tail_tx,
+        roster_events: None,
         bro_label,
         agent_label,
         system_events,
@@ -2126,6 +2254,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         store_dir,
         task_store,
         tail_tx,
+        roster_events,
         bro_label,
         agent_label,
         system_events,
@@ -2212,8 +2341,10 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
+                roster_events: roster_events.clone(),
             });
             let _ = task_store.write().insert_reserved(id, task.clone());
+            task.emit_roster_added();
             request_persist(&task_store, &store_dir);
             task.notify.notify_waiters();
             return SpawnedTask { task, stdin: None };
@@ -2263,6 +2394,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(pid),
+        roster_events: roster_events.clone(),
     });
 
     if let Err(err) = task_store.write().insert_reserved(id.clone(), task.clone()) {
@@ -2283,6 +2415,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             stdin: None,
         };
     }
+
+    task.emit_roster_added();
 
     // Emit tail event
     let _ = tail_tx.send(tail::TailEvent::TaskStarted {
@@ -2423,6 +2557,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                             .or_else(|| session_id_observed.then(|| (String::new(), true)))
                     };
 
+                    task_ref.emit_roster_updated();
+
                     if let Some((snippet, session_id_observed)) = snippet_to_emit {
                         if session_id_observed {
                             task_ref.notify.notify_waiters();
@@ -2490,8 +2626,9 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     inner.supervision.observe_bulk_sink(&sink, now_ms());
                     apply_sink_updates(&mut inner, sink);
                 }
+                drop(inner);
+                task_ref_bulk.emit_roster_updated();
                 if session_id_observed {
-                    drop(inner);
                     task_ref_bulk.notify.notify_waiters();
                 }
             }
@@ -2569,6 +2706,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                 task_kind,
             )
         };
+        task_ref_wait.emit_roster_updated();
         match terminal_status {
             TaskStatus::Completed => {
                 let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
@@ -2741,6 +2879,7 @@ pub fn cancel_task(
     inner.status = TaskStatus::Cancelled;
     inner.completed_at = Some(now_ms());
     drop(inner);
+    task.emit_roster_updated();
 
     // Kill the child process
     if let Some(pid) = task.child_id.lock().take() {
@@ -3397,6 +3536,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         }
     }
 
@@ -3722,6 +3862,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
         let second = Arc::new(Task {
             inner: Mutex::new(TaskInner {
@@ -3750,6 +3891,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
 
         store.insert("task-known".to_string(), first).unwrap();
@@ -3796,6 +3938,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let evt = serde_json::json!({
@@ -3843,6 +3986,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
         assert!(matches!(
             store.insert("task-reserved".to_string(), task.clone()),
@@ -3875,6 +4019,7 @@ mod tests {
                 store_dir: tmp.path().to_path_buf(),
                 task_store: task_store.clone(),
                 tail_tx,
+                roster_events: None,
                 bro_label: None,
                 agent_label: None,
                 system_events: None,
@@ -4233,6 +4378,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
 
         let json = task_result_json(&task);
@@ -4273,6 +4419,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
 
         let json = task_result_json(&task);
@@ -4317,6 +4464,7 @@ mod tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
 
         let json = task_result_json(&task);
@@ -4574,6 +4722,7 @@ mod async_tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
         // Should return immediately without blocking
         wait_for_task(&task).await;
@@ -4608,6 +4757,7 @@ mod async_tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
         let task_clone = task.clone();
         tokio::spawn(async move {
@@ -4648,6 +4798,7 @@ mod async_tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
 
         let session_id = wait_for_task_session_id_with_timeout(&task, 2.0).await;
@@ -4684,6 +4835,7 @@ mod async_tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
 
         let task_clone = task.clone();
@@ -4732,6 +4884,7 @@ mod async_tests {
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
+            roster_events: None,
         });
 
         // Should timeout after 0.1s
