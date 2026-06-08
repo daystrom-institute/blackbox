@@ -3,7 +3,7 @@
 //! The contract crate is the schema. Transports may be stdio, in-process calls,
 //! or a future socket, but the payloads live here.
 
-use bro_core::{BroError, SessionId, TaskId};
+use bro_core::{BroError, Provider, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 
 mod dispatch;
@@ -50,4 +50,141 @@ pub struct TaskSnapshot {
     pub status: TaskStatus,
     pub last_message: Option<String>,
     pub error: Option<BroError>,
+}
+
+/// Summary DTO for one fleet task, projected by the daemon for the
+/// roster snapshot endpoint (Slice 1a of
+/// design/fleet-tui/daemon-roster-and-tail-unification.md §3 item 1).
+///
+/// Contract: the DTO carries NO event payloads. Roster traffic is a
+/// summary plane — a verbose unfocused agent's transcript must not be
+/// able to balloon the snapshot, and the 80KB MCP-cap truncation class
+/// (cf. cf87a52) cannot occur on this path because the events field
+/// is simply absent. A test in this crate asserts the DTO serializes
+/// without an `events` field.
+///
+/// Field provenance is intentionally explicit:
+/// - `task_id` / `status` / `provider` / `cost` / `turns` / `cwd` /
+///   `label` / `session_id` / `last_message_snippet` are all already
+///   on `TaskInner`; the daemon reads them under the per-task lock
+///   and projects directly.
+/// - `model` is **best-effort derived** by scanning the task's
+///   recorded event buffer for the first `event.model` or
+///   `event.message.model` key. The fleet client uses the same scan
+///   (crates/bro-fleet-client/src/fleet.rs:1355-1363). May be `None`
+///   for tasks that never emitted a model-bearing event.
+/// - `last_event_at` is **not** a stored field — the daemon has no
+///   per-event arrival stamp on V1. The handler derives it from
+///   `max(started_at, completed_at)` (the only wall-clock fields on
+///   `TaskInner`); for terminal tasks this is the completion time,
+///   for live tasks this is the spawn time. Slice 2 will revisit this
+///   if a per-event arrival stamp becomes available.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RosterSummaryV1 {
+    pub task_id: TaskId,
+    pub status: TaskStatus,
+    pub provider: Provider,
+    pub cost: Option<f64>,
+    pub turns: Option<u64>,
+    pub cwd: Option<String>,
+    pub label: Option<String>,
+    pub session_id: Option<SessionId>,
+    pub last_message_snippet: Option<String>,
+    pub model: Option<String>,
+    pub last_event_at: Option<u64>,
+}
+
+/// Wire envelope for the `GET /control/roster` snapshot. The
+/// monotonic `version` field gives Slice 2's roster SSE a way to
+/// re-fetch the snapshot and resume from a known baseline after a
+/// sequence gap or SSE-lag signal — V1 only sets the field and
+/// documents the source. The V1 source is the wall-clock millis at
+/// read time (monotonic, no new SharedState counter); Slice 2 can
+/// swap to a task-store generation counter if the delta protocol
+/// needs a tighter "generation N" contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RosterSnapshotV1 {
+    pub version: u64,
+    pub tasks: Vec<RosterSummaryV1>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RosterSummaryV1 must serialize with the documented fields and
+    /// carry no events payload. A regression that adds an `events` field
+    /// (even as an empty Vec) reintroduces the 80KB MCP-cap truncation
+    /// class (cf87a52) and breaks the contract the snapshot endpoint
+    /// advertises to Slice 2's SSE delta stream.
+    #[test]
+    fn roster_summary_v1_serializes_without_events_field() {
+        let summary = RosterSummaryV1 {
+            task_id: TaskId::new("task-1"),
+            status: TaskStatus::Running,
+            provider: Provider::Glm,
+            cost: Some(0.42),
+            turns: Some(3),
+            cwd: Some("/tmp/repo".to_string()),
+            label: Some("team-x::member-y".to_string()),
+            session_id: Some(SessionId::new("sess-1")),
+            last_message_snippet: Some("Looking at the file…".to_string()),
+            model: Some("claude-opus-4-6".to_string()),
+            last_event_at: Some(1_700_000_000_000),
+        };
+        let value = serde_json::to_value(&summary).unwrap();
+        let obj = value.as_object().expect("summary must serialize as object");
+
+        // Every documented field must be present.
+        for key in [
+            "task_id",
+            "status",
+            "provider",
+            "cost",
+            "turns",
+            "cwd",
+            "label",
+            "session_id",
+            "last_message_snippet",
+            "model",
+            "last_event_at",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "RosterSummaryV1 must serialize field `{key}`; got keys: {:?}",
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // No event-payload field, no Vec/array field that could carry one.
+        assert!(
+            !obj.contains_key("events"),
+            "RosterSummaryV1 must NOT carry an `events` field (regression of cf87a52)"
+        );
+        assert!(
+            !obj.contains_key("recentEvents"),
+            "RosterSummaryV1 must NOT carry a `recentEvents` field"
+        );
+        for (k, v) in obj {
+            assert!(
+                !v.is_array(),
+                "RosterSummaryV1 field `{k}` unexpectedly serialized as array: {v}"
+            );
+        }
+    }
+
+    /// Envelope shape: `{ version, tasks }`. Used by Slice 2's resync
+    /// logic, so the field names are part of the contract.
+    #[test]
+    fn roster_snapshot_v1_envelope_has_version_and_tasks() {
+        let snap = RosterSnapshotV1 {
+            version: 1_700_000_000_000,
+            tasks: vec![],
+        };
+        let value = serde_json::to_value(&snap).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("version"));
+        assert!(obj.contains_key("tasks"));
+        assert_eq!(obj.len(), 2, "envelope should carry exactly `version` and `tasks`");
+    }
 }

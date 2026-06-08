@@ -1119,6 +1119,121 @@ pub(crate) async fn control_status_handler(
     )
 }
 
+// ── /control/roster — daemon-authoritative fleet roster snapshot ─────────
+//
+// Slice 1a of design/fleet-tui/daemon-roster-and-tail-unification.md §3
+// item 2. A pure-addition read-only endpoint that projects every task
+// currently in `state.task_store` into a `RosterSummaryV1` and wraps
+// them in a versioned `RosterSnapshotV1` envelope. No new task fields,
+// no client-side change yet, no SSE — that is Slice 2.
+//
+// Two design notes for the derivation:
+//
+// 1. `model` is best-effort, scanned from the task's recorded event
+//    buffer. The fleet client uses the same logic at
+//    `crates/bro-fleet-client/src/fleet.rs:1355-1363`; we inline the
+//    scan here because the touched-file list for this slice is
+//    daemon-side only (the design explicitly defers client changes).
+//
+// 2. `last_event_at` is NOT a stored field — the daemon has no
+//    per-event arrival stamp on V1 (the client stamps it from
+//    `eventCount` growth today, fleet.rs:1301). We derive it from
+//    `max(started_at, completed_at)`: for a live task this is the
+//    spawn time, for a terminal task this is the completion time.
+//    Coarse, but it stays within "no new task fields" and the
+//    derivation is documented in the DTO doc-comment in
+//    `crates/bro-protocol/src/lib.rs`.
+pub(crate) async fn control_roster_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    use bro_protocol::{RosterSnapshotV1, RosterSummaryV1};
+
+    // Snapshot under the store read lock, then drop it before doing
+    // any per-task lock work — same pattern tail_handler uses
+    // (src/server/tail.rs:135) and the same pattern
+    // `serialize_snapshot` (src/orchestration/mod.rs:584) follows.
+    // Even though this handler is not async, holding the parking_lot
+    // read guard across per-task mutex acquisitions would extend the
+    // critical section unnecessarily.
+    let summaries: Vec<RosterSummaryV1> = {
+        use bro_protocol::TaskStatus as Wire;
+        let store = state.task_store.read();
+        let mut out = Vec::with_capacity(store.all_tasks().len());
+        for task in store.all_tasks() {
+            let inner = task.inner.lock();
+            let last_event_at = match inner.completed_at {
+                Some(done) => done.max(inner.started_at),
+                None => inner.started_at,
+            };
+            // `TaskInner::status` and the wire `TaskStatus` are
+            // distinct enums (orchestration owns the runtime one,
+            // bro-protocol owns the contract one). The conversion
+            // mirrors `protocol_task_snapshot` at
+            // `src/orchestration/mod.rs:2961` — same 1:1 mapping
+            // across the four shared variants; `Pending` is wire-only
+            // and `TaskInner` does not surface it.
+            let status = match inner.status {
+                orchestration::TaskStatus::Running => Wire::Running,
+                orchestration::TaskStatus::Completed => Wire::Completed,
+                orchestration::TaskStatus::Failed => Wire::Failed,
+                orchestration::TaskStatus::Cancelled => Wire::Cancelled,
+            };
+            out.push(RosterSummaryV1 {
+                task_id: bro_core::TaskId::new(inner.id.clone()),
+                status,
+                provider: inner.provider,
+                cost: inner.cost_usd,
+                turns: inner.num_turns,
+                cwd: inner.cwd.clone(),
+                // `bro_label` is the caller-supplied dispatch
+                // identity (`<team>::<member>` for ensembles); fall
+                // back to `agent_label` for brofile-only dispatches
+                // that never set bro_label.
+                label: inner
+                    .bro_label
+                    .clone()
+                    .or_else(|| inner.agent_label.clone()),
+                session_id: (!inner.session_id.is_empty())
+                    .then(|| bro_core::SessionId::new(inner.session_id.clone())),
+                last_message_snippet: inner
+                    .last_assistant_message
+                    .as_deref()
+                    .map(|s| s.chars().take(200).collect::<String>()),
+                model: model_from_events(&inner.events),
+                last_event_at: Some(last_event_at),
+            });
+        }
+        out
+    };
+
+    // V1 source for `version` is the wall-clock millis at read time —
+    // monotonic, no new SharedState counter. See the DTO doc-comment
+    // for the rationale and the Slice-2 follow-on.
+    let snapshot = RosterSnapshotV1 {
+        version: orchestration::now_ms(),
+        tasks: summaries,
+    };
+    axum::Json(snapshot).into_response()
+}
+
+/// Best-effort model id from a task's recorded event buffer, mirroring
+/// the client-side scan at
+/// `crates/bro-fleet-client/src/fleet.rs:1355-1363` so V1 and the
+/// client agree on what `model` is. Returns the first event that
+/// carries `event.model` or `event.message.model` as a string; `None`
+/// when no event in the buffer is model-bearing (common for tasks
+/// that haven't reached an `assistant`/`init` event yet, or whose
+/// provider stream-json never emits a model key).
+fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().find_map(|e| {
+        e.get("model")
+            .or_else(|| e.get("message").and_then(|m| m.get("model")))
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+    })
+}
+
 pub(crate) async fn control_dashboard_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(query): Query<DashboardParams>,
@@ -2966,5 +3081,99 @@ mod tests {
             axum::http::StatusCode::BAD_REQUEST,
             "publish without commit_message must yield 400"
         );
+    }
+
+    // ── /control/roster — Slice 1a focused test ──────────────────────────
+    //
+    // Spec: the DTO serializes with the expected fields and has NO
+    // events field (regression guard for the cf87a52 truncation
+    // class); the handler returns one summary per task in
+    // state.task_store. The DTO field-shape assertion lives in
+    // `crates/bro-protocol/src/lib.rs::tests::roster_summary_v1_serializes_without_events_field`;
+    // this test focuses on the handler: insert N tasks, get back N
+    // summaries, none of them carrying an events array.
+    #[tokio::test]
+    async fn control_roster_returns_one_summary_per_task() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        // Seed two tasks — one running, one completed — so we can also
+        // see that the status mapping is consistent (not asserted
+        // here; the DTO test owns the field shape, this test owns
+        // the count + absence of events).
+        {
+            let mut store = state.task_store.write();
+            store
+                .insert(
+                    "task-a".to_string(),
+                    orchestration::test_task(
+                        "task-a",
+                        orchestration::TaskStatus::Running,
+                        Provider::Glm,
+                    ),
+                )
+                .expect("insert task-a");
+            store
+                .insert(
+                    "task-b".to_string(),
+                    orchestration::test_task(
+                        "task-b",
+                        orchestration::TaskStatus::Completed,
+                        Provider::Deepseek,
+                    ),
+                )
+                .expect("insert task-b");
+        }
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body_bytes)
+            .expect("roster body must be valid JSON");
+        let tasks = value
+            .get("tasks")
+            .and_then(|t| t.as_array())
+            .expect("envelope must carry a `tasks` array");
+        assert_eq!(
+            tasks.len(),
+            2,
+            "expected one RosterSummaryV1 per task in the store, got {tasks:?}"
+        );
+
+        // Per-summary regression guard: no events field, no
+        // recentEvents field, no array-typed field at all (a Vec
+        // empty-or-otherwise would reopen the 80KB truncation class).
+        for (i, summary) in tasks.iter().enumerate() {
+            let obj = summary
+                .as_object()
+                .unwrap_or_else(|| panic!("summary[{i}] must be an object"));
+            assert!(
+                !obj.contains_key("events"),
+                "summary[{i}] must NOT carry an `events` field (cf87a52 regression guard)"
+            );
+            assert!(
+                !obj.contains_key("recentEvents"),
+                "summary[{i}] must NOT carry a `recentEvents` field"
+            );
+            for (k, v) in obj {
+                assert!(
+                    !v.is_array(),
+                    "summary[{i}].{k} unexpectedly serialized as array: {v}"
+                );
+            }
+        }
+
+        // Envelope shape: { version, tasks }. Version source is
+        // now_ms() — monotonic, but not asserted beyond presence in
+        // this test (DTO test owns the wire shape).
+        let obj = value.as_object().expect("envelope must be an object");
+        assert!(obj.contains_key("version"), "envelope must carry `version`");
+        assert_eq!(obj.len(), 2, "envelope must carry exactly `version` and `tasks`");
     }
 }

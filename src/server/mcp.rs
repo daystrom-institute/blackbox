@@ -88,6 +88,10 @@ pub(super) fn build_http_app(
             axum::routing::get(control_status_handler),
         )
         .route(
+            "/control/roster",
+            axum::routing::get(control_roster_handler),
+        )
+        .route(
             "/control/dashboard",
             axum::routing::get(control_dashboard_handler),
         )
