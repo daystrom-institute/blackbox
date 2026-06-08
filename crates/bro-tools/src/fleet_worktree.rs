@@ -387,12 +387,17 @@ pub fn prepare_closeout_request(
     worktree_arg: Option<&str>,
     target_resolver: impl FnOnce(&Path) -> String,
     allow_branch_prefixes: Option<Vec<String>>,
+    // Additional managed-worktree roots the caller recognizes, beyond the
+    // legacy `.bro-fleet-worktrees` convention. The daemon passes the cockpit's
+    // fleet/agent store worktree roots here so `/closeout` accepts worktrees the
+    // cockpit created. Pass `&[]` to keep the legacy-only behavior.
+    extra_managed_roots: &[PathBuf],
 ) -> anyhow::Result<CloseoutRequest> {
     let worktree = worktree_arg
         .map(PathBuf::from)
         .unwrap_or_else(|| cx_root.to_path_buf())
         .canonicalize()?;
-    ensure_managed_worktree(&worktree)?;
+    ensure_managed_worktree(&worktree, extra_managed_roots)?;
     let base_repo = fleet_base_repo(cx_root)?;
     let branch = git_capture(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let target = target_resolver(&base_repo);
@@ -1040,6 +1045,7 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
         args.worktree.as_deref(),
         |_| resolve_target_or(args.target.as_deref(), "main"),
         args.allow_branch_prefixes.clone(),
+        &[],
     )?;
     let worktree = req.worktree.clone();
     let base_repo = req.base_repo.clone();
@@ -1213,23 +1219,44 @@ fn fleet_worktree_root(anchor: &Path) -> anyhow::Result<PathBuf> {
         .join(sanitize_path_component(repo_name)))
 }
 
-fn ensure_managed_worktree(path: &Path) -> anyhow::Result<()> {
-    let root = if let Ok(raw) = std::env::var("BRO_FLEET_WORKTREE_ROOT")
+fn ensure_managed_worktree(path: &Path, extra_roots: &[PathBuf]) -> anyhow::Result<()> {
+    // Primary managed root: an explicit env override, else the legacy
+    // `<repo_parent>/.bro-fleet-worktrees/<repo>` convention used by the
+    // `enter_worktree`/`exit_worktree` tool path.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(raw) = std::env::var("BRO_FLEET_WORKTREE_ROOT")
         && !raw.trim().is_empty()
     {
-        PathBuf::from(raw).canonicalize()?
+        roots.push(PathBuf::from(raw).canonicalize()?);
     } else {
         let base = fleet_base_repo(path)?;
-        fleet_worktree_root(&base)?.canonicalize()?
-    };
-    if !path.starts_with(&root) {
-        anyhow::bail!(
-            "refusing unmanaged worktree {}; expected under {}",
-            path.display(),
-            root.display()
-        );
+        if let Ok(root) = fleet_worktree_root(&base)?.canonicalize() {
+            roots.push(root);
+        }
     }
-    Ok(())
+    // Caller-supplied roots — the daemon passes the fleet/agent store worktree
+    // roots (`bro_home/{fleet,agent}/worktrees`), where the cockpit actually
+    // creates managed worktrees. These differ from the legacy
+    // `.bro-fleet-worktrees` convention, so without them `/closeout` refuses
+    // every real fleet worktree. Non-existent roots are skipped.
+    roots.extend(extra_roots.iter().filter_map(|r| r.canonicalize().ok()));
+    if roots.iter().any(|root| path.starts_with(root)) {
+        return Ok(());
+    }
+    let expected = if roots.is_empty() {
+        "(no managed worktree root resolved)".to_string()
+    } else {
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    anyhow::bail!(
+        "refusing unmanaged worktree {}; expected under one of: {}",
+        path.display(),
+        expected
+    );
 }
 
 fn ensure_base_ready_for_publish(base_repo: &Path, target: &str) -> anyhow::Result<()> {
@@ -2233,6 +2260,7 @@ mod tests {
             Some(worktree.to_str().unwrap()),
             |_| "main".to_string(),
             None,
+            &[],
         );
         assert!(
             fix.is_ok(),
@@ -2267,6 +2295,7 @@ mod tests {
             Some(worktree.to_str().unwrap()),
             |_| "main".to_string(),
             None,
+            &[],
         );
         assert!(
             old_bug.is_err(),
@@ -2284,6 +2313,85 @@ mod tests {
                 || err.contains("primary_worktree"),
             "OLD-BUG: error must come from primary_worktree's git invocation, \
              got: {err}"
+        );
+
+        // Cleanup.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&base_repo)
+            .args(["worktree", "remove", "--force", worktree.to_str().unwrap()])
+            .output();
+    }
+
+    /// REGRESSION (dogfooding finding): the cockpit creates managed worktrees
+    /// under its fleet store (`bro_home/fleet/worktrees`), NOT the legacy
+    /// `<repo_parent>/.bro-fleet-worktrees` convention. Without recognizing the
+    /// store root, `/closeout` refused every real fleet worktree. The guard must
+    /// accept a worktree under a caller-supplied `extra_managed_roots` entry
+    /// (the daemon derives it from `bro_home`), while still refusing it when no
+    /// matching root is supplied.
+    #[test]
+    fn prepare_closeout_request_accepts_extra_managed_root() {
+        let mut _env = EnvGuard::new();
+        _env.clear("BRO_FLEET_BASE_REPO");
+        _env.clear("BRO_FLEET_WORKTREE_ROOT");
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo_name = "store-repo";
+        let base_repo = sandbox.path().join(repo_name);
+        std::fs::create_dir_all(&base_repo).unwrap();
+        run_git(&base_repo, &["init", "-b", "main"]);
+        run_git(&base_repo, &["config", "user.email", "test@example.com"]);
+        run_git(&base_repo, &["config", "user.name", "Test User"]);
+        std::fs::write(base_repo.join("README.md"), "base\n").unwrap();
+        run_git(&base_repo, &["add", "."]);
+        run_git(&base_repo, &["commit", "-m", "init"]);
+
+        // Worktree under a fleet-store-style root, NOT under `.bro-fleet-worktrees`.
+        let store_root = sandbox.path().join("store").join("fleet").join("worktrees");
+        let worktree = store_root.join(repo_name).join("slug");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        run_git(
+            &base_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/store-test",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        // Without the store root, the legacy guard refuses it.
+        let refused = prepare_closeout_request(
+            &worktree,
+            Some(worktree.to_str().unwrap()),
+            |_| "main".to_string(),
+            None,
+            &[],
+        );
+        assert!(
+            refused.is_err(),
+            "worktree outside .bro-fleet-worktrees must be refused without an extra root; got Ok",
+        );
+
+        // With the store root supplied (as the daemon does from bro_home), accepted.
+        let accepted = prepare_closeout_request(
+            &worktree,
+            Some(worktree.to_str().unwrap()),
+            |_| "main".to_string(),
+            None,
+            &[store_root.clone()],
+        );
+        assert!(
+            accepted.is_ok(),
+            "worktree under a supplied extra_managed_root must be accepted; got Err({})",
+            accepted
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default()
         );
 
         // Cleanup.

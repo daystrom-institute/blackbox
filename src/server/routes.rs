@@ -973,6 +973,18 @@ pub(crate) async fn control_closeout_handler(
         Some(req.worktree.as_str())
     };
 
+    // The cockpit creates managed worktrees under its fleet/agent store
+    // (`bro_home/{fleet,agent}/worktrees`), NOT the legacy
+    // `<repo_parent>/.bro-fleet-worktrees` convention the tool path assumes.
+    // Pass those store roots so the managed-worktree guard accepts the
+    // worktrees the cockpit actually produces (without them, `/closeout`
+    // refuses every real fleet worktree — dogfooding finding).
+    let bro_home = crate::util::bro_home_dir(&dirs::home_dir().unwrap_or_default());
+    let extra_managed_roots = [
+        bro_home.join("fleet").join("worktrees"),
+        bro_home.join("agent").join("worktrees"),
+    ];
+
     // Shared pre-driver guard: managed-worktree, branch-prefix, detached-HEAD,
     // target resolution. The endpoint's target default is the base repo's
     // CURRENT branch (operator-decided) — the tool's default stays "main".
@@ -985,6 +997,7 @@ pub(crate) async fn control_closeout_handler(
                 .unwrap_or_else(|_| "main".to_string()),
         },
         req.allow_branch_prefixes.clone(),
+        &extra_managed_roots,
     ) {
         Ok(r) => r,
         Err(e) => {
