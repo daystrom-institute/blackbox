@@ -1092,6 +1092,15 @@ impl DaemonFleetClient {
         Ok(resp.json().await?)
     }
 
+    async fn forget_roster_task(&self, task_id: &str) -> anyhow::Result<()> {
+        self.http
+            .delete(self.endpoint(&format!("/control/roster/{task_id}")))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     async fn open_roster_stream(&self) -> anyhow::Result<reqwest::Response> {
         Ok(self
             .stream_http
@@ -1194,6 +1203,10 @@ impl DaemonFleetClient {
             serde_json::to_value(req)?,
         ))?;
         Ok(serde_json::from_value(value)?)
+    }
+
+    fn forget(&self, task_id: &str) -> anyhow::Result<()> {
+        block_on_fleet_http(self.forget_roster_task(task_id))
     }
 
     fn handle_from_response(
@@ -1913,12 +1926,13 @@ impl FleetOrchestrator {
         self.daemon.closeout(req)
     }
 
-    /// Drop a task from the store (used after a resume supersedes the old
-    /// Interrupted task, or on Ctrl+X delete, so a reload doesn't show it). The
+    /// Drop a terminal task from the daemon roster and this local projection. The
     /// underlying provider session jsonl survives on disk regardless (§5).
-    pub fn forget(&self, task_id: &str) {
+    pub fn forget(&self, task_id: &str) -> anyhow::Result<()> {
+        self.daemon.forget(task_id)?;
         self.task_store.write().retain_drop(|t| t.id() != task_id);
         emit_roster_changed(&self.tail_tx);
+        Ok(())
     }
 
     /// Stop a running session (Ctrl+X): the daemon SIGTERMs the child and marks

@@ -2392,17 +2392,21 @@ fn stop_or_delete_selected(app: &mut App) {
             Err(e) => app.set_status(format!("stop: {e}"), Duration::from_secs(4)),
         }
     } else {
-        // Delete: forget the cockpit's task record + drop the row. The provider
+        // Delete: forget the daemon roster record + drop the row. The provider
         // session jsonl persists for a future resume.
-        remove_agent_row(app, idx);
-        app.focused_agent_id = None;
-        if app.zone == Zone::SingleAgent {
-            app.zone = Zone::Roster;
+        match remove_agent_row(app, idx) {
+            Ok(()) => {
+                app.focused_agent_id = None;
+                if app.zone == Zone::SingleAgent {
+                    app.zone = Zone::Roster;
+                }
+                app.set_status(
+                    "deleted from roster (session kept on disk)",
+                    Duration::from_secs(3),
+                );
+            }
+            Err(e) => app.set_status(format!("delete: {e:#}"), Duration::from_secs(5)),
         }
-        app.set_status(
-            "deleted from roster (session kept on disk)",
-            Duration::from_secs(3),
-        );
     }
 }
 
@@ -2449,29 +2453,30 @@ fn prune_terminal_agents(app: &mut App) {
         .enumerate()
         .filter_map(|(idx, agent)| agent.task.snapshot().status.is_terminal().then_some(idx))
         .collect();
-    let pruned = terminal.len();
-    if pruned == 0 {
+    if terminal.is_empty() {
         app.clear_input();
         app.set_status("no terminal agents to prune", Duration::from_secs(3));
         return;
     }
 
     let mut focused_removed = false;
+    let mut pruned = 0usize;
+    let mut failed = 0usize;
     for idx in terminal.into_iter().rev() {
         let id = app.agents[idx].task.id();
-        if app.focused_agent_id.as_deref() == Some(id.as_str()) {
-            focused_removed = true;
+        let was_focused = app.focused_agent_id.as_deref() == Some(id.as_str());
+        match remove_agent_row(app, idx) {
+            Ok(()) => {
+                pruned += 1;
+                if was_focused {
+                    focused_removed = true;
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                tracing::warn!("fleet prune-terminal failed for {id}: {e:#}");
+            }
         }
-        if let Some(classifier) = &app.agents[idx].classifier {
-            let classifier_id = classifier.id();
-            let _ = app.orch.stop(classifier);
-            app.orch.forget(&classifier_id);
-            app.activity_clocks
-                .remove(&activity_key("classifier", &classifier_id));
-        }
-        app.activity_clocks.remove(&activity_key("agent", &id));
-        app.orch.forget(&id);
-        app.agents.remove(idx);
     }
 
     if focused_removed {
@@ -2482,10 +2487,17 @@ fn prune_terminal_agents(app: &mut App) {
     }
     app.reconcile_roster_selection();
     app.clear_input();
-    app.set_status(
-        format!("pruned {pruned} terminal agents"),
-        Duration::from_secs(3),
-    );
+    if failed > 0 {
+        app.set_status(
+            format!("pruned {pruned} terminal agents ({failed} failed)"),
+            Duration::from_secs(5),
+        );
+    } else {
+        app.set_status(
+            format!("pruned {pruned} terminal agents"),
+            Duration::from_secs(3),
+        );
+    }
 }
 
 /// Begin renaming the selected roster agent with a blank composer; Enter
@@ -2894,7 +2906,7 @@ fn sync_classifier_monitors(app: &mut App) -> ClassifierSync {
         if let Some(old) = app.agents[i].classifier.take() {
             let old_id = old.id();
             let _ = app.orch.stop(&old);
-            app.orch.forget(&old_id);
+            let _ = app.orch.forget(&old_id);
             app.activity_clocks
                 .remove(&activity_key("classifier", &old_id));
             sync.stopped += 1;
@@ -2929,19 +2941,20 @@ fn show_help_overlay(app: &mut App) {
 /// by Ctrl+X delete and post-fold cleanup (a folded worktree is gone, so its row
 /// is a dead end). Caller handles any zone/focus/status changes. Private: the
 /// `closeout` child module reaches it through normal ancestor-visibility.
-fn remove_agent_row(app: &mut App, idx: usize) {
+fn remove_agent_row(app: &mut App, idx: usize) -> anyhow::Result<()> {
     let id = app.agents[idx].task.id();
     if let Some(classifier) = &app.agents[idx].classifier {
         let classifier_id = classifier.id();
         let _ = app.orch.stop(classifier);
-        app.orch.forget(&classifier_id);
+        let _ = app.orch.forget(&classifier_id);
         app.activity_clocks
             .remove(&activity_key("classifier", &classifier_id));
     }
+    app.orch.forget(&id)?;
     app.activity_clocks.remove(&activity_key("agent", &id));
-    app.orch.forget(&id);
     app.agents.remove(idx);
     app.reconcile_roster_selection();
+    Ok(())
 }
 
 fn forget_standalone_agents(app: &mut App, stop_running: bool) {
@@ -2950,7 +2963,7 @@ fn forget_standalone_agents(app: &mut App, stop_running: bool) {
         if stop_running && agent.task.snapshot().status == TaskStatus::Running {
             let _ = app.orch.stop(&agent.task);
         }
-        app.orch.forget(&id);
+        let _ = app.orch.forget(&id);
     }
 }
 
@@ -3206,10 +3219,10 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
     else {
         // The agent was removed while its resume was in flight; the relaunched
         // task is live on the daemon but unowned here — forget it to avoid a leak.
-        app.orch.forget(&outcome.task.id());
+        let _ = app.orch.forget(&outcome.task.id());
         return;
     };
-    app.orch.forget(&outcome.agent_id); // drop the stale terminal task
+    let _ = app.orch.forget(&outcome.agent_id); // drop the stale terminal task
     let new_id = outcome.task.id();
     app.agents[idx].task = outcome.task;
     // Repoint the stable identities at the resumed task's fresh id, or the

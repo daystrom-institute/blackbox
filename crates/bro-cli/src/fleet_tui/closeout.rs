@@ -460,10 +460,14 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
                 && matches!(outcome, CloseoutOutcome::Success { .. })
                 && let Some(idx) = agent_index_for_worktree(app, &worktree)
             {
-                remove_agent_row(app, idx);
-                if app.zone == Zone::SingleAgent {
-                    app.focused_agent_id = None;
-                    app.zone = Zone::Roster;
+                match remove_agent_row(app, idx) {
+                    Ok(()) => {
+                        if app.zone == Zone::SingleAgent {
+                            app.focused_agent_id = None;
+                            app.zone = Zone::Roster;
+                        }
+                    }
+                    Err(e) => app.set_status(format!("closeout cleanup: {e:#}"), Duration::from_secs(5)),
                 }
             }
         }

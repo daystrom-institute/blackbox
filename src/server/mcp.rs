@@ -95,6 +95,10 @@ pub(super) fn build_http_app(
             axum::routing::get(control_roster_handler),
         )
         .route(
+            "/control/roster/{task_id}",
+            axum::routing::delete(control_roster_forget_handler),
+        )
+        .route(
             "/control/roster/stream",
             axum::routing::get(roster_stream_handler),
         )

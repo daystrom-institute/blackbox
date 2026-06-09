@@ -1194,6 +1194,60 @@ pub(crate) async fn control_roster_handler(
     axum::Json(snapshot).into_response()
 }
 
+pub(crate) async fn control_roster_forget_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use serde_json::json;
+
+    let dropped = {
+        let mut store = state.task_store.write();
+        let Some(task) = store.get(&task_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({
+                    "error": format!("task {task_id} is not in the roster"),
+                })),
+            )
+                .into_response();
+        };
+        let status = task.inner.lock().status;
+        if !status.is_terminal() {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "error": format!(
+                        "task {task_id} is {status:?}; only terminal tasks can be forgotten"
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        store.retain_drop(|task| task.id() != task_id)
+    };
+
+    if dropped.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "error": format!("task {task_id} is not in the roster"),
+            })),
+        )
+            .into_response();
+    }
+
+    orchestration::request_persist(&state.task_store, &state.store_dir);
+    state.roster_events().emit_removed(task_id.clone());
+
+    axum::Json(json!({
+        "taskId": task_id,
+        "forgotten": true,
+    }))
+    .into_response()
+}
+
 pub(crate) async fn control_dashboard_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(query): Query<DashboardParams>,
@@ -3138,6 +3192,68 @@ mod tests {
         let obj = value.as_object().expect("envelope must be an object");
         assert!(obj.contains_key("version"), "envelope must carry `version`");
         assert_eq!(obj.len(), 2, "envelope must carry exactly `version` and `tasks`");
+    }
+
+    #[tokio::test]
+    async fn control_roster_forget_drops_only_terminal_tasks_from_snapshot() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        {
+            let mut store = state.task_store.write();
+            store
+                .insert(
+                    "running".to_string(),
+                    orchestration::test_task(
+                        "running",
+                        orchestration::TaskStatus::Running,
+                        Provider::Glm,
+                    ),
+                )
+                .expect("insert running");
+            store
+                .insert(
+                    "terminal".to_string(),
+                    orchestration::test_task(
+                        "terminal",
+                        orchestration::TaskStatus::Completed,
+                        Provider::Brodex,
+                    ),
+                )
+                .expect("insert terminal");
+        }
+
+        let running_resp = control_roster_forget_handler(
+            AxumState(state.clone()),
+            axum::extract::Path("running".to_string()),
+        )
+        .await;
+        assert_eq!(running_resp.status(), axum::http::StatusCode::CONFLICT);
+
+        let terminal_resp = control_roster_forget_handler(
+            AxumState(state.clone()),
+            axum::extract::Path("terminal".to_string()),
+        )
+        .await;
+        assert_eq!(terminal_resp.status(), axum::http::StatusCode::OK);
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let snapshot: bro_protocol::RosterSnapshotV1 = serde_json::from_slice(&body_bytes)
+            .expect("roster body must decode as RosterSnapshotV1");
+        let ids: Vec<String> = snapshot
+            .tasks
+            .into_iter()
+            .map(|task| task.task_id.as_str().to_string())
+            .collect();
+
+        assert_eq!(ids, vec!["running".to_string()]);
     }
 
     #[tokio::test]
