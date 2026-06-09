@@ -9,34 +9,20 @@
     clippy::let_and_return
 )]
 
-//! `bro tail` — multi-lane transcript tail for agent orchestration.
+//! `bro tail` — headless stream printer for agent orchestration.
 //!
-//! Selects one or more bros (by name, team, or provider), resolves their
-//! current session JSONL via the daemon's `/roster` endpoint, seeds each
-//! lane with recent history, then follows the files live. Tool calls,
-//! thinking blocks, text, and out-of-band system signals (compaction,
-//! hooks, system-reminders) are rendered in a ratatui split-pane layout.
+//! Selects one or more bros (by name, team, session, or provider), subscribes
+//! to the daemon's `/tail` SSE stream, and writes each event payload to stdout
+//! for piping, scripting, and logging. The interactive cockpit lives in
+//! `bro fleet`.
 
-use std::collections::HashSet;
-use std::io::{self, BufRead, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::io::{self, Write};
+use std::time::Duration;
 
 use bro_fleet_client::Provider;
 
 use clap::{Args, Parser, Subcommand};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::prelude::*;
-use ratatui::widgets::*;
-use serde::Deserialize;
+use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 
 mod council_tui;
 mod fleet_classifier;
@@ -45,26 +31,6 @@ mod logging;
 mod mcp_call;
 #[cfg(test)]
 mod test_backend;
-use bro_transcript::{
-    EventDetail, MessageRole, SystemSignalKind, TranscriptEvent, parse_codex_line_rich,
-    parse_copilot_line_rich, parse_gemini_file_rich, parse_transcript_line_rich,
-    parse_vibe_line_rich,
-};
-
-// ── Roster fetch ────────────────────────────────────────────────────
-
-#[derive(Deserialize, Debug, Clone)]
-struct RosterEntry {
-    bro: String,
-    bro_selector: String,
-    team: String,
-    provider: String,
-    session_id: Option<String>,
-    jsonl_path: Option<String>,
-    #[allow(dead_code)]
-    brofile: String,
-    model: Option<String>,
-}
 
 #[derive(Default, Debug, Clone)]
 struct TailSelectors {
@@ -87,7 +53,7 @@ struct BroCli {
 
 #[derive(Debug, Subcommand)]
 enum BroCommand {
-    /// Multi-lane transcript tail for agent orchestration
+    /// Print daemon tail SSE payloads to stdout
     Tail(TailArgs),
     /// Workflow orchestration — drive a mermaid-shaped flow through the daemon
     Orchestrate(OrchestrateArgs),
@@ -314,7 +280,7 @@ struct OrchestrateRunArgs {
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Selectors are unioned. Each flag is repeatable.\n\nExamples:\n  bro tail alice bob\n  bro tail --team review-panel\n  bro tail --team A --team B\n  bro tail --team A --bro solo --bro qa\n  bro tail --session <uuid>\n  bro tail --provider codex"
+    after_help = "Prints one SSE data payload per stdout line. Selectors are unioned and each flag is repeatable.\n\nExamples:\n  bro tail alice bob\n  bro tail --team review-panel\n  bro tail --team A --team B\n  bro tail --team A --bro solo --bro qa\n  bro tail --session <uuid>\n  bro tail --provider codex"
 )]
 struct TailArgs {
     /// Specific bros to include. Accepts bare names or `team::bro`.
@@ -347,58 +313,9 @@ impl From<TailArgs> for TailSelectors {
     }
 }
 
-// ── SSE subscriber ─────────────────────────────────────────────────
-//
-// The daemon synthesises richer activity signal than the JSONL file
-// gets. Claude exec streams via stdout → the daemon emits TaskProgress
-// events with a rolling snippet of the latest assistant message, even
-// while the subprocess's own JSONL is still sitting idle. We subscribe
-// to that stream so the UI can distinguish "alive and streaming" from
-// "alive but quiet (in a tool call)" from "truly idle".
+// ── Tail stream printer ─────────────────────────────────────────────
 
-/// Event pushed from the async SSE task into the sync TUI loop.
-#[derive(Debug, Clone)]
-enum LaneSignal {
-    TaskStarted {
-        bro: Option<String>,
-        bro_selector: Option<String>,
-        session_id: Option<String>,
-        jsonl_path: Option<String>,
-        task_id: String,
-    },
-    TaskProgress {
-        bro: Option<String>,
-        bro_selector: Option<String>,
-        session_id: Option<String>,
-        jsonl_path: Option<String>,
-        task_id: String,
-        snippet: String,
-    },
-    TaskCompleted {
-        bro: Option<String>,
-        bro_selector: Option<String>,
-        session_id: Option<String>,
-        jsonl_path: Option<String>,
-        task_id: String,
-    },
-    TaskFailed {
-        bro: Option<String>,
-        bro_selector: Option<String>,
-        session_id: Option<String>,
-        jsonl_path: Option<String>,
-        task_id: String,
-        error: String,
-    },
-    TaskCancelled {
-        bro: Option<String>,
-        bro_selector: Option<String>,
-        session_id: Option<String>,
-        jsonl_path: Option<String>,
-        task_id: String,
-    },
-}
-
-async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
+fn tail_url(sel: &TailSelectors) -> String {
     let port = bro_fleet_client::daemon_port();
     let mut url = format!("http://127.0.0.1:{port}/tail");
     let mut params = Vec::new();
@@ -418,539 +335,81 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
         url.push('?');
         url.push_str(&params.join("&"));
     }
+    url
+}
 
-    // Reconnect loop — if the daemon restarts mid-tail, keep trying.
+async fn run_tail_stream_printer(sel: TailSelectors) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
+    let url = tail_url(&sel);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()?;
+
     loop {
-        let client = match reqwest::Client::builder().build() {
-            Ok(c) => c,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
         let resp = match client
             .get(&url)
             .header("Accept", "text/event-stream")
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => r,
-            _ => {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                eprintln!("/tail returned {}; retrying", resp.status());
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            Err(err) => {
+                eprintln!("cannot reach blackboxd tail stream: {err}; retrying");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
 
-        use futures::StreamExt;
+        let mut stdout = io::stdout().lock();
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let Ok(bytes) = chunk else { break };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            // SSE frames are separated by blank line. Each frame may contain
-            // multiple `data:` lines, which we concat into one JSON payload.
-            while let Some(split) = buf.find("\n\n") {
-                let frame = buf[..split].to_string();
-                buf.drain(..split + 2);
-                let mut payload = String::new();
-                for line in frame.lines() {
-                    if let Some(rest) = line.strip_prefix("data:") {
-                        payload.push_str(rest.trim_start());
-                    }
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    eprintln!("tail stream ended with error: {err}; reconnecting");
+                    break;
                 }
-                if payload.is_empty() {
-                    continue;
-                }
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload)
-                    && let Some(signal) = parse_lane_signal(&value)
-                    && tx.send(signal).is_err()
-                {
-                    return;
+            };
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = find_sse_separator(&buf) {
+                let frame_bytes = buf.drain(..pos + 2).collect::<Vec<_>>();
+                let frame = String::from_utf8_lossy(&frame_bytes);
+                if !write_tail_frame(&mut stdout, &frame)? {
+                    return Ok(());
                 }
             }
         }
-        // Stream ended — pause and reconnect.
+
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
-    let task_id = v.get("task_id")?.as_str()?.to_string();
-    let bro = v.get("bro_name").and_then(|x| x.as_str()).map(String::from);
-    let bro_selector = v
-        .get("bro_selector")
-        .and_then(|x| x.as_str())
-        .map(String::from);
-    let session_id = v
-        .get("session_id")
-        .and_then(|x| x.as_str())
-        .map(String::from);
-    let jsonl_path = v
-        .get("jsonl_path")
-        .and_then(|x| x.as_str())
-        .map(String::from);
-    let kind = v.get("type").and_then(|x| x.as_str())?;
-    match kind {
-        "task_started" => Some(LaneSignal::TaskStarted {
-            bro,
-            bro_selector,
-            session_id,
-            jsonl_path,
-            task_id,
-        }),
-        "task_progress" => {
-            let snippet = v
-                .get("activity")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some(LaneSignal::TaskProgress {
-                bro,
-                bro_selector,
-                session_id,
-                jsonl_path,
-                task_id,
-                snippet,
-            })
+fn write_tail_frame(out: &mut impl Write, frame: &str) -> io::Result<bool> {
+    let mut payload = String::new();
+    for line in frame.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("data:") {
+            payload.push_str(rest.trim_start());
         }
-        "task_completed" => Some(LaneSignal::TaskCompleted {
-            bro,
-            bro_selector,
-            session_id,
-            jsonl_path,
-            task_id,
-        }),
-        "task_failed" => {
-            let error = v
-                .get("error")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some(LaneSignal::TaskFailed {
-                bro,
-                bro_selector,
-                session_id,
-                jsonl_path,
-                task_id,
-                error,
-            })
-        }
-        "task_cancelled" => Some(LaneSignal::TaskCancelled {
-            bro,
-            bro_selector,
-            session_id,
-            jsonl_path,
-            task_id,
-        }),
-        _ => None,
     }
+    if payload.is_empty() {
+        return Ok(true);
+    }
+    if writeln!(out, "{payload}").is_err() {
+        return Ok(false);
+    }
+    if out.flush().is_err() {
+        return Ok(false);
+    }
+    Ok(true)
 }
-
-async fn fetch_roster(sel: TailSelectors) -> anyhow::Result<Vec<RosterEntry>> {
-    let port = bro_fleet_client::daemon_port();
-    let mut url = format!("http://127.0.0.1:{port}/roster");
-    let mut params = Vec::new();
-    if !sel.bros.is_empty() {
-        params.push(format!("bros={}", sel.bros.join(",")));
-    }
-    if !sel.teams.is_empty() {
-        params.push(format!("teams={}", sel.teams.join(",")));
-    }
-    if !sel.sessions.is_empty() {
-        params.push(format!("sessions={}", sel.sessions.join(",")));
-    }
-    if !sel.providers.is_empty() {
-        params.push(format!("providers={}", sel.providers.join(",")));
-    }
-    if !params.is_empty() {
-        url.push('?');
-        url.push_str(&params.join("&"));
-    }
-    let client = reqwest::Client::new();
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            // Connection-level failure — daemon almost certainly down.
-            anyhow::bail!("cannot reach blackboxd on port {port}: {e}");
-        }
-    };
-    if !resp.status().is_success() {
-        anyhow::bail!("/roster returned {}", resp.status());
-    }
-    Ok(resp.json().await?)
-}
-
-// ── App / Lane state ────────────────────────────────────────────────
-
-struct Lane {
-    bro: String,
-    bro_selector: String,
-    team: String,
-    provider: String,
-    model: Option<String>,
-    session_id: Option<String>,
-    jsonl_path: Option<PathBuf>,
-    events: Vec<TranscriptEvent>,
-    /// JSONL tail cursor (Claude / Codex).
-    file_offset: u64,
-    /// mtime of last successful read (Gemini re-parse trigger).
-    file_mtime: Option<SystemTime>,
-    /// Dedupe key for full-file re-parsers (Gemini keys by message id).
-    seen_ids: HashSet<String>,
-    /// Scroll offset from bottom (0 = latest visible). Non-zero = user scrolled up.
-    scroll_from_bottom: usize,
-    cached_total_lines: usize,
-    status: LaneStatus,
-    // ── Live activity, driven by the daemon's /tail SSE stream ──────
-    /// Tasks the daemon has told us are currently running for this lane.
-    /// Keyed by task_id; Claude exec/resume stays here until we see a
-    /// task_completed|failed|cancelled event.
-    active_tasks: HashSet<String>,
-    /// Wall-clock of the most recent TaskProgress delta for this lane.
-    last_progress_at: Option<Instant>,
-    /// Rolling 160-char tail of the latest assistant message.
-    last_progress_snippet: Option<String>,
-    /// If a task failed recently, flash its error for a few seconds.
-    last_failure: Option<(Instant, String)>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum LaneStatus {
-    Waiting, // no session_id yet
-    Tailing,
-    MissingFile,
-}
-
-impl Lane {
-    fn from_roster(e: RosterEntry) -> Self {
-        let status = if e.session_id.is_none() {
-            LaneStatus::Waiting
-        } else if e.jsonl_path.is_none() {
-            LaneStatus::MissingFile
-        } else {
-            LaneStatus::Tailing
-        };
-        let mut lane = Lane {
-            bro: e.bro,
-            bro_selector: e.bro_selector,
-            team: e.team,
-            provider: e.provider,
-            model: e.model,
-            session_id: e.session_id,
-            jsonl_path: e.jsonl_path.map(PathBuf::from),
-            events: Vec::new(),
-            file_offset: 0,
-            file_mtime: None,
-            seen_ids: HashSet::new(),
-            scroll_from_bottom: 0,
-            cached_total_lines: 0,
-            status,
-            active_tasks: HashSet::new(),
-            last_progress_at: None,
-            last_progress_snippet: None,
-            last_failure: None,
-        };
-        lane.seed();
-        lane
-    }
-
-    /// Does this signal belong to this lane?
-    fn matches_signal(
-        &self,
-        bro: Option<&str>,
-        bro_selector: Option<&str>,
-        session_id: Option<&str>,
-    ) -> bool {
-        if let Some(selector) = bro_selector
-            && selector == self.bro_selector
-        {
-            return true;
-        }
-        if let Some(b) = bro
-            && b == self.bro
-            && self.team == "adhoc"
-        {
-            return true;
-        }
-        if let (Some(s), Some(lane_sid)) = (session_id, self.session_id.as_deref())
-            && s == lane_sid
-        {
-            return true;
-        }
-        false
-    }
-
-    fn apply_signal(&mut self, sig: &LaneSignal) {
-        self.attach_from_signal(sig);
-        match sig {
-            LaneSignal::TaskStarted { task_id, .. } => {
-                self.active_tasks.insert(task_id.clone());
-                self.last_failure = None;
-            }
-            LaneSignal::TaskProgress {
-                task_id, snippet, ..
-            } => {
-                self.active_tasks.insert(task_id.clone());
-                self.last_progress_at = Some(Instant::now());
-                if !snippet.is_empty() {
-                    self.last_progress_snippet = Some(snippet.clone());
-                }
-            }
-            LaneSignal::TaskCompleted { task_id, .. } => {
-                self.active_tasks.remove(task_id);
-            }
-            LaneSignal::TaskFailed { task_id, error, .. } => {
-                self.active_tasks.remove(task_id);
-                self.last_failure = Some((Instant::now(), error.clone()));
-            }
-            LaneSignal::TaskCancelled { task_id, .. } => {
-                self.active_tasks.remove(task_id);
-            }
-        }
-    }
-
-    fn attach_from_signal(&mut self, sig: &LaneSignal) {
-        let (session_id, jsonl_path) = match sig {
-            LaneSignal::TaskStarted {
-                bro_selector: _,
-                session_id,
-                jsonl_path,
-                ..
-            }
-            | LaneSignal::TaskProgress {
-                bro_selector: _,
-                session_id,
-                jsonl_path,
-                ..
-            }
-            | LaneSignal::TaskCompleted {
-                bro_selector: _,
-                session_id,
-                jsonl_path,
-                ..
-            }
-            | LaneSignal::TaskFailed {
-                bro_selector: _,
-                session_id,
-                jsonl_path,
-                ..
-            }
-            | LaneSignal::TaskCancelled {
-                bro_selector: _,
-                session_id,
-                jsonl_path,
-                ..
-            } => (session_id.as_deref(), jsonl_path.as_deref()),
-        };
-
-        if self.session_id.is_none()
-            && let Some(sid) = session_id
-        {
-            self.session_id = Some(sid.to_string());
-        }
-        if self.jsonl_path.is_none()
-            && let Some(path) = jsonl_path
-        {
-            self.jsonl_path = Some(PathBuf::from(path));
-        }
-        if self.status != LaneStatus::Tailing
-            && self.session_id.is_some()
-            && self.jsonl_path.is_some()
-        {
-            self.status = LaneStatus::Tailing;
-            if self.events.is_empty() {
-                self.seed();
-            }
-        }
-    }
-
-    fn seed(&mut self) {
-        let Some(path) = self.jsonl_path.clone() else {
-            return;
-        };
-        if self.provider == "gemini" {
-            self.seed_gemini(&path);
-        } else {
-            self.seed_jsonl(&path);
-        }
-    }
-
-    fn seed_jsonl(&mut self, path: &Path) {
-        const SEED_EVENTS: usize = 50;
-        let Ok(content) = std::fs::read_to_string(path) else {
-            self.status = LaneStatus::MissingFile;
-            return;
-        };
-        self.file_offset = content.len() as u64;
-        let lines: Vec<&str> = content.lines().collect();
-        let start = lines.len().saturating_sub(SEED_EVENTS * 3);
-        let mut events = Vec::new();
-        for line in &lines[start..] {
-            events.extend(self.parse_jsonl_line(line));
-        }
-        if events.len() > SEED_EVENTS {
-            let drop = events.len() - SEED_EVENTS;
-            events.drain(..drop);
-        }
-        self.events = events;
-    }
-
-    fn seed_gemini(&mut self, path: &Path) {
-        const SEED_EVENTS: usize = 50;
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            self.status = LaneStatus::MissingFile;
-            return;
-        };
-        if let Ok(meta) = std::fs::metadata(path) {
-            self.file_mtime = meta.modified().ok();
-        }
-        let mut events = parse_gemini_file_rich(&raw);
-        // Tag every seen id so future polls only pick up new ones.
-        for ev in &events {
-            if let Some(ref id) = ev.parent_tool_use_id {
-                self.seen_ids.insert(id.clone());
-            }
-        }
-        if events.len() > SEED_EVENTS {
-            let drop = events.len() - SEED_EVENTS;
-            events.drain(..drop);
-        }
-        self.events = events;
-    }
-
-    fn parse_jsonl_line(&self, line: &str) -> Vec<TranscriptEvent> {
-        let sid = self.session_id.as_deref().unwrap_or("");
-        match self.provider.as_str() {
-            "codex" => parse_codex_line_rich(line, sid),
-            "copilot" => parse_copilot_line_rich(line, sid),
-            "vibe" => parse_vibe_line_rich(line, sid),
-            _ => parse_transcript_line_rich(line),
-        }
-    }
-
-    fn poll(&mut self) -> bool {
-        let Some(path) = self.jsonl_path.clone() else {
-            return false;
-        };
-        if self.provider == "gemini" {
-            self.poll_gemini(&path)
-        } else {
-            self.poll_jsonl(&path)
-        }
-    }
-
-    fn poll_jsonl(&mut self, path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        if meta.len() <= self.file_offset {
-            return false;
-        }
-        if meta.len() < self.file_offset {
-            // Truncation / rotation.
-            self.file_offset = 0;
-        }
-        let Ok(mut file) = std::fs::File::open(path) else {
-            return false;
-        };
-        if file.seek(SeekFrom::Start(self.file_offset)).is_err() {
-            return false;
-        }
-        let mut reader = io::BufReader::new(&mut file);
-        let mut added = false;
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if line.ends_with('\n') {
-                        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                        for ev in self.parse_jsonl_line(trimmed) {
-                            self.events.push(ev);
-                            added = true;
-                        }
-                        self.file_offset += n as u64;
-                    } else {
-                        // mid-flush; leave for next poll
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        self.cap_events();
-        added
-    }
-
-    fn poll_gemini(&mut self, path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        let mtime = meta.modified().ok();
-        if mtime == self.file_mtime {
-            return false;
-        }
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        self.file_mtime = mtime;
-        let parsed = parse_gemini_file_rich(&raw);
-        let mut added = false;
-        // Dedupe at the message-group level: every event parsed from a gemini
-        // message shares the same parent_tool_use_id, so per-event dedupe
-        // would keep only the first (thoughts-only, dropping content +
-        // toolCalls). Group-level means: if the message id is new, keep all
-        // of its events; otherwise skip the whole group.
-        let mut current_id: Option<String> = None;
-        let mut keep_group = false;
-        for ev in parsed {
-            let Some(id) = ev.parent_tool_use_id.as_ref().cloned() else {
-                continue;
-            };
-            if current_id.as_ref() != Some(&id) {
-                current_id = Some(id.clone());
-                keep_group = self.seen_ids.insert(id);
-            }
-            if keep_group {
-                self.events.push(ev);
-                added = true;
-            }
-        }
-        self.cap_events();
-        added
-    }
-
-    fn cap_events(&mut self) {
-        const MAX_EVENTS: usize = 2000;
-        if self.events.len() > MAX_EVENTS {
-            let drop = self.events.len() - MAX_EVENTS;
-            self.events.drain(..drop);
-        }
-    }
-}
-
-struct App {
-    lanes: Vec<Lane>,
-    /// Lane targeted by key commands (scroll, etc). Always valid.
-    selected: usize,
-    /// Whether to fullscreen the selected lane.
-    fullscreen: bool,
-    /// Last rendered body height — used for page-scroll step size.
-    last_body_h: u16,
-    /// Per-lane horizontal weight (in pct-ish units). Adjusted by drag.
-    lane_weights: Vec<u16>,
-    /// Column range per visible lane: (start_inclusive, end_exclusive,
-    /// absolute lane index in `lanes`). Updated every draw so mouse
-    /// events can map column → lane identity regardless of fullscreen.
-    lane_columns: Vec<(u16, u16, usize)>,
-    /// Body area y bounds (top inclusive, bottom exclusive).
-    body_y_range: (u16, u16),
-    /// If dragging a divider, which one: the index of the right-hand lane.
-    dragging_divider: Option<usize>,
-    quit: bool,
-}
-
-// ── Entry point ─────────────────────────────────────────────────────
 
 async fn run_orchestrate(args: OrchestrateArgs) -> anyhow::Result<()> {
     match args.command {
@@ -1481,28 +940,14 @@ fn main() -> anyhow::Result<()> {
     let cli = BroCli::parse();
     let rt = tokio::runtime::Runtime::new()?;
 
-    let sel = match cli.command {
-        BroCommand::Tail(args) => TailSelectors::from(args),
-        BroCommand::Orchestrate(args) => {
-            let result = rt.block_on(run_orchestrate(args));
-            drop(rt);
-            return result;
-        }
-        BroCommand::Council(args) => {
-            let result = rt.block_on(run_council(args));
-            drop(rt);
-            return result;
-        }
-        BroCommand::Mcp(args) => {
-            let result = rt.block_on(mcp_call::run(args));
-            drop(rt);
-            return result;
-        }
+    let result = match cli.command {
+        BroCommand::Tail(args) => rt.block_on(run_tail_stream_printer(TailSelectors::from(args))),
+        BroCommand::Orchestrate(args) => rt.block_on(run_orchestrate(args)),
+        BroCommand::Council(args) => rt.block_on(run_council(args)),
+        BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
-            let result = rt.block_on(fleet_tui::run(args.cwd, args.daemon_url));
-            drop(rt);
-            return result;
+            rt.block_on(fleet_tui::run(args.cwd, args.daemon_url))
         }
         BroCommand::Agent(args) => {
             default_fleet_harness_tee();
@@ -1515,769 +960,16 @@ fn main() -> anyhow::Result<()> {
                 resume: args.resume,
                 prompt,
             };
-            let result = rt.block_on(fleet_tui::run_agent(launch));
-            drop(rt);
-            return result;
+            rt.block_on(fleet_tui::run_agent(launch))
         }
     };
-
-    let roster = match rt.block_on(fetch_roster(sel.clone())) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to fetch roster: {e}");
-            std::process::exit(1);
-        }
-    };
-    if roster.is_empty() {
-        eprintln!("No bros matched. Try `bro tail` with no args, or check team/bro/session names.");
-        std::process::exit(1);
-    }
-
-    // SSE subscription — the daemon pushes task_started / task_progress /
-    // task_completed / task_failed / task_cancelled events matching our
-    // selectors. We forward them through an mpsc channel into the sync
-    // TUI loop; the channel closes when the runtime drops at exit.
-    let (tx, rx) = mpsc::channel::<LaneSignal>();
-    rt.spawn(run_sse_subscriber(sel, tx));
-
-    let lanes: Vec<Lane> = roster.into_iter().map(Lane::from_roster).collect();
-    let n = lanes.len();
-    let app = App {
-        lanes,
-        selected: 0,
-        fullscreen: false,
-        last_body_h: 0,
-        lane_weights: vec![100; n],
-        lane_columns: Vec::with_capacity(n),
-        body_y_range: (0, 0),
-        dragging_divider: None,
-        quit: false,
-    };
-    let result = run_tui(app, rx);
-    // Runtime is dropped here, killing the SSE task.
     drop(rt);
     result
 }
 
-// ── TUI main loop ───────────────────────────────────────────────────
-
-fn run_tui(mut app: App, signals: mpsc::Receiver<LaneSignal>) -> anyhow::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut last_poll = Instant::now();
-    let poll_interval = Duration::from_millis(250);
-
-    let result = (|| -> anyhow::Result<()> {
-        loop {
-            terminal.draw(|f| draw(f, &mut app))?;
-
-            if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        handle_key(&mut app, key);
-                        if app.quit {
-                            break;
-                        }
-                    }
-                    Event::Mouse(ev) => handle_mouse(&mut app, ev),
-                    _ => {}
-                }
-            }
-
-            // Drain SSE signals from the async subscriber — non-blocking.
-            while let Ok(sig) = signals.try_recv() {
-                dispatch_signal(&mut app, sig);
-            }
-
-            if last_poll.elapsed() >= poll_interval {
-                for lane in &mut app.lanes {
-                    lane.poll();
-                }
-                last_poll = Instant::now();
-            }
-        }
-        Ok(())
-    })();
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    result
-}
-
-fn dispatch_signal(app: &mut App, sig: LaneSignal) {
-    let (bro, bro_selector, session_id) = match &sig {
-        LaneSignal::TaskStarted {
-            bro,
-            bro_selector,
-            session_id,
-            ..
-        }
-        | LaneSignal::TaskProgress {
-            bro,
-            bro_selector,
-            session_id,
-            ..
-        }
-        | LaneSignal::TaskCompleted {
-            bro,
-            bro_selector,
-            session_id,
-            ..
-        }
-        | LaneSignal::TaskFailed {
-            bro,
-            bro_selector,
-            session_id,
-            ..
-        }
-        | LaneSignal::TaskCancelled {
-            bro,
-            bro_selector,
-            session_id,
-            ..
-        } => (
-            bro.as_deref(),
-            bro_selector.as_deref(),
-            session_id.as_deref(),
-        ),
-    };
-    for lane in &mut app.lanes {
-        if lane.matches_signal(bro, bro_selector, session_id) {
-            lane.apply_signal(&sig);
-        }
-    }
-}
-
-fn handle_mouse(app: &mut App, ev: MouseEvent) {
-    let (col, row) = (ev.column, ev.row);
-    let (body_top, body_bot) = app.body_y_range;
-    let in_body = row >= body_top && row < body_bot;
-
-    match ev.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if !in_body {
-                return;
-            }
-            // Divider hit has priority — checked against internal boundaries only.
-            if let Some(div_idx) = divider_at(&app.lane_columns, col) {
-                app.dragging_divider = Some(div_idx);
-                return;
-            }
-            if let Some(lane_idx) = lane_at(&app.lane_columns, col) {
-                app.selected = lane_idx;
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            app.dragging_divider = None;
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(div_idx) = app.dragging_divider {
-                resize_divider(app, div_idx, col);
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            if !in_body {
-                return;
-            }
-            if let Some(idx) = lane_at(&app.lane_columns, col)
-                && let Some(l) = app.lanes.get_mut(idx)
-            {
-                l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(3);
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            if !in_body {
-                return;
-            }
-            if let Some(idx) = lane_at(&app.lane_columns, col)
-                && let Some(l) = app.lanes.get_mut(idx)
-            {
-                l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(3);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Find the (absolute) lane index whose column range contains `col`.
-fn lane_at(lane_columns: &[(u16, u16, usize)], col: u16) -> Option<usize> {
-    lane_columns
-        .iter()
-        .find(|&&(start, end, _)| col >= start && col < end)
-        .map(|&(_, _, lane_idx)| lane_idx)
-}
-
-/// Find the divider sitting at `col` (within ±1 column tolerance).
-/// Returns the *visible-slot* index of the right-hand lane (for use
-/// with `resize_divider` which operates on lane_columns slots, not
-/// absolute lane indexes). Only internal dividers qualify — the
-/// leftmost edge is the window border, not a divider.
-fn divider_at(lane_columns: &[(u16, u16, usize)], col: u16) -> Option<usize> {
-    for (i, &(start, _, _)) in lane_columns.iter().enumerate().skip(1) {
-        if col + 1 >= start && col <= start + 1 {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Resize: the divider between visible slots `div_idx-1` and `div_idx`
-/// was dragged to `target_col`. Rebalance those two lanes' weights so
-/// the new split is honored; other lanes keep their weights. Enforces
-/// a minimum visible width so a lane can't get crushed to zero.
-fn resize_divider(app: &mut App, div_idx: usize, target_col: u16) {
-    if div_idx == 0 || div_idx >= app.lane_columns.len() {
-        return;
-    }
-    let (left_start, _, left_lane) = app.lane_columns[div_idx - 1];
-    let (_, right_end, right_lane) = app.lane_columns[div_idx];
-    let total_w = right_end.saturating_sub(left_start);
-    if total_w == 0 {
-        return;
-    }
-    const MIN_LANE: u16 = 12;
-    let lo = left_start.saturating_add(MIN_LANE);
-    let hi = right_end.saturating_sub(MIN_LANE);
-    if hi <= lo {
-        return;
-    }
-    let divider = target_col.clamp(lo, hi);
-    let left_w = divider - left_start;
-
-    let combined = app.lane_weights[left_lane] + app.lane_weights[right_lane];
-    if combined == 0 {
-        return;
-    }
-    let new_left = ((left_w as u32 * combined as u32) / total_w as u32) as u16;
-    let new_left = new_left.max(1);
-    let new_right = combined.saturating_sub(new_left).max(1);
-    app.lane_weights[left_lane] = new_left;
-    app.lane_weights[right_lane] = new_right;
-}
-
-fn handle_key(app: &mut App, key: KeyEvent) {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-        app.quit = true;
-        return;
-    }
-    let n = app.lanes.len();
-    // Page step is ~body height; fall back to 10 if we haven't drawn yet.
-    let page_step = app.last_body_h.max(10);
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-        KeyCode::Tab => app.selected = (app.selected + 1) % n,
-        KeyCode::BackTab => {
-            app.selected = if app.selected == 0 {
-                n - 1
-            } else {
-                app.selected - 1
-            };
-        }
-        KeyCode::Char('f') => app.fullscreen = !app.fullscreen,
-        KeyCode::Char('a') => app.fullscreen = false,
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(l) = app.lanes.get_mut(app.selected) {
-                l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(1);
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(l) = app.lanes.get_mut(app.selected) {
-                l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(1);
-            }
-        }
-        KeyCode::PageUp => {
-            if let Some(l) = app.lanes.get_mut(app.selected) {
-                l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(page_step as usize);
-            }
-        }
-        KeyCode::PageDown => {
-            if let Some(l) = app.lanes.get_mut(app.selected) {
-                l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(page_step as usize);
-            }
-        }
-        // Home / 'g' — jump far up (clamped on draw).
-        KeyCode::Home | KeyCode::Char('g') => {
-            if let Some(l) = app.lanes.get_mut(app.selected) {
-                l.scroll_from_bottom = usize::MAX / 2;
-            }
-        }
-        // End / 'G' — follow mode (bottom).
-        KeyCode::End | KeyCode::Char('G') => {
-            if let Some(l) = app.lanes.get_mut(app.selected) {
-                l.scroll_from_bottom = 0;
-            }
-        }
-        _ => {}
-    }
-}
-
-// ── Rendering ───────────────────────────────────────────────────────
-
-fn draw(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    draw_tab_strip(f, chunks[0], app);
-    app.body_y_range = (chunks[1].y, chunks[1].y.saturating_add(chunks[1].height));
-    draw_body(f, chunks[1], app);
-    draw_status(f, chunks[2], app);
-}
-
-fn draw_tab_strip(f: &mut Frame, area: Rect, app: &App) {
-    let spans: Vec<Span> = app
-        .lanes
-        .iter()
-        .enumerate()
-        .flat_map(|(i, l)| {
-            let selected = i == app.selected;
-            let bg = if selected {
-                Color::DarkGray
-            } else {
-                Color::Reset
-            };
-            let fg = provider_color(&l.provider);
-            let marker = if selected { "▸" } else { " " };
-            vec![
-                Span::styled(
-                    format!("{marker}{} ", l.bro),
-                    Style::default().fg(fg).bg(bg).add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-                ),
-                Span::raw(" "),
-            ]
-        })
-        .collect();
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
-    let indexes: Vec<usize> = if app.fullscreen {
-        vec![app.selected]
-    } else {
-        (0..app.lanes.len()).collect()
-    };
-    if indexes.is_empty() {
-        app.lane_columns.clear();
-        return;
-    }
-    // Use Fill(weight) so the user's drag-adjusted weights are honored
-    // proportionally without having to normalize to 100 on every drag.
-    let constraints: Vec<Constraint> = indexes
-        .iter()
-        .map(|&i| Constraint::Fill(app.lane_weights.get(i).copied().unwrap_or(100)))
-        .collect();
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
-    let mut max_body_h = 0u16;
-    app.lane_columns.clear();
-    for (slot, &lane_idx) in indexes.iter().enumerate() {
-        let rect = cols[slot];
-        app.lane_columns
-            .push((rect.x, rect.x.saturating_add(rect.width), lane_idx));
-        let is_selected = lane_idx == app.selected;
-        let body_h = draw_lane(f, rect, &mut app.lanes[lane_idx], is_selected);
-        if is_selected {
-            max_body_h = max_body_h.max(body_h);
-        }
-    }
-    app.last_body_h = max_body_h;
-}
-
-/// Draw one lane. Returns the body height (in rows) so the caller can
-/// use it to size page-scroll steps.
-fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u16 {
-    let border_style = if is_selected {
-        Style::default().fg(provider_color(&lane.provider))
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let outer = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(border_style);
-    let inner = outer.inner(area);
-    f.render_widget(outer, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(2),
-        ])
-        .split(inner);
-
-    // Header
-    let sid = lane
-        .session_id
-        .as_deref()
-        .map(|s| &s[..s.len().min(8)])
-        .unwrap_or("-");
-    let model = lane.model.as_deref().unwrap_or("?");
-    let header_line1 = Line::from(vec![
-        Span::styled(
-            lane.bro.clone(),
-            Style::default()
-                .fg(provider_color(&lane.provider))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" • "),
-        Span::styled(model.to_string(), Style::default().fg(Color::White)),
-    ]);
-    let header_line2 = Line::from(vec![
-        Span::styled(
-            format!("team {}", lane.team),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw(" • "),
-        Span::styled(
-            format!("session {sid}"),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    let header_block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
-    f.render_widget(
-        Paragraph::new(vec![header_line1, header_line2]).block(header_block),
-        rows[0],
-    );
-
-    // Body — render via Paragraph with proper wrapped-line scroll math.
-    let body_area = rows[1];
-    let body_h = body_area.height;
-    let all_lines = render_events(&lane.events);
-    let paragraph_all = Paragraph::new(all_lines).wrap(Wrap { trim: false });
-    let wrapped_total = paragraph_all.line_count(body_area.width);
-    // Anchor preservation: when the user is scrolled up and new events
-    // have landed since the last draw, bump scroll_from_bottom by the
-    // wrapped-line delta so the visible content stays fixed in place.
-    // Width changes can still cause small jumps (wrap density shifts);
-    // that's rare enough to accept.
-    if lane.scroll_from_bottom > 0
-        && lane.cached_total_lines > 0
-        && wrapped_total > lane.cached_total_lines
-    {
-        let delta = wrapped_total - lane.cached_total_lines;
-        lane.scroll_from_bottom = lane.scroll_from_bottom.saturating_add(delta);
-    }
-    lane.cached_total_lines = wrapped_total;
-
-    let wrapped_total_u = wrapped_total as u16;
-    let max_scroll = wrapped_total_u.saturating_sub(body_h);
-    let requested = lane.scroll_from_bottom.min(max_scroll as usize) as u16;
-    lane.scroll_from_bottom = requested as usize;
-    let scroll_y = max_scroll.saturating_sub(requested);
-    f.render_widget(paragraph_all.scroll((scroll_y, 0)), body_area);
-
-    // Footer
-    let (text_events, tool_events, thinking_events, signal_events) = count_events(&lane.events);
-    let follow_badge = if lane.scroll_from_bottom == 0 {
-        Span::styled(" ▼ ", Style::default().fg(Color::DarkGray))
-    } else {
-        Span::styled(
-            format!(" ⏸ -{} ", lane.scroll_from_bottom),
-            Style::default().fg(Color::Yellow),
-        )
-    };
-    let activity_badge = activity_badge(lane);
-    let status_badge = match lane.status {
-        LaneStatus::Waiting => Span::styled(" waiting ", Style::default().fg(Color::Yellow)),
-        LaneStatus::MissingFile => Span::styled(" no-file ", Style::default().fg(Color::Red)),
-        LaneStatus::Tailing => Span::raw(""),
-    };
-    let footer = Line::from(vec![
-        follow_badge,
-        activity_badge,
-        status_badge,
-        Span::styled(
-            format!(
-                " {} txt • {} tool • {} thk • {} sig",
-                text_events, tool_events, thinking_events, signal_events
-            ),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    let snippet_line = snippet_line(lane);
-    let footer_split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(rows[2]);
-    f.render_widget(Paragraph::new(snippet_line), footer_split[0]);
-    f.render_widget(Paragraph::new(footer), footer_split[1]);
-    body_h
-}
-
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let n = app.lanes.len();
-    let selected = app
-        .lanes
-        .get(app.selected)
-        .map(|l| l.bro.as_str())
-        .unwrap_or("-");
-    let mode = if app.fullscreen { "FULL" } else { "SPLIT" };
-    let help = "click:lane • drag:resize • wheel:scroll • Tab • f full • G live • g top • q quit";
-    let line = format!(" bro tail • {n} lanes • {mode}:{selected}   {help}");
-    f.render_widget(
-        Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
-}
-
-fn provider_color(p: &str) -> Color {
-    match p {
-        "claude" => Color::Magenta,
-        "codex" => Color::Cyan,
-        "copilot" => Color::Blue,
-        "vibe" => Color::Yellow,
-        "gemini" => Color::Green,
-        _ => Color::White,
-    }
-}
-
-/// Wall-clock phase inside a period, for cheap animation. Returns 0..period_ms.
-fn phase_now(period_ms: u64) -> u64 {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    millis % period_ms.max(1)
-}
-
-/// Activity badge — the ex-"LIVE" indicator, now driven by the daemon's
-/// task lifecycle stream. Three visual tiers:
-///   ● streaming  — bright/dim 400ms throb; task has pushed a progress
-///                  delta in the last 2s (model is actively emitting).
-///   ○ running    — slow 1.2s pulse; task alive but quiet (likely in a
-///                  long tool call / tool result round-trip).
-///   ⚠ FAILED     — red flash for 5s after a task_failed event.
-///   (empty)      — no active task.
-fn activity_badge(lane: &Lane) -> Span<'static> {
-    let now = Instant::now();
-    if let Some((t, _)) = &lane.last_failure
-        && now.duration_since(*t) < Duration::from_secs(5)
-    {
-        let bright = phase_now(400) < 200;
-        let color = if bright { Color::Red } else { Color::DarkGray };
-        return Span::styled(
-            " ⚠ FAILED ",
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        );
-    }
-    if lane.active_tasks.is_empty() {
-        return Span::raw("");
-    }
-    let fresh = lane
-        .last_progress_at
-        .map(|t| now.duration_since(t) < Duration::from_secs(2))
-        .unwrap_or(false);
-    if fresh {
-        let bright = phase_now(400) < 200;
-        let color = if bright {
-            Color::Green
-        } else {
-            Color::DarkGray
-        };
-        return Span::styled(
-            " ● streaming ",
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        );
-    }
-    let bright = phase_now(1200) < 600;
-    let color = if bright {
-        Color::Green
-    } else {
-        Color::DarkGray
-    };
-    Span::styled(" ○ running ", Style::default().fg(color))
-}
-
-/// Snippet line shown above the badge row — the rolling tail of the
-/// current assistant message while a task is active, so the user can
-/// watch the model stream even before the on-disk JSONL catches up.
-fn snippet_line(lane: &Lane) -> Line<'static> {
-    if lane.active_tasks.is_empty() {
-        if let Some((t, err)) = &lane.last_failure
-            && Instant::now().duration_since(*t) < Duration::from_secs(5)
-        {
-            return Line::from(Span::styled(
-                format!(" ✗ {err}"),
-                Style::default().fg(Color::Red),
-            ));
-        }
-        return Line::from("");
-    }
-    let snippet = lane.last_progress_snippet.as_deref().unwrap_or("…");
-    // Collapse whitespace so multi-line streaming text still fits a single row.
-    let flat: String = snippet
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    Line::from(Span::styled(
-        format!(" ▶ {flat}"),
-        Style::default().fg(Color::DarkGray),
-    ))
-}
-
-fn count_events(events: &[TranscriptEvent]) -> (usize, usize, usize, usize) {
-    let (mut t, mut tool, mut th, mut s) = (0, 0, 0, 0);
-    for ev in events {
-        match &ev.detail {
-            EventDetail::Text { .. } => t += 1,
-            EventDetail::ToolUse { .. } | EventDetail::ToolResult { .. } => tool += 1,
-            EventDetail::Thinking { .. } => th += 1,
-            EventDetail::SystemSignal { .. } => s += 1,
-        }
-    }
-    (t, tool, th, s)
-}
-
-// ── Per-event rendering → Line(s) ──────────────────────────────────
-
-fn render_events(events: &[TranscriptEvent]) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    for ev in events {
-        out.extend(render_event(ev));
-        // Blank separator between events for breathing room.
-        out.push(Line::from(""));
-    }
-    out
-}
-
-fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
-    match &ev.detail {
-        EventDetail::Text { text } => {
-            // In orchestration, "user" is usually another agent sending
-            // markdown (broadcasts, cross-pollination prompts). Render the
-            // body through tui-markdown regardless of role; the prefix
-            // stripe still conveys who authored it.
-            let (prefix, color) = match ev.role {
-                MessageRole::User => ("▶ user", Color::Blue),
-                MessageRole::Assistant => ("◀ asst", Color::White),
-                MessageRole::Developer => ("· dev ", Color::DarkGray),
-                _ => ("  msg ", Color::White),
-            };
-            let mut lines = vec![Line::from(Span::styled(
-                prefix.to_string(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ))];
-            let md = tui_markdown::from_str(text);
-            let owned: Vec<Line<'static>> = md.lines.into_iter().map(line_into_owned).collect();
-            lines.extend(stitch_list_markers(owned));
-            lines
-        }
-        EventDetail::Thinking { text } => {
-            let style = Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::ITALIC);
-            let mut lines = vec![Line::from(Span::styled(
-                "◦ thinking".to_string(),
-                style.add_modifier(Modifier::BOLD),
-            ))];
-            for l in text.lines() {
-                lines.push(Line::from(Span::styled(l.to_string(), style)));
-            }
-            lines
-        }
-        EventDetail::ToolUse { name, target, .. } => {
-            vec![Line::from(vec![
-                Span::styled(
-                    "⚙ ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    name.clone(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(target.clone(), Style::default().fg(Color::White)),
-            ])]
-        }
-        EventDetail::ToolResult {
-            exit_code,
-            is_error,
-            size,
-            preview,
-            ..
-        } => {
-            let bad = *is_error || exit_code.is_some_and(|c| c != 0);
-            let color = if bad { Color::Red } else { Color::Green };
-            let exit_str = exit_code.map(|c| format!(" exit={c}")).unwrap_or_default();
-            vec![Line::from(vec![
-                Span::styled(
-                    "↳ ",
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("{}B{}", size, exit_str), Style::default().fg(color)),
-                Span::raw("  "),
-                Span::styled(preview.clone(), Style::default().fg(Color::DarkGray)),
-            ])]
-        }
-        EventDetail::SystemSignal { kind, summary } => {
-            let label = match kind {
-                SystemSignalKind::SessionInit => "session-start",
-                SystemSignalKind::SessionResumed => "session-resumed",
-                SystemSignalKind::Compaction => "compaction",
-                SystemSignalKind::HookFired => "hook",
-                SystemSignalKind::SystemReminder => "system-reminder",
-                SystemSignalKind::PermissionDenied => "permission-denied",
-                SystemSignalKind::RateLimitHit => "rate-limit",
-                SystemSignalKind::UserCommand => "user-command",
-                SystemSignalKind::SubagentLaunched => "subagent",
-                SystemSignalKind::Other => "signal",
-            };
-            let head = summary.lines().next().unwrap_or("");
-            vec![Line::from(vec![
-                Span::styled(
-                    format!("── {} ── ", label),
-                    Style::default()
-                        .fg(Color::LightYellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(head.to_string(), Style::default().fg(Color::LightYellow)),
-            ])]
-        }
-    }
-}
-
-/// Convert a `ratatui_core` Line (from tui-markdown output) into a
-/// `'static`-lived `ratatui` Line that our widgets consume. ratatui 0.29
-/// still carries its own Line/Span/Style/Color types distinct from
-/// ratatui-core's — structurally identical, nominally different — so we
-/// cross the boundary with a field-by-field copy.
+/// Convert a `ratatui_core` Line from tui-markdown output into a `'static`
+/// ratatui Line that the council and fleet widgets consume.
 pub(crate) fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
-    // tui-markdown puts heading/list/emphasis styles on `Line.style` with
-    // default-styled spans inside. Relying on ratatui's Paragraph to patch
-    // line-level style into default spans has been flaky in practice, so
-    // we bake the line style into every span's style here — guarantees
-    // the styling survives all the way to the buffer.
-    //
-    // We also strip the leading `#+ ` span tui-markdown emits for ATX
-    // headings — the marker is noise once the heading itself is visibly
-    // styled; stripping matches what rendered markdown normally looks
-    // like.
     let mut line_style = convert_core_style(line.style);
     let mut iter = line.spans.into_iter().peekable();
     let is_heading = iter
@@ -2285,8 +977,6 @@ pub(crate) fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'s
         .is_some_and(|s| is_heading_marker_span(&s.content));
     if is_heading {
         let _ = iter.next();
-        // ANSI Cyan is often indistinct under dark terminal themes; add
-        // UNDERLINED so headings read unambiguously regardless of palette.
         line_style = line_style.add_modifier(Modifier::UNDERLINED);
     }
     let spans: Vec<Span<'static>> = iter
@@ -2303,10 +993,6 @@ fn is_heading_marker_span(s: &str) -> bool {
     !t.is_empty() && t.chars().all(|c| c == '#')
 }
 
-/// True if the line is ONLY a numbered-list marker like "1. ", "42. "
-/// (optional surrounding whitespace, no other content). tui-markdown emits
-/// such markers on their own line and puts the content on the next one,
-/// which looks like a bug to the eye.
 fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
     let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let t = joined.trim();
@@ -2322,18 +1008,11 @@ fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
     t[..dot_pos].chars().all(|c| c.is_ascii_digit())
 }
 
-/// True if the line is ONLY a bullet-list marker (`-`, `*`, or `+`), with
-/// optional surrounding whitespace and no other content. tui-markdown splits
-/// the marker from its content the same way it does for ordered lists when the
-/// item is "loose" (has a following paragraph).
 fn is_bullet_marker_only(line: &Line<'_>) -> bool {
     let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     matches!(joined.trim(), "-" | "*" | "+")
 }
 
-/// Merge lines emitted by tui-markdown where a list marker has been split from
-/// its content: `"1. "` / `"- "` on one line followed by the item text on the
-/// next. Returns the post-processed line vec.
 pub(crate) fn stitch_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     let mut iter = lines.into_iter().peekable();
@@ -2389,50 +1068,10 @@ fn convert_core_color(c: ratatui_core::style::Color) -> Color {
     }
 }
 
-// Suppress dead-code warning on Path import when only used via PathBuf methods.
-#[allow(dead_code)]
-const _PATH: Option<&Path> = None;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lane(team: &str, bro: &str, bro_selector: &str, session_id: Option<&str>) -> Lane {
-        Lane {
-            bro: bro.into(),
-            bro_selector: bro_selector.into(),
-            team: team.into(),
-            provider: "gemini".into(),
-            model: None,
-            session_id: session_id.map(str::to_string),
-            jsonl_path: None,
-            events: Vec::new(),
-            file_offset: 0,
-            file_mtime: None,
-            seen_ids: HashSet::new(),
-            scroll_from_bottom: 0,
-            cached_total_lines: 0,
-            status: LaneStatus::Waiting,
-            active_tasks: HashSet::new(),
-            last_progress_at: None,
-            last_progress_snippet: None,
-            last_failure: None,
-        }
-    }
-
-    #[test]
-    fn lane_matches_scoped_signal_before_bare_name() {
-        let lane = lane("red", "reviewer", "red::reviewer", Some("sid-red"));
-        assert!(lane.matches_signal(Some("reviewer"), Some("red::reviewer"), Some("sid-red")));
-        assert!(!lane.matches_signal(Some("reviewer"), Some("blue::reviewer"), Some("sid-blue")));
-    }
-
-    #[test]
-    fn adhoc_lane_can_match_by_session_without_team_scoping() {
-        let lane = lane("adhoc", "sid-red", "sid-red", Some("sid-red"));
-        assert!(lane.matches_signal(Some("sid-red"), None, Some("sid-red")));
-        assert!(!lane.matches_signal(Some("sid-blue"), None, Some("sid-blue")));
-    }
 
     #[test]
     fn clap_parses_tail_repeatable_and_positional_selectors() {
