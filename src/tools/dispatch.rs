@@ -638,7 +638,7 @@ impl BlackboxServer {
             provider,
             session_id,
             _lens,
-            exec_opts,
+            mut exec_opts,
             env_overrides,
             cwd,
             brofile_filters,
@@ -669,6 +669,9 @@ impl BlackboxServer {
             Some(p) => Some(p.to_string_lossy().into_owned()),
             None => cwd,
         };
+        if let Some(service_tier) = p.service_tier.clone() {
+            exec_opts.get_or_insert_with(Default::default).service_tier = Some(service_tier);
+        }
 
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let task_id = uuid::Uuid::new_v4().to_string();

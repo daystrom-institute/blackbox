@@ -29,7 +29,7 @@ pub use fleet::{
 };
 pub use bro_protocol::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,
-    PhaseResult,
+    PhaseResult, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY,
 };
 pub use mcp::McpServerConfig;
 pub use tail::TailEvent;

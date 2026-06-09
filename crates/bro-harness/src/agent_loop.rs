@@ -582,6 +582,7 @@ impl Session {
         tx.set_session_id(store.id.clone());
         let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
         let restored_code_mode = store.restored.as_ref().and_then(|r| r.code_mode.clone());
+        let restored_service_tier = store.restored.as_ref().and_then(|r| r.service_tier.clone());
         // Loop-level side cells restored from a prior turn. Each cell
         // deserializes its own slot tolerantly (absent/garbage → empty).
         let prior_side = store
@@ -764,6 +765,7 @@ impl Session {
             service_tier: cli
                 .service_tier
                 .clone()
+                .or(restored_service_tier)
                 .or_else(|| std::env::var("BRO_HARNESS_SERVICE_TIER").ok()),
         };
 
@@ -1444,6 +1446,7 @@ impl Session {
             transport: self.tx.name(),
             model: &self.base_opts.model,
             code_mode: self.code_mode.as_str(),
+            service_tier: self.base_opts.service_tier.as_deref(),
             snapshot: self.tx.snapshot(),
             side: self.side_state(),
         })

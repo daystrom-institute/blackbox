@@ -498,9 +498,12 @@ Trailing paragraph.";
     fn fast_service_tier_only_applies_to_brodex_dispatches() {
         assert_eq!(
             service_tier_for_dispatch(true, Provider::Brodex).as_deref(),
-            Some(FAST_SERVICE_TIER)
+            Some(SERVICE_TIER_PRIORITY)
         );
-        assert_eq!(service_tier_for_dispatch(false, Provider::Brodex), None);
+        assert_eq!(
+            service_tier_for_dispatch(false, Provider::Brodex).as_deref(),
+            Some(SERVICE_TIER_DEFAULT)
+        );
         assert_eq!(service_tier_for_dispatch(true, Provider::Glm), None);
     }
 

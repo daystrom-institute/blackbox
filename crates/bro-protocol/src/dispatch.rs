@@ -22,6 +22,12 @@ use std::path::PathBuf;
 use bro_core::Provider;
 use serde::{Deserialize, Serialize};
 
+/// Codex/OpenAI Responses priority-routing value used by `/fast`.
+pub const SERVICE_TIER_PRIORITY: &str = "priority";
+/// Explicit standard-routing sentinel. The Responses request body drops it, but
+/// the harness persists it so resume does not fall back to an ambient fast tier.
+pub const SERVICE_TIER_DEFAULT: &str = "default";
+
 /// What to dispatch as a new top-level entrypoint agent. The cockpit's
 /// composer fills this in; cwd/model are optional and resolved per dispatch
 /// (no stickiness on the agent itself — provider is fixed at spawn, §4).
@@ -44,9 +50,10 @@ pub struct DispatchSpec {
     /// dispatches from the cockpit's `/config` toggle; `None` ⇒ harness default.
     /// Resume does not carry this — the session restores its persisted value.
     pub code_mode: Option<String>,
-    /// Service tier for support providers. `priority` is the Codex `/fast`
-    /// tier; `default` clears back to backend default. Applies to fresh
-    /// dispatches only; resume relies on the session's persisted value.
+    /// Service tier for supported providers. `priority` is the Codex `/fast`
+    /// tier; `default` is the standard-routing sentinel. Resume normally
+    /// restores the persisted value, but `ResumeSpec.service_tier` can override
+    /// it for a specific continuation.
     pub service_tier: Option<String>,
 }
 
@@ -79,6 +86,10 @@ pub struct ResumeSpec {
     pub effort: Option<String>,
     pub name: Option<String>,
     pub env_overrides: Option<HashMap<String, String>>,
+    /// Explicit service-tier override for this continuation. `None` defers to
+    /// the restored session/brofile/harness default; `Some("default")` clears
+    /// back to standard routing while still persisting that choice.
+    pub service_tier: Option<String>,
 }
 
 impl ResumeSpec {
@@ -96,6 +107,7 @@ impl ResumeSpec {
             effort: None,
             name: None,
             env_overrides: None,
+            service_tier: None,
         }
     }
 }

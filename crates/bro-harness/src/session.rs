@@ -36,6 +36,10 @@ pub struct Restored {
     /// the harness restores this value. `None` for sessions written before this
     /// field existed.
     pub code_mode: Option<String>,
+    /// Service tier the session was created/resumed with. `default` is an
+    /// explicit standard-routing sentinel; `priority` maps to Codex `/fast`.
+    /// `None` for sessions written before this field existed.
+    pub service_tier: Option<String>,
     pub snapshot: Value,
     /// Loop-level side cells from the prior run (`Value::Null` if absent, e.g.
     /// sessions written before this field existed).
@@ -49,6 +53,7 @@ pub struct SaveState<'a> {
     pub transport: &'a str,
     pub model: &'a str,
     pub code_mode: &'a str,
+    pub service_tier: Option<&'a str>,
     pub snapshot: Value,
     pub side: Value,
 }
@@ -78,6 +83,7 @@ impl SessionStore {
                         transport: v["transport"].as_str().unwrap_or_default().to_string(),
                         model: v["model"].as_str().map(str::to_string),
                         code_mode: v["code_mode"].as_str().map(str::to_string),
+                        service_tier: v["service_tier"].as_str().map(str::to_string),
                         snapshot: v["snapshot"].clone(),
                         side: v.get("side").cloned().unwrap_or(Value::Null),
                     })
@@ -108,6 +114,7 @@ impl SessionStore {
             "transport": state.transport,
             "model": state.model,
             "code_mode": state.code_mode,
+            "service_tier": state.service_tier,
             "snapshot": state.snapshot,
             "side": state.side,
         }))
@@ -120,6 +127,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bro_protocol::SERVICE_TIER_PRIORITY;
 
     /// A unique, hermetic session dir under the OS temp dir — no `tempfile`
     /// dep, no process-global env mutation (so it can't race the bin's other
@@ -154,6 +162,7 @@ mod tests {
                 transport: v["transport"].as_str().unwrap_or_default().to_string(),
                 model: v["model"].as_str().map(str::to_string),
                 code_mode: v["code_mode"].as_str().map(str::to_string),
+                service_tier: v["service_tier"].as_str().map(str::to_string),
                 snapshot: v["snapshot"].clone(),
                 side: v.get("side").cloned().unwrap_or(Value::Null),
             }
@@ -174,6 +183,7 @@ mod tests {
                 transport: "anthropic",
                 model: "m",
                 code_mode: "only",
+                service_tier: Some(SERVICE_TIER_PRIORITY),
                 snapshot: json!({"msgs": 1}),
                 side: json!({"todos": []}),
             })
@@ -183,6 +193,7 @@ mod tests {
         assert_eq!(r.transport, "anthropic");
         assert_eq!(r.model.as_deref(), Some("m"));
         assert_eq!(r.code_mode.as_deref(), Some("only"));
+        assert_eq!(r.service_tier.as_deref(), Some(SERVICE_TIER_PRIORITY));
         assert_eq!(r.snapshot, json!({"msgs": 1}));
         assert_eq!(r.side["todos"], json!([]));
 
@@ -203,6 +214,8 @@ mod tests {
         assert_eq!(r.side, Value::Null);
         // A session written before code_mode existed restores it as absent.
         assert_eq!(r.code_mode, None);
+        // A session written before service_tier existed restores it as absent.
+        assert_eq!(r.service_tier, None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

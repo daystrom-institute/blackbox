@@ -846,7 +846,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_resume",
         category: ToolCategory::Orchestration,
         summary: "Continue an existing session with a follow-up; single-flight per provider session and the continuity path after bro_exec.",
-        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Pass explicit `session_id` / `provider` when possible; named bro targeting is only safe when the session is unambiguous. Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Pass explicit `session_id` / `provider` when possible; named bro targeting is only safe when the session is unambiguous. For Brodex, pass `service_tier=\"priority\"` to force fast routing for the continuation or `service_tier=\"default\"` to persist standard routing. Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),

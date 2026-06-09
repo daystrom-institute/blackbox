@@ -1335,6 +1335,9 @@ fn resume_body(spec: &ResumeSpec) -> Value {
     if let Some(effort) = &spec.effort {
         body["pin_effort"] = Value::String(effort.clone());
     }
+    if let Some(service_tier) = &spec.service_tier {
+        body["service_tier"] = Value::String(service_tier.clone());
+    }
     body
 }
 
@@ -1990,6 +1993,7 @@ pub fn provider_supports_bidi(provider: Provider) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bro_protocol::{SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY};
 
     #[test]
     fn new_orchestrator_has_no_tasks() {
@@ -2090,7 +2094,7 @@ mod tests {
         assert!(dispatch_body(&spec).get("service_tier").is_none());
         // Set ⇒ forwarded as ExecParams.code_mode.
         spec.code_mode = Some("only".to_string());
-        spec.service_tier = Some("priority".to_string());
+        spec.service_tier = Some(SERVICE_TIER_PRIORITY.to_string());
         assert_eq!(
             dispatch_body(&spec).get("code_mode").and_then(|v| v.as_str()),
             Some("only")
@@ -2099,7 +2103,21 @@ mod tests {
             dispatch_body(&spec)
                 .get("service_tier")
                 .and_then(|v| v.as_str()),
-            Some("priority")
+            Some(SERVICE_TIER_PRIORITY)
+        );
+    }
+
+    #[test]
+    fn resume_body_carries_service_tier_only_when_set() {
+        let mut spec = ResumeSpec::new(Provider::Brodex, "sess-1", "continue");
+        assert!(resume_body(&spec).get("service_tier").is_none());
+
+        spec.service_tier = Some(SERVICE_TIER_DEFAULT.to_string());
+        assert_eq!(
+            resume_body(&spec)
+                .get("service_tier")
+                .and_then(|v| v.as_str()),
+            Some(SERVICE_TIER_DEFAULT)
         );
     }
 

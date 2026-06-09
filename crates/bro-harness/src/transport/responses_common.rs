@@ -10,6 +10,7 @@
 
 use super::{StopReason, ToolCall, ToolResult, ToolSpec, TurnOpts, TurnOutput, Usage};
 use anyhow::{Context, Result};
+use bro_protocol::SERVICE_TIER_DEFAULT;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -246,7 +247,7 @@ pub(super) fn build_body(
         body["prompt_cache_key"] = json!(session_id);
     }
     // `/fast` lever: forward the priority/flex tier when set (and not the
-    // literal "default", which the backend rejects as a no-op).
+    // standard-routing sentinel, which the backend rejects as a no-op).
     if let Some(tier) = service_tier_for_request(opts.service_tier.as_deref()) {
         body["service_tier"] = json!(tier);
     }
@@ -738,11 +739,11 @@ pub(super) fn reasoning_summary() -> Option<String> {
 }
 
 /// Normalize a requested service tier: forward it unless it's empty or the
-/// literal `"default"` (which the backend rejects as a no-op). Codex's
+/// standard-routing sentinel (which the backend rejects as a no-op). Codex's
 /// `service_tier_for_request` does the same drop.
 pub(super) fn service_tier_for_request(tier: Option<&str>) -> Option<String> {
     let t = tier?.trim();
-    if t.is_empty() || t.eq_ignore_ascii_case("default") {
+    if t.is_empty() || t.eq_ignore_ascii_case(SERVICE_TIER_DEFAULT) {
         return None;
     }
     Some(t.to_string())
@@ -788,6 +789,7 @@ pub(super) fn classify_http_error(status: reqwest::StatusCode, body: &str) -> St
 mod tests {
     use super::*;
     use crate::transport::{BaseInstructions, SystemPrompt};
+    use bro_protocol::SERVICE_TIER_PRIORITY;
 
     fn state() -> ResponsesState {
         let mut s = ResponsesState::new(Auth::ApiKey("k".into()));
@@ -1050,12 +1052,12 @@ mod tests {
             volatile: None,
         });
         o.effort = Some("medium".into());
-        o.service_tier = Some("priority".into());
+        o.service_tier = Some(SERVICE_TIER_PRIORITY.into());
         let body = state().build_body(&[], &o);
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["prompt_cache_key"], "sess-1");
-        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["service_tier"], SERVICE_TIER_PRIORITY);
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
     }
@@ -1066,7 +1068,7 @@ mod tests {
             stable: Some("BASE".into()),
             volatile: None,
         });
-        o.service_tier = Some("default".into());
+        o.service_tier = Some(SERVICE_TIER_DEFAULT.into());
         let body = state().build_body(&[], &o);
         assert!(body.get("service_tier").is_none());
     }
@@ -1159,10 +1161,10 @@ mod tests {
         assert!(!model_supports_reasoning("gpt-4o"));
         assert!(!model_supports_reasoning("gpt-4.1"));
         assert_eq!(
-            service_tier_for_request(Some("priority")).as_deref(),
-            Some("priority")
+            service_tier_for_request(Some(SERVICE_TIER_PRIORITY)).as_deref(),
+            Some(SERVICE_TIER_PRIORITY)
         );
-        assert_eq!(service_tier_for_request(Some("default")), None);
+        assert_eq!(service_tier_for_request(Some(SERVICE_TIER_DEFAULT)), None);
         assert_eq!(service_tier_for_request(Some("")), None);
         assert_eq!(service_tier_for_request(None), None);
     }

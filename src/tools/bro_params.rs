@@ -144,6 +144,11 @@ pub(crate) struct ResumeParams {
     /// Working directory
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
+    /// Per-resume service tier override. For Brodex, `priority` is fast mode
+    /// and `default` is the standard-routing sentinel persisted by the harness.
+    /// When absent, resume defers to the brofile/session/harness default.
+    #[serde(default)]
+    pub(crate) service_tier: Option<String>,
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
     pub(crate) allow_recursion: Option<bool>,

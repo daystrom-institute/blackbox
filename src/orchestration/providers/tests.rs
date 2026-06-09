@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use bro_protocol::{SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY};
+
 use crate::orchestration::mcp::{McpFilters, McpServerConfig, SecretString};
 
 use super::dispatch_prelude::*;
@@ -34,7 +36,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: Some("high".into()),
         provider_defaults: None,
         code_mode: Some(crate::orchestration::brofile::CodeMode::Only),
-        service_tier: Some("priority".into()),
+        service_tier: Some(SERVICE_TIER_PRIORITY.into()),
         output_schema: Some(r#"{"type":"object"}"#.into()),
     };
     let glm = Provider::Glm.build_exec_args("hello", "sid-1", None, Some(&glm_opts));
@@ -52,7 +54,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(glm.contains(&"only".to_string()));
     // service_tier is emitted as `--service-tier <value>` for harness providers.
     assert!(glm.contains(&"--service-tier".to_string()));
-    assert!(glm.contains(&"priority".to_string()));
+    assert!(glm.contains(&SERVICE_TIER_PRIORITY.to_string()));
     // output_schema is emitted as `--output-schema <json>` for harness providers.
     assert!(glm.contains(&"--output-schema".to_string()));
     assert!(glm.contains(&r#"{"type":"object"}"#.to_string()));
@@ -66,7 +68,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: None,
         provider_defaults: None,
         code_mode: None,
-        service_tier: None,
+        service_tier: Some(SERVICE_TIER_DEFAULT.into()),
         output_schema: None,
     };
     let deepseek = Provider::Deepseek.build_resume_args("sid-2", "continue", Some(&deepseek_opts));
@@ -77,6 +79,9 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(!deepseek.contains(&"deepseek/deepseek-v4-pro".to_string()));
     // No code_mode set on resume ⇒ no flag emitted (session restores it).
     assert!(!deepseek.contains(&"--code-mode".to_string()));
+    // service_tier is still explicit on resume when supplied by the caller.
+    assert!(deepseek.contains(&"--service-tier".to_string()));
+    assert!(deepseek.contains(&SERVICE_TIER_DEFAULT.to_string()));
     assert!(
         !deepseek.contains(&"--mcp-config".to_string()),
         "in-process resume also avoids CLI MCP config"

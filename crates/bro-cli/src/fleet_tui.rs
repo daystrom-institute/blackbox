@@ -57,8 +57,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use bro_fleet_client::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DispatchSpec, FleetConfig,
     FleetOrchestrator, FocusedTranscriptBuffer, FocusedTranscriptStreamEvent, Provider,
-    ResumeSpec, TailEvent, TaskStatus, TodoItemStatus, TodoState, TranscriptHistoryPageV1,
-    TranscriptItem, bro_home, intern_rider, parse_transcript, provider_supports_bidi,
+    ResumeSpec, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY, TailEvent, TaskStatus,
+    TodoItemStatus, TodoState, TranscriptHistoryPageV1, TranscriptItem, bro_home, intern_rider,
+    parse_transcript, provider_supports_bidi,
 };
 
 use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
@@ -82,7 +83,6 @@ const TOOL_CALL_GLYPH: &str = "▸";
 const ROSTER_SELECTED_MARKER: &str = "› ";
 const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
 const FINISHED_AFTER_IDLE_MS: u64 = 20 * 60 * 1000;
-const FAST_SERVICE_TIER: &str = "priority";
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -2625,10 +2625,14 @@ fn toggle_fast_mode(app: &mut App, arg: &str) {
             return;
         }
     };
-    let state = if app.fast_mode { "on" } else { "off" };
+    let state = if app.fast_mode {
+        "fast priority"
+    } else {
+        "standard routing"
+    };
     app.clear_input();
     app.set_status(
-        format!("fast priority {state} for new Brodex dispatches"),
+        format!("{state} for new Brodex dispatches"),
         Duration::from_secs(4),
     );
 }
@@ -2642,8 +2646,14 @@ fn service_tier_for_next_dispatch(app: &App, provider: Provider) -> Option<Strin
 }
 
 fn service_tier_for_dispatch(fast_mode: bool, provider: Provider) -> Option<String> {
-    (fast_mode && provider_supports_service_priority(provider))
-        .then(|| FAST_SERVICE_TIER.to_string())
+    provider_supports_service_priority(provider).then(|| {
+        if fast_mode {
+            SERVICE_TIER_PRIORITY
+        } else {
+            SERVICE_TIER_DEFAULT
+        }
+        .to_string()
+    })
 }
 
 fn open_config(app: &mut App) {
@@ -3180,6 +3190,7 @@ fn resume_agent(app: &mut App, idx: usize, text: String) {
     let cwd = snap.cwd.clone();
     let model = app.agents[idx].selected_model.clone().or(snap.model.clone());
     let effort = app.agents[idx].selected_effort.clone();
+    let service_tier = app.agents[idx].selected_service_tier.clone();
     let name = app.agents[idx].name.clone();
     let env_overrides = resume_env_overrides(app, idx, cwd.as_deref());
     let session_id = snap.session_id.clone();
@@ -3197,6 +3208,7 @@ fn resume_agent(app: &mut App, idx: usize, text: String) {
         spec.cwd = cwd;
         spec.model = model;
         spec.effort = effort;
+        spec.service_tier = service_tier;
         spec.name = Some(name);
         spec.env_overrides = env_overrides;
         let task = orch.resume(spec);
@@ -3955,7 +3967,7 @@ fn provider_tuple(a: &Agent, v: &AgentView) -> String {
         Some(effort) => format!("{} {model} {effort}", a.provider),
         None => format!("{} {model}", a.provider),
     };
-    if a.selected_service_tier.as_deref() == Some(FAST_SERVICE_TIER) {
+    if a.selected_service_tier.as_deref() == Some(SERVICE_TIER_PRIORITY) {
         tuple.push_str(" fast");
     }
     tuple
@@ -3975,7 +3987,8 @@ fn next_tuple(app: &App) -> String {
         Some(effort) => format!("{} {model} {effort}", app.next_provider),
         None => format!("{} {model}", app.next_provider),
     };
-    if service_tier_for_next_dispatch(app, app.next_provider).as_deref() == Some(FAST_SERVICE_TIER)
+    if service_tier_for_next_dispatch(app, app.next_provider).as_deref()
+        == Some(SERVICE_TIER_PRIORITY)
     {
         tuple.push_str(" fast");
     }
