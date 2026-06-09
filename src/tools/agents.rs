@@ -944,6 +944,7 @@ impl BlackboxServer {
                 ambient_bro_name: p.bro.clone(),
                 spawn_bro_label: Some(bro_label.clone()),
                 spawn_agent_label: Some(bro_label.clone()),
+                display_name: None,
                 record_to_bro: p.bro.clone(),
                 brofile_context,
                 code_mode: agent_code_mode,

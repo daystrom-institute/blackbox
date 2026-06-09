@@ -156,6 +156,7 @@ impl BlackboxServer {
                     ambient_bro_name: Some(brofile.to_string()),
                     spawn_bro_label: None,
                     spawn_agent_label: None,
+                    display_name: None,
                     record_to_bro: Some(brofile.to_string()),
                     brofile_context,
                     code_mode: wf_code_mode,

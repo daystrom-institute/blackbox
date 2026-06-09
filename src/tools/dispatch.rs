@@ -41,6 +41,10 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) ambient_bro_name: Option<String>,
     pub(crate) spawn_bro_label: Option<String>,
     pub(crate) spawn_agent_label: Option<String>,
+    /// Roster display name hint (control-plane only). Takes priority over the
+    /// prompt-derived teaser when seeding the task name, so a cockpit dispatch
+    /// shows the operator's turn rather than the worktree-grounding preamble.
+    pub(crate) display_name: Option<String>,
     pub(crate) record_to_bro: Option<String>,
     /// Spawn-time origin (Slice 1b). Each caller of
     /// `dispatch_fresh_bro_task` tags the dispatch with the source the
@@ -242,6 +246,7 @@ fn allocator_status_runtime_request(
         code_mode: None,
         service_tier: None,
         origin_override: None,
+        display_name: None,
     };
     exec_params_runtime_request(&exec_like, None)
 }
@@ -337,8 +342,9 @@ impl BlackboxServer {
 
         let dispatch_model = request.exec_opts.as_ref().and_then(|opts| opts.model.clone());
         let default_name = request
-            .spawn_bro_label
+            .display_name
             .clone()
+            .or_else(|| request.spawn_bro_label.clone())
             .or_else(|| orch::default_task_name_from_prompt(&request.prompt));
 
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -542,6 +548,7 @@ impl BlackboxServer {
             ambient_bro_name: p.bro.clone(),
             spawn_bro_label: None,
             spawn_agent_label: None,
+            display_name: p.display_name.clone(),
             record_to_bro: p.bro.clone(),
             brofile_context,
             code_mode: resolved_code_mode,
@@ -2609,6 +2616,7 @@ mod tests {
             code_mode: None,
             service_tier: None,
             origin_override: None,
+            display_name: None,
         }
     }
 

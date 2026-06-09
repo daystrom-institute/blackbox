@@ -1297,6 +1297,12 @@ fn dispatch_body(spec: &DispatchSpec) -> Value {
     if let Some(service_tier) = &spec.service_tier {
         body["service_tier"] = Value::String(service_tier.clone());
     }
+    // Carry the un-augmented turn teaser as the roster display name. The cockpit
+    // prefixes a worktree-grounding preamble onto `spec.prompt`; without this the
+    // daemon would seed the roster name from that preamble instead of the turn.
+    if let Some(name) = &spec.name {
+        body["display_name"] = Value::String(name.clone());
+    }
     body
 }
 

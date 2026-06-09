@@ -116,6 +116,15 @@ pub(crate) struct ExecParams {
     #[serde(default)]
     #[schemars(skip)]
     pub(crate) origin_override: Option<bro_core::Origin>,
+    /// **Internal.** Roster display name for this dispatch (the operator's
+    /// un-augmented turn teaser). The Fleet cockpit augments the prompt with a
+    /// worktree-grounding preamble before dispatch; without this hint the
+    /// daemon would derive the roster name from that preamble. When set, it
+    /// takes priority over the prompt-derived teaser for the seeded task name.
+    /// Not part of the public MCP schema — set only by the control plane.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub(crate) display_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
