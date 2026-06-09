@@ -86,7 +86,10 @@ mod tool_docs;
 mod tools;
 mod transcripts;
 pub mod util;
-mod vectors;
+// `vectors` was extracted into the `bbox-vectors` workspace crate (build-time
+// decomposition). Aliased back to `crate::vectors` so existing `crate::vectors::*`
+// call sites resolve unchanged.
+use bbox_vectors as vectors;
 mod watcher;
 mod webhooks;
 mod whiteboards;

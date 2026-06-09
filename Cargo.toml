@@ -13,6 +13,12 @@ members = [
     "crates/bro-fleet-client",
     "crates/bro-transcript",
     "crates/bro-code-mode",
+
+    # Daemon-internal corpus crates peeled out of the root `blackbox` crate for
+    # build parallelism (NOT bro-harness crates). Pure leaves: they depend only
+    # on external crates, never on blackbox internals, and are re-exported back
+    # into the daemon under their original module path.
+    "crates/bbox-vectors",
 ]
 
 [package]
@@ -72,6 +78,8 @@ tera = "1"
 
 # Error handling
 anyhow = "1"
+# Daemon-internal corpus crate (HNSW vector store) extracted from src/vectors.
+bbox-vectors = { path = "crates/bbox-vectors" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }
@@ -181,6 +189,10 @@ rusqlite = "0.32"
 
 [dev-dependencies]
 filetime = "0.2"
+# Enable bbox-vectors' test-global-store helpers for the daemon's own tests.
+# cfg(test) doesn't cross crate boundaries, so this dev-dep turns on the
+# `test-support` feature only when building blackbox's tests (off in release).
+bbox-vectors = { path = "crates/bbox-vectors", features = ["test-support"] }
 # ServiceExt::oneshot for exercising axum route tables in tests.
 tower = { version = "0.5", features = ["util"] }
 

@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -30,30 +30,34 @@ const SNAPSHOT_MIN_RECORDS: usize = 100_000;
 
 static GLOBAL_STORE: OnceLock<Arc<VectorStore>> = OnceLock::new();
 
-#[cfg(test)]
+// Test-global-store plumbing — gated on `test` (this crate's own tests) OR the
+// `test-support` feature (downstream crates' tests, since cfg(test) doesn't cross
+// crate boundaries). The read-path checks in global()/try_global()/etc. below use
+// the same gate so an installed test store is actually consulted under the feature.
+#[cfg(any(test, feature = "test-support"))]
 static TEST_GLOBAL_STORE: OnceLock<RwLock<Option<Arc<VectorStore>>>> = OnceLock::new();
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_GLOBAL_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn test_global_store() -> &'static RwLock<Option<Arc<VectorStore>>> {
     TEST_GLOBAL_STORE.get_or_init(|| RwLock::new(None))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct TestGlobalStoreGuard {
     previous: Option<Arc<VectorStore>>,
     _lock: MutexGuard<'static, ()>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestGlobalStoreGuard {
     fn drop(&mut self) {
         *test_global_store().write() = self.previous.take();
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn install_test_global(store: Arc<VectorStore>) -> TestGlobalStoreGuard {
     let lock = TEST_GLOBAL_STORE_LOCK.get_or_init(|| Mutex::new(())).lock();
     let mut slot = test_global_store().write();
@@ -160,7 +164,7 @@ fn spawn_periodic_compactor(store: Arc<VectorStore>) {
 }
 
 pub fn global() -> Arc<VectorStore> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(store) = test_global_store().read().clone() {
         return store;
     }
@@ -183,7 +187,7 @@ pub fn global() -> Arc<VectorStore> {
 /// it to degrade during cold-start warmup instead of blocking behind a
 /// multi-GB partition load.
 pub fn try_global() -> Option<Arc<VectorStore>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(store) = test_global_store().read().clone() {
         return Some(store);
     }
@@ -216,7 +220,7 @@ pub(crate) fn try_contains_active_if_initialized(
     entity_id: &str,
     content_hash: &str,
 ) -> Result<Option<bool>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(store) = test_global_store().read().clone() {
         return store
             .contains_active(route, entity_id, content_hash)
@@ -235,18 +239,22 @@ pub fn search(route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
     global().search(route, query, k)
 }
 
-pub(crate) fn iter_active(
+// Promoted pub(crate) -> pub: called from the daemon (src/embed/mod.rs) across
+// the new crate boundary.
+pub fn iter_active(
     route: &str,
     since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<std::vec::IntoIter<VectorEntry>> {
     global().iter_active(route, since)
 }
 
-pub(crate) fn active_entity_hashes(route: &str) -> Result<Vec<(String, String)>> {
+// Promoted pub(crate) -> pub: called from src/embed/mod.rs across the crate boundary.
+pub fn active_entity_hashes(route: &str) -> Result<Vec<(String, String)>> {
     global().active_entity_hashes(route)
 }
 
-pub(crate) fn cluster_neighbors_within_route(
+// Promoted pub(crate) -> pub: called from src/embed/mod.rs across the crate boundary.
+pub fn cluster_neighbors_within_route(
     route: &str,
     similarity_threshold: f32,
 ) -> Result<Vec<VectorCluster>> {
@@ -350,7 +358,7 @@ impl VectorStore {
             let mut partition = partition.write();
             partition.flush_derived_full()?;
         }
-        crate::vectors::wal::sync_pending().ok();
+        crate::wal::sync_pending().ok();
         Ok(())
     }
 
@@ -1010,7 +1018,7 @@ impl Partition {
     fn write_snapshot(&mut self) -> Result<()> {
         fs::create_dir_all(&self.path)?;
         let wal_path = self.wal_path();
-        crate::vectors::wal::sync_path(&wal_path)?;
+        crate::wal::sync_path(&wal_path)?;
         let wal_len_bytes = wal_path.metadata().map(|meta| meta.len()).unwrap_or(0);
         let snapshot = PartitionSnapshot {
             schema_version: VECTOR_SNAPSHOT_VERSION.to_string(),
@@ -1238,7 +1246,7 @@ impl Partition {
         // Checkpoint the WAL — durability for everything written since
         // the last sync. The append path no longer fsyncs per batch
         // (see `wal::append_many`), so this is where durability lands.
-        crate::vectors::wal::sync_path(&self.wal_path())?;
+        crate::wal::sync_path(&self.wal_path())?;
         self.last_flushed_wal_records = self.wal_records;
         Ok(())
     }
