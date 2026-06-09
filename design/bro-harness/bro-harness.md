@@ -63,6 +63,16 @@ points to a backlog doc.
   harness-first strangler ending **in-harness only** (decided): external/MCP
   agents route via `bro_exec`/`bro_resume` or canned atoms; RX-V2 retires with
   the MCP surface.
+- [The cell DSL: composable in-box infrastructure](code-mode-cell-dsl.md) —
+  proposed: the platform layer under refactor-tools-v2 and later in-box
+  domains. Values-not-refs (salvaged from narf-data-model, validated by the
+  codex-native fallback); the hash-anchored Span as the composability quantum;
+  provenance via a host-side issuance ledger (weakest-link tiers computable
+  without taint-tracking or cell-supplied tags); the namespace contract for
+  shipping a domain (bindings + hand-authored TS declarations + tiers +
+  optional choke point, composed at dispatch); sessions/batching/no durable
+  promises in-box. Tenant test: refactor + diagnostics ship as namespaces with
+  zero runtime changes.
 
 ## Backlog (proposed — pick this up)
 

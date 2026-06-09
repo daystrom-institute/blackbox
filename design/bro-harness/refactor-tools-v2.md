@@ -383,6 +383,13 @@ retires the invariant instead of relocating it.
 - **Sibling of** [`remote-worker-boundary.md`](./remote-worker-boundary.md) —
   that doc owns topology/residency and proves the daemon needs no reach-in;
   this doc owns the worker-side execution surface that makes that true.
+- **Tenant of** [`code-mode-cell-dsl.md`](./code-mode-cell-dsl.md) — the
+  platform layer: value model (values, not refs), the hash-anchored Span,
+  the host-side provenance ledger that makes §3.3's lineage-computed
+  `semantic_status` mechanically honest, the namespace contract this doc's
+  `code.*`/`lsp.*`/`analysis.*`/`edits.*` strata instantiate, and
+  session/batching semantics. Cross-cutting infrastructure questions belong
+  there, not here.
 - **v2 of** the `design/refactor-tools/` intent corpus: supersedes the
   orchestration-layer intent of
   [`../refactor-tools/context-clipboard-refactor-primitives.md`](../refactor-tools/context-clipboard-refactor-primitives.md)
