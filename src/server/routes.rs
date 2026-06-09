@@ -2139,6 +2139,10 @@ pub(crate) fn migrate_project_refs(
         .threads
         .write()
         .rename_project_refs(old_project, new_project)?;
+    if threads > 0 {
+        // This sync migration helper cannot await; threads persistence is write-behind here.
+        state.threads_persister.request();
+    }
     let notes = state
         .notes
         .write()
@@ -2151,6 +2155,10 @@ pub(crate) fn migrate_project_refs(
         .pins
         .write()
         .rename_project_refs(old_project, new_project)?;
+    if pins > 0 {
+        // This sync migration helper cannot await; pins persistence is write-behind here.
+        state.pins_persister.request();
+    }
     let packets = state
         .packets
         .read()

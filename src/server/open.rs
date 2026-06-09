@@ -69,7 +69,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         th_path.clone(),
         rm_path.clone(),
     )?;
-    let projects_store = ProjectRegistry::open(&projects_path)?;
+    let (projects_store, projects_needs_persist) =
+        ProjectRegistry::open_with_backfill_status(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());
 
     let mut kb = Knowledge::open(&kb_path)?;
@@ -117,8 +118,13 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     if let Err(err) = idx.index_threads_store(&th) {
         tracing::warn!(error = %err, "thread index sync failed; will retry on next reindex cycle");
     }
+    let threads_store = Arc::new(RwLock::new(th));
+    let threads_persister =
+        StorePersister::spawn("threads", threads_store.clone(), th_path.clone());
 
-    let roadmap_store = Roadmap::open(&rm_path)?;
+    let roadmap_store = Arc::new(RwLock::new(Roadmap::open(&rm_path)?));
+    let roadmap_persister =
+        StorePersister::spawn("roadmap", roadmap_store.clone(), rm_path.clone());
     tracing::info!("Roadmap store: {}", rm_path.display());
 
     let notes_path = cfg.paths.notes_path.clone();
@@ -127,8 +133,17 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     tracing::info!("Notes store: {}", notes_path.display());
 
     let pins_path = cfg.paths.pins_path.clone();
-    let pins_store = Pins::open(&pins_path)?;
+    let pins_store = Arc::new(RwLock::new(Pins::open(&pins_path)?));
+    let pins_persister = StorePersister::spawn("pins", pins_store.clone(), pins_path.clone());
     tracing::info!("Pins store: {}", pins_path.display());
+
+    let projects_store = Arc::new(RwLock::new(projects_store));
+    let projects_persister =
+        StorePersister::spawn("projects", projects_store.clone(), projects_path.clone());
+    if projects_needs_persist {
+        // Startup language backfill is synchronous setup; projects persistence is write-behind here.
+        projects_persister.request();
+    }
 
     let packets_dir = cfg.paths.packets_dir.clone();
     let packets_store = Packets::open(&packets_dir)?;
@@ -168,24 +183,28 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         &cfg,
         &idx,
         &kb,
-        &th,
+        &threads_store.read(),
         &notes_store.read(),
         &task_store,
-        &roadmap_store,
+        &roadmap_store.read(),
         &store_dir,
-        &projects_store,
+        &projects_store.read(),
     );
 
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         kb: RwLock::new(kb),
         gaps: RwLock::new(gaps_store),
-        roadmap: RwLock::new(roadmap_store),
-        threads: RwLock::new(th),
+        roadmap: roadmap_store,
+        roadmap_persister,
+        threads: threads_store,
+        threads_persister,
         notes: notes_store,
         notes_persister,
-        pins: RwLock::new(pins_store),
-        projects: RwLock::new(projects_store),
+        pins: pins_store,
+        pins_persister,
+        projects: projects_store,
+        projects_persister,
         packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
         bbox_watcher: std::sync::Mutex::new(None),

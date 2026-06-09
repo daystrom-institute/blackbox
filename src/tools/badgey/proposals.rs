@@ -1348,7 +1348,7 @@ impl BlackboxServer {
             },
             None,
         )?;
-        let _ = self.state.threads.write().thread(&threads::ThreadParams {
+        let resolve_result = self.state.threads.write().thread(&threads::ThreadParams {
             action: "resolve".to_string(),
             name: None,
             id: Some(instance.thread_of_record_id.clone()),
@@ -1366,6 +1366,10 @@ impl BlackboxServer {
             kind: None,
             origin: None,
         });
+        if resolve_result.is_ok() {
+            // This sync thread helper cannot await; threads persistence is write-behind here.
+            self.state.threads_persister.request();
+        }
         Ok(json!({
             "badgey_id": id,
             "status": "dismissed",

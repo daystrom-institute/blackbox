@@ -16,8 +16,12 @@ impl BlackboxServer {
         name = "bbox_thread",
         description = "Open / continue / resolve / promote / rename / link a work thread."
     )]
-    pub(crate) fn bbox_thread(&self, Parameters(p): Parameters<ThreadParams>) -> CallToolResult {
-        Self::run("bbox_thread", || {
+    pub(crate) async fn bbox_thread(
+        &self,
+        Parameters(p): Parameters<ThreadParams>,
+    ) -> CallToolResult {
+        let start = std::time::Instant::now();
+        let mutation_result: anyhow::Result<_> = {
             // When the agent passes a managed fleet worktree as `project`, key the
             // thread to its registered base (durable scope) but write the committed
             // `.bbox/record/` snapshot into the worktree so it travels with the
@@ -29,31 +33,48 @@ impl BlackboxServer {
                     &self.state.projects.read().list(),
                 )
             });
-            let mutation = {
-                let mut threads = self.state.threads.write();
-                match resolved {
-                    Some((base, worktree)) => {
-                        let mut p = p.clone();
-                        p.project = Some(base);
-                        threads.thread_mutation(&p, Some(&worktree))?
-                    }
-                    None => threads.thread_mutation(&p, None)?,
+            let mut threads = self.state.threads.write();
+            match resolved {
+                Some((base, worktree)) => {
+                    let mut p = p.clone();
+                    p.project = Some(base);
+                    threads.thread_mutation(&p, Some(&worktree))
                 }
-            };
-            if let Some(thread) = mutation.changed_thread.as_ref() {
-                if let Err(err) = self.state.idx.write().index_thread(thread) {
-                    tracing::warn!(
-                        thread_id = %thread.id,
-                        error = %err,
-                        "thread index sync failed after bbox_thread mutation"
-                    );
-                }
+                None => threads.thread_mutation(&p, None),
             }
-            if mutation.changed_edges {
-                self.rebuild_edge_index_from_stores();
+        };
+        let mutation = match mutation_result {
+            Ok(mutation) => mutation,
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
             }
-            Ok(mutation.message)
-        })
+        };
+
+        if p.action != "get" {
+            if let Err(e) = self.state.persist_threads_durable().await {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
+            }
+        }
+
+        if let Some(thread) = mutation.changed_thread.as_ref() {
+            if let Err(err) = self.state.idx.write().index_thread(thread) {
+                tracing::warn!(
+                    thread_id = %thread.id,
+                    error = %err,
+                    "thread index sync failed after bbox_thread mutation"
+                );
+            }
+        }
+        if mutation.changed_edges {
+            self.rebuild_edge_index_from_stores();
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, bytes = mutation.message.len(), "ok");
+        Self::ok_text(&mutation.message)
     }
 
     #[tool(
@@ -147,8 +168,8 @@ mod tests {
     /// the worktree path as `project`. The thread is keyed to the registered
     /// base, the committed record is written into the worktree (travels with the
     /// branch), and list-before-open from the worktree finds the base-keyed thread.
-    #[test]
-    fn bbox_thread_from_worktree_keys_base_writes_worktree_and_list_normalizes() {
+    #[tokio::test]
+    async fn bbox_thread_from_worktree_keys_base_writes_worktree_and_list_normalizes() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("repo");
         std::fs::create_dir_all(&base).unwrap();
@@ -184,11 +205,13 @@ mod tests {
             .unwrap();
 
         // Open from the worktree.
-        let open = server.bbox_thread(Parameters(ThreadParams {
-            topic: Some("audit the dispatch path".into()),
-            project: Some(wt.clone()),
-            ..tp("open")
-        }));
+        let open = server
+            .bbox_thread(Parameters(ThreadParams {
+                topic: Some("audit the dispatch path".into()),
+                project: Some(wt.clone()),
+                ..tp("open")
+            }))
+            .await;
         assert_ne!(open.is_error, Some(true), "open failed: {open:?}");
 
         // Scope keyed to base; committed-record write-dir = worktree.
@@ -209,12 +232,14 @@ mod tests {
         );
 
         // Resolve from the worktree → record in worktree, not base.
-        let resolve = server.bbox_thread(Parameters(ThreadParams {
-            id: Some(id.clone()),
-            project: Some(wt.clone()),
-            note: Some("found it".into()),
-            ..tp("resolve")
-        }));
+        let resolve = server
+            .bbox_thread(Parameters(ThreadParams {
+                id: Some(id.clone()),
+                project: Some(wt.clone()),
+                note: Some("found it".into()),
+                ..tp("resolve")
+            }))
+            .await;
         assert_ne!(resolve.is_error, Some(true), "resolve failed: {resolve:?}");
         assert!(
             worktree_canon

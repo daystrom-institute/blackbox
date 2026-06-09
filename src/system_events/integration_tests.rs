@@ -38,13 +38,25 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     .unwrap();
     let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
     let gaps = crate::gaps::GapStore::open(&tmp.path().join("gaps.json")).unwrap();
-    let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
-    let roadmap_store = Roadmap::open(&tmp.path().join("roadmap.json")).unwrap();
+    let threads_path = tmp.path().join("threads.json");
+    let threads = Arc::new(RwLock::new(Threads::open(&threads_path).unwrap()));
+    let threads_persister = StorePersister::spawn("threads-test", threads.clone(), threads_path);
+    let roadmap_path = tmp.path().join("roadmap.json");
+    let roadmap_store = Arc::new(RwLock::new(Roadmap::open(&roadmap_path).unwrap()));
+    let roadmap_persister =
+        StorePersister::spawn("roadmap-test", roadmap_store.clone(), roadmap_path);
     let notes_path = tmp.path().join("notes.json");
     let notes = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
     let notes_persister = StorePersister::spawn("notes-test", notes.clone(), notes_path);
-    let pins = Pins::open(&tmp.path().join("pins.json")).unwrap();
-    let projects = ProjectRegistry::open(tmp.path().join("projects.json")).unwrap();
+    let pins_path = tmp.path().join("pins.json");
+    let pins = Arc::new(RwLock::new(Pins::open(&pins_path).unwrap()));
+    let pins_persister = StorePersister::spawn("pins-test", pins.clone(), pins_path);
+    let projects_path = tmp.path().join("projects.json");
+    let projects = Arc::new(RwLock::new(
+        ProjectRegistry::open(projects_path.clone()).unwrap(),
+    ));
+    let projects_persister =
+        StorePersister::spawn("projects-test", projects.clone(), projects_path);
     let packets = Packets::open(tmp.path()).unwrap();
     let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
     let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
@@ -53,12 +65,16 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         idx: RwLock::new(index),
         kb: RwLock::new(kb),
         gaps: RwLock::new(gaps),
-        roadmap: RwLock::new(roadmap_store),
-        threads: RwLock::new(threads),
+        roadmap: roadmap_store,
+        roadmap_persister,
+        threads,
+        threads_persister,
         notes,
         notes_persister,
-        pins: RwLock::new(pins),
-        projects: RwLock::new(projects),
+        pins,
+        pins_persister,
+        projects,
+        projects_persister,
         packets: RwLock::new(packets),
         artifacts: RwLock::new(artifacts),
         bbox_watcher: std::sync::Mutex::new(None),

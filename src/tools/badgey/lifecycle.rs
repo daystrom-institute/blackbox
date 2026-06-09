@@ -285,6 +285,8 @@ impl BlackboxServer {
                 origin: None,
             })
             .map_err(|e| format!("opening badgey thread of record: {e:#}"))?;
+        // This sync thread helper cannot await; threads persistence is write-behind here.
+        self.state.threads_persister.request();
         let thread_id = self.badgey_thread_id_from_open_result(&thread_result)?;
         let (task, provider, _initial_session_id, merged_filters) =
             self.badgey_launch_exec(&id, &scope, &thread_id, bro_label)?;
@@ -322,7 +324,7 @@ impl BlackboxServer {
             .badgey_registry
             .register(instance.clone())
             .map_err(|e| e.to_string())?;
-        let _ = self.state.threads.write().thread(&threads::ThreadParams {
+        let continue_result = self.state.threads.write().thread(&threads::ThreadParams {
             action: "continue".to_string(),
             name: None,
             id: Some(thread_id.clone()),
@@ -340,6 +342,10 @@ impl BlackboxServer {
             kind: None,
             origin: None,
         });
+        if continue_result.is_ok() {
+            // This sync thread helper cannot await; threads persistence is write-behind here.
+            self.state.threads_persister.request();
+        }
         self.badgey_write_event(
             &instance,
             orchestration::badgey::events::ThreadEvent::Exec {

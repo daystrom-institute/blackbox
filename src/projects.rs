@@ -10,6 +10,7 @@ pub use bbox_corpus_core::language::Language;
 pub use bbox_corpus_core::project_record::ProjectRecord;
 
 use crate::entity_ref;
+use crate::store_persister::StoreSnapshot;
 use crate::util;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -81,7 +82,7 @@ pub(crate) struct ProjectInitParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectStore {
+pub struct ProjectStore {
     version: u32,
     projects: Vec<ProjectRecord>,
 }
@@ -97,12 +98,24 @@ impl Default for ProjectStore {
 
 #[derive(Debug, Clone)]
 pub struct ProjectRegistry {
-    path: PathBuf,
     store: ProjectStore,
 }
 
+impl StoreSnapshot for ProjectRegistry {
+    type Snapshot = ProjectStore;
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        Ok(self.store.clone())
+    }
+}
+
 impl ProjectRegistry {
+    #[allow(dead_code)]
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self::open_with_backfill_status(path)?.0)
+    }
+
+    pub fn open_with_backfill_status(path: impl Into<PathBuf>) -> Result<(Self, bool)> {
         let path = path.into();
         let mut store = load_store(&path)?;
         let mut dirty = false;
@@ -120,20 +133,12 @@ impl ProjectRegistry {
                 dirty = true;
             }
         }
-        let registry = Self { path, store };
-        if dirty {
-            registry.save()?;
-        }
-        Ok(registry)
+        Ok((Self { store }, dirty))
     }
 
     pub fn register_path(&mut self, path: impl AsRef<Path>) -> Result<ProjectRecord> {
         let path = path.as_ref().to_path_buf();
-        let store_path = self.path.clone();
-        crate::json_store::with_store_lock(&store_path, || {
-            self.reload()?;
-            self.register_path_locked(&path)
-        })
+        self.register_path_locked(&path)
     }
 
     fn register_path_locked(&mut self, path: &Path) -> Result<ProjectRecord> {
@@ -176,16 +181,11 @@ impl ProjectRegistry {
         self.store
             .projects
             .sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
-        self.save()?;
         Ok(record)
     }
 
     pub fn rename_project(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
-        let store_path = self.path.clone();
-        crate::json_store::with_store_lock(&store_path, || {
-            self.reload()?;
-            self.rename_project_locked(p)
-        })
+        self.rename_project_locked(p)
     }
 
     fn rename_project_locked(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
@@ -278,7 +278,6 @@ impl ProjectRegistry {
             self.store
                 .projects
                 .sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
-            self.save()?;
         }
 
         Ok(ProjectRenameResponse {
@@ -298,17 +297,11 @@ impl ProjectRegistry {
     }
 
     pub fn unregister_project(&mut self, raw: &str) -> Result<ProjectRecord> {
-        let store_path = self.path.clone();
         let raw = raw.to_string();
-        crate::json_store::with_store_lock(&store_path, || {
-            self.reload()?;
-            let idx = self
-                .resolve_project_index(&raw)?
-                .with_context(|| format!("project not registered: {raw}"))?;
-            let removed = self.store.projects.remove(idx);
-            self.save()?;
-            Ok(removed)
-        })
+        let idx = self
+            .resolve_project_index(&raw)?
+            .with_context(|| format!("project not registered: {raw}"))?;
+        Ok(self.store.projects.remove(idx))
     }
 
     pub fn list(&self) -> Vec<ProjectRecord> {
@@ -317,20 +310,6 @@ impl ProjectRegistry {
 
     pub fn load_records(path: impl AsRef<Path>) -> Result<Vec<ProjectRecord>> {
         Ok(load_store(path.as_ref())?.projects)
-    }
-
-    fn save(&self) -> Result<()> {
-        crate::json_store::atomic_write_json_locked(&self.path, &self.store)
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        if self.path.exists() {
-            let raw = fs::read_to_string(&self.path)
-                .with_context(|| format!("reading {}", self.path.display()))?;
-            self.store = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", self.path.display()))?;
-        }
-        Ok(())
     }
 
     fn resolve_project_index(&self, raw: &str) -> Result<Option<usize>> {
@@ -540,7 +519,10 @@ fn canonical_nonexistent_absolute_path(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_persister::StorePersister;
+    use parking_lot::RwLock;
     use std::process::Command;
+    use std::sync::Arc;
 
     #[test]
     fn register_git_and_plain_projects_with_stable_ids() {
@@ -571,6 +553,28 @@ mod tests {
         assert!(git_record.is_git_repo);
         assert_eq!(plain_record.repo_id, None);
         assert!(!plain_record.is_git_repo);
+    }
+
+    #[tokio::test]
+    async fn project_registry_round_trip_through_persister() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("repo");
+        fs::create_dir_all(&project).unwrap();
+        let store_path = root.join("projects.json");
+        let registry = Arc::new(RwLock::new(ProjectRegistry::open(&store_path).unwrap()));
+        let persister = StorePersister::spawn(
+            "projects-test-roundtrip",
+            registry.clone(),
+            store_path.clone(),
+        );
+
+        let record = registry.write().register_path(&project).unwrap();
+        persister.request_durable().await.unwrap();
+
+        let reopened = ProjectRegistry::open(&store_path).unwrap();
+        assert_eq!(reopened.list().len(), 1);
+        assert_eq!(reopened.list()[0].project_id, record.project_id);
     }
 
     #[test]
@@ -759,8 +763,8 @@ mod tests {
         assert!(langs.is_empty());
     }
 
-    #[test]
-    fn open_redetects_languages_for_legacy_records() {
+    #[tokio::test]
+    async fn open_redetects_languages_for_legacy_records() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("legacy");
         fs::create_dir_all(&project).unwrap();
@@ -781,12 +785,21 @@ mod tests {
         });
         fs::write(&store_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 
-        let registry = ProjectRegistry::open(&store_path).unwrap();
+        let (registry, backfilled) =
+            ProjectRegistry::open_with_backfill_status(&store_path).unwrap();
+        assert!(backfilled);
         let recs = registry.list();
         assert_eq!(recs.len(), 1);
         assert!(recs[0].languages.contains(&Language::Rust));
 
         // Persisted on disk so subsequent loads skip the walk.
+        let registry = Arc::new(RwLock::new(registry));
+        let persister = StorePersister::spawn(
+            "projects-test-legacy-backfill",
+            registry,
+            store_path.clone(),
+        );
+        persister.request_durable().await.unwrap();
         let raw2 = fs::read_to_string(&store_path).unwrap();
         assert!(raw2.contains("\"languages\""));
     }

@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+use crate::store_persister::StoreSnapshot;
+
 // ── MCP parameter structs ─────────────────────────────────────────
 //
 // These are the typed inputs for the bbox_thread / bbox_thread_list
@@ -198,7 +200,7 @@ pub struct Thread {
     pub resolved_at: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadStore {
     pub version: u32,
     pub threads: Vec<Thread>,
@@ -327,8 +329,15 @@ pub(crate) fn load_repo_records(project_dir: &Path) -> Vec<ThreadRecord> {
 // ── Store operations ───────────────────────────────────────────────
 
 pub struct Threads {
-    store_path: PathBuf,
     store: ThreadStore,
+}
+
+impl StoreSnapshot for Threads {
+    type Snapshot = ThreadStore;
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        Ok(self.store.clone())
+    }
 }
 
 impl Threads {
@@ -341,24 +350,7 @@ impl Threads {
         } else {
             ThreadStore::new()
         };
-        Ok(Self {
-            store_path: store_path.to_path_buf(),
-            store,
-        })
-    }
-
-    fn save(&self) -> Result<()> {
-        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        if self.store_path.exists() {
-            let raw = fs::read_to_string(&self.store_path)
-                .with_context(|| format!("reading {}", self.store_path.display()))?;
-            self.store = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", self.store_path.display()))?;
-        }
-        Ok(())
+        Ok(Self { store })
     }
 
     fn now_iso() -> String {
@@ -381,28 +373,23 @@ impl Threads {
     }
 
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let mut updated = 0usize;
-            let now = Self::now_iso();
-            for thread in &mut self.store.threads {
-                if thread.project == old_project {
-                    thread.project = new_project.to_string();
-                    thread.last_activity = now.clone();
-                    updated += 1;
+        let mut updated = 0usize;
+        let now = Self::now_iso();
+        for thread in &mut self.store.threads {
+            if thread.project == old_project {
+                thread.project = new_project.to_string();
+                thread.last_activity = now.clone();
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            for thread in &self.store.threads {
+                if thread.project == new_project {
+                    crate::embed_queue::enqueue_thread(thread);
                 }
             }
-            if updated > 0 {
-                self.save()?;
-                for thread in &self.store.threads {
-                    if thread.project == new_project {
-                        crate::embed_queue::enqueue_thread(thread);
-                    }
-                }
-            }
-            Ok(updated)
-        })
+        }
+        Ok(updated)
     }
 
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
@@ -429,21 +416,17 @@ impl Threads {
                 changed_edges: false,
             });
         }
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            match p.action.as_str() {
-                "open" => self.thread_open(p, write_dir),
-                "continue" => self.thread_continue(p),
-                "link" => self.thread_link(p),
-                "resolve" => self.thread_resolve(p, write_dir),
-                "promote" => self.thread_promote(p, write_dir),
-                "rename" => self.thread_rename(p),
-                other => anyhow::bail!(
-                    "Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"
-                ),
-            }
-        })
+        match p.action.as_str() {
+            "open" => self.thread_open(p, write_dir),
+            "continue" => self.thread_continue(p),
+            "link" => self.thread_link(p),
+            "resolve" => self.thread_resolve(p, write_dir),
+            "promote" => self.thread_promote(p, write_dir),
+            "rename" => self.thread_rename(p),
+            other => anyhow::bail!(
+                "Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"
+            ),
+        }
     }
 
     fn thread_open(&mut self, p: &ThreadParams, write_dir: Option<&str>) -> Result<ThreadMutation> {
@@ -504,7 +487,6 @@ impl Threads {
 
         let changed_edges = !thread.sessions.is_empty();
         self.store.threads.push(thread.clone());
-        self.save()?;
         crate::embed_queue::enqueue_thread(&thread);
 
         Ok(ThreadMutation {
@@ -691,7 +673,6 @@ impl Threads {
 
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
-        self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(ThreadMutation {
@@ -771,7 +752,6 @@ impl Threads {
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
 
-        self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(ThreadMutation {
@@ -814,7 +794,6 @@ impl Threads {
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
 
-        self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
             Ok(Some((root, path))) => Some(crate::util::repo_artifact_rider(
                 &root.to_string_lossy(),
@@ -876,7 +855,6 @@ impl Threads {
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
 
-        self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
             Ok(Some((root, path))) => Some(crate::util::repo_artifact_rider(
                 &root.to_string_lossy(),
@@ -921,7 +899,6 @@ impl Threads {
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
 
-        self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(ThreadMutation {
@@ -1165,6 +1142,9 @@ impl Threads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_persister::StorePersister;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn params(action: &str) -> ThreadParams {
@@ -1186,6 +1166,58 @@ mod tests {
             kind: None,
             origin: None,
         }
+    }
+
+    #[tokio::test]
+    async fn threads_round_trip_through_persister() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_path = root.join("threads.json");
+        let threads = Arc::new(RwLock::new(Threads::open(&store_path).unwrap()));
+        let persister = StorePersister::spawn(
+            "threads-test-roundtrip",
+            threads.clone(),
+            store_path.clone(),
+        );
+
+        let created = threads
+            .write()
+            .thread(&ThreadParams {
+                action: "open".into(),
+                topic: Some("persister-backed thread".into()),
+                project: Some(root.to_string_lossy().into_owned()),
+                name: Some("persisted".into()),
+                id: None,
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".into()),
+                origin: None,
+            })
+            .unwrap();
+        let thread_id = created.split_whitespace().nth(2).unwrap().to_string();
+        persister.request_durable().await.unwrap();
+
+        let reopened = Threads::open(&store_path).unwrap();
+        let listed = reopened
+            .thread_list(&ThreadListParams {
+                status: None,
+                project: Some(root.to_string_lossy().into_owned()),
+                name: None,
+                min_idle_days: None,
+                include_resolved: None,
+                kind: None,
+                include_workflows: None,
+            })
+            .unwrap();
+        assert!(listed.contains(&thread_id));
+        assert!(listed.contains("persister-backed thread"));
     }
 
     fn open_thread_id(threads: &mut Threads, topic: &str, project: &str) -> String {
@@ -1447,16 +1479,14 @@ mod tests {
         );
     }
 
-    fn set_last_activity(store_path: &Path, thread_id: &str, last_activity: &str) {
-        let raw = fs::read_to_string(store_path).unwrap();
-        let mut store: ThreadStore = serde_json::from_str(&raw).unwrap();
-        let thread = store
+    fn set_last_activity(threads: &mut Threads, thread_id: &str, last_activity: &str) {
+        let thread = threads
+            .store
             .threads
             .iter_mut()
             .find(|t| t.id == thread_id)
             .unwrap();
         thread.last_activity = last_activity.to_string();
-        fs::write(store_path, serde_json::to_string_pretty(&store).unwrap()).unwrap();
     }
 
     #[test]
@@ -1548,8 +1578,7 @@ mod tests {
             })
             .unwrap();
         let thread_id = created.split_whitespace().nth(2).unwrap().to_string();
-        set_last_activity(&store_path, &thread_id, "2026-01-01T00:00:00Z");
-        let threads = Threads::open(&store_path).unwrap();
+        set_last_activity(&mut threads, &thread_id, "2026-01-01T00:00:00Z");
 
         let out = threads
             .thread_list(&ThreadListParams {

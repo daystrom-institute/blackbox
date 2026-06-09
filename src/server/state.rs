@@ -41,12 +41,16 @@ pub(crate) struct SharedState {
     /// (one file per gap under `<project>/.bbox/gaps/`); global gaps live in the
     /// central host store. Mirrors the `kb` repo-owned model.
     pub(crate) gaps: RwLock<GapStore>,
-    pub(crate) roadmap: RwLock<Roadmap>,
-    pub(crate) threads: RwLock<Threads>,
+    pub(crate) roadmap: Arc<RwLock<Roadmap>>,
+    pub(crate) roadmap_persister: StorePersister<Roadmap>,
+    pub(crate) threads: Arc<RwLock<Threads>>,
+    pub(crate) threads_persister: StorePersister<Threads>,
     pub(crate) notes: Arc<RwLock<Notes>>,
     pub(crate) notes_persister: StorePersister<Notes>,
-    pub(crate) pins: RwLock<Pins>,
-    pub(crate) projects: RwLock<ProjectRegistry>,
+    pub(crate) pins: Arc<RwLock<Pins>>,
+    pub(crate) pins_persister: StorePersister<Pins>,
+    pub(crate) projects: Arc<RwLock<ProjectRegistry>>,
+    pub(crate) projects_persister: StorePersister<ProjectRegistry>,
     pub(crate) packets: RwLock<Packets>,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
     pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
@@ -229,6 +233,22 @@ impl SharedState {
         self.notes_persister.request_durable().await
     }
 
+    pub(crate) async fn persist_roadmap_durable(&self) -> anyhow::Result<()> {
+        self.roadmap_persister.request_durable().await
+    }
+
+    pub(crate) async fn persist_threads_durable(&self) -> anyhow::Result<()> {
+        self.threads_persister.request_durable().await
+    }
+
+    pub(crate) async fn persist_pins_durable(&self) -> anyhow::Result<()> {
+        self.pins_persister.request_durable().await
+    }
+
+    pub(crate) async fn persist_projects_durable(&self) -> anyhow::Result<()> {
+        self.projects_persister.request_durable().await
+    }
+
     pub(crate) fn record_signal(&self, ev: SignalEvent) {
         let mut log = self.signal_log.write();
         if log.len() >= SIGNAL_LOG_CAP {
@@ -332,17 +352,41 @@ impl SharedState {
         let notes_path = store_dir.join("notes.json");
         let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
         let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);
+        let roadmap_path = store_dir.join("roadmap.json");
+        let roadmap_store = Arc::new(RwLock::new(Roadmap::open(&roadmap_path).unwrap()));
+        let roadmap_persister =
+            StorePersister::spawn("roadmap-test", roadmap_store.clone(), roadmap_path);
+        let threads_path = store_dir.join("threads.json");
+        let threads_store = Arc::new(RwLock::new(Threads::open(&threads_path).unwrap()));
+        let threads_persister =
+            StorePersister::spawn("threads-test", threads_store.clone(), threads_path);
+        let pins_path = store_dir.join("pins.json");
+        let pins_store = Arc::new(RwLock::new(Pins::open(&pins_path).unwrap()));
+        let pins_persister = StorePersister::spawn("pins-test", pins_store.clone(), pins_path);
+        let projects_path = store_dir.join("projects.json");
+        let (projects, projects_needs_persist) =
+            ProjectRegistry::open_with_backfill_status(&projects_path).unwrap();
+        let projects_store = Arc::new(RwLock::new(projects));
+        let projects_persister =
+            StorePersister::spawn("projects-test", projects_store.clone(), projects_path);
+        if projects_needs_persist {
+            projects_persister.request();
+        }
 
         SharedState {
             idx: RwLock::new(idx),
             kb: RwLock::new(kb),
             gaps: RwLock::new(gaps),
-            roadmap: RwLock::new(Roadmap::open(&store_dir.join("roadmap.json")).unwrap()),
-            threads: RwLock::new(Threads::open(&store_dir.join("threads.json")).unwrap()),
+            roadmap: roadmap_store,
+            roadmap_persister,
+            threads: threads_store,
+            threads_persister,
             notes: notes_store,
             notes_persister,
-            pins: RwLock::new(Pins::open(&store_dir.join("pins.json")).unwrap()),
-            projects: RwLock::new(ProjectRegistry::open(store_dir.join("projects.json")).unwrap()),
+            pins: pins_store,
+            pins_persister,
+            projects: projects_store,
+            projects_persister,
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),

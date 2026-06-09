@@ -18,8 +18,28 @@ impl BlackboxServer {
         name = "bbox_pin",
         description = "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope."
     )]
-    pub(crate) fn bbox_pin(&self, Parameters(p): Parameters<PinParams>) -> CallToolResult {
-        Self::run("bbox_pin", || self.state.pins.write().pin(&p))
+    pub(crate) async fn bbox_pin(&self, Parameters(p): Parameters<PinParams>) -> CallToolResult {
+        let start = std::time::Instant::now();
+        let text = match self.state.pins.write().pin(&p) {
+            Ok(text) => text,
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_pin", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
+            }
+        };
+
+        if p.action != "list" {
+            if let Err(e) = self.state.persist_pins_durable().await {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_pin", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
+            }
+        }
+
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(target: "blackbox::tool", tool = "bbox_pin", elapsed_ms = ms, bytes = text.len(), "ok");
+        Self::ok_text(&text)
     }
 
     #[tool(

@@ -162,31 +162,36 @@ impl BlackboxServer {
         name = "bbox_roadmap",
         description = "Manage the bbox roadmap — an operator-directed prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Roadmap interactions are performed only at the express direction of the operator; never use the roadmap to defer, postpone, or avoid requested implementation work. Inbox is reactive; threads are active work; knowledge is atemporal. Status lifecycle: proposed → accepted → delivered (shipped) or rejected; accepted → deferred → accepted."
     )]
-    pub(crate) fn bbox_roadmap(&self, Parameters(p): Parameters<RoadmapParams>) -> CallToolResult {
+    pub(crate) async fn bbox_roadmap(
+        &self,
+        Parameters(p): Parameters<RoadmapParams>,
+    ) -> CallToolResult {
         let start = std::time::Instant::now();
-        match (|| -> anyhow::Result<String> {
+        match (async {
             let action = p.action.as_str();
             let params = serde_json::to_value(&p)?;
 
             match action {
-                "create" => self.roadmap_create(serde_json::from_value(params)?),
+                "create" => self.roadmap_create(serde_json::from_value(params)?).await,
                 "get" => self.roadmap_get(serde_json::from_value(params)?),
                 "list" => self.roadmap_list(serde_json::from_value(params)?),
                 "search" => self.roadmap_search(serde_json::from_value(params)?),
-                "update" => self.roadmap_update(serde_json::from_value(params)?),
-                "delete" => self.roadmap_delete(serde_json::from_value(params)?),
+                "update" => self.roadmap_update(serde_json::from_value(params)?).await,
+                "delete" => self.roadmap_delete(serde_json::from_value(params)?).await,
                 "next" => self.roadmap_next(serde_json::from_value(params)?),
-                "promote" => self.roadmap_promote(serde_json::from_value(params)?),
-                "link" => self.roadmap_link(serde_json::from_value(params)?),
-                "unlink" => self.roadmap_unlink(serde_json::from_value(params)?),
-                "repair_links" => self.roadmap_repair_links(serde_json::from_value(params)?),
+                "promote" => self.roadmap_promote(serde_json::from_value(params)?).await,
+                "link" => self.roadmap_link(serde_json::from_value(params)?).await,
+                "unlink" => self.roadmap_unlink(serde_json::from_value(params)?).await,
+                "repair_links" => self.roadmap_repair_links(serde_json::from_value(params)?).await,
                 "render" => self.roadmap_render(serde_json::from_value(params)?),
                 "default_template" => Ok(crate::roadmap::DEFAULT_ROADMAP_TEMPLATE.to_string()),
                 other => anyhow::bail!(
                     "unknown action '{other}'. Valid: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, render, default_template"
                 ),
             }
-        })() {
+        })
+        .await
+        {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_roadmap", elapsed_ms = ms, bytes = text.len(), "ok");
@@ -202,7 +207,7 @@ impl BlackboxServer {
 }
 
 impl BlackboxServer {
-    fn roadmap_create(&self, p: RoadmapCreateParams) -> anyhow::Result<String> {
+    async fn roadmap_create(&self, p: RoadmapCreateParams) -> anyhow::Result<String> {
         let priority = roadmap::RoadmapPriority::parse(p.priority.as_deref().unwrap_or("medium"))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let category =
@@ -215,35 +220,39 @@ impl BlackboxServer {
             anyhow::bail!("scope='project' requires a 'project' path");
         }
 
-        let mut rm = self.state.roadmap.write();
+        let item = {
+            let mut rm = self.state.roadmap.write();
 
-        // List Before Create guard
-        if let Some(existing) = rm.find_by_title(&p.title) {
-            return Ok(serde_json::json!({
-                "duplicate": true,
-                "existing_id": existing.id,
-                "message": format!("Roadmap item with title '{}' already exists as {}. Use update instead.", p.title, existing.id)
-            })
-            .to_string());
-        }
+            // List Before Create guard
+            if let Some(existing) = rm.find_by_title(&p.title) {
+                return Ok(serde_json::json!({
+                    "duplicate": true,
+                    "existing_id": existing.id,
+                    "message": format!("Roadmap item with title '{}' already exists as {}. Use update instead.", p.title, existing.id)
+                })
+                .to_string());
+            }
 
-        let item = rm.create(
-            p.title.clone(),
-            p.body,
-            category,
-            priority,
-            scope,
-            p.project,
-            None,
-        )?;
+            rm.create(
+                p.title.clone(),
+                p.body,
+                category,
+                priority,
+                scope,
+                p.project,
+                None,
+            )?
+            .clone()
+        };
+        self.state.persist_roadmap_durable().await?;
 
         // Sync to index + embed
         let entity_id = roadmap_entity_id(&item.id);
-        let chunk_hash = roadmap_chunk_hash(item);
-        if let Err(err) = self.state.idx.write().index_roadmap_item(item) {
+        let chunk_hash = roadmap_chunk_hash(&item);
+        if let Err(err) = self.state.idx.write().index_roadmap_item(&item) {
             tracing::warn!(error = %err, item = %item.id, "roadmap index sync failed");
         }
-        embed_queue::enqueue_roadmap(item, &entity_id, &chunk_hash);
+        embed_queue::enqueue_roadmap(&item, &entity_id, &chunk_hash);
 
         Ok(serde_json::json!({
             "id": item.id,
@@ -404,7 +413,7 @@ impl BlackboxServer {
         .to_string())
     }
 
-    fn roadmap_update(&self, p: RoadmapUpdateParams) -> anyhow::Result<String> {
+    async fn roadmap_update(&self, p: RoadmapUpdateParams) -> anyhow::Result<String> {
         let status = match p.status.as_deref() {
             Some(s) => Some(roadmap::RoadmapStatus::parse(s).map_err(|e| anyhow::anyhow!("{e}"))?),
             None => None,
@@ -423,10 +432,13 @@ impl BlackboxServer {
             None => None,
         };
 
-        let mut rm = self.state.roadmap.write();
-        let item = rm.update(
-            &p.id, p.title, p.body, status, category, priority, None, None,
-        )?;
+        let item = {
+            let mut rm = self.state.roadmap.write();
+            rm.update(
+                &p.id, p.title, p.body, status, category, priority, None, None,
+            )?
+        };
+        self.state.persist_roadmap_durable().await?;
 
         // Sync to index
         let entity_id = roadmap_entity_id(&item.id);
@@ -447,10 +459,13 @@ impl BlackboxServer {
         .to_string())
     }
 
-    fn roadmap_delete(&self, p: RoadmapDeleteParams) -> anyhow::Result<String> {
-        let mut rm = self.state.roadmap.write();
+    async fn roadmap_delete(&self, p: RoadmapDeleteParams) -> anyhow::Result<String> {
         let entity_id = roadmap_entity_id(&p.id);
-        rm.delete(&p.id)?;
+        {
+            let mut rm = self.state.roadmap.write();
+            rm.delete(&p.id)?;
+        }
+        self.state.persist_roadmap_durable().await?;
 
         // Tombstone in index
         if let Err(err) = self.state.idx.write().delete_roadmap_item(&p.id) {
@@ -491,17 +506,19 @@ impl BlackboxServer {
         .to_string())
     }
 
-    fn roadmap_promote(&self, p: RoadmapPromoteParams) -> anyhow::Result<String> {
-        let rm = self.state.roadmap.read();
-        let Some(item) = rm.item(&p.id) else {
-            anyhow::bail!("roadmap item '{}' not found", p.id);
-        };
-        let item = item.clone();
-        let canonical_from = format!("roadmap_item:{}", p.id);
+    async fn roadmap_promote(&self, p: RoadmapPromoteParams) -> anyhow::Result<String> {
+        let (item, canonical_from, existing_spawns) = {
+            let rm = self.state.roadmap.read();
+            let Some(item) = rm.item(&p.id) else {
+                anyhow::bail!("roadmap item '{}' not found", p.id);
+            };
+            let item = item.clone();
+            let canonical_from = format!("roadmap_item:{}", p.id);
 
-        // Check idempotency: existing unresolved spawns
-        let existing_spawns = rm.spawned_thread_ids(&p.id);
-        drop(rm);
+            // Check idempotency: existing unresolved spawns
+            let existing_spawns = rm.spawned_thread_ids(&p.id);
+            (item, canonical_from, existing_spawns)
+        };
 
         if !existing_spawns.is_empty() {
             return Ok(serde_json::json!({
@@ -523,7 +540,6 @@ impl BlackboxServer {
             item.body,
         );
 
-        let mut th = self.state.threads.write();
         let params = threads::ThreadParams {
             action: "open".into(),
             topic: Some(thread_topic),
@@ -542,8 +558,11 @@ impl BlackboxServer {
             promoted_to: None,
             origin: None,
         };
-        let result = th.thread(&params)?;
-        drop(th);
+        let result = {
+            let mut th = self.state.threads.write();
+            th.thread(&params)?
+        };
+        self.state.persist_threads_durable().await?;
 
         // Parse thread id from result string: "Thread created: <id> — \"<topic>\""
         let thread_id = result
@@ -553,15 +572,18 @@ impl BlackboxServer {
             .ok_or_else(|| anyhow::anyhow!("failed to parse thread id from: {}", result))?;
 
         // Record the SPOWNS edge
-        let mut rm = self.state.roadmap.write();
-        rm.add_edge(
-            canonical_from.clone(),
-            format!("thread:{thread_id}"),
-            roadmap::RoadmapEdgeKind::Spawns,
-            Some(format!("Promoted from roadmap item {}", p.id)),
-            None,
-            None,
-        )?;
+        {
+            let mut rm = self.state.roadmap.write();
+            rm.add_edge(
+                canonical_from.clone(),
+                format!("thread:{thread_id}"),
+                roadmap::RoadmapEdgeKind::Spawns,
+                Some(format!("Promoted from roadmap item {}", p.id)),
+                None,
+                None,
+            )?;
+        }
+        self.state.persist_roadmap_durable().await?;
 
         Ok(serde_json::json!({
             "id": item.id,
@@ -572,7 +594,7 @@ impl BlackboxServer {
         .to_string())
     }
 
-    fn roadmap_link(&self, p: RoadmapLinkParams) -> anyhow::Result<String> {
+    async fn roadmap_link(&self, p: RoadmapLinkParams) -> anyhow::Result<String> {
         let edge_kind =
             roadmap::RoadmapEdgeKind::parse(&p.link_type).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -621,11 +643,6 @@ impl BlackboxServer {
         let canonical_from = format!("roadmap_item:{}", p.id);
 
         // Validate source item exists
-        let mut rm = self.state.roadmap.write();
-        if rm.item(&p.id).is_none() {
-            anyhow::bail!("source roadmap item '{}' not found", p.id);
-        }
-
         // For designed_in edges, try to capture file_path from the project_file ref
         let (file_path, section_anchor) = if edge_kind == roadmap::RoadmapEdgeKind::DesignedIn {
             let path = resolve_project_file_path(&self.state, &p.link_target)?;
@@ -634,14 +651,21 @@ impl BlackboxServer {
             (None, None)
         };
 
-        rm.add_edge(
-            canonical_from,
-            p.link_target.clone(),
-            edge_kind,
-            p.link_note,
-            file_path,
-            section_anchor,
-        )?;
+        {
+            let mut rm = self.state.roadmap.write();
+            if rm.item(&p.id).is_none() {
+                anyhow::bail!("source roadmap item '{}' not found", p.id);
+            }
+            rm.add_edge(
+                canonical_from,
+                p.link_target.clone(),
+                edge_kind,
+                p.link_note,
+                file_path,
+                section_anchor,
+            )?;
+        }
+        self.state.persist_roadmap_durable().await?;
 
         Ok(serde_json::json!({
             "from": format!("roadmap_item:{}", p.id),
@@ -651,12 +675,15 @@ impl BlackboxServer {
         .to_string())
     }
 
-    fn roadmap_unlink(&self, p: RoadmapUnlinkParams) -> anyhow::Result<String> {
+    async fn roadmap_unlink(&self, p: RoadmapUnlinkParams) -> anyhow::Result<String> {
         let edge_kind =
             roadmap::RoadmapEdgeKind::parse(&p.link_type).map_err(|e| anyhow::anyhow!("{e}"))?;
         let canonical_from = format!("roadmap_item:{}", p.id);
-        let mut rm = self.state.roadmap.write();
-        rm.remove_edge(&canonical_from, &p.link_target, edge_kind)?;
+        {
+            let mut rm = self.state.roadmap.write();
+            rm.remove_edge(&canonical_from, &p.link_target, edge_kind)?;
+        }
+        self.state.persist_roadmap_durable().await?;
 
         Ok(serde_json::json!({
             "from": canonical_from,
@@ -667,17 +694,18 @@ impl BlackboxServer {
         .to_string())
     }
 
-    fn roadmap_repair_links(&self, p: RoadmapRepairLinksParams) -> anyhow::Result<String> {
-        let rm = self.state.roadmap.read();
-        let edges: Vec<RoadmapEdge> = rm
-            .designed_in_edges(p.id.as_deref())
-            .into_iter()
-            .cloned()
-            .collect();
-        drop(rm);
+    async fn roadmap_repair_links(&self, p: RoadmapRepairLinksParams) -> anyhow::Result<String> {
+        let edges: Vec<RoadmapEdge> = {
+            let rm = self.state.roadmap.read();
+            rm.designed_in_edges(p.id.as_deref())
+                .into_iter()
+                .cloned()
+                .collect()
+        };
 
         let mut repaired = 0;
         let mut unresolved = 0;
+        let mut changed = false;
 
         // Fetch all project_file docs once
         let project_docs = self
@@ -711,6 +739,7 @@ impl BlackboxServer {
                             Some(matched.file_path.clone()),
                             None,
                         )?;
+                        changed = true;
                     }
                     repaired += 1;
                 } else {
@@ -734,11 +763,16 @@ impl BlackboxServer {
                         Some(matched.file_path.clone()),
                         None,
                     )?;
+                    changed = true;
                 }
                 repaired += 1;
             } else {
                 unresolved += 1;
             }
+        }
+
+        if changed {
+            self.state.persist_roadmap_durable().await?;
         }
 
         Ok(serde_json::json!({

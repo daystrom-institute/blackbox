@@ -1,10 +1,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::store_persister::StoreSnapshot;
 
 // ── Item model ─────────────────────────────────────────────────────
 
@@ -231,7 +233,7 @@ impl RoadmapEdgeKind {
 
 // ── Store ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoadmapStore {
     pub version: u32,
     pub items: Vec<RoadmapItem>,
@@ -252,8 +254,15 @@ impl RoadmapStore {
 // ── Roadmap ─────────────────────────────────────────────────────────
 
 pub struct Roadmap {
-    store_path: PathBuf,
     store: RoadmapStore,
+}
+
+impl StoreSnapshot for Roadmap {
+    type Snapshot = RoadmapStore;
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        Ok(self.store.clone())
+    }
 }
 
 impl Roadmap {
@@ -266,24 +275,7 @@ impl Roadmap {
         } else {
             RoadmapStore::new()
         };
-        Ok(Self {
-            store_path: store_path.to_path_buf(),
-            store,
-        })
-    }
-
-    fn save(&self) -> Result<()> {
-        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        if self.store_path.exists() {
-            let raw = std::fs::read_to_string(&self.store_path)
-                .with_context(|| format!("reading {}", self.store_path.display()))?;
-            self.store = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", self.store_path.display()))?;
-        }
-        Ok(())
+        Ok(Self { store })
     }
 
     fn now_iso() -> String {
@@ -332,29 +324,23 @@ impl Roadmap {
         project: Option<String>,
         actor: Option<String>,
     ) -> Result<&RoadmapItem> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let now = Self::now_iso();
-            let id = Self::gen_id();
-            let mut item = RoadmapItem {
-                id,
-                title,
-                body,
-                status: RoadmapStatus::Proposed,
-                category,
-                priority,
-                scope,
-                project,
-                created_at: now.clone(),
-                updated_at: now,
-                transitions: Vec::new(),
-            };
-            item.push_transition(RoadmapStatus::Proposed, None, actor, None);
-            self.store.items.push(item);
-            self.save()?;
-            Ok(())
-        })?;
+        let now = Self::now_iso();
+        let id = Self::gen_id();
+        let mut item = RoadmapItem {
+            id,
+            title,
+            body,
+            status: RoadmapStatus::Proposed,
+            category,
+            priority,
+            scope,
+            project,
+            created_at: now.clone(),
+            updated_at: now,
+            transitions: Vec::new(),
+        };
+        item.push_transition(RoadmapStatus::Proposed, None, actor, None);
+        self.store.items.push(item);
         Ok(self.store.items.last().unwrap())
     }
 
@@ -369,67 +355,57 @@ impl Roadmap {
         actor: Option<String>,
         source: Option<String>,
     ) -> Result<RoadmapItem> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            // Scoped block to drop mutable borrow before save
-            {
-                let item = self
-                    .store
-                    .items
-                    .iter_mut()
-                    .find(|i| i.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
+        {
+            let item = self
+                .store
+                .items
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
 
-                if let Some(t) = title {
-                    item.title = t;
-                }
-                if let Some(b) = body {
-                    item.body = b;
-                }
-                if let Some(c) = category {
-                    item.category = c;
-                }
-                if let Some(p) = priority {
-                    item.priority = p;
-                }
-                if let Some(s) = status {
-                    if !item.status.can_transition_to(&s) {
-                        anyhow::bail!(
-                            "cannot transition from {} to {}",
-                            item.status.as_str(),
-                            s.as_str()
-                        );
-                    }
-                    item.push_transition(s.clone(), None, actor, source);
-                    item.status = s;
-                }
-                item.updated_at = Self::now_iso();
+            if let Some(t) = title {
+                item.title = t;
             }
-            self.save()
-        })?;
+            if let Some(b) = body {
+                item.body = b;
+            }
+            if let Some(c) = category {
+                item.category = c;
+            }
+            if let Some(p) = priority {
+                item.priority = p;
+            }
+            if let Some(s) = status {
+                if !item.status.can_transition_to(&s) {
+                    anyhow::bail!(
+                        "cannot transition from {} to {}",
+                        item.status.as_str(),
+                        s.as_str()
+                    );
+                }
+                item.push_transition(s.clone(), None, actor, source);
+                item.status = s;
+            }
+            item.updated_at = Self::now_iso();
+        }
         Ok(self.item(id).cloned().unwrap())
     }
 
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let idx = self
-                .store
-                .items
-                .iter()
-                .position(|i| i.id == id)
-                .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
-            self.store.items.remove(idx);
+        let idx = self
+            .store
+            .items
+            .iter()
+            .position(|i| i.id == id)
+            .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
+        self.store.items.remove(idx);
 
-            // Remove all edges involving this item
-            let canonical = format!("roadmap_item:{id}");
-            self.store
-                .edges
-                .retain(|e| e.from != canonical && e.to != canonical);
-            self.save()
-        })
+        // Remove all edges involving this item
+        let canonical = format!("roadmap_item:{id}");
+        self.store
+            .edges
+            .retain(|e| e.from != canonical && e.to != canonical);
+        Ok(())
     }
 
     /// Search items by free-text query (title + body substring match).
@@ -516,48 +492,38 @@ impl Roadmap {
         file_path: Option<String>,
         section_anchor: Option<String>,
     ) -> Result<&RoadmapEdge> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            // Deduplicate
-            if self
-                .store
-                .edges
-                .iter()
-                .any(|e| e.from == from && e.to == to && e.kind == kind)
-            {
-                anyhow::bail!("edge from {from} to {to} of kind {kind:?} already exists");
-            }
-            let edge = RoadmapEdge {
-                from,
-                to,
-                kind,
-                note,
-                file_path,
-                section_anchor,
-                at: Self::now_iso(),
-            };
-            self.store.edges.push(edge);
-            self.save()?;
-            Ok(())
-        })?;
+        // Deduplicate
+        if self
+            .store
+            .edges
+            .iter()
+            .any(|e| e.from == from && e.to == to && e.kind == kind)
+        {
+            anyhow::bail!("edge from {from} to {to} of kind {kind:?} already exists");
+        }
+        let edge = RoadmapEdge {
+            from,
+            to,
+            kind,
+            note,
+            file_path,
+            section_anchor,
+            at: Self::now_iso(),
+        };
+        self.store.edges.push(edge);
         Ok(self.store.edges.last().unwrap())
     }
     pub fn remove_edge(&mut self, from: &str, to: &str, kind: RoadmapEdgeKind) -> Result<()> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let idx = self
-                .store
-                .edges
-                .iter()
-                .position(|e| e.from == from && e.to == to && e.kind == kind)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("edge from {from} to {to} of kind {kind:?} not found")
-                })?;
-            self.store.edges.remove(idx);
-            self.save()
-        })
+        let idx = self
+            .store
+            .edges
+            .iter()
+            .position(|e| e.from == from && e.to == to && e.kind == kind)
+            .ok_or_else(|| {
+                anyhow::anyhow!("edge from {from} to {to} of kind {kind:?} not found")
+            })?;
+        self.store.edges.remove(idx);
+        Ok(())
     }
 
     pub fn edges_for(&self, id: &str) -> Vec<&RoadmapEdge> {
@@ -618,7 +584,6 @@ impl Roadmap {
         edge.file_path = file_path;
         edge.section_anchor = section_anchor;
         edge.at = Self::now_iso();
-        self.save()?;
         Ok(())
     }
 
@@ -1074,7 +1039,11 @@ fn days_between(a: &str, b: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_persister::StorePersister;
     use crate::template;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     // ── Status transitions ───────────────────────────────────────────────
 
@@ -1105,6 +1074,38 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn roadmap_round_trip_through_persister() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("roadmap.json");
+        let roadmap = Arc::new(RwLock::new(Roadmap::open(&path).unwrap()));
+        let persister =
+            StorePersister::spawn("roadmap-test-roundtrip", roadmap.clone(), path.clone());
+
+        let item_id = roadmap
+            .write()
+            .create(
+                "Persister conversion".to_string(),
+                "move roadmap JSON writes behind the actor".to_string(),
+                RoadmapCategory::Refactor,
+                RoadmapPriority::High,
+                "project".to_string(),
+                Some(root.to_string_lossy().into_owned()),
+                Some("test".to_string()),
+            )
+            .unwrap()
+            .id
+            .clone();
+        persister.request_durable().await.unwrap();
+
+        let reopened = Roadmap::open(&path).unwrap();
+        assert_eq!(
+            reopened.item(&item_id).unwrap().title,
+            "Persister conversion"
+        );
+    }
+
     // ── Template context ─────────────────────────────────────────────────
 
     fn make_roadmap_with_item() -> Roadmap {
@@ -1128,10 +1129,7 @@ mod tests {
                 source: None,
             }],
         });
-        Roadmap {
-            store_path: std::path::PathBuf::from("/tmp/test-roadmap.json"),
-            store,
-        }
+        Roadmap { store }
     }
 
     #[test]
@@ -1169,7 +1167,6 @@ mod tests {
     #[test]
     fn default_template_renders_empty_roadmap() {
         let rm = Roadmap {
-            store_path: std::path::PathBuf::from("/tmp/test-roadmap.json"),
             store: RoadmapStore::new(),
         };
         let ctx = rm.to_template_context("my-project", &|_| None);

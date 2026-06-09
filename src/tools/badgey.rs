@@ -1006,6 +1006,8 @@ mod tests {
                 origin: None,
             })
             .unwrap();
+        // Test setup is sync-only; thread persistence is write-behind here.
+        server.state.threads_persister.request();
         let thread_id = server
             .badgey_thread_id_from_open_result(&thread_result)
             .unwrap();
@@ -1070,6 +1072,8 @@ mod tests {
                 origin: None,
             })
             .unwrap();
+        // Test setup is sync-only; thread persistence is write-behind here.
+        server.state.threads_persister.request();
         let thread_id = server
             .badgey_thread_id_from_open_result(&thread_result)
             .unwrap();
@@ -1099,6 +1103,8 @@ mod tests {
                 bro: Some("badgey".to_string()),
             })
             .unwrap();
+        // Test setup is sync-only; thread persistence is write-behind here.
+        server.state.threads_persister.request();
 
         restore_badgey_registry_from_notes(&server.state);
         assert!(server.state.badgey_registry.get(&id).is_err());

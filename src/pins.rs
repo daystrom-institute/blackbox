@@ -1,11 +1,12 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+use crate::store_persister::StoreSnapshot;
 use crate::util;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -73,7 +74,7 @@ pub struct Pin {
     pub updated_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinStore {
     pub version: u32,
     pub pins: Vec<Pin>,
@@ -98,8 +99,15 @@ pub struct AmbientPinQuery<'a> {
 }
 
 pub struct Pins {
-    store_path: PathBuf,
     store: PinStore,
+}
+
+impl StoreSnapshot for Pins {
+    type Snapshot = PinStore;
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        Ok(self.store.clone())
+    }
 }
 
 impl Pins {
@@ -112,24 +120,7 @@ impl Pins {
         } else {
             PinStore::new()
         };
-        Ok(Self {
-            store_path: store_path.to_path_buf(),
-            store,
-        })
-    }
-
-    fn save(&self) -> Result<()> {
-        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        if self.store_path.exists() {
-            let raw = fs::read_to_string(&self.store_path)
-                .with_context(|| format!("reading {}", self.store_path.display()))?;
-            self.store = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", self.store_path.display()))?;
-        }
-        Ok(())
+        Ok(Self { store })
     }
 
     fn now_iso() -> String {
@@ -159,21 +150,14 @@ impl Pins {
     }
 
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let mut updated = 0usize;
-            for pin in &mut self.store.pins {
-                if pin.project.as_deref() == Some(old_project) {
-                    pin.project = Some(new_project.to_string());
-                    updated += 1;
-                }
+        let mut updated = 0usize;
+        for pin in &mut self.store.pins {
+            if pin.project.as_deref() == Some(old_project) {
+                pin.project = Some(new_project.to_string());
+                updated += 1;
             }
-            if updated > 0 {
-                self.save()?;
-            }
-            Ok(updated)
-        })
+        }
+        Ok(updated)
     }
 
     fn is_expired(pin: &Pin) -> bool {
@@ -183,14 +167,6 @@ impl Pins {
     }
 
     pub fn pin(&mut self, p: &PinParams) -> Result<String> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.pin_locked(p)
-        })
-    }
-
-    fn pin_locked(&mut self, p: &PinParams) -> Result<String> {
         match p.action.as_str() {
             "set" => self.set(p),
             "list" => self.list(p),
@@ -228,7 +204,6 @@ impl Pins {
                 pin.project = p.project.clone();
                 pin.expires_at = p.expires_at.clone();
                 pin.updated_at = now;
-                self.save()?;
                 return Ok(format!("Updated pin {id}"));
             }
         }
@@ -245,7 +220,6 @@ impl Pins {
             created_at: now.clone(),
             updated_at: now,
         });
-        self.save()?;
         Ok(format!("Created pin {id}"))
     }
 
@@ -306,7 +280,6 @@ impl Pins {
         if self.store.pins.len() == before {
             return Ok(format!("Pin {id} not found"));
         }
-        self.save()?;
         Ok(format!("Deleted pin {id}"))
     }
 
@@ -391,29 +364,34 @@ fn derive_title(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_persister::StorePersister;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
-    #[test]
-    fn pins_persist_across_reopen() {
+    #[tokio::test]
+    async fn pins_round_trip_through_persister() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("pins.json");
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("pins.json");
+        let pins = Arc::new(RwLock::new(Pins::open(&path).unwrap()));
+        let persister = StorePersister::spawn("pins-test-roundtrip", pins.clone(), path.clone());
 
-        {
-            let mut pins = Pins::open(&path).unwrap();
-            let out = pins
-                .pin(&PinParams {
-                    action: "set".into(),
-                    id: None,
-                    content: Some("use the canonical scoping doc as authority".into()),
-                    title: Some("Scoping authority".into()),
-                    scope: Some("bro".into()),
-                    target: Some("executor".into()),
-                    project: Some("/repo/x".into()),
-                    expires_at: None,
-                })
-                .unwrap();
-            assert!(out.contains("Created pin"));
-        }
+        let out = pins
+            .write()
+            .pin(&PinParams {
+                action: "set".into(),
+                id: None,
+                content: Some("use the canonical scoping doc as authority".into()),
+                title: Some("Scoping authority".into()),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                project: Some("/repo/x".into()),
+                expires_at: None,
+            })
+            .unwrap();
+        assert!(out.contains("Created pin"));
+        persister.request_durable().await.unwrap();
 
         let reopened = Pins::open(&path).unwrap();
         let rendered = reopened

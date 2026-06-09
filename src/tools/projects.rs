@@ -149,12 +149,17 @@ impl BlackboxServer {
         name = "bbox_project_register",
         description = "Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. Use bbox_project_list to inspect registered projects."
     )]
-    pub(crate) fn bbox_project_register(
+    pub(crate) async fn bbox_project_register(
         &self,
         Parameters(p): Parameters<ProjectRegisterParams>,
     ) -> CallToolResult {
-        Self::run("bbox_project_register", || {
-            let record = self.state.projects.write().register_path(&p.path)?;
+        let start = std::time::Instant::now();
+        let result: anyhow::Result<String> = async {
+            let record = {
+                let mut projects = self.state.projects.write();
+                projects.register_path(&p.path)?
+            };
+            self.state.persist_projects_durable().await?;
             orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(&record.canonical_path))?;
             let project_config = config::load_project(Path::new(&record.canonical_path))?;
             let project_config_loaded = true;
@@ -254,7 +259,20 @@ impl BlackboxServer {
                 },
             });
             Ok(serde_json::to_string_pretty(&response)?)
-        })
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(
@@ -286,12 +304,19 @@ impl BlackboxServer {
         name = "bbox_project_rename",
         description = "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, councils, whiteboards, pollers, and crons, then reindexes project files."
     )]
-    pub(crate) fn bbox_project_rename(
+    pub(crate) async fn bbox_project_rename(
         &self,
         Parameters(p): Parameters<ProjectRenameParams>,
     ) -> CallToolResult {
-        Self::run("bbox_project_rename", || {
-            let response = self.state.projects.write().rename_project(&p)?;
+        let start = std::time::Instant::now();
+        let result: anyhow::Result<String> = async {
+            let response = {
+                let mut projects = self.state.projects.write();
+                projects.rename_project(&p)?
+            };
+            if !response.dry_run {
+                self.state.persist_projects_durable().await?;
+            }
             let old_project = response.old_record.canonical_path.clone();
             let new_project = response.record.canonical_path.clone();
 
@@ -333,18 +358,32 @@ impl BlackboxServer {
                 "migrated_refs": counts,
                 "reindex": reindex,
             }))?)
-        })
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(
         name = "bbox_project_unregister",
         description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, councils, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry."
     )]
-    pub(crate) fn bbox_project_unregister(
+    pub(crate) async fn bbox_project_unregister(
         &self,
         Parameters(p): Parameters<ProjectUnregisterParams>,
     ) -> CallToolResult {
-        Self::run("bbox_project_unregister", || {
+        let start = std::time::Instant::now();
+        let result: anyhow::Result<String> = async {
             let force = p.force.unwrap_or(false);
             let dry_run = p.dry_run.unwrap_or(false);
 
@@ -391,7 +430,11 @@ impl BlackboxServer {
                 );
             }
 
-            let removed = self.state.projects.write().unregister_project(&p.project)?;
+            let removed = {
+                let mut projects = self.state.projects.write();
+                projects.unregister_project(&p.project)?
+            };
+            self.state.persist_projects_durable().await?;
 
             // Drop the unregistered project's repo from kb roots; its committed
             // `.bbox/knowledge/` stays on disk and reloads on re-register.
@@ -408,7 +451,20 @@ impl BlackboxServer {
                 "orphaned_refs": total_refs,
                 "forced": total_refs > 0 && force,
             }))?)
-        })
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool = "bbox_project_unregister", elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_unregister", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(
@@ -484,8 +540,8 @@ mod tests {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
     }
 
-    #[test]
-    fn register_loads_and_counts_committed_project_knowledge() {
+    #[tokio::test]
+    async fn register_loads_and_counts_committed_project_knowledge() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(repo.join(".bbox").join("knowledge")).unwrap();
@@ -526,9 +582,11 @@ mod tests {
         .unwrap();
 
         let server = test_server(&tmp);
-        let reg = server.bbox_project_register(Parameters(ProjectRegisterParams {
-            path: repo.to_string_lossy().into_owned(),
-        }));
+        let reg = server
+            .bbox_project_register(Parameters(ProjectRegisterParams {
+                path: repo.to_string_lossy().into_owned(),
+            }))
+            .await;
         assert_ne!(reg.is_error, Some(true));
 
         // Register loaded the committed entry into the query surface...
@@ -696,16 +754,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bbox_project_list_round_trips_through_tool_serialization() {
+    #[tokio::test]
+    async fn bbox_project_list_round_trips_through_tool_serialization() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let server = test_server(&tmp);
 
-        let register = server.bbox_project_register(Parameters(ProjectRegisterParams {
-            path: project.to_string_lossy().into_owned(),
-        }));
+        let register = server
+            .bbox_project_register(Parameters(ProjectRegisterParams {
+                path: project.to_string_lossy().into_owned(),
+            }))
+            .await;
         assert_ne!(register.is_error, Some(true));
         let register_text = serde_json::to_value(&register).unwrap()["content"][0]["text"]
             .as_str()
@@ -734,8 +794,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bbox_project_rename_migrates_project_scoped_state() {
+    #[tokio::test]
+    async fn bbox_project_rename_migrates_project_scoped_state() {
         let tmp = tempfile::tempdir().unwrap();
         let old_project = tmp.path().join("old-project");
         let new_project = tmp.path().join("new-project");
@@ -751,9 +811,11 @@ mod tests {
             .into_owned();
         let server = test_server(&tmp);
 
-        let register = server.bbox_project_register(Parameters(ProjectRegisterParams {
-            path: old_project.clone(),
-        }));
+        let register = server
+            .bbox_project_register(Parameters(ProjectRegisterParams {
+                path: old_project.clone(),
+            }))
+            .await;
         assert_ne!(register.is_error, Some(true));
         let text = serde_json::to_value(&register).unwrap()["content"][0]["text"]
             .as_str()
@@ -808,6 +870,8 @@ mod tests {
                 origin: None,
             })
             .unwrap();
+        // Test setup is sync-only; thread persistence is write-behind here.
+        server.state.threads_persister.request();
         server
             .state
             .notes
@@ -839,12 +903,14 @@ mod tests {
             })
             .unwrap();
 
-        let renamed = server.bbox_project_rename(Parameters(ProjectRenameParams {
-            project: registered.project_id.clone(),
-            new_path: new_project.clone(),
-            move_on_disk: None,
-            dry_run: None,
-        }));
+        let renamed = server
+            .bbox_project_rename(Parameters(ProjectRenameParams {
+                project: registered.project_id.clone(),
+                new_path: new_project.clone(),
+                move_on_disk: None,
+                dry_run: None,
+            }))
+            .await;
         assert_ne!(renamed.is_error, Some(true));
         let text = serde_json::to_value(&renamed).unwrap()["content"][0]["text"]
             .as_str()
