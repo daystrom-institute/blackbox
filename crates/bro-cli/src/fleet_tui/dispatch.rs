@@ -177,8 +177,6 @@ pub(super) fn install_dispatch(app: &mut App, outcome: DispatchOutcome) {
     // Pin the roster cursor to the freshly dispatched agent so it stays selected
     // as it surfaces in (and later moves between) buckets.
     app.roster_anchor_id = Some(id.clone());
-    // Persist so the session is recoverable even before it terminates.
-    app.orch.persist();
     app.set_status(
         format!(
             "dispatched {} agent {}{} in {}",
@@ -277,7 +275,6 @@ pub(super) fn install_standalone(app: &mut App, o: StandaloneOutcome) {
     let _ = composer_history::append_history(&app.composer_history_path, &o.prompt);
     app.focused_agent_id = Some(id.clone());
     app.zone = Zone::SingleAgent;
-    app.orch.persist();
     let verb = if o.is_resume { "resumed" } else { "started" };
     app.set_status(
         format!("{verb} {} agent {}", o.provider, &id[..8.min(id.len())]),

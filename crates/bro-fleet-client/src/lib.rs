@@ -1,9 +1,9 @@
 //! `bro-fleet-client` — the daemon-driving engine behind `bro fleet`.
 //!
 //! The fleet cockpit (`bro-cli`) links this crate, not `blackbox`. It holds the
-//! `FleetOrchestrator` that POSTs `/control/*` to the daemon singleton, the live
-//! task mirror the cockpit reloads/persists, the stream-json transcript parser,
-//! and the `fleet.json` config types — all over the contract bottom
+//! `FleetOrchestrator` that POSTs `/control/*` to the daemon singleton, the
+//! in-memory roster projection, the stream-json transcript parser, and the
+//! `fleet.json` config types — all over the contract bottom
 //! (`bro-protocol` + `bro-core`) plus transport deps, never the daemon crate
 //! (harness-daemon-boundary.md §7).
 
@@ -13,7 +13,6 @@
 #![allow(clippy::collapsible_if)]
 
 mod config;
-mod events;
 mod fleet;
 mod mcp;
 mod tail;

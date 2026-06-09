@@ -7,9 +7,9 @@
 //! panic leaves the shell wedged in raw/alt-screen) and then records the panic
 //! to that log + the now-clean stderr.
 //!
-//! This is the durable "loud, TUI-safe" channel: the status poller, the reload
-//! reconcile pass, and any future cockpit diagnostic call `tracing::*` and land
-//! in `<store_dir>/logs/cockpit.<date>.log`. Until this existed, every
+//! This is the durable "loud, TUI-safe" channel: the roster subscriber and any
+//! future cockpit diagnostic call `tracing::*` land in
+//! `<store_dir>/logs/cockpit.<date>.log`. Until this existed, every
 //! `tracing::*` in the thin client (e.g. `FleetConfig::load_from`) was dropped
 //! on the floor for want of a subscriber.
 
@@ -28,8 +28,8 @@ static PANIC_HOOK: Once = Once::new();
 /// appender: the cockpit emits only a handful of lines per run, which a blocking
 /// `BufWriter` keeps buffered until the buffer fills or the process exits — so
 /// the log appears effectively write-on-exit and is useless for live tailing
-/// while debugging (the exact failure mode that made this session's poller-stall
-/// chase so hard). The non-blocking worker flushes promptly on its own thread.
+/// while debugging live cockpit state. The non-blocking worker flushes promptly
+/// on its own thread.
 #[must_use = "hold the returned WorkerGuard for the cockpit's lifetime, or logs are lost"]
 pub fn init_cockpit_logging(store_dir: &Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = store_dir.join("logs");
@@ -72,9 +72,9 @@ pub fn init_cockpit_logging(store_dir: &Path) -> Option<tracing_appender::non_bl
     Some(guard)
 }
 
-/// Wrap the existing panic hook so a panic in the cockpit (TUI thread, a status
-/// poller task, anywhere) restores the terminal before the process dies, then
-/// records the panic to the log file and the restored stderr. Without this a
+/// Wrap the existing panic hook so a panic in the cockpit (TUI thread,
+/// background subscriber task, anywhere) restores the terminal before the
+/// process dies, then records the panic to the log file and the restored stderr. Without this a
 /// panic leaves the shell in raw-mode + alternate-screen — the classic TUI
 /// wedge that forces a `reset`.
 fn install_panic_hook() {

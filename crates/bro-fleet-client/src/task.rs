@@ -1,19 +1,16 @@
-//! Client-side task mirror.
+//! Client-side roster projection.
 //!
-//! A lean local copy of the fields the fleet cockpit reads, fed by the daemon
-//! status poller. This is NOT the daemon's `Task` (the daemon owns the real
-//! execution engine); it is the client's view of a dispatched agent, persisted
-//! to the cockpit's own `bro_home/fleet` store so historical sessions survive a
-//! reload. Status is typed directly on the wire `bro_protocol::TaskStatus`.
+//! A lean in-memory copy of the daemon roster fields the fleet cockpit reads.
+//! The daemon owns Tier-1 fleet data; this store is rebuilt from
+//! `/control/roster` snapshots and `/control/roster/stream` deltas and never
+//! persists `$BRO_HOME/fleet/tasks.json`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
-use bro_core::Provider;
-use bro_protocol::TaskStatus;
+use bro_core::{Origin, Provider};
+use bro_protocol::{RosterDelta, RosterSnapshotV1, RosterSummaryV1, TaskStatus};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -25,20 +22,8 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Human-readable elapsed time between `started_at` and `completed_at` (or now).
-pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
-    let end = completed_at.unwrap_or_else(now_ms);
-    let ms = end.saturating_sub(started_at);
-    let s = ms / 1000;
-    if s < 60 {
-        format!("{s}s")
-    } else {
-        format!("{}m {}s", s / 60, s % 60)
-    }
-}
-
-/// Live mirror of a dispatched fleet agent. Only the fields the cockpit renders
-/// (via `AgentHandle::snapshot`) are kept; the daemon owns everything else.
+/// Live projection of a daemon roster row. Only the fields the cockpit renders
+/// (via `AgentHandle::snapshot`) are kept here; the daemon owns execution.
 pub struct TaskInner {
     pub id: String,
     pub provider: Provider,
@@ -52,84 +37,40 @@ pub struct TaskInner {
     pub started_at: u64,
     pub completed_at: Option<u64>,
     pub cwd: Option<String>,
-    /// Durable roster display name (mirrors the daemon's `bro_label`).
+    /// Durable roster display name (mirrors the daemon's `label`).
     pub bro_label: Option<String>,
-    /// Loaded/orphaned tasks are marked recoverable so the cockpit can
-    /// distinguish a resumable interruption from ordinary terminal state.
+    /// Roster snapshot rows are daemon-owned; recoverable is retained only for
+    /// local synthetic error rows returned from a failed dispatch/resume call.
     pub recoverable: bool,
-    /// Wall-clock (ms) of the last observed stream event ("last interaction").
-    /// Stamped by the status poller when the event count grows.
+    /// Wall-clock (ms) of the last daemon-observed activity stamp.
     pub last_event_at_ms: Option<u64>,
-    /// The model pinned at dispatch time - survives cockpit reload even when
-    /// stream events lack a top-level `model` field (e.g. brodex/Responses).
+    /// Model reported by the daemon roster, if available.
     pub model: Option<String>,
+    pub origin: Origin,
+    pub managed_worktree: Option<String>,
+    pub workflow_owned: bool,
 }
 
 pub struct Task {
     pub inner: Mutex<TaskInner>,
     pub notify: Arc<Notify>,
-    /// Wall-clock (ms) the status poller last completed a poll cycle (success OR
-    /// handled error) for this task — a liveness heartbeat, distinct from
-    /// `last_event_at_ms` (which only advances on new daemon events). The
-    /// poller-supervisor watches this: if a non-terminal task's heartbeat goes
-    /// stale, its poller has silently wedged and the supervisor respawns it.
-    /// Seeded to "now" at construction so a freshly-attached poller gets a grace
-    /// window before the supervisor would consider it stalled.
-    pub last_poll_ms: AtomicU64,
 }
 
 impl Task {
     pub fn id(&self) -> String {
         self.inner.lock().id.clone()
     }
-
-    /// Stamp the poll-liveness heartbeat (called by the poller each cycle).
-    pub fn mark_polled(&self) {
-        self.last_poll_ms
-            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Milliseconds since the last poll-liveness heartbeat.
-    pub fn since_last_poll_ms(&self) -> u64 {
-        now_ms().saturating_sub(self.last_poll_ms.load(std::sync::atomic::Ordering::Relaxed))
-    }
 }
 
-/// On-disk record. A subset of the daemon's persisted shape — serde ignores the
-/// daemon-only fields in any pre-existing `tasks.json`, so a cockpit store
-/// written by an older in-process fleet still loads.
-#[derive(Serialize, Deserialize)]
-struct PersistedTask {
-    id: String,
-    provider: Provider,
-    session_id: String,
-    #[serde(default)]
-    events: Vec<Value>,
-    #[serde(default)]
-    last_assistant_message: Option<String>,
-    #[serde(default)]
-    cost_usd: Option<f64>,
-    #[serde(default)]
-    num_turns: Option<u64>,
-    #[serde(default)]
-    stderr: String,
-    status: TaskStatus,
-    started_at: u64,
-    #[serde(default)]
-    completed_at: Option<u64>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    bro_label: Option<String>,
-    #[serde(default)]
-    recoverable: bool,
-    #[serde(default)]
-    model: Option<String>,
-}
-
-/// The cockpit's task store: the agents it has dispatched or reloaded.
+/// The cockpit's in-memory roster projection.
 pub struct TaskStore {
     tasks: HashMap<String, Arc<Task>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterApply {
+    Applied { seq: u64 },
+    Gap { expected: u64, got: u64 },
 }
 
 impl TaskStore {
@@ -165,99 +106,190 @@ impl TaskStore {
         dropped
     }
 
-    /// Flush every task to `store_dir/tasks.json` (atomic rename) so a later
-    /// cockpit launch reloads these sessions.
-    pub fn persist_all_events(&self, store_dir: &std::path::Path) {
-        let records: Vec<PersistedTask> = self
-            .tasks
-            .values()
-            .map(|t| {
-                let inner = t.inner.lock();
-                PersistedTask {
-                    id: inner.id.clone(),
-                    provider: inner.provider,
-                    session_id: inner.session_id.clone(),
-                    events: inner.events.clone(),
-                    last_assistant_message: inner.last_assistant_message.clone(),
-                    cost_usd: inner.cost_usd,
-                    num_turns: inner.num_turns,
-                    stderr: inner.stderr.chars().take(2000).collect(),
-                    status: inner.status,
-                    started_at: inner.started_at,
-                    completed_at: inner.completed_at,
-                    cwd: inner.cwd.clone(),
-                    bro_label: inner.bro_label.clone(),
-                    recoverable: inner.recoverable,
-                    model: inner.model.clone(),
-                }
-            })
-            .collect();
-
-        let file = store_dir.join("tasks.json");
-        let tmp = store_dir.join("tasks.json.tmp");
-        if let Ok(data) = serde_json::to_string(&records) {
-            let _ = std::fs::create_dir_all(store_dir);
-            if std::fs::write(&tmp, &data).is_ok() {
-                let _ = std::fs::rename(&tmp, &file);
-            }
+    pub fn replace_from_snapshot(&mut self, snapshot: RosterSnapshotV1) -> u64 {
+        let mut seen = HashSet::new();
+        for task in snapshot.tasks {
+            seen.insert(task.task_id.as_str().to_string());
+            self.upsert_roster_task(task);
         }
+        self.tasks.retain(|id, _| seen.contains(id));
+        snapshot.version
     }
 
-    /// Load persisted sessions. A `Running` task from a prior launch is flipped
-    /// to `Failed` + `recoverable` (the cockpit shows it as Interrupted, §5);
-    /// `ttl_ms` evicts records older than the cutoff (the cockpit passes
-    /// `u64::MAX` — manual cleanup, no TTL).
-    pub fn load(store_dir: &std::path::Path, ttl_ms: u64) -> Self {
-        let file = store_dir.join("tasks.json");
-        let mut store = Self::new();
-        let data = match std::fs::read_to_string(&file) {
-            Ok(d) => d,
-            Err(_) => return store,
-        };
-        let records: Vec<PersistedTask> = match serde_json::from_str(&data) {
-            Ok(r) => r,
-            Err(_) => return store,
-        };
-        let cutoff = now_ms().saturating_sub(ttl_ms);
-        for mut rec in records {
-            if rec.started_at < cutoff {
-                continue;
-            }
-            if rec.status == TaskStatus::Running || rec.status == TaskStatus::Pending {
-                rec.status = TaskStatus::Failed;
-                rec.completed_at = Some(now_ms());
-                rec.recoverable = true;
-            }
-            let task = Arc::new(Task {
-                inner: Mutex::new(TaskInner {
-                    id: rec.id.clone(),
-                    provider: rec.provider,
-                    session_id: rec.session_id,
-                    events: rec.events,
-                    last_assistant_message: rec.last_assistant_message,
-                    cost_usd: rec.cost_usd,
-                    num_turns: rec.num_turns,
-                    stderr: rec.stderr,
-                    status: rec.status,
-                    started_at: rec.started_at,
-                    completed_at: rec.completed_at,
-                    cwd: rec.cwd,
-                    bro_label: rec.bro_label,
-                    recoverable: rec.recoverable,
-                    last_event_at_ms: None,
-                    model: rec.model,
-                }),
-                notify: Arc::new(Notify::new()),
-                last_poll_ms: AtomicU64::new(now_ms()),
-            });
-            store.tasks.insert(rec.id, task);
+    pub fn apply_delta(&mut self, last_seq: u64, delta: RosterDelta) -> RosterApply {
+        let seq = delta.seq();
+        if seq <= last_seq {
+            return RosterApply::Applied { seq: last_seq };
         }
-        store
+        let expected = last_seq.saturating_add(1);
+        if seq != expected {
+            return RosterApply::Gap { expected, got: seq };
+        }
+        match delta {
+            RosterDelta::Added { task, .. } | RosterDelta::Updated { task, .. } => {
+                self.upsert_roster_task(task);
+            }
+            RosterDelta::Removed { task_id, .. } => {
+                self.tasks.remove(task_id.as_str());
+            }
+        }
+        RosterApply::Applied { seq }
+    }
+
+    fn upsert_roster_task(&mut self, task: RosterSummaryV1) {
+        let id = task.task_id.as_str().to_string();
+        if let Some(existing) = self.tasks.get(&id) {
+            update_task_from_roster(existing, task);
+        } else {
+            self.tasks.insert(id, task_from_roster(task));
+        }
     }
 }
 
 impl Default for TaskStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
+    let now = now_ms();
+    let completed_at = task.status.is_terminal().then_some(task.last_event_at.unwrap_or(now));
+    Arc::new(Task {
+        inner: Mutex::new(TaskInner {
+            id: task.task_id.as_str().to_string(),
+            provider: task.provider,
+            session_id: task
+                .session_id
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_else(|| "pending".to_string()),
+            events: Vec::new(),
+            last_assistant_message: task.last_message_snippet,
+            cost_usd: task.cost,
+            num_turns: task.turns,
+            stderr: String::new(),
+            status: task.status,
+            started_at: task.last_event_at.unwrap_or(now),
+            completed_at,
+            cwd: task.cwd,
+            bro_label: task.label,
+            recoverable: false,
+            last_event_at_ms: task.last_event_at,
+            model: task.model,
+            origin: task.origin,
+            managed_worktree: task.managed_worktree,
+            workflow_owned: task.workflow_owned,
+        }),
+        notify: Arc::new(Notify::new()),
+    })
+}
+
+fn update_task_from_roster(existing: &Task, task: RosterSummaryV1) {
+    let mut inner = existing.inner.lock();
+    inner.provider = task.provider;
+    inner.session_id = task
+        .session_id
+        .as_ref()
+        .map(|id| id.as_str().to_string())
+        .unwrap_or_else(|| "pending".to_string());
+    inner.last_assistant_message = task.last_message_snippet;
+    inner.cost_usd = task.cost;
+    inner.num_turns = task.turns;
+    inner.status = task.status;
+    if inner.started_at == 0 {
+        inner.started_at = task.last_event_at.unwrap_or_else(now_ms);
+    }
+    inner.completed_at = task.status.is_terminal().then_some(task.last_event_at.unwrap_or_else(now_ms));
+    inner.cwd = task.cwd;
+    inner.bro_label = task.label;
+    inner.recoverable = false;
+    inner.last_event_at_ms = task.last_event_at;
+    inner.model = task.model;
+    inner.origin = task.origin;
+    inner.managed_worktree = task.managed_worktree;
+    inner.workflow_owned = task.workflow_owned;
+    drop(inner);
+    existing.notify.notify_waiters();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bro_core::{Origin, TaskId};
+
+    fn summary(id: &str, status: TaskStatus) -> RosterSummaryV1 {
+        RosterSummaryV1 {
+            task_id: TaskId::new(id),
+            status,
+            provider: Provider::Brodex,
+            cost: Some(0.25),
+            turns: Some(3),
+            cwd: Some("/tmp/project".to_string()),
+            label: Some(format!("agent-{id}")),
+            session_id: None,
+            last_message_snippet: Some("hello".to_string()),
+            model: Some("gpt-test".to_string()),
+            last_event_at: Some(42),
+            origin: Origin::Cockpit,
+            managed_worktree: Some("/tmp/worktree".to_string()),
+            workflow_owned: false,
+        }
+    }
+
+    #[test]
+    fn applies_added_updated_removed_roster_deltas() {
+        let mut store = TaskStore::new();
+        let added = RosterDelta::Added {
+            seq: 1,
+            task: summary("task-1", TaskStatus::Running),
+        };
+        assert_eq!(store.apply_delta(0, added), RosterApply::Applied { seq: 1 });
+        assert_eq!(store.all_tasks().len(), 1);
+
+        let updated = RosterDelta::Updated {
+            seq: 2,
+            task: summary("task-1", TaskStatus::Completed),
+        };
+        assert_eq!(store.apply_delta(1, updated), RosterApply::Applied { seq: 2 });
+        let task = store.all_tasks().pop().unwrap();
+        assert_eq!(task.inner.lock().status, TaskStatus::Completed);
+
+        let removed = RosterDelta::Removed {
+            seq: 3,
+            task_id: TaskId::new("task-1"),
+        };
+        assert_eq!(store.apply_delta(2, removed), RosterApply::Applied { seq: 3 });
+        assert!(store.all_tasks().is_empty());
+    }
+
+    #[test]
+    fn roster_seq_gap_requests_snapshot_resync() {
+        let mut store = TaskStore::new();
+        let delta = RosterDelta::Added {
+            seq: 7,
+            task: summary("task-1", TaskStatus::Running),
+        };
+        assert_eq!(
+            store.apply_delta(4, delta),
+            RosterApply::Gap {
+                expected: 5,
+                got: 7
+            }
+        );
+        assert!(store.all_tasks().is_empty());
+    }
+
+    #[test]
+    fn in_memory_roster_does_not_write_tasks_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = TaskStore::new();
+        let snapshot = RosterSnapshotV1 {
+            version: 1,
+            tasks: vec![summary("task-1", TaskStatus::Running)],
+        };
+        store.replace_from_snapshot(snapshot);
+        assert!(!root.join("tasks.json").exists());
     }
 }

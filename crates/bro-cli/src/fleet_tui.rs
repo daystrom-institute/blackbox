@@ -675,6 +675,61 @@ impl App {
     }
 }
 
+fn refresh_agents_from_roster(app: &mut App) {
+    let mut existing: HashMap<String, Agent> = app
+        .agents
+        .drain(..)
+        .map(|agent| (agent.task.id(), agent))
+        .collect();
+    let mut next = Vec::new();
+    for handle in app.orch.tasks() {
+        let id = handle.id();
+        let snap = handle.snapshot();
+        let daemon_name = snap.name.clone().unwrap_or_else(|| "(session)".to_string());
+        if daemon_name.starts_with(CLASSIFIER_NAME_PREFIX) {
+            continue;
+        }
+        if let Some(mut agent) = existing.remove(&id) {
+            agent.task = handle;
+            agent.provider = snap.provider;
+            if snap.model.is_some() {
+                agent.selected_model = snap.model.clone();
+            }
+            if let Some(cwd) = project_display_cwd(snap.cwd.as_deref()) {
+                agent.selected_cwd = Some(cwd);
+            }
+            if snap.name.is_some() {
+                agent.name = daemon_name;
+            }
+            next.push(agent);
+        } else {
+            next.push(Agent {
+                task: handle,
+                classifier: None,
+                provider: snap.provider,
+                selected_model: snap.model.clone(),
+                selected_effort: None,
+                selected_service_tier: None,
+                selected_cwd: project_display_cwd(snap.cwd.as_deref()),
+                name: daemon_name,
+                initial_prompt: None,
+                pending_inputs: VecDeque::new(),
+                seen_user_steers: 0,
+            });
+        }
+    }
+    app.agents = next;
+    if let Some(id) = &app.focused_agent_id
+        && !app.agents.iter().any(|agent| agent.task.id() == *id)
+    {
+        app.focused_agent_id = None;
+        if app.zone == Zone::SingleAgent && !app.mode.is_standalone() {
+            app.zone = Zone::Roster;
+        }
+    }
+    app.reconcile_roster_selection();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchMode {
     Fleet,
@@ -1082,48 +1137,16 @@ fn complete_project(app: &mut App) {
 pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_config_with_daemon_url(daemon_url)?);
     // File-only logging + terminal-restoring panic hook before we take the
-    // terminal. The status poller and the reload reconcile pass below log here.
-    // Hold the guard for the whole cockpit lifetime (drop = flush + stop worker).
+    // terminal. Hold the guard for the whole cockpit lifetime (drop = flush +
+    // stop worker).
     let _log_guard = crate::logging::init_cockpit_logging(orch.store_dir());
+    orch.start_roster_subscription().await?;
     let mut app = App::new(orch.clone(), cwd, tokio::runtime::Handle::current());
+    refresh_agents_from_roster(&mut app);
 
-    // Repopulate from prior fleet sessions persisted on disk. `load` flips every
-    // prior `Running` task to recoverable/Interrupted, but the daemon may still
-    // be running it (only the cockpit restarted) — so reconcile each recoverable
-    // task against the daemon: still-live ones get their status restored and a
-    // fresh poller re-attached (steerable again); genuinely-orphaned ones stay
-    // Interrupted. This is the reload half of the poller-death fix.
-    for handle in orch.reconcile_reloaded().await {
-        let snap = handle.snapshot();
-        let name = snap.name.clone().unwrap_or_else(|| "(session)".to_string());
-        // Hidden classifier-companion sessions never surface in the roster.
-        if name.starts_with(CLASSIFIER_NAME_PREFIX) {
-            continue;
-        }
-        app.agents.push(Agent {
-            task: handle,
-            classifier: None,
-            provider: snap.provider,
-            selected_model: snap.model.clone(),
-            selected_effort: None,
-            selected_service_tier: None,
-            selected_cwd: project_display_cwd(snap.cwd.as_deref()),
-            name,
-            initial_prompt: None,
-            pending_inputs: VecDeque::new(),
-            seen_user_steers: 0,
-        });
-    }
-
-    // Liveness backstop: respawn any per-task status poller that silently wedges
-    // under load (pollers have been observed to freeze while the daemon stays
-    // healthy, leaving stale "Active" rows). One watchdog, started after the
-    // initial reconcile.
-    orch.spawn_poller_supervisor();
-
-    // Forward tail events into the sync TUI loop (mirrors council_tui's SSE
-    // fan-in). State is derived by polling the task Arcs each tick; tail events
-    // drive status flashes and ensure prompt redraws on completion.
+    // Forward roster-change/status signals into the sync TUI loop (mirrors
+    // council_tui's SSE fan-in). State is derived by reading the in-memory
+    // daemon roster projection each tick; signals wake redraws.
     let (tx, rx) = mpsc::channel::<TailEvent>();
     let mut sub = orch.subscribe();
     let forward = tokio::spawn(async move {
@@ -1136,15 +1159,13 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
 
     let result = run_tui(&mut app, rx);
     forward.abort();
-    // Persist on exit so this session set is here on the next launch.
-    orch.persist();
     result
 }
 
 pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_agent_config()?);
     let _log_guard = crate::logging::init_cockpit_logging(orch.store_dir());
-    orch.spawn_poller_supervisor();
+    orch.start_roster_subscription().await?;
     let mut app = App::new_with_mode(
         orch.clone(),
         launch.cwd.clone(),
@@ -1179,7 +1200,6 @@ pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
 
     let result = run_tui(&mut app, rx);
     forward.abort();
-    orch.persist();
     result
 }
 
@@ -1192,7 +1212,6 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
     if app.mode.is_standalone() {
         forget_standalone_agents(app, true);
         app.agents.clear();
-        app.orch.persist();
     }
     result
 }
@@ -1772,6 +1791,9 @@ fn page_scroll_step(app: &App) -> usize {
 }
 
 fn handle_tail(app: &mut App, ev: TailEvent) {
+    if !app.mode.is_standalone() {
+        refresh_agents_from_roster(app);
+    }
     match ev {
         TailEvent::TaskCompleted { cost, .. } => {
             let c = cost.map(|c| format!(" (${c:.4})")).unwrap_or_default();
@@ -1783,7 +1805,7 @@ fn handle_tail(app: &mut App, ev: TailEvent) {
                 Duration::from_secs(6),
             );
         }
-        _ => {}
+        TailEvent::RosterChanged | TailEvent::TaskCancelled { .. } => {}
     }
 }
 
@@ -2602,7 +2624,6 @@ fn clear_standalone(app: &mut App) {
     app.history_cursor = None;
     app.scroll_from_bottom = 0;
     reset_inline_commit_state(app);
-    app.orch.persist();
     app.set_status(
         "cleared — next input starts a fresh session",
         Duration::from_secs(4),
@@ -2879,7 +2900,6 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
     });
     app.agents[idx].pending_inputs.clear();
     app.agents[idx].seen_user_steers = 0;
-    app.orch.persist();
     app.set_status("resumed session", Duration::from_secs(3));
 }
 
