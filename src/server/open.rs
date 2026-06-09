@@ -15,6 +15,7 @@ use crate::packets::Packets;
 use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::roadmap::Roadmap;
+use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
     artifacts, config, council, crons, edge_index, index, lsp, orchestration, path_cache, pollers,
@@ -121,7 +122,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     tracing::info!("Roadmap store: {}", rm_path.display());
 
     let notes_path = cfg.paths.notes_path.clone();
-    let notes_store = Notes::open(&notes_path)?;
+    let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path)?));
+    let notes_persister = StorePersister::spawn("notes", notes_store.clone(), notes_path.clone());
     tracing::info!("Notes store: {}", notes_path.display());
 
     let pins_path = cfg.paths.pins_path.clone();
@@ -167,7 +169,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         &idx,
         &kb,
         &th,
-        &notes_store,
+        &notes_store.read(),
         &task_store,
         &roadmap_store,
         &store_dir,
@@ -180,7 +182,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         gaps: RwLock::new(gaps_store),
         roadmap: RwLock::new(roadmap_store),
         threads: RwLock::new(th),
-        notes: RwLock::new(notes_store),
+        notes: notes_store,
+        notes_persister,
         pins: RwLock::new(pins_store),
         projects: RwLock::new(projects_store),
         packets: RwLock::new(packets_store),

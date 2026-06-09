@@ -15,8 +15,29 @@ impl BlackboxServer {
         name = "bbox_note",
         description = "Record a structured side-channel note while working."
     )]
-    pub(crate) fn bbox_note(&self, Parameters(p): Parameters<NoteParams>) -> CallToolResult {
-        Self::run("bbox_note", || self.state.notes.write().create(&p))
+    pub(crate) async fn bbox_note(&self, Parameters(p): Parameters<NoteParams>) -> CallToolResult {
+        let start = std::time::Instant::now();
+        let text = match self.state.notes.write().create(&p) {
+            Ok(text) => text,
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_note", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
+            }
+        };
+
+        match self.state.persist_notes_durable().await {
+            Ok(()) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool = "bbox_note", elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_note", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(
@@ -31,10 +52,31 @@ impl BlackboxServer {
         name = "bbox_note_resolve",
         description = "Mark a note acknowledged or addressed."
     )]
-    pub(crate) fn bbox_note_resolve(
+    pub(crate) async fn bbox_note_resolve(
         &self,
         Parameters(p): Parameters<NoteResolveParams>,
     ) -> CallToolResult {
-        Self::run("bbox_note_resolve", || self.state.notes.write().resolve(&p))
+        let start = std::time::Instant::now();
+        let text = match self.state.notes.write().resolve(&p) {
+            Ok(text) => text,
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_note_resolve", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
+            }
+        };
+
+        match self.state.persist_notes_durable().await {
+            Ok(()) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool = "bbox_note_resolve", elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_note_resolve", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 }

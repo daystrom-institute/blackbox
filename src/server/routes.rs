@@ -1286,6 +1286,14 @@ pub(crate) async fn control_team_handler(
 // scripts can use plain `curl`. They're loopback-only via the listener
 // binding.
 
+pub(crate) async fn admin_runtime_metrics() -> impl axum::response::IntoResponse {
+    axum::Json(json!({
+        "status": "ok",
+        "snapshot": super::runtime_metrics::latest_runtime_metrics_snapshot(),
+    }))
+    .into_response()
+}
+
 pub(crate) async fn admin_packet_compile(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<Value>,
@@ -2135,6 +2143,10 @@ pub(crate) fn migrate_project_refs(
         .notes
         .write()
         .rename_project_refs(old_project, new_project)?;
+    if notes > 0 {
+        // This sync migration helper cannot await; notes persistence is write-behind here.
+        state.notes_persister.request();
+    }
     let pins = state
         .pins
         .write()
@@ -3151,8 +3163,8 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body_bytes)
-            .expect("roster body must be valid JSON");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("roster body must be valid JSON");
         let tasks = value
             .get("tasks")
             .and_then(|t| t.as_array())
@@ -3191,7 +3203,11 @@ mod tests {
         // delta test owns generation semantics.
         let obj = value.as_object().expect("envelope must be an object");
         assert!(obj.contains_key("version"), "envelope must carry `version`");
-        assert_eq!(obj.len(), 2, "envelope must carry exactly `version` and `tasks`");
+        assert_eq!(
+            obj.len(),
+            2,
+            "envelope must carry exactly `version` and `tasks`"
+        );
     }
 
     #[tokio::test]

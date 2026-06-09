@@ -125,6 +125,7 @@ chrono = "0.4"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-metrics = "0.5"
 async-trait = "0.1"
 
 # MCP SDK

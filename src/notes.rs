@@ -1,10 +1,12 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+
+use crate::store_persister::StoreSnapshot;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -180,7 +182,7 @@ pub struct Note {
     pub resolution_note: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteStore {
     pub version: u32,
     pub notes: Vec<Note>,
@@ -195,10 +197,17 @@ impl NoteStore {
     }
 }
 
+impl StoreSnapshot for Notes {
+    type Snapshot = NoteStore;
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        Ok(self.store.clone())
+    }
+}
+
 // ── Store operations ───────────────────────────────────────────────
 
 pub struct Notes {
-    store_path: PathBuf,
     store: NoteStore,
 }
 
@@ -212,24 +221,7 @@ impl Notes {
         } else {
             NoteStore::new()
         };
-        Ok(Self {
-            store_path: store_path.to_path_buf(),
-            store,
-        })
-    }
-
-    fn save(&self) -> Result<()> {
-        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        if self.store_path.exists() {
-            let raw = fs::read_to_string(&self.store_path)
-                .with_context(|| format!("reading {}", self.store_path.display()))?;
-            self.store = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", self.store_path.display()))?;
-        }
-        Ok(())
+        Ok(Self { store })
     }
 
     fn now_iso() -> String {
@@ -252,38 +244,29 @@ impl Notes {
     }
 
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let mut updated = 0usize;
-            let now = Self::now_iso();
-            for note in &mut self.store.notes {
-                if note.project.as_deref() == Some(old_project) {
-                    note.project = Some(new_project.to_string());
-                    note.updated_at = now.clone();
-                    updated += 1;
+        let mut updated = 0usize;
+        let now = Self::now_iso();
+        for note in &mut self.store.notes {
+            if note.project.as_deref() == Some(old_project) {
+                note.project = Some(new_project.to_string());
+                note.updated_at = now.clone();
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            for note in &self.store.notes {
+                if note.project.as_deref() == Some(new_project) {
+                    crate::embed_queue::enqueue_note(note);
                 }
             }
-            if updated > 0 {
-                self.save()?;
-                for note in &self.store.notes {
-                    if note.project.as_deref() == Some(new_project) {
-                        crate::embed_queue::enqueue_note(note);
-                    }
-                }
-            }
-            Ok(updated)
-        })
+        }
+        Ok(updated)
     }
 
     // ── bbox_note (create) ─────────────────────────────────────────
 
     pub fn create(&mut self, p: &NoteParams) -> Result<String> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.create_locked(p)
-        })
+        self.create_locked(p)
     }
 
     fn create_locked(&mut self, p: &NoteParams) -> Result<String> {
@@ -318,7 +301,6 @@ impl Notes {
         };
 
         self.store.notes.push(note.clone());
-        self.save()?;
         crate::embed_queue::enqueue_note(&note);
 
         Ok(format!("Note {id} recorded (kind={})", kind.as_ref()))
@@ -327,11 +309,7 @@ impl Notes {
     // ── bbox_note_resolve ──────────────────────────────────────────
 
     pub fn resolve(&mut self, p: &NoteResolveParams) -> Result<String> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.resolve_locked(p)
-        })
+        self.resolve_locked(p)
     }
 
     fn resolve_locked(&mut self, p: &NoteResolveParams) -> Result<String> {
@@ -370,7 +348,6 @@ impl Notes {
             note.resolution_note = Some(txt.to_string());
         }
 
-        self.save()?;
         Ok(format!("Note {} → {}", p.id, resolution.as_ref()))
     }
 
@@ -525,6 +502,10 @@ impl Notes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_persister::StorePersister;
+    use fs2::FileExt;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn mk_store() -> (tempfile::TempDir, Notes) {
@@ -532,6 +513,114 @@ mod tests {
         let path = dir.path().join("notes.json");
         let notes = Notes::open(&path).unwrap();
         (dir, notes)
+    }
+
+    #[tokio::test]
+    async fn create_and_resolve_round_trip_through_persister() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("notes.json");
+        let notes = Arc::new(RwLock::new(Notes::open(&path).unwrap()));
+        let persister = StorePersister::spawn("notes-test-roundtrip", notes.clone(), path.clone());
+
+        notes
+            .write()
+            .create(&NoteParams {
+                kind: "done".into(),
+                body: "persisted through actor".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        persister.request_durable().await.unwrap();
+
+        let saved: NoteStore =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.notes.len(), 1);
+        assert_eq!(saved.notes[0].body, "persisted through actor");
+        let id = saved.notes[0].id.clone();
+
+        notes
+            .write()
+            .resolve(&NoteResolveParams {
+                id: id.clone(),
+                resolution: "addressed".into(),
+                note: Some("verified".into()),
+            })
+            .unwrap();
+        persister.request_durable().await.unwrap();
+
+        let saved: NoteStore =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let note = saved.notes.iter().find(|note| note.id == id).unwrap();
+        assert_eq!(note.resolution, NoteResolution::Addressed);
+        assert_eq!(note.resolution_note.as_deref(), Some("verified"));
+    }
+
+    #[tokio::test]
+    async fn reads_succeed_while_persistence_ack_is_pending() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("notes.json");
+        let notes = Arc::new(RwLock::new(Notes::open(&path).unwrap()));
+        let persister = StorePersister::spawn("notes-test-pending", notes.clone(), path.clone());
+
+        notes
+            .write()
+            .create(&NoteParams {
+                kind: "done".into(),
+                body: "read before ack".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+
+        let lock_path = path.with_extension("json.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock_exclusive().unwrap();
+
+        let pending = {
+            let persister = persister.clone();
+            tokio::spawn(async move { persister.request_durable().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(!pending.is_finished());
+
+        let out = notes
+            .read()
+            .list(&NoteListParams {
+                id: None,
+                kind: None,
+                project: None,
+                session_id: None,
+                task_id: None,
+                thread_id: None,
+                bro: None,
+                resolution: None,
+                query: Some("read before ack".into()),
+                since: None,
+                limit: None,
+                include_addressed: None,
+                full: None,
+            })
+            .unwrap();
+        assert!(out.contains("read before ack"));
+
+        lock_file.unlock().unwrap();
+        pending.await.unwrap().unwrap();
     }
 
     #[test]
@@ -954,25 +1043,28 @@ mod tests {
         assert!(full.contains("END"));
     }
 
-    #[test]
-    fn roundtrip_persists() {
+    #[tokio::test]
+    async fn roundtrip_persists() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("notes.json");
-        {
-            let mut notes = Notes::open(&path).unwrap();
-            notes
-                .create(&NoteParams {
-                    kind: "learned".into(),
-                    body: "repo uses bb:managed markers".into(),
-                    session_id: None,
-                    project: Some("/repo/x".into()),
-                    task_id: None,
-                    thread_id: None,
-                    provider: None,
-                    bro: None,
-                })
-                .unwrap();
-        }
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("notes.json");
+        let notes = Arc::new(RwLock::new(Notes::open(&path).unwrap()));
+        let persister =
+            StorePersister::spawn("notes-test-roundtrip-legacy", notes.clone(), path.clone());
+        notes
+            .write()
+            .create(&NoteParams {
+                kind: "learned".into(),
+                body: "repo uses bb:managed markers".into(),
+                session_id: None,
+                project: Some("/repo/x".into()),
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        persister.request_durable().await.unwrap();
         let notes = Notes::open(&path).unwrap();
         assert_eq!(notes.store.notes.len(), 1);
         assert_eq!(notes.store.notes[0].kind, NoteKind::Learned);

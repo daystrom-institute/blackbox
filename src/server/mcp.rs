@@ -164,6 +164,10 @@ pub(super) fn build_http_app(
             axum::routing::get(admin_artifact_list),
         )
         .route(
+            "/admin/runtime-metrics",
+            axum::routing::get(admin_runtime_metrics),
+        )
+        .route(
             "/admin/artifact/supersede",
             axum::routing::post(admin_artifact_supersede),
         )

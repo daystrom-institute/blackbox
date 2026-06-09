@@ -2,6 +2,7 @@ use super::restore::restore_runtime_state;
 use super::{SharedState, dispatch_routed_event, spawn_edge_index_rebuild_watcher};
 use crate::packets::ScannerConfig;
 use crate::server::routes::signal_arc_dispatch;
+use crate::server::runtime_metrics::spawn_runtime_metrics_sampler;
 use crate::server::storage_gc::{spawn_storage_gc_thread, storage_gc_interval_from_env};
 use crate::tools::badgey_adapter::{
     BadgeyAgentAdapter, recover_badgey_non_terminal_state, restore_badgey_registry_from_notes,
@@ -20,6 +21,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_vector_warmup_thread()?;
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
     spawn_storage_gc(shared.clone());
+    spawn_runtime_metrics_sampler();
     spawn_task_completed_router(shared.clone());
     spawn_system_event_signal_bridge(shared.clone());
     start_bbox_watcher(&shared);

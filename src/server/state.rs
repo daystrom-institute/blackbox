@@ -20,6 +20,7 @@ use crate::packets::Packets;
 use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::roadmap::Roadmap;
+use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
     artifacts, council, crons, edge_index, lsp, path_cache, pollers, slack_channel_bindings,
@@ -42,7 +43,8 @@ pub(crate) struct SharedState {
     pub(crate) gaps: RwLock<GapStore>,
     pub(crate) roadmap: RwLock<Roadmap>,
     pub(crate) threads: RwLock<Threads>,
-    pub(crate) notes: RwLock<Notes>,
+    pub(crate) notes: Arc<RwLock<Notes>>,
+    pub(crate) notes_persister: StorePersister<Notes>,
     pub(crate) pins: RwLock<Pins>,
     pub(crate) projects: RwLock<ProjectRegistry>,
     pub(crate) packets: RwLock<Packets>,
@@ -223,6 +225,10 @@ pub(crate) struct WebhookDelivery {
 }
 
 impl SharedState {
+    pub(crate) async fn persist_notes_durable(&self) -> anyhow::Result<()> {
+        self.notes_persister.request_durable().await
+    }
+
     pub(crate) fn record_signal(&self, ev: SignalEvent) {
         let mut log = self.signal_log.write();
         if log.len() >= SIGNAL_LOG_CAP {
@@ -323,13 +329,18 @@ impl SharedState {
         // project's committed `.bbox/gaps/` into the query surface at startup.
         let mut gaps = GapStore::open(&store_dir.join("blackbox-gaps.json")).unwrap();
         gaps.set_project_roots(kb_project_roots).unwrap();
+        let notes_path = store_dir.join("notes.json");
+        let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
+        let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);
+
         SharedState {
             idx: RwLock::new(idx),
             kb: RwLock::new(kb),
             gaps: RwLock::new(gaps),
             roadmap: RwLock::new(Roadmap::open(&store_dir.join("roadmap.json")).unwrap()),
             threads: RwLock::new(Threads::open(&store_dir.join("threads.json")).unwrap()),
-            notes: RwLock::new(Notes::open(&store_dir.join("notes.json")).unwrap()),
+            notes: notes_store,
+            notes_persister,
             pins: RwLock::new(Pins::open(&store_dir.join("pins.json")).unwrap()),
             projects: RwLock::new(ProjectRegistry::open(store_dir.join("projects.json")).unwrap()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),

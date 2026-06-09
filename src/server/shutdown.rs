@@ -105,6 +105,9 @@ fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
     shared.lsp_sessions.shutdown_all();
     // Block until durable: shutdown must not race the persist actor's thread.
     crate::orchestration::flush_persist_blocking(&shared.task_store, &store_dir);
+    if let Err(err) = shared.notes_persister.flush_blocking() {
+        tracing::warn!(error = %err, "notes persister flush on shutdown failed");
+    }
     flush_vectors_with_timeout();
 }
 

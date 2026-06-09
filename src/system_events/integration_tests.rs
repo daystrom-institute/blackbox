@@ -16,6 +16,7 @@ use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::roadmap::Roadmap;
 use crate::server::state::{BlackboxServer, SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP};
+use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::tools::bro_runtime_params::*;
 use crate::{
@@ -39,7 +40,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let gaps = crate::gaps::GapStore::open(&tmp.path().join("gaps.json")).unwrap();
     let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
     let roadmap_store = Roadmap::open(&tmp.path().join("roadmap.json")).unwrap();
-    let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
+    let notes_path = tmp.path().join("notes.json");
+    let notes = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
+    let notes_persister = StorePersister::spawn("notes-test", notes.clone(), notes_path);
     let pins = Pins::open(&tmp.path().join("pins.json")).unwrap();
     let projects = ProjectRegistry::open(tmp.path().join("projects.json")).unwrap();
     let packets = Packets::open(tmp.path()).unwrap();
@@ -52,7 +55,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         gaps: RwLock::new(gaps),
         roadmap: RwLock::new(roadmap_store),
         threads: RwLock::new(threads),
-        notes: RwLock::new(notes),
+        notes,
+        notes_persister,
         pins: RwLock::new(pins),
         projects: RwLock::new(projects),
         packets: RwLock::new(packets),

@@ -88,6 +88,7 @@ mod slack_thread_store;
 mod slices;
 mod snapshot;
 mod storage_health;
+mod store_persister;
 mod system_events;
 mod system_memory;
 mod template;
