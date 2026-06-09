@@ -3208,6 +3208,10 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
 pub fn task_result_json(task: &Task) -> Value {
     populate_transcript_handle(task);
     let inner = task.inner.lock();
+    task_result_json_from_inner(&inner)
+}
+
+fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     let mut obj = serde_json::json!({
         "taskId": inner.id,
         "provider": inner.provider,
@@ -3245,7 +3249,7 @@ pub fn task_result_json(task: &Task) -> Value {
             obj["resultCapture"] = serde_json::json!({
                 "status": "missing",
                 "message": "task reached a terminal state without a captured assistant result",
-                "eventCount": observed_event_count(&inner),
+                "eventCount": observed_event_count(inner),
                 "exitCode": inner.exit_code,
                 "stderrPresent": !inner.stderr.trim().is_empty(),
                 "transcriptLocated": inner.transcript_location.is_some(),
@@ -3363,8 +3367,44 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
 }
 
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
-    let mut obj = task_result_json(task);
-    let inner = task.inner.lock();
+    populate_transcript_handle(task);
+    let (mut obj, snapshot, event_count, had_events, compacted_events, stderr_tail) = {
+        let inner = task.inner.lock();
+        let obj = task_result_json_from_inner(&inner);
+        let snapshot = protocol_task_snapshot(&inner);
+        let event_count = observed_event_count(&inner);
+        let had_events = tail > 0 && !inner.events.is_empty();
+        let compacted_events = if had_events {
+            inner
+                .events
+                .iter()
+                .rev()
+                .filter_map(compact_status_event)
+                .take(tail)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let stderr_tail = if (inner.status == TaskStatus::Failed || event_count == 0)
+            && !inner.stderr.trim().is_empty()
+        {
+            const MAX: usize = 2000;
+            let s = inner.stderr.trim_end();
+            Some(if s.len() > MAX {
+                let mut start = s.len() - MAX;
+                while start < s.len() && !s.is_char_boundary(start) {
+                    start += 1;
+                }
+                format!("…{}", &s[start..])
+            } else {
+                s.to_string()
+            })
+        } else {
+            None
+        };
+        (obj, snapshot, event_count, had_events, compacted_events, stderr_tail)
+    };
+
     // Typed wire snapshot. The flat taskId/sessionId/status/result fields above
     // already carry its task_id/session_id/status/last_message, and the fleet
     // cockpit reads dispatch facets (origin/managed_worktree/workflow_owned)
@@ -3372,7 +3412,6 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
     // snapshot only when it adds something a flat-field reader cannot already
     // see: a structured error, a non-default origin, a managed worktree, or
     // workflow ownership. In the common case it is pure duplication — omitted.
-    let snapshot = protocol_task_snapshot(&inner);
     if snapshot.error.is_some()
         || snapshot.origin != bro_core::Origin::Unknown
         || snapshot.managed_worktree.is_some()
@@ -3380,9 +3419,8 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
     {
         obj["snapshot"] = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
     }
-    let event_count = observed_event_count(&inner);
     obj["eventCount"] = Value::from(event_count);
-    if tail > 0 && !inner.events.is_empty() {
+    if had_events {
         // Bound `recentEvents` by SERIALIZED SIZE as well as by `tail` count, so
         // the whole status response stays under the 80KB MCP response cap
         // (`server/response.rs::cap_response_text`). That cap BYTE-truncates an
@@ -3395,13 +3433,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
         const RECENT_EVENTS_BUDGET_BYTES: usize = 56 * 1024;
         let mut recent: Vec<Value> = Vec::new();
         let mut bytes = 0usize;
-        for ev in inner
-            .events
-            .iter()
-            .rev()
-            .filter_map(compact_status_event)
-            .take(tail)
-        {
+        for ev in compacted_events {
             let sz = serde_json::to_string(&ev).map(|s| s.len()).unwrap_or(0);
             if !recent.is_empty() && bytes + sz > RECENT_EVENTS_BUDGET_BYTES {
                 break;
@@ -3416,18 +3448,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
     // stream events — otherwise a pre-stream bail (e.g. the harness exiting
     // before any stdout) shows only exitCode:1 with no reason. Bounded so a
     // chatty stderr can't flood the response.
-    if (inner.status == TaskStatus::Failed || event_count == 0) && !inner.stderr.trim().is_empty() {
-        const MAX: usize = 2000;
-        let s = inner.stderr.trim_end();
-        let tail_str = if s.len() > MAX {
-            let mut start = s.len() - MAX;
-            while start < s.len() && !s.is_char_boundary(start) {
-                start += 1;
-            }
-            format!("…{}", &s[start..])
-        } else {
-            s.to_string()
-        };
+    if let Some(tail_str) = stderr_tail {
         obj["stderrTail"] = Value::from(tail_str);
     }
     obj
@@ -4147,6 +4168,51 @@ mod tests {
             json["stderrTail"].as_str().unwrap().contains("no --model"),
             "failed task must surface the stderr reason, got {json}"
         );
+    }
+
+    #[test]
+    fn status_shape_matches_failed_task_with_events_and_stderr() {
+        let failed = task_with(
+            TaskStatus::Failed,
+            "provider failed before final answer\n",
+            vec![
+                serde_json::json!({"type": "assistant", "idx": 1, "message": "first"}),
+                serde_json::json!({"type": "stream_event", "idx": 2}),
+                serde_json::json!({"type": "assistant", "idx": 3, "message": "second"}),
+            ],
+        );
+
+        let json = task_status_json(&failed, 10);
+
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["eventCount"], 3);
+        assert_eq!(json["resultCapture"]["eventCount"], json["eventCount"]);
+        assert_eq!(
+            json["recentEvents"],
+            serde_json::json!([
+                {"type": "assistant", "idx": 1, "message": "first"},
+                {"type": "assistant", "idx": 3, "message": "second"}
+            ])
+        );
+        assert_eq!(json["stderrTail"], "provider failed before final answer");
+        assert!(json["snapshot"]["error"].is_object());
+    }
+
+    #[test]
+    fn status_emits_empty_recent_events_when_all_events_are_filtered() {
+        let running = task_with(
+            TaskStatus::Running,
+            "",
+            vec![
+                serde_json::json!({"type": "stream_event", "idx": 1}),
+                serde_json::json!({"type": "stream_event", "idx": 2}),
+            ],
+        );
+
+        let json = task_status_json(&running, 10);
+
+        assert!(json.get("recentEvents").is_some());
+        assert_eq!(json["recentEvents"], serde_json::json!([]));
     }
 
     #[test]
