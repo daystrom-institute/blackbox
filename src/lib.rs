@@ -53,8 +53,8 @@ mod knowledge;
 // `lsp` extracted into bbox-lsp (stage 2); aliased back to `crate::lsp`.
 use bbox_lsp as lsp;
 pub(crate) mod macros;
-mod manifest;
 mod managed_worktrees;
+mod manifest;
 mod mcp_client;
 mod mcp_tools;
 mod migration;
@@ -71,7 +71,9 @@ mod pollers;
 mod projects;
 mod providers;
 mod query;
-mod refactor;
+// `refactor` extracted into bbox-refactor (stage 3); aliased back to
+// `crate::refactor` so existing call sites resolve unchanged.
+use bbox_refactor as refactor;
 pub mod render;
 mod roadmap;
 mod routing;

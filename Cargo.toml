@@ -22,6 +22,7 @@ members = [
     "crates/bbox-corpus-core",
     "crates/bbox-chunker",
     "crates/bbox-lsp",
+    "crates/bbox-refactor",
 ]
 
 [package]
@@ -89,6 +90,8 @@ bbox-corpus-core = { path = "crates/bbox-corpus-core" }
 bbox-chunker = { path = "crates/bbox-chunker" }
 # Shared LSP session/conversion helpers, extracted from the root crate (stage 2).
 bbox-lsp = { path = "crates/bbox-lsp" }
+# Structural refactor planners/runners, extracted from the root crate (stage 3).
+bbox-refactor = { path = "crates/bbox-refactor" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }

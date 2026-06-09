@@ -16,3 +16,4 @@ pub mod entity_ref;
 pub mod git;
 pub mod language;
 pub mod lsp_config;
+pub mod project_record;

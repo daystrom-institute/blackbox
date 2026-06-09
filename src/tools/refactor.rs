@@ -93,3 +93,28 @@ impl BlackboxServer {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn refactor_run_tool_schema_exposes_structured_step_variants() {
+        let router = super::router();
+        let tool = router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == "bbox_refactor_run")
+            .expect("bbox_refactor_run should be registered");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let steps = &schema["properties"]["steps"];
+        assert_ne!(
+            steps["items"]["type"], "string",
+            "bbox_refactor_run tool schema must not advertise steps as string[]: {steps}"
+        );
+        assert!(
+            steps["items"].get("oneOf").is_some()
+                || steps["items"].get("anyOf").is_some()
+                || steps["items"].get("$ref").is_some(),
+            "bbox_refactor_run tool schema should expose structured RefactorRunStep variants: {steps}"
+        );
+    }
+}

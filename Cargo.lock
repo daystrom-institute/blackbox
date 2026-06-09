@@ -332,6 +332,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-refactor"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-chunker",
+ "bbox-corpus-core",
+ "bbox-lsp",
+ "chrono",
+ "dirs",
+ "hex",
+ "lsp-types",
+ "regex",
+ "reqwest 0.12.28",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "strum 0.26.3",
+ "tempfile",
+ "tokio",
+ "toml",
+ "toml_edit 0.22.27",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-language-pack",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "walkdir",
+]
+
+[[package]]
 name = "bbox-vectors"
 version = "0.0.1"
 dependencies = [
@@ -440,6 +480,7 @@ dependencies = [
  "bbox-chunker",
  "bbox-corpus-core",
  "bbox-lsp",
+ "bbox-refactor",
  "bbox-vectors",
  "bincode",
  "bro-capabilities",

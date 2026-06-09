@@ -7,6 +7,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 pub use bbox_corpus_core::language::Language;
+pub use bbox_corpus_core::project_record::ProjectRecord;
 
 use crate::entity_ref;
 use crate::util;
@@ -57,21 +58,6 @@ pub struct ProjectEjectParams {
     /// Preview the count without writing repo files or touching the central store.
     #[serde(default)]
     pub dry_run: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-pub struct ProjectRecord {
-    pub project_id: String,
-    #[serde(default)]
-    pub repo_id: Option<String>,
-    pub canonical_path: String,
-    pub registered_at: String,
-    pub is_git_repo: bool,
-    /// Languages auto-detected at registration. Empty when the
-    /// directory predates the polyglot field — `ProjectRegistry::open`
-    /// re-detects empty entries on load and persists the result.
-    #[serde(default)]
-    pub languages: BTreeSet<Language>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]

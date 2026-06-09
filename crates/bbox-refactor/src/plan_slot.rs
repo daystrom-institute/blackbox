@@ -1,0 +1,197 @@
+// Plan-file slot policy (RX-F1b).
+//
+// All `output_path` writes and `bbox_refactor_apply(plan_path=…)` reads are
+// confined to the daemon-owned directory:
+//
+//   $BLACKBOX_STATE_DIR/refactor/plans/
+//
+// Sibling directories are reserved for future phases:
+//   $BLACKBOX_STATE_DIR/refactor/diagnostics/  — RX-F2a compiler-diagnostic capture
+//   $BLACKBOX_STATE_DIR/refactor/runs/         — RX-F2b run-state scratch
+//
+// Absolute paths and relative paths that canonicalize outside the slot are
+// rejected with error.bad_input(code=plan_path_outside_slot).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+/// Resolve `$BLACKBOX_STATE_DIR` without requiring a pre-loaded `home` argument.
+/// Mirrors `util::blackbox_state_dir` but self-contained for use from the
+/// refactor module which may run before the full daemon config is available.
+fn state_dir() -> Result<PathBuf> {
+    if let Ok(v) = std::env::var("BLACKBOX_STATE_DIR") {
+        if !v.trim().is_empty() {
+            return Ok(PathBuf::from(v));
+        }
+    }
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let state = dirs::state_dir().unwrap_or_else(|| home.join(".local").join("state"));
+    Ok(state.join("blackbox"))
+}
+
+/// Create `$BLACKBOX_STATE_DIR/refactor/plans/` and return its canonical path.
+pub fn ensure_plan_slot() -> Result<PathBuf> {
+    let slot = state_dir()?.join("refactor").join("plans");
+    fs::create_dir_all(&slot)
+        .with_context(|| format!("creating plan slot directory {}", slot.display()))?;
+    slot.canonicalize()
+        .with_context(|| format!("canonicalizing plan slot {}", slot.display()))
+}
+
+/// Lexically normalize a path: process `.` and `..` without filesystem access.
+/// This is used to detect slot-escape attempts before the path exists on disk.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut parts: Vec<std::path::Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                // Only pop a normal component — don't pop the root or a prefix.
+                if matches!(parts.last(), Some(std::path::Component::Normal(_))) {
+                    parts.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect()
+}
+
+fn reject_if_outside(normalized: &Path, slot: &Path, label: &str) -> Result<()> {
+    if !normalized.starts_with(slot) {
+        anyhow::bail!(
+            "error.bad_input(code=plan_path_outside_slot): {} resolves to {} which is outside the plan slot {}",
+            label,
+            normalized.display(),
+            slot.display()
+        );
+    }
+    Ok(())
+}
+
+/// Resolve an `output_path` string to an absolute path inside the plan
+/// slot. Accepts either:
+///   * a relative filename (resolves under the slot), or
+///   * an absolute path that already lives inside the slot (round-trips
+///     the `plan_path` value returned in the plan response).
+/// Anything that canonicalizes outside the slot is rejected.
+pub fn resolve_plan_write_path(output_path: &str) -> Result<PathBuf> {
+    let slot = ensure_plan_slot()?;
+    let p = Path::new(output_path);
+    // Path::join replaces its base when the argument is absolute, so this
+    // works uniformly for relative filenames and absolute paths.
+    let normalized = normalize_path(&slot.join(p));
+    reject_if_outside(&normalized, &slot, output_path)?;
+    Ok(normalized)
+}
+
+/// Resolve a `plan_path` string (from `bbox_refactor_apply`) to an absolute
+/// path inside the plan slot. Accepts either a relative filename or the
+/// absolute path returned in the plan response (round-trip). Paths that
+/// canonicalize outside the slot are rejected.
+pub fn resolve_plan_read_path(plan_path: &str) -> Result<PathBuf> {
+    let slot = ensure_plan_slot()?;
+    let p = Path::new(plan_path);
+    let normalized = normalize_path(&slot.join(p));
+    reject_if_outside(&normalized, &slot, plan_path)?;
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    fn with_state_dir<F: FnOnce()>(dir: &Path, f: F) {
+        let _lock = crate::test_env_lock();
+        let old = env::var("BLACKBOX_STATE_DIR").ok();
+        unsafe { env::set_var("BLACKBOX_STATE_DIR", dir) };
+        f();
+        match old {
+            Some(v) => unsafe { env::set_var("BLACKBOX_STATE_DIR", v) },
+            None => unsafe { env::remove_var("BLACKBOX_STATE_DIR") },
+        }
+    }
+
+    #[test]
+    fn slot_respects_env_override() {
+        // NB: with_state_dir already holds crate::test_env_lock(); do not
+        // re-acquire here — the lock is non-reentrant and would deadlock.
+        let tmp = tempfile::tempdir().unwrap();
+        // ensure_plan_slot canonicalizes the state dir; on macOS the tempdir's
+        // /var path canonicalizes to /private/var, so compare against canonical.
+        let tmp_canon = tmp.path().canonicalize().unwrap();
+        with_state_dir(tmp.path(), || {
+            let slot = ensure_plan_slot().unwrap();
+            assert!(slot.starts_with(&tmp_canon));
+            assert!(slot.ends_with("refactor/plans"));
+            assert!(slot.exists());
+        });
+    }
+
+    #[test]
+    fn write_path_resolves_under_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let resolved = resolve_plan_write_path("my-plan.json").unwrap();
+            let slot = ensure_plan_slot().unwrap();
+            assert!(resolved.starts_with(&slot));
+            assert!(resolved.ends_with("my-plan.json"));
+        });
+    }
+
+    #[test]
+    fn write_path_rejects_absolute_outside_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let err = resolve_plan_write_path("/tmp/evil.json").unwrap_err();
+            assert!(err.to_string().contains("plan_path_outside_slot"));
+        });
+    }
+
+    #[test]
+    fn write_path_accepts_absolute_inside_slot() {
+        // Round-trip: the plan response returns an absolute path under the
+        // slot; passing that same value to a follow-up call must succeed.
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let slot = ensure_plan_slot().unwrap();
+            let abs = slot.join("roundtrip.json");
+            let resolved =
+                resolve_plan_write_path(abs.to_str().unwrap()).expect("absolute-in-slot accepted");
+            assert_eq!(resolved, abs);
+        });
+    }
+
+    #[test]
+    fn read_path_accepts_absolute_inside_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let slot = ensure_plan_slot().unwrap();
+            let abs = slot.join("roundtrip.json");
+            let resolved =
+                resolve_plan_read_path(abs.to_str().unwrap()).expect("absolute-in-slot accepted");
+            assert_eq!(resolved, abs);
+        });
+    }
+
+    #[test]
+    fn write_path_rejects_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let err = resolve_plan_write_path("../../etc/passwd").unwrap_err();
+            assert!(err.to_string().contains("plan_path_outside_slot"));
+        });
+    }
+
+    #[test]
+    fn read_path_rejects_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let err = resolve_plan_read_path("../../foo.json").unwrap_err();
+            assert!(err.to_string().contains("plan_path_outside_slot"));
+        });
+    }
+}
