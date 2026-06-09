@@ -3366,6 +3366,32 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
     }
 }
 
+const STATUS_RESULT_BUDGET_BYTES: usize = 16 * 1024;
+const STATUS_RECENT_EVENTS_BUDGET_BYTES: usize = 56 * 1024;
+
+// `/control/status` is returned through `server/response.rs::cap_response_text`,
+// which caps MCP responses at 80 KiB. Keep the status producer comfortably below
+// that cap by budgeting the two chatty fields together: 16 KiB for the final
+// `result` tail, 56 KiB for serialized `recentEvents`, 2 KiB for `stderrTail`,
+// and the remaining space for snapshot/scalars/truncation metadata.
+fn budget_status_result(obj: &mut Value) {
+    let Some(result) = obj.get("result").and_then(Value::as_str) else {
+        return;
+    };
+    let result_bytes = result.len();
+    if result_bytes <= STATUS_RESULT_BUDGET_BYTES {
+        return;
+    }
+
+    let mut start = result_bytes - STATUS_RESULT_BUDGET_BYTES;
+    while start < result_bytes && !result.is_char_boundary(start) {
+        start += 1;
+    }
+    obj["result"] = Value::String(format!("…{}", &result[start..]));
+    obj["resultTruncated"] = Value::Bool(true);
+    obj["resultBytes"] = Value::from(result_bytes);
+}
+
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
     populate_transcript_handle(task);
     let (mut obj, snapshot, event_count, had_events, compacted_events, stderr_tail) = {
@@ -3402,9 +3428,17 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
         } else {
             None
         };
-        (obj, snapshot, event_count, had_events, compacted_events, stderr_tail)
+        (
+            obj,
+            snapshot,
+            event_count,
+            had_events,
+            compacted_events,
+            stderr_tail,
+        )
     };
 
+    budget_status_result(&mut obj);
     // Typed wire snapshot. The flat taskId/sessionId/status/result fields above
     // already carry its task_id/session_id/status/last_message, and the fleet
     // cockpit reads dispatch facets (origin/managed_worktree/workflow_owned)
@@ -3430,12 +3464,11 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
         // capped at 2KB by `compact_status_event`; this caps the array total.
         // Walk newest→oldest and keep events until the budget is hit (always
         // keeping at least one), so the response is valid regardless of `tail`.
-        const RECENT_EVENTS_BUDGET_BYTES: usize = 56 * 1024;
         let mut recent: Vec<Value> = Vec::new();
         let mut bytes = 0usize;
         for ev in compacted_events {
             let sz = serde_json::to_string(&ev).map(|s| s.len()).unwrap_or(0);
-            if !recent.is_empty() && bytes + sz > RECENT_EVENTS_BUDGET_BYTES {
+            if !recent.is_empty() && bytes + sz > STATUS_RECENT_EVENTS_BUDGET_BYTES {
                 break;
             }
             bytes += sz;
@@ -4213,6 +4246,70 @@ mod tests {
 
         assert!(json.get("recentEvents").is_some());
         assert_eq!(json["recentEvents"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn status_truncates_large_result_tail_and_keeps_status_fields() {
+        let final_summary = "final summary ".repeat(2_000);
+        let original = format!("{}{}", "progress narration ".repeat(2_000), final_summary);
+        let completed = task_with(
+            TaskStatus::Completed,
+            "",
+            vec![serde_json::json!({"type": "assistant", "idx": 1})],
+        );
+        completed.inner.lock().last_assistant_message = Some(original.clone());
+
+        let json = task_status_json(&completed, 1);
+        let result = json["result"].as_str().expect("result should be present");
+
+        assert!(result.starts_with("…"));
+        assert!(original.ends_with(result.trim_start_matches('…')));
+        assert_eq!(json["resultTruncated"], true);
+        assert_eq!(json["resultBytes"], original.len());
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["eventCount"], 1);
+        assert!(json["recentEvents"].is_array());
+    }
+
+    #[test]
+    fn status_leaves_small_result_shape_unchanged() {
+        let completed = task_with(
+            TaskStatus::Completed,
+            "",
+            vec![serde_json::json!({"type": "assistant", "idx": 1})],
+        );
+        completed.inner.lock().last_assistant_message = Some("short final answer".into());
+
+        let json = task_status_json(&completed, 1);
+
+        assert_eq!(json["result"], "short final answer");
+        assert!(json.get("resultTruncated").is_none());
+        assert!(json.get("resultBytes").is_none());
+    }
+
+    #[test]
+    fn status_combined_worst_case_stays_under_mcp_cap() {
+        let running = task_with(
+            TaskStatus::Running,
+            "",
+            (0..80)
+                .map(|idx| {
+                    serde_json::json!({
+                        "type": "assistant",
+                        "idx": idx,
+                        "message": "event payload ".repeat(400),
+                    })
+                })
+                .collect(),
+        );
+        running.inner.lock().last_assistant_message = Some("status result ".repeat(2_000));
+
+        let status = task_status_json(&running, 80);
+        let bytes = serde_json::to_string(&status).unwrap().len();
+
+        // Mirrors `BlackboxServer::MCP_RESPONSE_CAP_BYTES` without importing the
+        // server type into orchestration tests.
+        assert!(bytes < 80 * 1024, "status payload was {bytes} bytes");
     }
 
     #[test]
