@@ -15,7 +15,9 @@
   "impact": "low",
   "blocking_level": "workaround_available",
   "dedupe_key": "docs_runbook/design-corpus/frontmatter-schema",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-02T20:42:23Z",
-  "updated_at": "2026-06-02T20:42:23Z"
+  "updated_at": "2026-06-08T06:39:50Z",
+  "resolved_at": "2026-06-08T06:39:50Z",
+  "resolution_note": "Frontmatter contract written: docs/corpus-frontmatter-schema.md (chassis, per-corpus field matrix, topic convention, field-by-field rules, per-corpus worked examples, new-doc checklist) + sections added to design-corpus.md/research-corpus.md/specs-corpus.md (commit 6545b58 on beta/blackbox-v2). Lifecycle vocabularies (design proposed/partial/archived; research stub→verified; specs draft→ratified) cited from real docs, with an explicit \"observed, not invented\" outliers section. Dispatched to a fleet bro (minimax) during the autonomous dogfood loop (thread-c38e005d)."
 }
