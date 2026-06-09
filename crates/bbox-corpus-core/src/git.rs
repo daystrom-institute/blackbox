@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GitCommit {
+pub struct GitCommit {
     pub sha: String,
     pub parent_shas: Vec<String>,
     pub author_name: String,
@@ -16,7 +16,7 @@ pub(crate) struct GitCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GitBlameLine {
+pub struct GitBlameLine {
     pub commit_sha: String,
     pub author: String,
     pub author_time: Option<String>,
@@ -24,7 +24,7 @@ pub(crate) struct GitBlameLine {
     pub rel_path: String,
 }
 
-pub(crate) fn git_root_for_path(path: &Path) -> Option<PathBuf> {
+pub fn git_root_for_path(path: &Path) -> Option<PathBuf> {
     let cwd = if path.is_file() {
         path.parent().unwrap_or(path)
     } else {
@@ -42,7 +42,7 @@ pub(crate) fn git_root_for_path(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(root.trim()).ok()
 }
 
-pub(crate) fn git_first_commit_for_path(path: &Path) -> Option<String> {
+pub fn git_first_commit_for_path(path: &Path) -> Option<String> {
     let output = git_output(
         path,
         &["rev-list", "--max-parents=0", "HEAD"],
@@ -54,7 +54,7 @@ pub(crate) fn git_first_commit_for_path(path: &Path) -> Option<String> {
     git_first_commit_from_stdout(&output.stdout)
 }
 
-pub(crate) fn git_first_commit_from_stdout(stdout: &[u8]) -> Option<String> {
+pub fn git_first_commit_from_stdout(stdout: &[u8]) -> Option<String> {
     let raw = String::from_utf8(stdout.to_vec()).ok()?;
     let mut roots: Vec<&str> = raw
         .lines()
@@ -65,7 +65,7 @@ pub(crate) fn git_first_commit_from_stdout(stdout: &[u8]) -> Option<String> {
     roots.first().map(|line| (*line).to_string())
 }
 
-pub(crate) fn git_remote_origin_for_path(path: &Path) -> Option<String> {
+pub fn git_remote_origin_for_path(path: &Path) -> Option<String> {
     let output = git_output(
         path,
         &["config", "remote.origin.url"],
@@ -83,7 +83,7 @@ pub(crate) fn git_remote_origin_for_path(path: &Path) -> Option<String> {
     }
 }
 
-pub(crate) fn current_head(root: &Path) -> Option<String> {
+pub fn current_head(root: &Path) -> Option<String> {
     let output = git_output(root, &["rev-parse", "HEAD"], "deriving current HEAD")?;
     if !output.status.success() {
         return None;
@@ -97,7 +97,7 @@ pub(crate) fn current_head(root: &Path) -> Option<String> {
     }
 }
 
-pub(crate) fn current_branch(root: &Path) -> Option<String> {
+pub fn current_branch(root: &Path) -> Option<String> {
     let output = git_output(
         root,
         &["rev-parse", "--abbrev-ref", "HEAD"],
@@ -122,7 +122,7 @@ pub(crate) fn current_branch(root: &Path) -> Option<String> {
 /// worktree (which lives outside the registered repo root) to its registered
 /// base project. Returns `None` when `cwd` is not in a git repo or the path can't
 /// be canonicalized.
-pub(crate) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
     let output = git_output(
         cwd,
         &["rev-parse", "--git-common-dir"],
@@ -145,7 +145,7 @@ pub(crate) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
-pub(crate) fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<Vec<GitCommit>> {
+pub fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<Vec<GitCommit>> {
     let mut args = vec![
         "log".to_string(),
         "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%B%x1e".to_string(),
@@ -197,7 +197,7 @@ fn is_ancestor_of_head(root: &Path, since: &str) -> bool {
     }
 }
 
-pub(crate) fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<String>> {
+pub fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<String>> {
     let args = [
         "diff-tree",
         "--root",
@@ -220,10 +220,27 @@ pub(crate) fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<Str
         .collect())
 }
 
-pub(crate) fn notes_namespace() -> String {
-    if let Ok(cfg) = blackbox::config::load() {
-        if !cfg.provenance.git_notes_namespace.is_empty() {
-            return cfg.provenance.git_notes_namespace;
+/// Config-resolved git-notes namespace, injected once at daemon startup.
+///
+/// Dependency inversion: this foundation crate must not reach UP into
+/// `blackbox::config` (that would be a workspace cycle). The daemon owns config
+/// loading and pushes the resolved value in via [`set_notes_namespace`] right
+/// after `config::load()`. Absent injection (standalone use / tests), we fall
+/// back to the `BBOX_GIT_NOTES_NAMESPACE` env var, then the `"bbox"` default —
+/// the same precedence the inlined `config` lookup used to provide.
+static NOTES_NAMESPACE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the config-resolved git-notes namespace. Idempotent; first set wins.
+/// Called by the daemon at startup so corpus-core need not depend on the root
+/// crate's config loader.
+pub fn set_notes_namespace(namespace: String) {
+    let _ = NOTES_NAMESPACE_OVERRIDE.set(namespace);
+}
+
+pub fn notes_namespace() -> String {
+    if let Some(ns) = NOTES_NAMESPACE_OVERRIDE.get() {
+        if !ns.is_empty() {
+            return ns.clone();
         }
     }
     std::env::var("BBOX_GIT_NOTES_NAMESPACE")
@@ -232,18 +249,18 @@ pub(crate) fn notes_namespace() -> String {
         .unwrap_or_else(|| "bbox".to_string())
 }
 
-pub(crate) const NOTE_DOCUMENT_SEPARATOR: &str = "--bbox-note-separator--";
+pub const NOTE_DOCUMENT_SEPARATOR: &str = "--bbox-note-separator--";
 
 /// Build a bbox-owned git notes ref for an open-ended note kind.
 ///
 /// Kind `provenance` is used today. `knowledge` is reserved for v2
 /// cross-machine knowledge serialization, and future kinds should remain under
 /// this namespace instead of adding parallel `refs/notes/bbox-*` roots.
-pub(crate) fn notes_ref(kind: &str) -> String {
+pub fn notes_ref(kind: &str) -> String {
     format!("refs/notes/{}/{}", notes_namespace(), kind)
 }
 
-pub(crate) fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Result<()> {
+pub fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Result<()> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -283,7 +300,7 @@ pub(crate) fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str)
 /// bodies. Setting `union` once per repo makes concurrent provenance pushes
 /// safe; git config writes are idempotent so calling this on every export is
 /// harmless.
-pub(crate) fn ensure_notes_merge_strategy_union(root: &Path) -> Result<()> {
+pub fn ensure_notes_merge_strategy_union(root: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -300,7 +317,7 @@ pub(crate) fn ensure_notes_merge_strategy_union(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn show_note(root: &Path, notes_ref: &str, commit: &str) -> Result<Option<String>> {
+pub fn show_note(root: &Path, notes_ref: &str, commit: &str) -> Result<Option<String>> {
     let Some(output) = git_output(
         root,
         &["notes", "--ref", notes_ref, "show", commit],
@@ -314,7 +331,7 @@ pub(crate) fn show_note(root: &Path, notes_ref: &str, commit: &str) -> Result<Op
     Ok(Some(String::from_utf8(output.stdout)?))
 }
 
-pub(crate) fn list_notes(root: &Path, notes_ref: &str) -> Result<Vec<(String, String)>> {
+pub fn list_notes(root: &Path, notes_ref: &str) -> Result<Vec<(String, String)>> {
     let Some(output) = git_output(
         root,
         &["notes", "--ref", notes_ref, "list"],
@@ -337,7 +354,7 @@ pub(crate) fn list_notes(root: &Path, notes_ref: &str) -> Result<Vec<(String, St
         .collect())
 }
 
-pub(crate) fn blame_for_line(file: &Path, line: u64) -> Result<Option<GitBlameLine>> {
+pub fn blame_for_line(file: &Path, line: u64) -> Result<Option<GitBlameLine>> {
     if line == 0 {
         anyhow::bail!("line must be 1-based");
     }
@@ -364,7 +381,7 @@ pub(crate) fn blame_for_line(file: &Path, line: u64) -> Result<Option<GitBlameLi
     parse_blame_porcelain(&output.stdout, root, rel_path)
 }
 
-pub(crate) fn parse_blame_porcelain(
+pub fn parse_blame_porcelain(
     stdout: &[u8],
     root: PathBuf,
     rel_path: String,
@@ -400,7 +417,7 @@ pub(crate) fn parse_blame_porcelain(
     }))
 }
 
-pub(crate) fn head_fingerprint(root: &Path) -> Option<u64> {
+pub fn head_fingerprint(root: &Path) -> Option<u64> {
     // HACK: project-file reindex metadata only has `(mtime, size)`, so git
     // history uses `mtime = 0` plus `size = HEAD fingerprint` as a synthetic
     // source-file marker. A cleaner future shape is a parallel GitMeta map
@@ -414,7 +431,7 @@ pub(crate) fn head_fingerprint(root: &Path) -> Option<u64> {
     })
 }
 
-pub(crate) fn is_worktree_dirty(root: &Path) -> bool {
+pub fn is_worktree_dirty(root: &Path) -> bool {
     let output = match git_output(
         root,
         &["status", "--porcelain"],
@@ -426,7 +443,7 @@ pub(crate) fn is_worktree_dirty(root: &Path) -> bool {
     !String::from_utf8_lossy(&output.stdout).trim().is_empty()
 }
 
-pub(crate) fn dirty_fingerprint(root: &Path) -> Option<String> {
+pub fn dirty_fingerprint(root: &Path) -> Option<String> {
     let output = git_output(
         root,
         &["status", "--porcelain", "--no-renames", "-z"],
@@ -444,7 +461,7 @@ pub(crate) fn dirty_fingerprint(root: &Path) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
-pub(crate) fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
+pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
     let raw = String::from_utf8(stdout.to_vec())?;
     let mut commits = Vec::new();
     for record in raw.split('\x1e') {
@@ -483,7 +500,7 @@ pub(crate) fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
     Ok(commits)
 }
 
-pub(crate) fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<Output> {
+pub fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<Output> {
     match Command::new("git").arg("-C").arg(path).args(args).output() {
         Ok(output) => Some(output),
         Err(err) => {

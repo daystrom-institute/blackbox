@@ -1,0 +1,32 @@
+[package]
+name = "bbox-chunker"
+version = "0.0.1"
+edition = "2024"
+
+# Code/text/markdown chunking + tree-sitter symbol extraction, extracted from
+# the root `blackbox` crate (stage 1 of the code-intelligence cluster split,
+# gap-fe4dd97f). Sits on the bbox-corpus-core foundation (EntityRef). The 10
+# tree-sitter grammars stay dep'd in root too (refactor uses them directly until
+# its own stage); they compile once regardless. Re-exported into the daemon as
+# `crate::chunker` (see src/lib.rs).
+
+[dependencies]
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+anyhow = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+tracing = "0.1"
+tree-sitter = "0.26"
+tree-sitter-c = "0.24.2"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-language-pack = "1.8.1"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"

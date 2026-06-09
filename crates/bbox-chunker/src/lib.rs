@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::entity_ref::EntityRef;
+use bbox_corpus_core::entity_ref::EntityRef;
 
 pub const MAX_CHUNK_BYTES: usize = 12 * 1024;
 
@@ -86,7 +86,7 @@ pub fn default_registry() -> Vec<Box<dyn SourceFormatChunker>> {
     ]
 }
 
-pub(crate) fn placeholder_chunk(
+pub fn placeholder_chunk(
     path: &Path,
     chunk_kind: &str,
     language: Option<&str>,

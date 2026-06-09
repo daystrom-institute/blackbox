@@ -32,6 +32,11 @@ pub(super) struct OpenedServer {
 
 pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let cfg = config::load()?;
+    // Push the config-resolved git-notes namespace into the corpus-core
+    // foundation crate (dependency inversion: corpus-core must not reach up into
+    // blackbox::config). Absent this, git::notes_namespace falls back to the
+    // BBOX_GIT_NOTES_NAMESPACE env var, then "bbox".
+    crate::git::set_notes_namespace(cfg.provenance.git_notes_namespace.clone());
     let cfg_arc = Arc::new(RwLock::new(cfg.clone()));
 
     let roots = discover_transcript_roots(&cfg, home);

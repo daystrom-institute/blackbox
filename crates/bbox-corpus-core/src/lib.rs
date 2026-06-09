@@ -1,0 +1,15 @@
+//! bbox-corpus-core — daemon-internal foundation crate.
+//!
+//! Extracted from the root `blackbox` crate as stage 0 of the
+//! code-intelligence cluster split (gap-fe4dd97f). Holds the entity-ref
+//! identity/parse types and the git porcelain helpers that the cluster
+//! (chunker, lsp, refactor, code_nav, macros) depends on downward.
+//!
+//! Invariant: this crate must NOT depend on `blackbox` (that would be a
+//! workspace cycle). The one former upward reach — `git::notes_namespace`
+//! loading `blackbox::config` — is inverted to a startup injection via
+//! [`git::set_notes_namespace`], which the daemon calls once after it loads
+//! config.
+
+pub mod entity_ref;
+pub mod git;

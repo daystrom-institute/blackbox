@@ -278,6 +278,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bbox-chunker"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "toml",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-language-pack",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "bbox-corpus-core"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-vectors"
 version = "0.0.1"
 dependencies = [
@@ -383,6 +421,8 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "bbox-chunker",
+ "bbox-corpus-core",
  "bbox-vectors",
  "bincode",
  "bro-capabilities",

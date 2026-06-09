@@ -19,6 +19,8 @@ members = [
     # on external crates, never on blackbox internals, and are re-exported back
     # into the daemon under their original module path.
     "crates/bbox-vectors",
+    "crates/bbox-corpus-core",
+    "crates/bbox-chunker",
 ]
 
 [package]
@@ -80,6 +82,10 @@ tera = "1"
 anyhow = "1"
 # Daemon-internal corpus crate (HNSW vector store) extracted from src/vectors.
 bbox-vectors = { path = "crates/bbox-vectors" }
+# Foundation crate (entity_ref + git) extracted from the root crate (stage 0).
+bbox-corpus-core = { path = "crates/bbox-corpus-core" }
+# Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).
+bbox-chunker = { path = "crates/bbox-chunker" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }

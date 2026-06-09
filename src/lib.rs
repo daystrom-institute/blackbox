@@ -23,7 +23,9 @@ mod artifacts;
 #[cfg(test)]
 #[path = "../eval/badgey/check.rs"]
 mod badgey_eval_check;
-mod chunker;
+// chunker extracted into the bbox-chunker crate (stage 1); aliased back to
+// `crate::chunker` so existing call sites resolve unchanged.
+use bbox_chunker as chunker;
 pub mod code_nav;
 pub mod config;
 mod council;
@@ -33,14 +35,17 @@ mod edge_index;
 mod embed;
 mod embed_queue;
 mod entity_loader;
-pub mod entity_ref;
+// `entity_ref` extracted into the bbox-corpus-core foundation crate (stage 0).
+// Aliased back so existing `crate::entity_ref::*` paths resolve unchanged.
+pub use bbox_corpus_core::entity_ref;
 #[cfg(test)]
 #[path = "../eval/check.rs"]
 mod eval_check;
 mod gap_closeout;
 mod gap_spool;
 mod gaps;
-mod git;
+// `git` extracted into bbox-corpus-core (stage 0); aliased back to `crate::git`.
+use bbox_corpus_core::git;
 mod inbox;
 mod index;
 pub mod json_store;

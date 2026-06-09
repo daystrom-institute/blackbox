@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PARSER_VERSION: &str = "entity-ref-v1";
-pub(crate) use crate::git::git_root_for_path;
+pub use crate::git::git_root_for_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,7 +121,7 @@ impl EntityType {
         matches!(self, EntityType::Task | EntityType::BashCall)
     }
 
-    pub(crate) fn from_prefix(prefix: &str) -> Option<Self> {
+    pub fn from_prefix(prefix: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|ty| ty.as_str() == prefix)
     }
 }
@@ -508,7 +508,7 @@ pub fn repo_id_for_path(path: impl AsRef<Path>) -> io::Result<String> {
     repo_id_for_root(&repo_root)
 }
 
-pub(crate) fn repo_id_for_root(git_root: &Path) -> io::Result<String> {
+pub fn repo_id_for_root(git_root: &Path) -> io::Result<String> {
     if let Some(first_commit) = crate::git::git_first_commit_for_path(git_root) {
         return Ok(hash_string(&first_commit));
     }
@@ -542,7 +542,7 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(&digest[..4])
 }
 
-pub(crate) fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+pub fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     if canonical.is_file() {
         Err(io::Error::new(

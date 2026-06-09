@@ -1,0 +1,24 @@
+[package]
+name = "bbox-corpus-core"
+version = "0.0.1"
+edition = "2024"
+
+# Daemon-internal FOUNDATION crate, peeled out of the root `blackbox` crate
+# (build-time decomposition; stage 0 of the code-intelligence cluster split,
+# gap-fe4dd97f). Holds the entity-ref identity types and git helpers that the
+# cluster (chunker -> lsp -> refactor -> code_nav -> macros) sits on. Pure-ish:
+# depends only on external crates + std, NOT on blackbox internals. The one
+# upward reach (git notes namespace -> blackbox::config) was inverted to a
+# startup injection (git::set_notes_namespace). Grows in later stages
+# (util/json_store/projects, edit DTOs) as refactor/lsp need them.
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

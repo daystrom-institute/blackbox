@@ -71,7 +71,7 @@ fn h2_sections(text: &str) -> Vec<(usize, usize)> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn markdown_edge_kinds(content: &str) -> Vec<&'static str> {
+pub fn markdown_edge_kinds(content: &str) -> Vec<&'static str> {
     let mut kinds = Vec::new();
     if content.contains("```") {
         kinds.push("EMBEDS_CODE_FENCE");

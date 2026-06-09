@@ -116,7 +116,7 @@ fn log_language_pack_failure(language: &'static str, err: &dyn std::fmt::Display
     }
 }
 
-pub(crate) fn ts_language_for_name(language: &str) -> Result<tree_sitter::Language> {
+pub fn ts_language_for_name(language: &str) -> Result<tree_sitter::Language> {
     if let Ok(language) = tree_sitter_language_pack::get_language(language) {
         return Ok(language);
     }
@@ -134,7 +134,7 @@ pub(crate) fn ts_language_for_name(language: &str) -> Result<tree_sitter::Langua
     }
 }
 
-pub(crate) fn parser_for_language(language: &str) -> Result<tree_sitter::Parser> {
+pub fn parser_for_language(language: &str) -> Result<tree_sitter::Parser> {
     let ts_language = ts_language_for_name(language)?;
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -397,7 +397,7 @@ fn symbol_name(node: Node<'_>, source: &str, language: &str) -> Option<(String, 
     Some((bare.clone(), bare))
 }
 
-pub(crate) fn is_symbol_node(kind: &str) -> bool {
+pub fn is_symbol_node(kind: &str) -> bool {
     matches!(
         kind,
         "function_item"
