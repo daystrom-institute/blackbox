@@ -27,6 +27,46 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::roster_tools()
 }
 
+/// Per-agent rollup accumulated while scanning the task store for
+/// `bro_dashboard`. `dispatch_count` is the always-populated anchor (an agent
+/// only enters the map once it has been dispatched at least once); the rest are
+/// signal-gated on serialization so idle/still-running agents don't pad the
+/// response with zero tallies and null averages.
+#[derive(Default)]
+struct AgentDashboardMetrics {
+    dispatch_count: u64,
+    success_count: u64,
+    failure_count: u64,
+    elapsed_ms_total: u64,
+    elapsed_count: u64,
+    cost_usd_total: f64,
+}
+
+impl AgentDashboardMetrics {
+    /// Project to the dashboard wire object, omitting fields that carry no
+    /// signal: zero success/failure tallies, a null average (no terminal task
+    /// yet), and zero attributed cost are all dropped rather than serialized.
+    fn to_json(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("dispatch_count".into(), json!(self.dispatch_count));
+        if self.success_count > 0 {
+            obj.insert("success_count".into(), json!(self.success_count));
+        }
+        if self.failure_count > 0 {
+            obj.insert("failure_count".into(), json!(self.failure_count));
+        }
+        if self.elapsed_count > 0 {
+            let avg = (self.elapsed_ms_total as f64) / (self.elapsed_count as f64);
+            obj.insert("avg_elapsed_ms".into(), json!(avg));
+        }
+        let cost = (self.cost_usd_total * 10000.0).round() / 10000.0;
+        if cost > 0.0 {
+            obj.insert("cost_usd_total".into(), json!(cost));
+        }
+        Value::Object(obj)
+    }
+}
+
 #[tool_router(router = roster_tools)]
 impl BlackboxServer {
     #[tool(
@@ -59,16 +99,6 @@ impl BlackboxServer {
                         .collect(),
                 )
             });
-
-        #[derive(Default)]
-        struct AgentDashboardMetrics {
-            dispatch_count: u64,
-            success_count: u64,
-            failure_count: u64,
-            elapsed_ms_total: u64,
-            elapsed_count: u64,
-            cost_usd_total: f64,
-        }
 
         let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
         let mut with_ts: Vec<(u64, Value)> = store
@@ -142,23 +172,7 @@ impl BlackboxServer {
         let entries: Vec<Value> = with_ts.into_iter().take(limit).map(|(_, e)| e).collect();
         let agents: BTreeMap<String, Value> = agent_metrics
             .into_iter()
-            .map(|(label, metrics)| {
-                let avg_elapsed_ms = if metrics.elapsed_count == 0 {
-                    None
-                } else {
-                    Some((metrics.elapsed_ms_total as f64) / (metrics.elapsed_count as f64))
-                };
-                (
-                    label,
-                    json!({
-                        "dispatch_count": metrics.dispatch_count,
-                        "success_count": metrics.success_count,
-                        "failure_count": metrics.failure_count,
-                        "avg_elapsed_ms": avg_elapsed_ms,
-                        "cost_usd_total": (metrics.cost_usd_total * 10000.0).round() / 10000.0,
-                    }),
-                )
-            })
+            .map(|(label, metrics)| (label, metrics.to_json()))
             .collect();
 
         Self::ok_json(&json!({"count": entries.len(), "tasks": entries, "agents": agents}))
@@ -1324,6 +1338,47 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[test]
+    fn idle_agent_metrics_omit_zero_and_null_fields() {
+        // A single still-running dispatch: only dispatch_count is meaningful.
+        let metrics = AgentDashboardMetrics {
+            dispatch_count: 1,
+            ..AgentDashboardMetrics::default()
+        };
+        let value = metrics.to_json();
+        assert_eq!(value["dispatch_count"], 1);
+        for absent in [
+            "success_count",
+            "failure_count",
+            "avg_elapsed_ms",
+            "cost_usd_total",
+        ] {
+            assert!(
+                value.get(absent).is_none(),
+                "idle agent should omit {absent}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_agent_metrics_emit_populated_fields() {
+        // A completed dispatch with cost surfaces every signal-bearing field.
+        let metrics = AgentDashboardMetrics {
+            dispatch_count: 3,
+            success_count: 2,
+            failure_count: 1,
+            elapsed_ms_total: 6000,
+            elapsed_count: 3,
+            cost_usd_total: 0.1234,
+        };
+        let value = metrics.to_json();
+        assert_eq!(value["dispatch_count"], 3);
+        assert_eq!(value["success_count"], 2);
+        assert_eq!(value["failure_count"], 1);
+        assert_eq!(value["avg_elapsed_ms"], 2000.0);
+        assert_eq!(value["cost_usd_total"], 0.1234);
     }
 
     fn extract_text(result: &CallToolResult) -> String {

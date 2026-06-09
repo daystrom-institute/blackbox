@@ -181,6 +181,17 @@ pub fn inspect_entity(
         recommended: &recommended,
         coverage: &coverage,
     });
+    // The full `coverage` drives the human `text` render above (which surfaces
+    // optional-but-absent families as orientation). The structured array,
+    // though, drops optional zero-count rows: a machine reader infers "absent"
+    // from a family simply not being listed, so emitting `{count: 0, status:
+    // "0 (expected)"}` for every unused optional family is pure padding.
+    // Required families are retained even at count 0 so the "expected but
+    // missing" signal still reaches a structured consumer.
+    let coverage_json: Vec<&RenderedCoverage> = coverage
+        .iter()
+        .filter(|c| c.count > 0 || c.expected == "required")
+        .collect();
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "text": text,
@@ -192,7 +203,7 @@ pub fn inspect_entity(
             "in": rendered_reverse,
         },
         "recommended_next_hops": recommended,
-        "edge_family_coverage": coverage,
+        "edge_family_coverage": coverage_json,
     }))?)
 }
 
@@ -447,5 +458,38 @@ mod tests {
         );
         assert_eq!(value["properties"]["id"], "sm-agentic-opening-sequence");
         assert!(value["properties"].get("content").is_none());
+    }
+
+    #[test]
+    fn edge_family_coverage_omits_optional_zero_count_rows() {
+        // An entity with no edges in the index: every optional expected family
+        // resolves to count 0. Those rows are padding and must not reach the
+        // structured payload; only present (count > 0) or required families do.
+        crate::system_memory::init_for_tests();
+        let params = InspectEntityParams {
+            entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
+            edge_types: None,
+            direction: None,
+            per_type_limit: Some(0),
+            property_mode: Some("summary".into()),
+        };
+        let r = EntityRef::parse(&params.entity_ref).unwrap();
+        let rendered = inspect_entity(
+            &params,
+            &ProviderContext::empty_for_tests(),
+            &r,
+            &EdgeIndex::default(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let coverage = value["edge_family_coverage"].as_array().unwrap();
+        for row in coverage {
+            let count = row["count"].as_u64().unwrap();
+            let expected = row["expected"].as_str().unwrap();
+            assert!(
+                count > 0 || expected == "required",
+                "optional zero-count family leaked into structured coverage: {row}"
+            );
+        }
     }
 }

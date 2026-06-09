@@ -43,7 +43,9 @@ struct DiscoverSeedResponse {
     status: &'static str,
     text: String,
     seeds: Vec<SeedEntity>,
+    #[serde(skip_serializing_if = "HybridVectorStatus::is_empty")]
     vector_status: HybridVectorStatus,
+    #[serde(skip_serializing_if = "HybridDegraded::is_empty")]
     degraded: HybridDegraded,
 }
 

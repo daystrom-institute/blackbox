@@ -63,7 +63,14 @@ pub(crate) struct HybridSearchResponse {
     /// recalling the opening sequence from memory.
     pub(crate) next_steps: Vec<String>,
     pub(crate) results: Vec<HybridResult>,
+    /// Vector-lane health. Omitted entirely when no vector partitions were
+    /// searched (the common BM25-only / vectors-disabled path), so a healthy
+    /// response doesn't carry three empty collections.
+    #[serde(skip_serializing_if = "HybridVectorStatus::is_empty")]
     pub(crate) vector_status: HybridVectorStatus,
+    /// Per-route vector degradation. Omitted entirely when nothing degraded —
+    /// the overwhelmingly common case — so green responses stay terse.
+    #[serde(skip_serializing_if = "HybridDegraded::is_empty")]
     pub(crate) degraded: HybridDegraded,
 }
 
@@ -74,24 +81,49 @@ pub(crate) struct HybridResult {
     pub(crate) score: f32,
     pub(crate) base_score: f32,
     pub(crate) label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) doc_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) chunk_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) role: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) sources: BTreeMap<String, f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct HybridVectorStatus {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) queues: BTreeMap<String, crate::embed::queue::RouteStatus>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) partitions: BTreeMap<String, PartitionMetrics>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) searched_partitions: Vec<String>,
+}
+
+impl HybridVectorStatus {
+    /// True when no vector lane activity is worth surfacing — every sub-field
+    /// empty. Gates whether the wrapper is serialized at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queues.is_empty() && self.partitions.is_empty() && self.searched_partitions.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct HybridDegraded {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) vector_errors: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) skipped_partitions: BTreeMap<String, String>,
+}
+
+impl HybridDegraded {
+    /// True when nothing degraded — no vector errors and no skipped partitions.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.vector_errors.is_empty() && self.skipped_partitions.is_empty()
+    }
 }
 
 pub fn hybrid_search(
@@ -910,6 +942,47 @@ mod tests {
             text.contains("bbox_inspect_entity(entity_ref=\"knowledge:a\")"),
             "breadcrumb should carry the top seed ref: {text}"
         );
+    }
+
+    #[test]
+    fn healthy_response_omits_empty_status_and_null_fields() {
+        // A green BM25-only result: no vector lane activity, no degradation,
+        // and a result whose optional facets are all absent. None of the
+        // empty containers or null option fields should reach the wire.
+        let response = HybridSearchResponse {
+            text: "fixture".into(),
+            next_steps: vec![],
+            results: vec![HybridResult {
+                rank: 1,
+                entity_id: "knowledge:a".into(),
+                score: 0.1,
+                base_score: 0.1,
+                label: "A".into(),
+                doc_type: None,
+                chunk_kind: None,
+                role: None,
+                sources: BTreeMap::new(),
+                excerpt: None,
+            }],
+            vector_status: HybridVectorStatus::default(),
+            degraded: HybridDegraded::default(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(
+            value.get("vector_status").is_none(),
+            "empty vector_status should be omitted: {value}"
+        );
+        assert!(
+            value.get("degraded").is_none(),
+            "empty degraded should be omitted: {value}"
+        );
+        let first = &value["results"][0];
+        for absent in ["doc_type", "chunk_kind", "role", "sources", "excerpt"] {
+            assert!(
+                first.get(absent).is_none(),
+                "empty/null result field {absent} should be omitted: {first}"
+            );
+        }
     }
 
     #[test]
