@@ -43,6 +43,24 @@ the NARF graveyard.
 
 ## 1. The runtime as it ships (constraints, not aspirations)
 
+**Terminology, pinned** (these three words are load-bearing and easy to
+misread into a daemon-residency claim):
+
+- **Host** — the Rust side of the JS↔host trampoline, inside
+  `bro-harness`/`bro-code-mode`: the same process that runs the agent loop and
+  the V8 isolate. The ledger (§4), the EditSet builder, and every binding
+  implementation live here.
+- **Language server** — rust-analyzer/jdtls/roslyn, a **child process of the
+  harness**, sitting next to the working set (in the container, on the
+  remote-worker gradient). When this doc says a value was "server-authored,"
+  it means the language server computed it — never the daemon.
+- **Daemon** — appears nowhere in this doc's mechanisms. No binding, ledger
+  entry, or choke-point check references daemon state; everything travels
+  with the harness when the harness leaves the box. (In today's consolidated
+  deployment it all happens to *execute* inside the blackboxd process because
+  the daemon links the harness in-process — but by crate ownership it is
+  harness-side, and the boundary is the compile DAG, not the deployment.)
+
 What a binding author gets today (`crates/bro-code-mode`):
 
 - An async JS module per `exec` call, in a V8 isolate with `console`,
