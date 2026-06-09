@@ -25,6 +25,9 @@ describes behavior that matters for implementation, verify it against the code,
   neuralyze. Daemon-independent by invariant.
 - [Fleet TUI](fleet-tui/fleet-tui.md) - `bro fleet`, the multi-provider cockpit
   for live-driving many concurrent entrypoint agents in-process.
+- [Daemon Runtime](daemon-runtime/daemon-runtime.md) - blackboxd's execution
+  architecture: tokio topology, plane isolation, lock discipline, and
+  persistence actors.
 - [Refactor Tools](refactor-tools/refactor-tools.md) - structural refactor
   machinery, refactor atoms, Rust expansion, and Java gap closure.
 - [Integrations](integrations/integrations.md) - Obsidian, Slack, and other

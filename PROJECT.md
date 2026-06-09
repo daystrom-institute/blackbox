@@ -269,6 +269,9 @@ or system memories and link/pointer from here.
   invariant; separate from `orchestration/`.
 - `design/fleet-tui/` - top-level home for `bro fleet`, the in-process
   multi-provider cockpit for live-driving entrypoint agents.
+- `design/daemon-runtime/` - topic home for blackboxd's execution
+  architecture: tokio topology, plane isolation, lock discipline, and
+  persistence actors.
 - `design/refactor-tools/` - topic home for structural refactor tools,
   refactor atoms, Rust expansion, and Java refactor closure designs.
 - `design/integrations/` - topic home for editor/chat/external UI
