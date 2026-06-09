@@ -21,8 +21,9 @@ mod task;
 pub use config::{bro_home, daemon_port};
 pub use fleet::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DEFAULT_CLASSIFIER_PROMPT, DispatchSpec,
-    FleetConfig, FleetOrchestrator, INTERN_PREFIX, Provider, ResumeSpec, TaskSnapshot, TaskStatus,
-    TodoItem, TodoItemStatus, TodoState, TranscriptItem, intern_rider, parse_transcript,
+    FleetConfig, FleetOrchestrator, FocusedTranscriptBuffer, FocusedTranscriptStreamEvent,
+    INTERN_PREFIX, Provider, ResumeSpec, TaskSnapshot, TaskStatus, TodoItem, TodoItemStatus,
+    TodoState, TranscriptHistoryPageV1, TranscriptItem, intern_rider, parse_transcript,
     provider_supports_bidi,
 };
 pub use bro_protocol::{

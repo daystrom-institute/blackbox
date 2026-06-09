@@ -12,6 +12,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -27,7 +29,12 @@ use crate::task::{RosterApply, Task, TaskInner, TaskStore, now_ms};
 // is the wire `bro_protocol::TaskStatus` directly — there is no daemon-internal
 // enum on the client side.
 pub use bro_core::Provider;
-pub use bro_protocol::{CloseoutOutcome, CloseoutRequest, DispatchSpec, ResumeSpec, RosterDelta, RosterSnapshotV1, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptItem};
+pub use bro_protocol::{
+    CloseoutOutcome, CloseoutRequest, DispatchSpec, FocusedTranscriptLiveEventV1,
+    FocusedTranscriptSnapshotV1, ResumeSpec, RosterDelta,
+    RosterSnapshotV1, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptHistoryPageV1,
+    TranscriptItem,
+};
 
 /// TUI-local fleet config — `fleet.json` beside the selected blackbox
 /// `config.toml` but read entirely daemon-free. Deliberately
@@ -796,6 +803,31 @@ fn user_event_has_successful_tool_result(
 struct DaemonFleetClient {
     base_url: Arc<str>,
     http: reqwest::Client,
+    stream_http: reqwest::Client,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HttpClientTimeouts {
+    connect: Duration,
+    total: Option<Duration>,
+}
+
+const UNARY_HTTP_TIMEOUTS: HttpClientTimeouts = HttpClientTimeouts {
+    connect: Duration::from_secs(10),
+    total: Some(Duration::from_secs(180)),
+};
+
+const STREAM_HTTP_TIMEOUTS: HttpClientTimeouts = HttpClientTimeouts {
+    connect: Duration::from_secs(10),
+    total: None,
+};
+
+fn build_http_client(timeouts: HttpClientTimeouts) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().connect_timeout(timeouts.connect);
+    if let Some(total) = timeouts.total {
+        builder = builder.timeout(total);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 #[derive(Clone)]
@@ -844,11 +876,10 @@ impl DaemonFleetClient {
             // indefinitely. The global 180s backstop is generous enough for the
             // longest control op (a `/control/closeout` rebase+push); roster
             // snapshots add a shorter per-request timeout below.
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(180))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            http: build_http_client(UNARY_HTTP_TIMEOUTS),
+            // SSE streams are intentionally unbounded after connect. A total
+            // request timeout would kill healthy infinite streams on schedule.
+            stream_http: build_http_client(STREAM_HTTP_TIMEOUTS),
         }
     }
 
@@ -903,11 +934,62 @@ impl DaemonFleetClient {
 
     async fn open_roster_stream(&self) -> anyhow::Result<reqwest::Response> {
         Ok(self
-            .http
+            .stream_http
             .get(self.endpoint("/control/roster/stream"))
             .send()
             .await?
             .error_for_status()?)
+    }
+
+    async fn open_focused_transcript_stream(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(self
+            .stream_http
+            .get(self.endpoint(&format!("/control/transcript/{task_id}/stream")))
+            .send()
+            .await?
+            .error_for_status()?)
+    }
+
+    async fn get_focused_transcript_history(
+        &self,
+        task_id: &str,
+        from_cursor: u64,
+        limit: usize,
+    ) -> anyhow::Result<TranscriptHistoryPageV1> {
+        let resp = self
+            .http
+            .get(self.endpoint(&format!("/control/transcript/{task_id}")))
+            .query(&[("from_cursor", from_cursor.to_string()), ("limit", limit.to_string())])
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
+    async fn stream_focused_transcript(
+        &self,
+        task_id: String,
+        tx: Sender<FocusedTranscriptStreamEvent>,
+    ) -> anyhow::Result<()> {
+        let mut response = self.open_focused_transcript_stream(&task_id).await?;
+        let mut buffer = String::new();
+        while let Some(chunk) = response.chunk().await? {
+            let text = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
+            buffer.push_str(&text);
+            while let Some(idx) = buffer.find("\n\n") {
+                let frame: String = buffer.drain(..idx + 2).collect();
+                if let Some(item) = parse_focused_transcript_sse_frame(&frame) {
+                    if tx.send(item).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn dispatch(&self, spec: DispatchSpec) -> AgentHandle {
@@ -917,9 +999,27 @@ impl DaemonFleetClient {
         self.handle_from_response(value, spec.provider, spec.cwd, spec.name, spec.model)
     }
 
+    async fn dispatch_async(&self, spec: DispatchSpec) -> AgentHandle {
+        let body = dispatch_body(&spec);
+        let value = self
+            .post_json("/control/exec", body)
+            .await
+            .unwrap_or_else(|err| json!({ "error": err.to_string() }));
+        self.handle_from_response(value, spec.provider, spec.cwd, spec.name, spec.model)
+    }
+
     fn resume(&self, spec: ResumeSpec) -> AgentHandle {
         let body = resume_body(&spec);
         let value = block_on_fleet_http(self.post_json("/control/resume", body))
+            .unwrap_or_else(|err| json!({ "error": err.to_string() }));
+        self.handle_from_response(value, spec.provider, spec.cwd, spec.name, spec.model)
+    }
+
+    async fn resume_async(&self, spec: ResumeSpec) -> AgentHandle {
+        let body = resume_body(&spec);
+        let value = self
+            .post_json("/control/resume", body)
+            .await
             .unwrap_or_else(|err| json!({ "error": err.to_string() }));
         self.handle_from_response(value, spec.provider, spec.cwd, spec.name, spec.model)
     }
@@ -1113,6 +1213,81 @@ struct RosterSubscriptionState {
     last_seq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum FocusedTranscriptStreamEvent {
+    Snapshot(FocusedTranscriptSnapshotV1),
+    Event(FocusedTranscriptLiveEventV1),
+    Resync {
+        reason: Option<String>,
+        skipped: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FocusedTranscriptBuffer {
+    events: BTreeMap<u64, Value>,
+    live_cursor: Option<u64>,
+    memory_start_cursor: u64,
+    next_memory_cursor: u64,
+    history_jsonl_path: Option<String>,
+    resync_required: bool,
+}
+
+impl FocusedTranscriptBuffer {
+    pub fn apply_snapshot(&mut self, snapshot: FocusedTranscriptSnapshotV1) {
+        self.events.clear();
+        self.live_cursor = Some(snapshot.live_cursor);
+        self.memory_start_cursor = snapshot.memory_start_cursor;
+        self.next_memory_cursor = snapshot.next_memory_cursor;
+        self.history_jsonl_path = snapshot.history_jsonl_path;
+        self.resync_required = false;
+        for item in snapshot.events {
+            self.events.insert(item.cursor, item.event);
+        }
+    }
+
+    pub fn apply_live_event(&mut self, event: FocusedTranscriptLiveEventV1) -> bool {
+        if self.live_cursor.is_some_and(|cursor| event.cursor <= cursor) {
+            return false;
+        }
+        self.live_cursor = Some(event.cursor);
+        self.next_memory_cursor = self.next_memory_cursor.max(event.cursor.saturating_add(1));
+        self.events.insert(event.cursor, event.event);
+        true
+    }
+
+    pub fn apply_history_page(&mut self, page: TranscriptHistoryPageV1) -> bool {
+        let mut changed = false;
+        for item in page.events {
+            changed |= self.events.insert(item.cursor, item.event).is_none();
+        }
+        if changed {
+            self.memory_start_cursor = self.events.keys().next().copied().unwrap_or(0);
+        }
+        changed
+    }
+
+    pub fn mark_resync_required(&mut self) {
+        self.resync_required = true;
+    }
+
+    pub fn resync_required(&self) -> bool {
+        self.resync_required
+    }
+
+    pub fn history_jsonl_path(&self) -> Option<&str> {
+        self.history_jsonl_path.as_deref()
+    }
+
+    pub fn earliest_cursor(&self) -> Option<u64> {
+        self.events.keys().next().copied()
+    }
+
+    pub fn events(&self) -> Vec<Value> {
+        self.events.values().cloned().collect()
+    }
+}
+
 async fn resync_roster_from<T: RosterTransport + ?Sized>(
     transport: &T,
     task_store: &Arc<RwLock<TaskStore>>,
@@ -1157,8 +1332,8 @@ enum RosterSseItem {
     Resync { reason: Option<String>, skipped: Option<u64> },
 }
 
-fn parse_roster_sse_frame(frame: &str) -> Option<RosterSseItem> {
-    let mut event_name: Option<&str> = None;
+fn parse_sse_frame(frame: &str) -> (Option<String>, String) {
+    let mut event_name: Option<String> = None;
     let mut data = String::new();
     for raw in frame.lines() {
         let line = raw.trim_end_matches('\r');
@@ -1166,7 +1341,7 @@ fn parse_roster_sse_frame(frame: &str) -> Option<RosterSseItem> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("event:") {
-            event_name = Some(rest.trim());
+            event_name = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("data:") {
             if !data.is_empty() {
                 data.push('\n');
@@ -1174,8 +1349,13 @@ fn parse_roster_sse_frame(frame: &str) -> Option<RosterSseItem> {
             data.push_str(rest.trim_start());
         }
     }
+    (event_name, data)
+}
 
-    if event_name == Some("resync") {
+fn parse_roster_sse_frame(frame: &str) -> Option<RosterSseItem> {
+    let (event_name, data) = parse_sse_frame(frame);
+
+    if event_name.as_deref() == Some("resync") {
         let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
         return Some(RosterSseItem::Resync {
             reason: parsed
@@ -1192,6 +1372,29 @@ fn parse_roster_sse_frame(frame: &str) -> Option<RosterSseItem> {
     serde_json::from_str::<RosterDelta>(&data)
         .ok()
         .map(RosterSseItem::Delta)
+}
+
+fn parse_focused_transcript_sse_frame(frame: &str) -> Option<FocusedTranscriptStreamEvent> {
+    let (event_name, data) = parse_sse_frame(frame);
+    match event_name.as_deref() {
+        Some("snapshot") => serde_json::from_str::<FocusedTranscriptSnapshotV1>(&data)
+            .ok()
+            .map(FocusedTranscriptStreamEvent::Snapshot),
+        Some("event") => serde_json::from_str::<FocusedTranscriptLiveEventV1>(&data)
+            .ok()
+            .map(FocusedTranscriptStreamEvent::Event),
+        Some("resync") => {
+            let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+            Some(FocusedTranscriptStreamEvent::Resync {
+                reason: parsed
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                skipped: parsed.get("skipped").and_then(|v| v.as_u64()),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn emit_roster_changed(tail_tx: &broadcast::Sender<TailEvent>) {
@@ -1426,6 +1629,28 @@ impl FleetOrchestrator {
         Ok(())
     }
 
+    /// Open the focused transcript SSE stream for one zoomed task. The first item
+    /// should be a snapshot; later items are live cursor events or resync signals.
+    pub async fn stream_focused_transcript(
+        &self,
+        task_id: String,
+        tx: Sender<FocusedTranscriptStreamEvent>,
+    ) -> anyhow::Result<()> {
+        self.daemon.stream_focused_transcript(task_id, tx).await
+    }
+
+    /// Fetch a cursor-bounded page from the provider transcript JSONL history.
+    pub async fn transcript_history_page(
+        &self,
+        task_id: &str,
+        from_cursor: u64,
+        limit: usize,
+    ) -> anyhow::Result<TranscriptHistoryPageV1> {
+        self.daemon
+            .get_focused_transcript_history(task_id, from_cursor, limit)
+            .await
+    }
+
     /// Subscribe to client-local roster-change/terminal signals. Each call
     /// returns an independent receiver; the cockpit forwards these into its sync
     /// TUI loop the same way `council_tui` forwards SSE signals.
@@ -1478,11 +1703,33 @@ impl FleetOrchestrator {
         handle
     }
 
+    /// Async form for TUI workers: await `/control/exec` without blocking the
+    /// synchronous render thread or a runtime worker with `block_in_place`.
+    pub async fn dispatch_async(&self, mut spec: DispatchSpec) -> AgentHandle {
+        if spec.name.is_none() {
+            spec.name = Some(prompt_head(&spec.prompt));
+        }
+        let handle = self.daemon.dispatch_async(spec).await;
+        self.task_store
+            .write()
+            .insert(handle.id(), handle.task.clone());
+        handle
+    }
+
     /// Resume a prior session (§5) over the daemon control plane: the daemon
     /// owns the session store and its transcript; the roster subscription updates
     /// the summary row after the resume lands.
     pub fn resume(&self, spec: ResumeSpec) -> AgentHandle {
         let handle = self.daemon.resume(spec);
+        self.task_store
+            .write()
+            .insert(handle.id(), handle.task.clone());
+        handle
+    }
+
+    /// Async form for TUI workers: await `/control/resume` without blocking draw.
+    pub async fn resume_async(&self, spec: ResumeSpec) -> AgentHandle {
+        let handle = self.daemon.resume_async(spec).await;
         self.task_store
             .write()
             .insert(handle.id(), handle.task.clone());
@@ -1569,6 +1816,59 @@ mod tests {
         assert!(orch.tasks().is_empty());
         // subscribe must yield a live receiver without a prior dispatch.
         let _rx = orch.subscribe();
+    }
+
+    #[test]
+    fn streaming_client_policy_has_no_total_timeout() {
+        assert_eq!(STREAM_HTTP_TIMEOUTS.connect, Duration::from_secs(10));
+        assert_eq!(STREAM_HTTP_TIMEOUTS.total, None);
+        assert_eq!(UNARY_HTTP_TIMEOUTS.total, Some(Duration::from_secs(180)));
+    }
+
+    #[test]
+    fn focused_transcript_snapshot_then_cursor_apply() {
+        let mut buffer = FocusedTranscriptBuffer::default();
+        buffer.apply_snapshot(FocusedTranscriptSnapshotV1 {
+            task_id: bro_core::TaskId::new("task-1"),
+            session_id: Some(bro_core::SessionId::new("session-1")),
+            provider: Provider::Brodex,
+            status: TaskStatus::Running,
+            live_cursor: 2,
+            memory_start_cursor: 0,
+            next_memory_cursor: 3,
+            events: vec![
+                bro_protocol::FocusedTranscriptMemoryEventV1 {
+                    cursor: 0,
+                    event: json!({ "type": "user", "message": { "content": "hi" } }),
+                },
+                bro_protocol::FocusedTranscriptMemoryEventV1 {
+                    cursor: 1,
+                    event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "one" }] } }),
+                },
+                bro_protocol::FocusedTranscriptMemoryEventV1 {
+                    cursor: 2,
+                    event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "two" }] } }),
+                },
+            ],
+            history_jsonl_path: Some("/tmp/task.jsonl".to_string()),
+        });
+
+        assert_eq!(buffer.events().len(), 3);
+        assert!(!buffer.apply_live_event(FocusedTranscriptLiveEventV1 {
+            task_id: bro_core::TaskId::new("task-1"),
+            cursor: 2,
+            event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "stale" }] } }),
+        }));
+        assert_eq!(buffer.events().len(), 3);
+        assert!(buffer.apply_live_event(FocusedTranscriptLiveEventV1 {
+            task_id: bro_core::TaskId::new("task-1"),
+            cursor: 3,
+            event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "three" }] } }),
+        }));
+
+        let events = buffer.events();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[3]["message"]["content"][0]["text"], "three");
     }
 
     #[test]

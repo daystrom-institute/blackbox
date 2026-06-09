@@ -56,8 +56,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use bro_fleet_client::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DispatchSpec, FleetConfig,
-    FleetOrchestrator, Provider, ResumeSpec, TailEvent, TaskStatus, TodoItemStatus, TodoState,
-    TranscriptItem, bro_home, intern_rider, provider_supports_bidi,
+    FleetOrchestrator, FocusedTranscriptBuffer, FocusedTranscriptStreamEvent, Provider,
+    ResumeSpec, TailEvent, TaskStatus, TodoItemStatus, TodoState, TranscriptHistoryPageV1,
+    TranscriptItem, bro_home, intern_rider, parse_transcript, provider_supports_bidi,
 };
 
 use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
@@ -348,6 +349,21 @@ pub struct AgentLaunch {
     pub prompt: Option<String>,
 }
 
+const FOCUSED_HISTORY_PAGE: usize = 200;
+
+#[derive(Debug)]
+enum FocusedTranscriptMsg {
+    Stream(FocusedTranscriptStreamEvent),
+    HistoryPage {
+        task_id: String,
+        result: Result<TranscriptHistoryPageV1, String>,
+    },
+    Error {
+        task_id: String,
+        message: String,
+    },
+}
+
 // ── App state ──────────────────────────────────────────────────────────────
 
 struct App {
@@ -368,6 +384,15 @@ struct App {
     /// Stable task id for the currently open single-agent view. Roster order is
     /// live-sorted, so a row index is not a stable identity while agents update.
     focused_agent_id: Option<String>,
+    /// Raw focused transcript events for the zoomed agent, hydrated from the
+    /// daemon's snapshot+cursor stream and optional JSONL history pages.
+    focused_transcript: Option<FocusedTranscriptBuffer>,
+    focused_transcript_task_id: Option<String>,
+    focused_transcript_task: Option<tokio::task::JoinHandle<()>>,
+    focused_transcript_tx: mpsc::Sender<FocusedTranscriptMsg>,
+    focused_transcript_rx: mpsc::Receiver<FocusedTranscriptMsg>,
+    focused_history_inflight: bool,
+    focused_reflow_requested: bool,
     /// Index into [`FLEET_PROVIDERS`] for the provider selector.
     provider_cursor: usize,
     /// Index into the selected provider's model catalog for the model selector.
@@ -524,6 +549,7 @@ impl App {
         let (ctrl_tx, ctrl_rx) = mpsc::channel();
         let (standalone_tx, standalone_rx) = mpsc::channel();
         let (closeout_tx, closeout_rx) = mpsc::channel();
+        let (focused_transcript_tx, focused_transcript_rx) = mpsc::channel();
         let default_provider = DEFAULT_FLEET_PROVIDER;
         let provider_cursor = default_fleet_provider_cursor();
         let model_cursor = default_provider
@@ -546,6 +572,13 @@ impl App {
             roster_selected: 0,
             roster_anchor_id: None,
             focused_agent_id: None,
+            focused_transcript: None,
+            focused_transcript_task_id: None,
+            focused_transcript_task: None,
+            focused_transcript_tx,
+            focused_transcript_rx,
+            focused_history_inflight: false,
+            focused_reflow_requested: false,
             provider_cursor,
             model_cursor,
             effort_cursor,
@@ -766,15 +799,199 @@ fn refresh_agents_from_roster(app: &mut App) {
         }
     }
     app.agents = next;
-    if let Some(id) = &app.focused_agent_id
-        && !app.agents.iter().any(|agent| agent.task.id() == *id)
+    if let Some(id) = app.focused_agent_id.clone()
+        && !app.agents.iter().any(|agent| agent.task.id() == id)
     {
+        stop_focused_transcript(app);
         app.focused_agent_id = None;
         if app.zone == Zone::SingleAgent && !app.mode.is_standalone() {
             app.zone = Zone::Roster;
         }
     }
     app.reconcile_roster_selection();
+}
+
+fn start_focused_transcript(app: &mut App, task_id: String) {
+    if app.focused_transcript_task_id.as_deref() == Some(task_id.as_str()) {
+        return;
+    }
+    stop_focused_transcript(app);
+    app.focused_transcript_task_id = Some(task_id.clone());
+    app.focused_transcript = Some(FocusedTranscriptBuffer::default());
+    app.focused_history_inflight = false;
+    app.focused_reflow_requested = true;
+    let ui_tx = app.focused_transcript_tx.clone();
+    let (stream_tx, stream_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = stream_rx.recv() {
+            if ui_tx.send(FocusedTranscriptMsg::Stream(event)).is_err() {
+                break;
+            }
+        }
+    });
+    let err_tx = app.focused_transcript_tx.clone();
+    let orch = app.orch.clone();
+    let stream_task_id = task_id.clone();
+    let handle = app.rt.spawn(async move {
+        let result = orch
+            .stream_focused_transcript(stream_task_id.clone(), stream_tx)
+            .await;
+        if let Err(err) = result {
+            let _ = err_tx.send(FocusedTranscriptMsg::Error {
+                task_id: stream_task_id,
+                message: err.to_string(),
+            });
+        }
+    });
+    app.focused_transcript_task = Some(handle);
+}
+
+fn stop_focused_transcript(app: &mut App) {
+    if let Some(handle) = app.focused_transcript_task.take() {
+        handle.abort();
+    }
+    app.focused_transcript_task_id = None;
+    app.focused_transcript = None;
+    app.focused_history_inflight = false;
+    app.focused_reflow_requested = false;
+}
+
+fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
+    if app.mode.is_standalone() {
+        return app.agents[idx].task.transcript();
+    }
+    let id = app.agents[idx].task.id();
+    if app.focused_transcript_task_id.as_deref() == Some(id.as_str())
+        && let Some(buffer) = &app.focused_transcript
+    {
+        return parse_transcript(&buffer.events());
+    }
+    Vec::new()
+}
+
+fn request_focused_history(app: &mut App) {
+    if app.zone != Zone::SingleAgent || app.mode.is_standalone() || app.focused_history_inflight {
+        return;
+    }
+    let Some(task_id) = app.focused_agent_id.clone() else {
+        return;
+    };
+    if app.focused_transcript_task_id.as_deref() != Some(task_id.as_str()) {
+        return;
+    }
+    let Some(buffer) = &app.focused_transcript else {
+        return;
+    };
+    if buffer.history_jsonl_path().is_none() {
+        return;
+    }
+    let Some(earliest) = buffer.earliest_cursor() else {
+        return;
+    };
+    if earliest == 0 {
+        return;
+    }
+    let limit = FOCUSED_HISTORY_PAGE.min(earliest as usize).max(1);
+    let from_cursor = earliest.saturating_sub(limit as u64);
+    app.focused_history_inflight = true;
+    let orch = app.orch.clone();
+    let tx = app.focused_transcript_tx.clone();
+    app.rt.spawn(async move {
+        let result = orch
+            .transcript_history_page(&task_id, from_cursor, limit)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(FocusedTranscriptMsg::HistoryPage { task_id, result });
+    });
+}
+
+fn handle_focused_transcript_msg(app: &mut App, msg: FocusedTranscriptMsg) {
+    match msg {
+        FocusedTranscriptMsg::Stream(FocusedTranscriptStreamEvent::Snapshot(snapshot)) => {
+            let task_id = snapshot.task_id.as_str().to_string();
+            if app.focused_agent_id.as_deref() != Some(task_id.as_str()) {
+                return;
+            }
+            let had_events = app
+                .focused_transcript
+                .as_ref()
+                .is_some_and(|buffer| buffer.earliest_cursor().is_some());
+            let buffer = app
+                .focused_transcript
+                .get_or_insert_with(FocusedTranscriptBuffer::default);
+            buffer.apply_snapshot(snapshot);
+            app.focused_transcript_task_id = Some(task_id.clone());
+            app.inline_commits.remove(&task_id);
+            app.focused_reflow_requested |= had_events;
+        }
+        FocusedTranscriptMsg::Stream(FocusedTranscriptStreamEvent::Event(event)) => {
+            let task_id = event.task_id.as_str().to_string();
+            if app.focused_agent_id.as_deref() != Some(task_id.as_str())
+                || app.focused_transcript_task_id.as_deref() != Some(task_id.as_str())
+            {
+                return;
+            }
+            let buffer = app
+                .focused_transcript
+                .get_or_insert_with(FocusedTranscriptBuffer::default);
+            let _ = buffer.apply_live_event(event);
+        }
+        FocusedTranscriptMsg::Stream(FocusedTranscriptStreamEvent::Resync { reason, skipped }) => {
+            if let Some(buffer) = &mut app.focused_transcript {
+                buffer.mark_resync_required();
+            }
+            let detail = reason.unwrap_or_else(|| "lag".to_string());
+            let skipped = skipped.map(|n| format!(" ({n} skipped)")).unwrap_or_default();
+            app.set_status(
+                format!("transcript stream resync: {detail}{skipped}"),
+                Duration::from_secs(4),
+            );
+            if let Some(task_id) = app.focused_agent_id.clone() {
+                start_focused_transcript(app, task_id);
+            }
+        }
+        FocusedTranscriptMsg::HistoryPage { task_id, result } => {
+            if app.focused_agent_id.as_deref() != Some(task_id.as_str()) {
+                return;
+            }
+            app.focused_history_inflight = false;
+            match result {
+                Ok(page) => {
+                    let buffer = app
+                        .focused_transcript
+                        .get_or_insert_with(FocusedTranscriptBuffer::default);
+                    if buffer.apply_history_page(page) {
+                        app.inline_commits.remove(&task_id);
+                        app.focused_reflow_requested = true;
+                    }
+                }
+                Err(message) => {
+                    app.set_status(
+                        format!("transcript history failed: {}", first_line(&message)),
+                        Duration::from_secs(5),
+                    );
+                }
+            }
+        }
+        FocusedTranscriptMsg::Error { task_id, message } => {
+            if app.focused_agent_id.as_deref() == Some(task_id.as_str()) {
+                app.set_status(
+                    format!("transcript stream failed: {}", first_line(&message)),
+                    Duration::from_secs(5),
+                );
+            }
+        }
+    }
+}
+
+fn drain_focused_transcript(app: &mut App) {
+    let mut messages = Vec::new();
+    while let Ok(msg) = app.focused_transcript_rx.try_recv() {
+        messages.push(msg);
+    }
+    for msg in messages {
+        handle_focused_transcript_msg(app, msg);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1595,6 +1812,16 @@ where
             terminal.clear_scrollback_and_visible_screen_ansi()?;
             prev_vp = None;
         }
+        if exit_on_zoom_out && app.focused_reflow_requested {
+            if let Some(idx) = inline_focus_idx(app) {
+                app.inline_commits.remove(&app.agents[idx].task.id());
+            }
+            let seed = inline_seed_viewport(app, screen_w, screen_h);
+            terminal.set_viewport_area(seed);
+            terminal.clear_scrollback_and_visible_screen_ansi()?;
+            prev_vp = None;
+            app.focused_reflow_requested = false;
+        }
         commit_size = Some((screen_w, screen_h));
 
         let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
@@ -1608,7 +1835,7 @@ where
 
         let mut committed_now = false;
         let active_lines = if let Some(idx) = focus {
-            let transcript = app.agents[idx].task.transcript();
+            let transcript = focused_transcript_items(app, idx);
             let turn_active = app.agents[idx].task.snapshot().turn_active;
             let stable_end = inline_stable_end(transcript.len(), turn_active);
             committed_now =
@@ -1744,6 +1971,7 @@ fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
     while let Ok(ev) = signals.try_recv() {
         handle_tail(app, ev);
     }
+    drain_focused_transcript(app);
     let mut notes = Vec::new();
     while let Ok(note) = app.classifier_rx.try_recv() {
         notes.push(note);
@@ -2031,23 +2259,33 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Home if editing => app.cursor_pos = 0,
         KeyCode::End if editing => app.cursor_pos = app.input.len(),
 
+        // Scroll the single-agent transcript when there's text in the composer
+        // (arrows are claimed by editing, so scroll rides Ctrl).
+        KeyCode::Up if ctrl && app.zone == Zone::SingleAgent => {
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(1);
+            request_focused_history(app);
+        }
+        KeyCode::Down if ctrl && app.zone == Zone::SingleAgent => {
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1);
+        }
+
         // ── Navigation (only when composer is empty) ──
         KeyCode::Left if zoom => zoom_left(app),
         KeyCode::Right if zoom => zoom_right(app),
         KeyCode::Up if nav => vertical(app, -1),
         KeyCode::Down if nav => vertical(app, 1),
 
-        // Scroll the single-agent transcript when there's text in the composer
-        // (arrows are claimed by editing, so scroll rides Ctrl).
-        KeyCode::Up if ctrl => app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(1),
-        KeyCode::Down if ctrl => app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1),
         KeyCode::PageUp if app.zone == Zone::SingleAgent => {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(page_scroll_step(app));
+            request_focused_history(app);
         }
         KeyCode::PageDown if app.zone == Zone::SingleAgent => {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(page_scroll_step(app));
         }
-        KeyCode::Home if app.zone == Zone::SingleAgent => app.scroll_from_bottom = usize::MAX / 2,
+        KeyCode::Home if app.zone == Zone::SingleAgent => {
+            app.scroll_from_bottom = usize::MAX / 2;
+            request_focused_history(app);
+        }
         KeyCode::End if app.zone == Zone::SingleAgent => app.scroll_from_bottom = 0,
 
         // Roster: half-page paging (clamped) + jump to first/last agent.
@@ -2972,6 +3210,7 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
     // single-agent view and roster cursor would lose this agent.
     if app.focused_agent_id.as_deref() == Some(outcome.agent_id.as_str()) {
         app.focused_agent_id = Some(new_id.clone());
+        start_focused_transcript(app, new_id.clone());
     }
     if app.roster_anchor_id.as_deref() == Some(outcome.agent_id.as_str()) {
         app.roster_anchor_id = Some(new_id.clone());
@@ -3182,6 +3421,7 @@ fn zoom_left(app: &mut App) {
             app.anchor_roster_selection();
         }
         app.focused_agent_id = None;
+        stop_focused_transcript(app);
     }
     app.zone = match app.zone {
         Zone::SingleAgent => Zone::Roster,
@@ -3265,7 +3505,9 @@ fn zoom_right(app: &mut App) {
         }
         Zone::Roster => {
             if let Some(idx) = app.selected_agent() {
-                app.focused_agent_id = Some(app.agents[idx].task.id());
+                let task_id = app.agents[idx].task.id();
+                app.focused_agent_id = Some(task_id.clone());
+                start_focused_transcript(app, task_id);
                 app.zone = Zone::SingleAgent;
                 app.scroll_from_bottom = 0;
                 app.history_cursor = None;

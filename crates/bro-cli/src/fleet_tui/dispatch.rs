@@ -66,7 +66,8 @@ pub(super) fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String)
             service_tier,
             classifier_cfg,
             alias,
-        );
+        )
+        .await;
         let _ = tx.send(outcome);
     });
 }
@@ -75,7 +76,7 @@ pub(super) fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String)
 /// isolated worktree, frame the first turn, and register the task with the
 /// daemon. The blocking git + HTTP live here, never on the UI loop.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_fleet_dispatch(
+pub(super) async fn build_fleet_dispatch(
     orch: Arc<FleetOrchestrator>,
     launch_cwd: Option<String>,
     prompt: String,
@@ -118,7 +119,7 @@ pub(super) fn build_fleet_dispatch(
     // Fleet-wide code-mode default from /config carries to NEW roster sessions.
     spec.code_mode = code_mode;
     spec.service_tier = service_tier.clone();
-    let task = orch.dispatch(spec);
+    let task = orch.dispatch_async(spec).await;
 
     DispatchOutcome::Ready(Box::new(DispatchedAgent {
         task,
@@ -229,7 +230,7 @@ pub(super) fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: St
             spec.model = model.clone();
             spec.effort = effort.clone();
             spec.name = Some(name.clone());
-            orch.resume(spec)
+            orch.resume_async(spec).await
         } else {
             let mut spec = DispatchSpec::new(provider, prompt.clone());
             spec.cwd = cwd.clone();
@@ -238,7 +239,7 @@ pub(super) fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: St
             spec.name = Some(name.clone());
             // New session carries the fleet-wide code-mode; resume does not.
             spec.code_mode = code_mode.clone();
-            orch.dispatch(spec)
+            orch.dispatch_async(spec).await
         };
         let _ = tx.send(StandaloneOutcome {
             task,
