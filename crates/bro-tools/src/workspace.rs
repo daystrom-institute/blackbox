@@ -5,9 +5,9 @@
 //! pass through [`SafetyPolicy::deny_command`]; `git_commit` additionally
 //! rejects staged sensitive files.
 
-use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
+use crate::tool::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use async_trait::async_trait;
-use globset::Glob as GlobPattern;
+use globset::{Glob as GlobPattern, GlobBuilder};
 use ignore::WalkBuilder;
 use regex::Regex;
 use schemars::JsonSchema;
@@ -1212,6 +1212,24 @@ struct GlobInput {
 /// independent of the user-facing `max_results`.
 const GLOB_SCAN_CEILING: usize = 20_000;
 
+/// Compile a glob for matching paths **relative to the walk base**.
+///
+/// Two deliberate choices, learned from a live failure where `glob {pattern:
+/// "**/*fleet*"}` returned the entire tree: the matcher was tested against the
+/// ABSOLUTE path, and the worktree prefix (`.../bro/fleet/worktrees/...`) itself
+/// contained "fleet", so every file matched.
+///   - `literal_separator(true)` so `*` does not cross `/` — standard glob
+///     semantics (cf. codex `protocol/src/permissions.rs::build_glob_matcher`,
+///     Apache-2.0); use `**` to span directories.
+///   - the caller matches ONLY the base-relative path (never the absolute
+///     path), so a base-dir prefix can never leak into the match.
+fn relpath_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
+    Ok(GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
+}
+
 pub struct Glob;
 
 #[async_trait]
@@ -1236,10 +1254,15 @@ impl Tool for Glob {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let matcher = match GlobPattern::new(&args.pattern) {
-            Ok(gp) => gp.compile_matcher(),
+        let matcher = match relpath_glob(&args.pattern) {
+            Ok(m) => m,
             Err(e) => return ToolResult::Error(format!("bad glob: {e}")),
         };
+        // A slash-less pattern (e.g. "*.rs", "Cargo.toml") is also matched
+        // against the file NAME at any depth — ripgrep/fd `-g` ergonomics — so
+        // an agent doesn't have to write "**/" for the common "find files of
+        // this kind anywhere" case. Patterns with a separator stay full-path.
+        let match_basename = !args.pattern.contains('/');
         let base = match walk_base(&cx.root, args.path.as_deref()) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
@@ -1253,7 +1276,11 @@ impl Tool for Glob {
             }
             let p = entry.path();
             let rel = p.strip_prefix(&base).unwrap_or(p);
-            if matcher.is_match(rel) || matcher.is_match(p) {
+            let name_hit = match_basename
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| matcher.is_match(n));
+            if matcher.is_match(rel) || name_hit {
                 let mtime = entry
                     .metadata()
                     .ok()
@@ -1379,6 +1406,144 @@ fn definition_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(SRC).expect("valid definition regex"))
         .clone()
+}
+
+// ---------------------------------------------------------------------------
+// apply_patch
+// ---------------------------------------------------------------------------
+
+/// The codex `*** Begin Patch` editor, exposed as a freeform/grammar-constrained
+/// tool. Only meaningful on transports that honor the lark grammar (Responses);
+/// the harness drops it elsewhere via the grammar-transport rule, so it never
+/// degrades to an unconstrained JSON-string editor competing with `file_edit`.
+pub struct ApplyPatch;
+
+#[async_trait]
+impl Tool for ApplyPatch {
+    fn name(&self) -> &str {
+        "apply_patch"
+    }
+    fn description(&self) -> &str {
+        "Edit files with a `*** Begin Patch` / `*** End Patch` envelope of \
+         `*** Add File:` / `*** Update File:` / `*** Delete File:` (and optional \
+         `*** Move to:`) hunks; update lines are prefixed ' ' (context), '+' \
+         (add), or '-' (remove). This is a FREEFORM tool — emit the patch text \
+         directly, do not wrap it in JSON. Paths are relative to the worktree root."
+    }
+    fn input_schema(&self) -> Value {
+        // JSON-function fallback shape. The freeform/grammar channel delivers
+        // the patch as raw text (mapped to `source`); the fallback accepts it
+        // under `source` too. The tool is only registered on grammar-capable
+        // transports, so the fallback is effectively unused.
+        json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "The full apply_patch envelope text."
+                }
+            },
+            "required": ["source"]
+        })
+    }
+    fn freeform_grammar(&self) -> Option<FreeformGrammar> {
+        Some(FreeformGrammar {
+            syntax: "lark".to_string(),
+            definition: bro_apply_patch::APPLY_PATCH_LARK_GRAMMAR.to_string(),
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: false,
+            destructive: true,
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        // The custom_tool_call freeform channel maps raw text to `source`; also
+        // accept `patch`/`input` for the JSON-function fallback.
+        let patch_text = input
+            .get("source")
+            .or_else(|| input.get("patch"))
+            .or_else(|| input.get("input"))
+            .and_then(|v| v.as_str());
+        let patch_text = match patch_text {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => {
+                return ToolResult::Error(
+                    "apply_patch expects the patch envelope text (as `source`)".to_string(),
+                );
+            }
+        };
+
+        // Snapshot pre-images of every source path the patch touches, so applied
+        // changes feed the edit-diagnostics sink the same way file_edit does.
+        let parsed = match bro_apply_patch::parse_patch(patch_text) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::Error(format!("apply_patch parse error: {e}")),
+        };
+        let mut pre_images: std::collections::HashMap<PathBuf, Vec<u8>> =
+            std::collections::HashMap::new();
+        for hunk in &parsed.hunks {
+            let src = match hunk {
+                bro_apply_patch::Hunk::AddFile { path, .. } => path,
+                bro_apply_patch::Hunk::DeleteFile { path } => path,
+                bro_apply_patch::Hunk::UpdateFile { path, .. } => path,
+            };
+            let abs = cx.root.join(src);
+            pre_images.insert(src.clone(), std::fs::read(&abs).unwrap_or_default());
+        }
+
+        let outcome = match bro_apply_patch::apply_patch(patch_text, &cx.root) {
+            Ok(o) => o,
+            Err(e) => return ToolResult::Error(format!("apply_patch failed: {e}")),
+        };
+
+        use bro_apply_patch::FileAction;
+        let mut summary = Vec::with_capacity(outcome.changes.len());
+        for ch in &outcome.changes {
+            let abs = cx.root.join(&ch.path);
+            match ch.action {
+                FileAction::Added | FileAction::Updated => {
+                    let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
+                    let post = std::fs::read(&abs).unwrap_or_default();
+                    record_edit(cx, &abs, &pre, &post);
+                }
+                FileAction::Deleted => {
+                    let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
+                    record_edit(cx, &abs, &pre, &[]);
+                }
+                FileAction::Moved => {
+                    // Old path removed, new path created.
+                    if let Some(from) = &ch.moved_from {
+                        let from_abs = cx.root.join(from);
+                        let pre = pre_images.get(from).cloned().unwrap_or_default();
+                        record_edit(cx, &from_abs, &pre, &[]);
+                        let post = std::fs::read(&abs).unwrap_or_default();
+                        record_edit(cx, &abs, &[], &post);
+                    }
+                }
+            }
+            let verb = match ch.action {
+                FileAction::Added => "added",
+                FileAction::Updated => "updated",
+                FileAction::Deleted => "deleted",
+                FileAction::Moved => "moved",
+            };
+            match (&ch.moved_from, ch.action) {
+                (Some(from), FileAction::Moved) => {
+                    summary.push(format!("{verb} {} -> {}", from.display(), ch.path.display()))
+                }
+                _ => summary.push(format!("{verb} {}", ch.path.display())),
+            }
+        }
+
+        ToolResult::Text(format!(
+            "Applied patch ({} change{}):\n{}",
+            summary.len(),
+            if summary.len() == 1 { "" } else { "s" },
+            summary.join("\n")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1782,6 +1947,98 @@ mod tests {
             }
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn glob_matches_relative_path_not_absolute_prefix() {
+        // Regression (live bug): a glob must match the BASE-RELATIVE path only.
+        // A base dir whose own absolute path contains the pattern's literal
+        // substring — here "fleet", as in `.../bro/fleet/worktrees/...` — must
+        // NOT make every file match. Before the fix, the matcher was also tested
+        // against the absolute path, so `**/*fleet*` returned the whole tree.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("fleet_worktrees");
+        let nested = base.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(base.join("AGENTS.md"), "x\n").unwrap();
+        std::fs::write(base.join("plain.rs"), "x\n").unwrap();
+        std::fs::write(base.join("fleet_tui.rs"), "x\n").unwrap();
+        std::fs::write(nested.join("deep.rs"), "x\n").unwrap();
+        let cx = cx_at(&base);
+
+        // `**/*fleet*` matches only the fleet-named file — NOT every file under a
+        // base whose absolute path contains "fleet".
+        let r = Glob
+            .call(json!({"pattern": "**/*fleet*", "sort": "name"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                let lines: Vec<&str> = t.lines().collect();
+                assert_eq!(lines, vec!["fleet_tui.rs"], "only the fleet file: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // A slash-less pattern matches the basename at ANY depth (fd/rg `-g`).
+        let r = Glob
+            .call(json!({"pattern": "*.rs", "sort": "name"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                let lines: Vec<&str> = t.lines().collect();
+                assert_eq!(
+                    lines,
+                    vec!["fleet_tui.rs", "nested/deep.rs", "plain.rs"],
+                    "slash-less pattern is recursive by basename: {t}"
+                );
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // A separator'd pattern is anchored: `*.rs` under no subdir prefix does
+        // not reach into `nested/`, but `**/*.rs` does.
+        let r = Glob
+            .call(json!({"pattern": "nested/*.rs", "sort": "name"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                let lines: Vec<&str> = t.lines().collect();
+                assert_eq!(lines, vec!["nested/deep.rs"], "anchored subdir: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_patch_tool_applies_records_edits_and_exposes_grammar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_at(dir.path());
+
+        // The grammar is exposed so the harness offers it on grammar transports.
+        let g = ApplyPatch.freeform_grammar().expect("grammar present");
+        assert_eq!(g.syntax, "lark");
+        assert!(g.definition.contains("*** Begin Patch"));
+
+        let r = ApplyPatch
+            .call(
+                json!({"source": "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch"}),
+                &cx,
+            )
+            .await;
+        match r {
+            ToolResult::Text(t) => assert!(t.contains("added a.txt"), "{t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "hello\n"
+        );
+        // The mutation was recorded for the edit-diagnostics sink.
+        assert!(!cx.edits.lock().unwrap().is_empty());
+
+        // Missing patch text is a clean error, not a panic.
+        let r = ApplyPatch.call(json!({}), &cx).await;
+        assert!(matches!(r, ToolResult::Error(_)));
     }
 
     #[tokio::test]

@@ -617,6 +617,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bro-apply-patch"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bro-capabilities"
 version = "0.0.1"
 dependencies = [
@@ -761,6 +769,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bro-apply-patch",
  "globset",
  "ignore",
  "libc",

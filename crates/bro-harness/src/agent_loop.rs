@@ -647,6 +647,15 @@ impl Session {
         let tool_filter =
             mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
         let mut builtins = builtin_tools();
+        // Grammar-transport rule: a tool that REQUIRES a freeform grammar (e.g.
+        // apply_patch) is only meaningful where the transport honors grammars
+        // (Responses). On Anthropic/Chat it would degrade to an unconstrained
+        // JSON-string tool competing with file_edit, so drop it rather than
+        // offer it unconstrained. (code-mode's exec/wait are added later, below,
+        // so this never touches them.)
+        if !kind.honors_grammar() {
+            builtins.retain(|t| t.freeform_grammar().is_none());
+        }
         builtins.push(Arc::new(crate::report::ReportTool::new(make_emitter(
             store.id.clone(),
             callback.clone(),

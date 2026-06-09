@@ -13,6 +13,7 @@ members = [
     "crates/bro-fleet-client",
     "crates/bro-transcript",
     "crates/bro-code-mode",
+    "crates/bro-apply-patch",
 
     # Daemon-internal corpus crates peeled out of the root `blackbox` crate for
     # build parallelism (NOT bro-harness crates). Pure leaves: they depend only

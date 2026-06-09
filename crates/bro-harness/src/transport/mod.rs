@@ -469,6 +469,14 @@ mod base_instruction_tests {
 }
 
 impl TransportKind {
+    /// Whether this transport honors a freeform tool grammar (the Responses
+    /// custom-tool `format`). Only `OpenAiResponses` does; the others would
+    /// silently degrade a grammar tool to an unconstrained JSON-function tool,
+    /// so a grammar-requiring tool must not be offered on them.
+    pub fn honors_grammar(self) -> bool {
+        matches!(self, TransportKind::OpenAiResponses)
+    }
+
     pub fn from_env() -> Self {
         match session_var("BRO_HARNESS_TRANSPORT")
             .unwrap_or_default()

@@ -42,6 +42,9 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(SmartRead),
         Arc::new(FileEdit),
         Arc::new(FileWrite),
+        // Freeform/grammar-constrained editor; the harness's grammar-transport
+        // rule keeps it off transports that can't honor the lark grammar.
+        Arc::new(ApplyPatch),
         Arc::new(ListDir),
         Arc::new(ContentSearch),
         Arc::new(Glob),

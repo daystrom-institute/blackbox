@@ -1,0 +1,43 @@
+bro-apply-patch
+===============
+
+This crate is vendored and adapted from the apply-patch implementation of the
+OpenAI Codex project:
+
+    https://github.com/openai/codex  (codex-rs/apply-patch, codex-rs/core)
+
+The original work is licensed under the Apache License, Version 2.0.
+A copy of the license terms is available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Portions Copyright OpenAI.
+
+Vendored sources:
+
+  - `src/parser.rs`        from `codex-rs/apply-patch/src/parser.rs`
+  - `src/seek_sequence.rs` from `codex-rs/apply-patch/src/seek_sequence.rs`
+  - `src/apply_patch.lark` from `codex-rs/core/src/tools/handlers/apply_patch.lark`
+
+Local modifications by the Blackbox project:
+
+  - `parser.rs`: dropped `Hunk::resolve_path` and the `codex-utils-absolute-path`
+    dependency; path resolution against the worktree root lives in `apply.rs`.
+    The two tests exercising absolute-path resolution were removed accordingly.
+  - `apply.rs` is a Blackbox-authored synchronous apply layer that ports the
+    essence of Codex's `compute_replacements` / `apply_replacements` /
+    `derive_new_contents_from_chunks` (`codex-rs/apply-patch/src/lib.rs`) onto
+    `std::fs` against a base directory, without Codex's async `ExecutorFileSystem`
+    abstraction, sandbox context, `AbsolutePathBuf`, or `similar`-based unified
+    diffs.
+  - The grammar is used verbatim as the freeform-tool constraint for the
+    Responses transport (the base variant, without Codex's `environment_id`
+    extension).
+
+Upstream NOTICE:
+
+  OpenAI Codex
+  Copyright 2025 OpenAI
+
+This NOTICE file is provided in satisfaction of the Apache-2.0 attribution
+requirement. Do not remove it.

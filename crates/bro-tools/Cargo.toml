@@ -21,6 +21,7 @@ walkdir = "2"
 globset = "0.4"
 tracing = "0.1"
 libc = "0.2"
+bro-apply-patch = { path = "../bro-apply-patch" }
 sha2 = "0.10"
 
 [dev-dependencies]
