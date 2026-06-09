@@ -186,7 +186,11 @@ tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# LTO disabled: this daemon is I/O-bound (tantivy search, HTTP, subprocess
+# orchestration), so thin-LTO's whole-program reopt pass costs build minutes for
+# marginal runtime benefit. Re-enable lto="thin" if a profile shows a hot path
+# that benefits from cross-crate inlining.
+lto = false
 # In-process session isolation prerequisite (harness-daemon-boundary.md §5):
 # the daemon runs API-native sessions as tokio tasks, and a logic panic in one
 # session's turn must be caught at the task boundary so the daemon and sibling
