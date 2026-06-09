@@ -30,6 +30,9 @@ use crate::{
 // Shared state
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+const ROSTER_BROADCAST_BUFFER: usize = 1024;
+
 pub(crate) struct SharedState {
     pub(crate) idx: RwLock<TranscriptIndex>,
     pub(crate) kb: RwLock<Knowledge>,
@@ -294,7 +297,7 @@ impl SharedState {
     pub(crate) fn for_test(store_dir: &std::path::Path) -> SharedState {
         use std::collections::VecDeque;
         let (tail_tx, _) = broadcast::channel(128);
-        let (roster_tx, _) = broadcast::channel(128);
+        let (roster_tx, _) = broadcast::channel(ROSTER_BROADCAST_BUFFER);
         let idx = TranscriptIndex::open_or_create(
             &store_dir.join("idx"),
             Vec::new(),

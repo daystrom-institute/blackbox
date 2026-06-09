@@ -324,6 +324,7 @@ pub struct TaskInner {
     pub provider: Provider,
     pub session_id: String,
     pub events: Vec<Value>,
+    pub model: Option<String>,
     pub last_assistant_message: Option<String>,
     pub usage: Option<Usage>,
     pub cost_usd: Option<f64>,
@@ -497,23 +498,29 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .last_assistant_message
             .as_deref()
             .map(|s| s.chars().take(200).collect::<String>()),
-        model: model_from_events(&inner.events),
+        model: inner.model.clone(),
         last_event_at: Some(last_event_at),
         origin: inner.origin,
         workflow_owned: inner.workflow_owned,
     }
 }
 
-/// Best-effort model id from a task's recorded event buffer. Mirrors the fleet
-/// client scan so roster snapshots and deltas expose the same `model` value.
-fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
-    events.iter().find_map(|event| {
-        event
-            .get("model")
-            .or_else(|| event.get("message").and_then(|message| message.get("model")))
-            .and_then(|model| model.as_str())
-            .map(|model| model.to_string())
-    })
+fn model_from_event(event: &serde_json::Value) -> Option<String> {
+    event
+        .get("model")
+        .or_else(|| event.get("message").and_then(|message| message.get("model")))
+        .and_then(|model| model.as_str())
+        .map(|model| model.to_string())
+}
+
+fn model_from_events_at_load(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().find_map(model_from_event)
+}
+
+fn update_model_cache_from_event(inner: &mut TaskInner, event: &serde_json::Value) {
+    if inner.model.is_none() {
+        inner.model = model_from_event(event);
+    }
 }
 
 pub(crate) fn workflow_owned_for_origin(origin: bro_core::Origin) -> bool {
@@ -531,6 +538,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             provider,
             session_id: format!("sess-{id}"),
             events: vec![],
+            model: None,
             last_assistant_message: None,
             usage: None,
             cost_usd: None,
@@ -658,6 +666,8 @@ struct PersistedTask {
     provider: Provider,
     session_id: String,
     events: Vec<Value>,
+    #[serde(default)]
+    model: Option<String>,
     last_assistant_message: Option<String>,
     usage: Option<Usage>,
     cost_usd: Option<f64>,
@@ -751,6 +761,7 @@ impl TaskStore {
                         .rev()
                         .cloned()
                         .collect(),
+                    model: inner.model.clone(),
                     last_assistant_message: inner.last_assistant_message.clone(),
                     usage: inner.usage.clone(),
                     cost_usd: inner.cost_usd,
@@ -807,6 +818,9 @@ impl TaskStore {
             if rec.started_at < cutoff {
                 continue;
             }
+            let model = rec
+                .model
+                .or_else(|| model_from_events_at_load(&rec.events));
             if rec.status == TaskStatus::Running {
                 rec.status = TaskStatus::Failed;
                 rec.completed_at = Some(now_ms());
@@ -824,6 +838,7 @@ impl TaskStore {
                     provider: rec.provider,
                     session_id: rec.session_id,
                     events: rec.events,
+                    model,
                     last_assistant_message: rec.last_assistant_message,
                     usage: rec.usage,
                     cost_usd: rec.cost_usd,
@@ -1420,6 +1435,7 @@ fn failed_duplicate_task(
             provider,
             session_id,
             events: vec![],
+            model: None,
             last_assistant_message: None,
             usage: None,
             cost_usd: None,
@@ -1493,6 +1509,7 @@ pub fn spawn_in_process_task(
             provider,
             session_id: session_id.clone(),
             events: Vec::new(),
+            model: None,
             last_assistant_message: None,
             usage: None,
             cost_usd: None,
@@ -1580,6 +1597,7 @@ pub fn spawn_in_process_task(
 pub fn push_in_process_event(task: &Task, event: Value) {
     {
         let mut inner = task.inner.lock();
+        update_model_cache_from_event(&mut inner, &event);
         inner.events.push(event);
     }
     task.emit_roster_updated();
@@ -2385,6 +2403,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     provider,
                     session_id,
                     events: vec![],
+                    model: None,
                     last_assistant_message: None,
                     usage: None,
                     cost_usd: None,
@@ -2441,6 +2460,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             provider,
             session_id: session_id.clone(),
             events: vec![],
+            model: None,
             last_assistant_message: None,
             usage: None,
             cost_usd: None,
@@ -2577,6 +2597,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     }
                     let snippet_to_emit = {
                         let mut inner = task_ref.inner.lock();
+                        update_model_cache_from_event(&mut inner, &evt);
                         inner.events.push(evt.clone());
                         let mut sink = EventSink {
                             last_assistant_message: inner.last_assistant_message.clone(),
@@ -3703,6 +3724,42 @@ mod tests {
         assert!(inner.workflow_owned);
     }
 
+    #[test]
+    fn task_model_cache_drives_roster_and_survives_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = TaskStore::new();
+        let task = test_task("task-model", TaskStatus::Completed, Provider::Glm);
+
+        push_in_process_event(
+            &task,
+            serde_json::json!({"message": {"model": "cached-model"}}),
+        );
+        assert_eq!(task.inner.lock().model.as_deref(), Some("cached-model"));
+
+        {
+            let mut inner = task.inner.lock();
+            inner.events = (0..5_000)
+                .map(|idx| serde_json::json!({"idx": idx, "model": "scanned-model"}))
+                .collect();
+        }
+        assert_eq!(
+            roster_summary_from_task(&task).model.as_deref(),
+            Some("cached-model")
+        );
+
+        store.insert("task-model".to_string(), task).unwrap();
+        store.persist(&root);
+
+        let loaded = TaskStore::load(&root, u64::MAX);
+        let task = loaded.get("task-model").expect("task should load");
+        assert_eq!(task.inner.lock().model.as_deref(), Some("cached-model"));
+        assert_eq!(
+            roster_summary_from_task(&task).model.as_deref(),
+            Some("cached-model")
+        );
+    }
+
     fn task_with(status: TaskStatus, stderr: &str, events: Vec<Value>) -> Task {
         Task {
             inner: Mutex::new(TaskInner {
@@ -3710,6 +3767,7 @@ mod tests {
                 provider: Provider::Glm,
                 session_id: "s".into(),
                 events,
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4039,6 +4097,7 @@ mod tests {
                 provider: Provider::Brodex,
                 session_id: "session-a".to_string(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4071,6 +4130,7 @@ mod tests {
                 provider: Provider::Brodex,
                 session_id: "session-b".to_string(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4121,6 +4181,7 @@ mod tests {
                 provider: Provider::Minimax,
                 session_id: "sess-err".to_string(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4172,6 +4233,7 @@ mod tests {
                 provider: Provider::Brodex,
                 session_id: "session-a".to_string(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4563,6 +4625,7 @@ mod tests {
                 provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
+                model: None,
                 last_assistant_message: Some("Done!".into()),
                 usage: Some(Usage {
                     input_tokens: 100,
@@ -4611,6 +4674,7 @@ mod tests {
                 provider: Provider::Brodex,
                 session_id: "s2".into(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4659,6 +4723,7 @@ mod tests {
                 provider: Provider::Minimax,
                 session_id: "s-empty".into(),
                 events: vec![serde_json::json!({"type": "system", "subtype": "init"})],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4705,6 +4770,7 @@ mod tests {
             provider: Provider::Deepseek,
             session_id: "requested-session".into(),
             events: vec![],
+            model: None,
             last_assistant_message: Some("trusted prior result".into()),
             usage: Some(Usage {
                 input_tokens: 10,
@@ -4761,6 +4827,7 @@ mod tests {
             provider: Provider::Deepseek,
             session_id: "s1".into(),
             events: vec![],
+            model: None,
             last_assistant_message: None,
             usage: None,
             cost_usd: None,
@@ -4825,6 +4892,7 @@ mod tests {
                     { "type": "tool_use", "id": "enter1", "name": "enter_worktree" }
                 ]}
             })],
+            model: None,
             last_assistant_message: None,
             usage: None,
             cost_usd: None,
@@ -4877,6 +4945,7 @@ mod tests {
                     { "type": "tool_use", "id": "exit1", "name": "exit_worktree" }
                 ]}
             })],
+            model: None,
             last_assistant_message: None,
             usage: None,
             cost_usd: None,
@@ -4932,6 +5001,7 @@ mod async_tests {
                 provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -4970,6 +5040,7 @@ mod async_tests {
                 provider: Provider::Brodex,
                 session_id: "pending".into(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -5014,6 +5085,7 @@ mod async_tests {
                 provider: Provider::Brodex,
                 session_id: "pending".into(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -5054,6 +5126,7 @@ mod async_tests {
                 provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
@@ -5106,6 +5179,7 @@ mod async_tests {
                 provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
+                model: None,
                 last_assistant_message: None,
                 usage: None,
                 cost_usd: None,
