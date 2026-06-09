@@ -23,12 +23,12 @@ use lsp_types::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
-use crate::code_nav::{
+use crate::{
     CodeProjectRefsHint, CodeProjectRefsHintArgs, CodeRefactorHandoff, CodeRefactorStatusHint,
     CodeRefactorStatusHintArgs,
 };
-use crate::lsp::LspSessionManager;
-use crate::projects::Language;
+use bbox_corpus_core::language::Language;
+use bbox_lsp::LspSessionManager;
 
 /// Semantic status value reported by the LSP lane.
 pub const SEMANTIC_STATUS_LSP_VERIFIED: &str = "lsp_verified";
@@ -70,7 +70,7 @@ pub struct UsagesReport {
 /// `lsp_verified`.
 ///
 /// `line` and `column` are **0-based** LSP coordinates.
-pub(crate) fn java_find_usages(
+pub fn java_find_usages(
     manager: &LspSessionManager,
     project_dir: &Path,
     source_path: &Path,
@@ -198,7 +198,7 @@ fn usage_site_handoff(file: &str, project_dir: &str) -> CodeRefactorHandoff {
 }
 
 /// Resolve a path that may be absolute or project-relative.
-pub(crate) fn resolve_path_for_usages(project_dir: Option<&str>, file: &str) -> Result<PathBuf> {
+pub fn resolve_path_for_usages(project_dir: Option<&str>, file: &str) -> Result<PathBuf> {
     let candidate = PathBuf::from(file);
     if candidate.is_absolute() {
         return Ok(candidate);
@@ -212,12 +212,9 @@ pub(crate) fn resolve_path_for_usages(project_dir: Option<&str>, file: &str) -> 
 
 /// Resolve `project_dir`: if supplied use it, otherwise walk up from
 /// `source_path` to the git root, or fall back to the file's parent.
-pub(crate) fn resolve_project_dir_for_usages(
-    project_dir: Option<&str>,
-    source_path: &Path,
-) -> PathBuf {
+pub fn resolve_project_dir_for_usages(project_dir: Option<&str>, source_path: &Path) -> PathBuf {
     project_dir.map(PathBuf::from).unwrap_or_else(|| {
-        crate::entity_ref::git_root_for_path(source_path)
+        bbox_corpus_core::entity_ref::git_root_for_path(source_path)
             .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
     })
 }
@@ -308,7 +305,7 @@ pub struct WorkspaceSymbolsReport {
 /// initialise.
 ///
 /// `line` and `column` are **0-based** LSP coordinates.
-pub(crate) fn java_find_implementations(
+pub fn java_find_implementations(
     manager: &LspSessionManager,
     project_dir: &Path,
     source_path: &Path,
@@ -413,7 +410,7 @@ pub(crate) fn java_find_implementations(
 /// initialise.
 ///
 /// `line` and `column` are **0-based** LSP coordinates.
-pub(crate) fn java_type_at(
+pub fn java_type_at(
     manager: &LspSessionManager,
     project_dir: &Path,
     source_path: &Path,
@@ -493,7 +490,7 @@ pub(crate) fn java_type_at(
 /// Unlike file-position queries (usages, implementations, type_at),
 /// workspace/symbol queries the **whole indexed workspace** and does
 /// NOT require didOpen — the server maintains its own workspace index.
-pub(crate) fn java_workspace_symbols(
+pub fn java_workspace_symbols(
     manager: &LspSessionManager,
     project_dir: &Path,
     query: &str,
@@ -655,7 +652,7 @@ pub struct OutlineReport {
 /// message when the session manager is unavailable or JDTLS fails to
 /// initialise. Never returns a syntactic approximation labelled as
 /// `lsp_verified`.
-pub(crate) fn java_document_outline(
+pub fn java_document_outline(
     manager: &LspSessionManager,
     project_dir: &Path,
     source_path: &Path,

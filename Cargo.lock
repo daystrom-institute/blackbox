@@ -303,6 +303,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-code-nav"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-chunker",
+ "bbox-corpus-core",
+ "bbox-lsp",
+ "bbox-refactor",
+ "ignore",
+ "lsp-types",
+ "reqwest 0.12.28",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tree-sitter",
+ "url",
+]
+
+[[package]]
 name = "bbox-corpus-core"
 version = "0.0.1"
 dependencies = [
@@ -478,6 +500,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bbox-chunker",
+ "bbox-code-nav",
  "bbox-corpus-core",
  "bbox-lsp",
  "bbox-refactor",
