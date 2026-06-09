@@ -4,6 +4,8 @@ use rmcp::model::{CallToolResult, IntoContents};
 use serde_json::Value;
 
 impl BlackboxServer {
+    const JSON_RESPONSE_PREVIEW_BYTES: usize = 1024;
+
     pub(crate) fn ok_text(text: &str) -> CallToolResult {
         CallToolResult::success(Self::cap_response_text(text).into_contents())
     }
@@ -46,6 +48,19 @@ impl BlackboxServer {
         if text.len() <= Self::MCP_RESPONSE_CAP_BYTES {
             return text.to_string();
         }
+        let trimmed = text.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            // Transport invariant: never emit invalid JSON; size JSON at the producer.
+            let preview = Self::prefix_at_char_boundary(text, Self::JSON_RESPONSE_PREVIEW_BYTES);
+            return serde_json::json!({
+                "error": "response_too_large",
+                "bytes": text.len(),
+                "cap_bytes": Self::MCP_RESPONSE_CAP_BYTES,
+                "hint": "response exceeded the MCP cap; narrow the query (filters, limit, tail) or use a paginated variant",
+                "preview": preview,
+            })
+            .to_string();
+        }
         let suffix = "\n\n[... response truncated to 80KB by bbox response cap]";
         let target = Self::MCP_RESPONSE_CAP_BYTES.saturating_sub(suffix.len());
         let mut out = String::new();
@@ -56,6 +71,17 @@ impl BlackboxServer {
             out.push(ch);
         }
         out.push_str(suffix);
+        out
+    }
+
+    fn prefix_at_char_boundary(text: &str, max_bytes: usize) -> String {
+        let mut out = String::new();
+        for ch in text.chars() {
+            if out.len() + ch.len_utf8() > max_bytes {
+                break;
+            }
+            out.push(ch);
+        }
         out
     }
 
@@ -91,7 +117,45 @@ mod tests {
     fn mcp_response_cap_limits_large_text() {
         let huge = "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1024);
         let capped = BlackboxServer::cap_response_text(&huge);
-        assert!(capped.len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        let suffix = "\n\n[... response truncated to 80KB by bbox response cap]";
+        let target = BlackboxServer::MCP_RESPONSE_CAP_BYTES - suffix.len();
+        let expected = format!("{}{}", "x".repeat(target), suffix);
+
+        assert_eq!(capped, expected);
+        assert_eq!(capped.len(), BlackboxServer::MCP_RESPONSE_CAP_BYTES);
         assert!(capped.contains("response truncated"));
+    }
+
+    #[test]
+    fn oversized_json_returns_valid_error_envelope() {
+        let inputs = [
+            format!(
+                "{{\"data\":\"{}\"}}",
+                "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES)
+            ),
+            format!(
+                "[\"{}\"]",
+                "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES)
+            ),
+        ];
+
+        for input in inputs {
+            let capped = BlackboxServer::cap_response_text(&input);
+            let parsed: Value = serde_json::from_str(&capped).expect("valid JSON error envelope");
+            let preview = parsed["preview"].as_str().expect("preview string");
+
+            assert_eq!(parsed["error"], "response_too_large");
+            assert_eq!(parsed["bytes"], input.len());
+            assert_eq!(parsed["cap_bytes"], BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+            assert!(input.starts_with(preview));
+            assert!(preview.len() <= BlackboxServer::JSON_RESPONSE_PREVIEW_BYTES);
+            assert!(capped.len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        }
+    }
+
+    #[test]
+    fn under_cap_json_passthrough_is_unchanged() {
+        let json = "{\"ok\":true,\"items\":[1,2,3]}";
+        assert_eq!(BlackboxServer::cap_response_text(json), json);
     }
 }
