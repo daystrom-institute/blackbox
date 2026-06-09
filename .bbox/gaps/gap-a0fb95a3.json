@@ -16,7 +16,7 @@
   "dedupe_key": "mcp_surface/interactive-tmux-mcp/execute-command-result-polling",
   "resolution": "acknowledged",
   "created_at": "2026-06-02T05:09:08Z",
-  "updated_at": "2026-06-09T04:38:15Z",
-  "resolved_at": "2026-06-09T04:38:15Z",
-  "resolution_note": "Premise no longer holds: the tmux MCP surface co-exposes the paired result-polling primitive (get-command-result) alongside execute-command — both are available to an interactive agent in the same deferred-tool set (verified live this session, 2026-06-08, while smoke-testing the Fleet TUI via tmux). The orphaned-execute_command concern does not manifest. Residual scope (whether an external MCP server's own tool guidance names the validation path) is outside blackbox's surface to fix. Closing as acknowledged rather than addressed since no blackbox code change was required."
+  "updated_at": "2026-06-09T19:01:45Z",
+  "resolved_at": "2026-06-09T19:01:45Z",
+  "resolution_note": "Spurious premise. Verified the tmux MCP surface does expose the paired result-polling primitive with execute_command; no blackbox code change needed. Keeping closed as acknowledged rather than addressed because the gap was invalid, not fixed by implementation."
 }

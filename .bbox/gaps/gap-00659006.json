@@ -15,8 +15,10 @@
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/bro-harness/nudge-gap-note-compulsion-no-suppression",
   "notes": "Discovered while dogfooding a codex driver bro driving `bro fleet` via tmux. The note-storm was itself the friction signal (the driver surfacing repeated tool friction as designed); the underlying triggers were a raw-shell-tmux brief instead of the tmux MCP surface, plus bro_resume scope/cwd confusion. This is the headline finding of the session.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-c38e005d",
   "created_at": "2026-06-09T07:26:53Z",
-  "updated_at": "2026-06-09T07:26:53Z"
+  "updated_at": "2026-06-09T19:06:43Z",
+  "resolved_at": "2026-06-09T19:06:43Z",
+  "resolution_note": "Implemented focused nudge rider controls. GAP_NOTE_DIRECTIVE is no longer appended to every delivered nudge; it is session-deduped through NudgeLedger and delivered at most once per harness session. Added BRO_HARNESS_NUDGE_GAP_NOTES=0/false as a per-session env kill switch for the gap-note rider while leaving BRO_HARNESS_NUDGES steering enabled; both flags now resolve through the harness session-env resolver before process env, so daemon env_overrides work for in-process dispatches. Updated hook tests to cover first-rider delivery, later-rider suppression, rider-disabled nudges, and task-local session-env suppression. Validated with cargo test -p bro-harness hooks and cargo test -p bro-harness."
 }
