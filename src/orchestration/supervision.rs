@@ -98,6 +98,8 @@ pub struct ToolHashObservation {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub input: Option<String>,
+    #[serde(default = "default_loop_candidate")]
+    pub loop_candidate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,15 +187,21 @@ impl SupervisionState {
         for (tool_name, input) in extract_tool_calls(event) {
             dispatched_tool = true;
             let hashed = hash_tool_call(&tool_name, &input);
+            let loop_candidate = is_loop_candidate_tool(&tool_name);
             self.recent_hashes.push_back(ToolHashObservation {
                 at_ms: now_ms,
                 hash: hashed.clone(),
                 tool_name: Some(tool_name.clone()),
                 input: Some(input),
+                loop_candidate,
             });
 
             while self.recent_hashes.len() > config().max_recent_hashes {
                 self.recent_hashes.pop_front();
+            }
+
+            if !loop_candidate {
+                continue;
             }
 
             let count = self.trailing_loop_count(&hashed);
@@ -485,6 +493,11 @@ impl SupervisionState {
         let mut current_count = 0_u64;
 
         for obs in &self.recent_hashes {
+            if !obs.loop_candidate {
+                current_hash = None;
+                current_count = 0;
+                continue;
+            }
             let hash = obs.hash.as_str();
             if current_hash == Some(hash) {
                 current_count = current_count.saturating_add(1);
@@ -506,6 +519,12 @@ impl SupervisionState {
         let mut current_count = 0_u64;
 
         for obs in &self.recent_hashes {
+            if !obs.loop_candidate {
+                current_hash = None;
+                current_tool = None;
+                current_count = 0;
+                continue;
+            }
             let hash = obs.hash.as_str();
             if current_hash == Some(hash) {
                 current_count = current_count.saturating_add(1);
@@ -527,7 +546,7 @@ impl SupervisionState {
         self.recent_hashes
             .iter()
             .rev()
-            .take_while(|obs| obs.hash == hash)
+            .take_while(|obs| obs.loop_candidate && obs.hash == hash)
             .count() as u64
     }
 
@@ -607,6 +626,10 @@ fn default_max_recent_hashes() -> usize {
     DEFAULT_MAX_RECENT_HASHES
 }
 
+fn default_loop_candidate() -> bool {
+    true
+}
+
 fn default_loop_amber_count() -> u64 {
     LOOP_AMBER_COUNT
 }
@@ -664,6 +687,10 @@ fn hash_tool_call(tool_name: &str, input: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     canonical.hash(&mut hasher);
     hasher.finish().to_string()
+}
+
+fn is_loop_candidate_tool(tool_name: &str) -> bool {
+    !tool_name.eq_ignore_ascii_case("shell_poll")
 }
 
 fn extract_tool_calls(event: &Value) -> Vec<(String, String)> {
@@ -915,6 +942,42 @@ mod tests {
             state.alerts
         );
         assert_eq!(state.max_loop_count(), 1);
+    }
+
+    #[test]
+    fn repeated_shell_poll_events_are_progress_not_loop_alerts() {
+        let mut state = SupervisionState::default();
+        let poll = serde_json::json!({
+            "tool_use": {
+                "name": "shell_poll",
+                "input": {
+                    "session_id": "sh-7",
+                    "yield_time_ms": 1000
+                }
+            }
+        });
+
+        for idx in 0..8 {
+            state.observe_event(&poll, &sink_without_usage(), 1_000 + idx * 1_000);
+        }
+
+        assert_eq!(state.recent_hashes.len(), 8);
+        assert!(
+            state.recent_hashes.iter().all(|obs| !obs.loop_candidate),
+            "shell_poll observations should remain visible but not feed loop detection"
+        );
+        assert_eq!(state.max_loop_count(), 0);
+        assert_eq!(state.loop_hash_max_tool(), None);
+        assert_eq!(state.tool_running, Some(true));
+        assert!(
+            state
+                .alerts
+                .iter()
+                .all(|alert| !matches!(alert.kind, AlertKind::Loop)),
+            "shell_poll cadence is expected progress polling, not struggle: {:?}",
+            state.alerts
+        );
+        assert_eq!(state.snapshot_for_response(10_000)["ok"], true);
     }
 
     #[test]
