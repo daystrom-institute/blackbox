@@ -20,36 +20,54 @@ impl BlackboxServer {
         name = "bbox_session",
         description = "Summary metadata for a single session."
     )]
-    pub(crate) fn bbox_session(&self, Parameters(p): Parameters<SessionParams>) -> CallToolResult {
-        Self::run("bbox_session", || self.state.idx.read().session(&p))
+    pub(crate) async fn bbox_session(
+        &self,
+        Parameters(p): Parameters<SessionParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_session", move || server.state.idx.read().session(&p)).await
     }
 
     #[tool(
         name = "bbox_messages",
         description = "Chronological messages from a session."
     )]
-    pub(crate) fn bbox_messages(
+    pub(crate) async fn bbox_messages(
         &self,
         Parameters(p): Parameters<MessagesParams>,
     ) -> CallToolResult {
-        Self::run("bbox_messages", || self.state.idx.read().messages(&p))
+        let server = self.clone();
+        Self::run_blocking("bbox_messages", move || {
+            server.state.idx.read().messages(&p)
+        })
+        .await
     }
 
     #[tool(
         name = "bbox_reindex",
         description = "Build or incrementally update the search index."
     )]
-    pub(crate) fn bbox_reindex(&self, Parameters(p): Parameters<ReindexParams>) -> CallToolResult {
-        Self::run("bbox_reindex", || self.state.idx.write().reindex(&p))
+    pub(crate) async fn bbox_reindex(
+        &self,
+        Parameters(p): Parameters<ReindexParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_reindex", move || server.state.idx.write().reindex(&p)).await
     }
 
     #[tool(
         name = "bbox_reembed",
         description = "Request an embedding rebuild for a configured route."
     )]
-    pub(crate) fn bbox_reembed(&self, Parameters(p): Parameters<ReembedParams>) -> CallToolResult {
-        let state = self.state.clone();
-        Self::run("bbox_reembed", || embed::reembed_start(&p, state))
+    pub(crate) async fn bbox_reembed(
+        &self,
+        Parameters(p): Parameters<ReembedParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_reembed", move || {
+            embed::reembed_start(&p, server.state)
+        })
+        .await
     }
 
     #[tool(
@@ -66,28 +84,35 @@ impl BlackboxServer {
         name = "bbox_topics",
         description = "Top terms in a session by frequency."
     )]
-    pub(crate) fn bbox_topics(&self, Parameters(p): Parameters<TopicsParams>) -> CallToolResult {
-        Self::run("bbox_topics", || self.state.idx.read().topics(&p))
+    pub(crate) async fn bbox_topics(
+        &self,
+        Parameters(p): Parameters<TopicsParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_topics", move || server.state.idx.read().topics(&p)).await
     }
 
     #[tool(
         name = "bbox_sessions_list",
         description = "Browse sessions sorted by recency."
     )]
-    pub(crate) fn bbox_sessions_list(
+    pub(crate) async fn bbox_sessions_list(
         &self,
         Parameters(p): Parameters<SessionsListParams>,
     ) -> CallToolResult {
-        Self::run("bbox_sessions_list", || {
-            self.state.idx.read().sessions_list(&p)
+        let server = self.clone();
+        Self::run_blocking("bbox_sessions_list", move || {
+            server.state.idx.read().sessions_list(&p)
         })
+        .await
     }
 
     #[tool(
         name = "bbox_stats",
         description = "Corpus statistics (doc count, index size, file counts)."
     )]
-    pub(crate) fn bbox_stats(&self) -> CallToolResult {
-        Self::run("bbox_stats", || self.state.idx.read().stats())
+    pub(crate) async fn bbox_stats(&self) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_stats", move || server.state.idx.read().stats()).await
     }
 }

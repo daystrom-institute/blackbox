@@ -20,90 +20,107 @@ impl BlackboxServer {
         name = "bbox_search",
         description = "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax."
     )]
-    pub(crate) fn bbox_search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
-        Self::run("bbox_search", || {
-            if self.state.idx.read().is_empty() {
-                self.state
+    pub(crate) async fn bbox_search(
+        &self,
+        Parameters(p): Parameters<SearchParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_search", move || {
+            if server.state.idx.read().is_empty() {
+                server
+                    .state
                     .idx
                     .write()
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            self.state.idx.read().search(&p)
+            server.state.idx.read().search(&p)
         })
+        .await
     }
 
     #[tool(
         name = "bbox_hybrid_search",
         description = "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only."
     )]
-    pub(crate) fn bbox_hybrid_search(
+    pub(crate) async fn bbox_hybrid_search(
         &self,
         Parameters(p): Parameters<HybridSearchParams>,
     ) -> CallToolResult {
-        Self::run("bbox_hybrid_search", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_hybrid_search", move || {
             // Fast path: read-lock the index to check emptiness. Only escalate
             // to a write lock if we actually need to build_index. The previous
             // unconditional write lock blocked every search behind the
             // auto-reindex thread's writer, adding 5-30 seconds of latency
             // to interactive queries during reindex windows.
-            if self.state.idx.read().is_empty() {
-                self.state
+            if server.state.idx.read().is_empty() {
+                server
+                    .state
                     .idx
                     .write()
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            let provider_ctx = ProviderContext::new(&self.state);
+            let provider_ctx = ProviderContext::new(&server.state);
             mcp_tools::hybrid_search::hybrid_search(
-                &self.state.idx.read(),
-                &self.state.kb.read(),
+                &server.state.idx.read(),
+                &server.state.kb.read(),
                 &provider_ctx,
                 &p,
             )
         })
+        .await
     }
 
     #[tool(
         name = "bbox_discover_seed_entities",
         description = "Find seed entities with notable_edges; inspect before answering."
     )]
-    pub(crate) fn bbox_discover_seed_entities(
+    pub(crate) async fn bbox_discover_seed_entities(
         &self,
         Parameters(p): Parameters<DiscoverSeedParams>,
     ) -> CallToolResult {
-        Self::run("bbox_discover_seed_entities", || {
-            if self.state.idx.read().is_empty() {
-                self.state
+        let server = self.clone();
+        Self::run_blocking("bbox_discover_seed_entities", move || {
+            if server.state.idx.read().is_empty() {
+                server
+                    .state
                     .idx
                     .write()
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            let provider_ctx = ProviderContext::new(&self.state);
+            let provider_ctx = ProviderContext::new(&server.state);
             mcp_tools::discover_seed::discover_seed_entities(
-                &self.state.idx.read(),
-                &self.state.kb.read(),
+                &server.state.idx.read(),
+                &server.state.kb.read(),
                 &provider_ctx,
-                &self.state.edge_index.read(),
+                &server.state.edge_index.read(),
                 &p,
             )
         })
+        .await
     }
 
     #[tool(
         name = "bbox_cite",
         description = "Trace a claim back to the turn that established it."
     )]
-    pub(crate) fn bbox_cite(&self, Parameters(p): Parameters<CiteParams>) -> CallToolResult {
-        Self::run("bbox_cite", || self.state.idx.read().cite(&p))
+    pub(crate) async fn bbox_cite(&self, Parameters(p): Parameters<CiteParams>) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_cite", move || server.state.idx.read().cite(&p)).await
     }
 
     #[tool(
         name = "bbox_context",
         description = "Conversation context around a specific byte offset."
     )]
-    pub(crate) fn bbox_context(&self, Parameters(p): Parameters<ContextParams>) -> CallToolResult {
-        Self::run("bbox_context", || self.state.idx.read().context(&p))
+    pub(crate) async fn bbox_context(
+        &self,
+        Parameters(p): Parameters<ContextParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_context", move || server.state.idx.read().context(&p)).await
     }
 }

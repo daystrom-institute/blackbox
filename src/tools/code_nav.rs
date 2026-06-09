@@ -114,60 +114,63 @@ impl BlackboxServer {
         name = "bbox_code_query",
         description = "Run a tree-sitter query against one source file. Return syntactic matches plus handoff hints for refactor/status grounding."
     )]
-    pub(crate) fn bbox_code_query(
+    pub(crate) async fn bbox_code_query(
         &self,
         Parameters(p): Parameters<CodeQueryParams>,
     ) -> CallToolResult {
-        Self::run("bbox_code_query", || code_query(&p))
+        Self::run_blocking("bbox_code_query", move || code_query(&p)).await
     }
 
     #[tool(
         name = "bbox_code_symbols",
         description = "Find refactorable syntax symbols across a project and return exact line ranges plus refactor/project-ref handoff hints."
     )]
-    pub(crate) fn bbox_code_symbols(
+    pub(crate) async fn bbox_code_symbols(
         &self,
         Parameters(p): Parameters<CodeSymbolSearchParams>,
     ) -> CallToolResult {
-        Self::run("bbox_code_symbols", || {
-            let projects = self.state.projects.read().list();
-            let idx = self.state.idx.read();
+        let server = self.clone();
+        Self::run_blocking("bbox_code_symbols", move || {
+            let projects = server.state.projects.read().list();
+            let idx = server.state.idx.read();
             code_symbols(&p, &projects, Some(&*idx))
         })
+        .await
     }
 
     #[tool(
         name = "bbox_code_node_describe",
         description = "Describe the smallest named AST node at a source position and suggest the next refactor/status grounding call."
     )]
-    pub(crate) fn bbox_code_node_describe(
+    pub(crate) async fn bbox_code_node_describe(
         &self,
         Parameters(p): Parameters<CodeNodeDescribeParams>,
     ) -> CallToolResult {
-        Self::run("bbox_code_node_describe", || code_node_describe(&p))
+        Self::run_blocking("bbox_code_node_describe", move || code_node_describe(&p)).await
     }
 
     #[tool(
         name = "bbox_code_refs",
         description = "Extract syntactic references (calls, imports, fields, identifiers) from one source file. Per-language tree-sitter queries; identifiers fallback for unsupported languages. Records are syntax-only with edge_confidence=\"heuristic\"."
     )]
-    pub(crate) fn bbox_code_refs(
+    pub(crate) async fn bbox_code_refs(
         &self,
         Parameters(p): Parameters<CodeRefsParams>,
     ) -> CallToolResult {
-        Self::run("bbox_code_refs", || code_refs(&p))
+        Self::run_blocking("bbox_code_refs", move || code_refs(&p)).await
     }
 
     #[tool(
         name = "bbox_code_usages",
         description = "Resolve binding-aware usages of the Java symbol at a file position via JDTLS (LSP textDocument/references). Returns semantically-verified usage sites with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; use bbox_code_refs for syntax-only cross-language reference extraction."
     )]
-    pub(crate) fn bbox_code_usages(
+    pub(crate) async fn bbox_code_usages(
         &self,
         Parameters(p): Parameters<CodeUsagesParams>,
     ) -> CallToolResult {
-        let lsp = self.state.lsp_sessions.clone();
-        Self::run("bbox_code_usages", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_code_usages", move || {
+            let lsp = server.state.lsp_sessions.clone();
             // Gate: Java only for now. Other languages → typed unsupported error.
             let source_path = resolve_path_for_usages(p.project_dir.as_deref(), &p.file)?;
             let ext = source_path
@@ -197,18 +200,20 @@ impl BlackboxServer {
             let report = java_find_usages(&lsp, &project_dir, &source_path, lsp_line, lsp_col)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
+        .await
     }
 
     #[tool(
         name = "bbox_code_implementations",
         description = "Resolve implementations of the Java symbol at a file position via JDTLS (LSP textDocument/implementation). Returns semantically-verified implementor sites with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only."
     )]
-    pub(crate) fn bbox_code_implementations(
+    pub(crate) async fn bbox_code_implementations(
         &self,
         Parameters(p): Parameters<CodeImplementationsParams>,
     ) -> CallToolResult {
-        let lsp = self.state.lsp_sessions.clone();
-        Self::run("bbox_code_implementations", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_code_implementations", move || {
+            let lsp = server.state.lsp_sessions.clone();
             let source_path = resolve_path_for_usages(p.project_dir.as_deref(), &p.file)?;
             let ext = source_path
                 .extension()
@@ -236,18 +241,20 @@ impl BlackboxServer {
                 java_find_implementations(&lsp, &project_dir, &source_path, lsp_line, lsp_col)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
+        .await
     }
 
     #[tool(
         name = "bbox_code_type_at",
         description = "Resolve the type/signature/documentation at a Java position via JDTLS (LSP textDocument/hover). Returns resolved type info with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only."
     )]
-    pub(crate) fn bbox_code_type_at(
+    pub(crate) async fn bbox_code_type_at(
         &self,
         Parameters(p): Parameters<CodeTypeAtParams>,
     ) -> CallToolResult {
-        let lsp = self.state.lsp_sessions.clone();
-        Self::run("bbox_code_type_at", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_code_type_at", move || {
+            let lsp = server.state.lsp_sessions.clone();
             let source_path = resolve_path_for_usages(p.project_dir.as_deref(), &p.file)?;
             let ext = source_path
                 .extension()
@@ -274,18 +281,20 @@ impl BlackboxServer {
             let report = java_type_at(&lsp, &project_dir, &source_path, lsp_line, lsp_col)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
+        .await
     }
 
     #[tool(
         name = "bbox_workspace_symbols",
         description = "Resolve workspace symbols matching a query via JDTLS (LSP workspace/symbol). Returns semantically-verified workspace symbol matches with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; project-wide query."
     )]
-    pub(crate) fn bbox_workspace_symbols(
+    pub(crate) async fn bbox_workspace_symbols(
         &self,
         Parameters(p): Parameters<WorkspaceSymbolsParams>,
     ) -> CallToolResult {
-        let lsp = self.state.lsp_sessions.clone();
-        Self::run("bbox_workspace_symbols", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_workspace_symbols", move || {
+            let lsp = server.state.lsp_sessions.clone();
             // Resolve project_dir: if supplied use it, otherwise use cwd
             let project_dir: PathBuf = match p.project_dir {
                 Some(ref dir) => PathBuf::from(dir),
@@ -299,18 +308,20 @@ impl BlackboxServer {
             let report = java_workspace_symbols(&lsp, &canonical, &p.query)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
+        .await
     }
 
     #[tool(
         name = "bbox_code_outline",
         description = "Return a file-scoped, hierarchical symbol outline for a Java source file via JDTLS (LSP textDocument/documentSymbol). Returns a recursive tree of OutlineSymbol nodes with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; no position anchor required — the whole file is outlined."
     )]
-    pub(crate) fn bbox_code_outline(
+    pub(crate) async fn bbox_code_outline(
         &self,
         Parameters(p): Parameters<CodeOutlineParams>,
     ) -> CallToolResult {
-        let lsp = self.state.lsp_sessions.clone();
-        Self::run("bbox_code_outline", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_code_outline", move || {
+            let lsp = server.state.lsp_sessions.clone();
             let source_path = resolve_path_for_usages(p.project_dir.as_deref(), &p.file)?;
             let ext = source_path
                 .extension()
@@ -335,5 +346,6 @@ impl BlackboxServer {
             let report = java_document_outline(&lsp, &project_dir, &source_path)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
+        .await
     }
 }

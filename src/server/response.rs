@@ -108,6 +108,32 @@ impl BlackboxServer {
             }
         }
     }
+
+    /// Run a blocking sync tool handler on tokio's blocking pool while
+    /// preserving the same timing, tracing, and response conversion as `run`.
+    pub(crate) async fn run_blocking<F>(tool: &'static str, op: F) -> CallToolResult
+    where
+        F: FnOnce() -> anyhow::Result<String> + Send + 'static,
+    {
+        let start = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(op)
+            .await
+            .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+            .and_then(std::convert::identity);
+
+        match result {
+            Ok(text) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
