@@ -262,6 +262,7 @@ pub(crate) struct TranscriptHistoryQuery {
 
 const DEFAULT_TRANSCRIPT_HISTORY_LIMIT: usize = 100;
 const MAX_TRANSCRIPT_HISTORY_LIMIT: usize = 500;
+const FOCUSED_TRANSCRIPT_SNAPSHOT_MEMORY_EVENT_LIMIT: usize = 200;
 
 fn wire_status(status: orchestration::TaskStatus) -> bro_protocol::TaskStatus {
     match status {
@@ -295,30 +296,55 @@ fn focused_transcript_snapshot(
         .get(task_id)
         .ok_or_else(|| response_error(StatusCode::NOT_FOUND, format!("unknown task id: {task_id}")))?;
 
-    let inner = task.inner.lock();
-    let session_id = (inner.session_id != "pending" && !inner.session_id.is_empty())
-        .then(|| bro_core::SessionId::new(inner.session_id.clone()));
+    let (
+        task_id,
+        raw_session_id,
+        provider,
+        status,
+        live_cursor,
+        memory_start_cursor,
+        next_memory_cursor,
+        memory_events,
+    ) = {
+        let inner = task.inner.lock();
+        let event_count = inner.events.len();
+        let memory_start_index =
+            event_count.saturating_sub(FOCUSED_TRANSCRIPT_SNAPSHOT_MEMORY_EVENT_LIMIT);
+        (
+            inner.id.clone(),
+            inner.session_id.clone(),
+            inner.provider,
+            inner.status,
+            inner.live_cursor,
+            memory_start_index as u64,
+            event_count as u64,
+            inner.events[memory_start_index..].to_vec(),
+        )
+    };
+
+    let session_id = (raw_session_id != "pending" && !raw_session_id.is_empty())
+        .then(|| bro_core::SessionId::new(raw_session_id));
     let history_jsonl_path = session_id
         .as_ref()
         .and_then(|sid| transcript_file_for_session(state, sid.as_str()));
-    let events = inner
-        .events
-        .iter()
+    let events = memory_events
+        .into_iter()
         .enumerate()
-        .map(|(cursor, event)| bro_protocol::FocusedTranscriptMemoryEventV1 {
-            cursor: cursor as u64,
-            event: event.clone(),
-        })
+        .map(
+            |(cursor, event)| bro_protocol::FocusedTranscriptMemoryEventV1 {
+                cursor: memory_start_cursor + cursor as u64,
+                event,
+            },
+        )
         .collect::<Vec<_>>();
-    let next_memory_cursor = events.len() as u64;
 
     Ok(bro_protocol::FocusedTranscriptSnapshotV1 {
-        task_id: bro_core::TaskId::new(inner.id.clone()),
+        task_id: bro_core::TaskId::new(task_id),
         session_id,
-        provider: inner.provider,
-        status: wire_status(inner.status),
-        live_cursor: inner.live_cursor,
-        memory_start_cursor: 0,
+        provider,
+        status: wire_status(status),
+        live_cursor,
+        memory_start_cursor,
         next_memory_cursor,
         events,
         history_jsonl_path,
@@ -569,6 +595,44 @@ mod tests {
         };
         assert!(focused_live_payload_after_snapshot(&wrong_task, task_id, snapshot_live_cursor)
             .is_none());
+    }
+
+    #[test]
+    fn focused_transcript_snapshot_bounds_memory_events_with_absolute_cursors() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        let task =
+            crate::orchestration::test_task("task-many-events", TaskStatus::Running, Provider::Glm);
+        {
+            let mut inner = task.inner.lock();
+            for idx in 0..1000_u64 {
+                inner.events.push(serde_json::json!({
+                    "type": "provider_event",
+                    "idx": idx,
+                }));
+            }
+        }
+        state
+            .task_store
+            .write()
+            .insert("task-many-events".to_string(), task)
+            .unwrap();
+
+        let snapshot = focused_transcript_snapshot(&state, "task-many-events").unwrap();
+
+        assert_eq!(
+            snapshot.events.len(),
+            FOCUSED_TRANSCRIPT_SNAPSHOT_MEMORY_EVENT_LIMIT
+        );
+        assert!(snapshot.events.len() <= FOCUSED_TRANSCRIPT_SNAPSHOT_MEMORY_EVENT_LIMIT);
+        assert_eq!(snapshot.memory_start_cursor, 800);
+        assert_eq!(snapshot.next_memory_cursor, 1000);
+        assert_eq!(snapshot.events[0].cursor, snapshot.memory_start_cursor);
+        assert_eq!(snapshot.events[0].event["idx"], 800);
+        let last = snapshot.events.last().expect("snapshot has tail events");
+        assert_eq!(last.cursor, snapshot.next_memory_cursor - 1);
+        assert_eq!(last.event["idx"], 999);
     }
 
     #[tokio::test]
