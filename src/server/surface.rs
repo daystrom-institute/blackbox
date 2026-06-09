@@ -409,8 +409,8 @@ mod tests {
         let rules = value["rules"].as_array().expect("rules array");
         assert_eq!(
             rules.len(),
-            5,
-            "expected 5 rules (readonly, agent-internal, ops, default, deny)"
+            6,
+            "expected 6 rules (readonly, agent-internal, interactive, ops, default, deny)"
         );
         let tmp = tempfile::TempDir::new().unwrap();
         let packets = Packets::open(tmp.path()).unwrap();
@@ -515,6 +515,22 @@ mod tests {
             &[emit, compact, r_install, r_execute, r_retry],
         );
         check(
+            "interactive",
+            &[],
+            &[
+                emit,
+                compact,
+                list,
+                open,
+                r_install,
+                r_list,
+                r_replay,
+                r_execute,
+                r_deliveries,
+                r_retry,
+            ],
+        );
+        check(
             "ops",
             &[
                 emit,
@@ -530,6 +546,84 @@ mod tests {
             ],
             &[],
         );
+    }
+
+    #[test]
+    fn example_surface_packet_interactive_hides_elided_clusters() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("system-defaults/mcp-surfaces/routing.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let domain = value["domain"].as_str().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let packets = Packets::open(tmp.path()).unwrap();
+        packets
+            .compile(&CompileParams {
+                domain: domain.to_string(),
+                rules: value["rules"].clone(),
+                classification_lattice: Some(vec!["tool_surface".into(), "deny".into()]),
+                prefix_inference: Some(Default::default()),
+                scope: Some("global".into()),
+                project: None,
+                source_ids: None,
+                rank_lookup_key: None,
+                rank_table: None,
+                threshold_lookup_key: None,
+                threshold_table: None,
+            })
+            .expect("packet compiles");
+        drop(packets);
+
+        let state = SharedState::for_test(tmp.path());
+        let packets = state.packets.read();
+        let visible = [
+            "mcp__blackbox__bbox_search",
+            "mcp__blackbox__bbox_hybrid_search",
+            "mcp__blackbox__bbox_knowledge",
+            "mcp__blackbox__bbox_refactor_plan",
+            "mcp__blackbox__bro_exec",
+            "mcp__blackbox__bro_status",
+        ];
+        let hidden = [
+            "mcp__blackbox__badgey_exec",
+            "mcp__blackbox__bro_slack_bind",
+            "mcp__blackbox__bro_irc_join",
+            "mcp__blackbox__bro_allocator_status",
+            "mcp__blackbox__bro_agent_list",
+            "mcp__blackbox__atom_list",
+            "mcp__blackbox__bro_cron_list",
+            "mcp__blackbox__bro_workflow_list",
+            "mcp__blackbox__bro_orchestrate_run",
+            "mcp__blackbox__bro_arc_status",
+            "mcp__blackbox__bro_webhook_list",
+            "mcp__blackbox__bro_poller_list",
+            "mcp__blackbox__bro_signals",
+            "mcp__blackbox__bro_council_list",
+            "mcp__blackbox__whiteboard_open",
+            "mcp__blackbox__work_bash",
+            "mcp__blackbox__system_event_list",
+            "mcp__blackbox__reaction_list",
+        ];
+        let universe: Vec<String> = visible
+            .iter()
+            .chain(hidden.iter())
+            .map(|tool| (*tool).to_string())
+            .collect();
+
+        let entity = build_surface_entity("interactive", None);
+        let decision = evaluate_tool_surface(&packets, entity, None);
+        for tool in visible {
+            assert!(
+                tool_visible(tool, &decision, &universe),
+                "interactive: {tool} should be visible",
+            );
+        }
+        for tool in hidden {
+            assert!(
+                !tool_visible(tool, &decision, &universe),
+                "interactive: {tool} should be hidden",
+            );
+        }
     }
 
     #[test]

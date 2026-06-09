@@ -1,7 +1,7 @@
 # MCP Tool Surfaces — Default Packet
 
 `routing.json` is the default `mcp-surface/routing` packet shipped with blackbox.
-It defines four named surfaces plus a catchall deny. Install it once globally;
+It defines five named surfaces plus a catchall deny. Install it once globally;
 clients select which surface they want via the `?surface=<id>` query parameter
 on the daemon's `/mcp` endpoint.
 
@@ -14,6 +14,7 @@ bbox_compile path=system-defaults/mcp-surfaces/routing.json scope=global
 | Surface | Audience | What's visible |
 |---|---|---|
 | `default` | constrained day-to-day clients | transcripts, agentic graph, knowledge r/w, threads, notes, inbox, code-nav, atom discovery/invoke/status/resume/delegate, refactor plan/run/status/apply, bro core dispatch (exec/resume/status/cancel/dashboard/team/brofile/agents), `bbox_mcp_surface` |
+| `interactive` | day-to-day interactive coding sessions | default-permissive working set: transcripts, graph, knowledge, threads, notes, inbox, code-nav/refactor, packets, artifacts, project listing, macro tools, identity read, and core bro operations. Hides Badgey, Slack/IRC, allocator/agent/atom catalogs, cron/workflow/arc/webhook/poller/signal tools, councils, whiteboards, workspace tools, system events, and reactions. |
 | `readonly` | reviewers, evaluators, observer agents | search/cite/inspect/find_paths/bundle, knowledge read, thread/note/inbox read, code-nav read, atom discovery, council observation, bro status/dashboard. **No writes, no dispatch, no admin.** |
 | `agent-internal` | dispatched bros inside a workflow or arc | superset of `default` plus whiteboards, councils, when_all/any, signals, broadcast, arc_*. `bro_exec`/`resume`/`cancel` denied as a backstop to the mechanical recursion guard; atom invocation remains policy-gated by atom composition/effect limits. |
 | `ops` | operator/admin sessions | full daemon access — setup tools (slack/webhook/poller/cron), workflow authoring, lifecycle (render/absorb/bootstrap/lint/review), index/embedding admin, artifact management, provenance, destructive refactor. |
@@ -23,6 +24,7 @@ bbox_compile path=system-defaults/mcp-surfaces/routing.json scope=global
 ```
 http://127.0.0.1:7264/mcp                          # → "default"
 http://127.0.0.1:7264/mcp?surface=readonly         # → "readonly"
+http://127.0.0.1:7264/mcp?surface=interactive      # → "interactive"
 http://127.0.0.1:7264/mcp?surface=agent-internal   # → "agent-internal"
 http://127.0.0.1:7264/mcp?surface=ops              # → "ops"
 http://127.0.0.1:7264/mcp?surface=anything-else    # → init fails: deny catchall
@@ -30,15 +32,16 @@ http://127.0.0.1:7264/mcp?surface=anything-else    # → init fails: deny catcha
 
 ## Provider config
 
-For normal human/operator use, register a single canonical `blackbox` MCP entry
-and point it at the `ops` surface. Add separate aliases only for intentionally
-restricted contexts such as read-only reviewers or workflow actors.
+For normal interactive use, register a single canonical `blackbox` MCP entry
+and point it at the `interactive` surface. Add separate aliases only for
+intentionally different contexts such as read-only reviewers, workflow actors,
+or admin/operator sessions that need `ops`.
 
 ```jsonc
 // ~/.claude/.claude.json
 {
   "mcpServers": {
-    "blackbox": { "type": "http", "url": "http://127.0.0.1:7264/mcp?surface=ops" }
+    "blackbox": { "type": "http", "url": "http://127.0.0.1:7264/mcp?surface=interactive" }
   }
 }
 ```
@@ -46,12 +49,13 @@ restricted contexts such as read-only reviewers or workflow actors.
 ```toml
 # ~/.codex/config.toml
 [mcp_servers.blackbox]
-url = "http://127.0.0.1:7264/mcp?surface=ops"
+url = "http://127.0.0.1:7264/mcp?surface=interactive"
 ```
 
 Do not register both `blackbox` and `blackbox-ops` by default. The duplicate
 catalog adds context noise, and dispatch-time recursion filters are anchored on
-the canonical `blackbox` server name.
+the canonical `blackbox` server name. Temporarily switch the canonical entry to
+`ops` only for setup, lifecycle, or admin work.
 
 Or use `bro_mcp action=add` with the `surface` field — the daemon appends the
 query string for you and fans the registration out to every installed provider:
@@ -76,10 +80,10 @@ bbox_mcp_surface action=list
 
 ## Design notes
 
-- **Disallow wins over allow.** The `agent-internal` surface uses an empty
-  allow list and a long disallow list — same passthrough-with-exclusions
-  pattern as `default`, plus whiteboards/councils stay visible by *not* being
-  listed in either column.
+- **Disallow wins over allow.** The `default`, `interactive`, and
+  `agent-internal` surfaces use an empty allow list plus a disallow list. This
+  keeps the packet default-permissive for normal tools while hiding whole
+  coordination/admin clusters from narrower surfaces.
 - **`default` keeps `refactor_apply`.** Applying a reviewed refactor plan is a
   day-to-day code-editing operation, not an ops-only daemon administration
   surface. `ops` remains the full passthrough surface for setup, lifecycle,

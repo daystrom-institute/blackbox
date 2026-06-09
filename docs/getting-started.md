@@ -57,9 +57,10 @@ systemctl --user enable --now blackbox-dev.service
 
 ## 3. Connect each provider CLI to the daemon
 
-For normal human/operator use, keep one canonical `blackbox` MCP entry and point
-it at the `ops` surface. Add extra aliases only when you intentionally want a
-restricted surface such as `readonly`.
+For normal interactive use, keep one canonical `blackbox` MCP entry and point it
+at the `interactive` surface. Switch to `ops` only for setup, lifecycle, or admin
+work; add extra aliases only when you intentionally want a restricted surface
+such as `readonly`.
 
 **Claude Code** - add to each `~/.claude*/.claude.json`:
 
@@ -68,7 +69,7 @@ restricted surface such as `readonly`.
   "mcpServers": {
     "blackbox": {
       "type": "http",
-      "url": "http://127.0.0.1:7264/mcp?surface=ops"
+      "url": "http://127.0.0.1:7264/mcp?surface=interactive"
     }
   }
 }
@@ -78,7 +79,7 @@ restricted surface such as `readonly`.
 
 ```toml
 [mcp_servers.blackbox]
-url = "http://127.0.0.1:7264/mcp?surface=ops"
+url = "http://127.0.0.1:7264/mcp?surface=interactive"
 ```
 
 
@@ -87,16 +88,16 @@ url = "http://127.0.0.1:7264/mcp?surface=ops"
   "mcp": {
     "blackbox": {
       "type": "remote",
-      "url": "http://127.0.0.1:7264/mcp?surface=ops",
+      "url": "http://127.0.0.1:7264/mcp?surface=interactive",
       "enabled": true
     }
   }
 }
 ```
 
-**Gemini CLI** - `gemini mcp add blackbox http://127.0.0.1:7264/mcp?surface=ops`
+**Gemini CLI** - `gemini mcp add blackbox http://127.0.0.1:7264/mcp?surface=interactive`
 
-**Copilot** - `copilot mcp add blackbox http://127.0.0.1:7264/mcp?surface=ops`
+**Copilot** - `copilot mcp add blackbox http://127.0.0.1:7264/mcp?surface=interactive`
 
 ## 4. Bootstrap a project
 

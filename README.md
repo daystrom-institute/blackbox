@@ -103,7 +103,10 @@ stays focused on installing and running.
 
 The daemon listens on `127.0.0.1:7264/mcp` by default. Point every agent CLI at the same URL.
 
-The URL accepts an optional `?surface=<name>` query param that scopes which tools are exposed. Omit it for the default surface, or append e.g. `?surface=ops` for an operator-focused toolset (`http://127.0.0.1:7264/mcp?surface=ops`). Run `bbox_mcp_surface` to list the available surfaces and what each includes.
+The URL accepts an optional `?surface=<name>` query param that scopes which tools
+are exposed. Use `?surface=interactive` for the normal working set, and switch to
+`?surface=ops` only for admin/operator work. Run `bbox_mcp_surface` to list the
+available surfaces and what each includes.
 
 **Claude Code** - top-level `~/.claude.json` (the `mcpServers` key; some installs keep this under a `~/.claude*` config dir instead — edit whichever your CLI actually reads):
 ```json

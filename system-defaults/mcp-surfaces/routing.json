@@ -18,6 +18,12 @@
       "consequent": "{\"route\":\"tool_surface\",\"allow\":[],\"disallow\":[\"mcp__blackbox__bro_slack_*\",\"mcp__blackbox__bro_webhook_*\",\"mcp__blackbox__bro_poller_*\",\"mcp__blackbox__bro_cron_*\",\"mcp__blackbox__bro_orchestrate_author\",\"mcp__blackbox__bro_orchestrate_run\",\"mcp__blackbox__bro_workflow_install\",\"mcp__blackbox__bro_exec\",\"mcp__blackbox__bro_resume\",\"mcp__blackbox__bro_cancel\",\"mcp__blackbox__bro_prune\",\"mcp__blackbox__badgey_*\",\"mcp__blackbox__bbox_render\",\"mcp__blackbox__bbox_absorb\",\"mcp__blackbox__bbox_bootstrap\",\"mcp__blackbox__bbox_lint\",\"mcp__blackbox__bbox_review\",\"mcp__blackbox__bbox_reindex\",\"mcp__blackbox__bbox_reembed\",\"mcp__blackbox__bbox_embed_status\",\"mcp__blackbox__bbox_provenance_export\",\"mcp__blackbox__bbox_provenance_import\",\"mcp__blackbox__bbox_artifact_install\",\"mcp__blackbox__bbox_artifact_supersede\",\"mcp__blackbox__system_event_emit\",\"mcp__blackbox__system_event_compact\",\"mcp__blackbox__reaction_install\",\"mcp__blackbox__reaction_execute\",\"mcp__blackbox__reaction_retry\"],\"instructions\":\"Surface for dispatched bros inside a workflow or arc. Whiteboards, councils, when_all/any, signals, and broadcast are visible (workflow coordination). bro_exec/resume/cancel are denied as a backstop to the mechanical recursion guard.\"}"
     },
     {
+      "id": "interactive_surface",
+      "classification": "tool_surface",
+      "antecedent": { "op": "Eq", "field": "surface", "value": "interactive" },
+      "consequent": "{\"route\":\"tool_surface\",\"allow\":[],\"disallow\":[\"mcp__blackbox__badgey_*\",\"mcp__blackbox__bro_slack_*\",\"mcp__blackbox__bro_irc_*\",\"mcp__blackbox__bro_allocator_*\",\"mcp__blackbox__bro_agent_*\",\"mcp__blackbox__atom_*\",\"mcp__blackbox__bro_cron_*\",\"mcp__blackbox__bro_workflow_*\",\"mcp__blackbox__bro_orchestrate_*\",\"mcp__blackbox__bro_arc_*\",\"mcp__blackbox__bro_webhook_*\",\"mcp__blackbox__bro_poller_*\",\"mcp__blackbox__bro_signals\",\"mcp__blackbox__bro_council_*\",\"mcp__blackbox__whiteboard_*\",\"mcp__blackbox__work_*\",\"mcp__blackbox__system_event_*\",\"mcp__blackbox__reaction_*\"],\"instructions\":\"Interactive working-set surface for day-to-day coding sessions. Default-permissive with coordination, ingress, workflow-internal, workspace, Badgey, Slack/IRC, system-event, and reaction clusters hidden.\"}"
+    },
+    {
       "id": "ops_surface",
       "classification": "tool_surface",
       "antecedent": { "op": "Eq", "field": "surface", "value": "ops" },
