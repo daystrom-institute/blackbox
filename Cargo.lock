@@ -354,6 +354,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-macros"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-code-nav",
+ "bbox-corpus-core",
+ "bbox-lsp",
+ "bbox-refactor",
+ "chrono",
+ "dirs",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-refactor"
 version = "0.0.1"
 dependencies = [
@@ -503,6 +522,7 @@ dependencies = [
  "bbox-code-nav",
  "bbox-corpus-core",
  "bbox-lsp",
+ "bbox-macros",
  "bbox-refactor",
  "bbox-vectors",
  "bincode",

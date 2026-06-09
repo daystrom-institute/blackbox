@@ -53,7 +53,7 @@ use super::java_sidecar_protocol::{
     METHOD_INSERT_STATEMENT_IN_METHOD, METHOD_PRUNE_UNUSED_IMPORT, METHOD_REPLACE_METHOD_BODY,
     PruneUnusedImportParams, ReplaceMethodBodyParams,
 };
-use crate::refactor::{FileCreate, FileEdit, TextEdit};
+use bbox_refactor::{FileCreate, FileEdit, TextEdit};
 
 // ── SidecarBackend ────────────────────────────────────────────────────────────
 

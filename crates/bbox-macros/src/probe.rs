@@ -1,14 +1,14 @@
 //! Probe substrate for the macro layer (Phase 4, P4a).
 //!
 //! A "probe" evaluates a read-only code-nav query at macro plan time and
-//! stores a normalized JSON result into [`crate::macros::expr::Context`]
+//! stores a normalized JSON result into [`crate::expr::Context`]
 //! under the probe's name slot, where refusal predicates and later
 //! operations can reference it via dotted paths like `"binding.exists"`.
 //!
 //! # Components
 //!
 //! - [`ProbeSpec`] — typed, serde-tagged enum. Deserialized from
-//!   [`crate::macros::model::MacroProbe::spec`]. **Bounded** to v1 kinds;
+//!   [`crate::model::MacroProbe::spec`]. **Bounded** to v1 kinds;
 //!   unknown discriminants are serde errors (fail closed).
 //! - [`ProbeOutput`] — normalized result stored in `Context.probes[name]`.
 //!   Shape: `{ exists: bool, count: usize, <kind-arrays> }`. Stable across
@@ -40,15 +40,15 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::code_nav::semantic::{WorkspaceSymbolItem, java_workspace_symbols};
-use crate::code_nav::{
+use bbox_code_nav::semantic::{WorkspaceSymbolItem, java_workspace_symbols};
+use bbox_code_nav::{
     CodeQueryParams, CodeQueryResponse, CodeSymbolSearchParams, CodeSymbolSearchResponse,
     ProjectTextMatch, ProjectTextNormalization, project_text_search,
 };
-use crate::lsp::LspSessionManager;
-use crate::macros::expr::Context;
-use crate::macros::model::{MacroInvocation, MacroSemanticStatus};
-use crate::projects::ProjectRecord;
+use bbox_lsp::LspSessionManager;
+use crate::expr::Context;
+use crate::model::{MacroInvocation, MacroSemanticStatus};
+use bbox_corpus_core::project_record::ProjectRecord;
 
 // ---------------------------------------------------------------------------
 // Caps
@@ -153,7 +153,7 @@ pub enum ProbeSpec {
     /// Generic project-wide text search — scan every source file for one or
     /// more literal string needles.
     ///
-    /// Backed by [`crate::code_nav::project_text_search`].
+    /// Backed by [`bbox_code_nav::project_text_search`].
     ///
     /// Probe output shape:
     /// ```json
@@ -263,7 +263,7 @@ pub struct ProbeOutput {
 /// Executes a named probe spec and returns a normalized [`ProbeOutput`].
 ///
 /// Implementations must be `Send + Sync` so they can be boxed and stored in
-/// [`crate::macros::planner_ctx::MacroPlannerContext`].
+/// [`crate::planner_ctx::MacroPlannerContext`].
 ///
 /// # Contract
 ///
@@ -291,7 +291,7 @@ pub trait ProbeRunner: Send + Sync {
 /// Fail-closed stub returned when no real code-nav backend is wired up.
 ///
 /// Every `run_probe` call returns `Err("error.probe_backend_unavailable")`.
-/// This is the default in [`crate::macros::planner_ctx::MacroPlannerContext`]
+/// This is the default in [`crate::planner_ctx::MacroPlannerContext`]
 /// until a real runner is injected at service startup.
 pub struct UnavailableProbeRunner;
 
@@ -415,7 +415,7 @@ impl CodeNavProbeRunner {
             include_text: Some(true),
         };
 
-        let json_str = crate::code_nav::code_query(&params)?;
+        let json_str = bbox_code_nav::code_query(&params)?;
         let response: CodeQueryResponse = serde_json::from_str(&json_str)?;
 
         let mut diagnostics = Vec::new();
@@ -539,7 +539,7 @@ impl CodeNavProbeRunner {
             mode: Some("live".to_owned()),
         };
 
-        let json_str = crate::code_nav::code_symbols_live(&params, &self.registered)?;
+        let json_str = bbox_code_nav::code_symbols_live(&params, &self.registered)?;
         let response: CodeSymbolSearchResponse = serde_json::from_str(&json_str)?;
 
         let mut diagnostics = Vec::new();
@@ -662,7 +662,7 @@ impl CodeNavProbeRunner {
                  no matches found but search was incomplete. \
                  Add 'languages' or 'path_contains' to narrow the search, \
                  or increase 'max_files'.",
-                max_files.unwrap_or(crate::code_nav::TEXT_SCAN_DEFAULT_MAX_FILES)
+                max_files.unwrap_or(bbox_code_nav::TEXT_SCAN_DEFAULT_MAX_FILES)
             ));
         }
 
@@ -1786,7 +1786,7 @@ mod tests {
 
     #[test]
     fn annotate_symbol_marks_local_vs_jdt() {
-        use crate::code_nav::semantic::WorkspaceSymbolItem;
+        use bbox_code_nav::semantic::WorkspaceSymbolItem;
 
         let dir = tempfile::tempdir().expect("tempdir");
         // Canonicalize: annotate_symbol canonicalizes the symbol path, and macOS

@@ -24,6 +24,7 @@ members = [
     "crates/bbox-lsp",
     "crates/bbox-refactor",
     "crates/bbox-code-nav",
+    "crates/bbox-macros",
 ]
 
 [package]
@@ -95,6 +96,8 @@ bbox-lsp = { path = "crates/bbox-lsp" }
 bbox-refactor = { path = "crates/bbox-refactor" }
 # Syntax code navigation, extracted from the root crate (stage 4).
 bbox-code-nav = { path = "crates/bbox-code-nav" }
+# Macro planning/model/backend layer, extracted from the root crate (stage 5).
+bbox-macros = { path = "crates/bbox-macros" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }

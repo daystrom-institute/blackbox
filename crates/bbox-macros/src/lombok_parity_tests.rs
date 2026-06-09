@@ -13,13 +13,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::macros::backend::JavaMacroBackend;
-use crate::macros::model::MacroInvocation;
-use crate::macros::planner::MacroPlanner;
-use crate::macros::planner_ctx::MacroPlannerContext;
-use crate::macros::probe::CodeNavProbeRunner;
-use crate::macros::registry::MacroRegistry;
-use crate::macros::sidecar_backend::SidecarBackend;
+use crate::backend::JavaMacroBackend;
+use crate::model::MacroInvocation;
+use crate::planner::MacroPlanner;
+use crate::planner_ctx::MacroPlannerContext;
+use crate::probe::CodeNavProbeRunner;
+use crate::registry::MacroRegistry;
+use crate::sidecar_backend::SidecarBackend;
 
 fn jar_ready() -> bool {
     std::env::var("BLACKBOX_JAVA_WORKER_JAR")
@@ -64,7 +64,7 @@ fn run_macro_strategy(
 
     let backend: Box<dyn JavaMacroBackend> =
         Box::new(SidecarBackend::new(project_dir.to_path_buf()));
-    let project_record = crate::projects::ProjectRecord {
+    let project_record = bbox_corpus_core::project_record::ProjectRecord {
         project_id: "lombok-golden".into(),
         repo_id: None,
         canonical_path: project_dir.to_string_lossy().into_owned(),

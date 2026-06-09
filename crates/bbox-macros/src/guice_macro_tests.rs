@@ -15,11 +15,11 @@
 
 use std::path::Path;
 
-use crate::macros::MacroPlan;
-use crate::macros::model::MacroInvocation;
-use crate::macros::planner::MacroPlanner;
-use crate::macros::planner_ctx::MacroPlannerContext;
-use crate::macros::registry::MacroRegistry;
+use crate::MacroPlan;
+use crate::model::MacroInvocation;
+use crate::planner::MacroPlanner;
+use crate::planner_ctx::MacroPlannerContext;
+use crate::registry::MacroRegistry;
 
 /// Plan `builtin.java.guice` for the given inputs and return the resulting
 /// `MacroPlan`. No JVM worker is required (delegate is pure Rust).
@@ -241,7 +241,7 @@ fn guice_macro_forwards_deep_analysis_as_typed_bool() {
 // macro data, not engine Rust.
 #[test]
 fn guice_macro_delegates_with_external_injection_wiring_spec() {
-    use crate::macros::model::MacroOperation;
+    use crate::model::MacroOperation;
 
     let def = MacroRegistry::get(None, "builtin.java.guice")
         .expect("registry get must not error")

@@ -23,14 +23,14 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::macros::backend::UnavailableBackend;
-use crate::macros::expr::Context;
-use crate::macros::model::{MacroInvocation, MacroSemanticStatus};
-use crate::macros::planner::MacroPlanner;
-use crate::macros::planner_ctx::MacroPlannerContext;
-use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
-use crate::macros::registry::MacroRegistry;
-use crate::macros::sidecar_backend::SidecarBackend;
+use crate::backend::UnavailableBackend;
+use crate::expr::Context;
+use crate::model::{MacroInvocation, MacroSemanticStatus};
+use crate::planner::MacroPlanner;
+use crate::planner_ctx::MacroPlannerContext;
+use crate::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+use crate::registry::MacroRegistry;
+use crate::sidecar_backend::SidecarBackend;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MockProbeRunner
@@ -153,7 +153,7 @@ impl ProbeRunner for MockProbeRunner {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn load_service_boundary_def() -> crate::macros::model::MacroDefinition {
+fn load_service_boundary_def() -> crate::model::MacroDefinition {
     MacroRegistry::list(None)
         .into_iter()
         .find(|d| d.id == "java.add_service_boundary")
@@ -163,7 +163,7 @@ fn load_service_boundary_def() -> crate::macros::model::MacroDefinition {
 /// Build a happy-path `MacroInvocation` for the canonical CallerService /
 /// AppModule fixture.  All required inputs are populated with realistic values.
 fn make_invocation(
-    def: &crate::macros::model::MacroDefinition,
+    def: &crate::model::MacroDefinition,
     project_dir: &str,
     source_root: &str,
     caller_file: &str,
@@ -523,7 +523,7 @@ fn integration_plan_lower_apply_with_real_sidecar() {
     );
 
     // Use CodeNavProbeRunner backed by the tempdir project.
-    let project_record = crate::projects::ProjectRecord {
+    let project_record = bbox_corpus_core::project_record::ProjectRecord {
         project_id: "test-fixture".to_string(),
         repo_id: None,
         canonical_path: project_dir.clone(),
@@ -531,7 +531,7 @@ fn integration_plan_lower_apply_with_real_sidecar() {
         is_git_repo: true,
         languages: std::collections::BTreeSet::new(),
     };
-    let probe_runner = crate::macros::probe::CodeNavProbeRunner::new(
+    let probe_runner = crate::probe::CodeNavProbeRunner::new(
         None, // no LSP — syntactic probes only
         vec![project_record],
     );
@@ -617,7 +617,7 @@ fn integration_plan_lower_apply_with_real_sidecar() {
     assert_eq!(refactor_plan.edits.len(), 2);
 
     // Apply
-    let apply_params = crate::refactor::RefactorApplyParams {
+    let apply_params = bbox_refactor::RefactorApplyParams {
         plan: serde_json::to_value(&refactor_plan).expect("serialize plan"),
         plan_path: None,
         confirm: Some(true),
@@ -626,7 +626,7 @@ fn integration_plan_lower_apply_with_real_sidecar() {
         cwd: None,
         force_path: Some(true),
     };
-    crate::refactor::apply(&apply_params, &[]).expect("apply should succeed");
+    bbox_refactor::apply(&apply_params, &[]).expect("apply should succeed");
 
     // Assert files were created.
     let pkg = tmp.path().join("src/main/java/com/example");

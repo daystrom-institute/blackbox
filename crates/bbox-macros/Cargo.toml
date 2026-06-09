@@ -1,0 +1,25 @@
+[package]
+name = "bbox-macros"
+version = "0.0.1"
+edition = "2024"
+
+# Macro planning/model/backend layer extracted from the root `blackbox` crate
+# (stage 5 of the code-intelligence cluster split). Depends downward on
+# bbox-corpus-core, bbox-lsp, bbox-refactor, bbox-code-nav, and external crates only.
+
+[dependencies]
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-lsp = { path = "../bbox-lsp" }
+bbox-refactor = { path = "../bbox-refactor" }
+bbox-code-nav = { path = "../bbox-code-nav" }
+anyhow = "1"
+chrono = "0.4"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmcp = { version = "1.4", features = ["macros"] }
+sha2 = "0.10"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

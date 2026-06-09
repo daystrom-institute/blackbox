@@ -2,7 +2,7 @@
 //!
 //! Converts a [`MacroInvocation`] + registry-resolved [`MacroDefinition`] into
 //! a [`MacroPlan`] review artifact, and lowers [`MacroPlan`] to a
-//! [`RefactorPlan`] for [`crate::refactor::apply`].
+//! [`RefactorPlan`] for [`bbox_refactor::apply`].
 //!
 //! # Pipeline (8 hard constraints from design)
 //!
@@ -62,15 +62,15 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::macros::backend::{JavaEmitOp, JavaRewriteOp};
-use crate::macros::expr;
-use crate::macros::model::{
+use crate::backend::{JavaEmitOp, JavaRewriteOp};
+use crate::expr;
+use crate::model::{
     EditSet, MacroDefinition, MacroInvocation, MacroOperation, MacroPlan, MacroPlanCheck,
     MacroPlanOperation, MacroRefusalHit, MacroSemanticStatus,
 };
-use crate::macros::planner_ctx::MacroPlannerContext;
-use crate::macros::probe::ProbeSpec;
-use crate::refactor::{
+use crate::planner_ctx::MacroPlannerContext;
+use crate::probe::ProbeSpec;
+use bbox_refactor::{
     self, PlanContext, RefactorApplyParams, RefactorPlan, RefactorPlanParams, SemanticStatus,
     ValidationStep,
 };
@@ -100,7 +100,7 @@ impl MacroPlanner {
     ///
     /// Returns a [`MacroPlan`] review artifact describing what the macro will do.
     /// Never writes files. Call [`MacroPlanner::lower`] on the result, then
-    /// [`crate::refactor::apply`] to execute.
+    /// [`bbox_refactor::apply`] to execute.
     ///
     /// # Errors
     ///
@@ -742,7 +742,7 @@ impl MacroPlanner {
         })
     }
 
-    /// Lower a [`MacroPlan`] to a [`RefactorPlan`] for [`crate::refactor::apply`].
+    /// Lower a [`MacroPlan`] to a [`RefactorPlan`] for [`bbox_refactor::apply`].
     ///
     /// # Lowering map
     ///
@@ -819,7 +819,7 @@ impl MacroPlanner {
             external_calls: vec![],
             inherited_dependencies: vec![],
             deep_analysis: None,
-            plan_status: crate::refactor::PlanStatus::Planned,
+            plan_status: bbox_refactor::PlanStatus::Planned,
             fixme_count: None,
             operator_opt_outs_used: plan.operator_opt_outs_used.clone(),
         })
@@ -1408,7 +1408,7 @@ fn plan_delegate(
 
     // ── Call plan_with_ctx ────────────────────────────────────────────────────
     let plan_json_str =
-        refactor::plan_with_ctx(&rpp, &plan_ctx).context("delegate_refactor plan failed")?;
+        bbox_refactor::plan_with_ctx(&rpp, &plan_ctx).context("delegate_refactor plan failed")?;
 
     // ── Deserialize as RefactorPlan (constraint 6b: reject analysis-only kinds) ──
     let rp: RefactorPlan = serde_json::from_str(&plan_json_str).map_err(|e| {
@@ -1423,7 +1423,7 @@ fn plan_delegate(
 
     // ── Reject Blocked / Errored plans (constraint 6c) ───────────────────────
     match rp.plan_status {
-        crate::refactor::PlanStatus::Blocked => {
+        bbox_refactor::PlanStatus::Blocked => {
             bail!(
                 "error.delegate_plan_blocked: DelegateRefactor kind '{}' returned a Blocked \
                  plan (deep-analysis findings must be resolved before the macro can proceed). \
@@ -1432,7 +1432,7 @@ fn plan_delegate(
                 rp.title
             );
         }
-        crate::refactor::PlanStatus::Errored => {
+        bbox_refactor::PlanStatus::Errored => {
             bail!(
                 "error.delegate_plan_errored: DelegateRefactor kind '{}' returned an \
                  Errored plan. Title: {}",
@@ -1621,8 +1621,8 @@ fn path_root(path: &str) -> &str {
 }
 
 /// Recursively collect the root segments referenced by a [`Predicate`].
-fn collect_predicate_roots(pred: &crate::macros::expr::Predicate, out: &mut Vec<String>) {
-    use crate::macros::expr::Predicate;
+fn collect_predicate_roots(pred: &crate::expr::Predicate, out: &mut Vec<String>) {
+    use crate::expr::Predicate;
     match pred {
         Predicate::Exists { path } | Predicate::Eq { path, .. } | Predicate::In { path, .. } => {
             out.push(path_root(path).to_string());
@@ -1805,7 +1805,7 @@ fn validate_context_roots(
 /// Critical: `allow_dirty_worktree`, `allow_unregistered_paths`, and `force_path`
 /// are all `None` (= false in `refactor::apply`). `macro_apply` is an envelope
 /// over `refactor::apply` — it MUST NOT set bypass flags by default.
-pub(crate) fn build_macro_apply_params(
+pub fn build_macro_apply_params(
     plan_value: Value,
     confirm: Option<bool>,
     cwd: Option<String>,
@@ -1833,9 +1833,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::macros::model::{MacroProbe, MacroRefusal, MacroScope};
-    use crate::macros::planner_ctx::MacroPlannerContext;
-    use crate::refactor;
+    use crate::model::{MacroProbe, MacroRefusal, MacroScope};
+    use crate::planner_ctx::MacroPlannerContext;
+    use bbox_refactor;
 
     // ── Test fixture helpers ─────────────────────────────────────────────────
 
@@ -1958,7 +1958,7 @@ mod tests {
             }
         });
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Exists {
+            when: crate::expr::Predicate::Exists {
                 path: "inputs.service_name".into(),
             },
             code: "error.type_already_exists".into(),
@@ -1994,7 +1994,7 @@ mod tests {
     fn refusal_not_fires_when_predicate_is_false() {
         let mut def = minimal_def();
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Exists {
+            when: crate::expr::Predicate::Exists {
                 path: "inputs.nonexistent_key".into(),
             },
             code: "error.should_not_fire".into(),
@@ -2118,7 +2118,7 @@ mod tests {
             force_path: Some(true), // bypass worktree check for tempdir
         };
         let projects = vec![];
-        let apply_result = refactor::apply(&apply_params, &projects).expect("apply should succeed");
+        let apply_result = bbox_refactor::apply(&apply_params, &projects).expect("apply should succeed");
         assert!(
             apply_result.contains("Generated.java") || apply_result.contains("files_written"),
             "apply result should mention the file: {apply_result}"
@@ -2175,8 +2175,8 @@ mod tests {
     /// arm falls through to `register_path`, which detects the duplicate.
     #[test]
     fn delegate_refactor_then_rewrite_same_path_is_duplicate() {
-        use crate::macros::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
-        use crate::refactor::{FileEdit, TextEdit};
+        use crate::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
+        use bbox_refactor::{FileEdit, TextEdit};
 
         // A test-only backend that returns a canned FileEdit for any rewrite.
         struct CannedRewriteBackend {
@@ -2239,7 +2239,7 @@ mod tests {
                 rewrite_path: target_path,
             }),
             None,
-            Box::new(crate::macros::probe::UnavailableProbeRunner),
+            Box::new(crate::probe::UnavailableProbeRunner),
         );
 
         let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
@@ -2297,9 +2297,9 @@ mod tests {
     /// `${item.*}` per element and honoring the body's per-item `when` guard.
     #[test]
     fn for_each_fans_out_rewrite_per_probe_item_with_per_item_guard() {
-        use crate::macros::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
-        use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
-        use crate::refactor::{FileEdit, TextEdit};
+        use crate::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
+        use crate::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+        use bbox_refactor::{FileEdit, TextEdit};
         use std::sync::Mutex;
 
         // Records the target_type of every rewrite op it receives, echoing the
@@ -2344,8 +2344,8 @@ mod tests {
                 &self,
                 _name: &str,
                 _spec: &ProbeSpec,
-                _ctx: &crate::macros::expr::Context,
-                _inv: &crate::macros::model::MacroInvocation,
+                _ctx: &crate::expr::Context,
+                _inv: &crate::model::MacroInvocation,
             ) -> anyhow::Result<ProbeOutput> {
                 Ok(ProbeOutput {
                     value: json!({
@@ -2390,7 +2390,7 @@ mod tests {
                         "member_text": "// generated",
                         "imports": []
                     }),
-                    when: Some(crate::macros::expr::Predicate::Eq {
+                    when: Some(crate::expr::Predicate::Eq {
                         path: "item.keep".into(),
                         value: json!(true),
                     }),
@@ -2443,15 +2443,15 @@ mod tests {
     /// A ForEach whose `over` path resolves to a non-array value fails closed.
     #[test]
     fn for_each_over_non_array_fails_closed() {
-        use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+        use crate::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
         struct ScalarRunner;
         impl ProbeRunner for ScalarRunner {
             fn run_probe(
                 &self,
                 _name: &str,
                 _spec: &ProbeSpec,
-                _ctx: &crate::macros::expr::Context,
-                _inv: &crate::macros::model::MacroInvocation,
+                _ctx: &crate::expr::Context,
+                _inv: &crate::model::MacroInvocation,
             ) -> anyhow::Result<ProbeOutput> {
                 Ok(ProbeOutput {
                     value: json!({"exists": true, "count": 1, "items": "not-an-array"}),
@@ -2493,7 +2493,7 @@ mod tests {
 
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::new(
-            Box::new(crate::macros::backend::UnavailableBackend),
+            Box::new(crate::backend::UnavailableBackend),
             None,
             Box::new(ScalarRunner),
         );
@@ -2715,7 +2715,7 @@ mod tests {
         let mut def = minimal_def();
         def.authority_gates = vec!["acknowledge_repr".to_string()];
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Exists {
+            when: crate::expr::Predicate::Exists {
                 path: "inputs.foo".into(),
             },
             code: "error.regular_refusal".into(),
@@ -2740,7 +2740,7 @@ mod tests {
     #[test]
     fn template_only_status_refuses_lowering() {
         // Manually construct a MacroPlan with a non-record op that has template_only status
-        use crate::macros::model::MacroPlan;
+        use crate::model::MacroPlan;
         let plan = MacroPlan {
             macro_id: "test.macro".into(),
             summary: "test".into(),
@@ -2752,7 +2752,7 @@ mod tests {
                 summary: "Emit Foo".into(),
             }],
             edits: EditSet {
-                file_creates: vec![crate::refactor::FileCreate {
+                file_creates: vec![bbox_refactor::FileCreate {
                     path: "/tmp/Foo.java".into(),
                     content: "class Foo {}".into(),
                 }],
@@ -2780,7 +2780,7 @@ mod tests {
     fn record_only_plan_lowers_to_syntax_only() {
         // A plan with only Record ops (template_only each) should lower successfully
         // because Record is non-mutating (excluded from the tier computation).
-        use crate::macros::model::MacroPlan;
+        use crate::model::MacroPlan;
         let plan = MacroPlan {
             macro_id: "test.macro".into(),
             summary: "only notes".into(),
@@ -2965,7 +2965,7 @@ mod tests {
 
     #[test]
     fn delegate_residue_surfaces_in_questions() {
-        use crate::refactor::{ExternalCall, ExtractedCallSite, PlanStatus};
+        use bbox_refactor::{ExternalCall, ExtractedCallSite, PlanStatus};
 
         // Construct a RefactorPlan with leftovers + external_calls residue.
         // The dup-check and edit-merge paths in plan() are not exercised here —
@@ -2974,7 +2974,7 @@ mod tests {
         let rp = RefactorPlan {
             title: "test delegate plan".into(),
             kind: "extract_java_methods".into(),
-            semantic_status: crate::refactor::SemanticStatus::SyntaxOnly,
+            semantic_status: bbox_refactor::SemanticStatus::SyntaxOnly,
             dry_run: true,
             file_moves: vec![],
             file_creates: vec![],
@@ -3048,7 +3048,7 @@ mod tests {
         let rp = RefactorPlan {
             title: "clean plan".into(),
             kind: "create_file".into(),
-            semantic_status: crate::refactor::SemanticStatus::SyntaxOnly,
+            semantic_status: bbox_refactor::SemanticStatus::SyntaxOnly,
             dry_run: true,
             file_moves: vec![],
             file_creates: vec![],
@@ -3062,7 +3062,7 @@ mod tests {
             external_calls: vec![],
             inherited_dependencies: vec![],
             deep_analysis: None,
-            plan_status: crate::refactor::PlanStatus::Planned,
+            plan_status: bbox_refactor::PlanStatus::Planned,
             fixme_count: None,
             operator_opt_outs_used: vec![],
         };
@@ -3086,7 +3086,7 @@ mod tests {
     /// probe B can assert that probe A's result is already in `ctx.probes`.
     struct MockProbeRunner {
         /// Canned outputs keyed by probe name.
-        canned: std::collections::HashMap<String, crate::macros::probe::ProbeOutput>,
+        canned: std::collections::HashMap<String, crate::probe::ProbeOutput>,
     }
 
     impl MockProbeRunner {
@@ -3104,7 +3104,7 @@ mod tests {
         ) -> Self {
             self.canned.insert(
                 name.to_string(),
-                crate::macros::probe::ProbeOutput {
+                crate::probe::ProbeOutput {
                     value,
                     semantic_status: status,
                     truncated: false,
@@ -3115,14 +3115,14 @@ mod tests {
         }
     }
 
-    impl crate::macros::probe::ProbeRunner for MockProbeRunner {
+    impl crate::probe::ProbeRunner for MockProbeRunner {
         fn run_probe(
             &self,
             name: &str,
-            _spec: &crate::macros::probe::ProbeSpec,
-            _ctx: &crate::macros::expr::Context,
-            _invocation: &crate::macros::model::MacroInvocation,
-        ) -> anyhow::Result<crate::macros::probe::ProbeOutput> {
+            _spec: &crate::probe::ProbeSpec,
+            _ctx: &crate::expr::Context,
+            _invocation: &crate::model::MacroInvocation,
+        ) -> anyhow::Result<crate::probe::ProbeOutput> {
             self.canned.get(name).cloned().ok_or_else(|| {
                 anyhow::anyhow!(
                     "mock: no canned output for probe '{}'; returning error",
@@ -3134,7 +3134,7 @@ mod tests {
 
     /// Build a `MacroPlannerContext` with a mock probe runner.
     fn ctx_with_mock(mock: MockProbeRunner) -> MacroPlannerContext {
-        use crate::macros::backend::UnavailableBackend;
+        use crate::backend::UnavailableBackend;
         MacroPlannerContext::new(Box::new(UnavailableBackend), None, Box::new(mock))
     }
 
@@ -3153,7 +3153,7 @@ mod tests {
             spec: probe_spec_code_symbols(),
         }];
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Exists {
+            when: crate::expr::Predicate::Exists {
                 path: "binding.exists".into(),
             },
             code: "error.already_bound".into(),
@@ -3196,7 +3196,7 @@ mod tests {
             spec: probe_spec_code_symbols(),
         }];
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Exists {
+            when: crate::expr::Predicate::Exists {
                 path: "binding.exists".into(),
             },
             code: "error.already_bound".into(),
@@ -3207,7 +3207,7 @@ mod tests {
         // resolves. Since binding.exists = false (bool), it DOES resolve.
         // Use a path that won't resolve: "binding.nonexistent"
         let mut def2 = def.clone();
-        def2.refusals[0].when = crate::macros::expr::Predicate::Exists {
+        def2.refusals[0].when = crate::expr::Predicate::Exists {
             path: "binding.nonexistent".into(),
         };
 
@@ -3244,13 +3244,13 @@ mod tests {
         ];
         // Refusal fires when BOTH probe_a.exists AND probe_b.exists are true.
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::All {
+            when: crate::expr::Predicate::All {
                 predicates: vec![
-                    crate::macros::expr::Predicate::Eq {
+                    crate::expr::Predicate::Eq {
                         path: "probe_a.exists".into(),
                         value: json!(true),
                     },
-                    crate::macros::expr::Predicate::Eq {
+                    crate::expr::Predicate::Eq {
                         path: "probe_b.exists".into(),
                         value: json!(true),
                     },
@@ -3299,7 +3299,7 @@ mod tests {
         }];
         // Typo: "bindng" instead of "binding"
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Exists {
+            when: crate::expr::Predicate::Exists {
                 path: "bindng.exists".into(), // typo
             },
             code: "error.bad_predicate".into(),
@@ -3471,7 +3471,7 @@ mod tests {
         // Refusal predicate references "inline_sym" which is only populated
         // by the inline probe op (executed AFTER refusals). This must error.
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Exists {
+            when: crate::expr::Predicate::Exists {
                 path: "inline_sym.exists".into(),
             },
             code: "error.should_not_reach".into(),
@@ -3507,7 +3507,7 @@ mod tests {
         // on the boolean value we compare it. With exists=false below, the
         // refusal must NOT fire — proving the top-level probe name resolves.
         def.refusals = vec![MacroRefusal {
-            when: crate::macros::expr::Predicate::Eq {
+            when: crate::expr::Predicate::Eq {
                 path: "top_probe.exists".into(),
                 value: json!(true),
             },
@@ -3649,7 +3649,7 @@ mod tests {
     /// string, not a literal placeholder.
     #[test]
     fn probe_spec_inputs_interpolation_runs_before_decode() {
-        use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+        use crate::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
 
         struct CapturingProbeRunner {
             captured_query: std::sync::Mutex<Option<String>>,
@@ -3659,15 +3659,15 @@ mod tests {
                 &self,
                 _name: &str,
                 spec: &ProbeSpec,
-                _ctx: &crate::macros::expr::Context,
-                _inv: &crate::macros::model::MacroInvocation,
+                _ctx: &crate::expr::Context,
+                _inv: &crate::model::MacroInvocation,
             ) -> anyhow::Result<ProbeOutput> {
                 if let ProbeSpec::CodeSymbols { query, .. } = spec {
                     *self.captured_query.lock().unwrap() = query.clone();
                 }
                 Ok(ProbeOutput {
                     value: json!({"exists": true, "count": 1, "items": []}),
-                    semantic_status: crate::macros::model::MacroSemanticStatus::SyntaxOnly,
+                    semantic_status: crate::model::MacroSemanticStatus::SyntaxOnly,
                     truncated: false,
                     diagnostics: vec![],
                 })
@@ -3675,7 +3675,7 @@ mod tests {
         }
 
         let mut def = minimal_def();
-        def.probes = vec![crate::macros::model::MacroProbe {
+        def.probes = vec![crate::model::MacroProbe {
             name: "method_probe".into(),
             description: "checks method exists".into(),
             // spec contains ${inputs.method_name} placeholder
@@ -3693,15 +3693,15 @@ mod tests {
                 &self,
                 name: &str,
                 spec: &ProbeSpec,
-                ctx: &crate::macros::expr::Context,
-                inv: &crate::macros::model::MacroInvocation,
+                ctx: &crate::expr::Context,
+                inv: &crate::model::MacroInvocation,
             ) -> anyhow::Result<ProbeOutput> {
                 self.0.run_probe(name, spec, ctx, inv)
             }
         }
 
         let ctx = MacroPlannerContext::new(
-            Box::new(crate::macros::backend::UnavailableBackend),
+            Box::new(crate::backend::UnavailableBackend),
             None,
             Box::new(SharedRunner(runner.clone())),
         );
@@ -3849,7 +3849,7 @@ mod tests {
     /// "skipped (guard false)" summary is recorded in the plan.
     #[test]
     fn emit_with_false_guard_is_skipped_without_calling_backend() {
-        use crate::macros::expr::Predicate;
+        use crate::expr::Predicate;
         let mut def = minimal_def();
         // inject probe result: service_type_exists.count = 1 (type already exists)
         def.probes = vec![]; // no real probes — we inject via inputs trick below
@@ -3897,7 +3897,7 @@ mod tests {
     /// is NOT called and a "skipped (guard false)" summary is recorded.
     #[test]
     fn rewrite_with_false_guard_is_skipped_without_calling_backend() {
-        use crate::macros::expr::Predicate;
+        use crate::expr::Predicate;
         let mut def = minimal_def();
         def.operations = vec![MacroOperation::Rewrite {
             targets: vec!["/repo/src/FooImpl.java".into()],
@@ -3936,7 +3936,7 @@ mod tests {
     /// the backend WAS actually called (not skipped).
     #[test]
     fn emit_with_true_guard_calls_backend() {
-        use crate::macros::expr::Predicate;
+        use crate::expr::Predicate;
         let mut def = minimal_def();
         def.operations = vec![MacroOperation::Emit {
             name: "interface_file".into(),

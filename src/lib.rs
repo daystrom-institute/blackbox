@@ -52,7 +52,9 @@ pub mod json_store;
 mod knowledge;
 // `lsp` extracted into bbox-lsp (stage 2); aliased back to `crate::lsp`.
 use bbox_lsp as lsp;
-pub(crate) mod macros;
+// `macros` extracted into bbox-macros (stage 5); aliased back to
+// `crate::macros` so existing call sites resolve unchanged.
+use bbox_macros as macros;
 mod managed_worktrees;
 mod manifest;
 mod mcp_client;

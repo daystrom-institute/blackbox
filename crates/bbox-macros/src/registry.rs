@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::macros::expr::Predicate;
-use crate::macros::model::{MacroDefinition, MacroOperation, MacroScope};
-use crate::macros::probe::ProbeSpec;
+use crate::expr::Predicate;
+use crate::model::{MacroDefinition, MacroOperation, MacroScope};
+use crate::probe::ProbeSpec;
 
 // ---------------------------------------------------------------------------
 // RegistryError
@@ -196,21 +196,21 @@ impl MacroRegistry {
         const BUILTINS: &[(&str, &str)] = &[
             (
                 "java.add_service_boundary",
-                include_str!("../../system-defaults/macros/java.add_service_boundary.json"),
+                include_str!("../../../system-defaults/macros/java.add_service_boundary.json"),
             ),
             (
                 "builtin.java.vaadin.ensure_provider_bindings",
                 include_str!(
-                    "../../system-defaults/macros/builtin.java.vaadin.ensure_provider_bindings.json"
+                    "../../../system-defaults/macros/builtin.java.vaadin.ensure_provider_bindings.json"
                 ),
             ),
             (
                 "builtin.java.lombok",
-                include_str!("../../system-defaults/macros/builtin.java.lombok.json"),
+                include_str!("../../../system-defaults/macros/builtin.java.lombok.json"),
             ),
             (
                 "builtin.java.guice",
-                include_str!("../../system-defaults/macros/builtin.java.guice.json"),
+                include_str!("../../../system-defaults/macros/builtin.java.guice.json"),
             ),
         ];
 
@@ -742,7 +742,7 @@ impl ValidationIssue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macros::model::MacroRefusal;
+    use crate::model::MacroRefusal;
     use serde_json::json;
     use std::path::Path;
 
@@ -1312,7 +1312,7 @@ mod tests {
     // Probe validation (P4a)
     // -----------------------------------------------------------------------
 
-    fn example_def_with_probes(probes: Vec<crate::macros::model::MacroProbe>) -> MacroDefinition {
+    fn example_def_with_probes(probes: Vec<crate::model::MacroProbe>) -> MacroDefinition {
         MacroDefinition {
             id: "probe.test".into(),
             version: "1".into(),
@@ -1331,7 +1331,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_valid_probes() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probes = vec![
             MacroProbe {
                 name: "binding".into(),
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_duplicate_probe_names() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probe = MacroProbe {
             name: "binding".into(),
             description: "dup".into(),
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_probe_spec_kind() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probe = MacroProbe {
             name: "bad".into(),
             description: "bad kind".into(),
@@ -1401,7 +1401,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_malformed_probe_spec() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probe = MacroProbe {
             name: "bad".into(),
             description: "missing file".into(),
@@ -1415,7 +1415,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_too_many_probes() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probes: Vec<MacroProbe> = (0..=MAX_PROBE_COUNT)
             .map(|i| MacroProbe {
                 name: format!("probe{i}"),
@@ -1474,7 +1474,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_inline_probe_exceeds_budget() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         // MAX_PROBE_COUNT top-level + 1 inline = over budget
         let mut def = MacroDefinition {
             id: "inline.probe.test".into(),
@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_duplicate_probe_name_across_top_level_and_inline() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         // top-level probe "binding" and inline Probe op also named "binding" → collision
         let def = MacroDefinition {
             id: "dup.cross.test".into(),
@@ -1590,7 +1590,7 @@ mod tests {
         // `${inputs.file}` is a valid interpolation placeholder.  After stripping
         // (replacing `${...}` with `"__placeholder__"`) the spec should still
         // deserialize as a valid CodeQuery with a non-empty file field.
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probe = MacroProbe {
             name: "sym".into(),
             description: "has interpolation".into(),
@@ -1635,7 +1635,7 @@ mod tests {
         // A probe spec with an unknown `kind` discriminant must still fail validation
         // even when the spec contains interpolation.  Stripping `${...}` should not
         // mask a missing or misspelled `kind` field.
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probe = MacroProbe {
             name: "bad_kind".into(),
             description: "unknown kind".into(),
@@ -1655,7 +1655,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_spec_without_interpolation() {
-        use crate::macros::model::MacroProbe;
+        use crate::model::MacroProbe;
         let probe = MacroProbe {
             name: "sym".into(),
             description: "clean spec".into(),

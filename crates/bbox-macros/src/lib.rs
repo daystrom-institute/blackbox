@@ -66,7 +66,7 @@ pub use model::{
     MacroSemanticStatus, MacroValidation,
 };
 #[allow(unused_imports)]
-pub use planner::MacroPlanner;
+pub use planner::{MacroPlanner, build_macro_apply_params};
 #[allow(unused_imports)]
 pub use planner_ctx::MacroPlannerContext;
 #[allow(unused_imports)]

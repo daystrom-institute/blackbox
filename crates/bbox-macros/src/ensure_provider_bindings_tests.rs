@@ -35,14 +35,14 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::macros::backend::UnavailableBackend;
-use crate::macros::expr::Context;
-use crate::macros::model::{MacroInvocation, MacroSemanticStatus};
-use crate::macros::planner::MacroPlanner;
-use crate::macros::planner_ctx::MacroPlannerContext;
-use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
-use crate::macros::registry::MacroRegistry;
-use crate::macros::sidecar_backend::SidecarBackend;
+use crate::backend::UnavailableBackend;
+use crate::expr::Context;
+use crate::model::{MacroInvocation, MacroSemanticStatus};
+use crate::planner::MacroPlanner;
+use crate::planner_ctx::MacroPlannerContext;
+use crate::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+use crate::registry::MacroRegistry;
+use crate::sidecar_backend::SidecarBackend;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MockProbeRunner
@@ -197,7 +197,7 @@ impl ProbeRunner for MockProbeRunner {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn load_vaadin_def() -> crate::macros::model::MacroDefinition {
+fn load_vaadin_def() -> crate::model::MacroDefinition {
     MacroRegistry::list(None)
         .into_iter()
         .find(|d| d.id == "builtin.java.vaadin.ensure_provider_bindings")
@@ -207,7 +207,7 @@ fn load_vaadin_def() -> crate::macros::model::MacroDefinition {
 }
 
 fn make_invocation(
-    def: &crate::macros::model::MacroDefinition,
+    def: &crate::model::MacroDefinition,
     project_dir: &str,
     module_file: &str,
     module_name: &str,
@@ -521,8 +521,8 @@ fn init_git_project(project_dir: &str) {
     );
 }
 
-fn make_probe_runner(project_dir: &str) -> crate::macros::probe::CodeNavProbeRunner {
-    let project_record = crate::projects::ProjectRecord {
+fn make_probe_runner(project_dir: &str) -> crate::probe::CodeNavProbeRunner {
+    let project_record = bbox_corpus_core::project_record::ProjectRecord {
         project_id: "vaadin-fixture".to_string(),
         repo_id: None,
         canonical_path: project_dir.to_string(),
@@ -530,7 +530,7 @@ fn make_probe_runner(project_dir: &str) -> crate::macros::probe::CodeNavProbeRun
         is_git_repo: true,
         languages: std::collections::BTreeSet::new(),
     };
-    crate::macros::probe::CodeNavProbeRunner::new(None, vec![project_record])
+    crate::probe::CodeNavProbeRunner::new(None, vec![project_record])
 }
 
 /// Happy path: VaadinModule.java has no provider methods → macro adds both.

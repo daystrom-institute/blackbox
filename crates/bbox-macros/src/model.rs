@@ -26,8 +26,8 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::macros::expr::Predicate;
-use crate::refactor::{FileCreate, FileEdit, FileMove};
+use crate::expr::Predicate;
+use bbox_refactor::{FileCreate, FileEdit, FileMove};
 
 // ---------------------------------------------------------------------------
 // MacroScope
@@ -140,7 +140,7 @@ pub struct MacroInvocation {
 
 /// Semantic verification tier for a `MacroPlan` or individual operation.
 ///
-/// Reuses the refactor [`crate::refactor::SemanticStatus`] ladder and adds
+/// Reuses the refactor [`bbox_refactor::SemanticStatus`] ladder and adds
 /// two macro-only tiers:
 ///
 /// | `MacroSemanticStatus` | Maps to `SemanticStatus`          | Notes |
@@ -202,7 +202,7 @@ pub enum MacroOperation {
         /// Backend op spec (JavaPoet, template, etc.); opaque at this layer.
         backend_op: Value,
         /// Optional guard predicate. When present and evaluating to `false`
-        /// against the planning [`crate::macros::expr::Context`], this
+        /// against the planning [`crate::expr::Context`], this
         /// operation is skipped entirely — the backend is NOT called and a
         /// `"skipped (guard false)"` summary is recorded in the plan.
         ///
@@ -219,7 +219,7 @@ pub enum MacroOperation {
         /// Backend op spec (OpenRewrite recipe, etc.); opaque at this layer.
         backend_op: Value,
         /// Optional guard predicate. When present and evaluating to `false`
-        /// against the planning [`crate::macros::expr::Context`], this
+        /// against the planning [`crate::expr::Context`], this
         /// operation is skipped entirely — the backend is NOT called and a
         /// `"skipped (guard false)"` summary is recorded in the plan.
         ///
@@ -255,7 +255,7 @@ pub enum MacroOperation {
         /// Short label for the note, e.g. `"manual_wiring_required"`.
         label: String,
         /// Note body; `${path}` interpolation supported via
-        /// [`crate::macros::expr::interpolate`].
+        /// [`crate::expr::interpolate`].
         body: String,
     },
 
@@ -477,7 +477,7 @@ pub struct MacroPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::refactor::FileCreate;
+    use bbox_refactor::FileCreate;
     use serde_json::json;
 
     fn minimal_definition() -> MacroDefinition {
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn edit_set_file_moves_round_trip() {
-        use crate::refactor::FileMove;
+        use bbox_refactor::FileMove;
         let es = EditSet {
             file_edits: vec![],
             file_creates: vec![],
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn macro_refusal_with_predicate_round_trip() {
-        use crate::macros::expr::Predicate;
+        use crate::expr::Predicate;
         let refusal = MacroRefusal {
             when: Predicate::Exists {
                 path: "binding.type_exists".into(),

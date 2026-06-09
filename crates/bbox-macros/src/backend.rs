@@ -10,7 +10,7 @@
 //! - [`JavaMacroBackend`] — the trait the planner calls.
 //! - [`UnavailableBackend`] — fail-closed default; every method returns
 //!   `error.backend_unavailable`. Used as the default in
-//!   [`crate::macros::MacroPlannerContext`] until the real sidecar lands.
+//!   [`crate::MacroPlannerContext`] until the real sidecar lands.
 //!
 //! # Fail-closed invariant
 //!
@@ -22,7 +22,7 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::refactor::{FileCreate, FileEdit};
+use bbox_refactor::{FileCreate, FileEdit};
 
 // ---------------------------------------------------------------------------
 // BackendEditSet
@@ -30,7 +30,7 @@ use crate::refactor::{FileCreate, FileEdit};
 
 /// The file-mutation output produced by a Java macro backend.
 ///
-/// Folds into [`crate::macros::EditSet`] at planner aggregation time; never
+/// Folds into [`crate::EditSet`] at planner aggregation time; never
 /// written to disk directly. Matches the subset of `EditSet` that backends
 /// actually produce (backends do not produce `file_moves` — those come from
 /// the macro planner compositing delegate refactor ops).
@@ -240,7 +240,7 @@ pub enum JavaRewriteOp {
 ///
 /// The planner calls `emit` for new-file generation and `rewrite` for
 /// existing-file transformation. Both return a [`BackendEditSet`] that the
-/// planner folds into the aggregate [`crate::macros::EditSet`].
+/// planner folds into the aggregate [`crate::EditSet`].
 ///
 /// Implementations must be object-safe (`&self` receivers, no generics on
 /// methods) so the planner can hold a `Box<dyn JavaMacroBackend>`.
@@ -288,7 +288,7 @@ pub trait JavaMacroBackend: Send + Sync {
 /// Fail-closed default backend.
 ///
 /// Every method returns `Err` with an `error.backend_unavailable` message.
-/// Used as the [`crate::macros::MacroPlannerContext`] default until the real
+/// Used as the [`crate::MacroPlannerContext`] default until the real
 /// OpenRewrite/JavaPoet sidecar is wired up in Phase 3.
 ///
 /// This ensures the planner always fails with a clear error rather than

@@ -10,13 +10,13 @@
 //!
 //! # Design note
 //!
-//! The backend is NOT placed on [`crate::refactor::PlanContext`] — the macro
+//! The backend is NOT placed on [`bbox_refactor::PlanContext`] — the macro
 //! layer owns its own context so it can carry Java-specific state without
 //! polluting the general refactor plumbing.
 
-use crate::lsp::LspSessionManager;
-use crate::macros::backend::{JavaMacroBackend, UnavailableBackend};
-use crate::macros::probe::{ProbeRunner, UnavailableProbeRunner};
+use bbox_lsp::LspSessionManager;
+use crate::backend::{JavaMacroBackend, UnavailableBackend};
+use crate::probe::{ProbeRunner, UnavailableProbeRunner};
 
 // ---------------------------------------------------------------------------
 // MacroPlannerContext
@@ -40,11 +40,11 @@ pub struct MacroPlannerContext {
     /// planner must check for `Some` before issuing LSP-backed probe ops.
     pub lsp: Option<LspSessionManager>,
 
-    /// Probe runner for evaluating [`crate::macros::model::MacroProbe`] slots
+    /// Probe runner for evaluating [`crate::model::MacroProbe`] slots
     /// at plan time.
     ///
     /// Defaults to [`UnavailableProbeRunner`] (fail-closed) until a real
-    /// [`crate::macros::probe::CodeNavProbeRunner`] is injected at service
+    /// [`crate::probe::CodeNavProbeRunner`] is injected at service
     /// startup (Phase 4 P4b wires the planner to this runner).
     pub probe_runner: Box<dyn ProbeRunner>,
 }
@@ -54,7 +54,7 @@ impl MacroPlannerContext {
     /// and a probe runner.
     ///
     /// Pass [`UnavailableProbeRunner`] when no real runner is available yet;
-    /// pass a [`crate::macros::probe::CodeNavProbeRunner`] for production use.
+    /// pass a [`crate::probe::CodeNavProbeRunner`] for production use.
     pub fn new(
         backend: Box<dyn JavaMacroBackend>,
         lsp: Option<LspSessionManager>,
@@ -87,7 +87,7 @@ impl Default for MacroPlannerContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macros::backend::{JavaEmitOp, JavaRewriteOp};
+    use crate::backend::{JavaEmitOp, JavaRewriteOp};
 
     #[test]
     fn default_context_uses_unavailable_backend() {
@@ -114,9 +114,9 @@ mod tests {
 
     #[test]
     fn default_context_probe_runner_fails_closed() {
-        use crate::macros::expr::Context;
-        use crate::macros::model::MacroInvocation;
-        use crate::macros::probe::ProbeSpec;
+        use crate::expr::Context;
+        use crate::model::MacroInvocation;
+        use crate::probe::ProbeSpec;
         let ctx = MacroPlannerContext::default();
         let spec = ProbeSpec::CodeSymbols {
             query: None,
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn new_constructor_accepts_unavailable_backend() {
-        use crate::macros::probe::UnavailableProbeRunner;
+        use crate::probe::UnavailableProbeRunner;
         let ctx = MacroPlannerContext::new(
             Box::new(UnavailableBackend),
             None,
