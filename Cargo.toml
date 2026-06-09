@@ -33,6 +33,9 @@ name = "blackbox"
 version = "0.0.1"
 edition = "2024"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
 [[bin]]
 name = "blackboxd"
 path = "src/main.rs"
