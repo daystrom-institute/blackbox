@@ -2574,12 +2574,10 @@ fn run_local_slash(app: &mut App) -> bool {
             toggle_fast_mode(app, arg);
             true
         }
-        // `/closeout` is discoverable + previewable from any zone (`keep`,
-        // `preflight`, and any `--dry-run` run against the roster-selected
-        // agent), but `run_closeout` gates MUTATING folds (discard/publish/
-        // merge/adopt) to the focused single-agent view so a real push can't
-        // fire against whatever the roster cursor happens to sit on. The
-        // daemon's managed-worktree guard is the backstop, not the first line.
+        // `/closeout` is discoverable + previewable from any zone. `run_closeout`
+        // gates mutating folds (discard/publish/merge/adopt) against daemon roster
+        // metadata: a managed worktree must be present, and workflow-owned rows
+        // require an explicit owner ack before mutation.
         "/closeout" => {
             run_closeout(app, arg);
             true

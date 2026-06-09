@@ -43,6 +43,9 @@ pub(super) struct ParsedCloseout {
     /// and the dry-run short-circuit still runs preflight for the typed
     /// disposition.
     pub confirm: bool,
+    /// Explicit operator override for workflow/atom-owned rows. The value must
+    /// name the owning origin shown by the daemon roster metadata.
+    pub ack_owner: Option<String>,
 }
 
 /// A worktree-local rebase conflict that has been handed back to the owning
@@ -99,7 +102,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     let trimmed = arg.trim();
     if trimmed.is_empty() {
         return Err(
-            "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>]"
+            "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>] [--ack-owner <origin>]"
                 .to_string(),
         );
     }
@@ -110,6 +113,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     let mut disposition: Option<String> = None;
     let mut dry_run = false;
     let mut target: Option<String> = None;
+    let mut ack_owner: Option<String> = None;
     let mut tokens = trimmed.split_whitespace();
     while let Some(tok) = tokens.next() {
         match tok {
@@ -125,6 +129,17 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
                 }
                 target = Some(value.to_string());
             }
+            "--ack-owner" => {
+                let value = tokens.next().ok_or_else(|| {
+                    "/closeout: --ack-owner requires the owning origin label".to_string()
+                })?;
+                if value.is_empty() {
+                    return Err(
+                        "/closeout: --ack-owner requires a non-empty origin label".to_string()
+                    );
+                }
+                ack_owner = Some(value.to_string());
+            }
             _ if disposition.is_none() => disposition = Some(tok.to_string()),
             _ => {
                 return Err(format!(
@@ -135,7 +150,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     }
 
     let disposition = disposition.ok_or_else(|| {
-        "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>]"
+        "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>] [--ack-owner <origin>]"
             .to_string()
     })?;
     if !is_valid_disposition(&disposition) {
@@ -162,6 +177,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
         dry_run,
         target,
         confirm,
+        ack_owner,
     })
 }
 
@@ -197,10 +213,33 @@ fn build_request(parsed: &ParsedCloseout, worktree: &str) -> bro_fleet_client::C
     }
 }
 
-/// Render-thread entrypoint. Resolves the focused agent's worktree
-/// (`snapshot.cwd` is the agent's managed worktree), validates the
-/// parse, sets a "closeout: …" status flash, and spawns the worker
-/// task that hits `/control/closeout`.
+#[derive(Debug, Clone)]
+struct FocusedCloseoutContext {
+    managed_worktree: Option<String>,
+    fallback_worktree: Option<String>,
+    workflow_owned: bool,
+    owner_origin: String,
+}
+
+fn closeout_mutation_enabled(managed_worktree: Option<&str>, workflow_owned: bool) -> bool {
+    managed_worktree.is_some() && !workflow_owned
+}
+
+fn focused_closeout_context(app: &App) -> Option<FocusedCloseoutContext> {
+    let idx = app.selected_agent()?;
+    let snap = app.agents[idx].task.snapshot();
+    Some(FocusedCloseoutContext {
+        managed_worktree: snap.managed_worktree,
+        fallback_worktree: snap.cwd,
+        workflow_owned: snap.workflow_owned,
+        owner_origin: snap.origin.to_string(),
+    })
+}
+
+/// Render-thread entrypoint. Resolves the focused row's daemon-classified
+/// managed worktree, validates the parse, applies proactive closeout gates,
+/// sets a "closeout: …" status flash, and spawns the worker task that hits
+/// `/control/closeout`.
 pub(super) fn run_closeout(app: &mut App, arg: &str) {
     let parsed = match parse_closeout(arg) {
         Ok(p) => p,
@@ -210,35 +249,57 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
             return;
         }
     };
-    // Footgun gate: a MUTATING fold (discard/publish/merge/adopt) pushes to a
-    // real branch, so it must not fire from the roster against whatever agent
-    // the cursor happens to sit on — too easy to fold the wrong worktree. Run
-    // those only from the focused single-agent view, where the operator has
-    // explicitly zoomed into the agent being folded. Non-mutating dispositions
-    // (`keep`/`preflight`) and ANY `--dry-run` stay runnable from the roster so
-    // the command keeps its discoverability + safe preview there.
+    let context = match focused_closeout_context(app) {
+        Some(c) => c,
+        None => {
+            app.set_status(
+                "/closeout: no focused fleet agent (select or open a fleet agent first)".to_string(),
+                Duration::from_secs(6),
+            );
+            app.clear_input();
+            return;
+        }
+    };
     let mutating = matches!(
         parsed.disposition.as_str(),
         "discard" | "publish" | "merge" | "adopt"
     );
-    if mutating && !parsed.dry_run && app.zone != Zone::SingleAgent {
-        app.set_status(
-            format!(
-                "/closeout {}: open the agent first (→) — a mutating fold runs only from the \
-                 focused view so it can't fold the wrong worktree. (Add --dry-run to preview \
-                 from the roster.)",
-                parsed.disposition
-            ),
-            Duration::from_secs(8),
-        );
-        app.clear_input();
-        return;
+    if mutating
+        && !parsed.dry_run
+        && !closeout_mutation_enabled(
+            context.managed_worktree.as_deref(),
+            context.workflow_owned,
+        )
+    {
+        if context.managed_worktree.is_none() {
+            app.set_status(
+                format!(
+                    "/closeout {} disabled: no managed worktree (add --dry-run to preview daemon preflight)",
+                    parsed.disposition
+                ),
+                Duration::from_secs(8),
+            );
+            app.clear_input();
+            return;
+        }
+        let expected = context.owner_origin.as_str();
+        if parsed.ack_owner.as_deref() != Some(expected) {
+            app.set_status(
+                format!(
+                    "/closeout {} disabled: workflow-owned by {expected}; rerun with --ack-owner {expected} to confirm",
+                    parsed.disposition
+                ),
+                Duration::from_secs(10),
+            );
+            app.clear_input();
+            return;
+        }
     }
-    let worktree = match focused_worktree(app) {
+    let worktree = match context.managed_worktree.or(context.fallback_worktree) {
         Some(w) => w,
         None => {
             app.set_status(
-                "/closeout: no focused fleet agent with a managed worktree (open a fleet agent first)".to_string(),
+                "/closeout: no focused fleet agent worktree to preflight".to_string(),
                 Duration::from_secs(6),
             );
             app.clear_input();
@@ -279,16 +340,6 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
         };
         let _ = tx.send(msg);
     });
-}
-
-/// Walk the focused agent to its snapshot `cwd` (the agent's managed
-/// worktree, not the project root). The same `selected_agent()` the
-/// steer/interrupt/rename path uses — `Zone::SingleAgent` focuses by
-/// `focused_agent_id`, otherwise the roster cursor wins.
-fn focused_worktree(app: &App) -> Option<String> {
-    let idx = app.selected_agent()?;
-    let snap = app.agents[idx].task.snapshot();
-    snap.cwd
 }
 
 /// UI-thread half of a finished `/closeout` worker. Renders the
@@ -587,6 +638,14 @@ mod tests {
     }
 
     #[test]
+    fn closeout_mutation_enabled_requires_managed_unowned_worktree() {
+        assert!(closeout_mutation_enabled(Some("/tmp/wt"), false));
+        assert!(!closeout_mutation_enabled(None, false));
+        assert!(!closeout_mutation_enabled(Some("/tmp/wt"), true));
+        assert!(!closeout_mutation_enabled(None, true));
+    }
+
+    #[test]
     fn parse_closeout_minimal_publish() {
         let p = parsed("publish");
         assert_eq!(p.disposition, "publish");
@@ -688,6 +747,7 @@ mod tests {
                 dry_run: false,
                 target: None,
                 confirm: expected_confirm,
+                ack_owner: None,
             };
             let req = build_request(&parsed, "/tmp/wt");
             assert_eq!(req.disposition, disp, "disposition roundtrip for {disp}");
@@ -712,6 +772,7 @@ mod tests {
                 dry_run: true,
                 target: None,
                 confirm: true,
+                ack_owner: None,
             };
             let req = build_request(&parsed, "/tmp/wt");
             assert_eq!(req.disposition, disp, "disposition roundtrips for {disp} --dry-run");
