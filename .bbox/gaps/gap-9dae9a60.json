@@ -1,0 +1,26 @@
+{
+  "id": "gap-9dae9a60",
+  "title": "Stateful consultant runtime should be atom/workflow-native instead of Badgey-specific",
+  "gap_kind": "agent",
+  "domain": "consultant-runtime",
+  "wanted_capability": "A reusable stateful consultant primitive that exposes instance identity, resumable session binding, proposal lifecycle, action journaling, and workflow-visible apply/dispatch through atom contracts and workflow nodes, so Badgey is one configured consumer rather than a bespoke daemon feature.",
+  "missing_primitive": "Atom/workflow-native consultant runtime with generic instance registry, proposal store, action journal, intent post-processor, and split apply protocol.",
+  "fallback_used": "Badgey implements these facilities through bespoke badgey_* MCP tools, BadgeyId, BadgeyRegistry, ProposalStore under state_dir/badgey, bg-action-* note parsing, and Badgey-specific workflow MCP calls.",
+  "evidence": [
+    "/home/invidious/repos/transcript-search/src/orchestration/badgey/types.rs:13",
+    "/home/invidious/repos/transcript-search/src/orchestration/badgey/registry.rs:12",
+    "/home/invidious/repos/transcript-search/src/orchestration/badgey/proposals.rs:91",
+    "/home/invidious/repos/transcript-search/src/tools/badgey/proposals.rs:276",
+    "/home/invidious/repos/transcript-search/src/workflow/schema.rs:22",
+    "/home/invidious/repos/transcript-search/src/workflow/engine/actor_nodes.rs:152",
+    "/home/invidious/repos/transcript-search/system-defaults/atoms/adapters/badgey.json:1"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "agent/consultant-runtime/atom-workflow-stateful-consultant",
+  "suggested_owner": "blackbox",
+  "notes": "Existing workflow machinery already supports atom_bindings, workflow-backed atoms, hook mcp_call, foreach/subworkflow fanout, gates, actor_failure=continue, and structured workflow handles. Badgey apply/triage workflows show the desired direction, but the core consultant state remains outside atom invocation ownership/effects/composition.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-08T23:41:43Z",
+  "updated_at": "2026-06-08T23:41:43Z"
+}
