@@ -913,12 +913,13 @@ impl BlackboxServer {
                         Some(outcome.to_string()),
                     )
                     .map_err(|e| format!("transitioning proposal to applied: {e}"))?;
-                let decide_id = if let Some(existing) =
+                let (decide_id, wrote_decision) = if let Some(existing) =
                     self.badgey_existing_audit_decision_id(id.as_str(), proposal_id)
                 {
-                    existing
+                    (existing, false)
                 } else {
-                    self.state
+                    let decision_id = self
+                        .state
                         .kb
                         .write()
                         .decide_result(
@@ -941,8 +942,16 @@ impl BlackboxServer {
                             false,
                         )
                         .map_err(|e| format!("writing proposal audit decision: {e:#}"))?
-                        .id
+                        .id;
+                    (decision_id, true)
                 };
+                if wrote_decision {
+                    self.state
+                        .kb_persister
+                        .request_durable()
+                        .await
+                        .map_err(|e| format!("persisting proposal audit decision: {e:#}"))?;
+                }
                 let artifact_ref = outcome
                     .get("artifact_ref")
                     .and_then(Value::as_str)
@@ -1201,12 +1210,13 @@ impl BlackboxServer {
                     Some(note),
                 )
                 .map_err(|e| format!("transitioning proposal to applied: {e}"))?;
-            let decide_id = if let Some(existing) =
+            let (decide_id, wrote_decision) = if let Some(existing) =
                 self.badgey_existing_audit_decision_id(id.as_str(), proposal_id)
             {
-                existing
+                (existing, false)
             } else {
-                self.state
+                let decision_id = self
+                    .state
                     .kb
                     .write()
                     .decide_result(
@@ -1227,8 +1237,16 @@ impl BlackboxServer {
                         false,
                     )
                     .map_err(|e| format!("writing proposal audit decision: {e:#}"))?
-                    .id
+                    .id;
+                (decision_id, true)
             };
+            if wrote_decision {
+                self.state
+                    .kb_persister
+                    .request_durable()
+                    .await
+                    .map_err(|e| format!("persisting proposal audit decision: {e:#}"))?;
+            }
             let audit_ref = artifact_ref
                 .map(String::from)
                 .unwrap_or_else(|| "task".to_string());

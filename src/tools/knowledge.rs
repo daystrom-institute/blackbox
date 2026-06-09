@@ -38,6 +38,28 @@ fn first_entry_id(entries_block: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
+fn entry_ids(entries_block: &str) -> Vec<String> {
+    entries_block
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix('[')?;
+            let end = rest.find(']')?;
+            let id = rest[..end].trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .collect()
+}
+
+fn log_tool_ok(tool: &'static str, start: std::time::Instant, bytes: usize) {
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes, "ok");
+}
+
+fn log_tool_err(tool: &'static str, start: std::time::Instant, err: &anyhow::Error) {
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %err, "err");
+}
+
 fn matches_system_memory_catalog(category: Option<&str>) -> bool {
     matches!(
         category,
@@ -72,23 +94,36 @@ impl BlackboxServer {
         name = "bbox_learn",
         description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
     )]
-    pub(crate) fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
+    pub(crate) async fn bbox_learn(
+        &self,
+        Parameters(p): Parameters<LearnParams>,
+    ) -> CallToolResult {
         let format = match ResponseFormat::parse_optional(p.format.as_deref()) {
             Ok(format) => format,
             Err(e) => return Self::err_text(&format!("Error: {e:#}")),
         };
+        let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
         let start = std::time::Instant::now();
-        match (|| {
-            let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
-            let result = self.state.kb.write().learn_result(&p, false)?;
-            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
-                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
-            }
-            Ok::<_, anyhow::Error>((result, warning))
-        })() {
-            Ok((result, warning)) => {
-                let ms = start.elapsed().as_secs_f64() * 1000.0;
-                let rider = self.state.kb.read().repo_record_rider(&result.id);
+        let server = self.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            let mut kb = server.state.kb.write();
+            let result = kb.learn_result(&p, false)?;
+            let rider = kb.repo_record_rider(&result.id);
+            Ok::<_, anyhow::Error>((result, rider))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
+        .and_then(std::convert::identity);
+
+        match write_result {
+            Ok((result, rider)) => {
+                if let Err(e) = self.state.kb_persister.request_durable().await {
+                    log_tool_err("bbox_learn", start, &e);
+                    return Self::err_text(&format!("Error: {e:#}"));
+                }
+                if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                    tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+                }
                 match format {
                     ResponseFormat::Text => {
                         let mut text = match warning {
@@ -98,7 +133,7 @@ impl BlackboxServer {
                         if let Some(rider) = &rider {
                             text.push_str(rider);
                         }
-                        tracing::info!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, bytes = text.len(), "ok");
+                        log_tool_ok("bbox_learn", start, text.len());
                         Self::ok_text(&text)
                     }
                     ResponseFormat::Json => {
@@ -122,14 +157,13 @@ impl BlackboxServer {
                         let bytes = serde_json::to_string(&payload)
                             .map(|s| s.len())
                             .unwrap_or_default();
-                        tracing::info!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, bytes, "ok");
+                        log_tool_ok("bbox_learn", start, bytes);
                         Self::ok_json(&payload)
                     }
                 }
             }
             Err(e) => {
-                let ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::warn!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, error = %e, "err");
+                log_tool_err("bbox_learn", start, &e);
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -139,67 +173,132 @@ impl BlackboxServer {
         name = "bbox_remember",
         description = "Persist a fact for later recall; indexed but NOT rendered."
     )]
-    pub(crate) fn bbox_remember(
+    pub(crate) async fn bbox_remember(
         &self,
         Parameters(p): Parameters<RememberParams>,
     ) -> CallToolResult {
-        Self::run("bbox_remember", || {
-            let result = self.state.kb.write().remember_result(&p, false)?;
-            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
-                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
-            }
-            let mut message = result.message;
-            if let Some(rider) = self.state.kb.read().repo_record_rider(&result.id) {
-                message.push_str(&rider);
-            }
-            Ok(message)
+        let start = std::time::Instant::now();
+        let server = self.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            let mut kb = server.state.kb.write();
+            let result = kb.remember_result(&p, false)?;
+            let rider = kb.repo_record_rider(&result.id);
+            Ok::<_, anyhow::Error>((result, rider))
         })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
+        .and_then(std::convert::identity);
+
+        match write_result {
+            Ok((result, rider)) => {
+                if let Err(e) = self.state.kb_persister.request_durable().await {
+                    log_tool_err("bbox_remember", start, &e);
+                    return Self::err_text(&format!("Error: {e:#}"));
+                }
+                if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                    tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+                }
+                let mut message = result.message;
+                if let Some(rider) = rider {
+                    message.push_str(&rider);
+                }
+                log_tool_ok("bbox_remember", start, message.len());
+                Self::ok_text(&message)
+            }
+            Err(e) => {
+                log_tool_err("bbox_remember", start, &e);
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(
         name = "bbox_decide",
         description = "Record a durable commitment with required rationale; supports supersession."
     )]
-    pub(crate) fn bbox_decide(&self, Parameters(p): Parameters<DecideParams>) -> CallToolResult {
-        Self::run("bbox_decide", || {
-            let result = self.state.kb.write().decide_result(&p, false)?;
-            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
-                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
-            }
-            if let Some(old_id) = result.superseded.as_deref() {
-                if let Err(err) = self.tombstone_knowledge_entry_in_index(old_id) {
-                    tracing::warn!(error = %err, entry = %old_id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
-                }
-            }
-            let mut message = result.message;
-            if let Some(rider) = self.state.kb.read().repo_record_rider(&result.id) {
-                message.push_str(&rider);
-            }
-            Ok(message)
+    pub(crate) async fn bbox_decide(
+        &self,
+        Parameters(p): Parameters<DecideParams>,
+    ) -> CallToolResult {
+        let start = std::time::Instant::now();
+        let server = self.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            let mut kb = server.state.kb.write();
+            let result = kb.decide_result(&p, false)?;
+            let rider = kb.repo_record_rider(&result.id);
+            Ok::<_, anyhow::Error>((result, rider))
         })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge write task failed: {e}"))
+        .and_then(std::convert::identity);
+
+        match write_result {
+            Ok((result, rider)) => {
+                if let Err(e) = self.state.kb_persister.request_durable().await {
+                    log_tool_err("bbox_decide", start, &e);
+                    return Self::err_text(&format!("Error: {e:#}"));
+                }
+                if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                    tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+                }
+                if let Some(old_id) = result.superseded.as_deref() {
+                    if let Err(err) = self.tombstone_knowledge_entry_in_index(old_id) {
+                        tracing::warn!(error = %err, entry = %old_id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
+                    }
+                }
+                let mut message = result.message;
+                if let Some(rider) = rider {
+                    message.push_str(&rider);
+                }
+                log_tool_ok("bbox_decide", start, message.len());
+                Self::ok_text(&message)
+            }
+            Err(e) => {
+                log_tool_err("bbox_decide", start, &e);
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(
         name = "bbox_knowledge",
         description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces matching rule-packets and system memories; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters."
     )]
-    pub(crate) fn bbox_knowledge(
+    pub(crate) async fn bbox_knowledge(
         &self,
         Parameters(p): Parameters<KnowledgeListParams>,
     ) -> CallToolResult {
-        Self::run("bbox_knowledge", || {
+        let server = self.clone();
+        Self::run_blocking("bbox_knowledge", move || {
             if let Some(out) = exact_system_memory_response(&p) {
                 return Ok(out);
             }
 
-            let mut combined = self.state.kb.write().list(&p)?;
+            let mut combined = server.state.kb.write().list(&p)?;
             // Captured before packets/memories are appended, so it reflects the
             // top knowledge entry (not a packet/memory line).
             let top_entry_id = first_entry_id(&combined);
+            let recall_ids = entry_ids(&combined);
+            if !recall_ids.is_empty() {
+                let recall_result = {
+                    let mut kb = server.state.kb.write();
+                    kb.record_recall(&recall_ids)
+                };
+                match recall_result {
+                    Ok(()) => {
+                        // Recall telemetry was always best-effort on this read path;
+                        // keep it write-behind rather than making queries wait for fsync.
+                        server.state.kb_persister.request();
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "knowledge recall telemetry update failed");
+                    }
+                }
+            }
 
             // Surface matching packets. Uses the same match semantics as
             // bbox_packet_list so the two tools agree on what "matches" means.
-            let all_packets = self.state.packets.read().list_all()?;
+            let all_packets = server.state.packets.read().list_all()?;
             let matching_packets: Vec<_> =
                 if let Some(q) = p.query.as_deref().filter(|q| !q.is_empty()) {
                     all_packets
@@ -285,16 +384,19 @@ impl BlackboxServer {
             }
             Ok(combined)
         })
+        .await
     }
 
     #[tool(name = "bbox_knowledge_link", description = "Append a knowledge edge.")]
-    pub(crate) fn bbox_knowledge_link(
+    pub(crate) async fn bbox_knowledge_link(
         &self,
         Parameters(p): Parameters<KnowledgeLinkParams>,
     ) -> CallToolResult {
-        Self::run("bbox_knowledge_link", || {
-            let edge = self.state.kb.write().append_link(&p)?;
-            Ok(serde_json::to_string_pretty(&json!({
+        let start = std::time::Instant::now();
+        let server = self.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            let edge = server.state.kb.write().append_link(&p)?;
+            Ok::<_, anyhow::Error>(serde_json::to_string_pretty(&json!({
                 "status": "linked",
                 "source": p.source,
                 "target": p.target,
@@ -302,17 +404,56 @@ impl BlackboxServer {
                 "confidence": edge.confidence,
             }))?)
         })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge link task failed: {e}"))
+        .and_then(std::convert::identity);
+
+        match write_result {
+            Ok(text) => {
+                if let Err(e) = self.state.kb_persister.request_durable().await {
+                    log_tool_err("bbox_knowledge_link", start, &e);
+                    return Self::err_text(&format!("Error: {e:#}"));
+                }
+                log_tool_ok("bbox_knowledge_link", start, text.len());
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                log_tool_err("bbox_knowledge_link", start, &e);
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(name = "bbox_forget", description = "Retire or supersede an entry.")]
-    pub(crate) fn bbox_forget(&self, Parameters(p): Parameters<ForgetParams>) -> CallToolResult {
-        Self::run("bbox_forget", || {
-            let message = self.state.kb.write().forget(&p)?;
-            if let Err(err) = self.tombstone_knowledge_entry_in_index(&p.id) {
-                tracing::warn!(error = %err, entry = %p.id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
+    pub(crate) async fn bbox_forget(
+        &self,
+        Parameters(p): Parameters<ForgetParams>,
+    ) -> CallToolResult {
+        let start = std::time::Instant::now();
+        let id = p.id.clone();
+        let server = self.clone();
+        let write_result = tokio::task::spawn_blocking(move || server.state.kb.write().forget(&p))
+            .await
+            .map_err(|e| anyhow::anyhow!("knowledge forget task failed: {e}"))
+            .and_then(std::convert::identity);
+
+        match write_result {
+            Ok(message) => {
+                if let Err(e) = self.state.kb_persister.request_durable().await {
+                    log_tool_err("bbox_forget", start, &e);
+                    return Self::err_text(&format!("Error: {e:#}"));
+                }
+                if let Err(err) = self.tombstone_knowledge_entry_in_index(&id) {
+                    tracing::warn!(error = %err, entry = %id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
+                }
+                log_tool_ok("bbox_forget", start, message.len());
+                Self::ok_text(&message)
             }
-            Ok(message)
-        })
+            Err(e) => {
+                log_tool_err("bbox_forget", start, &e);
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 }
 

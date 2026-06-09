@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunker::EdgeConfidence;
 use crate::entity_ref::EntityRef;
+use crate::store_persister::StoreSnapshot;
 
 use crate::query::{QueryAtom, QueryNode, parse_query};
 
@@ -915,7 +916,7 @@ fn persist_repo_kb_entries(
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeStore {
     pub version: u32,
     pub entries: Vec<KnowledgeEntry>,
@@ -927,6 +928,14 @@ impl KnowledgeStore {
             version: 1,
             entries: Vec::new(),
         }
+    }
+}
+
+impl StoreSnapshot for Knowledge {
+    type Snapshot = KnowledgeStore;
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        Ok(self.central_snapshot())
     }
 }
 
@@ -960,30 +969,37 @@ impl Knowledge {
         self.reload()
     }
 
-    fn save(&self) -> Result<()> {
-        // Persistence is split by scope. The central store owns only global
-        // (non-project) entries; project-scoped entries are persisted under
-        // their owning repo's `.bbox/knowledge/`, one file per entry. An entry
-        // whose owning repo isn't present on this host falls back to central so
-        // it is never dropped (it round-trips back to the repo once present).
+    fn central_snapshot(&self) -> KnowledgeStore {
         let mut central = KnowledgeStore {
             version: self.store.version,
             entries: Vec::new(),
         };
-        let mut by_project: HashMap<PathBuf, Vec<&KnowledgeEntry>> = HashMap::new();
         for e in &self.store.entries {
             match e.project.as_deref() {
                 // Route to the repo only for projects that are already
                 // repo-owned. A project-scoped entry for a not-yet-migrated
                 // project stays in central until an explicit eject/init opts it
                 // in — so deploying never bulk-migrates every repo at boot.
-                Some(dir) if !dir.is_empty() && project_is_repo_owned(Path::new(dir)) => {
-                    by_project.entry(PathBuf::from(dir)).or_default().push(e);
-                }
+                Some(dir) if !dir.is_empty() && project_is_repo_owned(Path::new(dir)) => {}
                 _ => central.entries.push(e.clone()),
             }
         }
-        crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
+        central
+    }
+
+    fn persist_repo_owned_entries(&self) -> Result<()> {
+        // Persistence is split by scope. The central store owns only global
+        // (non-project) entries and is written by StorePersister. Project-scoped
+        // entries for repo-owned projects stay synchronous one-file writes here.
+        let mut by_project: HashMap<PathBuf, Vec<&KnowledgeEntry>> = HashMap::new();
+        for e in &self.store.entries {
+            if let Some(dir) = e.project.as_deref()
+                && !dir.is_empty()
+                && project_is_repo_owned(Path::new(dir))
+            {
+                by_project.entry(PathBuf::from(dir)).or_default().push(e);
+            }
+        }
         // Purge only for projects whose repo entries we actually loaded (root is
         // tracked) — otherwise our in-memory set is not authoritative and
         // purging would delete committed entries that were never loaded.
@@ -994,6 +1010,13 @@ impl Knowledge {
             persist_repo_kb_entries(dir, entries, purge)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn save(&self) -> Result<()> {
+        let central = self.central_snapshot();
+        crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
+        self.persist_repo_owned_entries()
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -1099,7 +1122,7 @@ impl Knowledge {
             // this marks the project repo-owned for future writes).
             fs::create_dir_all(repo_kb_dir(Path::new(project_dir)))
                 .with_context(|| format!("creating .bbox/knowledge under {project_dir}"))?;
-            self.save()?;
+            self.persist_repo_owned_entries()?;
             Ok(count)
         })
     }
@@ -1118,7 +1141,7 @@ impl Knowledge {
                 }
             }
             if updated > 0 {
-                self.save()?;
+                self.persist_repo_owned_entries()?;
             }
             Ok(updated)
         })
@@ -1166,7 +1189,7 @@ impl Knowledge {
             if !duplicate {
                 entry.links.push(edge.clone());
                 entry.updated_at = now;
-                self.save()?;
+                self.persist_repo_owned_entries()?;
             }
             Ok(edge)
         })
@@ -1185,7 +1208,7 @@ impl Knowledge {
             } else {
                 self.store.entries.push(entry);
             }
-            self.save()
+            self.persist_repo_owned_entries()
         })
     }
 
@@ -1346,7 +1369,7 @@ impl Knowledge {
                     ));
                 }
 
-                self.save()?;
+                self.persist_repo_owned_entries()?;
                 let summary = if changes.is_empty() {
                     "no-op (all fields unchanged)".to_string()
                 } else {
@@ -1398,7 +1421,7 @@ impl Knowledge {
         };
 
         self.store.entries.push(entry);
-        self.save()?;
+        self.persist_repo_owned_entries()?;
         // Signal render-lifecycle state: entries are stored + indexed but NOT
         // automatically rendered into provider markdown (CLAUDE.md / AGENTS.md /
         // GEMINI.md). Making this explicit at the call site prevents the
@@ -1493,7 +1516,7 @@ impl Knowledge {
             last_recalled: None,
         });
 
-        self.save()?;
+        self.persist_repo_owned_entries()?;
         Ok(KnowledgeWriteResult {
             id: id.clone(),
             message: format!("Remembered entry {id} (indexed only, not rendered)"),
@@ -1595,7 +1618,7 @@ impl Knowledge {
             }
         }
 
-        self.save()?;
+        self.persist_repo_owned_entries()?;
         let message = if let Some(old_id) = p.supersedes.as_deref() {
             format!("Decided entry {id} (supersedes {old_id})")
         } else {
@@ -1627,7 +1650,7 @@ impl Knowledge {
                     entry.status = Status::Deleted;
                 }
                 entry.updated_at = Self::now_iso();
-                self.save()?;
+                self.persist_repo_owned_entries()?;
                 Ok(format!("Removed entry {id}"))
             } else {
                 Ok(format!("Entry {id} not found"))
@@ -1751,8 +1774,6 @@ impl Knowledge {
             return Ok("No entries found.".to_string());
         }
 
-        let returned_ids: Vec<String> = results.iter().map(|(e, _)| e.id.clone()).collect();
-
         let lines: Vec<String> = results
             .iter()
             .map(|(e, query_match)| {
@@ -1795,20 +1816,26 @@ impl Knowledge {
             })
             .collect();
 
-        let output = format!("{} entries:\n\n{}", results.len(), lines.join("\n\n"));
-        drop(results); // release immutable borrow
+        Ok(format!(
+            "{} entries:\n\n{}",
+            results.len(),
+            lines.join("\n\n")
+        ))
+    }
 
-        // Update recall stats (best-effort, don't fail the query)
+    pub fn record_recall(&mut self, returned_ids: &[String]) -> Result<()> {
+        if returned_ids.is_empty() {
+            return Ok(());
+        }
+        let returned_ids: BTreeSet<&str> = returned_ids.iter().map(String::as_str).collect();
         let now = Self::now_iso();
         for entry in &mut self.store.entries {
-            if returned_ids.contains(&entry.id) {
+            if returned_ids.contains(entry.id.as_str()) {
                 entry.recall_count += 1;
                 entry.last_recalled = Some(now.clone());
             }
         }
-        let _ = self.save();
-
-        Ok(output)
+        self.persist_repo_owned_entries()
     }
 
     // ── Render ─────────────────────────────────────────────────────
@@ -2309,7 +2336,7 @@ impl Knowledge {
                 if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
                     entry.approval = Approval::UserConfirmed;
                     entry.updated_at = Self::now_iso();
-                    self.save()?;
+                    self.persist_repo_owned_entries()?;
                     Ok(format!("Approved entry {}", id))
                 } else {
                     Ok(format!("Entry {} not found", id))
@@ -2320,7 +2347,7 @@ impl Knowledge {
                 if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
                     entry.status = Status::Deleted;
                     entry.updated_at = Self::now_iso();
-                    self.save()?;
+                    self.persist_repo_owned_entries()?;
                     Ok(format!("Rejected entry {}", id))
                 } else {
                     Ok(format!("Entry {} not found", id))
@@ -2674,6 +2701,9 @@ impl Knowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_persister::StorePersister;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     fn mk_kb() -> (tempfile::TempDir, Knowledge) {
         let dir = tempfile::tempdir().unwrap();
@@ -2725,6 +2755,102 @@ mod tests {
         // in memory and a reload (which correctly discards unsaved state when
         // central is absent) would drop it.
         kb.save().expect("persist seeded entry");
+    }
+
+    fn entry(id: &str, title: &str, content: &str, scope: Scope) -> KnowledgeEntry {
+        KnowledgeEntry {
+            id: id.into(),
+            title: title.into(),
+            content: content.into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope,
+            project: None,
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn central_store_round_trips_through_persister() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("kb.json");
+        let store = Arc::new(RwLock::new(Knowledge::open(&path).unwrap()));
+        let persister =
+            StorePersister::spawn("knowledge-roundtrip-test", store.clone(), path.clone());
+
+        {
+            let mut kb = store.write();
+            kb.store.entries.push(entry(
+                "central001",
+                "Central entry",
+                "central content",
+                Scope::Global,
+            ));
+        }
+        persister.request_durable().await.unwrap();
+
+        let reloaded = Knowledge::open(&path).unwrap();
+        let saved = reloaded.entry("central001").expect("central entry saved");
+        assert_eq!(saved.title, "Central entry");
+        assert_eq!(saved.content, "central content");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_persist_waits_for_reload_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("kb.json");
+        let store = Arc::new(RwLock::new(Knowledge::open(&path).unwrap()));
+        let persister = StorePersister::spawn(
+            "knowledge-reload-interleave-test",
+            store.clone(),
+            path.clone(),
+        );
+
+        let mut reload_guard = store.write();
+        reload_guard.store.entries.push(entry(
+            "reloaded001",
+            "Reloaded entry",
+            "repo reload content",
+            Scope::Global,
+        ));
+
+        let pending = {
+            let persister = persister.clone();
+            tokio::spawn(async move { persister.request_durable().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !pending.is_finished(),
+            "persist actor must wait for the active reload write lock"
+        );
+
+        drop(reload_guard);
+        pending.await.unwrap().unwrap();
+
+        let reloaded = Knowledge::open(&path).unwrap();
+        let saved = reloaded
+            .entry("reloaded001")
+            .expect("persisted snapshot should include reload result");
+        assert_eq!(saved.content, "repo reload content");
     }
 
     #[test]
@@ -3139,6 +3265,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .unwrap();
         // "Decided entry <id>"
         let old_id = r1.trim_start_matches("Decided entry ").to_string();
+        kb.save().unwrap();
 
         let r2 = kb
             .decide(
@@ -3243,7 +3370,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         );
 
         // Central store does not carry the project entry.
-        let central_raw = std::fs::read_to_string(&kb_path).unwrap();
+        let central_raw = std::fs::read_to_string(&kb_path).unwrap_or_default();
         assert!(
             !central_raw.contains(&id),
             "central kb.json must not contain project entry {id}: {central_raw}"
@@ -3453,6 +3580,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             !repo_root.join(".bbox").join("knowledge").exists(),
             "must not create repo .bbox/knowledge for a non-repo-owned project"
         );
+        kb.save().unwrap();
         assert!(
             std::fs::read_to_string(&kb_path).unwrap().contains(&id),
             "entry must stay in central until the project is repo-owned"
@@ -3469,6 +3597,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 .exists(),
             "eject should write the entry into the repo"
         );
+        kb.save().unwrap();
         assert!(
             !std::fs::read_to_string(&kb_path).unwrap().contains(&id),
             "entry should leave central after eject"
@@ -3725,6 +3854,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 .exists(),
             "ejected entry should be written into the repo"
         );
+        kb.save().unwrap();
         let central_raw = std::fs::read_to_string(&kb_path).unwrap();
         assert!(
             !central_raw.contains("legacy01"),

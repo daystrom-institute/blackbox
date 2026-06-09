@@ -36,7 +36,8 @@ const ROSTER_BROADCAST_BUFFER: usize = 1024;
 
 pub(crate) struct SharedState {
     pub(crate) idx: RwLock<TranscriptIndex>,
-    pub(crate) kb: RwLock<Knowledge>,
+    pub(crate) kb: Arc<RwLock<Knowledge>>,
+    pub(crate) kb_persister: StorePersister<Knowledge>,
     /// First-class substrate gap-note store. Project-scoped gaps are repo-owned
     /// (one file per gap under `<project>/.bbox/gaps/`); global gaps live in the
     /// central host store. Mirrors the `kb` repo-owned model.
@@ -337,7 +338,8 @@ impl SharedState {
         // Load committed `.bbox/knowledge/` for every registered project into
         // the knowledge query surface at startup (project durable knowledge is
         // repo-owned; the central store holds only global entries).
-        let mut kb = Knowledge::open(&store_dir.join("kb.json")).unwrap();
+        let kb_path = store_dir.join("kb.json");
+        let mut kb = Knowledge::open(&kb_path).unwrap();
         let kb_project_roots: Vec<std::path::PathBuf> =
             ProjectRegistry::load_records(store_dir.join("projects.json"))
                 .unwrap_or_default()
@@ -345,6 +347,8 @@ impl SharedState {
                 .map(|r| std::path::PathBuf::from(r.canonical_path))
                 .collect();
         kb.set_project_roots(kb_project_roots.clone()).unwrap();
+        let kb_store = Arc::new(RwLock::new(kb));
+        let kb_persister = StorePersister::spawn("knowledge-test", kb_store.clone(), kb_path);
         // Gap store mirrors the kb repo-owned model: load every registered
         // project's committed `.bbox/gaps/` into the query surface at startup.
         let mut gaps = GapStore::open(&store_dir.join("blackbox-gaps.json")).unwrap();
@@ -375,7 +379,8 @@ impl SharedState {
 
         SharedState {
             idx: RwLock::new(idx),
-            kb: RwLock::new(kb),
+            kb: kb_store,
+            kb_persister,
             gaps: RwLock::new(gaps),
             roadmap: roadmap_store,
             roadmap_persister,

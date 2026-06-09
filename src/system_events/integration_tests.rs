@@ -36,7 +36,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         tmp.path().join("roadmap.json"),
     )
     .unwrap();
-    let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
+    let kb_path = tmp.path().join("knowledge.json");
+    let kb = Arc::new(RwLock::new(Knowledge::open(&kb_path).unwrap()));
+    let kb_persister = StorePersister::spawn("knowledge-test", kb.clone(), kb_path);
     let gaps = crate::gaps::GapStore::open(&tmp.path().join("gaps.json")).unwrap();
     let threads_path = tmp.path().join("threads.json");
     let threads = Arc::new(RwLock::new(Threads::open(&threads_path).unwrap()));
@@ -63,7 +65,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(16);
     let state = Arc::new(SharedState {
         idx: RwLock::new(index),
-        kb: RwLock::new(kb),
+        kb,
+        kb_persister,
         gaps: RwLock::new(gaps),
         roadmap: roadmap_store,
         roadmap_persister,

@@ -2135,6 +2135,10 @@ pub(crate) fn migrate_project_refs(
         .kb
         .write()
         .rename_project_refs(old_project, new_project)?;
+    if knowledge > 0 {
+        // This sync migration helper cannot await; knowledge persistence is write-behind here.
+        state.kb_persister.request();
+    }
     let threads = state
         .threads
         .write()

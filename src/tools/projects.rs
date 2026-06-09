@@ -471,11 +471,12 @@ impl BlackboxServer {
         name = "bbox_project_eject",
         description = "Migrate a registered project's central-store knowledge entries into the repo's committed .bbox/knowledge/ (one file per entry), so the project's durable knowledge travels with the checkout. Accepts project (project_id, registered canonical_path, or absolute path) and optional dry_run. Entries are written without the absolute project path (location encodes scope) and dropped from the central store. dry_run=true reports the count without writing. Commit the resulting .bbox/ files to publish them."
     )]
-    pub(crate) fn bbox_project_eject(
+    pub(crate) async fn bbox_project_eject(
         &self,
         Parameters(p): Parameters<ProjectEjectParams>,
     ) -> CallToolResult {
-        Self::run("bbox_project_eject", || {
+        let start = std::time::Instant::now();
+        let result = (|| {
             let record = self
                 .state
                 .projects
@@ -495,19 +496,47 @@ impl BlackboxServer {
                 self.state.kb.write().eject_project_to_repo(&dir)?
             };
 
-            Ok(serde_json::to_string_pretty(&json!({
-                "status": if dry_run { "dry_run" } else { "ok" },
-                "project_id": record.project_id,
-                "canonical_path": dir,
-                "entries": entries,
-                "target": format!("{}/.bbox/knowledge", dir),
-                "detail": if dry_run {
-                    "preview only; re-run without dry_run to write repo files and drop central copies"
-                } else {
-                    "written to repo .bbox/knowledge/ and removed from central store; commit the files to publish"
-                },
-            }))?)
-        })
+            Ok::<_, anyhow::Error>((record, dir, dry_run, entries))
+        })();
+
+        match result {
+            Ok((record, dir, dry_run, entries)) => {
+                if !dry_run && let Err(e) = self.state.kb_persister.request_durable().await {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %e, "err");
+                    return Self::err_text(&format!("Error: {e:#}"));
+                }
+                match serde_json::to_string_pretty(&json!({
+                    "status": if dry_run { "dry_run" } else { "ok" },
+                    "project_id": record.project_id,
+                    "canonical_path": dir,
+                    "entries": entries,
+                    "target": format!("{}/.bbox/knowledge", dir),
+                    "detail": if dry_run {
+                        "preview only; re-run without dry_run to write repo files and drop central copies"
+                    } else {
+                        "written to repo .bbox/knowledge/ and removed from central store; commit the files to publish"
+                    },
+                })) {
+                    Ok(text) => {
+                        let ms = start.elapsed().as_secs_f64() * 1000.0;
+                        tracing::info!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, bytes = text.len(), "ok");
+                        Self::ok_text(&text)
+                    }
+                    Err(e) => {
+                        let err = anyhow::Error::new(e);
+                        let ms = start.elapsed().as_secs_f64() * 1000.0;
+                        tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %err, "err");
+                        Self::err_text(&format!("Error: {err:#}"))
+                    }
+                }
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(

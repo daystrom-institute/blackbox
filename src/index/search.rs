@@ -1667,6 +1667,14 @@ mod agentic_project_file_tests {
                 false,
             )
             .unwrap();
+        crate::json_store::atomic_write_json_locked(
+            &knowledge_path,
+            &<crate::knowledge::Knowledge as crate::store_persister::StoreSnapshot>::snapshot(
+                &knowledge,
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),

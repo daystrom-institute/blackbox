@@ -295,6 +295,12 @@ mod tests {
         {
             let mut reg = crate::projects::ProjectRegistry::open(&projects_path).unwrap();
             reg.register_path(&repo_root).unwrap();
+            crate::json_store::atomic_write_json_locked(
+                &projects_path,
+                &<crate::projects::ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&reg)
+                    .unwrap(),
+            )
+            .unwrap();
         }
 
         let (schema, fields) = crate::index::build_schema();

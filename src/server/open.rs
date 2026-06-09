@@ -90,7 +90,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
             tracing::warn!("kb project-root load at startup: {e:#}");
         }
     }
-    sync_tool_docs(&mut kb);
+    let tool_docs_synced = sync_tool_docs(&mut kb);
 
     // Gap store mirrors the kb repo-owned model. Load every registered repo's
     // committed `.bbox/gaps/` into the query surface BEFORE any producer
@@ -112,6 +112,13 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     }
     load_system_memory_catalog(&cfg)?;
     configure_dispatch_mcp_env(&cfg);
+
+    let kb_store = Arc::new(RwLock::new(kb));
+    let kb_persister = StorePersister::spawn("knowledge", kb_store.clone(), kb_path.clone());
+    if tool_docs_synced {
+        // Startup sync is synchronous setup; central knowledge persistence is write-behind here.
+        kb_persister.request();
+    }
 
     let th = Threads::open(&th_path)?;
     tracing::info!("Thread store: {}", th_path.display());
@@ -182,7 +189,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let edge_index = build_startup_edge_index(
         &cfg,
         &idx,
-        &kb,
+        &kb_store.read(),
         &threads_store.read(),
         &notes_store.read(),
         &task_store,
@@ -193,7 +200,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
 
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
-        kb: RwLock::new(kb),
+        kb: kb_store,
+        kb_persister,
         gaps: RwLock::new(gaps_store),
         roadmap: roadmap_store,
         roadmap_persister,
@@ -282,11 +290,20 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     })
 }
 
-fn sync_tool_docs(kb: &mut Knowledge) {
+fn sync_tool_docs(kb: &mut Knowledge) -> bool {
     match tool_docs::sync_into_knowledge(kb) {
-        Ok(r) if r.wrote => tracing::info!("Tool reference synced ({} bytes)", r.bytes),
-        Ok(_) => tracing::debug!("Tool reference already up to date"),
-        Err(e) => tracing::warn!("Tool reference sync failed: {e:#}"),
+        Ok(r) if r.wrote => {
+            tracing::info!("Tool reference synced ({} bytes)", r.bytes);
+            true
+        }
+        Ok(_) => {
+            tracing::debug!("Tool reference already up to date");
+            false
+        }
+        Err(e) => {
+            tracing::warn!("Tool reference sync failed: {e:#}");
+            false
+        }
     }
 }
 
