@@ -100,7 +100,38 @@ pub fn bundle_evidence(
         &unresolved_entity_refs,
     );
     let property_mode = PropertyMode::from_param(p.property_mode.as_deref());
-    Ok(serde_json::to_string_pretty(&json!({
+    // Build `degraded` from only the signal-bearing facts. A clean bundle —
+    // nothing stale, nothing unresolved, nothing omitted or truncated, full
+    // property mode — degraded to nothing, so the whole block is dropped rather
+    // than emitting `{stale_path_ids: [], omitted_entity_refs: 0, ...}` padding
+    // on every healthy response. property_mode is surfaced only when it altered
+    // the payload (summary/none); "full" is the no-op default a reader assumes.
+    let mut degraded = serde_json::Map::new();
+    if !stale_path_ids.is_empty() {
+        degraded.insert("stale_path_ids".into(), json!(stale_path_ids));
+    }
+    if !unresolved_entity_refs.is_empty() {
+        degraded.insert(
+            "unresolved_entity_refs".into(),
+            json!(unresolved_entity_refs),
+        );
+    }
+    if omitted_entity_refs > 0 {
+        degraded.insert("omitted_entity_refs".into(), json!(omitted_entity_refs));
+    }
+    if omitted_path_ids > 0 {
+        degraded.insert("omitted_path_ids".into(), json!(omitted_path_ids));
+    }
+    if intra_bundle_edges_truncated {
+        degraded.insert("intra_bundle_edges_truncated".into(), json!(true));
+    }
+    if intra_bundle_convergences_truncated {
+        degraded.insert("intra_bundle_convergences_truncated".into(), json!(true));
+    }
+    if property_mode != PropertyMode::Full {
+        degraded.insert("property_mode".into(), json!(property_mode.as_str()));
+    }
+    let mut out = json!({
         "status": "ok",
         "text": text,
         "question": p.question,
@@ -114,18 +145,20 @@ pub fn bundle_evidence(
             "summary": render_path(ctx, path),
             "steps": path.steps,
         })).collect::<Vec<_>>(),
-        "intra_bundle_edges": intra_bundle_edges,
-        "intra_bundle_convergences": intra_bundle_convergences,
-        "degraded": {
-            "stale_path_ids": stale_path_ids,
-            "unresolved_entity_refs": unresolved_entity_refs,
-            "omitted_entity_refs": omitted_entity_refs,
-            "omitted_path_ids": omitted_path_ids,
-            "intra_bundle_edges_truncated": intra_bundle_edges_truncated,
-            "intra_bundle_convergences_truncated": intra_bundle_convergences_truncated,
-            "property_mode": property_mode.as_str(),
-        }
-    }))?)
+    });
+    // Intra-bundle structure is the exception, not the rule — most bundles have
+    // none. Emit these arrays only when non-empty so the common case doesn't
+    // carry two empty lists.
+    if !intra_bundle_edges.is_empty() {
+        out["intra_bundle_edges"] = json!(intra_bundle_edges);
+    }
+    if !intra_bundle_convergences.is_empty() {
+        out["intra_bundle_convergences"] = json!(intra_bundle_convergences);
+    }
+    if !degraded.is_empty() {
+        out["degraded"] = Value::Object(degraded);
+    }
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +443,39 @@ mod tests {
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["status"], "error.not_found");
+    }
+
+    #[test]
+    fn clean_bundle_omits_degraded_and_empty_intra_arrays() {
+        // A single resolvable ref, full property mode, no paths: nothing
+        // degraded and no intra-bundle structure. The padding blocks should
+        // be absent entirely.
+        crate::system_memory::init_for_tests();
+        let params = BundleEvidenceParams {
+            question: "what is the opening sequence?".into(),
+            entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
+            path_ids: Vec::new(),
+            property_mode: None,
+        };
+        let rendered = bundle_evidence(
+            &params,
+            &ProviderContext::empty_for_tests(),
+            &EdgeIndex::default(),
+            &mut PathCache::default(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["status"], "ok");
+        for absent in [
+            "degraded",
+            "intra_bundle_edges",
+            "intra_bundle_convergences",
+        ] {
+            assert!(
+                value.get(absent).is_none(),
+                "clean bundle should omit {absent}: {value}"
+            );
+        }
     }
 
     #[test]

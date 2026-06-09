@@ -58,8 +58,10 @@ impl PropertyMode {
 struct RenderedEdge {
     kind: String,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     source_label: Option<String>,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target_label: Option<String>,
     direction: String,
 }
