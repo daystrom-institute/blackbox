@@ -31,8 +31,10 @@ an agent is told to read.
 |--------|------------------------------|
 | [daily-boot-sequence.md](daily-boot-sequence.md) | Daily conductor: clean → survey residuals/net-news → process gaps → refine & process the TODO list → closeout. Sequences the other daily prompts; owns the TODO-refinement loop + closeout. |
 | [daily-cleaning.md](daily-cleaning.md) | Start-of-day environment reset: sync main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall prod daemon/bro/bro-harness, restart prod service (gated). |
+| [daily-cleaning-beta.md](daily-cleaning-beta.md) | Beta-line sibling of daily-cleaning.md: same reset, but tracks `beta/blackbox-v2` as the integration branch (sync + landing checks against beta) instead of `main`. |
 | [gap-processing.md](gap-processing.md) | Launch the gap-processing **workflow** (`bro_orchestrate_run`): Cluster (codex) → foreach `atom_invoke` validators (deepseek) → Sieve (codex). Present grouped/sorted action lists; resolve operator-gated one at a time. |
 | [CLOSEOUT.md](CLOSEOUT.md) | Fold a worktree back into `main`: commit, ff-only merge, push, clean up. |
+| [CLOSEOUT-beta.md](CLOSEOUT-beta.md) | Beta-line sibling of CLOSEOUT.md: fold a worktree into `beta/blackbox-v2` instead of `main`. |
 | [DOC_REVIEW.md](DOC_REVIEW.md) | Dispatch the 5-lens `blackbox-review` ensemble against a design doc. |
 | [RETRO_INTERACTIVE.md](RETRO_INTERACTIVE.md) | End-of-session retro for a **live interactive** agent (tools, MCP, instructions, operator steering). Files gaps + follow-up notes. |
 | [RETRO_HARNESS.md](RETRO_HARNESS.md) | End-of-session retro for a **`bro fleet` / bro-harness** session (built-in tools, injected context, intern, turn machinery). Files gaps. |
