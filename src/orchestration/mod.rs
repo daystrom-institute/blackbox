@@ -348,6 +348,10 @@ pub struct TaskInner {
     /// tasks (workflow implementer, single-bro advisor) still surface
     /// in `bro tail` with a name instead of being anonymous.
     pub bro_label: Option<String>,
+    /// Daemon-owned display name for the roster/cockpit. Defaults from the
+    /// first user prompt for fresh dispatches and is independent of bro_label,
+    /// which still carries bro/team identity.
+    pub name: Option<String>,
     /// Agent attribution set by bro_agent_dispatch. Format:
     /// `agent:<name>@v<version>`. Preserved even when record_task_to_bro
     /// overwrites bro_label for team routing. Surfaced in bro_status /
@@ -492,6 +496,11 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         cwd: inner.cwd.clone(),
         managed_worktree: inner.managed_worktree.clone(),
         label: inner.bro_label.clone().or_else(|| inner.agent_label.clone()),
+        name: inner
+            .name
+            .clone()
+            .or_else(|| inner.bro_label.clone())
+            .or_else(|| inner.agent_label.clone()),
         session_id: (!inner.session_id.is_empty())
             .then(|| bro_core::SessionId::new(inner.session_id.clone())),
         last_message_snippet: inner
@@ -499,6 +508,7 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .as_deref()
             .map(|s| s.chars().take(200).collect::<String>()),
         model: inner.model.clone(),
+        report: inner.report.as_ref().and_then(roster_report_teaser),
         last_event_at: Some(last_event_at),
         origin: inner.origin,
         workflow_owned: inner.workflow_owned,
@@ -517,9 +527,56 @@ fn model_from_events_at_load(events: &[serde_json::Value]) -> Option<String> {
     events.iter().find_map(model_from_event)
 }
 
+const DEFAULT_TASK_NAME_CHARS: usize = 60;
+const ROSTER_REPORT_TEASER_CHARS: usize = 80;
+
 fn update_model_cache_from_event(inner: &mut TaskInner, event: &serde_json::Value) {
     if inner.model.is_none() {
         inner.model = model_from_event(event);
+    }
+}
+
+fn compact_teaser(raw: &str, max_chars: usize) -> Option<String> {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        None
+    } else {
+        Some(compact.chars().take(max_chars).collect())
+    }
+}
+
+pub(crate) fn default_task_name_from_prompt(prompt: &str) -> Option<String> {
+    compact_teaser(prompt, DEFAULT_TASK_NAME_CHARS)
+}
+
+fn roster_report_teaser(report: &BroReport) -> Option<String> {
+    compact_teaser(&report.message, ROSTER_REPORT_TEASER_CHARS)
+}
+
+pub(crate) fn seed_task_roster_fields(
+    task: &Task,
+    name: Option<String>,
+    model: Option<String>,
+    task_store: &RwLock<TaskStore>,
+    store_dir: &std::path::Path,
+) {
+    let mut changed = false;
+    {
+        let mut inner = task.inner.lock();
+        if inner.name.is_none()
+            && let Some(name) = name.and_then(|name| compact_teaser(&name, DEFAULT_TASK_NAME_CHARS))
+        {
+            inner.name = Some(name);
+            changed = true;
+        }
+        if inner.model.is_none() && model.is_some() {
+            inner.model = model;
+            changed = true;
+        }
+    }
+    if changed {
+        task.emit_roster_updated();
+        request_persist(task_store, store_dir);
     }
 }
 
@@ -551,6 +608,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             cwd: None,
             managed_worktree: None,
             bro_label: None,
+            name: None,
             agent_label: None,
             report: None,
             recoverable: false,
@@ -683,6 +741,8 @@ struct PersistedTask {
     #[serde(default)]
     bro_label: Option<String>,
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     agent_label: Option<String>,
     #[serde(default)]
     report: Option<BroReport>,
@@ -774,6 +834,7 @@ impl TaskStore {
                     cwd: inner.cwd.clone(),
                     managed_worktree: inner.managed_worktree.clone(),
                     bro_label: inner.bro_label.clone(),
+                    name: inner.name.clone(),
                     agent_label: inner.agent_label.clone(),
                     report: inner.report.clone(),
                     recoverable: inner.recoverable,
@@ -851,6 +912,7 @@ impl TaskStore {
                     cwd: rec.cwd,
                     managed_worktree: rec.managed_worktree,
                     bro_label: rec.bro_label,
+                    name: rec.name,
                     agent_label: rec.agent_label,
                     report: rec.report,
                     recoverable: rec.recoverable,
@@ -1448,6 +1510,7 @@ fn failed_duplicate_task(
             managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             cwd,
             bro_label,
+            name: None,
             agent_label,
             report: None,
             recoverable: false,
@@ -1522,6 +1585,7 @@ pub fn spawn_in_process_task(
             managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             cwd,
             bro_label,
+            name: None,
             agent_label,
             report: None,
             recoverable: false,
@@ -2416,6 +2480,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
                     cwd,
                     bro_label: bro_label.clone(),
+                    name: None,
                     agent_label: agent_label.clone(),
                     report: None,
                     recoverable: false,
@@ -2473,6 +2538,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             cwd: cwd.clone(),
             managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
             bro_label,
+            name: None,
             agent_label,
             report: None,
             recoverable: false,
@@ -3780,6 +3846,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_name_defaults_from_prompt_teaser_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let task_store = RwLock::new(TaskStore::new());
+        let prompt = "Inspect the daemon roster regression and restore the model report name columns";
+        let expected = default_task_name_from_prompt(prompt).unwrap();
+        assert_eq!(expected.chars().count(), DEFAULT_TASK_NAME_CHARS);
+
+        let task = test_task("task-name", TaskStatus::Completed, Provider::Brodex);
+        task_store
+            .write()
+            .insert("task-name".to_string(), task.clone())
+            .unwrap();
+        seed_task_roster_fields(
+            &task,
+            default_task_name_from_prompt(prompt),
+            None,
+            &task_store,
+            &root,
+        );
+        assert_eq!(task.inner.lock().name.as_deref(), Some(expected.as_str()));
+        assert_eq!(roster_summary_from_task(&task).name.as_deref(), Some(expected.as_str()));
+
+        task_store.read().persist(&root);
+        let loaded = TaskStore::load(&root, u64::MAX);
+        let loaded_task = loaded.get("task-name").expect("task should load");
+        assert_eq!(loaded_task.inner.lock().name.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            roster_summary_from_task(&loaded_task).name.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn dispatch_model_cache_wins_over_event_scrape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let task_store = RwLock::new(TaskStore::new());
+        let task = test_task("task-dispatch-model", TaskStatus::Completed, Provider::Brodex);
+        task_store
+            .write()
+            .insert("task-dispatch-model".to_string(), task.clone())
+            .unwrap();
+        seed_task_roster_fields(
+            &task,
+            None,
+            Some("dispatch-model".to_string()),
+            &task_store,
+            &root,
+        );
+
+        push_in_process_event(
+            &task,
+            serde_json::json!({"message": {"model": "event-model"}}),
+        );
+        assert_eq!(task.inner.lock().model.as_deref(), Some("dispatch-model"));
+        assert_eq!(
+            roster_summary_from_task(&task).model.as_deref(),
+            Some("dispatch-model")
+        );
+    }
+
+    #[test]
+    fn roster_summary_projects_report_teaser() {
+        let task = test_task("task-report", TaskStatus::Running, Provider::Brodex);
+        {
+            let mut inner = task.inner.lock();
+            inner.report = Some(BroReport {
+                message: "Working through the daemon roster regression and checking the report teaser projection stays bounded".to_string(),
+                needs: None,
+                data: None,
+                reported_at: now_ms(),
+            });
+        }
+
+        let report = roster_summary_from_task(&task)
+            .report
+            .expect("report teaser should be projected");
+        assert_eq!(report.chars().count(), ROSTER_REPORT_TEASER_CHARS);
+        assert!(report.starts_with("Working through the daemon roster regression"));
+    }
+
     fn task_with(status: TaskStatus, stderr: &str, events: Vec<Value>) -> Task {
         Task {
             inner: Mutex::new(TaskInner {
@@ -3800,6 +3949,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4130,6 +4280,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4163,6 +4314,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4214,6 +4366,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4266,6 +4419,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4662,6 +4816,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4756,6 +4911,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4805,6 +4961,7 @@ mod tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -4856,6 +5013,7 @@ mod tests {
             cwd: None,
             managed_worktree: None,
             bro_label: None,
+            name: None,
             agent_label: None,
             report: None,
             recoverable: false,
@@ -4909,6 +5067,7 @@ mod tests {
             cwd: None,
             managed_worktree: None,
             bro_label: None,
+            name: None,
             agent_label: None,
             report: None,
             recoverable: false,
@@ -4974,6 +5133,7 @@ mod tests {
             cwd: Some("/repo/base".into()),
             managed_worktree: None,
             bro_label: None,
+            name: None,
             agent_label: None,
             report: None,
             recoverable: false,
@@ -5027,6 +5187,7 @@ mod tests {
             cwd: Some("/repo/.bro-fleet-worktrees/wt".into()),
             managed_worktree: None,
             bro_label: None,
+            name: None,
             agent_label: None,
             report: None,
             recoverable: false,
@@ -5083,6 +5244,7 @@ mod async_tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -5122,6 +5284,7 @@ mod async_tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -5167,6 +5330,7 @@ mod async_tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -5208,6 +5372,7 @@ mod async_tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,
@@ -5261,6 +5426,7 @@ mod async_tests {
                 cwd: None,
                 managed_worktree: None,
                 bro_label: None,
+                name: None,
                 agent_label: None,
                 report: None,
                 recoverable: false,

@@ -80,11 +80,12 @@ pub struct TaskSnapshot {
 ///   `label` / `session_id` / `last_message_snippet` are all already
 ///   on `TaskInner`; the daemon reads them under the per-task lock
 ///   and projects directly.
-/// - `model` is **best-effort derived** by scanning the task's
-///   recorded event buffer for the first `event.model` or
-///   `event.message.model` key. The fleet client uses the same scan
-///   (crates/bro-fleet-client/src/fleet.rs:1355-1363). May be `None`
-///   for tasks that never emitted a model-bearing event.
+/// - `name` is the daemon-owned display name. Fresh dispatch defaults it
+///   from the first user prompt; later rename flows may overwrite it.
+/// - `model` is the resolved dispatch model persisted on `TaskInner`, with
+///   event-buffer scraping retained only as a load-time fallback for legacy
+///   tasks that predate the dispatch-time cache.
+/// - `report` is a bounded teaser of the latest `bro_report` message.
 /// - `last_event_at` is **not** a stored field — the daemon has no
 ///   per-event arrival stamp on V1. The handler derives it from
 ///   `max(started_at, completed_at)` (the only wall-clock fields on
@@ -100,9 +101,13 @@ pub struct RosterSummaryV1 {
     pub turns: Option<u64>,
     pub cwd: Option<String>,
     pub label: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
     pub session_id: Option<SessionId>,
     pub last_message_snippet: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub report: Option<String>,
     pub last_event_at: Option<u64>,
     /// Source of the dispatch (Slice 1b). Lets the fleet roster tab Fleet
     /// vs Dispatched vs Workflow vs Atom without re-deriving from labels.
@@ -222,9 +227,11 @@ mod tests {
             cwd: Some("/tmp/repo".to_string()),
             managed_worktree: Some("/tmp/repo".to_string()),
             label: Some("team-x::member-y".to_string()),
+            name: Some("Inspect the failing roster columns".to_string()),
             session_id: Some(SessionId::new("sess-1")),
             last_message_snippet: Some("Looking at the file…".to_string()),
             model: Some("claude-opus-4-6".to_string()),
+            report: Some("Reading roster state".to_string()),
             last_event_at: Some(1_700_000_000_000),
             origin: Origin::AgentDispatch,
             workflow_owned: false,
@@ -242,9 +249,11 @@ mod tests {
             "cwd",
             "managed_worktree",
             "label",
+            "name",
             "session_id",
             "last_message_snippet",
             "model",
+            "report",
             "last_event_at",
             "origin",
             "workflow_owned",

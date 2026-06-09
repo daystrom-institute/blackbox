@@ -30,6 +30,7 @@ pub struct TaskInner {
     pub session_id: String,
     pub events: Vec<Value>,
     pub last_assistant_message: Option<String>,
+    pub report_message: Option<String>,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
     pub stderr: String,
@@ -166,6 +167,7 @@ fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
                 .unwrap_or_else(|| "pending".to_string()),
             events: Vec::new(),
             last_assistant_message: task.last_message_snippet,
+            report_message: task.report,
             cost_usd: task.cost,
             num_turns: task.turns,
             stderr: String::new(),
@@ -173,7 +175,7 @@ fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
             started_at: task.last_event_at.unwrap_or(now),
             completed_at,
             cwd: task.cwd,
-            bro_label: task.label,
+            bro_label: task.name.or(task.label),
             recoverable: false,
             last_event_at_ms: task.last_event_at,
             model: task.model,
@@ -194,6 +196,7 @@ fn update_task_from_roster(existing: &Task, task: RosterSummaryV1) {
         .map(|id| id.as_str().to_string())
         .unwrap_or_else(|| "pending".to_string());
     inner.last_assistant_message = task.last_message_snippet;
+    inner.report_message = task.report;
     inner.cost_usd = task.cost;
     inner.num_turns = task.turns;
     inner.status = task.status;
@@ -202,7 +205,7 @@ fn update_task_from_roster(existing: &Task, task: RosterSummaryV1) {
     }
     inner.completed_at = task.status.is_terminal().then_some(task.last_event_at.unwrap_or_else(now_ms));
     inner.cwd = task.cwd;
-    inner.bro_label = task.label;
+    inner.bro_label = task.name.or(task.label);
     inner.recoverable = false;
     inner.last_event_at_ms = task.last_event_at;
     inner.model = task.model;
@@ -227,9 +230,11 @@ mod tests {
             turns: Some(3),
             cwd: Some("/tmp/project".to_string()),
             label: Some(format!("agent-{id}")),
+            name: Some(format!("Prompt teaser {id}")),
             session_id: None,
             last_message_snippet: Some("hello".to_string()),
             model: Some("gpt-test".to_string()),
+            report: Some("checking roster".to_string()),
             last_event_at: Some(42),
             origin: Origin::Cockpit,
             managed_worktree: Some("/tmp/worktree".to_string()),

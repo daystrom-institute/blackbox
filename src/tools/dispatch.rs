@@ -335,6 +335,12 @@ impl BlackboxServer {
             request.exec_opts = Some(o);
         }
 
+        let dispatch_model = request.exec_opts.as_ref().and_then(|opts| opts.model.clone());
+        let default_name = request
+            .spawn_bro_label
+            .clone()
+            .or_else(|| orch::default_task_name_from_prompt(&request.prompt));
+
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
         let ambient_ctx = orch::AmbientContext {
@@ -402,6 +408,13 @@ impl BlackboxServer {
             request.tool_placement,
             Some(self.state.system_events.clone()),
             request.origin,
+        );
+        orch::seed_task_roster_fields(
+            &task,
+            default_name,
+            dispatch_model,
+            &self.state.task_store,
+            &store_dir,
         );
         if let Some(allocation) = &allocation {
             let (task_id, session_id, cwd) = {

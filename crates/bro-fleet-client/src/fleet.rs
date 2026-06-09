@@ -526,9 +526,9 @@ impl AgentHandle {
             provider: inner.provider,
             session_id: inner.session_id.clone(),
             last_assistant_message: inner.last_assistant_message.clone(),
-            // The harness `report` line. (The daemon BroReport fallback that
-            // existed in-process never populated for fleet agents.)
-            report_message: stream.report_message,
+            // Prefer a live harness `report` line when events are present; daemon
+            // roster rows provide the persisted BroReport teaser for thin views.
+            report_message: stream.report_message.or_else(|| inner.report_message.clone()),
             needs_input: stream.needs_input,
             turn_active: stream.turn_active,
             worktree_finished: stream.worktree_finished,
@@ -1337,6 +1337,7 @@ fn daemon_task(
             session_id,
             events: Vec::new(),
             last_assistant_message: None,
+            report_message: None,
             cost_usd: None,
             num_turns: None,
             stderr,
@@ -2440,9 +2441,11 @@ mod tests {
             turns: Some(3),
             cwd: Some("/tmp/project".to_string()),
             label: Some(format!("agent-{id}")),
+            name: Some(format!("Prompt teaser {id}")),
             session_id: Some(bro_core::SessionId::new(format!("session-{id}"))),
             last_message_snippet: Some("hello".to_string()),
             model: Some("gpt-test".to_string()),
+            report: Some("checking roster".to_string()),
             last_event_at: Some(42),
             origin: bro_core::Origin::Cockpit,
             managed_worktree: Some("/tmp/worktree".to_string()),
@@ -2479,6 +2482,23 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("missing mock roster snapshot"))
             })
         }
+    }
+
+    #[test]
+    fn roster_summary_fields_reach_snapshot() {
+        let mut store = TaskStore::new();
+        let snapshot = RosterSnapshotV1 {
+            version: 1,
+            tasks: vec![roster_summary("task-1", TaskStatus::Running)],
+        };
+        store.replace_from_snapshot(snapshot);
+        let task = store.all_tasks().pop().unwrap();
+        let handle = AgentHandle { task, daemon: None };
+        let snap = handle.snapshot();
+
+        assert_eq!(snap.name.as_deref(), Some("Prompt teaser task-1"));
+        assert_eq!(snap.model.as_deref(), Some("gpt-test"));
+        assert_eq!(snap.report_message.as_deref(), Some("checking roster"));
     }
 
     #[tokio::test]
