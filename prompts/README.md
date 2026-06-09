@@ -30,6 +30,7 @@ an agent is told to read.
 | Prompt | When to point an agent at it |
 |--------|------------------------------|
 | [daily-boot-sequence.md](daily-boot-sequence.md) | Daily conductor: clean → survey residuals/net-news → process gaps → refine & process the TODO list → closeout. Sequences the other daily prompts; owns the TODO-refinement loop + closeout. |
+| [dogfood-orchestration.md](dogfood-orchestration.md) | Three-layer track-based work loop: a top-level interactive orchestrator owns 1..n tracks, dispatches one driver bro per track to drive `bro fleet` and surface the pain, and negotiates each tranche WITH the drivers (they feel the friction; the orchestrator de-dupes/synthesizes across tracks). Driver lens: [agents/DOGFOOD_DRIVER.md](agents/DOGFOOD_DRIVER.md). |
 | [daily-cleaning.md](daily-cleaning.md) | Start-of-day environment reset: sync main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall prod daemon/bro/bro-harness, restart prod service (gated). |
 | [daily-cleaning-beta.md](daily-cleaning-beta.md) | Beta-line sibling of daily-cleaning.md: same reset, but tracks `beta/blackbox-v2` as the integration branch (sync + landing checks against beta) instead of `main`. |
 | [gap-processing.md](gap-processing.md) | Launch the gap-processing **workflow** (`bro_orchestrate_run`): Cluster (codex) → foreach `atom_invoke` validators (deepseek) → Sieve (codex). Present grouped/sorted action lists; resolve operator-gated one at a time. |
