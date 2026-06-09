@@ -1,0 +1,22 @@
+{
+  "id": "gap-a4e13310",
+  "title": "bbox_note_resolve has no batch mode and rewrites the entire note store on every single-id call",
+  "gap_kind": "mcp_surface",
+  "domain": "notes",
+  "wanted_capability": "A batch bbox_note_resolve (resolve N note ids in one call: one lock acquisition, one mutation pass, one persist) AND a fix for the per-call cost. Today resolving M notes requires M separate MCP calls, and each one is slow because NoteStore::save (src/notes.rs:221) calls json_store::atomic_write_json_locked — a full serialize of the ENTIRE note store to a temp file + fsync + rename, under a cross-process file lock. So resolving 40 notes = 40 full-store rewrites serialized on the lock. Same blocking-fs-on-write-under-lock pattern the threads already fixed for the task store via the single-writer TaskPersister actor.</wanted_capability>\n<parameter name=\"missing_primitive\">A batch-resolve param on bbox_note_resolve (ids: [..]) that mutates once and saves once; and/or moving the note-store persist to the coalesced single-writer actor pattern (like TaskPersister) so per-note writes don't each rewrite the whole file under the lock.",
+  "fallback_used": "Resolved 40 driver notes via 40 sequential single-id bbox_note_resolve calls; operator observed each is slow (full-store atomic rewrite per call).",
+  "evidence": [
+    "src/notes.rs:221",
+    "src/notes.rs:329",
+    "src/notes.rs:337",
+    "thread-c38e005d"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/notes/note-resolve-batch-and-per-call-rewrite",
+  "notes": "Operator-directed: \"bbox_note_resolve is still slow ... probably needs a batch mode + root causing.\" Root cause = full-store atomic_write_json_locked per resolve. Surfaced while cleaning up a 40-note storm (see the nudge-compulsion gap).",
+  "resolution": "unresolved",
+  "thread_id": "thread-c38e005d",
+  "created_at": "2026-06-09T07:26:41Z",
+  "updated_at": "2026-06-09T07:26:41Z"
+}
