@@ -3,6 +3,10 @@
 
 ## Conventions
 
+**Fleet/worktree dispatch env is project/language-agnostic (no hardcoded build env)**
+
+Fleet/worktree dispatch env is project/language-agnostic. The `bro fleet` cockpit dispatch path must not hardcode any language-specific build env (no shared `CARGO_TARGET_DIR` — each worktree uses its own `target/`, so concurrent builds don't serialize on cargo's build lock). Per-project build/dispatch config lives in `fleet.json`: `project_dispatch` (opt-in dispatch env, e.g. `RUSTC_WRAPPER=sccache`, best-effort load) and `project_closeout` (fold target/prefixes/`closeout_hooks`, strict-loaded so a typo fails `/closeout` loudly). sccache setup is documented in `docs/developing-blackbox.md`. Closeout hooks are a general lifecycle surface — worktree removal already auto-reclaims per-worktree targets, so they are not a Rust-disk reclaim mechanism. Supersedes the retired "Share CARGO_TARGET_DIR across worktrees" convention.
+
 **Multiple agents operate concurrently across worktrees — only touch files you changed**
 
 Multiple agents operate concurrently in this repo — the main worktree plus additional git/Claude worktrees — against shared working state. Treat the working tree as multi-tenant: only stage, commit, discard, restore, or stash files that THIS session changed. Files you didn't touch may carry a peer agent's uncommitted edits.
