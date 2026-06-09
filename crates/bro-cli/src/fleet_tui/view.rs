@@ -32,17 +32,18 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
         draw_config_body(f, chunks[0], app);
-        let bottom_title = Some(Line::from(roster_status_spans(app, &views)));
+        let bottom_title = Some(Line::from(roster_status_spans(app, &views, &order)));
         draw_composer(f, chunks[1], app, None, bottom_title);
     } else {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
-        draw_roster_body(f, chunks[0], app, &views, &order);
+        let roster_order = app.roster_order_from_views(&views);
+        draw_roster_body(f, chunks[0], app, &views, &roster_order);
         let top_titles = app
             .rename_target
             .is_none()
             .then(|| roster_composer_top_titles(app));
-        let bottom_title = Some(Line::from(roster_status_spans(app, &views)));
+        let bottom_title = Some(Line::from(roster_status_spans(app, &views, &roster_order)));
         draw_composer(f, chunks[1], app, top_titles, bottom_title);
         if slash_active(app) {
             draw_slash_menu(f, chunks[1], app);
@@ -155,6 +156,7 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
             Line::from("  ↑/↓           navigate agents"),
             Line::from("  PgUp/PgDn     page agents (half-page)"),
             Line::from("  Home/End      first / last agent"),
+            Line::from("  Tab           switch origin tab"),
             Line::from("  →             open agent (zoom in)"),
             Line::from("  ←             provider selector"),
             Line::from("  @project Tab  dispatch from project alias"),
@@ -259,6 +261,26 @@ pub(super) fn draw_roster_body(
     }
 }
 
+fn roster_tab_header(app: &App) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::raw("  "));
+    for tab in RosterTab::ALL {
+        let active = tab == app.roster_tab;
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!(" {} ", tab.label()), style));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled("Tab cycles", Style::default().fg(Color::DarkGray)));
+    Line::from(spans)
+}
+
 pub(super) fn draw_config_body(f: &mut Frame, area: Rect, app: &App) {
     let path = FleetConfig::path()
         .map(|p| p.display().to_string())
@@ -324,21 +346,44 @@ pub(super) fn draw_config_body(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-pub(super) fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], order: &[usize]) {
+pub(super) fn draw_roster(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    views: &[AgentView],
+    order: &[usize],
+) {
     // Full-width, borderless — the roster is the focus (the title bar and
     // composer frame it). In provider-selector mode the selector to the left
     // carries its own separator.
-    let inner = area;
+    let (header, inner) = if area.height > 1 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        (Some(split[0]), split[1])
+    } else {
+        (None, area)
+    };
+    if let Some(header) = header {
+        f.render_widget(Paragraph::new(roster_tab_header(app)), header);
+    }
     // Record the body height so PgUp/PgDn can move the selection a real half-page.
     app.roster_rows = inner.height;
 
-    if app.agents.is_empty() {
+    if inner.height == 0 {
+        return;
+    }
+
+    if order.is_empty() {
+        let hint_text = if app.agents.is_empty() {
+            "  no agents yet — type a prompt below + Enter to dispatch one".to_string()
+        } else {
+            format!("  no agents in {}", app.roster_tab.label())
+        };
         let hint = Paragraph::new(vec![
             Line::from(""),
-            Line::from(Span::styled(
-                "  no agents yet — type a prompt below + Enter to dispatch one",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
         ]);
         f.render_widget(hint, inner);
         return;

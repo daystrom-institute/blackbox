@@ -307,6 +307,35 @@ impl AppMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RosterTab {
+    FleetAgents,
+    DispatchedAgents,
+}
+
+impl RosterTab {
+    const ALL: [RosterTab; 2] = [RosterTab::FleetAgents, RosterTab::DispatchedAgents];
+
+    fn label(self) -> &'static str {
+        match self {
+            RosterTab::FleetAgents => "Fleet Agents",
+            RosterTab::DispatchedAgents => "Dispatched Agents",
+        }
+    }
+
+    fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+}
+
+fn roster_tab_accepts_origin(tab: RosterTab, origin: &str) -> bool {
+    match tab {
+        RosterTab::FleetAgents => origin == "cockpit",
+        RosterTab::DispatchedAgents => origin != "cockpit",
+    }
+}
+
 /// Launch settings for `bro agent`, the standalone single-agent shell extracted
 /// from the Fleet TUI's reusable single-agent view component.
 #[derive(Debug, Clone)]
@@ -327,7 +356,9 @@ struct App {
     mode: AppMode,
 
     zone: Zone,
-    /// Index into the bucket-ordered agent list (see [`ordered_agents`]).
+    /// Active origin partition for the roster.
+    roster_tab: RosterTab,
+    /// Index into the active tab's bucket-ordered agent list (see [`ordered_roster_agents`]).
     roster_selected: usize,
     /// Task id the roster cursor is pinned to, so the selection follows that
     /// agent across live re-sorts (bucket/started_at changes) instead of a row
@@ -511,6 +542,7 @@ impl App {
             agents: Vec::new(),
             mode,
             zone: Zone::Roster,
+            roster_tab: RosterTab::FleetAgents,
             roster_selected: 0,
             roster_anchor_id: None,
             focused_agent_id: None,
@@ -606,6 +638,21 @@ impl App {
         (views, order)
     }
 
+    fn ordered_roster_agents(&self) -> (Vec<AgentView>, Vec<usize>) {
+        let views: Vec<AgentView> = self.agents.iter().map(Agent::view).collect();
+        let order = self.roster_order_from_views(&views);
+        (views, order)
+    }
+
+    fn roster_order_from_views(&self, views: &[AgentView]) -> Vec<usize> {
+        let origins: Vec<&str> = self
+            .agents
+            .iter()
+            .map(|agent| agent.task.snapshot().origin.as_wire())
+            .collect();
+        ordered_roster_indices(views, &origins, self.roster_tab)
+    }
+
     fn selected_agent(&self) -> Option<usize> {
         if self.zone == Zone::SingleAgent {
             if let Some(id) = &self.focused_agent_id
@@ -617,12 +664,12 @@ impl App {
                 return Some(0);
             }
         }
-        let (_, order) = self.ordered_agents();
+        let (_, order) = self.ordered_roster_agents();
         order.get(self.roster_selected).copied()
     }
 
     fn roster_position_for_agent_id(&self, id: &str) -> Option<usize> {
-        let (_, order) = self.ordered_agents();
+        let (_, order) = self.ordered_roster_agents();
         order
             .iter()
             .position(|&idx| self.agents[idx].task.id() == id)
@@ -632,7 +679,7 @@ impl App {
     /// re-sort can move the row index to keep tracking the same agent. Call
     /// after any user-driven change to `roster_selected`.
     fn anchor_roster_selection(&mut self) {
-        let (_, order) = self.ordered_agents();
+        let (_, order) = self.ordered_roster_agents();
         self.roster_anchor_id = order
             .get(self.roster_selected)
             .map(|&idx| self.agents[idx].task.id());
@@ -643,7 +690,7 @@ impl App {
     /// the cursor never silently slides onto a different agent (e.g. when the
     /// selected agent finishes and drops from the active bucket to Finished).
     fn reconcile_roster_selection(&mut self) {
-        let (_, order) = self.ordered_agents();
+        let (_, order) = self.ordered_roster_agents();
         if order.is_empty() {
             self.roster_selected = 0;
             self.roster_anchor_id = None;
@@ -839,6 +886,52 @@ fn ordered_agent_indices(views: &[AgentView]) -> Vec<usize> {
     order
 }
 
+fn ordered_roster_indices(views: &[AgentView], origins: &[&str], tab: RosterTab) -> Vec<usize> {
+    ordered_agent_indices(views)
+        .into_iter()
+        .filter(|&idx| {
+            origins
+                .get(idx)
+                .is_some_and(|origin| roster_tab_accepts_origin(tab, origin))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn origin_tabs_partition_roster_rows() {
+    fn view(state: FleetState, started_at: u64) -> AgentView {
+        AgentView {
+            state,
+            turn_active: false,
+            needs_input: false,
+            model: None,
+            cwd: None,
+            report_message: None,
+            started_at,
+            last_activity_ms: None,
+            stderr_tail: None,
+        }
+    }
+
+    let views = vec![
+        view(FleetState::Idle, 40),
+        view(FleetState::Active, 30),
+        view(FleetState::Waiting, 20),
+        view(FleetState::Active, 10),
+    ];
+    let origins = ["cockpit", "agentdispatch", "workflow", "cockpit"];
+
+    assert_eq!(
+        ordered_roster_indices(&views, &origins, RosterTab::FleetAgents),
+        vec![3, 0]
+    );
+    assert_eq!(
+        ordered_roster_indices(&views, &origins, RosterTab::DispatchedAgents),
+        vec![2, 1]
+    );
+}
+
 fn default_model_for(provider: Provider) -> Option<&'static str> {
     provider
         .models()
@@ -869,6 +962,13 @@ fn set_next_provider(app: &mut App, provider: Provider) {
     app.next_provider = provider;
     app.next_model = default_model_for(provider).map(str::to_string);
     app.next_effort = default_effort_for(provider).map(str::to_string);
+}
+
+fn cycle_roster_tab(app: &mut App) {
+    app.roster_tab = app.roster_tab.next();
+    app.roster_selected = 0;
+    app.roster_anchor_id = None;
+    app.reconcile_roster_selection();
 }
 
 fn cycle_value(current: &mut Option<String>, values: &[&'static str]) -> Option<String> {
@@ -1846,8 +1946,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     // Completion carveouts: slash commands and roster @project aliases own Tab
-    // and ↑/↓ while their menus are up. Otherwise Tab cycles the current
-    // sub-selector level (provider / model / effort).
+    // and ↑/↓ while their menus are up. Otherwise Tab cycles roster tabs from
+    // home, or the current provider / model / effort sub-selector level.
     let slash = slash_active(app);
     let project = project_active(app);
     if key.code == KeyCode::Tab {
@@ -1857,6 +1957,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             complete_project(app);
         } else {
             match app.zone {
+                Zone::Roster => cycle_roster_tab(app),
                 Zone::ModelSelector => {
                     let models = FLEET_PROVIDERS[app.provider_cursor].models();
                     let n = models.len();
@@ -2135,10 +2236,7 @@ fn prune_terminal_agents(app: &mut App) {
             app.zone = Zone::Roster;
         }
     }
-    let n = app.agents.len();
-    if n == 0 || app.roster_selected >= n {
-        app.roster_selected = n.saturating_sub(1);
-    }
+    app.reconcile_roster_selection();
     app.clear_input();
     app.set_status(
         format!("pruned {pruned} terminal agents"),
@@ -2599,10 +2697,7 @@ fn remove_agent_row(app: &mut App, idx: usize) {
     app.activity_clocks.remove(&activity_key("agent", &id));
     app.orch.forget(&id);
     app.agents.remove(idx);
-    let n = app.agents.len();
-    if n == 0 || app.roster_selected >= n {
-        app.roster_selected = n.saturating_sub(1);
-    }
+    app.reconcile_roster_selection();
 }
 
 fn forget_standalone_agents(app: &mut App, stop_running: bool) {
@@ -3230,7 +3325,8 @@ fn vertical(app: &mut App, delta: isize) {
             set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
         }
         Zone::Roster => {
-            let n = app.agents.len();
+            let (_, order) = app.ordered_roster_agents();
+            let n = order.len();
             if n == 0 {
                 return;
             }
@@ -3251,7 +3347,8 @@ fn roster_page(app: &mut App, dir: isize, to_end: bool) {
     if app.zone != Zone::Roster {
         return;
     }
-    let n = app.agents.len();
+    let (_, order) = app.ordered_roster_agents();
+    let n = order.len();
     if n == 0 {
         return;
     }
@@ -3349,6 +3446,18 @@ fn fleet_counts(views: &[AgentView]) -> (usize, usize) {
     let waiting = views
         .iter()
         .filter(|v| v.state == FleetState::Waiting)
+        .count();
+    (active, waiting)
+}
+
+fn fleet_counts_for_order(views: &[AgentView], order: &[usize]) -> (usize, usize) {
+    let active = order
+        .iter()
+        .filter(|&&idx| views[idx].state == FleetState::Active)
+        .count();
+    let waiting = order
+        .iter()
+        .filter(|&&idx| views[idx].state == FleetState::Waiting)
         .count();
     (active, waiting)
 }
@@ -3460,8 +3569,8 @@ fn roster_composer_top_titles(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
-    let (active, waiting) = fleet_counts(views);
+fn roster_status_spans(app: &App, views: &[AgentView], order: &[usize]) -> Vec<Span<'static>> {
+    let (active, waiting) = fleet_counts_for_order(views, order);
     let byline = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
     let project = app
@@ -3473,7 +3582,7 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(format!(" {project} "), byline),
         Span::styled("──", dim),
-        Span::styled(format!(" {} agents ", views.len()), byline),
+        Span::styled(format!(" {} agents ", order.len()), byline),
         Span::styled("──", dim),
         Span::styled(format!(" {active} active "), byline),
         Span::styled("-", dim),
@@ -3487,7 +3596,7 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
     // list reads as scrollable (the Table auto-scrolls to the selection; this
     // gives the position). Conservative — roster_rows includes header/bucket
     // rows, so it triggers slightly before the list strictly overflows.
-    let total = views.len();
+    let total = order.len();
     if app.roster_rows > 0 && total > app.roster_rows as usize {
         let pos = (app.roster_selected + 1).min(total);
         let pct = if total > 1 {
