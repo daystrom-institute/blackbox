@@ -309,10 +309,26 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "schemars 1.2.1",
  "serde",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "bbox-lsp"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "lsp-types",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -423,6 +439,7 @@ dependencies = [
  "axum",
  "bbox-chunker",
  "bbox-corpus-core",
+ "bbox-lsp",
  "bbox-vectors",
  "bincode",
  "bro-capabilities",

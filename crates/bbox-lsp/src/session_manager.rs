@@ -49,10 +49,11 @@ use lsp_types::{
     request::{Initialize, Request, Shutdown},
 };
 use parking_lot::Mutex;
-use reqwest::Url;
 use serde_json::Value;
+use url::Url;
 
-use crate::projects::Language;
+use bbox_corpus_core::language::Language;
+use bbox_corpus_core::lsp_config::LspConfig;
 
 /// Shared LSP session pool. Cheap to clone; the live state lives
 /// behind an `Arc<Mutex>`.
@@ -117,7 +118,7 @@ impl Default for Config {
 }
 
 impl Config {
-    fn from_lsp_config(cfg: &blackbox::config::LspConfig) -> Self {
+    fn from_lsp_config(cfg: &LspConfig) -> Self {
         Self {
             idle_timeout: Duration::from_secs(cfg.idle_timeout_secs),
             request_timeout: Duration::from_secs(cfg.request_timeout_secs),
@@ -275,7 +276,7 @@ impl LspSessionManager {
         Self::with_config(Config::default())
     }
 
-    pub fn with_lsp_config(cfg: &blackbox::config::LspConfig) -> Self {
+    pub fn with_lsp_config(cfg: &LspConfig) -> Self {
         Self::with_config(Config::from_lsp_config(cfg))
     }
 
@@ -857,6 +858,8 @@ fn read_message<R: BufRead + Read>(reader: &mut R) -> Result<Value> {
 mod tests {
     use super::*;
 
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn manager_starts_empty_and_shuts_down_idempotently() {
         let m = LspSessionManager::new();
@@ -957,7 +960,7 @@ mod tests {
 
     #[test]
     fn jdtls_ready_timeout_env_override_is_picked_up() {
-        let _guard = blackbox::util::test_env_lock();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let orig = std::env::var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS").ok();
         unsafe {
             std::env::set_var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS", "12");
@@ -974,7 +977,7 @@ mod tests {
 
     #[test]
     fn rust_analyzer_alias_no_longer_used() {
-        let _guard = blackbox::util::test_env_lock();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let orig_prefixed = std::env::var("BLACKBOX_RUST_ANALYZER_BIN").ok();
 
         unsafe {

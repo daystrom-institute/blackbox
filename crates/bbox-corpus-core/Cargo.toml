@@ -17,6 +17,7 @@ anyhow = "1"
 chrono = "0.4"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
+schemars = "1.2"
 sha2 = "0.10"
 tracing = "0.1"
 

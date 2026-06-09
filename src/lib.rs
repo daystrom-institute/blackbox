@@ -50,7 +50,8 @@ mod inbox;
 mod index;
 pub mod json_store;
 mod knowledge;
-mod lsp;
+// `lsp` extracted into bbox-lsp (stage 2); aliased back to `crate::lsp`.
+use bbox_lsp as lsp;
 pub(crate) mod macros;
 mod manifest;
 mod managed_worktrees;

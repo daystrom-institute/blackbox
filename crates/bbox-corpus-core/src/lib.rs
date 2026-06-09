@@ -11,5 +11,8 @@
 //! [`git::set_notes_namespace`], which the daemon calls once after it loads
 //! config.
 
+pub mod edit;
 pub mod entity_ref;
 pub mod git;
+pub mod language;
+pub mod lsp_config;

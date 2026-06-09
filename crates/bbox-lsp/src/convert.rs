@@ -11,10 +11,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use lsp_types::{DocumentChanges, Position, WorkspaceEdit};
 
-use crate::refactor::{FileEdit, TextEdit, path_string, sha256_hex};
+use bbox_corpus_core::edit::{FileEdit, TextEdit, path_string, sha256_hex};
 
 /// Convert a UTF-8 byte offset into an LSP [`Position`] (line + UTF-16 column).
-pub(crate) fn byte_to_lsp_position(source: &str, byte: usize) -> Position {
+pub fn byte_to_lsp_position(source: &str, byte: usize) -> Position {
     let line = source[..byte].bytes().filter(|b| *b == b'\n').count() as u32;
     let line_start = line_start_before(source, byte);
     let character = source[line_start..byte].encode_utf16().count() as u32;
@@ -22,7 +22,7 @@ pub(crate) fn byte_to_lsp_position(source: &str, byte: usize) -> Position {
 }
 
 /// Convert an LSP (line, UTF-16 character) pair into a UTF-8 byte offset.
-pub(crate) fn lsp_position_to_byte(source: &str, line: u32, character: u32) -> Result<usize> {
+pub fn lsp_position_to_byte(source: &str, line: u32, character: u32) -> Result<usize> {
     let mut current_line = 0u32;
     let mut line_start = 0usize;
     for (idx, byte) in source.bytes().enumerate() {
@@ -59,7 +59,7 @@ pub(crate) fn lsp_position_to_byte(source: &str, line: u32, character: u32) -> R
 
 /// Flatten an LSP [`WorkspaceEdit`] into a list of [`FileEdit`] values
 /// that `apply_file_edits` can consume.
-pub(crate) fn workspace_edit_to_file_edits(workspace_edit: WorkspaceEdit) -> Result<Vec<FileEdit>> {
+pub fn workspace_edit_to_file_edits(workspace_edit: WorkspaceEdit) -> Result<Vec<FileEdit>> {
     let mut grouped: BTreeMap<PathBuf, Vec<lsp_types::TextEdit>> = BTreeMap::new();
 
     if let Some(changes) = workspace_edit.changes {

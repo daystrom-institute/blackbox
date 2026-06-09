@@ -21,6 +21,7 @@ members = [
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
     "crates/bbox-chunker",
+    "crates/bbox-lsp",
 ]
 
 [package]
@@ -86,6 +87,8 @@ bbox-vectors = { path = "crates/bbox-vectors" }
 bbox-corpus-core = { path = "crates/bbox-corpus-core" }
 # Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).
 bbox-chunker = { path = "crates/bbox-chunker" }
+# Shared LSP session/conversion helpers, extracted from the root crate (stage 2).
+bbox-lsp = { path = "crates/bbox-lsp" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }
