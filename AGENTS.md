@@ -35,10 +35,6 @@ Rust test isolation invariants (this repo, surfaced on macOS aarch64). Two conve
 
 2. Isolate to per-test tempdirs; never touch real `$HOME`/XDG/prod state. Tests that read/write `~/.config/blackbox`, `~/.local/state/blackbox`, `~/.claude*`, the real tantivy index, or the prod daemon on 127.0.0.1:7264 collide across parallel agents/worktrees. Use `SharedState::for_test(tempdir)` (`src/server/state.rs`). Any test mutating process env must also hold `crate::util::test_env_lock()` (non-reentrant — don't double-take it via a helper that already locks).
 
-**Share CARGO_TARGET_DIR across Cargo-workspace git worktrees**
-
-When spinning up a git worktree of this Cargo workspace ad hoc (outside orchestrated workflows), point it at a shared `CARGO_TARGET_DIR` before building. Git worktrees do NOT share build state — each sibling worktree cold-compiles into its own `target/`, and for this large workspace that silently accumulates tens of GB per worktree (43G + 16G observed). A shared target dir reuses the existing build cache, skips the cold compile, and keeps disk bounded. Caveat: cargo takes a build lock on the target dir, so two worktrees sharing one `CARGO_TARGET_DIR` serialize their builds; if you genuinely need parallel builds across worktrees, accept the duplication instead. Applies to both orchestrated WorktreeCreate flows and hand-rolled `git worktree add`.
-
 **The bro-harness/daemon boundary: a shared contract bottom**
 
 The shared **contract bottom** — `bro-core` (ids/refs/errors), `bro-protocol` (control plane + status/view DTOs), `bro-capabilities` (Atom/Corpus/Refactor traits) — holds the types and traits that cross the harness↔daemon boundary; it is pure (serde + traits, no I/O) and depends on nothing. `bro-harness` is a library (`[lib]`); `blackbox` (the daemon + the `bro`/fleet tooling) links it as a crate and/or spawns its binary (subprocess + Claude stream-json envelope), per consumer. The compile DAG is `blackbox → bro-harness → bro-tools`, all pointing **down** into the contract bottom — acyclic and compiler-enforced. **`bro-harness` must never depend on `blackbox`** — a compile error, not a convention. Daemon capabilities reach the harness only through `bro-capabilities` traits the daemon implements and the harness calls (dependency inversion, owned by neither) — never an RPC or compile edge *from* the harness — and **fail closed** when the daemon's capability impls aren't present. The thin **fleet client** (`bro-cli` via `bro-fleet-client`) depends on `bro-protocol` + `bro-core` only — never `blackbox`, `bro-capabilities`, or either implementer. Crate boundaries follow consumer cleavage, not topic. (The harness Promise layer keeps the same shape: Promise producers are harness-local; `bro_exec`/`bro_resume`/daemon orchestration are not Promise producers inside the harness.) See `design/bro-harness/harness-daemon-boundary.md` §2/§7/§11.
@@ -67,15 +63,6 @@ For Forgejo-backed coordination, implementers and reviewers must use distinct ex
 **work_* namespace is workflow-agent-facing only**
 
 In transcript-search, `work_*` MCP tools are reserved for restricted agents operating inside atoms/workflows. Only add tools under `work_*` when the operator explicitly asks for an atom/workflow-internal surface; general MCP tool families should use `bbox_*` or a dedicated prefix cluster such as `macro_*` when large enough.
-
-
-### Provider Catalog
-
-**Do not expose mercury-edit-2**
-
-
-**Semantic Claude-compatible GLM and DeepSeek providers**
-
 
 
 ### Render Hygiene
