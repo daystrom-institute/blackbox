@@ -46,11 +46,18 @@ happy path. Three things keep it from being a single, robust command:
    a rebase conflict, a push rejected because the remote moved, a base branch
    that has diverged. `exit_worktree` correctly `bail!`s rather than forcing, but
    a one-shot tool call then dead-ends with no recovery path.
-2. **There is no lifecycle hook for project hygiene** — most concretely the
-   build-cache reclaim (`cargo sweep` / `cargo clean`) that bounds the never-GC'd
-   shared `target/` (see the `Share CARGO_TARGET_DIR` convention). Closeout is
-   the natural reclaim cadence, but nothing runs there — and per blocker 1, it
-   *can't* without a phased driver.
+2. **There is no lifecycle hook for project hygiene** — originally motivated by
+   the build-cache reclaim (`cargo sweep` / `cargo clean`) that bounded the
+   never-GC'd **shared** `target/`. **Update (Phase 5 landed):** the fleet
+   dispatch path no longer injects a shared `CARGO_TARGET_DIR` — each worktree
+   gets its own `target/` (per-worktree isolation; see the leading-edge section
+   below). Every implemented disposition (publish/merge/adopt/discard) removes
+   the worktree, so its target dir is **auto-reclaimed** — the shared-target
+   disk-reclaim that motivated hooks is now moot. `closeout_hooks` therefore ship
+   as a **general-purpose lifecycle surface** (pre-push gating like
+   "cargo check before folding to beta", notifications, external cleanup), not a
+   Rust-disk mechanism. Closeout remains the natural cadence; per blocker 1 the
+   hooks still run inside the phased driver, never as an external post-step.
 3. **`exit_worktree` is hardwired to `main`** and to `bro-fleet/*` branches, so
    it cannot close out against `beta/blackbox-v2` (now primary focus) or any
    non-fleet branch.
@@ -336,13 +343,36 @@ surfaces as a cockpit status flash via the structured result.
 
 Phases 1–3 are independently shippable.
 
-**Status (as of the dogfooding run):** Phases **1–3 ✅** implemented, landed on
-`beta/blackbox-v2`, deployed, and validated (3a HTTP probe; 3b tmux). Phases **4
-and 5 REMAIN — not started.**
+**Status:** Phases **1–4 ✅** and Phase **5 ✅** implemented on
+`beta/build-cache-sccache` (off `beta/blackbox-v2`). Phase 5 shipped both edges:
 
-A dogfooding attempt to build Phases 4/5 *via `bro fleet`* (an MM bro driving the
-cockpit, two levels up) was **aborted** — it surfaced daemon/cockpit defects that
-blocked it. Findings, sifted into verified vs. the bro's unverified narration:
+- **Leading edge (de-hardcode → isolation + `project_dispatch`).** The fleet
+  dispatch path no longer injects a shared `CARGO_TARGET_DIR` (removed from
+  `bro-cli/.../fleet_tui/dispatch.rs` create+resume and
+  `bro-tools/.../fleet_worktree.rs` EnterWorktree, plus the `workspace.rs`
+  reporter). Each worktree gets its own `target/` — concurrent builds no longer
+  serialize on cargo's build lock, and the cockpit is language-agnostic. A new
+  **`project_dispatch: BTreeMap<repo_path, ProjectDispatch{env}>`** in
+  `fleet.json` (best-effort load) lets a project opt into env — e.g. blackbox
+  sets `RUSTC_WRAPPER=sccache` for cross-worktree compile reuse; a Java repo sets
+  its own. Reserved `BRO_FLEET_*` vars are never overridden.
+  *Limitation:* the daemon-side `EnterWorktree` tool (`bro-tools`, which doesn't
+  read `fleet.json`) gets isolation only, no `project_dispatch` injection — the
+  cockpit dispatch path is where project env is merged.
+- **Trailing edge (`closeout_hooks`).** `project_closeout` config
+  (strict-loaded — a typo fails the command loudly), resolved cockpit-side into
+  the `CloseoutHooksWire` DTO, translated by the daemon into the `bro-tools`
+  `CloseoutHooks`, and fired by `run_closeout_phases` at the pre_push / pre_remove
+  / on_discard / post_success boundaries. Scriptlets run via `bash -lc` with
+  `BBOX_*` env injected (`BBOX_WORKTREE`, `BBOX_TARGET_DIR`, `BBOX_TARGET_BRANCH`,
+  `BBOX_BRANCH`, `BBOX_DISPOSITION`, `BBOX_BASE_REPO`) — so a scriptlet uses
+  `$BBOX_WORKTREE` directly, no template engine. `on_fail=block` aborts the fold
+  at the guarded boundaries (`HookBlocked`); `post_success`/`warn` are advisory.
+
+**Historical note (the original dogfooding run):** an earlier attempt to build
+Phases 4/5 *via `bro fleet`* (an MM bro driving the cockpit, two levels up) was
+**aborted** — it surfaced daemon/cockpit defects that blocked it. Findings, sifted
+into verified vs. the bro's unverified narration:
 
 - **VERIFIED — `orchestration::mcp::glob_match` exponential-backtracking wedge
   (PRIORITY).** The recursive glob matcher (`src/orchestration/mcp.rs:556`/`:562`),
@@ -366,9 +396,12 @@ Phases 4/5 are deferred until the `glob_match` wedge is fixed.
 
 ## 7. Open questions
 
-- Should `closeout_hooks` inherit the dispatch env (`resolve_provider_env`
-  `src/orchestration/brofile.rs:543`; `prepare_dispatch_worktree` `dispatch.rs:319`)
-  so the sweep hook targets the right `CARGO_TARGET_DIR`? Likely yes.
+- ~~Should `closeout_hooks` inherit the dispatch env so the sweep hook targets the
+  right `CARGO_TARGET_DIR`?~~ **Resolved by the per-worktree target model.** With
+  isolation, the target dir is deterministically `<worktree>/target`, exposed to
+  hooks as `$BBOX_TARGET_DIR` (alongside `$BBOX_WORKTREE` etc.) — no need to
+  inherit a shared dispatch env. And because worktree removal auto-reclaims that
+  dir, a `cargo sweep`/`clean` hook is no longer load-bearing for disk anyway.
 - Escalation turn budget: cap reconcile attempts before handing to the operator.
 - Concurrent closeouts into the same target (push races) — rely on the
   push-reject recovery state, or serialize per-target in the endpoint?

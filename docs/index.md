@@ -22,6 +22,7 @@ The crate is `blackbox`. It produces four binaries:
 | Page | What it covers |
 |---|---|
 | [Getting Started](getting-started.md) | Build, install, systemd service, connect CLIs, bootstrap |
+| [Developing Blackbox](developing-blackbox.md) | Contributor build/test, Nix flake + isolated dev-agent world, per-worktree build isolation + sccache |
 | [Operating Guide](operating-blackbox.md) | Day-2 runbooks: reindexing, re-embedding, compaction, post-update checks |
 | [Internals](internals.md) | Map of the internal projections and where the deeper design pages live |
 | [Graph And Retrieval Internals](graph-retrieval-internals.md) | Graph grounding, opening sequence, entity refs, edges, hybrid search ranking |

@@ -1,15 +1,29 @@
 ---
 title: "Shared build cache for workflow-created worktrees"
 kind: design
-lifecycle: proposed
+lifecycle: superseded
 corpus: blackbox-design
 topic:
   - orchestration
   - workflows
 date: 2026-05-31
-status: "design proposal v1"
+status: "superseded 2026-06-08 by per-worktree isolation + project_dispatch (closeout Phase 5)"
+superseded_by: design/fleet-tui/closeout-command.md
 brief: "Give WorktreeCreate an optional shared-build-cache mode so sibling Cargo-workspace worktrees stop cold-compiling the full dependency tree independently — threaded via a new arc→dispatch env seam, gated on a benchmark."
 ---
+
+> **SUPERSEDED (2026-06-08).** This doc's Option A/B/C framing (shared
+> `CARGO_TARGET_DIR` vs sccache vs per-worktree, gated on a benchmark) was
+> resolved by a different cut: the fleet dispatch path was **de-hardcoded to
+> per-worktree target isolation** (no shared `CARGO_TARGET_DIR`), which removes
+> the build-lock contention this doc set out to fix, and a project-agnostic
+> **`project_dispatch`** env surface in `fleet.json` now carries optional
+> per-project build env (e.g. `RUSTC_WRAPPER=sccache`) instead of the engine
+> guessing a mode. The shared-target disk-bounding motivation evaporates because
+> worktree removal auto-reclaims a per-worktree target dir. See
+> `design/fleet-tui/closeout-command.md` (Phase 5, leading edge) and
+> `docs/developing-blackbox.md` (sccache setup). The original gap note
+> `note-555bf465` is resolved by that work.
 
 # Shared build cache for workflow-created worktrees
 

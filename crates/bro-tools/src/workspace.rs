@@ -197,7 +197,6 @@ fn visible_process_env() -> BTreeMap<String, String> {
         "BRO_FLEET_WORKTREE_BRANCH",
         "BRO_HARNESS_PROJECT_DOC_FILES",
         "BRO_HARNESS_PROJECT_DOC_MAX_BYTES",
-        "CARGO_TARGET_DIR",
     ] {
         if let Ok(value) = std::env::var(key) {
             out.insert(key.to_string(), value);

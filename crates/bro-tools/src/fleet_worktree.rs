@@ -8,9 +8,11 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BRANCH_PREFIX: &str = "bro-fleet";
 
@@ -269,6 +271,9 @@ pub enum CloseoutPhase {
     /// `git worktree remove` (+ `git branch -D <branch>`) in the base/target
     /// checkout.
     Remove,
+    /// A project-configured `closeout_hooks` scriptlet ran (or was blocked) at a
+    /// phase boundary (pre_push / pre_remove / post_success / on_discard).
+    Hook,
 }
 
 /// Coarse classification of a phase failure. Callers route recovery by class
@@ -296,6 +301,9 @@ pub enum CloseoutErrorClass {
     PushRejected,
     /// `git worktree remove` failed in base.
     RemoveFailed,
+    /// A `closeout_hooks` scriptlet with `on_fail = "block"` exited nonzero and
+    /// aborted the closeout before the guarded mutation (push / remove / discard).
+    HookBlocked,
     /// Disposition-not-applicable bail (e.g. publish with a clean branch ahead
     /// of target → use adopt) or other unclassified preflight bail.
     Other,
@@ -351,6 +359,90 @@ pub struct CloseoutRequest {
     /// When `true`, run only `phase_preflight` for `disposition` and
     /// return its result without mutating. See struct doc.
     pub dry_run: bool,
+    /// Fully-resolved project `closeout_hooks` (design §3 Gap B / §4.4). `None`
+    /// (or empty) means no hooks run. Constructed by the daemon endpoint from the
+    /// wire `CloseoutHooksWire`; the legacy `exit_worktree` tool path passes
+    /// `None`. Skipped entirely on `dry_run`.
+    pub closeout_hooks: Option<CloseoutHooks>,
+}
+
+/// A closeout lifecycle event a `closeout_hooks` scriptlet can bind to. Fires at
+/// a phase boundary inside `run_closeout_phases` (design §3 Gap B):
+/// `pre_push` after the local ff-merge and before `git push`; `pre_remove` after
+/// push and before `git worktree remove` (publish/merge/adopt); `on_discard`
+/// before the discard removal; `post_success` after a successful
+/// publish/merge/adopt fold. `on_fail = block` only aborts at the guarded
+/// boundaries (`pre_push` / `pre_remove` / `on_discard`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseoutEvent {
+    PrePush,
+    PreRemove,
+    PostSuccess,
+    OnDiscard,
+}
+
+impl CloseoutEvent {
+    fn key(self) -> &'static str {
+        match self {
+            CloseoutEvent::PrePush => "pre_push",
+            CloseoutEvent::PreRemove => "pre_remove",
+            CloseoutEvent::PostSuccess => "post_success",
+            CloseoutEvent::OnDiscard => "on_discard",
+        }
+    }
+
+    /// Whether `on_fail = block` can abort the closeout at this boundary.
+    /// `post_success` fires after the mutation has already landed, so a block
+    /// there is meaningless (advisory only).
+    fn is_blocking_capable(self) -> bool {
+        !matches!(self, CloseoutEvent::PostSuccess)
+    }
+}
+
+/// `on_fail` policy for closeout hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HookOnFail {
+    /// Log the failure and continue the closeout.
+    #[default]
+    Warn,
+    /// Abort the closeout before the guarded mutation (push/remove/discard).
+    Block,
+}
+
+/// Fully-resolved closeout hooks handed to the driver. The daemon translates the
+/// wire `bro_protocol::CloseoutHooksWire` into this; `bro-tools` stays free of
+/// `bro-protocol`. Policy (`cwd` / `on_fail` / `timeout_secs`) applies to every
+/// scriptlet. Scriptlets run via `bash -lc` with the `BBOX_*` variable env.
+#[derive(Debug, Clone)]
+pub struct CloseoutHooks {
+    /// event key (`"pre_push"` | `"pre_remove"` | `"post_success"` |
+    /// `"on_discard"`) → ordered scriptlets. Unknown keys are ignored.
+    pub hooks: BTreeMap<String, Vec<String>>,
+    /// Working directory for hook execution. `None` → the base repo checkout.
+    pub cwd: Option<PathBuf>,
+    pub on_fail: HookOnFail,
+    /// Per-scriptlet timeout in seconds.
+    pub timeout_secs: u64,
+}
+
+impl CloseoutHooks {
+    fn scriptlets(&self, event: CloseoutEvent) -> &[String] {
+        self.hooks
+            .get(event.key())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+/// Result of running the hooks bound to one event.
+enum HookRun {
+    /// No hooks configured for this event.
+    None,
+    /// Hooks ran; push this informational `Hook` `PhaseResult` (always `ok`).
+    Ran(PhaseResult),
+    /// A blocking-capable event had `on_fail = block` and a scriptlet failed;
+    /// abort the closeout with this failing `PhaseResult`.
+    Blocked(PhaseResult),
 }
 
 /// Resolved target for the closeout driver: either the caller-supplied
@@ -447,6 +539,9 @@ pub fn prepare_closeout_request(
         commit_message: None,
         paths: Vec::new(),
         dry_run: false,
+        // Stamped by the caller (the daemon endpoint resolves project hooks);
+        // the legacy `exit_worktree` tool path leaves this `None`.
+        closeout_hooks: None,
     })
 }
 
@@ -516,7 +611,13 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
         }
         results.push(ff_merge);
 
-        // ---- pre_push hook SEAM (no-op in Phase 1) ----
+        // pre_push hook: after the local ff-merge, before publishing. A
+        // blocking failure aborts before anything reaches the remote.
+        match run_closeout_hooks(req, CloseoutEvent::PrePush) {
+            HookRun::Blocked(p) => return CloseoutOutcome::Failed(p),
+            HookRun::Ran(p) => results.push(p),
+            HookRun::None => {}
+        }
         let push = phase_push(req);
         if !push.ok {
             if push.error_class == CloseoutErrorClass::PushRejected
@@ -538,15 +639,216 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
         }
     }
 
-    // ---- pre_remove hook SEAM (no-op in Phase 1) ----
+    // pre_remove (publish/merge/adopt) or on_discard (discard): the last seam
+    // before `git worktree remove`. Both are blocking-capable.
+    let pre_remove_event = if req.disposition == "discard" {
+        CloseoutEvent::OnDiscard
+    } else {
+        CloseoutEvent::PreRemove
+    };
+    match run_closeout_hooks(req, pre_remove_event) {
+        HookRun::Blocked(p) => return CloseoutOutcome::Failed(p),
+        HookRun::Ran(p) => results.push(p),
+        HookRun::None => {}
+    }
     let remove = phase_remove(req);
     if !remove.ok {
         return CloseoutOutcome::Failed(remove);
     }
     results.push(remove);
-    // ---- post_success hook SEAM (no-op in Phase 1) ----
+
+    // post_success: advisory, only after a real fold (a discard already ran its
+    // on_discard hook and is not "work landed"). `on_fail = block` is a no-op
+    // here — the mutation already happened.
+    if req.disposition != "discard"
+        && let HookRun::Ran(p) = run_closeout_hooks(req, CloseoutEvent::PostSuccess)
+    {
+        results.push(p);
+    }
 
     CloseoutOutcome::Success { phases: results }
+}
+
+/// Run the `closeout_hooks` scriptlets bound to `event`, in order, if any.
+///
+/// Scriptlets run via `bash -lc` in `hooks.cwd` (default: the base repo), with
+/// the `BBOX_*` variable env injected so a scriptlet can reference
+/// `$BBOX_WORKTREE`, `$BBOX_TARGET_DIR`, `$BBOX_TARGET_BRANCH`, `$BBOX_BRANCH`,
+/// `$BBOX_DISPOSITION`, `$BBOX_BASE_REPO` directly (no template engine). Output
+/// is captured (truncated) into the `Hook` phase content so the cockpit can flash
+/// it. Returns [`HookRun::Blocked`] when a blocking-capable event has
+/// `on_fail = block` and a scriptlet exits nonzero — the driver then aborts
+/// before the guarded mutation.
+fn run_closeout_hooks(req: &CloseoutRequest, event: CloseoutEvent) -> HookRun {
+    let Some(hooks) = req.closeout_hooks.as_ref() else {
+        return HookRun::None;
+    };
+    let scriptlets = hooks.scriptlets(event);
+    if scriptlets.is_empty() {
+        return HookRun::None;
+    }
+    let cwd = hooks.cwd.clone().unwrap_or_else(|| req.base_repo.clone());
+    let target_dir = req.worktree.join("target");
+    let env: [(&str, String); 6] = [
+        ("BBOX_WORKTREE", req.worktree.display().to_string()),
+        ("BBOX_TARGET_DIR", target_dir.display().to_string()),
+        ("BBOX_TARGET_BRANCH", req.target.clone()),
+        ("BBOX_BRANCH", req.branch.clone()),
+        ("BBOX_DISPOSITION", req.disposition.clone()),
+        ("BBOX_BASE_REPO", req.base_repo.display().to_string()),
+    ];
+    let timeout = Duration::from_secs(hooks.timeout_secs.max(1));
+
+    let mut ran: Vec<Value> = Vec::with_capacity(scriptlets.len());
+    for script in scriptlets {
+        let outcome = run_hook_scriptlet(script, &cwd, &env, timeout);
+        let failed = !outcome.ok;
+        ran.push(json!({
+            "script": script,
+            "ok": outcome.ok,
+            "exit_code": outcome.exit_code,
+            "timed_out": outcome.timed_out,
+            "stdout": outcome.stdout,
+            "stderr": outcome.stderr,
+        }));
+        if failed && hooks.on_fail == HookOnFail::Block && event.is_blocking_capable() {
+            let detail = if outcome.timed_out {
+                format!("timed out after {}s", timeout.as_secs())
+            } else {
+                outcome
+                    .exit_code
+                    .map(|c| format!("exited {c}"))
+                    .unwrap_or_else(|| "terminated by signal".to_string())
+            };
+            return HookRun::Blocked(PhaseResult {
+                phase: CloseoutPhase::Hook,
+                repo_cwd: cwd,
+                ok: false,
+                error_class: CloseoutErrorClass::HookBlocked,
+                content: json!({
+                    "error": format!(
+                        "closeout {} hook blocked the fold: `{script}` {detail}",
+                        event.key()
+                    ),
+                    "event": event.key(),
+                    "hooks": ran,
+                }),
+            });
+        }
+    }
+
+    // All scriptlets ran (or failed under `warn`): record an informational,
+    // always-`ok` Hook phase so the outcome carries the hook output.
+    HookRun::Ran(PhaseResult {
+        phase: CloseoutPhase::Hook,
+        repo_cwd: cwd,
+        ok: true,
+        error_class: CloseoutErrorClass::None,
+        content: json!({ "event": event.key(), "hooks": ran }),
+    })
+}
+
+/// Captured result of one hook scriptlet.
+struct HookScriptOutcome {
+    ok: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run a single scriptlet via `bash -lc` with a wall-clock timeout. stdout/stderr
+/// are drained on dedicated threads (so a scriptlet that fills the pipe buffer
+/// cannot deadlock the poll loop) and truncated to keep the phase content small.
+fn run_hook_scriptlet(
+    script: &str,
+    cwd: &Path,
+    env: &[(&str, String)],
+    timeout: Duration,
+) -> HookScriptOutcome {
+    use std::process::Stdio;
+
+    const CAP: usize = 8 * 1024;
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc")
+        .arg(script)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return HookScriptOutcome {
+                ok: false,
+                exit_code: None,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: format!("hook spawn failed: {e}"),
+            };
+        }
+    };
+
+    // ChildStdout/ChildStderr are distinct types; drain each on its own thread.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let truncate = |bytes: Vec<u8>| {
+        let mut s = String::from_utf8_lossy(&bytes).into_owned();
+        if s.len() > CAP {
+            s.truncate(CAP);
+            s.push_str("…[truncated]");
+        }
+        s
+    };
+    let stdout = truncate(out_handle.join().unwrap_or_default());
+    let stderr = truncate(err_handle.join().unwrap_or_default());
+    let exit_code = status.as_ref().and_then(|s| s.code());
+    let ok = !timed_out && status.map(|s| s.success()).unwrap_or(false);
+
+    HookScriptOutcome {
+        ok,
+        exit_code,
+        timed_out,
+        stdout,
+        stderr,
+    }
 }
 
 /// Render a `CloseoutOutcome` into the existing `exit_worktree` tool JSON
@@ -1033,7 +1335,6 @@ fn push_recovery_retry_failed(mut result: PhaseResult, message: &str) -> PhaseRe
 }
 
 fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
-    // ---- pre_remove hook SEAM (no-op in Phase 1) ----
     let base_repo = &req.base_repo;
     let worktree = &req.worktree;
     let branch = &req.branch;
@@ -1065,7 +1366,6 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
         };
     }
     let _ = git_run(base_repo, &["branch", "-D", branch]);
-    // ---- post_success hook SEAM (no-op in Phase 1) ----
     PhaseResult {
         phase: CloseoutPhase::Remove,
         repo_cwd: base_repo.clone(),
@@ -1132,16 +1432,18 @@ fn enter_worktree(cx_root: &Path, args: EnterWorktreeInput) -> anyhow::Result<Va
     let base_sha = git_capture(&parent_worktree, &["rev-parse", "--short=12", "HEAD"])
         .unwrap_or_else(|_| "unknown".to_string());
     let status = git_capture(&path, &["status", "--short", "--branch"]).unwrap_or_default();
-    let cargo_target = base_repo.join("target");
-    let mut env = json!({
+    // Per-worktree build isolation: no shared CARGO_TARGET_DIR (or any
+    // language-specific build env) is injected — each worktree gets its own
+    // target dir (the cargo default), so concurrent builds never serialize on a
+    // shared build lock. (This daemon-side EnterWorktree path does not read
+    // fleet.json, so project-scoped `project_dispatch` env is not applied here;
+    // the cockpit dispatch path is where project env is merged.)
+    let env = json!({
         "BRO_FLEET_BASE_REPO": base_repo.display().to_string(),
         "BRO_FLEET_WORKTREE_ROOT": worktree_root.display().to_string(),
         "BRO_FLEET_PARENT_WORKTREE": parent_worktree.display().to_string(),
         "BRO_FLEET_WORKTREE_BRANCH": branch,
     });
-    if base_repo.join("Cargo.toml").is_file() {
-        env["CARGO_TARGET_DIR"] = json!(cargo_target.display().to_string());
-    }
     let grounding = format!(
         "[fleet worktree grounding]\n\
 You are running in a managed isolated git worktree.\n\
@@ -2193,6 +2495,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             dry_run: false,
+            closeout_hooks: None,
         };
         let outcome = run_closeout_phases(&req);
         let results = match outcome {
@@ -2330,6 +2633,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             dry_run: false,
+            closeout_hooks: None,
         };
         let outcome = run_closeout_phases(&req);
         let failed = match outcome {
@@ -2413,6 +2717,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             dry_run: true,
+            closeout_hooks: None,
         };
         let outcome = run_closeout_phases(&req);
         let results = match outcome {
@@ -2515,6 +2820,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             dry_run: true,
+            closeout_hooks: None,
         };
         let outcome = run_closeout_phases(&req);
         let failed = match outcome {
@@ -2576,6 +2882,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             dry_run: false,
+            closeout_hooks: None,
         };
         let rebase = phase_rebase(&req);
         assert!(rebase.ok, "setup rebase failed: {:?}", rebase.content);
@@ -2666,6 +2973,7 @@ mod tests {
             commit_message: None,
             paths: vec![],
             dry_run: false,
+            closeout_hooks: None,
         };
         let rebase = phase_rebase(&req);
         assert!(rebase.ok, "setup rebase failed: {:?}", rebase.content);
@@ -2942,5 +3250,188 @@ mod tests {
             .arg(&base_repo)
             .args(["worktree", "remove", "--force", worktree.to_str().unwrap()])
             .output();
+    }
+
+    // ---- Phase 5: closeout_hooks ------------------------------------------
+
+    /// Set up a repo with a bare origin and a committed worktree branch ready to
+    /// `adopt`-fold, returning `(repo, origin, worktree_value, cwd, branch)`.
+    async fn seed_foldable_worktree() -> (tempfile::TempDir, tempfile::TempDir, Value, PathBuf, String)
+    {
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        let branch = value["branch"].as_str().unwrap().to_string();
+        std::fs::write(cwd.join("README.md"), "base\ncommitted\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+        (repo, origin, value, cwd, branch)
+    }
+
+    fn hooks_for(event: &str, scripts: Vec<String>, on_fail: HookOnFail) -> CloseoutHooks {
+        let mut map = BTreeMap::new();
+        map.insert(event.to_string(), scripts);
+        CloseoutHooks {
+            hooks: map,
+            cwd: None,
+            on_fail,
+            timeout_secs: 30,
+        }
+    }
+
+    /// post_success fires after a successful adopt fold and sees the closeout
+    /// variables via injected env (`$BBOX_WORKTREE`), proving interpolation.
+    #[tokio::test]
+    async fn closeout_post_success_hook_runs_with_interpolated_env() {
+        let (repo, _origin, value, cwd, branch) = seed_foldable_worktree().await;
+        let marker = repo.path().join("hook-ran.txt");
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: Some(hooks_for(
+                "post_success",
+                vec![format!("printf '%s' \"$BBOX_WORKTREE\" > {}", marker.display())],
+                HookOnFail::Warn,
+            )),
+        };
+        let phases = match run_closeout_phases(&req) {
+            CloseoutOutcome::Success { phases } => phases,
+            CloseoutOutcome::Failed(p) => panic!("adopt fold failed: {:?}", p.content),
+        };
+        assert!(
+            phases.iter().any(|p| p.phase == CloseoutPhase::Hook),
+            "a post_success Hook phase must be recorded"
+        );
+        let recorded = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            recorded,
+            cwd.display().to_string(),
+            "$BBOX_WORKTREE must interpolate to the real worktree path"
+        );
+        // adopt removed the worktree → its per-worktree target/ is auto-reclaimed.
+        assert!(!cwd.exists(), "adopt must remove the worktree");
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    /// A blocking pre_push hook (`on_fail = block`, nonzero exit) aborts the fold
+    /// before anything reaches the remote, and surfaces `HookBlocked`.
+    #[tokio::test]
+    async fn closeout_pre_push_block_hook_aborts_before_push() {
+        let (repo, origin, value, cwd, branch) = seed_foldable_worktree().await;
+        let origin_main_before = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: Some(hooks_for(
+                "pre_push",
+                vec!["exit 1".to_string()],
+                HookOnFail::Block,
+            )),
+        };
+        match run_closeout_phases(&req) {
+            CloseoutOutcome::Failed(p) => {
+                assert_eq!(p.phase, CloseoutPhase::Hook);
+                assert_eq!(p.error_class, CloseoutErrorClass::HookBlocked);
+            }
+            CloseoutOutcome::Success { .. } => {
+                panic!("a blocking pre_push hook must abort the fold")
+            }
+        }
+        let origin_main_after = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
+        assert_eq!(
+            origin_main_before, origin_main_after,
+            "nothing must reach the remote when pre_push blocks"
+        );
+        assert!(cwd.exists(), "worktree must survive a blocked pre_push");
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    /// on_discard fires on the discard path (worktree removed, no push), and sees
+    /// `$BBOX_DISPOSITION = discard`.
+    #[tokio::test]
+    async fn closeout_on_discard_hook_runs_on_discard() {
+        let repo = seed_repo();
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        let branch = value["branch"].as_str().unwrap().to_string();
+        let marker = repo.path().join("discard-hook.txt");
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch,
+            target: "main".to_string(),
+            disposition: "discard".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: Some(hooks_for(
+                "on_discard",
+                vec![format!(
+                    "printf 'disposition=%s' \"$BBOX_DISPOSITION\" > {}",
+                    marker.display()
+                )],
+                HookOnFail::Warn,
+            )),
+        };
+        let phases = match run_closeout_phases(&req) {
+            CloseoutOutcome::Success { phases } => phases,
+            CloseoutOutcome::Failed(p) => panic!("discard failed: {:?}", p.content),
+        };
+        assert!(
+            phases.iter().any(|p| p.phase == CloseoutPhase::Hook),
+            "an on_discard Hook phase must be recorded"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "disposition=discard"
+        );
+        assert!(!cwd.exists(), "discard removes the worktree");
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    /// Leading edge: the EnterWorktree tool no longer injects a shared
+    /// `CARGO_TARGET_DIR`, even for a Cargo workspace — per-worktree isolation.
+    #[tokio::test]
+    async fn enter_worktree_env_has_no_cargo_target_dir() {
+        let repo = seed_repo();
+        std::fs::write(repo.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "cargo workspace"]);
+        let value = enter_test_worktree(repo.path()).await;
+        assert!(
+            value["env_overrides"].get("CARGO_TARGET_DIR").is_none(),
+            "EnterWorktree must not inject a shared CARGO_TARGET_DIR: {}",
+            value["env_overrides"]
+        );
+        assert!(value["env_overrides"]["BRO_FLEET_BASE_REPO"].is_string());
+        let cwd = value["cwd"].as_str().unwrap();
+        run_git(repo.path(), &["worktree", "remove", "--force", cwd]);
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
     }
 }

@@ -400,19 +400,13 @@ pub(super) fn prepare_dispatch_worktree(
         git_root.display().to_string(),
     );
     env.insert("BRO_FLEET_WORKTREE_BRANCH".to_string(), branch.clone());
-    let cargo_target = git_root.join("target");
-    if git_root.join("Cargo.toml").is_file() {
-        env.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            cargo_target.display().to_string(),
-        );
-    }
+    // Per-worktree build isolation: the cockpit no longer injects CARGO_TARGET_DIR
+    // (or any language-specific build env). Each worktree gets its own target dir
+    // (the cargo default), so concurrent worktree builds never serialize on a
+    // shared build lock, and the cockpit stays project-agnostic. Project-specific
+    // dispatch env is opt-in via fleet.json `project_dispatch` (merged below).
+    merge_project_dispatch_env(&mut env, &git_root);
     let env_overrides = Some(env);
-    let cargo_line = env_overrides
-        .as_ref()
-        .and_then(|m| m.get("CARGO_TARGET_DIR"))
-        .map(|target| format!("\nShared Cargo target dir: {target}"))
-        .unwrap_or_default();
 
     let grounding = format!(
         "[fleet worktree grounding]\n\
@@ -420,7 +414,7 @@ You are running in an isolated git worktree created for this fleet dispatch.\n\
 Worktree path: {}\n\
 Worktree branch: {branch}\n\
 Base repository: {}\n\
-Base branch/ref: {base_branch} @ {base_sha}{cargo_line}\n\
+Base branch/ref: {base_branch} @ {base_sha}\n\
 Make code changes only inside the worktree path above unless the operator explicitly redirects you.\n\
 For project-scoped bbox calls (bbox_thread/_list, bbox_code_*, bbox_learn/decide/remember, \
 bbox_render, slice tools), pass THIS worktree path as project/project_dir — committed artifacts \
@@ -482,13 +476,32 @@ pub(super) fn resume_env_overrides(
         base_repo.display().to_string(),
     );
     env.insert("BRO_FLEET_WORKTREE_BRANCH".to_string(), branch);
-    if base_repo.join("Cargo.toml").is_file() {
-        env.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            base_repo.join("target").display().to_string(),
-        );
-    }
+    // Per-worktree build isolation on resume too — no shared CARGO_TARGET_DIR.
+    // Project-specific dispatch env is merged from fleet.json `project_dispatch`.
+    merge_project_dispatch_env(&mut env, &base_repo);
     Some(env)
+}
+
+/// Merge per-project dispatch env from `fleet.json` `project_dispatch` (keyed by
+/// canonical repo path) into the worktree dispatch env. Best-effort: a missing or
+/// malformed `fleet.json` must never block a dispatch, and reserved `BRO_FLEET_*`
+/// vars (already inserted) are never overridden.
+fn merge_project_dispatch_env(env: &mut HashMap<String, String>, repo: &Path) {
+    if let Some(dispatch) = FleetConfig::load().project_dispatch_for(repo) {
+        apply_dispatch_env(env, &dispatch.env);
+    }
+}
+
+/// Merge project-declared env into the dispatch env without clobbering reserved
+/// `BRO_FLEET_*` vars (already present). Pure half of
+/// [`merge_project_dispatch_env`] so the precedence is unit-testable.
+pub(super) fn apply_dispatch_env(
+    env: &mut HashMap<String, String>,
+    project_env: &std::collections::BTreeMap<String, String>,
+) {
+    for (k, v) in project_env {
+        env.entry(k.clone()).or_insert_with(|| v.clone());
+    }
 }
 
 pub(super) fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {

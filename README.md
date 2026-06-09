@@ -90,77 +90,14 @@ systemctl --user enable --now blackbox-dev.service
 
 This sample unit listens on `127.0.0.1:7265/mcp` with MCP name `blackbox-dev`, while keeping knowledge/threads/notes/index/render backups under dev-specific XDG paths. It also runs a separate installed binary path, `~/.local/bin/blackboxd-dev`, so dev restarts and binary swaps do not touch the prod service executable.
 
-### 2b. Build, run, or develop with Nix
+### 2b. Build or develop with Nix, and contributor setup
 
-The root flake now separates product outputs from contributor tooling:
-
-```bash
-nix build .#blackbox
-nix run .#blackboxd
-nix run .#bro
-nix develop .
-nix flake check
-nix fmt
-```
-
-- `packages.blackbox` / `packages.default`: build the crate for consumers
-- `apps.blackboxd` / `apps.bro`: run the shipped binaries without a local Rust toolchain
-- `checks.default`: validates the packaged build path that consumers use
-- `formatter`: `nix fmt` formats the flake with `nixpkgs-fmt`
-- `devShells.default`: contributor shell with Rust/Nix tooling
-
-### 2c. Run a fully isolated dev-agent world with Nix
-
-The dev systemd unit isolates the daemon, but not the agent harnesses that may
-still auto-read `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, or
-`~/.gemini/GEMINI.md`. For contained end-to-end testing, use the flake-backed
-dev harness instead:
-
-```bash
-nix develop .#dev-agent
-cp .dev-agent-links.example .dev-agent-links   # optional; keep untracked
-$EDITOR .dev-agent-links                       # link only auth/session material
-bbx-dev-home init
-bbx-dev-blackboxd
-```
-
-Open a second shell in the same repo and launch provider CLIs through the
-wrappers:
-
-```bash
-nix develop .#dev-agent
-bbx-dev-claude
-bbx-dev-codex
-bbx-dev-gemini
-```
-
-What the harness does:
-
-- creates an isolated home tree at `./.dev-agent/home`
-- keeps config, MCP wiring, render targets, blackbox state, transcript index,
-  and bro state inside that tree
-- points rendered global memory at the fake home's real pickup paths:
-  - `./.dev-agent/home/.claude-shared/CLAUDE.md`
-  - `./.dev-agent/home/.codex/AGENTS.md`
-  - `./.dev-agent/home/.gemini/GEMINI.md`
-- leaves auth/session passthrough explicit via `./.dev-agent-links`
-
-`./.dev-agent-links` is TAB-separated: `<relative-path-under-dev-home><TAB><absolute-host-path>`.
-That lets you borrow only the auth material the real CLI requires while keeping
-the mutable config and memory files isolated. Example:
-
-```text
-.claude/.credentials.json	/home/you/.claude/.credentials.json
-.codex/auth.json	/home/you/.codex/auth.json
-```
-
-This split is intentional: auth may need to map back to host paths, but config,
-MCP, render targets, and blackbox state should not.
-
-If a provider co-locates auth with config in a single file, do not symlink your
-real config wholesale unless you accept losing isolation for that provider.
-Prefer copying just the auth-bearing material into the dev home or using a
-provider-specific env var when the CLI supports one.
+Nix flake outputs (`nix build .#blackbox`, `nix run .#blackboxd|.#bro`,
+`nix develop .`/`.#dev-agent`, `nix flake check`, `nix fmt`), the fully isolated
+dev-agent world, and build-performance guidance (per-worktree target isolation +
+`sccache` via `fleet.json` `project_dispatch`) now live in
+**[`docs/developing-blackbox.md`](docs/developing-blackbox.md)** so this README
+stays focused on installing and running.
 
 ### 3. Connect your CLIs
 

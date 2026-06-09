@@ -11,10 +11,12 @@
 //! `App::closeout_rx` and is installed by `install_closeout` on the UI thread.
 
 use super::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bro_fleet_client::{CloseoutErrorClass, CloseoutOutcome, CloseoutPhase};
+use bro_fleet_client::{
+    CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, ProjectCloseout,
+};
 
 /// What the operator typed in the `/closeout` composer. The render-thread
 /// half stores the literal `disposition` for the result message; the
@@ -193,23 +195,33 @@ fn is_valid_disposition(d: &str) -> bool {
     matches!(d, "discard" | "publish" | "merge" | "adopt")
 }
 
-/// Compose the wire DTO from the parsed command + the focused agent's
-/// managed worktree path.
-fn build_request(parsed: &ParsedCloseout, worktree: &str) -> bro_fleet_client::CloseoutRequest {
+/// Compose the wire DTO from the parsed command + the focused agent's managed
+/// worktree path, layering in the resolved `project_closeout` config (default
+/// target, branch prefixes, and the `closeout_hooks` the daemon's phased driver
+/// runs). An explicit `--target` overrides the project default.
+fn build_request(
+    parsed: &ParsedCloseout,
+    worktree: &str,
+    project: Option<&ProjectCloseout>,
+) -> bro_fleet_client::CloseoutRequest {
     bro_fleet_client::CloseoutRequest {
         worktree: worktree.to_string(),
         disposition: parsed.disposition.clone(),
         confirm: parsed.confirm,
-        target: parsed.target.clone(),
+        target: parsed
+            .target
+            .clone()
+            .or_else(|| project.and_then(|p| p.target.clone())),
         // commit_message: the cockpit's `/closeout` is read-only on the
         // publish commit-message knob in Phase 3b (Phase 4 may add
         // `--message`); the daemon enforces the non-empty guard.
         commit_message: None,
         paths: Vec::new(),
-        allow_branch_prefixes: None,
+        allow_branch_prefixes: project.and_then(|p| p.allow_branch_prefixes.clone()),
         // Stamped verbatim from the parsed command. The daemon's phased
         // driver short-circuits to preflight-only when this is true.
         dry_run: parsed.dry_run,
+        closeout_hooks: project.and_then(resolve_closeout_hooks),
     }
 }
 
@@ -236,9 +248,59 @@ fn focused_closeout_context(app: &App) -> Option<FocusedCloseoutContext> {
     })
 }
 
+/// Map a project's `closeout_hooks` config into the resolved wire shape. Returns
+/// `None` when the project declares no hooks (keeps the wire payload empty).
+fn resolve_closeout_hooks(project: &ProjectCloseout) -> Option<CloseoutHooksWire> {
+    if project.closeout_hooks.is_empty() {
+        return None;
+    }
+    let hooks = project
+        .closeout_hooks
+        .iter()
+        .map(|(event, scripts)| (event.key().to_string(), scripts.clone()))
+        .collect();
+    Some(CloseoutHooksWire {
+        hooks,
+        cwd: project.hook_policy.cwd.clone(),
+        on_fail: Some(project.hook_policy.on_fail.as_str().to_string()),
+        timeout_secs: Some(project.hook_policy.timeout_secs),
+    })
+}
+
+/// Resolve the `project_closeout` entry for the repo backing `worktree`, keyed by
+/// canonical base-repo path. Strict-loads `fleet.json` so a typo'd
+/// target/hook fails the command loudly rather than silently reverting to
+/// defaults (design §3 Gap B). `Ok(None)` = no entry / no fleet.json.
+fn resolve_project_closeout(worktree: &str) -> Result<Option<ProjectCloseout>, String> {
+    let cfg = bro_fleet_client::FleetConfig::load_strict().map_err(|e| format!("{e:#}"))?;
+    let Some(base) = base_repo_of_worktree(worktree) else {
+        return Ok(None);
+    };
+    Ok(cfg.project_closeout_for(&base).cloned())
+}
+
+/// Resolve the base repo backing a managed worktree via
+/// `git --git-common-dir` (`<base>/.git` → `<base>`). Used to key
+/// `project_closeout`/`project_dispatch` by canonical repo path.
+fn base_repo_of_worktree(worktree: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let base = common.parent()?.to_path_buf();
+    base.canonicalize().ok()
+}
+
 /// Render-thread entrypoint. Resolves the focused row's daemon-classified
 /// managed worktree, validates the parse, applies proactive closeout gates,
-/// sets a "closeout: …" status flash, and spawns the worker task that hits
+/// resolves project closeout config (target/prefixes/hooks), sets a
+/// "closeout: …" status flash, and spawns the worker task that hits
 /// `/control/closeout`.
 pub(super) fn run_closeout(app: &mut App, arg: &str) {
     let parsed = match parse_closeout(arg) {
@@ -306,12 +368,26 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
             return;
         }
     };
+    // Strict-load + resolve project closeout config (target/prefixes/hooks). A
+    // malformed fleet.json blocks the command loudly rather than silently
+    // folding into the wrong target or skipping hooks (design §3 Gap B).
+    let project = match resolve_project_closeout(&worktree) {
+        Ok(p) => p,
+        Err(e) => {
+            app.set_status(
+                format!("/closeout: fleet.json error — {e}"),
+                Duration::from_secs(8),
+            );
+            app.clear_input();
+            return;
+        }
+    };
     let verb = if parsed.dry_run {
         "preflight"
     } else {
         &parsed.disposition
     };
-    let req = build_request(&parsed, &worktree);
+    let req = build_request(&parsed, &worktree, project.as_ref());
     let sent_disposition = req.disposition.clone();
     let dry_run = parsed.dry_run;
     let target = req.target.clone();
@@ -474,17 +550,25 @@ pub(super) fn poll_pending_closeout_recovery(app: &mut App) {
 }
 
 fn spawn_adopt_retry(app: &mut App, worktree: String, target: Option<String>) {
+    // The retry is a real adopt fold, so it must carry the same project hooks /
+    // branch prefixes as the original command. fleet.json was already validated
+    // by the initial /closeout, so resolve best-effort here (ignore a late parse
+    // error rather than stranding the recovery).
+    let project = resolve_project_closeout(&worktree).ok().flatten();
     let req = bro_fleet_client::CloseoutRequest {
         worktree: worktree.clone(),
         disposition: "adopt".to_string(),
         confirm: true,
-        target: target.clone(),
+        target: target
+            .clone()
+            .or_else(|| project.as_ref().and_then(|p| p.target.clone())),
         commit_message: None,
         paths: Vec::new(),
-        allow_branch_prefixes: None,
+        allow_branch_prefixes: project.as_ref().and_then(|p| p.allow_branch_prefixes.clone()),
         // The post-rebase-reconciliation retry is a real adopt run, not
         // a dry-run; the daemon's phased driver runs the full sequence.
         dry_run: false,
+        closeout_hooks: project.as_ref().and_then(resolve_closeout_hooks),
     };
     let orch = app.orch.clone();
     let tx = app.closeout_tx.clone();
@@ -610,6 +694,7 @@ fn phase_label(phase: CloseoutPhase) -> &'static str {
         CloseoutPhase::FfMerge => "ff_merge",
         CloseoutPhase::Push => "push",
         CloseoutPhase::Remove => "remove",
+        CloseoutPhase::Hook => "hook",
     }
 }
 
@@ -625,6 +710,7 @@ fn error_class_label(class: CloseoutErrorClass) -> &'static str {
         CloseoutErrorClass::FfMergeFailed => "ff_merge_failed",
         CloseoutErrorClass::PushRejected => "push_rejected",
         CloseoutErrorClass::RemoveFailed => "remove_failed",
+        CloseoutErrorClass::HookBlocked => "hook_blocked",
         CloseoutErrorClass::Other => "other",
     }
 }
@@ -749,7 +835,7 @@ mod tests {
                 confirm: expected_confirm,
                 ack_owner: None,
             };
-            let req = build_request(&parsed, "/tmp/wt");
+            let req = build_request(&parsed, "/tmp/wt", None);
             assert_eq!(req.disposition, disp, "disposition roundtrip for {disp}");
             assert_eq!(req.confirm, expected_confirm, "confirm for {disp}");
             assert_eq!(req.worktree, "/tmp/wt");
@@ -774,7 +860,7 @@ mod tests {
                 confirm: true,
                 ack_owner: None,
             };
-            let req = build_request(&parsed, "/tmp/wt");
+            let req = build_request(&parsed, "/tmp/wt", None);
             assert_eq!(req.disposition, disp, "disposition roundtrips for {disp} --dry-run");
             assert!(req.dry_run, "dry_run is stamped for {disp} --dry-run");
             assert!(req.confirm, "confirm stays true on dry-run for mutating {disp}");

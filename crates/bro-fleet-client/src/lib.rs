@@ -20,14 +20,16 @@ mod task;
 
 pub use config::{bro_home, daemon_port};
 pub use fleet::{
-    AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DEFAULT_CLASSIFIER_PROMPT, DispatchSpec,
-    FleetConfig, FleetOrchestrator, FocusedTranscriptBuffer, FocusedTranscriptStreamEvent,
-    INTERN_PREFIX, Provider, ResumeSpec, TaskSnapshot, TaskStatus, TodoItem, TodoItemStatus,
+    AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, CloseoutEvent, DEFAULT_CLASSIFIER_PROMPT,
+    DispatchSpec, FleetConfig, FleetOrchestrator, FocusedTranscriptBuffer,
+    FocusedTranscriptStreamEvent, HookOnFail, HookPolicy, INTERN_PREFIX, ProjectCloseout,
+    ProjectDispatch, Provider, ResumeSpec, TaskSnapshot, TaskStatus, TodoItem, TodoItemStatus,
     TodoState, TranscriptHistoryPageV1, TranscriptItem, intern_rider, parse_transcript,
     provider_supports_bidi,
 };
 pub use bro_protocol::{
-    CloseoutErrorClass, CloseoutOutcome, CloseoutPhase, CloseoutRequest, PhaseResult,
+    CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,
+    PhaseResult,
 };
 pub use mcp::McpServerConfig;
 pub use tail::TailEvent;

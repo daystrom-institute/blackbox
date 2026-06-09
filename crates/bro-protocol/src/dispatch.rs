@@ -16,7 +16,7 @@
 //! `bro_tools` side) on purpose: bro-protocol stays free of bro-tools and
 //! vice versa; the daemon bridges them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use bro_core::Provider;
@@ -138,6 +138,9 @@ pub enum CloseoutPhase {
     Push,
     /// `git worktree remove` in the base/target checkout.
     Remove,
+    /// A project-configured `closeout_hooks` scriptlet ran (or was blocked) at a
+    /// phase boundary (pre_push / pre_remove / post_success / on_discard).
+    Hook,
 }
 
 /// Coarse classification of a phase failure. Mirrors
@@ -163,6 +166,9 @@ pub enum CloseoutErrorClass {
     PushRejected,
     /// `git worktree remove` failed in base.
     RemoveFailed,
+    /// A `closeout_hooks` scriptlet with `on_fail = "block"` exited nonzero and
+    /// aborted the closeout before the guarded mutation (push / remove / discard).
+    HookBlocked,
     /// Disposition-not-applicable bail or other unclassified preflight bail.
     Other,
 }
@@ -190,6 +196,37 @@ pub struct PhaseResult {
 pub enum CloseoutOutcome {
     Success { phases: Vec<PhaseResult> },
     Failed(PhaseResult),
+}
+
+/// Fully-resolved closeout hooks on the wire (design/fleet-tui/closeout-command.md
+/// §3 Gap B, §4.4). The cockpit strict-loads the project's `project_closeout`
+/// config, resolves which scriptlets apply for the worktree's base repo, and
+/// sends this resolved shape; the daemon translates it into the `bro_tools`
+/// local `CloseoutHooks` and the driver runs each scriptlet at the matching
+/// phase boundary.
+///
+/// Event keys are `"pre_push" | "pre_remove" | "post_success" | "on_discard"`
+/// (kept stringly so the contract crate need not duplicate the event enum;
+/// unknown keys are ignored by the driver). The scriptlets run via `bash -lc`
+/// with the `BBOX_*` variable env injected (worktree, target dir, target branch,
+/// branch, disposition, base repo), so a scriptlet uses `$BBOX_WORKTREE` etc.
+/// directly. Policy (`cwd` / `on_fail` / `timeout_secs`) applies to every hook;
+/// the daemon supplies defaults (base-repo cwd, `"warn"`, 600s) for absent fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseoutHooksWire {
+    /// event name → ordered shell scriptlets.
+    #[serde(default)]
+    pub hooks: BTreeMap<String, Vec<String>>,
+    /// Working directory for hook execution (daemon defaults to base repo).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// `"warn"` (default) or `"block"`. `block` is only meaningful at the
+    /// guarded boundaries (pre_push / pre_remove / on_discard).
+    #[serde(default)]
+    pub on_fail: Option<String>,
+    /// Per-scriptlet timeout in seconds (daemon defaults to 600).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Wire DTO for `/control/closeout`.
@@ -238,4 +275,10 @@ pub struct CloseoutRequest {
     /// doc for the full contract.
     #[serde(default)]
     pub dry_run: bool,
+    /// Fully-resolved project closeout hooks (see `CloseoutHooksWire`). Absent
+    /// means no hooks run. The cockpit resolves these from `project_closeout`
+    /// config; the daemon translates to the `bro_tools` local type and the
+    /// driver fires them at phase boundaries. Skipped entirely on `dry_run`.
+    #[serde(default)]
+    pub closeout_hooks: Option<CloseoutHooksWire>,
 }

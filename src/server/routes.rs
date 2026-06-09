@@ -1022,6 +1022,10 @@ pub(crate) async fn control_closeout_handler(
     driver_req.commit_message = req.commit_message.clone();
     driver_req.paths = req.paths.clone();
     driver_req.dry_run = req.dry_run;
+    // Resolved project closeout hooks (the cockpit strict-loaded fleet.json and
+    // sent them fully resolved). Translate the wire shape into the bro_tools
+    // local type; the driver fires them at phase boundaries. Skipped on dry_run.
+    driver_req.closeout_hooks = req.closeout_hooks.as_ref().map(to_driver_hooks);
 
     let outcome = run_closeout_phases(&driver_req);
 
@@ -1062,6 +1066,7 @@ fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::Ph
         ToolPhase::FfMerge => WirePhase::FfMerge,
         ToolPhase::Push => WirePhase::Push,
         ToolPhase::Remove => WirePhase::Remove,
+        ToolPhase::Hook => WirePhase::Hook,
     };
     let error_class = match r.error_class {
         ToolErr::None => WireErr::None,
@@ -1073,6 +1078,7 @@ fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::Ph
         ToolErr::FfMergeFailed => WireErr::FfMergeFailed,
         ToolErr::PushRejected => WireErr::PushRejected,
         ToolErr::RemoveFailed => WireErr::RemoveFailed,
+        ToolErr::HookBlocked => WireErr::HookBlocked,
         ToolErr::Other => WireErr::Other,
     };
     bro_protocol::PhaseResult {
@@ -1081,6 +1087,25 @@ fn to_wire_phase(r: &bro_tools::fleet_worktree::PhaseResult) -> bro_protocol::Ph
         ok: r.ok,
         error_class,
         content: r.content.clone(),
+    }
+}
+
+/// Translate the resolved wire `CloseoutHooksWire` into the `bro_tools` local
+/// `CloseoutHooks` the phased driver consumes. The daemon bridges the two type
+/// families (bro_protocol is contract-bottom; bro_tools stays free of it).
+fn to_driver_hooks(
+    w: &bro_protocol::CloseoutHooksWire,
+) -> bro_tools::fleet_worktree::CloseoutHooks {
+    use bro_tools::fleet_worktree::{CloseoutHooks, HookOnFail};
+    let on_fail = match w.on_fail.as_deref() {
+        Some("block") => HookOnFail::Block,
+        _ => HookOnFail::Warn,
+    };
+    CloseoutHooks {
+        hooks: w.hooks.clone(),
+        cwd: w.cwd.as_ref().map(std::path::PathBuf::from),
+        on_fail,
+        timeout_secs: w.timeout_secs.unwrap_or(600),
     }
 }
 
@@ -2954,6 +2979,7 @@ mod tests {
             paths: vec![],
             allow_branch_prefixes: None,
             dry_run: false,
+            closeout_hooks: None,
         };
         let resp = control_closeout_handler(AxumState(state), axum::Json(req))
             .await
@@ -2981,6 +3007,7 @@ mod tests {
             paths: vec![],
             allow_branch_prefixes: None,
             dry_run: false,
+            closeout_hooks: None,
         };
         let resp = control_closeout_handler(AxumState(state), axum::Json(req))
             .await
@@ -3007,6 +3034,7 @@ mod tests {
             paths: vec![],
             allow_branch_prefixes: None,
             dry_run: false,
+            closeout_hooks: None,
         };
         let resp = control_closeout_handler(AxumState(state), axum::Json(req))
             .await

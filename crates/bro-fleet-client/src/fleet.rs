@@ -87,6 +87,134 @@ pub struct FleetConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<String>,
+
+    /// Per-project dispatch env (the "leading edge"), keyed by **canonical repo
+    /// path**. Merged verbatim into the worktree dispatch env when the cockpit
+    /// dispatches into that repo. This is the project-agnostic replacement for
+    /// the old hardcoded `CARGO_TARGET_DIR`: a Rust repo opts into sccache
+    /// (`{"RUSTC_WRAPPER":"sccache"}`), a Java repo sets its own, most set none.
+    /// Read best-effort at dispatch time (a bad `fleet.json` must never block a
+    /// dispatch).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_dispatch: BTreeMap<String, ProjectDispatch>,
+
+    /// Per-project closeout config (the "trailing edge"), keyed by **canonical
+    /// repo path**. Strict-loaded at `/closeout` (a typo'd target/hook fails
+    /// loudly rather than silently reverting to defaults — design §3 Gap B).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_closeout: BTreeMap<String, ProjectCloseout>,
+}
+
+/// Per-project dispatch env (leading edge). See [`FleetConfig::project_dispatch`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProjectDispatch {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+/// A closeout lifecycle event a hook can bind to (config-side mirror of the
+/// driver's `CloseoutEvent`; serialized as the `closeout_hooks` map keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseoutEvent {
+    PrePush,
+    PreRemove,
+    PostSuccess,
+    OnDiscard,
+}
+
+impl CloseoutEvent {
+    /// Stable wire key (`"pre_push"`, …) used in the resolved `CloseoutHooksWire`.
+    pub fn key(self) -> &'static str {
+        match self {
+            CloseoutEvent::PrePush => "pre_push",
+            CloseoutEvent::PreRemove => "pre_remove",
+            CloseoutEvent::PostSuccess => "post_success",
+            CloseoutEvent::OnDiscard => "on_discard",
+        }
+    }
+}
+
+/// `on_fail` policy for closeout hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOnFail {
+    /// Log the failure and continue.
+    #[default]
+    Warn,
+    /// Abort the closeout before the guarded mutation.
+    Block,
+}
+
+impl HookOnFail {
+    /// Wire string (`"warn"` / `"block"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookOnFail::Warn => "warn",
+            HookOnFail::Block => "block",
+        }
+    }
+}
+
+fn default_hook_timeout_secs() -> u64 {
+    600
+}
+
+/// Policy applied to every closeout hook for a project.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HookPolicy {
+    /// Working directory for hook execution; absent → the base repo checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub on_fail: HookOnFail,
+    #[serde(default = "default_hook_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for HookPolicy {
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            on_fail: HookOnFail::default(),
+            timeout_secs: default_hook_timeout_secs(),
+        }
+    }
+}
+
+/// Per-project closeout config (trailing edge). See
+/// [`FleetConfig::project_closeout`]. The driver runs each scriptlet via
+/// `bash -lc` with `BBOX_*` env injected; see `design/fleet-tui/closeout-command.md`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProjectCloseout {
+    /// Default fold target branch (overridden by an explicit `/closeout --target`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Eligible worktree branch prefixes (defaults to `["bro-fleet/"]` downstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_branch_prefixes: Option<Vec<String>>,
+    /// event → ordered shell scriptlets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub closeout_hooks: BTreeMap<CloseoutEvent, Vec<String>>,
+    #[serde(default)]
+    pub hook_policy: HookPolicy,
+}
+
+/// Look up a per-project config entry by canonical repo path, falling back to
+/// the raw path. Keys in `fleet.json` are canonical repo paths.
+fn lookup_project<'a, T>(map: &'a BTreeMap<String, T>, repo: &Path) -> Option<&'a T> {
+    if map.is_empty() {
+        return None;
+    }
+    let canon = repo.canonicalize().ok();
+    for cand in [canon.as_deref(), Some(repo)].into_iter().flatten() {
+        if let Some(v) = map.get(cand.to_string_lossy().as_ref()) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Config for the experimental classifier companion — the "assistant's
@@ -249,6 +377,38 @@ impl FleetConfig {
                 Self::default()
             }
         }
+    }
+
+    /// Strict load for command paths that must not silently drop config — most
+    /// importantly `/closeout`, which reads `project_closeout`. A missing file is
+    /// still an empty config (`Ok`), but a present-but-malformed file is an error
+    /// (design §3 Gap B: a typo'd `target`/hook must fail loudly rather than
+    /// revert to `main`/no-hooks). `load()` stays best-effort for boot/dispatch.
+    pub fn load_strict() -> anyhow::Result<Self> {
+        match Self::path() {
+            Some(p) => Self::load_strict_from(&p),
+            None => Ok(Self::default()),
+        }
+    }
+
+    pub fn load_strict_from(path: &Path) -> anyhow::Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+        };
+        serde_json::from_str::<FleetConfig>(&text)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))
+    }
+
+    /// Per-project dispatch entry for `repo` (canonical-path keyed).
+    pub fn project_dispatch_for(&self, repo: &Path) -> Option<&ProjectDispatch> {
+        lookup_project(&self.project_dispatch, repo)
+    }
+
+    /// Per-project closeout entry for `repo` (canonical-path keyed).
+    pub fn project_closeout_for(&self, repo: &Path) -> Option<&ProjectCloseout> {
+        lookup_project(&self.project_closeout, repo)
     }
 
     /// Persist this fleet config next to the selected blackbox config.
@@ -2388,5 +2548,80 @@ mod tests {
         assert!(r.contains(INTERN_PREFIX));
         assert!(r.contains("advice"));
         assert!(r.contains("free to disagree"));
+    }
+
+    // ---- Phase 5: project config + strict load ----------------------------
+
+    #[test]
+    fn load_strict_from_missing_is_default_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FleetConfig::load_strict_from(&dir.path().join("fleet.json"))
+            .expect("a missing fleet.json is Ok(default) under strict load");
+        assert!(cfg.project_closeout.is_empty());
+        assert!(cfg.project_dispatch.is_empty());
+    }
+
+    #[test]
+    fn load_strict_from_malformed_errors_while_best_effort_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fleet.json");
+        std::fs::write(&p, "{ not valid json").unwrap();
+        assert!(
+            FleetConfig::load_strict_from(&p).is_err(),
+            "strict load must fail loudly on a malformed fleet.json"
+        );
+        // The boot/dispatch path stays best-effort (never blocks the cockpit).
+        assert!(FleetConfig::load_from(&p).project_closeout.is_empty());
+    }
+
+    #[test]
+    fn project_dispatch_and_closeout_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let p = dir.path().join("fleet.json");
+        let json = format!(
+            r#"{{
+              "project_dispatch": {{ "{repo}": {{ "env": {{ "RUSTC_WRAPPER": "sccache" }} }} }},
+              "project_closeout": {{ "{repo}": {{
+                  "target": "beta/blackbox-v2",
+                  "allow_branch_prefixes": ["bro-fleet/"],
+                  "closeout_hooks": {{ "pre_push": ["cargo check"], "post_success": ["echo done"] }},
+                  "hook_policy": {{ "on_fail": "block", "timeout_secs": 120 }}
+              }} }}
+            }}"#,
+            repo = repo.display()
+        );
+        std::fs::write(&p, json).unwrap();
+
+        let cfg = FleetConfig::load_strict_from(&p).expect("valid config loads");
+        let dispatch = cfg.project_dispatch_for(&repo).expect("dispatch entry");
+        assert_eq!(
+            dispatch.env.get("RUSTC_WRAPPER").map(String::as_str),
+            Some("sccache")
+        );
+        let closeout = cfg.project_closeout_for(&repo).expect("closeout entry");
+        assert_eq!(closeout.target.as_deref(), Some("beta/blackbox-v2"));
+        assert_eq!(closeout.hook_policy.on_fail, HookOnFail::Block);
+        assert_eq!(closeout.hook_policy.timeout_secs, 120);
+        assert_eq!(
+            closeout
+                .closeout_hooks
+                .get(&CloseoutEvent::PrePush)
+                .map(Vec::as_slice),
+            Some(&["cargo check".to_string()][..])
+        );
+        assert_eq!(
+            closeout.closeout_hooks[&CloseoutEvent::PostSuccess][0],
+            "echo done"
+        );
+    }
+
+    #[test]
+    fn hook_policy_defaults_when_absent() {
+        // A bare project_closeout entry → warn + 600s default policy.
+        let policy = HookPolicy::default();
+        assert_eq!(policy.on_fail, HookOnFail::Warn);
+        assert_eq!(policy.timeout_secs, 600);
+        assert!(policy.cwd.is_none());
     }
 }

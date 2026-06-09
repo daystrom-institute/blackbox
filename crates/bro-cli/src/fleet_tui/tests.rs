@@ -951,22 +951,18 @@ Trailing paragraph.";
         assert!(cwd.join("README.md").is_file());
         assert!(worktree.grounding.contains("isolated git worktree"));
         assert!(worktree.grounding.contains("Worktree branch: bro-fleet/"));
-        assert_eq!(
-            worktree
-                .env_overrides
-                .as_ref()
-                .and_then(|m| m.get("CARGO_TARGET_DIR"))
-                .map(String::as_str),
-            Some(
-                repo.path()
-                    .canonicalize()
-                    .unwrap()
-                    .join("target")
-                    .to_str()
-                    .unwrap()
-            )
-        );
         let env = worktree.env_overrides.as_ref().unwrap();
+        // Per-worktree build isolation: the cockpit must NOT inject a shared
+        // CARGO_TARGET_DIR (concurrent worktree builds would otherwise serialize
+        // on cargo's build lock). Each worktree uses its own target/ by default.
+        assert!(
+            !env.contains_key("CARGO_TARGET_DIR"),
+            "dispatch env must not hardcode CARGO_TARGET_DIR; got {env:?}"
+        );
+        assert!(
+            !worktree.grounding.contains("Shared Cargo target dir"),
+            "grounding must not advertise a shared target dir"
+        );
         let repo_root = repo.path().canonicalize().unwrap();
         let worktree_root = store.path().join("fleet").join("worktrees");
         assert_eq!(
@@ -1154,5 +1150,30 @@ Trailing paragraph.";
         assert!(
             rendered.iter().any(|l| l.contains("second")),
             "{rendered:?}"
+        );
+    }
+
+    /// Leading edge: project-declared dispatch env (e.g. sccache) is merged into
+    /// the worktree env, but reserved BRO_FLEET_* vars are never clobbered.
+    #[test]
+    fn apply_dispatch_env_adds_project_env_without_clobbering_reserved() {
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "BRO_FLEET_BASE_REPO".to_string(),
+            "/repo".to_string(),
+        );
+        let mut project = std::collections::BTreeMap::new();
+        project.insert("RUSTC_WRAPPER".to_string(), "sccache".to_string());
+        // A project entry must NOT be able to override a reserved fleet var.
+        project.insert(
+            "BRO_FLEET_BASE_REPO".to_string(),
+            "/evil".to_string(),
+        );
+        apply_dispatch_env(&mut env, &project);
+        assert_eq!(env.get("RUSTC_WRAPPER").map(String::as_str), Some("sccache"));
+        assert_eq!(
+            env.get("BRO_FLEET_BASE_REPO").map(String::as_str),
+            Some("/repo"),
+            "reserved BRO_FLEET_* must win over project_dispatch"
         );
     }
