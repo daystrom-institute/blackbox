@@ -48,6 +48,21 @@ points to a backlog doc.
   axes (native emission shape vs hosted backend) folded back through the
   `ToolFilter`. Subsumes the backlog web_search-fallback + result-normalization
   bullets.
+- [Remote-worker boundary](remote-worker-boundary.md) — proposed: what
+  irreducibly stays in the daemon when a harness worker runs in its own
+  container/machine. Working-set vs corpus truth (`semantic_status` is the
+  placement function); isolation *dissolves* granular governance into two
+  boundaries the daemon owns (dispatch composition + integration re-entry);
+  residency test = shared mutable state or the coordination point.
+- [Refactor tools v2: the in-box DSL](refactor-tools-v2.md) — proposed: dissolve
+  the 100+-kind `bbox-refactor` catalog into code-mode cell programs over a
+  small binding algebra (facts `code.*`/`lsp.*`/`analysis.*`, EditSet algebra,
+  one `apply()` choke point). Adjudication inverted to exception handler
+  (apply bounces with structured findings); catalog inverts into a script
+  library; lineage-computed `semantic_status` on the artifact. Migration is a
+  harness-first strangler ending **in-harness only** (decided): external/MCP
+  agents route via `bro_exec`/`bro_resume` or canned atoms; RX-V2 retires with
+  the MCP surface.
 
 ## Backlog (proposed — pick this up)
 
