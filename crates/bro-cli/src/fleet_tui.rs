@@ -156,6 +156,11 @@ struct Agent {
     selected_cwd: Option<String>,
     /// Display name: first N chars of the initial prompt, renamable (§5).
     name: String,
+    /// True once the user has renamed this agent locally (Ctrl+R in roster or
+    /// `/rename` in the zoom view). While set, `refresh_agents_from_roster`
+    /// stops adopting the daemon-derived name so a roster resync can't clobber
+    /// the operator's chosen label.
+    name_overridden: bool,
     /// Prompt rendered above the transcript for a fresh dispatch. Resume turns
     /// are synthesized into the event stream so they render after restored
     /// history instead of pretending to be turn 1.
@@ -778,7 +783,7 @@ fn refresh_agents_from_roster(app: &mut App) {
             if let Some(cwd) = project_display_cwd(snap.cwd.as_deref()) {
                 agent.selected_cwd = Some(cwd);
             }
-            if snap.name.is_some() {
+            if snap.name.is_some() && !agent.name_overridden {
                 agent.name = daemon_name;
             }
             next.push(agent);
@@ -792,6 +797,7 @@ fn refresh_agents_from_roster(app: &mut App) {
                 selected_service_tier: None,
                 selected_cwd: project_display_cwd(snap.cwd.as_deref()),
                 name: daemon_name,
+                name_overridden: false,
                 initial_prompt: None,
                 pending_inputs: VecDeque::new(),
                 seen_user_steers: 0,
@@ -2503,6 +2509,7 @@ fn submit(app: &mut App) {
         let new = app.input.trim();
         if !new.is_empty() {
             app.agents[idx].name = truncate(new, NAME_LEN);
+            app.agents[idx].name_overridden = true;
         }
         app.clear_input();
         return;
@@ -2523,6 +2530,7 @@ fn submit(app: &mut App) {
                 if let Some(idx) = app.selected_agent() {
                     if !name.is_empty() {
                         app.agents[idx].name = truncate(&name, NAME_LEN);
+                        app.agents[idx].name_overridden = true;
                     }
                 }
                 app.clear_input();
