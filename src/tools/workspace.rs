@@ -954,31 +954,38 @@ impl BlackboxServer {
         name = "work_tool_calls",
         description = "Query indexed workspace tool-call records by server, tool_name, glob_pattern, tool_kind, target, project, and time. Rows preserve (server, tool_name) identity."
     )]
-    pub(crate) fn work_tool_calls(
+    pub(crate) async fn work_tool_calls(
         &self,
         Parameters(p): Parameters<WorkToolCallsParams>,
     ) -> CallToolResult {
-        Self::run("work_tool_calls", || {
-            if self.state.idx.read().is_empty() {
-                self.state
+        let server = self.clone();
+        Self::run_blocking("work_tool_calls", move || {
+            if server.state.idx.read().is_empty() {
+                server
+                    .state
                     .idx
                     .write()
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("auto-index failed: {e}"))?;
             }
-            impl_work_tool_calls(&self.state.idx.read(), &p)
+            impl_work_tool_calls(&server.state.idx.read(), &p)
         })
+        .await
     }
 
     #[tool(
         name = "work_smart_read",
         description = "Read a file with stable line numbers and optional bounded bbox overlays. Use offset/limit to window large files; set enrich=false for plain reads."
     )]
-    pub(crate) fn work_smart_read(
+    pub(crate) async fn work_smart_read(
         &self,
         Parameters(p): Parameters<WorkSmartReadParams>,
     ) -> CallToolResult {
-        Self::run("work_smart_read", || impl_work_smart_read(&self.state, &p))
+        let server = self.clone();
+        Self::run_blocking("work_smart_read", move || {
+            impl_work_smart_read(&server.state, &p)
+        })
+        .await
     }
 
     #[tool(
@@ -1000,40 +1007,42 @@ impl BlackboxServer {
         name = "work_git_status",
         description = "Structured git status for a repository: branch, staged/unstaged/untracked files, and clean flag."
     )]
-    pub(crate) fn work_git_status(
+    pub(crate) async fn work_git_status(
         &self,
         Parameters(p): Parameters<WorkGitStatusParams>,
     ) -> CallToolResult {
-        Self::run("work_git_status", || {
+        Self::run_blocking("work_git_status", move || {
             let repo = resolve_repo(p.repo.as_deref())?;
             impl_work_git_status(&repo)
         })
+        .await
     }
 
     #[tool(
         name = "work_git_log",
         description = "Structured git commit log with sha, parents, author, date, and subject. Default limit is 20, max 200."
     )]
-    pub(crate) fn work_git_log(
+    pub(crate) async fn work_git_log(
         &self,
         Parameters(p): Parameters<WorkGitLogParams>,
     ) -> CallToolResult {
-        Self::run("work_git_log", || {
+        Self::run_blocking("work_git_log", move || {
             let repo = resolve_repo(p.repo.as_deref())?;
             let limit = p.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(200);
             impl_work_git_log(&repo, limit)
         })
+        .await
     }
 
     #[tool(
         name = "work_git_diff",
         description = "Structured git diff for working tree or staged changes, optionally path-restricted, with 32KB output cap. Set include_untracked=true to include untracked files as new-file patches."
     )]
-    pub(crate) fn work_git_diff(
+    pub(crate) async fn work_git_diff(
         &self,
         Parameters(p): Parameters<WorkGitDiffParams>,
     ) -> CallToolResult {
-        Self::run("work_git_diff", || {
+        Self::run_blocking("work_git_diff", move || {
             let repo = resolve_repo(p.repo.as_deref())?;
             impl_work_git_diff(
                 &repo,
@@ -1042,34 +1051,38 @@ impl BlackboxServer {
                 p.include_untracked.unwrap_or(false),
             )
         })
+        .await
     }
 
     #[tool(
         name = "work_git_show",
         description = "Show one commit by hex SHA with metadata and diff, capped at 32KB."
     )]
-    pub(crate) fn work_git_show(
+    pub(crate) async fn work_git_show(
         &self,
         Parameters(p): Parameters<WorkGitShowParams>,
     ) -> CallToolResult {
-        Self::run("work_git_show", || {
+        Self::run_blocking("work_git_show", move || {
             let repo = resolve_repo(p.repo.as_deref())?;
             impl_work_git_show(&repo, &p.sha)
         })
+        .await
     }
 
     #[tool(
         name = "work_git_commit",
         description = "Stage and commit files, rejecting sensitive paths before staging. Omitting files stages tracked modifications only; never pushes."
     )]
-    pub(crate) fn work_git_commit(
+    pub(crate) async fn work_git_commit(
         &self,
         Parameters(p): Parameters<WorkGitCommitParams>,
     ) -> CallToolResult {
-        Self::run("work_git_commit", || {
+        let server = self.clone();
+        Self::run_blocking("work_git_commit", move || {
             let repo = resolve_repo(p.repo.as_deref())?;
-            impl_work_git_commit(&self.state, &repo, &p)
+            impl_work_git_commit(&server.state, &repo, &p)
         })
+        .await
     }
 }
 

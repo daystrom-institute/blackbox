@@ -104,20 +104,21 @@ impl BlackboxServer {
         name = "bbox_storage_gc",
         description = "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule for temps, backups, orphan classes, inactive snapshots, and observed cap warnings."
     )]
-    pub(crate) fn bbox_storage_gc(
+    pub(crate) async fn bbox_storage_gc(
         &self,
         Parameters(p): Parameters<StorageGcParams>,
     ) -> CallToolResult {
-        Self::run("bbox_storage_gc", || {
-            let edges_dir = storage_health::find_edges_dir(&self.state.store_dir, None);
+        let server = self.clone();
+        Self::run_blocking("bbox_storage_gc", move || {
+            let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
 
             let registered: std::collections::HashSet<String> = {
-                let guard = self.state.projects.read();
+                let guard = server.state.projects.read();
                 guard.list().into_iter().map(|r| r.project_id).collect()
             };
 
             let project_filter: Option<String> = if let Some(ref project) = p.project {
-                let guard = self.state.projects.read();
+                let guard = server.state.projects.read();
                 match guard.resolve(project) {
                     Ok(Some(record)) => Some(record.project_id),
                     _ => Some(project.clone()),
@@ -188,5 +189,6 @@ impl BlackboxServer {
                 "result": result,
             }))?)
         })
+        .await
     }
 }

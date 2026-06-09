@@ -35,15 +35,16 @@ impl BlackboxServer {
         name = "bbox_storage_migrate_legacy_edges",
         description = "Dry-run or apply legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Drops derived only when managed replacement exists; quarantines malformed lines."
     )]
-    pub(crate) fn bbox_storage_migrate_legacy_edges(
+    pub(crate) async fn bbox_storage_migrate_legacy_edges(
         &self,
         Parameters(p): Parameters<StorageMigrationParams>,
     ) -> CallToolResult {
-        Self::run("bbox_storage_migrate_legacy_edges", || {
-            let edges_dir = storage_health::find_edges_dir(&self.state.store_dir, None);
+        let server = self.clone();
+        Self::run_blocking("bbox_storage_migrate_legacy_edges", move || {
+            let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
 
             let registered: std::collections::HashSet<String> = {
-                let guard = self.state.projects.read();
+                let guard = server.state.projects.read();
                 guard.list().into_iter().map(|r| r.project_id).collect()
             };
 
@@ -74,7 +75,7 @@ impl BlackboxServer {
                 anyhow::bail!("apply mode requires a project parameter");
             };
             let project_id = {
-                let guard = self.state.projects.read();
+                let guard = server.state.projects.read();
                 match guard.resolve(project) {
                     Ok(Some(record)) if registered.contains(&record.project_id) => {
                         record.project_id
@@ -102,6 +103,7 @@ impl BlackboxServer {
                 "migration": manifest,
             }))?)
         })
+        .await
     }
 }
 

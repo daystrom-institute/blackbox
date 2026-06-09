@@ -31,20 +31,21 @@ impl BlackboxServer {
         name = "bbox_storage_health",
         description = "Read-only edge sidecar inventory. Totals active legacy, managed derived, backups, temps, orphan classes, inactive snapshots, and observed history; include_files=true for exact rows."
     )]
-    pub(crate) fn bbox_storage_health(
+    pub(crate) async fn bbox_storage_health(
         &self,
         Parameters(p): Parameters<StorageHealthParams>,
     ) -> CallToolResult {
-        Self::run("bbox_storage_health", || {
-            let edges_dir = storage_health::find_edges_dir(&self.state.store_dir, None);
+        let server = self.clone();
+        Self::run_blocking("bbox_storage_health", move || {
+            let edges_dir = storage_health::find_edges_dir(&server.state.store_dir, None);
 
             let registered: std::collections::HashSet<String> = {
-                let guard = self.state.projects.read();
+                let guard = server.state.projects.read();
                 guard.list().into_iter().map(|r| r.project_id).collect()
             };
 
             let project_filter: Option<String> = if let Some(ref project) = p.project {
-                let guard = self.state.projects.read();
+                let guard = server.state.projects.read();
                 match guard.resolve(project) {
                     Ok(Some(record)) => Some(record.project_id),
                     _ => Some(project.clone()),
@@ -68,5 +69,6 @@ impl BlackboxServer {
                 "files": report.files,
             }))?)
         })
+        .await
     }
 }

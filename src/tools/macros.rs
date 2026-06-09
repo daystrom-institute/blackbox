@@ -173,10 +173,6 @@ fn err_text(msg: &str) -> CallToolResult {
     r
 }
 
-fn registry_err(e: RegistryError) -> CallToolResult {
-    err_text(&format!("registry error: {e}"))
-}
-
 /// Resolve `project_dir` from an optional string: canonicalize if it exists,
 /// otherwise return as-is (may be a path that hasn't been created yet).
 fn resolve_project_dir(input: Option<&str>) -> Option<PathBuf> {
@@ -207,28 +203,34 @@ impl BlackboxServer {
         name = "macro_list",
         description = "List macros from all scopes, merged and deduplicated by id. Returns id, version, scope, title, language, and effects for each macro. Use macro_describe for the full definition."
     )]
-    pub(crate) fn macro_list(&self, Parameters(p): Parameters<MacroListParams>) -> CallToolResult {
-        let project_dir = resolve_project_dir(p.project_dir.as_deref());
-        let macros = MacroRegistry::list(project_dir.as_deref());
+    pub(crate) async fn macro_list(
+        &self,
+        Parameters(p): Parameters<MacroListParams>,
+    ) -> CallToolResult {
+        Self::run_blocking("macro_list", move || {
+            let project_dir = resolve_project_dir(p.project_dir.as_deref());
+            let macros = MacroRegistry::list(project_dir.as_deref());
 
-        let summaries: Vec<serde_json::Value> = macros
-            .iter()
-            .map(|m| {
-                json!({
-                    "id": m.id,
-                    "version": m.version,
-                    "scope": m.scope,
-                    "title": m.title,
-                    "language": m.language,
-                    "effects": m.effects,
+            let summaries: Vec<serde_json::Value> = macros
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.id,
+                        "version": m.version,
+                        "scope": m.scope,
+                        "title": m.title,
+                        "language": m.language,
+                        "effects": m.effects,
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        ok_json(&json!({
-            "macros": summaries,
-            "count": summaries.len(),
-        }))
+            Ok(serde_json::to_string_pretty(&json!({
+                "macros": summaries,
+                "count": summaries.len(),
+            }))?)
+        })
+        .await
     }
 
     /// Describe a single macro by `id`: returns the full definition plus a
@@ -237,56 +239,56 @@ impl BlackboxServer {
         name = "macro_describe",
         description = "Describe a macro by id: returns the full MacroDefinition plus a human-readable summary of operations, probes, and refusals."
     )]
-    pub(crate) fn macro_describe(
+    pub(crate) async fn macro_describe(
         &self,
         Parameters(p): Parameters<MacroDescribeParams>,
     ) -> CallToolResult {
-        let project_dir = resolve_project_dir(p.project_dir.as_deref());
+        Self::run_blocking("macro_describe", move || {
+            let project_dir = resolve_project_dir(p.project_dir.as_deref());
 
-        let def = match MacroRegistry::get(project_dir.as_deref(), &p.id) {
-            Ok(Some(d)) => d,
-            Ok(None) => {
-                return err_text(&format!("macro '{id}' not found in any scope", id = p.id));
-            }
-            Err(e) => return registry_err(e),
-        };
+            let def = match MacroRegistry::get(project_dir.as_deref(), &p.id) {
+                Ok(Some(d)) => d,
+                Ok(None) => anyhow::bail!("macro '{id}' not found in any scope", id = p.id),
+                Err(e) => anyhow::bail!("{e}"),
+            };
 
-        // Build a human summary
-        let op_kinds: Vec<&str> = def
-            .operations
-            .iter()
-            .map(|op| match op {
-                crate::macros::model::MacroOperation::Probe { .. } => "probe",
-                crate::macros::model::MacroOperation::Emit { .. } => "emit",
-                crate::macros::model::MacroOperation::Rewrite { .. } => "rewrite",
-                crate::macros::model::MacroOperation::DelegateRefactor { .. } => {
-                    "delegate_refactor"
-                }
-                crate::macros::model::MacroOperation::Validate { .. } => "validate",
-                crate::macros::model::MacroOperation::Record { .. } => "record",
-                crate::macros::model::MacroOperation::ForEach { .. } => "for_each",
-            })
-            .collect();
+            let op_kinds: Vec<&str> = def
+                .operations
+                .iter()
+                .map(|op| match op {
+                    crate::macros::model::MacroOperation::Probe { .. } => "probe",
+                    crate::macros::model::MacroOperation::Emit { .. } => "emit",
+                    crate::macros::model::MacroOperation::Rewrite { .. } => "rewrite",
+                    crate::macros::model::MacroOperation::DelegateRefactor { .. } => {
+                        "delegate_refactor"
+                    }
+                    crate::macros::model::MacroOperation::Validate { .. } => "validate",
+                    crate::macros::model::MacroOperation::Record { .. } => "record",
+                    crate::macros::model::MacroOperation::ForEach { .. } => "for_each",
+                })
+                .collect();
 
-        let summary = json!({
-            "id": def.id,
-            "version": def.version,
-            "language": def.language,
-            "scope": def.scope,
-            "title": def.title,
-            "operation_count": def.operations.len(),
-            "operation_kinds": op_kinds,
-            "probe_count": def.probes.len(),
-            "refusal_count": def.refusals.len(),
-            "validation_count": def.validations.len(),
-            "effects": def.effects,
-            "authority_gates": def.authority_gates,
-        });
+            let summary = json!({
+                "id": def.id,
+                "version": def.version,
+                "language": def.language,
+                "scope": def.scope,
+                "title": def.title,
+                "operation_count": def.operations.len(),
+                "operation_kinds": op_kinds,
+                "probe_count": def.probes.len(),
+                "refusal_count": def.refusals.len(),
+                "validation_count": def.validations.len(),
+                "effects": def.effects,
+                "authority_gates": def.authority_gates,
+            });
 
-        ok_json(&json!({
-            "summary": summary,
-            "definition": def,
-        }))
+            Ok(serde_json::to_string_pretty(&json!({
+                "summary": summary,
+                "definition": def,
+            }))?)
+        })
+        .await
     }
 
     /// Validate a macro definition without registering it.
@@ -338,42 +340,39 @@ impl BlackboxServer {
         name = "macro_register",
         description = "Register a macro in the project scope. Writes to `<project_dir>/.bbox/macros/<id>.json`. Validates before writing. Refuses duplicate id+version unless overwrite=true."
     )]
-    pub(crate) fn macro_register(
+    pub(crate) async fn macro_register(
         &self,
         Parameters(p): Parameters<MacroRegisterParams>,
     ) -> CallToolResult {
-        let project_dir = PathBuf::from(&p.project_dir);
+        Self::run_blocking("macro_register", move || {
+            let project_dir = PathBuf::from(&p.project_dir);
 
-        if !project_dir.is_dir() {
-            return err_text(&format!(
-                "project_dir '{}' does not exist or is not a directory",
-                p.project_dir
-            ));
-        }
-
-        // Parse the definition
-        let def: MacroDefinition = match serde_json::from_value(p.definition) {
-            Ok(d) => d,
-            Err(e) => {
-                return err_text(&format!("failed to parse definition: {e}"));
+            if !project_dir.is_dir() {
+                anyhow::bail!(
+                    "project_dir '{}' does not exist or is not a directory",
+                    p.project_dir
+                );
             }
-        };
 
-        // List-before-register: the registry handles conflict detection.
-        // Capture the id before moving `def` so we can report it in the response.
-        let def_id = def.id.clone();
-        match MacroRegistry::register(&project_dir, def, p.overwrite) {
-            Ok(()) => ok_json(&json!({
-                "registered": true,
-                "id": def_id,
-                "scope": "project",
-            })),
-            Err(e @ RegistryError::Conflict { .. }) => {
-                // user-friendly conflict message
-                err_text(&format!("{e} (set overwrite=true to replace)"))
+            let def: MacroDefinition = serde_json::from_value(p.definition)
+                .map_err(|e| anyhow::anyhow!("failed to parse definition: {e}"))?;
+
+            // List-before-register: the registry handles conflict detection.
+            // Capture the id before moving `def` so we can report it in the response.
+            let def_id = def.id.clone();
+            match MacroRegistry::register(&project_dir, def, p.overwrite) {
+                Ok(()) => Ok(serde_json::to_string_pretty(&json!({
+                    "registered": true,
+                    "id": def_id,
+                    "scope": "project",
+                }))?),
+                Err(e @ RegistryError::Conflict { .. }) => {
+                    anyhow::bail!("{e} (set overwrite=true to replace)")
+                }
+                Err(e) => anyhow::bail!("{e}"),
             }
-            Err(e) => registry_err(e),
-        }
+        })
+        .await
     }
 
     /// Unregister (remove) a project-scope macro by `id`.
@@ -384,26 +383,29 @@ impl BlackboxServer {
         name = "macro_unregister",
         description = "Remove a project-scope macro by id. Deletes `.bbox/macros/<id>.json` from the project directory. Does not affect user or builtin macros."
     )]
-    pub(crate) fn macro_unregister(
+    pub(crate) async fn macro_unregister(
         &self,
         Parameters(p): Parameters<MacroUnregisterParams>,
     ) -> CallToolResult {
-        let project_dir = PathBuf::from(&p.project_dir);
+        Self::run_blocking("macro_unregister", move || {
+            let project_dir = PathBuf::from(&p.project_dir);
 
-        if !project_dir.is_dir() {
-            return err_text(&format!(
-                "project_dir '{}' does not exist or is not a directory",
-                p.project_dir
-            ));
-        }
+            if !project_dir.is_dir() {
+                anyhow::bail!(
+                    "project_dir '{}' does not exist or is not a directory",
+                    p.project_dir
+                );
+            }
 
-        match MacroRegistry::unregister(&project_dir, &p.id) {
-            Ok(()) => ok_json(&json!({
-                "unregistered": true,
-                "id": p.id,
-            })),
-            Err(e) => registry_err(e),
-        }
+            match MacroRegistry::unregister(&project_dir, &p.id) {
+                Ok(()) => Ok(serde_json::to_string_pretty(&json!({
+                    "unregistered": true,
+                    "id": p.id,
+                }))?),
+                Err(e) => anyhow::bail!("{e}"),
+            }
+        })
+        .await
     }
 
     /// Plan a macro invocation without writing anything to disk.
@@ -420,55 +422,57 @@ impl BlackboxServer {
         name = "macro_plan",
         description = "Plan a macro invocation: resolve the named macro, validate inputs, run the planner pipeline, and return a MacroPlan review artifact. Read-only — never writes files."
     )]
-    pub(crate) fn macro_plan(&self, Parameters(p): Parameters<MacroPlanParams>) -> CallToolResult {
-        let project_dir = resolve_project_dir(Some(&p.project_dir));
+    pub(crate) async fn macro_plan(
+        &self,
+        Parameters(p): Parameters<MacroPlanParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("macro_plan", move || {
+            let project_dir = resolve_project_dir(Some(&p.project_dir));
 
-        // Resolve definition from registry
-        let def = match MacroRegistry::get(project_dir.as_deref(), &p.macro_id) {
-            Ok(Some(d)) => d,
-            Ok(None) => {
-                return err_text(&format!(
-                    "macro '{}' not found in any scope (project_dir={:?})",
-                    p.macro_id, p.project_dir
-                ));
-            }
-            Err(e) => return registry_err(e),
-        };
+            let def = match MacroRegistry::get(project_dir.as_deref(), &p.macro_id) {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    anyhow::bail!(
+                        "macro '{}' not found in any scope (project_dir={:?})",
+                        p.macro_id,
+                        p.project_dir
+                    )
+                }
+                Err(e) => anyhow::bail!("{e}"),
+            };
 
-        // Build a planner context: sidecar backend (fails at call time when JAR
-        // is absent — fail-closed per RX-V3) + LSP from daemon state.
-        // P4b: wire the real CodeNavProbeRunner backed by lsp_sessions + project list.
-        let probe_runner = {
-            let projects = self.state.projects.read().list();
-            CodeNavProbeRunner::new(Some(self.state.lsp_sessions.clone()), projects)
-        };
-        let backend = {
-            let project_path = resolve_project_dir(Some(&p.project_dir))
-                .unwrap_or_else(|| std::path::PathBuf::from(&p.project_dir));
-            SidecarBackend::new(project_path)
-        };
+            // Build a planner context: sidecar backend (fails at call time when JAR
+            // is absent — fail-closed per RX-V3) + LSP from daemon state.
+            // P4b: wire the real CodeNavProbeRunner backed by lsp_sessions + project list.
+            let probe_runner = {
+                let projects = server.state.projects.read().list();
+                CodeNavProbeRunner::new(Some(server.state.lsp_sessions.clone()), projects)
+            };
+            let backend = {
+                let project_path = resolve_project_dir(Some(&p.project_dir))
+                    .unwrap_or_else(|| std::path::PathBuf::from(&p.project_dir));
+                SidecarBackend::new(project_path)
+            };
 
-        let invocation = MacroInvocation {
-            macro_id: p.macro_id,
-            version: p.version,
-            project_dir: p.project_dir,
-            inputs: p.inputs,
-            anchors: p.anchors,
-            operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
-        };
-        let ctx = MacroPlannerContext::new(
-            Box::new(backend),
-            Some(self.state.lsp_sessions.clone()),
-            Box::new(probe_runner),
-        );
+            let invocation = MacroInvocation {
+                macro_id: p.macro_id,
+                version: p.version,
+                project_dir: p.project_dir,
+                inputs: p.inputs,
+                anchors: p.anchors,
+                operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
+            };
+            let ctx = MacroPlannerContext::new(
+                Box::new(backend),
+                Some(server.state.lsp_sessions.clone()),
+                Box::new(probe_runner),
+            );
 
-        match MacroPlanner::plan(&invocation, &def, &ctx) {
-            Ok(plan) => match serde_json::to_value(&plan) {
-                Ok(v) => ok_json(&v),
-                Err(e) => err_text(&format!("failed to serialize MacroPlan: {e}")),
-            },
-            Err(e) => err_text(&e.to_string()),
-        }
+            let plan = MacroPlanner::plan(&invocation, &def, &ctx)?;
+            Ok(serde_json::to_string_pretty(&serde_json::to_value(&plan)?)?)
+        })
+        .await
     }
 
     /// Lower a `MacroPlan` to a `RefactorPlan` and apply it to disk.
@@ -484,50 +488,39 @@ impl BlackboxServer {
         name = "macro_apply",
         description = "Lower a MacroPlan to a RefactorPlan and apply it to disk. Wraps refactor::apply — no bypass flags are set by default. Requires confirm=true."
     )]
-    pub(crate) fn macro_apply(
+    pub(crate) async fn macro_apply(
         &self,
         Parameters(p): Parameters<MacroApplyParams>,
     ) -> CallToolResult {
-        // Deserialize the plan value as MacroPlan
-        let plan: MacroPlan = match serde_json::from_value(p.plan) {
-            Ok(pl) => pl,
-            Err(e) => {
-                return err_text(&format!(
+        let server = self.clone();
+        Self::run_blocking("macro_apply", move || {
+            let plan: MacroPlan = serde_json::from_value(p.plan).map_err(|e| {
+                anyhow::anyhow!(
                     "failed to parse `plan` as MacroPlan: {e}. \
                      Use macro_plan to generate a valid MacroPlan JSON."
-                ));
+                )
+            })?;
+
+            if !plan.refusals.is_empty() {
+                let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
+                anyhow::bail!(
+                    "macro '{}' has unresolved refusals: {}. \
+                     Resolve the refusal conditions before applying.",
+                    plan.macro_id,
+                    codes.join(", ")
+                );
             }
-        };
 
-        // Refuse plans with outstanding refusals (empty edit set, nothing to apply)
-        if !plan.refusals.is_empty() {
-            let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
-            return err_text(&format!(
-                "macro '{}' has unresolved refusals: {}. \
-                 Resolve the refusal conditions before applying.",
-                plan.macro_id,
-                codes.join(", ")
-            ));
-        }
+            let refactor_plan = MacroPlanner::lower(&plan)?;
 
-        // Lower to RefactorPlan
-        let refactor_plan = match MacroPlanner::lower(&plan) {
-            Ok(rp) => rp,
-            Err(e) => return err_text(&e.to_string()),
-        };
+            let plan_value = serde_json::to_value(&refactor_plan)
+                .map_err(|e| anyhow::anyhow!("failed to serialize RefactorPlan: {e}"))?;
 
-        // Serialize to Value for RefactorApplyParams
-        let plan_value = match serde_json::to_value(&refactor_plan) {
-            Ok(v) => v,
-            Err(e) => return err_text(&format!("failed to serialize RefactorPlan: {e}")),
-        };
-
-        let apply_params = build_macro_apply_params(plan_value, p.confirm, p.cwd);
-
-        Self::run("macro_apply", || {
-            let projects = self.state.projects.read().list();
+            let apply_params = build_macro_apply_params(plan_value, p.confirm, p.cwd);
+            let projects = server.state.projects.read().list();
             refactor::apply(&apply_params, &projects)
         })
+        .await
     }
 
     /// Plan and apply a macro in a single step.
@@ -542,90 +535,76 @@ impl BlackboxServer {
         name = "macro_run",
         description = "Plan and apply a macro in a single step. Equivalent to macro_plan followed by macro_apply. Requires confirm=true to execute."
     )]
-    pub(crate) fn macro_run(&self, Parameters(p): Parameters<MacroRunParams>) -> CallToolResult {
-        let project_dir = resolve_project_dir(Some(&p.project_dir));
+    pub(crate) async fn macro_run(
+        &self,
+        Parameters(p): Parameters<MacroRunParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("macro_run", move || {
+            let project_dir = resolve_project_dir(Some(&p.project_dir));
 
-        // Resolve definition from registry
-        let def = match MacroRegistry::get(project_dir.as_deref(), &p.macro_id) {
-            Ok(Some(d)) => d,
-            Ok(None) => {
-                return err_text(&format!(
-                    "macro '{}' not found in any scope (project_dir={:?})",
-                    p.macro_id, p.project_dir
-                ));
-            }
-            Err(e) => return registry_err(e),
-        };
-
-        let invocation = MacroInvocation {
-            macro_id: p.macro_id,
-            version: p.version,
-            project_dir: p.project_dir.clone(),
-            inputs: p.inputs,
-            anchors: None,
-            operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
-        };
-
-        // P4b: wire the real CodeNavProbeRunner backed by lsp_sessions + project list.
-        let probe_runner = {
-            let projects = self.state.projects.read().list();
-            CodeNavProbeRunner::new(Some(self.state.lsp_sessions.clone()), projects)
-        };
-        let backend = {
-            let project_path = resolve_project_dir(Some(&p.project_dir))
-                .unwrap_or_else(|| std::path::PathBuf::from(&p.project_dir));
-            SidecarBackend::new(project_path)
-        };
-        let ctx = MacroPlannerContext::new(
-            Box::new(backend),
-            Some(self.state.lsp_sessions.clone()),
-            Box::new(probe_runner),
-        );
-
-        // Plan phase
-        let plan = match MacroPlanner::plan(&invocation, &def, &ctx) {
-            Ok(pl) => pl,
-            Err(e) => return err_text(&e.to_string()),
-        };
-
-        // Short-circuit on refusals — return the plan for inspection
-        if !plan.refusals.is_empty() {
-            let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
-            return match serde_json::to_value(&plan) {
-                Ok(v) => {
-                    let mut r = ok_json(&json!({
-                        "status": "refused",
-                        "refusals": codes,
-                        "plan": v,
-                    }));
-                    r.is_error = Some(true);
-                    r
+            let def = match MacroRegistry::get(project_dir.as_deref(), &p.macro_id) {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    anyhow::bail!(
+                        "macro '{}' not found in any scope (project_dir={:?})",
+                        p.macro_id,
+                        p.project_dir
+                    )
                 }
-                Err(e) => err_text(&format!("macro refused; failed to serialize plan: {e}")),
+                Err(e) => anyhow::bail!("{e}"),
             };
-        }
 
-        // Lower to RefactorPlan
-        let refactor_plan = match MacroPlanner::lower(&plan) {
-            Ok(rp) => rp,
-            Err(e) => return err_text(&e.to_string()),
-        };
+            let invocation = MacroInvocation {
+                macro_id: p.macro_id,
+                version: p.version,
+                project_dir: p.project_dir.clone(),
+                inputs: p.inputs,
+                anchors: None,
+                operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
+            };
 
-        let plan_value = match serde_json::to_value(&refactor_plan) {
-            Ok(v) => v,
-            Err(e) => return err_text(&format!("failed to serialize RefactorPlan: {e}")),
-        };
+            // P4b: wire the real CodeNavProbeRunner backed by lsp_sessions + project list.
+            let probe_runner = {
+                let projects = server.state.projects.read().list();
+                CodeNavProbeRunner::new(Some(server.state.lsp_sessions.clone()), projects)
+            };
+            let backend = {
+                let project_path = resolve_project_dir(Some(&p.project_dir))
+                    .unwrap_or_else(|| std::path::PathBuf::from(&p.project_dir));
+                SidecarBackend::new(project_path)
+            };
+            let ctx = MacroPlannerContext::new(
+                Box::new(backend),
+                Some(server.state.lsp_sessions.clone()),
+                Box::new(probe_runner),
+            );
 
-        let apply_params =
-            build_macro_apply_params(plan_value, p.confirm, Some(p.project_dir.clone()));
+            let plan = MacroPlanner::plan(&invocation, &def, &ctx)?;
 
-        // Capture a serialized copy of the plan for the response envelope
-        let plan_json = serde_json::to_value(&plan).unwrap_or(serde_json::Value::Null);
+            if !plan.refusals.is_empty() {
+                let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
+                let v = serde_json::to_value(&plan)?;
+                return Ok(serde_json::to_string_pretty(&json!({
+                    "status": "refused",
+                    "refusals": codes,
+                    "plan": v,
+                }))?);
+            }
 
-        Self::run("macro_run", || {
-            let projects = self.state.projects.read().list();
+            let refactor_plan = MacroPlanner::lower(&plan)?;
+
+            let plan_value = serde_json::to_value(&refactor_plan)
+                .map_err(|e| anyhow::anyhow!("failed to serialize RefactorPlan: {e}"))?;
+
+            let apply_params =
+                build_macro_apply_params(plan_value, p.confirm, Some(p.project_dir.clone()));
+
+            // Capture a serialized copy of the plan for the response envelope
+            let plan_json = serde_json::to_value(&plan).unwrap_or(serde_json::Value::Null);
+
+            let projects = server.state.projects.read().list();
             let apply_result = refactor::apply(&apply_params, &projects)?;
-            // Return both the plan and the apply result for audit
             let envelope = json!({
                 "plan": plan_json,
                 "apply_result": apply_result,
@@ -633,5 +612,6 @@ impl BlackboxServer {
             serde_json::to_string_pretty(&envelope)
                 .map_err(|e| anyhow::anyhow!("failed to serialize macro_run result: {e}"))
         })
+        .await
     }
 }

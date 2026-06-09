@@ -83,8 +83,7 @@ fn block_on_tool_future<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| handle.block_on(future))
+    tokio::runtime::Handle::current().block_on(future)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -160,17 +159,19 @@ impl BlackboxServer {
         name = "system_event_emit",
         description = "Emit a synthetic system event into the journal and broadcast. Ops-only; surface-enforced."
     )]
-    pub(crate) fn tool_system_event_emit(
+    pub(crate) async fn tool_system_event_emit(
         &self,
         Parameters(p): Parameters<SystemEventEmitParams>,
     ) -> CallToolResult {
-        Self::run("system_event_emit", || {
+        let server = self.clone();
+        Self::run_blocking("system_event_emit", move || {
             block_on_tool_future(async {
                 let draft = draft_from_emit_params(p)?;
-                let outcome = self.state.system_events.emit(draft).await?;
+                let outcome = server.state.system_events.emit(draft).await?;
                 Ok(serde_json::to_string_pretty(&outcome)?)
             })
         })
+        .await
     }
 
     #[tool(
@@ -220,45 +221,51 @@ impl BlackboxServer {
         name = "system_event_compact",
         description = "Apply system-event journal and outbox retention compaction. Ops-only; surface-enforced."
     )]
-    pub(crate) fn tool_system_event_compact(
+    pub(crate) async fn tool_system_event_compact(
         &self,
         Parameters(p): Parameters<SystemEventCompactParams>,
     ) -> CallToolResult {
-        Self::run("system_event_compact", || {
+        let server = self.clone();
+        Self::run_blocking("system_event_compact", move || {
             let now = p.now.unwrap_or_else(crate::util::now_iso);
-            let report = self.state.system_events.compact_with_now(&now)?;
+            let report = server.state.system_events.compact_with_now(&now)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
+        .await
     }
 
     #[tool(
         name = "reaction_install",
         description = "Install a reaction spec. Ops-only. Validates and persists to disk."
     )]
-    pub(crate) fn tool_reaction_install(
+    pub(crate) async fn tool_reaction_install(
         &self,
         Parameters(p): Parameters<ReactionInstallParams>,
     ) -> CallToolResult {
-        Self::run("reaction_install", || {
+        let server = self.clone();
+        Self::run_blocking("reaction_install", move || {
             block_on_tool_future(async {
                 let spec: system_events::types::ReactionSpec = serde_json::from_value(p.spec)?;
-                self.state
+                server
+                    .state
                     .system_events
                     .install_reaction(spec, p.replace)
                     .await?;
                 Ok("installed".to_string())
             })
         })
+        .await
     }
 
     #[tool(name = "reaction_list", description = "List installed reactions.")]
-    pub(crate) fn tool_reaction_list(
+    pub(crate) async fn tool_reaction_list(
         &self,
         Parameters(_p): Parameters<ReactionListParams>,
     ) -> CallToolResult {
-        Self::run("reaction_list", || {
+        let server = self.clone();
+        Self::run_blocking("reaction_list", move || {
             block_on_tool_future(async {
-                let result = self
+                let result = server
                     .state
                     .system_events
                     .list_reactions_with_warnings()
@@ -266,58 +273,62 @@ impl BlackboxServer {
                 Ok(serde_json::to_string_pretty(&result)?)
             })
         })
+        .await
     }
 
     #[tool(
         name = "reaction_replay",
         description = "Dry-run replay a reaction against an event. Returns rendered outputs without executing side effects."
     )]
-    pub(crate) fn tool_reaction_replay(
+    pub(crate) async fn tool_reaction_replay(
         &self,
         Parameters(p): Parameters<ReactionReplayParams>,
     ) -> CallToolResult {
-        Self::run("reaction_replay", || {
+        let server = self.clone();
+        Self::run_blocking("reaction_replay", move || {
             block_on_tool_future(async {
                 if p.mode != "dry_run" {
                     anyhow::bail!("only mode='dry_run' is supported in this phase");
                 }
-                let event = self.state.system_events.open_event(&p.event_id)?;
+                let event = server.state.system_events.open_event(&p.event_id)?;
                 let Some(event) = event else {
                     anyhow::bail!("event '{}' not found", p.event_id);
                 };
-                let reaction = self.state.system_events.get_reaction(&p.reaction).await;
+                let reaction = server.state.system_events.get_reaction(&p.reaction).await;
                 let Some(reaction) = reaction else {
                     anyhow::bail!("reaction '{}' not found", p.reaction);
                 };
-                let outbox_records = self.state.system_events.outbox_store().load_all()?;
-                let packets = self.state.packets.read();
+                let outbox_records = server.state.system_events.outbox_store().load_all()?;
+                let packets = server.state.packets.read();
                 let result =
                     system_events::dry_run_replay(&reaction, &event, &packets, &outbox_records)?;
                 Ok(serde_json::to_string_pretty(&result)?)
             })
         })
+        .await
     }
 
     #[tool(
         name = "reaction_execute",
         description = "Execute a reaction once against an event through the audited outbox path. Ops-only. Set force=true to bypass succeeded-idempotency suppression."
     )]
-    pub(crate) fn tool_reaction_execute(
+    pub(crate) async fn tool_reaction_execute(
         &self,
         Parameters(p): Parameters<ReactionExecuteParams>,
     ) -> CallToolResult {
-        Self::run("reaction_execute", || {
+        let server = self.clone();
+        Self::run_blocking("reaction_execute", move || {
             block_on_tool_future(async {
-                let event = self.state.system_events.open_event(&p.event_id)?;
+                let event = server.state.system_events.open_event(&p.event_id)?;
                 let Some(event) = event else {
                     anyhow::bail!("event '{}' not found", p.event_id);
                 };
-                let reaction = self.state.system_events.get_reaction(&p.reaction).await;
+                let reaction = server.state.system_events.get_reaction(&p.reaction).await;
                 let Some(reaction) = reaction else {
                     anyhow::bail!("reaction '{}' not found", p.reaction);
                 };
                 let result = system_events::worker::execute_reaction_once(
-                    self.state.clone(),
+                    server.state.clone(),
                     &event,
                     &reaction,
                     p.force,
@@ -326,18 +337,20 @@ impl BlackboxServer {
                 Ok(serde_json::to_string_pretty(&result)?)
             })
         })
+        .await
     }
 
     #[tool(
         name = "reaction_deliveries",
         description = "List outbox delivery records with optional filters."
     )]
-    pub(crate) fn tool_reaction_deliveries(
+    pub(crate) async fn tool_reaction_deliveries(
         &self,
         Parameters(p): Parameters<ReactionDeliveriesParams>,
     ) -> CallToolResult {
-        Self::run("reaction_deliveries", || {
-            let mut records = self.state.system_events.outbox_store().load_all()?;
+        let server = self.clone();
+        Self::run_blocking("reaction_deliveries", move || {
+            let mut records = server.state.system_events.outbox_store().load_all()?;
             if let Some(ref event_id) = p.event_id {
                 records.retain(|r| r.event_id == *event_id);
             }
@@ -357,18 +370,20 @@ impl BlackboxServer {
             }
             Ok(serde_json::to_string_pretty(&records)?)
         })
+        .await
     }
 
     #[tool(
         name = "reaction_retry",
         description = "Retry a dead-lettered outbox record. Ops-only. Requires explicit outbox id."
     )]
-    pub(crate) fn tool_reaction_retry(
+    pub(crate) async fn tool_reaction_retry(
         &self,
         Parameters(p): Parameters<ReactionRetryParams>,
     ) -> CallToolResult {
-        Self::run("reaction_retry", || {
-            let found = self
+        let server = self.clone();
+        Self::run_blocking("reaction_retry", move || {
+            let found = server
                 .state
                 .system_events
                 .outbox_store()
@@ -382,6 +397,7 @@ impl BlackboxServer {
                 )
             }
         })
+        .await
     }
 
     #[tool(
