@@ -366,24 +366,7 @@ impl SupervisionState {
             return self.snapshot(now_ms);
         }
 
-        let cfg = config();
-        let alerts = self.recent_alerts();
-        let loop_max = self.max_loop_count();
-        let compactions = self.compactions_within_window(now_ms);
-        let burn_is_green = token_burn_ratio(
-            self.total_input_tokens + self.total_output_tokens,
-            self.token_baseline,
-        )
-        .is_none_or(|r| r < cfg.token_burn_amber_ratio);
-
-        // Idle is deliberately absent from this check: long inactivity is a
-        // neutral fact, not a problem, so it must not flip a task out of green.
-        let is_green = alerts.is_empty()
-            && loop_max < cfg.loop_amber_count
-            && compactions < cfg.compaction_amber_count
-            && burn_is_green;
-
-        if is_green {
+        if self.is_green(now_ms) {
             let mut obj = serde_json::json!({
                 "ok": true,
                 "event_count": self.event_count,
@@ -400,6 +383,41 @@ impl SupervisionState {
         }
 
         self.snapshot(now_ms)
+    }
+
+    /// True when every supervision metric sits within its green threshold.
+    /// Only meaningful while `enabled`; a disabled supervisor has no opinion,
+    /// so it reports as not-green and callers gating on greenness keep emitting
+    /// its (disabled) snapshot rather than silently dropping it.
+    fn is_green(&self, now_ms: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let cfg = config();
+        // Idle is deliberately absent from this check: long inactivity is a
+        // neutral fact, not a problem, so it must not flip a task out of green.
+        let burn_is_green = token_burn_ratio(
+            self.total_input_tokens + self.total_output_tokens,
+            self.token_baseline,
+        )
+        .is_none_or(|r| r < cfg.token_burn_amber_ratio);
+        self.recent_alerts().is_empty()
+            && self.max_loop_count() < cfg.loop_amber_count
+            && self.compactions_within_window(now_ms) < cfg.compaction_amber_count
+            && burn_is_green
+    }
+
+    /// `snapshot_for_response`, but yields `None` when the task is `terminal`
+    /// AND supervision is green. Liveness / loop / token-burn monitoring of a
+    /// finished, healthy task carries no signal — the row would only restate
+    /// `ok: true` — so the whole field is dropped from terminal status
+    /// responses. Live tasks (idle / tool_running thresholds still useful) and
+    /// any non-green state always yield `Some`.
+    pub fn snapshot_for_response_gated(&self, now_ms: u64, terminal: bool) -> Option<Value> {
+        if terminal && self.is_green(now_ms) {
+            return None;
+        }
+        Some(self.snapshot_for_response(now_ms))
     }
 
     fn observe_usage(&mut self, sink: &EventSink) {

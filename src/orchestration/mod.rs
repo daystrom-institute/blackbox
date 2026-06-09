@@ -3202,7 +3202,15 @@ pub fn task_result_json(task: &Task) -> Value {
         obj["transcriptCursor"] = serde_json::to_value(cursor).unwrap_or(Value::Null);
     }
     let supervision_now = inner.completed_at.unwrap_or_else(now_ms);
-    obj["supervision"] = inner.supervision.snapshot_for_response(supervision_now);
+    // Gate the liveness row out of terminal, healthy responses — on a finished
+    // task it would only restate `ok: true`. Live or alerting tasks keep it
+    // (idle / tool_running / alerts still carry signal).
+    if let Some(supervision) = inner
+        .supervision
+        .snapshot_for_response_gated(supervision_now, inner.status.is_terminal())
+    {
+        obj["supervision"] = supervision;
+    }
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {
             obj["exitCode"] = Value::from(code);
@@ -3291,9 +3299,21 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
     let mut obj = task_result_json(task);
     let inner = task.inner.lock();
-    // Typed wire snapshot (additive field; existing ad-hoc fields stay for the
-    // IRC bridge and other readers). The fleet poller deserializes this.
-    obj["snapshot"] = serde_json::to_value(protocol_task_snapshot(&inner)).unwrap_or(Value::Null);
+    // Typed wire snapshot. The flat taskId/sessionId/status/result fields above
+    // already carry its task_id/session_id/status/last_message, and the fleet
+    // cockpit reads dispatch facets (origin/managed_worktree/workflow_owned)
+    // from the roster endpoint (RosterSummaryV1), not from here. So attach the
+    // snapshot only when it adds something a flat-field reader cannot already
+    // see: a structured error, a non-default origin, a managed worktree, or
+    // workflow ownership. In the common case it is pure duplication — omitted.
+    let snapshot = protocol_task_snapshot(&inner);
+    if snapshot.error.is_some()
+        || snapshot.origin != bro_core::Origin::Unknown
+        || snapshot.managed_worktree.is_some()
+        || snapshot.workflow_owned
+    {
+        obj["snapshot"] = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+    }
     let event_count = observed_event_count(&inner);
     obj["eventCount"] = Value::from(event_count);
     if tail > 0 && !inner.events.is_empty() {
@@ -4663,7 +4683,56 @@ mod tests {
         assert_eq!(json["hasResult"], true);
         assert_eq!(json["costUsd"], 0.05);
         assert_eq!(json["usage"]["input_tokens"], 100);
-        assert!(json["supervision"].is_object());
+        // Terminal + green: the liveness row is gated out — on a finished,
+        // healthy task it would only restate `ok: true`.
+        assert!(
+            json.get("supervision").is_none(),
+            "terminal healthy task should omit supervision: {json}"
+        );
+    }
+
+    #[test]
+    fn running_task_keeps_supervision() {
+        // A live task still carries supervision (idle/tool_running thresholds
+        // and any alerts are useful while it runs).
+        let running = task_with(TaskStatus::Running, "", vec![]);
+        let json = task_result_json(&running);
+        assert!(
+            json["supervision"].is_object(),
+            "running task must keep supervision: {json}"
+        );
+    }
+
+    #[test]
+    fn task_status_json_omits_redundant_snapshot() {
+        // Plain completed task: Unknown origin, no worktree, not workflow-owned,
+        // no error. The typed snapshot would only duplicate the flat identity
+        // fields, so it is omitted — those flat fields stay.
+        let ok = task_with(
+            TaskStatus::Completed,
+            "",
+            vec![serde_json::json!({"type": "system"})],
+        );
+        let json = task_status_json(&ok, 0);
+        assert!(
+            json.get("snapshot").is_none(),
+            "redundant snapshot should be omitted: {json}"
+        );
+        assert_eq!(json["taskId"], "t");
+        assert_eq!(json["status"], "completed");
+    }
+
+    #[test]
+    fn task_status_json_keeps_snapshot_with_error() {
+        // A failed task carries a structured error the flat fields don't expose
+        // as a typed object, so the snapshot is retained to carry it.
+        let failed = task_with(TaskStatus::Failed, "boom", vec![]);
+        let json = task_status_json(&failed, 0);
+        assert!(
+            json["snapshot"].is_object(),
+            "snapshot bearing an error should be kept: {json}"
+        );
+        assert_eq!(json["snapshot"]["status"], "failed");
     }
 
     #[test]
