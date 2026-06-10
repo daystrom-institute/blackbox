@@ -36,7 +36,7 @@ pub(crate) fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, b
     let bro_name = orchestration::team::find_bro_name_for_task(&inner.id, store_dir);
     let label = bro_name.unwrap_or_else(|| inner.id[..inner.id.len().min(8)].to_string());
     let elapsed = orch::format_elapsed(inner.started_at, inner.completed_at);
-    let events = inner.events.len();
+    let events = inner.observed_event_count();
     let activity = if terminal {
         format!("{:?}", inner.status)
     } else {

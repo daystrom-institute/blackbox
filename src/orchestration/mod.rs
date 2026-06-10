@@ -14,6 +14,8 @@ pub mod tail;
 pub mod team;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write as _;
+use std::ops::{Deref, DerefMut, Index, RangeFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -115,7 +117,9 @@ impl TaskPersister {
                 }
             });
         if spawned.is_err() {
-            tracing::error!("failed to spawn task-persist thread; persistence falls back to synchronous writes");
+            tracing::error!(
+                "failed to spawn task-persist thread; persistence falls back to synchronous writes"
+            );
         }
         Self {
             store,
@@ -323,7 +327,7 @@ pub struct TaskInner {
     pub id: String,
     pub provider: Provider,
     pub session_id: String,
-    pub events: Vec<Value>,
+    pub events: EventRing,
     pub model: Option<String>,
     pub last_assistant_message: Option<String>,
     pub usage: Option<Usage>,
@@ -383,6 +387,131 @@ pub struct TaskInner {
     /// True when a live workflow/atom owns this task's lifecycle and operator
     /// closeout/interrupt should be confirm-gated.
     pub workflow_owned: bool,
+}
+
+const TASK_EVENT_RING_CAPACITY: usize = 512;
+
+impl TaskInner {
+    pub fn observed_event_count(&self) -> usize {
+        let supervision_count = usize::try_from(self.supervision.event_count).unwrap_or(usize::MAX);
+        self.events.total_count().max(supervision_count)
+    }
+}
+
+pub struct EventRing {
+    events: Vec<Value>,
+    total_count: usize,
+}
+
+impl EventRing {
+    pub fn new() -> Self {
+        Self {
+            events: Vec::with_capacity(TASK_EVENT_RING_CAPACITY.min(16)),
+            total_count: 0,
+        }
+    }
+
+    pub fn from_loaded(events: Vec<Value>) -> Self {
+        let total_count = events.len();
+        let events = retain_recent_events(events, TASK_EVENT_RING_CAPACITY);
+        Self {
+            events,
+            total_count,
+        }
+    }
+
+    pub fn push(&mut self, event: Value) {
+        self.total_count = self.total_count.saturating_add(1);
+        if self.events.len() == TASK_EVENT_RING_CAPACITY {
+            self.events.remove(0);
+        }
+        self.events.push(event);
+    }
+
+    pub fn len(&self) -> usize {
+        self.total_count
+    }
+
+    #[cfg(test)]
+    pub fn retained_len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_count == 0
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    fn retained_offset_for_absolute(&self, absolute_start: usize) -> usize {
+        let dropped_count = self.total_count.saturating_sub(self.events.len());
+        absolute_start
+            .saturating_sub(dropped_count)
+            .min(self.events.len())
+    }
+}
+
+impl Default for EventRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Vec<Value>> for EventRing {
+    fn from(events: Vec<Value>) -> Self {
+        Self::from_loaded(events)
+    }
+}
+
+impl FromIterator<Value> for EventRing {
+    fn from_iter<T: IntoIterator<Item = Value>>(iter: T) -> Self {
+        let mut ring = Self::new();
+        for event in iter {
+            ring.push(event);
+        }
+        ring
+    }
+}
+
+impl Deref for EventRing {
+    type Target = [Value];
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl DerefMut for EventRing {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.events
+    }
+}
+
+impl Index<RangeFrom<usize>> for EventRing {
+    type Output = [Value];
+
+    fn index(&self, index: RangeFrom<usize>) -> &Self::Output {
+        let start = self.retained_offset_for_absolute(index.start);
+        &self.events[start..]
+    }
+}
+
+impl Index<usize> for EventRing {
+    type Output = Value;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.events[index]
+    }
+}
+
+fn retain_recent_events(mut events: Vec<Value>, limit: usize) -> Vec<Value> {
+    if events.len() > limit {
+        let drop_count = events.len() - limit;
+        events.drain(0..drop_count);
+    }
+    events
 }
 
 #[derive(Clone)]
@@ -495,7 +624,10 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         turns: inner.num_turns,
         cwd: inner.cwd.clone(),
         managed_worktree: inner.managed_worktree.clone(),
-        label: inner.bro_label.clone().or_else(|| inner.agent_label.clone()),
+        label: inner
+            .bro_label
+            .clone()
+            .or_else(|| inner.agent_label.clone()),
         name: inner
             .name
             .clone()
@@ -518,7 +650,11 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
 fn model_from_event(event: &serde_json::Value) -> Option<String> {
     event
         .get("model")
-        .or_else(|| event.get("message").and_then(|message| message.get("model")))
+        .or_else(|| {
+            event
+                .get("message")
+                .and_then(|message| message.get("model"))
+        })
         .and_then(|model| model.as_str())
         .map(|model| model.to_string())
 }
@@ -594,7 +730,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             id: id.into(),
             provider,
             session_id: format!("sess-{id}"),
-            events: vec![],
+            events: EventRing::new(),
             model: None,
             last_assistant_message: None,
             usage: None,
@@ -879,9 +1015,7 @@ impl TaskStore {
             if rec.started_at < cutoff {
                 continue;
             }
-            let model = rec
-                .model
-                .or_else(|| model_from_events_at_load(&rec.events));
+            let model = rec.model.or_else(|| model_from_events_at_load(&rec.events));
             if rec.status == TaskStatus::Running {
                 rec.status = TaskStatus::Failed;
                 rec.completed_at = Some(now_ms());
@@ -898,7 +1032,7 @@ impl TaskStore {
                     id: rec.id.clone(),
                     provider: rec.provider,
                     session_id: rec.session_id,
-                    events: rec.events,
+                    events: EventRing::from_loaded(rec.events),
                     model,
                     last_assistant_message: rec.last_assistant_message,
                     usage: rec.usage,
@@ -1496,7 +1630,7 @@ fn failed_duplicate_task(
             id: task_id,
             provider,
             session_id,
-            events: vec![],
+            events: EventRing::new(),
             model: None,
             last_assistant_message: None,
             usage: None,
@@ -1571,7 +1705,7 @@ pub fn spawn_in_process_task(
             id: task_id.clone(),
             provider,
             session_id: session_id.clone(),
-            events: Vec::new(),
+            events: EventRing::new(),
             model: None,
             last_assistant_message: None,
             usage: None,
@@ -2374,21 +2508,89 @@ fn claude_family_option_takes_value(arg: &str) -> bool {
     )
 }
 
-/// Open a per-session append file for tee-ing harness stdout/stderr, when
+const HARNESS_TEE_CHANNEL_CAPACITY: usize = 256;
+
+struct HarnessTee {
+    id: String,
+    suffix: String,
+    tx: std::sync::mpsc::SyncSender<String>,
+    warned_drop: bool,
+}
+
+impl HarnessTee {
+    fn try_write_line(&mut self, line: &str) {
+        match self.tx.try_send(format!("{line}\n")) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                if !self.warned_drop {
+                    self.warned_drop = true;
+                    tracing::warn!(
+                        task_id = %self.id,
+                        suffix = %self.suffix,
+                        "harness tee buffer full; dropping diagnostic lines for this task tee"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Start a per-session writer for tee-ing harness stdout/stderr, when
 /// `BLACKBOX_HARNESS_TEE_DIR` is set (`bro fleet` sets it by default so fleet
-/// spurious-stop turns are captured for postmortem). Returns None when disabled
-/// or on any IO error — tee-ing is best-effort diagnostics and must never fail a
-/// dispatch. `suffix` is e.g. "stdout.jsonl" / "stderr.log".
-fn open_harness_tee(id: &str, suffix: &str) -> Option<std::fs::File> {
+/// spurious-stop turns are captured for postmortem). Returns None when disabled.
+/// The append file is opened on the writer thread; tee-ing is best-effort
+/// diagnostics and must never block or fail a dispatch. `suffix` is e.g.
+/// "stdout.jsonl" / "stderr.log".
+fn open_harness_tee(id: &str, suffix: &str) -> Option<HarnessTee> {
     let dir = std::env::var("BLACKBOX_HARNESS_TEE_DIR")
         .ok()
         .filter(|d| !d.is_empty())?;
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::path::Path::new(&dir).join(format!("{id}.{suffix}")))
-        .ok()
+    let id = id.to_string();
+    let suffix = suffix.to_string();
+    let path = std::path::Path::new(&dir).join(format!("{id}.{suffix}"));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(HARNESS_TEE_CHANNEL_CAPACITY);
+    let thread_name = format!(
+        "harness-tee-{}-{suffix}",
+        id.chars().take(8).collect::<String>()
+    );
+    let id_for_thread = id.clone();
+    let suffix_for_thread = suffix.clone();
+    let spawned = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            else {
+                tracing::warn!(
+                    task_id = %id_for_thread,
+                    suffix = %suffix_for_thread,
+                    path = %path.display(),
+                    "failed to open harness tee"
+                );
+                return;
+            };
+            while let Ok(line) = rx.recv() {
+                if file.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            let _ = file.flush();
+        });
+    if spawned.is_err() {
+        tracing::warn!(task_id = %id, suffix = %suffix, "failed to spawn harness tee writer");
+        return None;
+    }
+    Some(HarnessTee {
+        id,
+        suffix,
+        tx,
+        warned_drop: false,
+    })
 }
 
 fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask {
@@ -2466,7 +2668,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     id: id.clone(),
                     provider,
                     session_id,
-                    events: vec![],
+                    events: EventRing::new(),
                     model: None,
                     last_assistant_message: None,
                     usage: None,
@@ -2524,7 +2726,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             id: id.clone(),
             provider,
             session_id: session_id.clone(),
-            events: vec![],
+            events: EventRing::new(),
             model: None,
             last_assistant_message: None,
             usage: None,
@@ -2640,25 +2842,27 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             let mut disruption_recorded = false;
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(w) = tee.as_mut() {
-                    use std::io::Write as _;
-                    let _ = writeln!(w, "{line}");
+                    w.try_write_line(&line);
                 }
                 if let Ok(evt) = serde_json::from_str::<Value>(&line) {
                     if !disruption_recorded {
                         if let Some(disruption) = provider.detect_disruption(&evt) {
                             disruption_recorded = true;
-                            let account = allocator::lookup_lease_for_task(
-                                &disruption_store_dir,
-                                &disruption_task_id,
-                            )
-                            .and_then(|lease| lease.account);
-                            account_probes::record_disruption_cooldown(
-                                &disruption_store_dir,
-                                provider,
-                                account.as_deref(),
-                                disruption,
-                                now_ms(),
-                            );
+                            let store_dir = disruption_store_dir.clone();
+                            let task_id = disruption_task_id.clone();
+                            let observed_at = now_ms();
+                            tokio::task::spawn_blocking(move || {
+                                let account =
+                                    allocator::lookup_lease_for_task(&store_dir, &task_id)
+                                        .and_then(|lease| lease.account);
+                                account_probes::record_disruption_cooldown(
+                                    &store_dir,
+                                    provider,
+                                    account.as_deref(),
+                                    disruption,
+                                    observed_at,
+                                );
+                            });
                         }
                     }
                     let snippet_to_emit = {
@@ -2818,8 +3022,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         let mut tee = open_harness_tee(&tee_id_err, "stderr.log");
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(w) = tee.as_mut() {
-                use std::io::Write as _;
-                let _ = writeln!(w, "{line}");
+                w.try_write_line(&line);
             }
             let mut inner = task_ref_err.inner.lock();
             inner.stderr.push_str(&line);
@@ -3578,8 +3781,7 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
 }
 
 fn observed_event_count(inner: &TaskInner) -> usize {
-    let supervision_count = usize::try_from(inner.supervision.event_count).unwrap_or(usize::MAX);
-    inner.events.len().max(supervision_count)
+    inner.observed_event_count()
 }
 
 // ---------------------------------------------------------------------------
@@ -3901,11 +4103,87 @@ mod tests {
     }
 
     #[test]
+    fn event_ring_eviction_preserves_event_count_and_recent_events() {
+        let task = test_task("task-ring", TaskStatus::Running, Provider::Glm);
+        let total = TASK_EVENT_RING_CAPACITY + 3;
+        for idx in 0..total {
+            push_in_process_event(
+                &task,
+                serde_json::json!({"type": "provider_event", "idx": idx}),
+            );
+        }
+
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.observed_event_count(), total);
+            assert_eq!(inner.events.len(), total);
+            assert_eq!(inner.events.retained_len(), TASK_EVENT_RING_CAPACITY);
+            assert_eq!(inner.events[0]["idx"], 3);
+        }
+
+        let status = task_status_json(&task, 4);
+        assert_eq!(status["eventCount"], total);
+        let recent = status["recentEvents"].as_array().unwrap();
+        let idxs: Vec<u64> = recent
+            .iter()
+            .map(|event| event["idx"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            idxs,
+            vec![
+                (total - 4) as u64,
+                (total - 3) as u64,
+                (total - 2) as u64,
+                (total - 1) as u64
+            ]
+        );
+    }
+
+    #[test]
+    fn persisted_snapshot_preserves_under_limit_event_shape() {
+        let mut store = TaskStore::new();
+        let task = test_task("task-persist-events", TaskStatus::Completed, Provider::Glm);
+        let expected_events: Vec<Value> = (0..3)
+            .map(|idx| serde_json::json!({"type": "provider_event", "idx": idx}))
+            .collect();
+        for event in expected_events.clone() {
+            push_in_process_event(&task, event);
+        }
+        store
+            .insert("task-persist-events".to_string(), task)
+            .unwrap();
+
+        let snapshot = store.serialize_snapshot(MAX_PERSISTED_EVENTS).unwrap();
+        let records: Value = serde_json::from_str(&snapshot).unwrap();
+        let record = &records.as_array().unwrap()[0];
+        assert_eq!(record["events"], Value::Array(expected_events));
+        assert!(record.get("event_count").is_none());
+        assert!(record.get("eventCount").is_none());
+    }
+
+    #[test]
+    fn harness_tee_overflow_drops_without_blocking_and_warns_once() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(0);
+        let mut tee = HarnessTee {
+            id: "task-tee".into(),
+            suffix: "stdout.jsonl".into(),
+            tx,
+            warned_drop: false,
+        };
+
+        tee.try_write_line("first");
+        assert!(tee.warned_drop);
+        tee.try_write_line("second");
+        assert!(tee.warned_drop);
+    }
+
+    #[test]
     fn task_name_defaults_from_prompt_teaser_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let task_store = RwLock::new(TaskStore::new());
-        let prompt = "Inspect the daemon roster regression and restore the model report name columns";
+        let prompt =
+            "Inspect the daemon roster regression and restore the model report name columns";
         let expected = default_task_name_from_prompt(prompt).unwrap();
         assert_eq!(expected.chars().count(), DEFAULT_TASK_NAME_CHARS);
 
@@ -3922,12 +4200,18 @@ mod tests {
             &root,
         );
         assert_eq!(task.inner.lock().name.as_deref(), Some(expected.as_str()));
-        assert_eq!(roster_summary_from_task(&task).name.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            roster_summary_from_task(&task).name.as_deref(),
+            Some(expected.as_str())
+        );
 
         task_store.read().persist(&root);
         let loaded = TaskStore::load(&root, u64::MAX);
         let loaded_task = loaded.get("task-name").expect("task should load");
-        assert_eq!(loaded_task.inner.lock().name.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            loaded_task.inner.lock().name.as_deref(),
+            Some(expected.as_str())
+        );
         assert_eq!(
             roster_summary_from_task(&loaded_task).name.as_deref(),
             Some(expected.as_str())
@@ -3939,7 +4223,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let task_store = RwLock::new(TaskStore::new());
-        let task = test_task("task-dispatch-model", TaskStatus::Completed, Provider::Brodex);
+        let task = test_task(
+            "task-dispatch-model",
+            TaskStatus::Completed,
+            Provider::Brodex,
+        );
         task_store
             .write()
             .insert("task-dispatch-model".to_string(), task.clone())
@@ -3989,7 +4277,7 @@ mod tests {
                 id: "t".into(),
                 provider: Provider::Glm,
                 session_id: "s".into(),
-                events,
+                events: EventRing::from_loaded(events),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -4429,7 +4717,7 @@ mod tests {
                 id: "task-known".to_string(),
                 provider: Provider::Brodex,
                 session_id: "session-a".to_string(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -4463,7 +4751,7 @@ mod tests {
                 id: "task-known".to_string(),
                 provider: Provider::Brodex,
                 session_id: "session-b".to_string(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -4515,7 +4803,7 @@ mod tests {
                 id: "task-err".to_string(),
                 provider: Provider::Minimax,
                 session_id: "sess-err".to_string(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -4568,7 +4856,7 @@ mod tests {
                 id: "task-reserved".to_string(),
                 provider: Provider::Brodex,
                 session_id: "session-a".to_string(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -4961,7 +5249,7 @@ mod tests {
                 id: "t1".into(),
                 provider: Provider::Glm,
                 session_id: "s1".into(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: Some("Done!".into()),
                 usage: Some(Usage {
@@ -5060,7 +5348,7 @@ mod tests {
                 id: "t2".into(),
                 provider: Provider::Brodex,
                 session_id: "s2".into(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -5110,7 +5398,9 @@ mod tests {
                 id: "t-empty".into(),
                 provider: Provider::Minimax,
                 session_id: "s-empty".into(),
-                events: vec![serde_json::json!({"type": "system", "subtype": "init"})],
+                events: EventRing::from_loaded(vec![
+                    serde_json::json!({"type": "system", "subtype": "init"}),
+                ]),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -5158,7 +5448,7 @@ mod tests {
             id: "t3".into(),
             provider: Provider::Deepseek,
             session_id: "requested-session".into(),
-            events: vec![],
+            events: EventRing::new(),
             model: None,
             last_assistant_message: Some("trusted prior result".into()),
             usage: Some(Usage {
@@ -5216,7 +5506,7 @@ mod tests {
             id: "t4".into(),
             provider: Provider::Deepseek,
             session_id: "s1".into(),
-            events: vec![],
+            events: EventRing::new(),
             model: None,
             last_assistant_message: None,
             usage: None,
@@ -5277,12 +5567,12 @@ mod tests {
             id: "t5".into(),
             provider: Provider::Brodex,
             session_id: "s1".into(),
-            events: vec![serde_json::json!({
+            events: EventRing::from_loaded(vec![serde_json::json!({
                 "type": "assistant",
                 "message": { "content": [
                     { "type": "tool_use", "id": "enter1", "name": "enter_worktree" }
                 ]}
-            })],
+            })]),
             model: None,
             last_assistant_message: None,
             usage: None,
@@ -5331,12 +5621,12 @@ mod tests {
             id: "t6".into(),
             provider: Provider::Brodex,
             session_id: "s1".into(),
-            events: vec![serde_json::json!({
+            events: EventRing::from_loaded(vec![serde_json::json!({
                 "type": "assistant",
                 "message": { "content": [
                     { "type": "tool_use", "id": "exit1", "name": "exit_worktree" }
                 ]}
-            })],
+            })]),
             model: None,
             last_assistant_message: None,
             usage: None,
@@ -5393,7 +5683,7 @@ mod async_tests {
                 id: "t1".into(),
                 provider: Provider::Glm,
                 session_id: "s1".into(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -5433,7 +5723,7 @@ mod async_tests {
                 id: "t-session".into(),
                 provider: Provider::Brodex,
                 session_id: "pending".into(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -5479,7 +5769,7 @@ mod async_tests {
                 id: "t-session-terminal".into(),
                 provider: Provider::Brodex,
                 session_id: "pending".into(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -5521,7 +5811,7 @@ mod async_tests {
                 id: "t2".into(),
                 provider: Provider::Glm,
                 session_id: "s1".into(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,
@@ -5575,7 +5865,7 @@ mod async_tests {
                 id: "t3".into(),
                 provider: Provider::Glm,
                 session_id: "s1".into(),
-                events: vec![],
+                events: EventRing::new(),
                 model: None,
                 last_assistant_message: None,
                 usage: None,

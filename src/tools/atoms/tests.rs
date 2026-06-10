@@ -41,7 +41,7 @@ fn make_task(
     );
     {
         let mut inner = task.inner.lock();
-        inner.events = events;
+        inner.events = orchestration::EventRing::from_loaded(events);
         inner.last_assistant_message = last_message.map(str::to_string);
         inner.report = report;
     }
