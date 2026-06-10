@@ -1,7 +1,7 @@
 ---
 title: "Concurrency model: planes, invariants, and the path off the bolt-on era"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -11,10 +11,22 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 
 # Concurrency model: planes, invariants, and the path off the bolt-on era
 
-> **Status.** Proposed. Synthesized 2026-06-09 from a four-plane code survey on
-> `beta/blackbox-v2` (commit 9cb5228) driven by work thread
-> `thread-935b467d` (daemon-controlplane-concurrency). File:line citations are
-> point-in-time; verify against code before implementing from this doc.
+> **Status.** Partially implemented (same-day campaign, 2026-06-09, waves 1–6
+> on `beta/blackbox-v2`; work thread `thread-935b467d` holds the per-wave
+> record). LANDED: Phase 0 (status single-lock + result/report budgets, I7
+> JSON-safe transport cap, tokio-metrics sampler + /admin/runtime-metrics with
+> tokio_unstable detail); Phase 1 (StorePersister actors for notes, threads,
+> pins, roadmap, projects, central kb — incl. the wave-6c reload-wrapper
+> purge; ~60 heavy sync handlers moved to run_blocking); Phase 3 dispatch
+> plane (bounded EventRing + monotonic counter, tee via per-task writer
+> thread, allocator/cooldown off-path, /tail decoration caches, harness
+> session persist via spawn_blocking) and the §4.5 RosterView. Measured:
+> under-load mean poll ~16.1ms → ~7.2ms (load not strictly comparable; see
+> thread). REMAINING: Phase 2 IndexWriterActor (tantivy LockBusy class),
+> status-snapshot publication (evidence-gated), bro_dashboard on RosterView,
+> gaps-store treatment, Phase 4 enforcement, the §4.6 runtime-split decision
+> (still open, instrumented). File:line citations are point-in-time from the
+> original survey at commit 9cb5228; verify against code.
 
 ## 0. Thesis
 
