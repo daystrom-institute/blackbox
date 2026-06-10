@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+// Unknown params are a data hazard, not noise: a misnamed `cwd:` was once
+// silently dropped and the dispatched session ran in the daemon's process
+// cwd (gap-16d79781). Fail loudly instead.
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExecParams {
     /// Task instruction for the agent
     pub(crate) prompt: String,
@@ -20,8 +24,9 @@ pub(crate) struct ExecParams {
     /// Dispatch selector option 2: raw provider for ad-hoc tasks.
     #[serde(default)]
     pub(crate) provider: Option<String>,
-    /// Working directory (absolute path)
-    #[serde(default)]
+    /// Working directory (absolute path). `cwd` is the canonical name at
+    /// the protocol layer and is accepted as an alias here.
+    #[serde(default, alias = "cwd")]
     pub(crate) project_dir: Option<String>,
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
@@ -128,6 +133,7 @@ pub(crate) struct ExecParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResumeParams {
     /// Follow-up instruction
     pub(crate) prompt: String,
@@ -141,8 +147,8 @@ pub(crate) struct ResumeParams {
     /// Provider (required with session_id)
     #[serde(default)]
     pub(crate) provider: Option<String>,
-    /// Working directory
-    #[serde(default)]
+    /// Working directory. `cwd` accepted as an alias.
+    #[serde(default, alias = "cwd")]
     pub(crate) project_dir: Option<String>,
     /// Per-resume service tier override. For Brodex, `priority` is fast mode
     /// and `default` is the standard-routing sentinel persisted by the harness.

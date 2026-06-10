@@ -42,6 +42,9 @@ points to a backlog doc.
   delivery, Nudger v1 + four rules.
 - [Diagnostics (window-0)](bro-harness-diagnostics.md) — the instant/error-tier
   MVP (`bro-lsp` + per-mutation rider); upper tiers deferred.
+- [Tool-arg defaulting](tool-arg-defaulting.md) — proposed: host-set
+  default/pin table (`additional_context`) that fills or enforces tool args
+  the model elides; cwd param conformity + dispatch hardening (gap-16d79781).
 - [Search provider abstraction](search-provider-abstraction.md) — proposed:
   replace the bare `web_search: bool` (default-ON, ungoverned, three divergent
   per-transport spellings, vibe-bh hole) with a normalized `SearchConfig` + two

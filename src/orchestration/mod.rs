@@ -2390,6 +2390,31 @@ pub fn spawn_task_with_tool_placement(
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
+    // A session must never inherit the daemon's process cwd ($HOME under
+    // launchd): a dispatch without an explicit cwd used to confine the
+    // session's file tools to the operator's home directory and write there
+    // (gap-16d79781). Fail closed into a per-task scratch dir instead;
+    // callers wanting a real workspace pass cwd/project_dir explicitly.
+    let cwd = cwd.or_else(|| {
+        let scratch = store_dir.join("scratch").join(&task_id);
+        match std::fs::create_dir_all(&scratch) {
+            Ok(()) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    scratch = %scratch.display(),
+                    "dispatch without cwd; confining session to a per-task scratch dir"
+                );
+                Some(scratch.to_string_lossy().to_string())
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "scratch cwd creation failed; session inherits the daemon process cwd"
+                );
+                None
+            }
+        }
+    });
     if matches!(
         provider,
         Provider::Glm
