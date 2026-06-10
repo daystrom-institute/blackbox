@@ -415,6 +415,8 @@ Report concise findings under these headings:
 7. after-the-fact visibility: state what would be visible through bro_status tail, harness dumps, tasks.json, daemon logs, or helper output.
 
 Use safe commands if shell is available. Prefer summaries over raw dumps. Never print full environment or provider credentials.
+
+Note: this debug daemon's agentic corpus is intentionally empty (no registered projects, delayed reindex, no boot edge-index rebuild). Skip bbox graph grounding (bbox_describe_schema will report project_file=0 — that is by design, not a defect); use filesystem/work tools directly for any source inspection. Do not file a substrate gap about the empty corpus.
 PROMPT
 }
 

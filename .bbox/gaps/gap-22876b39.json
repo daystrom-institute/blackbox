@@ -4,20 +4,25 @@
   "gap_kind": "mcp_surface",
   "domain": "sandbox-observability",
   "wanted_capability": "During sandbox observability probes, the blackbox opening sequence should surface live project code/docs as project_file entities so agents can inspect and bundle implementation evidence without falling back to filesystem search.",
-  "missing_primitive": "indexed project_file/project_file_v2 entities for grounded cwd",
+  "missing_primitive": "Root-caused 2026-06-10: NOT an indexing-pipeline bug. The sandbox observability probe (scripts/mcp_debug.sh sandbox-audit) dispatches against the ISOLATED debug daemon (port 7276, fresh $STATE_DIR), whose config structurally guarantees an empty agentic corpus: fresh BLACKBOX_PROJECTS_PATH ($STATE_DIR/projects.json → zero registered projects), reindex_startup_delay_secs=3600, reindex_interval_secs=3600, edge_index_boot_rebuild=false (mcp_debug.sh:58-62,85-89). Prod daemon concurrently shows project_file=137,947 — the producer (src/index/project_files.rs:134, providers/project_file.rs) works. Missing primitive: a grounding-seed step in the sandbox-audit flow — register the probe's project-dir on the debug daemon (bbox_project_register) and trigger+await one reindex/edge-index pass before dispatching the probe, or a script flag (e.g. --ground) that does so.",
   "fallback_used": "Used bbox_knowledge/describe/inspect/bundle for runbook/tool refs, then content_search and work_smart_read for source locations because bbox_describe_schema reported project_file/project_file_v2 population_count=0 and hybrid search returned only knowledge:bb-tool-reference.",
   "evidence": [
-    "bbox_describe_schema: project_file=0 project_file_v2=0",
-    "bbox_hybrid_search(query='system_memory evidence bundle bbox_bundle_evidence'): only knowledge:bb-tool-reference; vector route degraded",
-    "work_smart_read src/mcp_tools/bundle_evidence.rs",
-    "work_smart_read src/providers/system_memory.rs"
+    "scripts/mcp_debug.sh:58-62 (debug daemon config: reindex_startup_delay_secs=3600, edge_index_boot_rebuild=false)",
+    "scripts/mcp_debug.sh:85-89 (fresh BLACKBOX_PROJECTS_PATH + BLACKBOX_REINDEX_INTERVAL_SECS=3600 + BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false)",
+    "Live prod probe 2026-06-10: bbox_describe_schema project_file=137947, project_file_v2=0 — producer healthy; original probe's 0 was the isolated daemon's empty state",
+    "src/index/reindex.rs:349-369 (project-file phase reads ProjectRegistry from projects_path each pass)",
+    "src/server/schema.rs:9 + src/edge_index.rs:267 (population_count = global edge-index active counts; edge index starts empty when boot_rebuild=false)",
+    "original probe evidence: bbox_describe_schema project_file=0 project_file_v2=0 (task 8243248d)"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/sandbox-observability/project-file-index-empty-for-grounding",
+  "notes": "Diagnosis session 2026-06-10: vector-route degradation in the original probe was a red herring for the zero counts (degraded vectors only affect ranking, never entity-type counts). Fix is script/flow-level: seed the debug daemon's grounding before dispatching sandbox probes — register project, run one reindex pass, optionally enable edge_index boot rebuild for the sandbox-audit path. project_file_v2=0 everywhere is separate, expected (BBOX_PROJECT_REFS_V2 gate, src/index/project_files.rs:48-51).",
   "supersedes": "gap-00eb2e18",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "task_id": "8243248d-e643-4681-8d7d-0b2411d731e9",
   "created_at": "2026-06-05T18:59:29Z",
-  "updated_at": "2026-06-05T22:29:53Z"
+  "updated_at": "2026-06-10T23:24:31Z",
+  "resolved_at": "2026-06-10T23:24:31Z",
+  "resolution_note": "By design, not a missing capability. The isolated debug daemon's empty agentic corpus is intentional (fast throwaway state, no prod contamination); the sandbox-audit probe's deliverable never needed project_file entities — only the rendered opening-sequence ritual did, and describe_schema's population_count=0 is itself the correct \"skip grounding, use filesystem tools\" signal, which both probe occurrences (this + superseded gap-00eb2e18) followed successfully. Auto-seeding (register 277k-LOC repo + full reindex per probe) is cost with no consumer and immediate index drift. Tests that genuinely need the corpus surface on the debug daemon should register a small fixture project per-test. Mitigation shipped instead: sandbox_prompt() in scripts/mcp_debug.sh now tells probes the corpus is intentionally empty, preventing wasted grounding turns and a third refile."
 }

@@ -17,7 +17,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/thinking-only-turn-terminates-success",
   "suggested_owner": "bro-harness / harness-dispatch-economics thread (9dfe1da5) — peer's active area, coordinate before editing agent_loop.rs",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-10T21:53:46Z",
-  "updated_at": "2026-06-10T21:53:46Z"
+  "updated_at": "2026-06-10T23:15:59Z",
+  "resolved_at": "2026-06-10T23:15:59Z",
+  "resolution_note": "Addressed by ffd3996f (beta/blackbox-v2): (1) loop nudges once on empty-output stop (agent_loop.rs:1223-1241, one-shot guard) before accepting termination; (2) empty_output_stop detector now tests the TERMINAL step's text via last_turn_text (agent_loop.rs:1567-1607) instead of session-stale final_text; (3) suspicious turn-end diagnostics now ride the terminal result event as suspicious_turn_end (emit.rs:225-259) so orchestrators see the deliverable may be missing. Verified by code inspection + 8 passing regression tests (empty_output_stop_is_nudged_once_then_recovers, empty_output_stop_nudges_only_once_then_breaks, turn_end_diagnostics suite incl. max_turns-not-laundered case). Live repro not re-forced; unit tests simulate the empty-output stop path. Residual facet split out to a follow-up gap: persisted assistant events still drop stop_reason/usage (emit.rs:137-147), so max_tokens cuts remain indistinguishable from natural stops in the persisted stream."
 }

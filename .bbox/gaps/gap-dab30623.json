@@ -1,0 +1,21 @@
+{
+  "id": "gap-dab30623",
+  "title": "Persisted assistant events drop stop_reason/usage — max_tokens cuts indistinguishable from natural stops",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Persisted per-turn assistant events in the harness event stream should carry the model step's stop_reason and usage, so after-the-fact forensics (and orchestrators reading events.jsonl) can distinguish an output-token-cap cut (max_tokens mid-thinking) from a natural end_turn without relying on the suspicious-turn-end diagnostics only emitted at session termination.",
+  "missing_primitive": "emit.rs assistant_message (crates/bro-harness/src/emit.rs:137-147) serializes only role+content; the harness tracks last_model_stop internally but surfaces it solely in turn_end diagnostics / the terminal result's suspicious_turn_end (post-ffd3996f). Per-turn stop_reason/usage never reach the persisted assistant event.",
+  "fallback_used": "Infer from terminal suspicious_turn_end (only fires on suspicious stops) or from message_delta stream events when streaming was captured; non-terminal max_tokens cuts mid-session remain invisible in persisted events.",
+  "evidence": [
+    "crates/bro-harness/src/emit.rs:137-147 (assistant event: role+content only)",
+    "Split from gap-aa032081 evidence item 5 (live repro: deepseek session 557fdac2, 9,499-char thinking-only terminal turn, persisted events stop_reason=None/usage=None)",
+    "ffd3996f fixed termination behavior but did not touch per-turn event persistence"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/assistant-event-stop-reason-usage-dropped",
+  "suggested_owner": "bro-harness / coordinate with harness-dispatch-economics thread (9dfe1da5) before editing agent_loop.rs/emit.rs",
+  "resolution": "unresolved",
+  "created_at": "2026-06-10T23:16:13Z",
+  "updated_at": "2026-06-10T23:16:13Z"
+}
