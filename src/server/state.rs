@@ -53,6 +53,10 @@ pub(crate) struct SharedState {
     pub(crate) projects: Arc<RwLock<ProjectRegistry>>,
     pub(crate) projects_persister: StorePersister<ProjectRegistry>,
     pub(crate) packets: RwLock<Packets>,
+    /// Generation-validated cache of MCP surface decisions; see
+    /// `server::surface::SurfaceDecisionCache`. Keeps the wire head from
+    /// re-reading the packet store on every request.
+    pub(crate) surface_decisions: crate::server::surface::SurfaceDecisionCache,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
     pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
     /// Out-of-band trigger for the background reindex thread. The `.bbox/knowledge`
@@ -407,6 +411,7 @@ impl SharedState {
             projects: projects_store,
             projects_persister,
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
+            surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),

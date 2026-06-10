@@ -222,6 +222,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         projects: projects_store,
         projects_persister,
         packets: RwLock::new(packets_store),
+        surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts_store),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::server::surface::SurfaceCacheEntry;
 use crate::server::{self, BlackboxServer};
 
 use rmcp::handler::server::tool::ToolCallContext;
@@ -13,6 +14,63 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
 // ---------------------------------------------------------------------------
 // ServerHandler impl
 // ---------------------------------------------------------------------------
+
+impl BlackboxServer {
+    fn tool_universe(&self) -> Vec<String> {
+        self.tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    fn session_surface(&self) -> String {
+        // Canonical setter is `initialize`; "default" covers paths that
+        // bypass it.
+        self.surface
+            .get()
+            .map(|s| s.as_ref().to_string())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Surface decision for this session via the generation-validated cache.
+    /// The hit path is two short lock reads; a rebuild (first request after
+    /// a packet mutation) re-reads the packet store, so it runs on the
+    /// blocking pool.
+    async fn surface_entry(&self, surface: &str) -> Arc<SurfaceCacheEntry> {
+        let generation = self.state.packets.read().generation();
+        if let Some(hit) = self
+            .state
+            .surface_decisions
+            .lookup(surface, None, generation)
+        {
+            return hit;
+        }
+        let server = self.clone();
+        let surface_owned = surface.to_string();
+        match tokio::task::spawn_blocking(move || {
+            let universe = server.tool_universe();
+            server::surface::cached_surface_entry(&server.state, &surface_owned, None, || universe)
+        })
+        .await
+        {
+            Ok(entry) => entry,
+            Err(e) => {
+                // Only reachable if the rebuild closure panicked; recompute
+                // inline rather than poisoning the session.
+                tracing::warn!(error = %e, "surface decision rebuild panicked; recomputing inline");
+                self.surface_entry_sync(surface)
+            }
+        }
+    }
+
+    /// Synchronous variant for trait methods that cannot await. The miss
+    /// path blocks on the packet store scan.
+    fn surface_entry_sync(&self, surface: &str) -> Arc<SurfaceCacheEntry> {
+        let universe = self.tool_universe();
+        server::surface::cached_surface_entry(&self.state, surface, None, || universe)
+    }
+}
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BlackboxServer {
@@ -31,21 +89,9 @@ impl ServerHandler for BlackboxServer {
         } else {
             "default"
         };
-        let entity = server::surface::build_surface_entity(surface_str, None);
-        let decision = {
-            let packets = self.state.packets.read();
-            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>)
-        };
-        if matches!(
-            decision.verdict,
-            server::surface::ToolSurfaceVerdict::Deny { .. }
-        ) {
-            let reason = match &decision.verdict {
-                server::surface::ToolSurfaceVerdict::Deny { reason } => {
-                    reason.as_deref().unwrap_or("surface denied")
-                }
-                _ => unreachable!(),
-            };
+        let entry = self.surface_entry(surface_str).await;
+        if let server::surface::ToolSurfaceVerdict::Deny { reason } = &entry.decision.verdict {
+            let reason = reason.as_deref().unwrap_or("surface denied");
             return Err(ErrorData::internal_error(
                 format!("tool surface denied: {}", reason),
                 None,
@@ -59,19 +105,8 @@ impl ServerHandler for BlackboxServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        // Canonical setter is `initialize`; fallback for paths that bypass it.
-        let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
-        let entity = server::surface::build_surface_entity(surface, None);
-        let packets = self.state.packets.read();
-        let decision = server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
-        drop(packets);
-        let universe: Vec<String> = self
-            .tool_router
-            .list_all()
-            .iter()
-            .map(|t| t.name.to_string())
-            .collect();
-        if !server::surface::tool_visible(name, &decision, &universe) {
+        let entry = self.surface_entry_sync(&self.session_surface());
+        if !entry.visible.contains(name) {
             return None;
         }
         self.tool_router.get(name).cloned()
@@ -82,22 +117,15 @@ impl ServerHandler for BlackboxServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        // Canonical setter is `initialize`; fallback for paths that bypass it.
-        let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
-        let entity = server::surface::build_surface_entity(surface, None);
-        let packets = self.state.packets.read();
-        let decision = server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
-        drop(packets);
-        let universe: Vec<String> = self
+        let entry = self.surface_entry(&self.session_surface()).await;
+        let tools = self
             .tool_router
             .list_all()
-            .iter()
-            .map(|t| t.name.to_string())
+            .into_iter()
+            .filter(|t| entry.visible.contains(t.name.as_ref()))
             .collect();
-        let all = self.tool_router.list_all();
-        let filtered = server::surface::filter_tools(&all, &decision, &universe);
         Ok(ListToolsResult {
-            tools: filtered,
+            tools,
             ..Default::default()
         })
     }
@@ -107,21 +135,9 @@ impl ServerHandler for BlackboxServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (surface, decision, universe) = {
-            // Canonical setter is `initialize`; fallback for paths that bypass it.
-            let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
-            let entity = server::surface::build_surface_entity(surface, None);
-            let packets = self.state.packets.read();
-            let decision = server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
-            let universe: Vec<String> = self
-                .tool_router
-                .list_all()
-                .iter()
-                .map(|t| t.name.to_string())
-                .collect();
-            (surface.to_string(), decision, universe)
-        };
-        if !server::surface::tool_visible(&request.name, &decision, &universe) {
+        let surface = self.session_surface();
+        let entry = self.surface_entry(&surface).await;
+        if !entry.visible.contains(request.name.as_ref()) {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 format!(

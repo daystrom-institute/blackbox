@@ -255,6 +255,157 @@ pub fn filter_tools(
     }
 }
 
+// ── Wire-head decision cache ───────────────────────────────────────
+//
+// `evaluate_tool_surface` re-reads the entire packet store from disk
+// (`Packets::list_all` — one open+parse per packet file). Running that on
+// every MCP `initialize`/`tools/list`/`tools/call` put hundreds of
+// milliseconds of blocking I/O on a tokio worker per request, scaling with
+// store size (thread-935b467d). The wire head instead consults this
+// generation-validated cache: decisions are recomputed only after a packet
+// mutation, and the per-tool visibility loop collapses to a set lookup.
+
+/// Precomputed visibility for one `(surface, project)` pair at one packet
+/// store generation.
+pub struct SurfaceCacheEntry {
+    /// Packet store generation this entry was computed against.
+    pub generation: u64,
+    pub decision: ToolSurfaceDecision,
+    /// Tool names (router form) visible on this surface. Empty on deny.
+    pub visible: std::collections::HashSet<String>,
+}
+
+/// Bounded map of `(surface, project)` → cached decision. Surfaces are
+/// client-supplied strings, so the map is capped: a full cache is cleared
+/// rather than grown (entries rebuild in one evaluation each).
+#[derive(Default)]
+pub struct SurfaceDecisionCache {
+    entries: parking_lot::RwLock<
+        std::collections::HashMap<(String, String), std::sync::Arc<SurfaceCacheEntry>>,
+    >,
+}
+
+const SURFACE_CACHE_MAX_ENTRIES: usize = 64;
+
+impl SurfaceDecisionCache {
+    fn key(surface: &str, project: Option<&str>) -> (String, String) {
+        (surface.to_string(), project.unwrap_or("").to_string())
+    }
+
+    /// Return the cached entry iff it was computed at `generation`.
+    pub fn lookup(
+        &self,
+        surface: &str,
+        project: Option<&str>,
+        generation: u64,
+    ) -> Option<std::sync::Arc<SurfaceCacheEntry>> {
+        self.entries
+            .read()
+            .get(&Self::key(surface, project))
+            .filter(|e| e.generation == generation)
+            .cloned()
+    }
+
+    fn insert(
+        &self,
+        surface: &str,
+        project: Option<&str>,
+        entry: std::sync::Arc<SurfaceCacheEntry>,
+    ) {
+        let key = Self::key(surface, project);
+        let mut guard = self.entries.write();
+        if guard.len() >= SURFACE_CACHE_MAX_ENTRIES && !guard.contains_key(&key) {
+            guard.clear();
+        }
+        guard.insert(key, entry);
+    }
+}
+
+/// Compute the set of universe tools visible under `decision`.
+///
+/// Equivalent to `permits()` over in-universe names, but does the pattern
+/// normalization/prefix-stripping once per pattern instead of once per
+/// (pattern × tool), and skips `expand_pattern`: for a name that is itself
+/// drawn from the universe, expansion followed by literal glob-match reduces
+/// to matching the pattern against the name directly (tool names carry no
+/// glob metacharacters).
+pub fn visible_tool_set(
+    decision: &ToolSurfaceDecision,
+    universe: &[String],
+) -> std::collections::HashSet<String> {
+    let ToolSurfaceVerdict::ToolSurface {
+        allow, disallow, ..
+    } = &decision.verdict
+    else {
+        return std::collections::HashSet::new();
+    };
+    let prefix = blackbox_mcp_prefix();
+    let strip = |s: &str| {
+        s.strip_prefix(prefix.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| s.to_string())
+    };
+    let disallow_pats: Vec<String> = disallow
+        .iter()
+        .map(|p| strip(&normalize_filter_pattern(p)))
+        .collect();
+    let allow_pats: Vec<String> = allow
+        .iter()
+        .map(|p| strip(&normalize_filter_pattern(p)))
+        .collect();
+
+    universe
+        .iter()
+        .filter(|name| {
+            let bare = strip(name);
+            if disallow_pats.iter().any(|p| glob_match(p, &bare)) {
+                return false;
+            }
+            if !allow_pats.is_empty() {
+                return allow_pats.iter().any(|p| glob_match(p, &bare));
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+/// Cache-through evaluation: return the decision + visible set for
+/// `(surface, project)`, recomputing only when the packet store generation
+/// moved. `universe` is only invoked on a rebuild. Callers on the async
+/// runtime should run the miss path on the blocking pool — the rebuild
+/// re-reads the packet store from disk.
+pub(crate) fn cached_surface_entry(
+    state: &crate::server::state::SharedState,
+    surface: &str,
+    project: Option<&str>,
+    universe: impl FnOnce() -> Vec<String>,
+) -> std::sync::Arc<SurfaceCacheEntry> {
+    // Generation is read BEFORE evaluation: a packet mutation that lands
+    // mid-evaluation leaves the entry tagged with the older generation, so
+    // the next lookup misses and recomputes. The tag can never claim to be
+    // fresher than the data it labels.
+    let generation = state.packets.read().generation();
+    if let Some(hit) = state.surface_decisions.lookup(surface, project, generation) {
+        return hit;
+    }
+    let entity = build_surface_entity(surface, project);
+    let decision = {
+        let packets = state.packets.read();
+        evaluate_tool_surface(&packets, entity, project)
+    };
+    let visible = visible_tool_set(&decision, &universe());
+    let entry = std::sync::Arc::new(SurfaceCacheEntry {
+        generation,
+        decision,
+        visible,
+    });
+    state
+        .surface_decisions
+        .insert(surface, project, entry.clone());
+    entry
+}
+
 /// Extract the `surface` query parameter from a URI query string.
 /// Returns `"default"` if no `surface=` parameter is present.
 pub fn extract_surface_from_uri(query: Option<&str>) -> &str {
@@ -1114,5 +1265,130 @@ mod tests {
         } else {
             panic!("expected Deny variant");
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::packets::CompileParams;
+    use crate::server::state::SharedState;
+
+    fn universe() -> Vec<String> {
+        vec![
+            "bbox_search".to_string(),
+            "bbox_knowledge".to_string(),
+            "bro_exec".to_string(),
+            "work_shell".to_string(),
+        ]
+    }
+
+    fn decision(allow: &[&str], disallow: &[&str]) -> ToolSurfaceDecision {
+        ToolSurfaceDecision {
+            verdict: ToolSurfaceVerdict::ToolSurface {
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+                disallow: disallow.iter().map(|s| s.to_string()).collect(),
+                instructions: None,
+            },
+            filters: McpFilters::default(),
+        }
+    }
+
+    /// The set computation must agree with `permits()` for every
+    /// in-universe name across the pattern shapes surfaces actually use.
+    #[test]
+    fn visible_tool_set_matches_permits() {
+        let universe = universe();
+        let cases: Vec<ToolSurfaceDecision> = vec![
+            decision(&[], &[]),
+            decision(&["bbox_*"], &[]),
+            decision(&[], &["bro_*"]),
+            decision(&["mcp__blackbox__bbox_*"], &["mcp__blackbox__bbox_knowledge"]),
+            decision(&["mcp__blackbox__.bbox_search"], &[]),
+            decision(&["bbox_search", "work_?hell"], &["work_*"]),
+            decision(&["nomatch_*"], &[]),
+            ToolSurfaceDecision::deny("nope"),
+        ];
+        for d in cases {
+            let set = visible_tool_set(&d, &universe);
+            for name in &universe {
+                assert_eq!(
+                    set.contains(name),
+                    tool_visible(name, &d, &universe),
+                    "set/permits divergence for {name} under {:?}",
+                    d.verdict
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_entry_hits_until_packet_mutation_then_recomputes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = SharedState::for_test(tmp.path());
+
+        // No surface packet installed → passthrough, everything visible.
+        let entry1 = cached_surface_entry(&state, "readonly", None, universe);
+        assert!(!entry1.decision.is_deny());
+        assert_eq!(entry1.visible.len(), universe().len());
+
+        // Same generation → same Arc (no recomputation).
+        let entry1b = cached_surface_entry(&state, "readonly", None, || {
+            panic!("universe must not be rebuilt on a cache hit")
+        });
+        assert!(std::sync::Arc::ptr_eq(&entry1, &entry1b));
+
+        // Install a routing packet restricting the surface → generation
+        // moves → next read recomputes.
+        let consequent = serde_json::json!({
+            "route": "tool_surface",
+            "allow": ["bbox_*"],
+            "disallow": [],
+        });
+        state
+            .packets
+            .read()
+            .compile(&CompileParams {
+                domain: SURFACE_ROUTING_DOMAIN.to_string(),
+                rules: serde_json::json!([{
+                    "id": "readonly",
+                    "antecedent": {"op": "Eq", "field": "surface", "value": "readonly"},
+                    "consequent": serde_json::to_string(&consequent).unwrap(),
+                    "classification": "tool_surface",
+                }]),
+                classification_lattice: Some(vec![
+                    "tool_surface".to_string(),
+                    "deny".to_string(),
+                ]),
+                prefix_inference: Some(Default::default()),
+                scope: Some("global".to_string()),
+                project: None,
+                source_ids: None,
+                rank_lookup_key: None,
+                rank_table: None,
+                threshold_lookup_key: None,
+                threshold_table: None,
+            })
+            .unwrap();
+
+        let entry2 = cached_surface_entry(&state, "readonly", None, universe);
+        assert!(!std::sync::Arc::ptr_eq(&entry1, &entry2));
+        assert!(entry2.visible.contains("bbox_search"));
+        assert!(entry2.visible.contains("bbox_knowledge"));
+        assert!(!entry2.visible.contains("bro_exec"));
+        assert!(!entry2.visible.contains("work_shell"));
+    }
+
+    #[test]
+    fn cache_is_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = SharedState::for_test(tmp.path());
+        for i in 0..(super::SURFACE_CACHE_MAX_ENTRIES * 2 + 3) {
+            cached_surface_entry(&state, &format!("surface-{i}"), None, universe);
+        }
+        assert!(
+            state.surface_decisions.entries.read().len() <= super::SURFACE_CACHE_MAX_ENTRIES,
+            "cache must stay bounded under arbitrary client-supplied surfaces"
+        );
     }
 }

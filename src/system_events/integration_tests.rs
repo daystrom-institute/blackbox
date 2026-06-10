@@ -79,6 +79,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         projects,
         projects_persister,
         packets: RwLock::new(packets),
+        surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
