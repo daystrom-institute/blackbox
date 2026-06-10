@@ -10,6 +10,22 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `bro-harness` sidecar session event log: every harness session now appends a
+  timestamped `<session-id>.events.jsonl` next to its resume snapshot in
+  `$BRO_HOME/harness-sessions` — one `{"ts", "event"}` line per protocol
+  envelope event (user turns, assistant turns, tool results, terminal results)
+  plus harness milestones (session start/resume, compaction triggers).
+  Append-only and flushed per line, so crashed or hung sessions keep a durable
+  record up to the last completed event; compaction appends to it but never
+  rewrites it (the snapshot stays the resume artifact).
+- Harness-sessions transcript adapter: in-process harness sessions
+  (glm/deepseek/minimax/brodex/vibebh) are now indexed into the transcript
+  corpus from their sidecar event logs and surface in `bbox_search`,
+  `bbox_messages`, `bbox_session`, and time-based queries like any other
+  provider transcript. Harness task records also resolve a
+  `transcript_location` pointing at the session event log (populated on status
+  reads and at task finish).
+
 - `bro-harness` code-mode (`exec` / `wait`): the authorial/metatool surface,
   adopted from openai/codex's `code-mode` (vendored as the `bro-code-mode`
   crate, Apache-2.0). `exec` runs a JS/TS cell that composes the whole filtered

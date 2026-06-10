@@ -69,6 +69,11 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         th_path.clone(),
         rm_path.clone(),
     )?;
+    // Index in-process harness session event logs (sidecar JSONL next to the
+    // resume snapshots) so harness sessions are searchable like any other
+    // provider transcript. Same dir the BRO_HOME export below points the
+    // in-process harness at.
+    idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
     let (projects_store, projects_needs_persist) =
         ProjectRegistry::open_with_backfill_status(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());

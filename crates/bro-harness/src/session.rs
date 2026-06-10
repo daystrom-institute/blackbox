@@ -59,7 +59,7 @@ pub struct SaveState<'a> {
     pub side: Value,
 }
 
-fn sessions_dir() -> PathBuf {
+pub(crate) fn sessions_dir() -> PathBuf {
     if let Ok(home) = std::env::var("BRO_HOME") {
         PathBuf::from(home).join("harness-sessions")
     } else {

@@ -4,6 +4,7 @@
 //! `evt["session_id"]`). Only protocol JSON goes to stdout — all logging
 //! goes to stderr.
 
+use crate::event_log::EventLog;
 use crate::transport::{ToolResult, Usage};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -15,6 +16,12 @@ pub type EventCallback = Arc<dyn Fn(Value) + Send + Sync + 'static>;
 pub struct Emitter {
     session_id: String,
     callback: Option<EventCallback>,
+    /// Sidecar append-only event log (`event_log.rs`). When present, every
+    /// emitted envelope event is teed there with a timestamp — except
+    /// `stream_event` deltas (per-chunk noise whose content is already
+    /// captured whole by the `assistant` turn event) and `isReplay` user
+    /// echoes (the loop logs the authoritative user turn itself).
+    event_log: Option<Arc<EventLog>>,
 }
 
 impl Emitter {
@@ -22,6 +29,7 @@ impl Emitter {
         Self {
             session_id,
             callback: None,
+            event_log: None,
         }
     }
 
@@ -29,7 +37,14 @@ impl Emitter {
         Self {
             session_id,
             callback: Some(callback),
+            event_log: None,
         }
+    }
+
+    /// Attach the session's sidecar event log; see [`Emitter::event_log`].
+    pub fn with_event_log(mut self, log: Arc<EventLog>) -> Self {
+        self.event_log = Some(log);
+        self
     }
 
     pub fn session_id(&self) -> &str {
@@ -37,6 +52,12 @@ impl Emitter {
     }
 
     fn write_line(&self, v: serde_json::Value) {
+        if let Some(log) = &self.event_log
+            && v["type"].as_str() != Some("stream_event")
+            && v["isReplay"].as_bool() != Some(true)
+        {
+            log.append_event(&v);
+        }
         if let Some(callback) = &self.callback {
             callback(v);
             return;

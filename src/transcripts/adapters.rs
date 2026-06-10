@@ -49,12 +49,26 @@ impl TranscriptAdapterRegistry {
         Self { adapters }
     }
 
-    pub(crate) fn from_reindex_config(_config: &ReindexConfig) -> Self {
-        Self::new(Vec::new())
+    /// Registry for index-time scans. The harness-sessions dir must be
+    /// explicit in the config (it is `None` in tests that build hermetic
+    /// indexes) so reindex never silently scans the operator's real
+    /// `~/.bro-harness` state.
+    pub(crate) fn from_reindex_config(config: &ReindexConfig) -> Self {
+        match &config.harness_sessions_dir {
+            Some(dir) => Self::new(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(
+                dir,
+            )),
+            None => Self::new(Vec::new()),
+        }
     }
 
+    /// Registry for runtime lookups (`locate` for task transcript handles).
+    /// Resolves the harness sessions dir from the live environment — the
+    /// daemon exports `BRO_HOME` during startup, matching where in-process
+    /// harness sessions write.
     pub(crate) fn from_runtime_config() -> Self {
-        Self::new(Vec::new())
+        let dir = super::harness_sessions::env_sessions_dir();
+        Self::new(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(&dir))
     }
 
     pub(crate) fn adapters(&self) -> impl Iterator<Item = &dyn TranscriptReadAdapter> {

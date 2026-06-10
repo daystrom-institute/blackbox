@@ -2201,6 +2201,10 @@ pub fn finish_in_process_task(
     tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
     system_events: Option<crate::system_events::SharedEventHub>,
 ) {
+    // Resolve the durable transcript handle (the harness session event log)
+    // before the terminal state is persisted, so finished task records carry
+    // their transcript_location without needing a later status read.
+    populate_transcript_handle(task);
     let mut inner = task.inner.lock();
     if let Some(result) = result {
         inner.last_assistant_message = Some(result);
@@ -2487,6 +2491,17 @@ fn spawn_harness_in_process_task(
     if task.inner.lock().status != TaskStatus::Running {
         return task;
     }
+
+    // Stamp the dispatch provider into the per-session env so the harness
+    // records it in the session event-log `session_start` milestone — the
+    // transcript adapter uses it to attribute the session to the right
+    // provider (transports are shared across providers, so the harness can't
+    // know this by itself).
+    let mut env_overrides = env_overrides;
+    env_overrides
+        .get_or_insert_with(HashMap::new)
+        .entry("BRO_HARNESS_PROVIDER".to_string())
+        .or_insert_with(|| provider.as_str().to_string());
 
     let task_for_run = task.clone();
     let task_for_events = task.clone();
@@ -4390,6 +4405,43 @@ mod tests {
             .status,
             bro_protocol::TaskStatus::Running
         );
+    }
+
+    #[test]
+    fn populate_transcript_handle_sets_event_log_location_for_harness_task() {
+        let mut env = crate::util::TestEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let bro_home = root.join("bro-home");
+        let sessions = bro_home.join("harness-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        env.set("BRO_HOME", &bro_home);
+
+        let log_path = sessions.join("sess-t-loc.events.jsonl");
+        std::fs::write(
+            &log_path,
+            concat!(
+                r#"{"ts":"2026-06-10T01:00:00.000Z","event":{"type":"harness_milestone","milestone":"session_start","session_id":"sess-t-loc","transport":"openai-responses","model":"gpt-5.5","cwd":"/repo/x","provider":"brodex"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        // test_task sets session_id = "sess-<id>".
+        let task = test_task("t-loc", TaskStatus::Completed, Provider::Brodex);
+        assert!(task.inner.lock().transcript_location.is_none());
+
+        populate_transcript_handle(&task);
+
+        let inner = task.inner.lock();
+        let location = inner
+            .transcript_location
+            .as_ref()
+            .expect("harness task resolves its event-log transcript location");
+        assert_eq!(location.provider, Provider::Brodex);
+        assert_eq!(location.path, log_path);
+        assert_eq!(location.session_id.as_deref(), Some("sess-t-loc"));
+        assert_eq!(location.cwd.as_deref(), Some("/repo/x"));
     }
 
     #[test]

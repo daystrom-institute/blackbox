@@ -822,4 +822,96 @@ mod tests {
             })
             .unwrap_or_default()
     }
+
+    /// End-to-end: a synthetic harness session event log under
+    /// `harness_sessions_dir` is discovered by the adapter registry and
+    /// indexed into tantivy with role/session/timestamp/project intact.
+    #[test]
+    fn harness_session_event_log_indexes_into_test_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sessions_dir = root.join("bro-home").join("harness-sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("sess-hx.events.jsonl"),
+            concat!(
+                r#"{"ts":"2026-06-10T01:00:00.000Z","event":{"type":"harness_milestone","milestone":"session_start","session_id":"sess-hx","transport":"openai-responses","model":"gpt-5.5","cwd":"/repo/hx","provider":"brodex"}}"#,
+                "\n",
+                r#"{"ts":"2026-06-10T01:00:01.000Z","event":{"type":"user","session_id":"sess-hx","message":{"role":"user","content":[{"type":"text","text":"investigate the flaky test"}]}}}"#,
+                "\n",
+                r#"{"ts":"2026-06-10T01:00:09.000Z","event":{"type":"assistant","session_id":"sess-hx","message":{"role":"assistant","content":[{"type":"text","text":"the test races the reindex thread"},{"type":"tool_use","id":"t1","name":"shell_run","input":{"command":"cargo test --lib reindex"}}]}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let config = ReindexConfig {
+            roots: Vec::new(),
+            codex_root: None,
+            meta_path: root.join("_meta.json"),
+            projects_path: root.join("projects.json"),
+            knowledge_path: root.join("kb.json"),
+            threads_path: root.join("threads.json"),
+            roadmap_path: root.join("roadmap.json"),
+            harness_sessions_dir: Some(sessions_dir),
+        };
+
+        let (schema, fields) = crate::index::build_schema();
+        let idx_dir = root.join("idx");
+        std::fs::create_dir_all(&idx_dir).unwrap();
+        let index = tantivy::Index::create_in_dir(&idx_dir, schema).unwrap();
+        crate::index::register_code_tokenizer(&index);
+        let mut writer = index.writer(50_000_000).unwrap();
+        let mut meta = HashMap::new();
+        let (mut files, mut docs, mut skipped) = (0u64, 0u64, 0u64);
+        let tool_edges = ToolEdgeContext::from_config(&config, false).unwrap();
+
+        index_transcripts_via_adapters(
+            &config,
+            fields,
+            &mut writer,
+            &mut meta,
+            &mut files,
+            &mut docs,
+            &mut skipped,
+            &tool_edges,
+            false,
+        )
+        .unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(files, 1, "one session log discovered");
+        // user + assistant text + tool_use transcript docs, plus the tool_call
+        // doc projected from the shell_run tool_use.
+        assert_eq!(docs, 4, "indexed docs");
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_text(fields.session_id, "sess-hx"),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let hits = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+
+        let mut saw_user = false;
+        for (_score, addr) in hits {
+            let doc: TantivyDocument = searcher.doc(addr).unwrap();
+            assert_eq!(first_text(&doc, fields.account), "brodex");
+            assert_eq!(first_text(&doc, fields.project), "/repo/hx");
+            assert!(first_text(&doc, fields.timestamp).starts_with("2026-06-10T01:00:0"));
+            if first_text(&doc, fields.role) == "user"
+                && first_text(&doc, fields.doc_type) == "transcript"
+            {
+                saw_user = true;
+                assert_eq!(
+                    first_text(&doc, fields.timestamp),
+                    "2026-06-10T01:00:01.000Z"
+                );
+            }
+        }
+        assert!(saw_user, "user prompt doc present");
+    }
 }

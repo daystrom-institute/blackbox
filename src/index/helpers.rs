@@ -50,6 +50,9 @@ pub fn find_session_file(
         knowledge_path: PathBuf::new(),
         threads_path: PathBuf::new(),
         roadmap_path: PathBuf::new(),
+        // Runtime lookup path (per-request locate, never a scan): resolve the
+        // harness sessions dir from the live env like from_runtime_config.
+        harness_sessions_dir: Some(crate::transcripts::harness_sessions::env_sessions_dir()),
     };
     let registry = crate::transcripts::adapters::TranscriptAdapterRegistry::from_reindex_config(
         &registry_config,

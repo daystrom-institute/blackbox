@@ -126,6 +126,13 @@ pub struct ReindexConfig {
     pub knowledge_path: PathBuf,
     pub threads_path: PathBuf,
     pub roadmap_path: PathBuf,
+    /// In-process harness sessions dir (`$BRO_HOME/harness-sessions`) whose
+    /// sidecar event logs are indexed via the transcript adapter registry.
+    /// `None` (the default, and what hermetic tests get) disables the
+    /// harness-sessions adapter entirely — reindex must never silently scan
+    /// the operator's real harness state. Set by the daemon at startup via
+    /// [`TranscriptIndex::set_harness_sessions_dir`].
+    pub harness_sessions_dir: Option<PathBuf>,
 }
 
 pub struct TranscriptIndex {
@@ -228,6 +235,7 @@ impl TranscriptIndex {
             knowledge_path,
             threads_path,
             roadmap_path,
+            harness_sessions_dir: None,
         };
 
         Ok(Self {
@@ -272,6 +280,13 @@ impl TranscriptIndex {
     /// Get the reindex config for the background thread.
     pub fn reindex_config(&self) -> ReindexConfig {
         self.config.clone()
+    }
+
+    /// Enable harness-session event-log indexing from `dir`
+    /// (`$BRO_HOME/harness-sessions`). Called by daemon startup; left unset
+    /// (and therefore disabled) in hermetic test indexes.
+    pub fn set_harness_sessions_dir(&mut self, dir: PathBuf) {
+        self.config.harness_sessions_dir = Some(dir);
     }
 
     pub(crate) fn index_knowledge_entry(

@@ -13,6 +13,7 @@ pub mod compaction;
 pub mod context;
 pub mod diagnostics;
 pub mod emit;
+pub mod event_log;
 pub mod hooks;
 pub mod lsp_baselines;
 pub mod mcp;

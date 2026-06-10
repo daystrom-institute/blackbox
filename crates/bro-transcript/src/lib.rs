@@ -177,10 +177,13 @@ pub fn tool_call_info(
     input: Value,
 ) -> Option<ToolCallInfo> {
     let kind = match name {
-        "Read" | "read" => ToolCallKind::Read,
-        "Write" | "write" => ToolCallKind::Write,
-        "Edit" | "edit" => ToolCallKind::Edit,
-        "Bash" | "bash" | "shell" => ToolCallKind::Bash,
+        // Claude/Codex CLI names, plus the bro-harness builtin tool names
+        // (crates/bro-tools) so harness session event logs project the same
+        // tool_call docs/edges as every other provider transcript.
+        "Read" | "read" | "file_read" | "smart_read" => ToolCallKind::Read,
+        "Write" | "write" | "file_write" => ToolCallKind::Write,
+        "Edit" | "edit" | "file_edit" | "apply_patch" => ToolCallKind::Edit,
+        "Bash" | "bash" | "shell" | "shell_run" => ToolCallKind::Bash,
         _ => return None,
     };
     Some(ToolCallInfo {

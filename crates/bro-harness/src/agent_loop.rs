@@ -17,6 +17,7 @@
 
 use crate::cli::Cli;
 use crate::emit::{Emitter, EventCallback};
+use crate::event_log::EventLog;
 use crate::hooks::{Delivery, HookEngine, NudgeLedger};
 use crate::lsp_baselines::LspBaselines;
 use crate::mcp;
@@ -170,10 +171,18 @@ async fn run_with_emitter(
     Ok(())
 }
 
-fn make_emitter(session_id: String, callback: Option<EventCallback>) -> Emitter {
-    match callback {
+fn make_emitter(
+    session_id: String,
+    callback: Option<EventCallback>,
+    event_log: Option<Arc<EventLog>>,
+) -> Emitter {
+    let emitter = match callback {
         Some(callback) => Emitter::with_callback(session_id, callback),
         None => Emitter::new(session_id),
+    };
+    match event_log {
+        Some(log) => emitter.with_event_log(log),
+        None => emitter,
     }
 }
 
@@ -191,10 +200,13 @@ async fn run_session(
     // The stdin reader runs as its own task so control messages (interrupt)
     // arrive while a turn is in flight. It owns a clone of the emitter purely to
     // honour `--replay-user-messages`.
-    let input_rx = spawn_stdin_reader(replay, make_emitter(sid.clone(), callback.clone()));
+    let input_rx = spawn_stdin_reader(
+        replay,
+        make_emitter(sid.clone(), callback.clone(), Some(session.event_log())),
+    );
     // A separate emitter for control responses emitted *during* a turn, when the
     // session's own emitter is borrowed by the running turn.
-    let ctrl_emitter = make_emitter(sid, callback);
+    let ctrl_emitter = make_emitter(sid, callback, Some(session.event_log()));
 
     // Steers that arrived mid-turn wait here for the next turn boundary.
     let mut pending: VecDeque<String> = VecDeque::new();
@@ -222,7 +234,7 @@ async fn run_controlled_session(
     let mut session = Session::build(&cli, callback.clone(), mcp_config).await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
-    let ctrl_emitter = make_emitter(sid, callback);
+    let ctrl_emitter = make_emitter(sid, callback, Some(session.event_log()));
 
     let mut pending: VecDeque<String> = VecDeque::new();
     if let Some(p) = cli.prompt.clone() {
@@ -546,6 +558,10 @@ struct Session {
     tool_result_cap: usize,
     dump_dir: std::path::PathBuf,
     store: SessionStore,
+    /// Sidecar append-only timestamped event log (`event_log.rs`). The
+    /// emitters tee every protocol event into it; the loop additionally logs
+    /// user turns and compaction milestones. Best-effort — never fails a turn.
+    event_log: Arc<EventLog>,
     prior_side: Value,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
     /// Cross-turn diagnostics baselines: per-file `{sha256, version,
@@ -634,6 +650,9 @@ impl Session {
         let mut tx = transport::build_transport(kind).await?;
 
         let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
+        // Sidecar append-only event log next to the snapshot — the durable
+        // timestamped record of this session (event_log.rs).
+        let event_log = Arc::new(EventLog::for_session(&store.id));
         // Hand the transport the stable session id, so it can populate the
         // codex-style `session-id` header + `prompt_cache_key` (vs a random
         // per-request id).
@@ -718,6 +737,7 @@ impl Session {
         builtins.push(Arc::new(crate::report::ReportTool::new(make_emitter(
             store.id.clone(),
             callback.clone(),
+            Some(event_log.clone()),
         ))));
         let (mcp_tools, tool_placement) = match injected_mcp {
             Some(config) => {
@@ -827,11 +847,31 @@ impl Session {
                 .or_else(|| std::env::var("BRO_HARNESS_SERVICE_TIER").ok()),
         };
 
-        let emitter = make_emitter(store.id.clone(), callback);
+        let emitter = make_emitter(store.id.clone(), callback, Some(event_log.clone()));
         let compaction = crate::compaction::CompactionPolicy::from_env();
         let compact_threshold = compaction.threshold(&base_opts.model);
         let tool_result_cap = crate::bound::cap_bytes();
         let dump_dir = crate::bound::dump_dir();
+
+        // Timestamp the session boundary in the sidecar log. `provider` is the
+        // daemon's dispatch provider when riding in-process
+        // (`BRO_HARNESS_PROVIDER` in the per-session env); absent for the
+        // standalone binary, where the transcript adapter falls back to
+        // transport+model inference.
+        event_log.append_milestone(
+            if restored_snapshot {
+                "session_resume"
+            } else {
+                "session_start"
+            },
+            &store.id,
+            json!({
+                "transport": tx.name(),
+                "model": base_opts.model,
+                "cwd": root.to_string_lossy(),
+                "provider": transport::session_var("BRO_HARNESS_PROVIDER"),
+            }),
+        );
 
         Ok(Self {
             tx,
@@ -850,6 +890,7 @@ impl Session {
             tool_result_cap,
             dump_dir,
             store,
+            event_log,
             prior_side,
             todos,
             lsp_baselines,
@@ -866,6 +907,12 @@ impl Session {
 
     fn session_id(&self) -> &str {
         self.emitter.session_id()
+    }
+
+    /// Shared handle to the sidecar event log, for auxiliary emitters
+    /// (control responses, stdin replay) created outside `build`.
+    fn event_log(&self) -> Arc<EventLog> {
+        self.event_log.clone()
     }
 
     /// Apply a mid-session control mutation. `interrupt` is handled by the
@@ -888,6 +935,11 @@ impl Session {
     /// `compact_boundary`. A no-op (logged) when there isn't enough history.
     async fn compact_manual(&mut self) -> Result<()> {
         let tool_specs = self.reg.wire_specs();
+        self.event_log.append_milestone(
+            "compaction_start",
+            self.emitter.session_id(),
+            json!({"reason": "manual"}),
+        );
         match self
             .tx
             .compact(
@@ -925,6 +977,19 @@ impl Session {
         let mut pending_prompt = Some(prompt);
         let prompt_estimate = est_tokens(prompt);
 
+        // Timestamp the user turn in the sidecar log. The protocol stream
+        // only carries user text when `--replay-user-messages` is on, so the
+        // loop logs the authoritative turn itself, in envelope shape, so the
+        // log stays a single uniform stream for postmortems and indexing.
+        self.event_log.append_event(&json!({
+            "type": "user",
+            "session_id": self.session_id(),
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}],
+            },
+        }));
+
         let mut final_text = String::new();
         let mut turn_steps = 0u64;
         let mut last_model_stop: Option<StopReason> = None;
@@ -960,6 +1025,11 @@ impl Session {
             if let Some(thresh) = self.compact_threshold
                 && projected_tokens > thresh
             {
+                self.event_log.append_milestone(
+                    "compaction_start",
+                    self.emitter.session_id(),
+                    json!({"reason": "auto", "projected_tokens": projected_tokens}),
+                );
                 match self
                     .tx
                     .compact(
@@ -1029,6 +1099,11 @@ impl Session {
                     {
                         overflow_compacted = true;
                         tracing::warn!("context window exceeded mid-turn; compacting and retrying");
+                        self.event_log.append_milestone(
+                            "compaction_start",
+                            self.emitter.session_id(),
+                            json!({"reason": "overflow"}),
+                        );
                         match self
                             .tx
                             .compact(
@@ -2147,6 +2222,7 @@ mod tests {
             tool_result_cap: 0,
             dump_dir: std::env::temp_dir(),
             store: SessionStore::open(Some(&id), None).unwrap(),
+            event_log: Arc::new(EventLog::disabled()),
             prior_side: Value::Null,
             todos,
             lsp_baselines: LspBaselines::default(),
@@ -2167,6 +2243,56 @@ mod tests {
             .user_turn(prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_turn_tees_timestamped_events_into_sidecar_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "bh-evlog-turn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = Arc::new(EventLog::at_path(dir.join("test.events.jsonl")));
+
+        let (mut session, _shared) = mk_session(vec![MockTurn::Text("answer".into())]);
+        session.event_log = log.clone();
+        session.emitter = Emitter::new("test".into()).with_event_log(log.clone());
+
+        run_user_turn(&mut session, "what is up").await;
+
+        let lines: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // Every line carries a parseable RFC3339 ts wrapping an envelope event.
+        for line in &lines {
+            chrono::DateTime::parse_from_rfc3339(line["ts"].as_str().expect("ts"))
+                .expect("rfc3339 ts");
+        }
+        let types: Vec<&str> = lines
+            .iter()
+            .map(|l| l["event"]["type"].as_str().unwrap())
+            .collect();
+        // The loop logs the user turn; the emitter tee logs the assistant turn
+        // and the terminal result.
+        assert_eq!(types.iter().filter(|t| **t == "user").count(), 1);
+        assert!(types.contains(&"assistant"), "{types:?}");
+        assert!(types.contains(&"result"), "{types:?}");
+        let user = lines
+            .iter()
+            .find(|l| l["event"]["type"] == "user")
+            .unwrap();
+        assert_eq!(
+            user["event"]["message"]["content"][0]["text"],
+            "what is up"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
