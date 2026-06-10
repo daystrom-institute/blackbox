@@ -119,6 +119,50 @@ pub struct RosterSummaryV1 {
     /// True when a workflow or atom owns this task's lifecycle.
     #[serde(default)]
     pub workflow_owned: bool,
+    /// Spawn-time wall-clock millis (wave 7c). `RosterView` is the
+    /// per-task summary plane; the dashboard consumer needs both
+    /// `last_event_at` and the spawn time to recompute the
+    /// `elapsed` field the legacy `bro_dashboard` returned (terminal
+    /// tasks: `last_event_at - started_at`; live tasks: `now -
+    /// started_at`). Cheap additive field — set once at dispatch
+    /// from `TaskInner.started_at`.
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    /// Agent attribution separate from `label` (wave 7c). The
+    /// dashboard needs to surface both `agentLabel` and `broLabel`
+    /// distinctly, but `label` already collapses them via
+    /// `bro_label.or(agent_label)`. Carrying both keeps the
+    /// projection lossless without forcing the dashboard back into
+    /// a per-task inner lock.
+    #[serde(default)]
+    pub agent_label: Option<String>,
+    /// Full structured `bro_report` (wave 7c). `report` is a bounded
+    /// 80-char teaser for the fleet row UI; consumers that need the
+    /// full object (`message` / `needs` / `data` / `reportedAt` /
+    /// `reportedAgo`) read it from this field. Additive+optional —
+    /// omitted for tasks that never called `bro_report`.
+    #[serde(default)]
+    pub report_full: Option<BroReportV1>,
+}
+
+/// Structured form of a `bro_report` payload, projected into the
+/// roster summary so dashboard consumers can render the full report
+/// object without re-locking the per-task inner mutex (wave 7c).
+///
+/// The field names match `orchestration::BroReport::to_json()`:
+/// `message`, `needs` (when set), `data` (when set), `reportedAt`,
+/// `reportedAgo`. `reportedAgo` is computed at projection time
+/// against the daemon's wall clock, identical to the
+/// `BroReport::to_json()` contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BroReportV1 {
+    pub message: String,
+    #[serde(default)]
+    pub needs: Option<String>,
+    #[serde(default)]
+    pub data: Option<Value>,
+    pub reported_at: u64,
+    pub reported_ago: String,
 }
 
 /// Wire envelope for the `GET /control/roster` snapshot. The
@@ -235,6 +279,9 @@ mod tests {
             last_event_at: Some(1_700_000_000_000),
             origin: Origin::AgentDispatch,
             workflow_owned: false,
+            started_at: Some(1_700_000_000_000),
+            agent_label: Some("team-x::member-y".to_string()),
+            report_full: None,
         };
         let value = serde_json::to_value(&summary).unwrap();
         let obj = value.as_object().expect("summary must serialize as object");
@@ -257,6 +304,9 @@ mod tests {
             "last_event_at",
             "origin",
             "workflow_owned",
+            "started_at",
+            "agent_label",
+            "report_full",
         ] {
             assert!(
                 obj.contains_key(key),

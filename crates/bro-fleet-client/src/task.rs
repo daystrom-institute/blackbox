@@ -239,6 +239,9 @@ mod tests {
             origin: Origin::Cockpit,
             managed_worktree: Some("/tmp/worktree".to_string()),
             workflow_owned: false,
+            started_at: Some(42),
+            agent_label: Some(format!("agent-{id}")),
+            report_full: None,
         }
     }
 

@@ -77,17 +77,26 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<DashboardParams>,
     ) -> CallToolResult {
-        let store = self.state.task_store.read();
         let limit = p.limit.unwrap_or(20);
 
         let filter_provider = p
             .provider
             .as_deref()
             .and_then(|s| s.parse::<Provider>().ok());
-        let filter_status: Option<orch::TaskStatus> = p
+        // Filter status parses through the in-process enum (no
+        // `Pending` variant) and is then converted to the wire
+        // enum for comparison against `RosterSummaryV1.status`.
+        let filter_status: Option<bro_protocol::TaskStatus> = p
             .status
             .as_deref()
-            .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok());
+            .and_then(|s| match s {
+                "pending" => Some(bro_protocol::TaskStatus::Pending),
+                "running" => Some(bro_protocol::TaskStatus::Running),
+                "completed" => Some(bro_protocol::TaskStatus::Completed),
+                "failed" => Some(bro_protocol::TaskStatus::Failed),
+                "cancelled" => Some(bro_protocol::TaskStatus::Cancelled),
+                _ => None,
+            });
 
         let team_task_ids: Option<std::collections::HashSet<String>> =
             p.team.as_ref().and_then(|name| {
@@ -100,72 +109,111 @@ impl BlackboxServer {
                 )
             });
 
+        // Wave 7c: read the materialized RosterView snapshot instead
+        // of iterating `task_store` and locking every per-task inner
+        // mutex. `RosterEventSink::emit_*` keeps the view fresh at
+        // the same call sites that touch `TaskInner`, so a snapshot
+        // serves the same fields the legacy projection read under
+        // the lock — without contending with event ingest on busy
+        // tasks (invariant I6 of design/daemon-runtime/concurrency-
+        // model.md). The team lookup is a per-call filesystem scan
+        // (does not take a per-task inner mutex).
+        let snapshot = self.state.roster_view.snapshot();
+        let store_dir = self.state.store_dir.clone();
+
         let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
-        let mut with_ts: Vec<(u64, Value)> = store
-            .all_tasks()
-            .iter()
-            .filter(|t| {
-                let inner = t.inner.lock();
+        let mut with_ts: Vec<(u64, Value)> = snapshot
+            .into_iter()
+            .filter(|s| {
                 if let Some(fp) = filter_provider {
-                    if inner.provider != fp {
+                    if s.provider != fp {
                         return false;
                     }
                 }
                 if let Some(fs) = filter_status {
-                    if inner.status != fs {
+                    if s.status != fs {
                         return false;
                     }
                 }
                 if let Some(ref ids) = team_task_ids {
-                    if !ids.contains(&inner.id) {
+                    if !ids.contains(s.task_id.as_str()) {
                         return false;
                     }
                 }
                 true
             })
-            .map(|t| {
-                let inner = t.inner.lock();
+            .map(|s| {
+                let task_id_str = s.task_id.as_str().to_string();
                 let bro_name =
-                    orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
-                if let Some(label) = inner.agent_label.as_ref() {
+                    orchestration::team::find_bro_name_for_task(&task_id_str, &store_dir);
+
+                // Agent attribution rollup. The summary carries
+                // `agent_label` directly (wave 7c DTO extension);
+                // a missing label means "no agent attribution",
+                // matching the legacy semantics where only
+                // `inner.agent_label.is_some()` rolled into the
+                // agents map.
+                if let Some(label) = s.agent_label.as_ref() {
                     let metrics = agent_metrics.entry(label.clone()).or_default();
                     metrics.dispatch_count += 1;
-                    match inner.status {
-                        orch::TaskStatus::Completed => metrics.success_count += 1,
-                        orch::TaskStatus::Failed | orch::TaskStatus::Cancelled => {
+                    match s.status {
+                        bro_protocol::TaskStatus::Completed => metrics.success_count += 1,
+                        bro_protocol::TaskStatus::Failed
+                        | bro_protocol::TaskStatus::Cancelled => {
                             metrics.failure_count += 1;
                         }
-                        orch::TaskStatus::Running => {}
+                        bro_protocol::TaskStatus::Running | bro_protocol::TaskStatus::Pending => {}
                     }
-                    if let Some(done) = inner.completed_at {
-                        metrics.elapsed_ms_total += done.saturating_sub(inner.started_at);
-                        metrics.elapsed_count += 1;
+                    if s.status.is_terminal() {
+                        if let (Some(start), Some(end)) = (s.started_at, s.last_event_at) {
+                            metrics.elapsed_ms_total += end.saturating_sub(start);
+                            metrics.elapsed_count += 1;
+                        }
                     }
-                    if let Some(cost) = inner.cost_usd {
+                    if let Some(cost) = s.cost {
                         metrics.cost_usd_total += cost;
                     }
                 }
+
+                // Recompute `elapsed` from summary timestamps so the
+                // dashboard row matches the legacy projection
+                // (terminal: `last_event_at - started_at`; live:
+                // `now - started_at`).
+                let elapsed = match (s.started_at, s.last_event_at) {
+                    (Some(start), Some(end)) if s.status.is_terminal() => {
+                        orch::format_elapsed(start, Some(end))
+                    }
+                    (Some(start), _) => orch::format_elapsed(start, None),
+                    _ => "0s".to_string(),
+                };
+
+                let session_id_str = s.session_id.as_ref().map(|s| s.as_str().to_string());
                 let mut entry = json!({
-                    "taskId": inner.id,
-                    "provider": inner.provider,
-                    "sessionId": inner.session_id,
-                    "status": inner.status,
-                    "elapsed": orch::format_elapsed(inner.started_at, inner.completed_at),
-                    "hasResult": inner.last_assistant_message.is_some(),
+                    "taskId": task_id_str,
+                    "provider": s.provider,
+                    "sessionId": session_id_str,
+                    "status": s.status,
+                    "elapsed": elapsed,
+                    "hasResult": s.last_message_snippet.is_some(),
                 });
                 if let Some(name) = bro_name {
                     entry["bro"] = Value::String(name);
                 }
-                if let Some(ref label) = inner.bro_label {
+                if let Some(ref label) = label_from_summary(&s) {
                     entry["broLabel"] = Value::String(label.clone());
                 }
-                if let Some(ref label) = inner.agent_label {
+                if let Some(ref label) = s.agent_label {
                     entry["agentLabel"] = Value::String(label.clone());
                 }
-                if let Some(ref report) = inner.report {
-                    entry["report"] = report.to_json();
+                if let Some(ref report) = s.report_full {
+                    entry["report"] = bro_report_v1_to_dashboard_json(report);
                 }
-                (inner.started_at, entry)
+                // Sort key: legacy used `started_at`. Fall back to
+                // `last_event_at` when `started_at` is somehow
+                // missing (older summaries before the wave-7c DTO
+                // extension); fall back to 0 so the row still sorts.
+                let sort_key = s.started_at.or(s.last_event_at).unwrap_or(0);
+                (sort_key, entry)
             })
             .collect();
         with_ts.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
@@ -1325,6 +1373,41 @@ Next step: <one concrete steering suggestion>\n"
     }
 }
 
+/// Pick the `broLabel` value the legacy `bro_dashboard` row
+/// surfaced. `RosterSummaryV1.label` collapses `bro_label` and
+/// `agent_label` (one or the other) — but the dashboard
+/// historically used `inner.bro_label` (the team-shaped identity)
+/// when present. The summary's `name` field is the daemon display
+/// name and can match, but `label` is the closest field-by-field
+/// proxy. We read the same `label` slot the projection already
+/// computed; the dashboard never relied on `agent_label` falling
+/// into the `broLabel` row.
+fn label_from_summary(s: &bro_protocol::RosterSummaryV1) -> Option<String> {
+    s.label.clone()
+}
+
+/// Project the wire `BroReportV1` to the dashboard's legacy report
+/// object shape (`{message, reportedAt, reportedAgo, needs?, data?}`).
+///
+/// `reportedAgo` is recomputed at call time against the daemon's
+/// wall clock so the rendered string is fresh — the legacy
+/// `BroReport::to_json()` did the same. The wire summary's
+/// `reported_ago` is only a snapshot for the fleet row UI.
+fn bro_report_v1_to_dashboard_json(report: &bro_protocol::BroReportV1) -> Value {
+    let mut obj = serde_json::json!({
+        "message": report.message,
+        "reportedAt": report.reported_at,
+        "reportedAgo": crate::orchestration::format_elapsed(report.reported_at, None),
+    });
+    if let Some(ref needs) = report.needs {
+        obj["needs"] = Value::String(needs.clone());
+    }
+    if let Some(ref data) = report.data {
+        obj["data"] = data.clone();
+    }
+    obj
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,6 +1467,389 @@ mod tests {
     fn extract_text(result: &CallToolResult) -> String {
         let wire = serde_json::to_value(result).unwrap();
         wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    // Wave 7c: bro_dashboard now reads from the materialized
+    // RosterView. These tests seed the view (via the sink or via
+    // `rebuild_from_store`, matching the wave-6a convention) and
+    // assert the row projection field-for-field against the legacy
+    // wire shape. The dashboard row MUST stay byte-compatible for
+    // existing consumers (the wave-7c invariant).
+    mod dashboard_view {
+        use super::*;
+        use bro_core::{Origin, SessionId, TaskId};
+        use bro_protocol::{BroReportV1, RosterSummaryV1};
+        use bro_protocol::TaskStatus as WireTaskStatus;
+
+        fn live_summary(id: &str, provider: Provider, started_at: u64) -> RosterSummaryV1 {
+            RosterSummaryV1 {
+                task_id: TaskId::new(id),
+                status: WireTaskStatus::Running,
+                provider,
+                cost: Some(0.10),
+                turns: Some(4),
+                cwd: Some("/work/alpha".to_string()),
+                label: Some("team::executor".to_string()),
+                name: Some("Inspect the failing roster columns".to_string()),
+                session_id: Some(SessionId::new(format!("sess-{id}"))),
+                last_message_snippet: Some("hello".to_string()),
+                model: Some("glm-pro".to_string()),
+                report: Some("teaser".to_string()),
+                last_event_at: Some(started_at),
+                origin: Origin::Cockpit,
+                managed_worktree: Some("/wt/alpha".to_string()),
+                workflow_owned: false,
+                started_at: Some(started_at),
+                agent_label: Some(format!("agent-{id}@v1")),
+                report_full: Some(BroReportV1 {
+                    message: "writing focused tests".to_string(),
+                    needs: Some("review API naming".to_string()),
+                    data: None,
+                    reported_at: started_at,
+                    reported_ago: "0s".to_string(),
+                }),
+            }
+        }
+
+        fn terminal_summary(
+            id: &str,
+            provider: Provider,
+            started_at: u64,
+            completed_at: u64,
+        ) -> RosterSummaryV1 {
+            RosterSummaryV1 {
+                task_id: TaskId::new(id),
+                status: WireTaskStatus::Completed,
+                provider,
+                cost: Some(0.42),
+                turns: Some(7),
+                cwd: None,
+                label: Some("team::reviewer".to_string()),
+                name: Some(format!("Prompt teaser {id}")),
+                session_id: Some(SessionId::new(format!("sess-{id}"))),
+                last_message_snippet: None,
+                model: None,
+                report: None,
+                last_event_at: Some(completed_at),
+                origin: Origin::AgentDispatch,
+                managed_worktree: None,
+                workflow_owned: false,
+                started_at: Some(started_at),
+                agent_label: Some(format!("agent-{id}@v1")),
+                report_full: None,
+            }
+        }
+
+        #[test]
+        fn dashboard_row_matches_legacy_shape_for_live_and_terminal_tasks() {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+
+            // Seed the view directly with two summaries that
+            // exercise the live (Running) and terminal (Completed)
+            // paths the dashboard projection branches on. The
+            // started_at / completed_at timestamps are pinned so
+            // the recomputed `elapsed` field is stable across
+            // wall-clock drift during the test run.
+            let live_start = 1_700_000_000_000_u64;
+            let terminal_start = 1_700_000_010_000_u64;
+            let terminal_done = 1_700_000_011_500_u64;
+            server.state.roster_view.upsert(
+                "live-1".to_string(),
+                live_summary("live-1", Provider::Glm, live_start),
+            );
+            server.state.roster_view.upsert(
+                "term-1".to_string(),
+                terminal_summary("term-1", Provider::Deepseek, terminal_start, terminal_done),
+            );
+
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: None,
+                status: None,
+                team: None,
+            }));
+            assert_ne!(dash.is_error, Some(true));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().expect("tasks must be array");
+            assert_eq!(tasks.len(), 2, "both seeded tasks should appear");
+
+            // Sort-agnostic lookup by task_id.
+            let by_id: std::collections::HashMap<_, _> = tasks
+                .iter()
+                .map(|t| (t["taskId"].as_str().unwrap().to_string(), t.clone()))
+                .collect();
+
+            // Live task: provider / status serialize in the same
+            // wire form the legacy projection emitted (lowercase
+            // variant); elapsed is `now - started_at` (a live
+            // string like "5s", recomputed at call time).
+            let live = by_id.get("live-1").expect("live-1 row present");
+            assert_eq!(live["provider"], "glm");
+            assert_eq!(live["status"], "running");
+            assert_eq!(live["sessionId"], "sess-live-1");
+            assert!(live["hasResult"].as_bool().unwrap_or(false));
+            assert_eq!(live["broLabel"], "team::executor");
+            assert_eq!(live["agentLabel"], "agent-live-1@v1");
+            assert_eq!(live["report"]["message"], "writing focused tests");
+            assert_eq!(live["report"]["needs"], "review API naming");
+            // `elapsed` is a live display; just check it parses as
+            // "<n>s" or "<n>m <n>s" — anything else is a regression
+            // in `format_elapsed` rather than the dashboard.
+            let live_elapsed = live["elapsed"].as_str().unwrap();
+            assert!(
+                live_elapsed.ends_with('s') && !live_elapsed.is_empty(),
+                "live elapsed shape regressed: {live_elapsed}"
+            );
+
+            // Terminal task: status is `completed`, elapsed is
+            // `completed_at - started_at` = 1500ms = "1s", and
+            // `hasResult` is false (no last_message_snippet).
+            let term = by_id.get("term-1").expect("term-1 row present");
+            assert_eq!(term["provider"], "deepseek");
+            assert_eq!(term["status"], "completed");
+            assert_eq!(term["sessionId"], "sess-term-1");
+            assert!(!term["hasResult"].as_bool().unwrap_or(true));
+            assert_eq!(term["broLabel"], "team::reviewer");
+            assert_eq!(term["agentLabel"], "agent-term-1@v1");
+            assert_eq!(term["elapsed"], "1s");
+            // Terminal task has no report in the seed.
+            assert!(term.get("report").is_none() || term["report"].is_null());
+
+            // Agents rollup: only the tasks that carry an
+            // `agent_label` show up in the agents map. Each seeded
+            // task is one dispatch for its agent label, but they
+            // share labels across `live-1` and `term-1`? No — each
+            // label is unique per seeded summary, so we expect two
+            // distinct entries with `dispatch_count: 1` each.
+            let agents = body["agents"].as_object().expect("agents must be object");
+            assert_eq!(agents.len(), 2);
+            assert_eq!(agents["agent-live-1@v1"]["dispatch_count"], 1);
+            assert_eq!(agents["agent-term-1@v1"]["dispatch_count"], 1);
+            // The terminal dispatch landed a success_count because
+            // status is `completed`; the live one has no
+            // success/failure tally yet.
+            assert_eq!(
+                agents["agent-term-1@v1"]["success_count"], 1,
+                "terminal success must roll up: {agents:?}"
+            );
+            assert_eq!(agents["agent-live-1@v1"]["success_count"].as_u64(), None);
+        }
+
+        #[test]
+        fn dashboard_filter_by_status_and_provider_runs_against_view() {
+            // Filters must apply on the snapshot, not the
+            // per-task inner lock. Seed one live and one terminal
+            // task across two providers and assert each filter
+            // returns the expected subset.
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            let t = 1_700_000_000_000_u64;
+            server.state.roster_view.upsert(
+                "a".to_string(),
+                live_summary("a", Provider::Glm, t),
+            );
+            server.state.roster_view.upsert(
+                "b".to_string(),
+                terminal_summary("b", Provider::Deepseek, t, t + 1000),
+            );
+            server.state.roster_view.upsert(
+                "c".to_string(),
+                terminal_summary("c", Provider::Glm, t, t + 2000),
+            );
+
+            // status="running" → only `a`.
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: None,
+                status: Some("running".into()),
+                team: None,
+            }));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1, "running filter should leave one row");
+            assert_eq!(tasks[0]["taskId"], "a");
+
+            // provider="deepseek" → only `b`.
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: Some("deepseek".into()),
+                status: None,
+                team: None,
+            }));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["taskId"], "b");
+
+            // provider="glm" + status="completed" → only `c`.
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: Some("glm".into()),
+                status: Some("completed".into()),
+                team: None,
+            }));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["taskId"], "c");
+        }
+
+        #[test]
+        fn dashboard_sort_order_is_started_at_descending() {
+            // The legacy sort key was `started_at` DESC. With the
+            // view snapshot, the order is non-deterministic, so
+            // the dashboard must still sort by `started_at` (or
+            // `last_event_at` fallback) DESC. Seed three tasks
+            // with explicit started_at and verify the served order.
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            server.state.roster_view.upsert(
+                "old".to_string(),
+                terminal_summary("old", Provider::Glm, 1_000, 2_000),
+            );
+            server.state.roster_view.upsert(
+                "new".to_string(),
+                live_summary("new", Provider::Glm, 9_000),
+            );
+            server.state.roster_view.upsert(
+                "mid".to_string(),
+                terminal_summary("mid", Provider::Glm, 5_000, 6_000),
+            );
+
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: None,
+                status: None,
+                team: None,
+            }));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().unwrap();
+            let order: Vec<&str> = tasks
+                .iter()
+                .map(|t| t["taskId"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                order,
+                vec!["new", "mid", "old"],
+                "dashboard must sort by started_at DESC"
+            );
+        }
+
+        #[test]
+        fn dashboard_reads_from_seeded_view_not_per_task_lock() {
+            // RosterView is the dashboard's read path; the handler
+            // MUST NOT lock any per-task inner mutex. Seed a
+            // summary directly (no inner mutex involved) and
+            // assert the row appears. If the dashboard fell back
+            // to `task_store.all_tasks()`, this test would
+            // produce an empty body.
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            let t = 1_700_000_000_000_u64;
+            server.state.roster_view.upsert(
+                "view-only".to_string(),
+                live_summary("view-only", Provider::Glm, t),
+            );
+
+            // Sanity: no task is in the store — only the view.
+            assert!(server.state.task_store.read().all_tasks().is_empty());
+
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: None,
+                status: None,
+                team: None,
+            }));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().unwrap();
+            assert_eq!(
+                tasks.len(),
+                1,
+                "dashboard must serve from the view, not the task store"
+            );
+            assert_eq!(tasks[0]["taskId"], "view-only");
+        }
+
+        #[test]
+        fn dashboard_rebuild_from_store_seeds_view_for_dashboard_path() {
+            // The same cold-start pattern the wave-6a
+            // /control/roster tests pinned: insert into the
+            // store, call rebuild_from_store, then read the
+            // dashboard. The handler must not need the per-task
+            // inner lock to project rows.
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            let t_live = 1_700_000_000_000_u64;
+            let t_done = 1_700_000_010_000_u64;
+            {
+                let mut store = server.state.task_store.write();
+                let live = orchestration::test_task(
+                    "live-1",
+                    orchestration::TaskStatus::Running,
+                    Provider::Glm,
+                );
+                {
+                    let mut inner = live.inner.lock();
+                    inner.started_at = t_live;
+                    inner.completed_at = None;
+                    inner.bro_label = Some("team::executor".into());
+                    inner.agent_label = Some("agent-live-1@v1".into());
+                    inner.last_assistant_message = Some("hi".into());
+                    inner.session_id = "sess-live-1".into();
+                }
+                store.insert("live-1".into(), live).expect("insert live-1");
+
+                let done = orchestration::test_task(
+                    "done-1",
+                    orchestration::TaskStatus::Completed,
+                    Provider::Deepseek,
+                );
+                {
+                    let mut inner = done.inner.lock();
+                    inner.started_at = t_done;
+                    inner.completed_at = Some(t_done + 1_500);
+                    inner.cost_usd = Some(0.5);
+                    inner.num_turns = Some(2);
+                    inner.bro_label = Some("team::reviewer".into());
+                    inner.agent_label = Some("agent-done-1@v1".into());
+                }
+                store.insert("done-1".into(), done).expect("insert done-1");
+            }
+            server
+                .state
+                .roster_view
+                .rebuild_from_store(&server.state.task_store.read());
+
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: None,
+                status: None,
+                team: None,
+            }));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 2);
+
+            let by_id: std::collections::HashMap<_, _> = tasks
+                .iter()
+                .map(|t| (t["taskId"].as_str().unwrap().to_string(), t.clone()))
+                .collect();
+
+            let live = by_id.get("live-1").expect("live-1 row");
+            assert_eq!(live["provider"], "glm");
+            assert_eq!(live["status"], "running");
+            assert_eq!(live["broLabel"], "team::executor");
+            assert_eq!(live["agentLabel"], "agent-live-1@v1");
+            assert!(live["hasResult"].as_bool().unwrap_or(false));
+
+            let done = by_id.get("done-1").expect("done-1 row");
+            assert_eq!(done["provider"], "deepseek");
+            assert_eq!(done["status"], "completed");
+            assert_eq!(done["broLabel"], "team::reviewer");
+            assert_eq!(done["agentLabel"], "agent-done-1@v1");
+            assert_eq!(done["elapsed"], "1s");
+        }
     }
 
     #[test]

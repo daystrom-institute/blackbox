@@ -742,6 +742,9 @@ mod roster_view_tests {
             origin: bro_core::Origin::Unknown,
             managed_worktree: None,
             workflow_owned: false,
+            started_at: Some(42),
+            agent_label: None,
+            report_full: None,
         };
         view.upsert("t1".into(), summary.clone());
         let snap = view.snapshot();
@@ -771,6 +774,9 @@ mod roster_view_tests {
                 origin: bro_core::Origin::Unknown,
                 managed_worktree: None,
                 workflow_owned: false,
+                started_at: None,
+                agent_label: None,
+                report_full: None,
             },
         );
         assert_eq!(view.snapshot().len(), 1);
@@ -891,6 +897,9 @@ mod roster_view_tests {
                 origin: bro_core::Origin::Unknown,
                 managed_worktree: None,
                 workflow_owned: false,
+                started_at: None,
+                agent_label: None,
+                report_full: None,
             },
         );
         let mut store = TaskStore::new();
@@ -991,6 +1000,40 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         last_event_at: Some(last_event_at),
         origin: inner.origin,
         workflow_owned: inner.workflow_owned,
+        // Wave 7c: the dashboard consumer needs `started_at` to
+        // recompute the legacy `elapsed` field (terminal:
+        // `last_event_at - started_at`; live: `now - started_at`).
+        // Set from the same `TaskInner.started_at` that the
+        // existing `last_event_at` derivation already reads.
+        started_at: Some(inner.started_at),
+        // Wave 7c: dashboard needs `agentLabel` distinct from
+        // `broLabel`; the legacy projection collapsed them into
+        // `label`. Carry both so the dashboard's row projection
+        // can stay off the per-task inner mutex.
+        agent_label: inner.agent_label.clone(),
+        // Wave 7c: structured report object for the dashboard's
+        // `report` row. `report` (the teaser string) stays for the
+        // fleet row UI; `report_full` carries the full
+        // `BroReport::to_json()` shape for the dashboard.
+        report_full: inner.report.as_ref().map(bro_report_to_wire),
+    }
+}
+
+/// Project an in-memory `BroReport` to the wire-shaped
+/// `BroReportV1` (wave 7c). The dashboard's `report` row uses
+/// `BroReport::to_json()` semantics (camelCase `reportedAt` /
+/// `reportedAgo`); the wire DTO is snake_case to match the
+/// rest of `RosterSummaryV1` and to round-trip cleanly through
+/// serde defaults. `reportedAgo` is computed at projection time
+/// from the current wall clock — the dashboard is for live
+/// display, not for replay.
+fn bro_report_to_wire(report: &BroReport) -> bro_protocol::BroReportV1 {
+    bro_protocol::BroReportV1 {
+        message: report.message.clone(),
+        needs: report.needs.clone(),
+        data: report.data.clone(),
+        reported_at: report.reported_at,
+        reported_ago: format_elapsed(report.reported_at, None),
     }
 }
 
