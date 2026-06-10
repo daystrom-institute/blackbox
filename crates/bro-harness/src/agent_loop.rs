@@ -1717,9 +1717,10 @@ fn compose_system(base: Option<&str>, reg: &Registry, has_structured_output: boo
         }
         if reg.contains("shell_poll") {
             stable.push_str(
-                "\nShell sessions: if `shell_run` or `shell_poll` returns `running=true`, the command \
-                 is still active. Do not treat the command as complete or stop the turn there; call \
-                 `shell_poll` with the returned `session_id` until `running=false`, or `shell_kill` \
+                "\nShell sessions: `shell_run` waits up to `yield_time_ms` for exit (default ~1s; \
+                 `0` waits until exit/timeout). If `shell_run` or `shell_poll` returns `running=true`, \
+                 the command is still active; call `shell_poll` with the returned `session_id` \
+                 until `running=false` (use its `yield_time_ms` to wake later), or `shell_kill` \
                  if you are abandoning it.\n",
             );
         }

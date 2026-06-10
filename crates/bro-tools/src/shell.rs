@@ -36,9 +36,13 @@ use tokio::time::{Instant, sleep_until};
 const MAX_BUF_BYTES: usize = 8 * 1024 * 1024;
 /// Default returned-output budget (~40 KB at a 4-bytes/token heuristic).
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
-/// Default cooperative yield. Long commands should not make the whole agent
-/// turn look hung just because the model forgot to set `yield_time_ms`.
-const DEFAULT_YIELD_MS: u64 = 1_000;
+/// Default cooperative yield for a fresh command. Long commands should not make
+/// the whole agent turn look hung just because the model forgot to set
+/// `yield_time_ms`.
+const DEFAULT_RUN_YIELD_MS: u64 = 1_000;
+/// Default cooperative yield when polling an already-yielded command. The poll
+/// default is longer because the model is explicitly checking an active child.
+const DEFAULT_POLL_YIELD_MS: u64 = 5_000;
 /// Max concurrently-retained (still-running) sessions per dispatch. A blocking
 /// command never counts; only yielded sessions are retained. Prevents a loop
 /// from accumulating unbounded live children.
@@ -146,6 +150,16 @@ fn session_progress(session: &ShellSession) -> Option<Value> {
     let started_ms =
         crate::promise::now_ms().saturating_sub(session.started.elapsed().as_millis() as u64);
     Some(progress.snapshot(started_ms))
+}
+
+/// Convert a model-requested wait window into a deadline. `0` means no yield
+/// deadline, so explicit long waits are honored all the way to exit or timeout.
+/// There is intentionally no low safety cap here: the model-facing contract lets
+/// agents request 60-180s waits to avoid extra polling turns, while `timeout_ms`
+/// remains the hard-kill safety boundary for runaway children.
+fn yield_deadline(now: Instant, requested_ms: Option<u64>, default_ms: u64) -> Option<Instant> {
+    let yield_ms = requested_ms.unwrap_or(default_ms);
+    (yield_ms > 0).then(|| now + Duration::from_millis(yield_ms))
 }
 
 /// Drive a child until it exits, the yield deadline elapses, or the hard-kill
@@ -401,7 +415,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue yielded sessions with shell_poll until running=false. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -468,8 +482,7 @@ impl Tool for ShellRun {
         }
 
         let now = Instant::now();
-        let yield_ms = args.yield_time_ms.unwrap_or(DEFAULT_YIELD_MS);
-        let yield_at = (yield_ms > 0).then(|| now + Duration::from_millis(yield_ms));
+        let yield_at = yield_deadline(now, args.yield_time_ms, DEFAULT_RUN_YIELD_MS);
         let kill_at = args.timeout_ms.map(|ms| now + Duration::from_millis(ms));
 
         let mut session = ShellSession {
@@ -540,7 +553,8 @@ struct ShellPollInput {
     /// shell_kill, the session stays alive if the process ignores the signal,
     /// so you can poll again or escalate.
     signal: Option<String>,
-    /// Cooperative yield in ms before returning if still running (default 5000).
+    /// Cooperative yield in milliseconds before returning if still running.
+    /// Defaults to 5000; set 0 to block until the command exits or times out.
     yield_time_ms: Option<u64>,
     /// Output token budget for this drain (default 10000).
     max_output_tokens: Option<usize>,
@@ -554,7 +568,7 @@ impl Tool for ShellPoll {
         "shell_poll"
     }
     fn description(&self) -> &str {
-        "Resume a running shell session from shell_run: drain new stdout/stderr, optionally feed stdin (set close_stdin to send EOF) or send a teardown signal (signal=int|term|kill, e.g. Ctrl-C a dev server then drain its shutdown output in one call), and wait up to yield_time_ms for it to finish. Returns {exit_code, stdout, stderr, running, timed_out}; exit_code is null while running. When running=false the session is closed; if the process ignores the signal the session stays alive for a follow-up poll. The originating timeout_ms still applies."
+        "Resume a running shell session from shell_run: optionally feed stdin, close stdin, send signal=int|term|kill, and wait up to yield_time_ms for exit. Defaults to 5000ms; set yield_time_ms=0 to block until exit/timeout. Returns {exit_code, stdout, stderr, running, timed_out}; running=false closes the session. If still running, poll again or use shell_kill. The originating timeout_ms still applies."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellPollInput>()
@@ -600,8 +614,11 @@ impl Tool for ShellPoll {
             signal_child(&session, sig);
         }
 
-        let yield_at =
-            Some(Instant::now() + Duration::from_millis(args.yield_time_ms.unwrap_or(5000)));
+        let yield_at = yield_deadline(
+            Instant::now(),
+            args.yield_time_ms,
+            DEFAULT_POLL_YIELD_MS,
+        );
         match drive(&mut session.child, yield_at, session.kill_at).await {
             Outcome::Exited(code) => {
                 let (so, se) = drain_final(&mut session, max_tokens).await;
@@ -914,6 +931,46 @@ mod tests {
         assert_eq!(v["stdout"], "done\n");
     }
 
+
+    #[tokio::test]
+    async fn generous_yield_blocks_slow_command_to_completion() {
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "sleep 2; echo done", "yield_time_ms": 5000}),
+                    &cx(),
+                )
+                .await,
+        );
+        assert_eq!(v["running"], false, "generous yield should finish inline: {v}");
+        assert_eq!(v["exit_code"], 0, "{v}");
+        assert_eq!(v["stdout"], "done\n");
+        assert!(
+            v["session_id"].is_null(),
+            "finished command should not retain a session: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_yield_elapses_before_exit() {
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 2", "yield_time_ms": 50}), &c)
+                .await,
+        );
+        assert_eq!(v["running"], true, "short yield should return a session: {v}");
+        assert!(
+            v["session_id"].as_str().is_some(),
+            "yielded command needs a session id: {v}"
+        );
+
+        let sid = v["session_id"].as_str().unwrap().to_string();
+        let _ = ShellKill
+            .call(json!({"session_id": sid, "signal": "term"}), &c)
+            .await;
+    }
+
     #[test]
     fn shell_path_env_prepends_user_local_bins() {
         let tmp = tempfile::tempdir().unwrap();
@@ -974,6 +1031,53 @@ mod tests {
             p["stdout"].as_str().unwrap().contains("done"),
             "final output: {p}"
         );
+    }
+
+
+    #[tokio::test]
+    async fn shell_poll_short_yield_keeps_session_running() {
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 2", "yield_time_ms": 50}), &c)
+                .await,
+        );
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let p = as_json(
+            ShellPoll
+                .call(json!({"session_id": sid, "yield_time_ms": 50}), &c)
+                .await,
+        );
+        assert_eq!(p["running"], true, "short poll yield should keep session: {p}");
+
+        let sid = p["session_id"].as_str().unwrap().to_string();
+        let _ = ShellKill
+            .call(json!({"session_id": sid, "signal": "term"}), &c)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shell_poll_yield_zero_blocks_until_completion() {
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "sleep 0.2; echo done", "yield_time_ms": 50}),
+                    &c,
+                )
+                .await,
+        );
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let p = as_json(
+            ShellPoll
+                .call(json!({"session_id": sid, "yield_time_ms": 0}), &c)
+                .await,
+        );
+        assert_eq!(p["running"], false, "zero poll yield should block to exit: {p}");
+        assert_eq!(p["exit_code"], 0, "{p}");
+        assert_eq!(p["stdout"], "done\n");
     }
 
     #[tokio::test]
