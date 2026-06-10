@@ -581,6 +581,18 @@ struct Session {
     output_schema: Option<Value>,
 }
 
+/// Whether this session may request the provider's server-side `web_search`
+/// tool (`BRO_HARNESS_WEB_SEARCH`, absent ⇒ enabled). Resolved through the
+/// per-session env (`transport::session_var`) — NOT raw process env — so an
+/// in-process host's per-dispatch `env_overrides` can disable it lane-by-lane
+/// (e.g. the daemon's glm lane defaults it off); the standalone binary still
+/// honors the operator's shell env via the `session_var` fallback.
+fn web_search_enabled() -> bool {
+    transport::session_var("BRO_HARNESS_WEB_SEARCH")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
 impl Session {
     async fn build(
         cli: &Cli,
@@ -595,9 +607,7 @@ impl Session {
 
         let max_tokens = env_u32("BRO_HARNESS_MAX_TOKENS").unwrap_or(DEFAULT_MAX_TOKENS);
         let max_turns = env_u64("BRO_HARNESS_MAX_TURNS").unwrap_or(DEFAULT_MAX_TURNS);
-        let web_search = std::env::var("BRO_HARNESS_WEB_SEARCH")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+        let web_search = web_search_enabled();
 
         // Three-state --system-prompt:
         //   non-empty ⇒ explicit override, kept verbatim in the system slot;
@@ -1794,6 +1804,55 @@ mod tests {
         assert!(names.contains("shell_poll"));
         assert!(names.contains("shell_kill"));
         assert!(names.contains("shell_list"));
+    }
+
+    /// Session env (the in-process daemon's per-dispatch `env_overrides`) must
+    /// beat process env for BRO_HARNESS_WEB_SEARCH, and the standalone-binary
+    /// path (no session scope) still reads process env — mirrors the
+    /// `session_var` contract exercised in `transport::session_env_tests`.
+    #[tokio::test]
+    async fn web_search_flag_prefers_session_env_over_process_env() {
+        // SAFETY: this key is read/written only by this test (the other
+        // web-search tests below never touch process env).
+        unsafe { std::env::set_var("BRO_HARNESS_WEB_SEARCH", "1") };
+
+        transport::with_session_env(
+            std::collections::BTreeMap::from([(
+                "BRO_HARNESS_WEB_SEARCH".to_string(),
+                "0".to_string(),
+            )]),
+            async {
+                assert!(
+                    !web_search_enabled(),
+                    "per-session opt-out must beat process env"
+                );
+            },
+        )
+        .await;
+
+        // Outside any session scope → process env (standalone binary).
+        assert!(web_search_enabled());
+
+        // SAFETY: cleanup of this test's key.
+        unsafe { std::env::remove_var("BRO_HARNESS_WEB_SEARCH") };
+        // Absent everywhere → enabled by default.
+        assert!(web_search_enabled());
+    }
+
+    #[tokio::test]
+    async fn web_search_flag_session_value_semantics() {
+        for (value, expected) in [("0", false), ("false", false), ("FALSE", false), ("1", true)] {
+            transport::with_session_env(
+                std::collections::BTreeMap::from([(
+                    "BRO_HARNESS_WEB_SEARCH".to_string(),
+                    value.to_string(),
+                )]),
+                async move {
+                    assert_eq!(web_search_enabled(), expected, "value {value:?}");
+                },
+            )
+            .await;
+        }
     }
 
     #[test]
