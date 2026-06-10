@@ -34,10 +34,19 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > holding it for the daemon lifetime (keeps boot initial build + cross-process
 > guard semantics; the queue, not the held lock, provides serialization).
 > Measured: idle mean poll 1791µs → ~236µs across the campaign; under-load
-> samples confounded by host rustc storms (see thread note 22). REMAINING:
-> status-snapshot publication (evidence-gated), gaps-store treatment,
-> edge-rebuild guard-stacking (§4.3 tail), Phase 4 enforcement, the §4.6
-> runtime-split decision (needs a compile-free streaming load test).
+> samples confounded by host rustc storms (see thread note 22). Wave 12
+> (2026-06-10 evening) closed the edge plane: `EdgeIndex::rebuild` split so
+> store read guards cover only the in-memory projections (the multi-GB
+> sidecar parse — measured 13–109s in prod — now runs guard-free on the
+> watcher thread); `bbox_thread` link / project unregister nudge the watcher
+> via a coalescing channel instead of rebuilding inline on tokio workers
+> (edges go eventually-consistent, ~seconds); gap-store mutations moved to
+> run_blocking; snapshot growth root-caused (one ~0.5GB generation per HEAD
+> commit, 14d age floor retained a 23.7GB week — maintenance GC default
+> tightened to 2d via `BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS`, emptied
+> snapshot dirs now pruned). REMAINING: status-snapshot publication
+> (evidence-gated), Phase 4 enforcement, the §4.6 runtime-split decision
+> (needs a compile-free streaming load test).
 > File:line citations are point-in-time from the original survey at commit
 > 9cb5228; verify against code.
 

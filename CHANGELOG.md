@@ -8,6 +8,25 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Fixed
+
+- Edge-index rebuilds no longer stall the daemon under load: the store read
+  guards now cover only the fast in-memory projections, while the multi-GB
+  sidecar parse (measured 13–109s per rebuild in production) runs with no
+  guards held. `bbox_thread` link actions and project unregister now wake the
+  rebuild watcher instead of rebuilding inline on the async runtime — they
+  return immediately, and the changed edges appear in the graph within
+  seconds (previously these calls blocked for the full rebuild duration).
+- Gap-note mutations (`bbox_gap`, `bbox_gap_resolve`, `bbox_gap_update`) run
+  their disk-authoritative reload/rewrite on the blocking pool instead of a
+  tokio worker.
+- Inactive edge-snapshot growth: the 6-hourly storage GC maintenance pass now
+  applies a 2-day snapshot age floor (override with
+  `BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS`; keep-recent retention of
+  3/workspace + 10/repo is unchanged). Previously the 14-day default let
+  per-commit snapshot churn accumulate ~24GB in one heavy week. GC also
+  removes snapshot directories once all their files are pruned.
+
 ### Added
 
 - `bro-harness` sidecar session event log: every harness session now appends a
