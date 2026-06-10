@@ -1295,6 +1295,9 @@ impl Session {
                         None,
                         None,
                     );
+                    // Turn-boundary event-log drain (see end of user_turn).
+                    let log = self.event_log.clone();
+                    let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
                     return Ok(());
                 }
             }
@@ -1464,6 +1467,11 @@ impl Session {
             None,
             suspicious.then_some(&turn_end),
         );
+        // Drain the sidecar event-log writer at the turn boundary — bounds
+        // the crash-durability gap to the current turn while keeping
+        // per-event appends off the runtime workers (event_log.rs).
+        let log = self.event_log.clone();
+        let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
         Ok(())
     }
 

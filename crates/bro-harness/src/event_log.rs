@@ -16,12 +16,23 @@
 //!
 //! Invariants:
 //!
-//! - **Append-only, flushed per line.** Postmortems of crashed or hung
-//!   sessions are the point — a plain `O_APPEND` open with one `write_all`
-//!   per line means the log is durable up to the last completed event even
-//!   when the process dies mid-turn. No tmp+rename (that idiom is for the
-//!   snapshot, which must be atomic *as a whole*; the log must never be
-//!   rewritten at all).
+//! - **Append-only.** Postmortems of crashed or hung sessions are the point —
+//!   a plain `O_APPEND` open with one `write_all` per line means the log is
+//!   durable up to the last drained event even when the process dies
+//!   mid-turn. No tmp+rename (that idiom is for the snapshot, which must be
+//!   atomic *as a whole*; the log must never be rewritten at all).
+//! - **Writes happen on a dedicated writer thread.** The agent loop runs as
+//!   an async task on the host's tokio runtime (in-process dispatch shares
+//!   the daemon's workers); serializing a multi-KB envelope and doing a sync
+//!   `write_all` inline per event measurably degraded daemon worker poll
+//!   times under streaming load (thread-935b467d §4.6 measurement). Appends
+//!   enqueue the raw `Value` on a bounded channel; the writer thread owns
+//!   serialization + the file handle and preserves line order. When the
+//!   channel is full the sender BLOCKS (backpressure) rather than dropping —
+//!   the log feeds the transcript corpus, so loss is worse than a stall on a
+//!   pathological disk. The agent loop flushes at turn boundaries
+//!   (`flush_blocking` via `spawn_blocking`) to bound the crash-durability
+//!   gap to the current turn.
 //! - **Compaction never rewrites the log.** Compaction rewrites the snapshot;
 //!   here it only *appends* (`compaction_start` milestone + the teed
 //!   `compact_boundary` envelope), which is what makes the log the durable
@@ -32,11 +43,13 @@
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
 /// File suffix of the sidecar log, appended to the session id.
 pub const EVENT_LOG_SUFFIX: &str = ".events.jsonl";
@@ -45,19 +58,33 @@ pub const EVENT_LOG_SUFFIX: &str = ".events.jsonl";
 /// not one per event.
 static WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Message to the writer thread: a line to append, or a flush rendezvous.
+enum LogMsg {
+    Line(Value),
+    Flush(SyncSender<()>),
+}
+
+/// Bound on queued-but-unwritten lines. Generous — at streaming-agent event
+/// rates the writer drains far faster than the loop produces; the bound only
+/// bites when the disk itself stalls, where blocking is the right behavior.
+const WRITER_QUEUE_CAP: usize = 4096;
+
 pub struct EventLog {
     path: PathBuf,
-    /// Lazily opened append handle; `None` until the first append.
-    file: Mutex<Option<File>>,
+    /// Sender to the lazily spawned writer thread; `None` until first append.
+    writer: Mutex<Option<SyncSender<LogMsg>>>,
     /// Set after the first failed open/write; later appends become no-ops.
-    disabled: AtomicBool,
+    /// Shared with the writer thread, which observes failures.
+    disabled: Arc<AtomicBool>,
 }
 
 impl EventLog {
     /// The log for `session_id`, in the same sessions dir the snapshot uses
     /// (`$BRO_HOME/harness-sessions`, else `~/.bro-harness/sessions`).
     pub fn for_session(session_id: &str) -> Self {
-        Self::at_path(crate::session::sessions_dir().join(format!("{session_id}{EVENT_LOG_SUFFIX}")))
+        Self::at_path(
+            crate::session::sessions_dir().join(format!("{session_id}{EVENT_LOG_SUFFIX}")),
+        )
     }
 
     /// A log at an explicit path (test seam; production goes through
@@ -65,8 +92,8 @@ impl EventLog {
     pub fn at_path(path: PathBuf) -> Self {
         Self {
             path,
-            file: Mutex::new(None),
-            disabled: AtomicBool::new(false),
+            writer: Mutex::new(None),
+            disabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -75,8 +102,8 @@ impl EventLog {
     pub fn disabled() -> Self {
         Self {
             path: PathBuf::new(),
-            file: Mutex::new(None),
-            disabled: AtomicBool::new(true),
+            writer: Mutex::new(None),
+            disabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -113,38 +140,127 @@ impl EventLog {
         if self.disabled.load(Ordering::Relaxed) {
             return;
         }
-        if let Err(err) = self.try_append(&line) {
-            self.disabled.store(true, Ordering::Relaxed);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %err,
-                    "session event log unwritable; disabling (agent loop unaffected)"
-                );
+        let mut guard = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            *guard = self.spawn_writer();
+            if guard.is_none() {
+                return; // spawn failed; disabled + warned inside
+            }
+        }
+        let tx = guard.as_ref().expect("spawned above");
+        match tx.try_send(LogMsg::Line(line)) {
+            Ok(()) => {}
+            // Queue full: the disk is stalled. Block (backpressure) rather
+            // than dropping — the log feeds the transcript corpus.
+            Err(TrySendError::Full(msg)) => {
+                let _ = tx.send(msg);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Writer thread died (open/write failure path warns there).
+                self.disabled.store(true, Ordering::Relaxed);
+                *guard = None;
             }
         }
     }
 
-    fn try_append(&self, line: &Value) -> std::io::Result<()> {
-        let mut guard = self.file.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.is_none() {
-            if let Some(parent) = self.path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-            *guard = Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)?,
-            );
+    /// Block until every line enqueued before this call is written to the
+    /// OS. Called from `spawn_blocking` at turn boundaries (bounds the
+    /// crash-durability gap to the current turn) and from tests before
+    /// reading the file. No-op when disabled or never written.
+    pub fn flush_blocking(&self) {
+        let guard = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(tx) = guard.as_ref() else { return };
+        let (ack_tx, ack_rx) = sync_channel(1);
+        if tx.send(LogMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(30));
         }
-        let file = guard.as_mut().expect("opened above");
-        // One write_all per line: with O_APPEND this is atomic enough for the
-        // whole-line JSONL contract, and `File` is unbuffered so the line is
-        // handed to the OS immediately (no explicit flush needed).
-        file.write_all(format!("{line}\n").as_bytes())
+    }
+
+    /// Spawn the writer thread that owns serialization and the append handle.
+    /// Returns `None` (and disables the log) if the thread can't spawn.
+    fn spawn_writer(&self) -> Option<SyncSender<LogMsg>> {
+        let (tx, rx) = sync_channel::<LogMsg>(WRITER_QUEUE_CAP);
+        let path = self.path.clone();
+        let disabled = self.disabled.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bro-evlog-writer".into())
+            .spawn(move || writer_loop(rx, path, disabled));
+        match spawned {
+            Ok(_) => Some(tx),
+            Err(err) => {
+                self.disabled.store(true, Ordering::Relaxed);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %err,
+                        "session event log writer thread failed to spawn; disabling"
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Writer-thread body: open the append handle lazily, then drain messages
+/// in order until every sender is dropped. The first open/write failure
+/// warns (once per process), disables the log, and the loop keeps draining
+/// (and discarding) so senders never block on a dead log.
+fn writer_loop(rx: Receiver<LogMsg>, path: PathBuf, disabled: Arc<AtomicBool>) {
+    let mut file = None;
+    let mut failed = false;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            LogMsg::Line(line) => {
+                if failed {
+                    continue;
+                }
+                if file.is_none() {
+                    match open_append(&path) {
+                        Ok(f) => file = Some(f),
+                        Err(err) => {
+                            failed = true;
+                            disabled.store(true, Ordering::Relaxed);
+                            warn_unwritable(&path, &err);
+                            continue;
+                        }
+                    }
+                }
+                // One write_all per line: with O_APPEND this is atomic enough
+                // for the whole-line JSONL contract, and `File` is unbuffered
+                // so the line is handed to the OS immediately.
+                let f = file.as_mut().expect("opened above");
+                if let Err(err) = f.write_all(format!("{line}\n").as_bytes()) {
+                    failed = true;
+                    disabled.store(true, Ordering::Relaxed);
+                    warn_unwritable(&path, &err);
+                }
+            }
+            LogMsg::Flush(ack) => {
+                // Everything enqueued before the flush is already written
+                // (in-order drain); just acknowledge.
+                let _ = ack.try_send(());
+            }
+        }
+    }
+}
+
+fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn warn_unwritable(path: &Path, err: &std::io::Error) {
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "session event log unwritable; disabling (agent loop unaffected)"
+        );
     }
 }
 
@@ -188,6 +304,7 @@ mod tests {
         }));
         log.append_event(&json!({"type": "result", "session_id": "s1", "result": "hi"}));
 
+        log.flush_blocking();
         let lines = read_lines(log.path());
         assert_eq!(lines.len(), 3);
         for line in &lines {
@@ -204,6 +321,7 @@ mod tests {
 
         // Append-only: a later append extends, never rewrites.
         log.append_milestone("compaction_start", "s1", json!({"reason": "auto"}));
+        log.flush_blocking();
         let lines = read_lines(log.path());
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[3]["event"]["milestone"], "compaction_start");
@@ -221,6 +339,9 @@ mod tests {
 
         log.append_event(&json!({"type": "assistant"}));
         log.append_event(&json!({"type": "result"}));
+        // Failure is observed on the writer thread; the flush rendezvous
+        // makes it deterministic before the assert.
+        log.flush_blocking();
         assert!(log.disabled.load(Ordering::Relaxed));
 
         std::fs::remove_dir_all(&dir).ok();
