@@ -49,49 +49,57 @@ impl BlackboxServer {
         name = "bbox_artifact_supersede",
         description = "Mark one installed artifact superseded by another artifact of the same kind."
     )]
-    pub(crate) fn bbox_artifact_supersede(
+    pub(crate) async fn bbox_artifact_supersede(
         &self,
         Parameters(p): Parameters<ArtifactSupersedeParams>,
     ) -> CallToolResult {
-        Self::run("bbox_artifact_supersede", || {
+        // supersede holds artifacts.write() across a flock + fsync + rename.
+        let server = self.clone();
+        Self::run_blocking("bbox_artifact_supersede", move || {
             let kind = p.kind;
             let name = p.name.clone();
-            let meta = self
-                .state
-                .artifacts
-                .write()
-                .supersede(p.kind, &p.name, &p.superseded_by)?;
-            deactivate_artifact(&self.state, kind, &name)?;
+            let meta =
+                server
+                    .state
+                    .artifacts
+                    .write()
+                    .supersede(p.kind, &p.name, &p.superseded_by)?;
+            deactivate_artifact(&server.state, kind, &name)?;
             Ok(serde_json::to_string_pretty(&meta)?)
         })
+        .await
     }
 
     #[tool(
         name = "bbox_artifact_remove",
         description = "Hard-remove one installed artifact."
     )]
-    pub(crate) fn bbox_artifact_remove(
+    pub(crate) async fn bbox_artifact_remove(
         &self,
         Parameters(p): Parameters<ArtifactRemoveParams>,
     ) -> CallToolResult {
-        Self::run("bbox_artifact_remove", || {
+        // remove_hard runs flock'd store rewrites + file removals.
+        let server = self.clone();
+        Self::run_blocking("bbox_artifact_remove", move || {
             if !p.dry_run && !p.confirm {
                 anyhow::bail!("hard artifact removal requires confirm=true");
             }
             if !p.dry_run {
-                self.state
+                server
+                    .state
                     .artifacts
                     .read()
                     .remove_hard(p.kind, &p.name, true, true)?;
-                deactivate_artifact(&self.state, p.kind, &p.name)?;
+                deactivate_artifact(&server.state, p.kind, &p.name)?;
             }
-            let result = self
+            let result = server
                 .state
                 .artifacts
                 .write()
                 .remove_hard(p.kind, &p.name, p.dry_run, p.confirm)?;
             Ok(serde_json::to_string_pretty(&result)?)
         })
+        .await
     }
 }
 

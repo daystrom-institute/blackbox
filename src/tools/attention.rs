@@ -46,12 +46,20 @@ impl BlackboxServer {
         name = "bbox_inbox",
         description = "Aggregate attention layer across every store."
     )]
-    pub(crate) fn bbox_inbox(&self, Parameters(p): Parameters<InboxParams>) -> CallToolResult {
-        Self::run("bbox_inbox", || {
+    pub(crate) async fn bbox_inbox(
+        &self,
+        Parameters(p): Parameters<InboxParams>,
+    ) -> CallToolResult {
+        // Gap-spool import is full-store disk I/O under the gaps write lock,
+        // and compute_inbox stacks five store read guards — run on the
+        // blocking pool, not a tokio worker. (The import's guards drop before
+        // the read stack below; only in-memory work happens under the stack.)
+        let server = self.clone();
+        Self::run_blocking("bbox_inbox", move || {
             let import_report = if p.import_gap_spool.unwrap_or(false) {
-                let projects = self.state.projects.read();
-                let mut gaps = self.state.gaps.write();
-                let state_dir = self.state.config.read().paths.state_dir.clone();
+                let projects = server.state.projects.read();
+                let mut gaps = server.state.gaps.write();
+                let state_dir = server.state.config.read().paths.state_dir.clone();
                 Some(gap_spool::import_gap_spool(
                     &mut gaps, &projects, &state_dir,
                 )?)
@@ -59,18 +67,18 @@ impl BlackboxServer {
                 None
             };
 
-            let kb = self.state.kb.read();
-            let threads = self.state.threads.read();
-            let notes = self.state.notes.read();
-            let gaps = self.state.gaps.read();
-            let task_store = self.state.task_store.read();
+            let kb = server.state.kb.read();
+            let threads = server.state.threads.read();
+            let notes = server.state.notes.read();
+            let gaps = server.state.gaps.read();
+            let task_store = server.state.task_store.read();
             let inbox = inbox::compute_inbox(
                 &kb,
                 &threads,
                 &notes,
                 &gaps,
                 &task_store,
-                &self.state.whiteboards,
+                &server.state.whiteboards,
                 &p,
             )?;
             if let Some(report) = import_report {
@@ -84,5 +92,6 @@ impl BlackboxServer {
                 Ok(inbox)
             }
         })
+        .await
     }
 }
