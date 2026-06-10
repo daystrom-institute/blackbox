@@ -1,0 +1,24 @@
+{
+  "id": "gap-c6dbc03f",
+  "title": "Shell tool lacks long-poll/backoff for long-running commands; bros turn-pace cargo waits",
+  "gap_kind": "tooling",
+  "domain": "bro-tools/shell",
+  "wanted_capability": "A wait_secs parameter (or automatic exponential backoff) on the shell poll surface so a model can say \"wake me in 90s\" while a known-long command (cargo build/test) runs. Today each poll returns after a short interval, forcing one full LLM turn (~8-16s latency + fresh-token tax) per poll: a 5-minute compile costs ~35 no-op turns. Runs are turn-paced, not compile-paced — measured 7.9-16.3s/turn nearly constant across nine wave sessions regardless of work content.",
+  "missing_primitive": "shell_run block_until_exit mode (or honor large yield_time_ms to completion)",
+  "fallback_used": "Briefs tell bros to be patient and poll the same session; supervision loop alerts on shell_poll treated as known false positives.",
+  "evidence": [
+    "W4b: 177 turns / 23m = 7.9s/turn while majority of narration is 'still polling cargo'",
+    "W2a unstable-matrix run: 95 turns / 44m dominated by two full workspace rebuilds",
+    "supervision shell_poll loop alerts (amber/red, hash-repeat up to 30) on every wave bro — same hotspot thread-c0ac4d45 wants exempted"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-tools/shell-long-poll-backoff",
+  "notes": "Sharpened by the wave-6 deepseek self-retro: the bro set yield_time_ms=180000 on shell_run for an 85s cargo run and the harness STILL returned running:true before completion, forcing the poll turn — the long-wait knob exists but does not block to exit. Fix shape: a block_until_exit=true mode (single call returns the final result, no session/poll) or honoring large yield_time_ms to completion. Even short 60-90s test runs cost 2 turns today. Also confirmed by call-mix data: gpt-5.5/Responses sessions show 82/133 calls = shell_poll; deepseek/anthropic-transport sessions show 18 shell_run vs 2 shell_poll (it leans on yield_time_ms but still pays the +1 poll). Transport note: the catalog-reinjection tax (gap-8a6f752c) appears Responses-transport-specific — deepseek fresh-token burn was 0.4-1.3K/turn vs gpt-5.5's 7-12K/turn.",
+  "resolution": "addressed",
+  "thread_id": "thread-935b467d",
+  "created_at": "2026-06-10T00:17:27Z",
+  "updated_at": "2026-06-10T07:37:51Z",
+  "resolved_at": "2026-06-10T07:37:51Z",
+  "resolution_note": "Addressed in a6421c5 (wave 7a, folded to beta): shell_run already honored explicit long waits — actual fixes were shell_poll yield_time_ms=0 now blocking to exit/timeout (matching shell_run), named wait-deadline helpers documenting no hidden cap, tightened model-facing descriptions, updated pinned shell guidance. Regression tests for one-call completion. Residual caveat documented: the code-mode JS exec cell has its own yield timer that can return before an inner shell wait completes — exec-surface follow-up, not a shell-tool defect."
+}

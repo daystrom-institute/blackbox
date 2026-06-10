@@ -1,0 +1,20 @@
+{
+  "id": "gap-4629bbeb",
+  "title": "Harness session transcripts are invisible to the transcript corpus and unusable for postmortems",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/session-observability",
+  "wanted_capability": "Three facets: (1) a transcript adapter so in-process harness sessions (brodex/glm/deepseek/minimax) are locatable and indexed — today every harness task has transcript_location=null, TRANSCRIPT_SEARCH roots don't cover the session dir, and bbox_search/bbox_cite/bbox_messages cannot see any bro work; (2) per-item timestamps or a sidecar append-only event log — session files are resume-state snapshots (Responses item shape, no timestamps, rewritten by compaction), so time-based postmortems of where a bro spent its run are impossible from disk; (3) BRO_HOME routing — the daemon does not export BRO_HOME to the in-process harness, so sessions land in the fallback ~/.bro-harness/sessions (2,224 files) instead of BRO_HOME/harness-sessions, off the documented state layout.",
+  "fallback_used": "Usage-ledger arithmetic (turns/elapsed/fresh-tokens) + task-store last-50 events for postmortems; find(1) to locate session files manually.",
+  "evidence": [
+    "all wave-bro tasks in thread-935b467d show transcript_location=null",
+    "~/.bro-harness/sessions/a2eb6d49*.json = 412KB, 442 items, zero timestamp fields, contains compaction_summary (history rewritten)",
+    "orchestrator postmortem of slow waves had to reconstruct timing from usage arithmetic; retained-window tool calls: 82/133 = shell_poll (validates gap-c6dbc03f)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/session-transcript-observability",
+  "resolution": "unresolved",
+  "thread_id": "thread-935b467d",
+  "created_at": "2026-06-10T00:23:24Z",
+  "updated_at": "2026-06-10T00:23:24Z"
+}

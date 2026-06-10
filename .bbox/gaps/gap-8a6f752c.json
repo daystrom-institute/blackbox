@@ -1,0 +1,21 @@
+{
+  "id": "gap-8a6f752c",
+  "title": "Harness re-injects the deferred-tool catalog nearly every turn during long shell waits",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/context-injection",
+  "wanted_capability": "Inject the optional/deferred tool catalog at most once per session (or only on actual registry change, hash-gated), not repeatedly during shell-poll loops. Long cargo waits currently receive the catalog on nearly every turn; dispatched gpt-5.5 bros burn ~7-12K fresh input tokens per poll turn and narrate around it (\"the optional tool catalog arrived again\") dozens of times per run.",
+  "fallback_used": "None — bros correctly ignore the injections, but the token+latency tax per turn remains; orchestrator absorbing it as slow waves.",
+  "evidence": [
+    "thread-935b467d wave sessions: W3a 327 turns/46m, W4a 321 turns/~50m, W4b 177 turns 1.22M fresh input (6.9K/turn) vs 18M cached",
+    "bro narrations contain 30-50 consecutive 'optional tool catalog arrived' turns per long cargo wait"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/tool-catalog-reinjection-per-turn",
+  "resolution": "addressed",
+  "thread_id": "thread-935b467d",
+  "created_at": "2026-06-10T00:17:19Z",
+  "updated_at": "2026-06-10T03:57:40Z",
+  "resolved_at": "2026-06-10T03:57:40Z",
+  "resolution_note": "Fixed in 7f0bad8: SystemPrompt three-way split (stable/ambient/volatile); Responses transport persists the manifest into the buffer hash-gated on change (codex idiom), resets on compaction, carries the hash in the v2 session snapshot. Live-verified: probe session bcab81ef shows exactly one persisted developer manifest item across the run and zero catalog narration; anthropic/chat transports unchanged in behavior."
+}

@@ -1,0 +1,19 @@
+{
+  "id": "gap-c21e34a3",
+  "title": "glm lane: Z.ai server-side builtins fire on degenerate invocations during tool-confusion; done-note path under-discoverable",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/provider-glm-builtins",
+  "wanted_capability": "Two coupled needs surfaced by transcript forensics (session d98ee38a item 182): (1) a way to suppress Z.ai's server-side built-in tools (web_search_prime) for dispatched code bros — the model, flailing for the bbox_note emission path, emitted six degenerate server_tool_use invocations with search_query=\"test\" plus self-generated markdown mimicking a tool-execution UI, all executed server-side mid-stream; the harness never requested web_search. Need a provider/request knob (or harness-side filter if Z.ai exposes one) to disable builtins on the glm lane. (2) note/done-note discoverability under code_mode: bbox_note lives behind the exec surface (note() idiom) and the model only found it after the websearch flail — the pinned-tool guidance or brief template should state the exec-note path explicitly for code_mode sessions.",
+  "fallback_used": "Brief-level \"do NOT call web_search or Z.ai built-ins\" prohibition on subsequent glm resumes (symptom treatment); model self-recovered via exec note() after six degenerate calls.",
+  "evidence": [
+    "session d98ee38a snapshot item 182: 6x server_tool_use web_search_prime {search_query: test} in one assistant turn, then items 183-185 exec cell -> note emitted",
+    "wave-7 W7d; thread-9dfe1da5"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/glm-server-builtin-suppression",
+  "resolution": "unresolved",
+  "thread_id": "thread-9dfe1da5",
+  "created_at": "2026-06-10T07:37:48Z",
+  "updated_at": "2026-06-10T07:37:48Z"
+}

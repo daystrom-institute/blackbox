@@ -1,0 +1,20 @@
+{
+  "id": "gap-43059df9",
+  "title": "Shell command timeout does not reap the child process tree; orphans hold cargo locks",
+  "gap_kind": "tooling",
+  "domain": "bro-tools/shell-process-group",
+  "wanted_capability": "When a shell_run/shell_poll command hits its timeout (or is killed), the harness should terminate the entire process group/tree, not just the direct child. Today a timed-out cargo command leaves sccache/rustc grandchildren alive holding the target-dir build lock; the next cargo command blocks on the lock and the bro burns a multi-turn forensic loop (pgrep/ps/kill cycles) to find and reap the orphans. W7a did this cleanup dance three separate times in one session; each cost 5-10 turns and several minutes.",
+  "missing_primitive": "process-group spawn (setsid/setpgid) + group kill on timeout/shell_kill",
+  "fallback_used": "Bros manually pgrep/ps to identify orphaned cargo/rustc/sccache PIDs under their target dir and kill them individually before retrying.",
+  "evidence": [
+    "W7a session faef2ed8 narration: three orphan-cleanup loops after 600s timeouts (PIDs 11254/29258/48211 + compiler children) each holding /Users/invidious/repos/ts-w7a/target lock",
+    "thread-9dfe1da5 wave-7 fan-out"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-tools/shell-timeout-process-group",
+  "resolution": "unresolved",
+  "thread_id": "thread-9dfe1da5",
+  "created_at": "2026-06-10T07:37:39Z",
+  "updated_at": "2026-06-10T07:37:39Z"
+}

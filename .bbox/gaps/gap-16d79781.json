@@ -1,0 +1,21 @@
+{
+  "id": "gap-16d79781",
+  "title": "Worktree dispatch: harness file tools silently resolve relative paths against the launch cwd",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/sandbox-cwd",
+  "wanted_capability": "A first-class working-directory override for dispatched sessions (dispatch-time cwd param, or an in-session chdir/workdir tool affecting file_read/file_edit/content_search and shell default cwd), so a bro instructed to work in a self-created git worktree actually operates there. Today file tools resolve relative paths against the LAUNCH cwd: in a 4-bro worktree fan-out, one bro silently edited five files in the primary checkout mid-flight (caught by orchestrator IDE diagnostics + steer), a second applied edits to primary AND made an accidental commit there before self-correcting, and a third only avoided it because the shell layer rejected a ../ escape loudly, forcing absolute paths. Silent-wrong-tree is a data-hazard class: it defeats worktree isolation and risks clobbering peer/orchestrator state in the primary tree.",
+  "missing_primitive": "dispatch-time cwd override / session workdir tool",
+  "fallback_used": "Brief-level instruction to use absolute paths + --manifest-path/--target-dir pinning on every cargo command; orchestrator mid-run bro_steer recovery (copy-to-worktree + git checkout -- restore of primary) when a bro falls into the trap.",
+  "evidence": [
+    "wave-7 fan-out thread-9dfe1da5: W7b narration 'changes were applied to the primary checkout... commit went to the primary checkout... undo the accidental commit'",
+    "W7c live-caught editing 5 primary files (bro-protocol/fleet-client/orchestration/roster) while briefed into ../ts-w7c",
+    "W7a narration: shell helper refused relative ../ts-w7a wd escape; succeeded only via absolute paths + manifest-path pinning"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/worktree-cwd-override",
+  "resolution": "unresolved",
+  "thread_id": "thread-9dfe1da5",
+  "created_at": "2026-06-10T06:10:29Z",
+  "updated_at": "2026-06-10T06:10:29Z"
+}
