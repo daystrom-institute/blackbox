@@ -99,6 +99,28 @@ fn count_materialized_jsonl_files(edges_dir: &Path) -> usize {
 impl EdgeIndex {
     pub fn rebuild(stores: &EdgeStoreRefs<'_>) -> Self {
         let started = Instant::now();
+        let (mut index, mut seen) = Self::project_store_edges(stores);
+
+        index.load_sidecar_edges(
+            &stores.edges_dir,
+            stores.registered_project_ids.as_ref(),
+            &mut seen,
+            stores.include_observed,
+        );
+
+        index.log_rebuilt(stores.include_tantivy_projection, started);
+        index
+    }
+
+    /// Store-projection half of `rebuild`: walks the in-memory stores only.
+    /// Callers holding store read guards (knowledge/threads/notes/tasks/
+    /// roadmap/idx) run just this half under them, then drop the guards
+    /// before `load_sidecar_edges` — the sidecar load is a multi-GB disk
+    /// parse that needs no store access, and parking_lot fairness means one
+    /// writer queued behind a guard held that long blocks all new readers.
+    /// Store projections must run before the sidecar load so `seen` dedup
+    /// attribution matches `rebuild`.
+    pub(crate) fn project_store_edges(stores: &EdgeStoreRefs<'_>) -> (Self, HashSet<EdgeKey>) {
         let mut index = Self::default();
         let mut seen = HashSet::new();
 
@@ -114,23 +136,18 @@ impl EdgeIndex {
         } else {
             tracing::debug!("rebuilt EdgeIndex without Tantivy stored-doc projection");
         }
+        (index, seen)
+    }
 
-        index.load_sidecar_edges(
-            &stores.edges_dir,
-            stores.registered_project_ids.as_ref(),
-            &mut seen,
-            stores.include_observed,
-        );
-
+    pub(crate) fn log_rebuilt(&self, include_tantivy_projection: bool, started: Instant) {
         tracing::info!(
-            edges = index.edge_count(),
-            sources = index.forward.len(),
-            targets = index.reverse.len(),
-            include_tantivy_projection = stores.include_tantivy_projection,
+            edges = self.edge_count(),
+            sources = self.forward.len(),
+            targets = self.reverse.len(),
+            include_tantivy_projection,
             elapsed_ms = started.elapsed().as_millis(),
             "rebuilt EdgeIndex"
         );
-        index
     }
 
     pub fn load_sidecar_edges(

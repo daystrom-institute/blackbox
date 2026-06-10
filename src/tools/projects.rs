@@ -492,9 +492,11 @@ impl BlackboxServer {
             // `.bbox/knowledge/` stays on disk and reloads on re-register.
             crate::server::routes::sync_kb_project_roots(&self.state);
 
-            // Rebuild EdgeIndex so edges that were keyed on the removed
-            // project no longer surface in subsequent inspections.
-            self.rebuild_edge_index_from_stores();
+            // Nudge the watcher to rebuild EdgeIndex so edges keyed on the
+            // removed project stop surfacing. Async handler — the rebuild's
+            // multi-GB sidecar parse must not run inline on a tokio worker;
+            // stale edges for a few seconds after unregister are acceptable.
+            self.state.nudge_edge_index_rebuild();
 
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",

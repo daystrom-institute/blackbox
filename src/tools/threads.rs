@@ -68,7 +68,11 @@ impl BlackboxServer {
                 )));
         }
         if mutation.changed_edges {
-            self.rebuild_edge_index_from_stores();
+            // Nudge the watcher thread instead of rebuilding inline: a full
+            // rebuild parses the multi-GB sidecar lanes (13s+ in prod) and
+            // must not pin a tokio worker. The linked edge appears in the
+            // graph once the watcher's rebuild lands (typically seconds).
+            self.state.nudge_edge_index_rebuild();
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, bytes = mutation.message.len(), "ok");

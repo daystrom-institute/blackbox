@@ -70,6 +70,15 @@ pub(crate) struct SharedState {
     pub(crate) reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
     #[allow(dead_code)]
     pub(crate) edge_index: RwLock<edge_index::EdgeIndex>,
+    /// Out-of-band wake for the edge-index rebuild watcher. Async tool
+    /// handlers whose store mutations change projected edges (bbox_thread
+    /// link, project unregister) nudge instead of rebuilding inline — a
+    /// rebuild parses the multi-GB sidecar lanes and must not run on a
+    /// tokio worker. 1-slot channel + try_send coalesces bursts; the
+    /// watcher rebuild picks up every store mutation made before it runs.
+    pub(crate) edge_rebuild_nudge_tx: std::sync::mpsc::SyncSender<()>,
+    /// Receiver half, taken once by `spawn_edge_index_rebuild_watcher`.
+    pub(crate) edge_rebuild_nudge_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pub(crate) path_cache: RwLock<path_cache::PathCache>,
     pub(crate) task_store: Arc<RwLock<TaskStore>>,
     pub(crate) tail_tx: broadcast::Sender<TailEvent>,
@@ -280,6 +289,14 @@ impl SharedState {
         log.push_back(d);
     }
 
+    /// Ask the edge-index rebuild watcher to run a rebuild soon (it wakes
+    /// immediately when parked on its interval). `try_send` failure means a
+    /// nudge is already pending — the queued rebuild will see this caller's
+    /// store mutation too, so dropping the second nudge is correct.
+    pub(crate) fn nudge_edge_index_rebuild(&self) {
+        let _ = self.edge_rebuild_nudge_tx.try_send(());
+    }
+
     pub(crate) fn roster_events(&self) -> orchestration::RosterEventSink {
         // Wire the view into the sink so every emit_* call also
         // updates the daemon-side cache. Sinks created before the
@@ -400,6 +417,7 @@ impl SharedState {
             projects_persister.request();
         }
 
+        let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
         SharedState {
             idx: RwLock::new(idx),
             index_writer,
@@ -422,6 +440,8 @@ impl SharedState {
             bbox_watcher: std::sync::Mutex::new(None),
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             edge_index: RwLock::new(edge_index::EdgeIndex::default()),
+            edge_rebuild_nudge_tx,
+            edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
             path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,

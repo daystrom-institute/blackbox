@@ -86,6 +86,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         edge_index: RwLock::new(edge_index::EdgeIndex::default()),
+        edge_rebuild_nudge_tx: std::sync::mpsc::sync_channel(1).0,
+        edge_rebuild_nudge_rx: std::sync::Mutex::new(None),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(TaskStore::new())),
         tail_tx,

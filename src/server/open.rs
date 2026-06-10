@@ -225,6 +225,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         &projects_store.read(),
     );
 
+    let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         index_writer,
@@ -247,6 +248,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
         edge_index: RwLock::new(edge_index),
+        edge_rebuild_nudge_tx,
+        edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx,
