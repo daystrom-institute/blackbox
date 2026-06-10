@@ -5,6 +5,14 @@ use crate::storage_health;
 
 const DEFAULT_STORAGE_GC_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
+/// Age floor for the maintenance pass's inactive-snapshot pruning. The
+/// interactive `bbox_storage_gc` default (14d) let per-commit snapshot churn
+/// accumulate ~24GB in one heavy week (145 generations, one per HEAD commit)
+/// before anything aged out. Snapshot reuse value lives in the keep-recent
+/// retention (3/workspace + 10/repo), which still applies regardless of this
+/// floor; 2 days of extra age protection covers branch-switch round-trips.
+const DEFAULT_SNAPSHOT_MAX_AGE_DAYS: u64 = 2;
+
 pub(crate) fn storage_gc_interval_from_env() -> std::time::Duration {
     let secs = std::env::var("BLACKBOX_STORAGE_GC_INTERVAL_SECS")
         .ok()
@@ -12,6 +20,16 @@ pub(crate) fn storage_gc_interval_from_env() -> std::time::Duration {
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_STORAGE_GC_INTERVAL_SECS);
     std::time::Duration::from_secs(secs)
+}
+
+/// `BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS` overrides the maintenance
+/// pass's snapshot age floor. `0` disables age-based retention entirely
+/// (keep-recent rules still protect the newest snapshots).
+fn snapshot_max_age_days_from_env() -> u64 {
+    std::env::var("BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SNAPSHOT_MAX_AGE_DAYS)
 }
 
 pub(crate) fn spawn_storage_gc_thread(state: Arc<SharedState>, interval: std::time::Duration) {
@@ -50,8 +68,9 @@ fn run_storage_gc_pass(state: &SharedState) -> anyhow::Result<()> {
         max_backup_age_days: Some(7),
         keep_newest_backup_per_source: 1,
     };
-    let candidates =
-        storage_health::plan_gc_with_policy(&edges_dir, &registered, &params, &Default::default())?;
+    let mut policy = storage_health::GcPolicy::default();
+    policy.materialized_snapshots.max_age_days = Some(snapshot_max_age_days_from_env());
+    let candidates = storage_health::plan_gc_with_policy(&edges_dir, &registered, &params, &policy)?;
     let deletable_bytes: u64 = candidates
         .iter()
         .filter(|candidate| candidate.deletable)

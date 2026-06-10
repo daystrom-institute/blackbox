@@ -1303,14 +1303,29 @@ fn plan_observed_gc(
 pub fn apply_gc(candidates: &[GcCandidate]) -> (Vec<String>, Vec<String>) {
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
+    let mut snapshot_dirs: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
     for c in candidates {
         if !c.deletable || c.path.is_empty() {
             continue;
         }
         match fs::remove_file(&c.path) {
-            Ok(()) => deleted.push(c.path.clone()),
+            Ok(()) => {
+                if c.kind == FileKind::InactiveSnapshot {
+                    if let Some(parent) = Path::new(&c.path).parent() {
+                        snapshot_dirs.insert(parent.to_path_buf());
+                    }
+                }
+                deleted.push(c.path.clone());
+            }
             Err(e) => errors.push(format!("{}: {}", c.path, e)),
         }
+    }
+    // Drop fully-pruned snapshot directories so dead `head-<sha>-…` dirs
+    // don't accumulate (remove_dir refuses non-empty dirs, so a dir that
+    // still holds retained files survives untouched).
+    for dir in snapshot_dirs {
+        let _ = fs::remove_dir(&dir);
     }
     (deleted, errors)
 }
