@@ -13,7 +13,10 @@
 //! Sessions are in-memory and live only within a single harness `run()` (across
 //! the LLM turns of one dispatch, NOT across exec → resume): a live OS child
 //! can't be serialized into the persisted `side` cell. Children are spawned
-//! `kill_on_drop`, so abandoned sessions die when the `ToolCx` drops.
+//! `kill_on_drop` in their own process group, so abandoned sessions die — whole
+//! group, grandchildren included — when the `ToolCx` drops
+//! ([`ShellSession`]'s `Drop` signals the group; `kill_on_drop` reaps the
+//! direct child).
 
 use crate::promise::{PromiseProgress, StreamKind};
 use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
@@ -101,6 +104,20 @@ struct ShellSession {
     progress: Option<Arc<PromiseProgress>>,
 }
 
+impl Drop for ShellSession {
+    /// `kill_on_drop` only covers the direct bash child; an abandoned live
+    /// session (the `ToolCx` drops mid-run) must take its whole process group
+    /// down too, or grandchildren keep running. `Child::id()` returns `None`
+    /// once the child has been reaped, so this never fires for a command that
+    /// already exited — survivors a *successful* command intentionally
+    /// backgrounded are left alone, same as before.
+    fn drop(&mut self) {
+        if let Some(pid) = self.child.id() {
+            signal_group(pid, libc::SIGKILL);
+        }
+    }
+}
+
 /// Session table hung off `ToolCx`. In-memory, single-`run()` lifetime.
 #[derive(Default)]
 pub struct ShellSessions {
@@ -163,7 +180,8 @@ fn yield_deadline(now: Instant, requested_ms: Option<u64>, default_ms: u64) -> O
 }
 
 /// Drive a child until it exits, the yield deadline elapses, or the hard-kill
-/// deadline elapses (in which case it is killed). Holds no lock.
+/// deadline elapses (in which case its whole process group is killed). Holds
+/// no lock.
 async fn drive(child: &mut Child, yield_at: Option<Instant>, kill_at: Option<Instant>) -> Outcome {
     let far = Instant::now() + Duration::from_secs(31_536_000);
     let y = yield_at.unwrap_or(far);
@@ -172,6 +190,12 @@ async fn drive(child: &mut Child, yield_at: Option<Instant>, kill_at: Option<Ins
         s = child.wait() => Outcome::Exited(s.ok().and_then(|st| st.code())),
         _ = sleep_until(y), if yield_at.is_some() => Outcome::Yielded,
         _ = sleep_until(k), if kill_at.is_some() => {
+            // Group-wide SIGKILL first: a single-pid kill leaves grandchildren
+            // (sccache/rustc under a timed-out cargo) alive holding e.g. the
+            // target-dir build lock. Then reap the direct child.
+            if let Some(pid) = child.id() {
+                signal_group(pid, libc::SIGKILL);
+            }
             let _ = child.kill().await;
             Outcome::TimedOut
         }
@@ -273,14 +297,22 @@ fn signal_for(name: Option<&str>) -> (i32, &'static str) {
     }
 }
 
-/// Send `sig` to a session's child (no-op if already reaped).
+/// Send `sig` to the child's whole process group. The child is spawned as its
+/// own group leader (`process_group(0)`), so `-pid` addresses the group —
+/// grandchildren included. Mirrors codex-rs's killpg-based group cleanup
+/// (codex-rs/utils/pty/src/process_group.rs).
+fn signal_group(pid: u32, sig: i32) {
+    // SAFETY: kill(2) with a constant signal; a negative pid targets the
+    // process group. ESRCH on an already-dead group is harmless.
+    unsafe {
+        libc::kill(-(pid as i32), sig);
+    }
+}
+
+/// Send `sig` to a session's process group (no-op if already reaped).
 fn signal_child(session: &ShellSession, sig: i32) {
     if let Some(pid) = session.child.id() {
-        // SAFETY: kill(2) with a real pid and a constant signal; ESRCH on an
-        // already-dead pid is harmless.
-        unsafe {
-            libc::kill(pid as i32, sig);
-        }
+        signal_group(pid, sig);
     }
 }
 
@@ -441,7 +473,12 @@ impl Tool for ShellRun {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // Each command gets its own process group so kill/timeout paths
+            // can take down the whole tree with one negative-pid kill(2)
+            // (codex-rs does the equivalent via setsid/setpgid in pre_exec).
+            // kill_on_drop alone only reaps the direct bash child.
+            .process_group(0);
         apply_child_env(&mut cmd);
         for (k, v) in &args.env {
             cmd.env(k, v);
@@ -522,6 +559,11 @@ impl Tool for ShellRun {
                         ToolResult::Json(out)
                     }
                     Err(mut overflow) => {
+                        // Group-wide kill so the overflow session's whole tree
+                        // dies, then reap the direct child.
+                        if let Some(pid) = overflow.child.id() {
+                            signal_group(pid, libc::SIGKILL);
+                        }
                         let _ = overflow.child.start_kill();
                         ToolResult::Error(format!(
                             "too many live shell sessions ({MAX_LIVE_SESSIONS}); \
@@ -998,6 +1040,50 @@ mod tests {
         assert_eq!(v["running"], false);
         assert_eq!(v["timed_out"], true);
         assert!(v["exit_code"].is_null(), "killed → no exit code");
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_backgrounded_grandchildren() {
+        // A timed-out command must take down its WHOLE process group: a
+        // backgrounded grandchild (the sccache/rustc-holding-the-build-lock
+        // analog) must not survive the kill. bash echoes its own pid, which is
+        // the group id because the child is spawned with process_group(0).
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "echo pgid=$$; sleep 30 & sleep 30",
+                           "yield_time_ms": 0, "timeout_ms": 300}),
+                    &cx(),
+                )
+                .await,
+        );
+        assert_eq!(v["running"], false, "{v}");
+        assert_eq!(v["timed_out"], true, "{v}");
+        let pgid: i32 = v["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("pgid="))
+            .expect("pgid line in stdout")
+            .trim()
+            .parse()
+            .unwrap();
+        // SIGKILL is immediate, but the reparented grandchild may linger as a
+        // zombie until init/launchd reaps it (macOS and Linux both); poll with
+        // a bound instead of asserting instantly.
+        let mut group_gone = false;
+        for _ in 0..100 {
+            // SAFETY: kill(2) with signal 0 probes group existence only.
+            if unsafe { libc::kill(-pgid, 0) } != 0 {
+                group_gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            group_gone,
+            "process group {pgid} still has live members after timeout kill"
+        );
     }
 
     #[tokio::test]
