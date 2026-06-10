@@ -98,11 +98,16 @@ pub fn write_snapshot_files(
     fs::create_dir_all(&tmp_dir)?;
     for (filename, edges) in files {
         let path = tmp_dir.join(*filename);
-        let mut file = fs::File::create(&path)?;
+        let file = fs::File::create(&path)?;
+        // Buffered: one syscall per ~8KiB instead of one per serialized
+        // fragment (unbuffered writes dominated snapshot rewrites;
+        // thread-935b467d).
+        let mut writer = std::io::BufWriter::new(file);
         for edge in *edges {
-            serde_json::to_writer(&mut file, edge)?;
-            file.write_all(b"\n")?;
+            serde_json::to_writer(&mut writer, edge)?;
+            writer.write_all(b"\n")?;
         }
+        let file = writer.into_inner().map_err(|err| err.into_error())?;
         file.sync_all()?;
     }
     if snap_dir.is_dir() {
@@ -176,11 +181,16 @@ pub fn write_dirty_overlay(
             continue;
         }
         let path = tmp_dir.join(*filename);
-        let mut file = fs::File::create(&path)?;
+        let file = fs::File::create(&path)?;
+        // Buffered: one syscall per ~8KiB instead of one per serialized
+        // fragment (unbuffered writes dominated snapshot rewrites;
+        // thread-935b467d).
+        let mut writer = std::io::BufWriter::new(file);
         for edge in *edges {
-            serde_json::to_writer(&mut file, edge)?;
-            file.write_all(b"\n")?;
+            serde_json::to_writer(&mut writer, edge)?;
+            writer.write_all(b"\n")?;
         }
+        let file = writer.into_inner().map_err(|err| err.into_error())?;
         file.sync_all()?;
     }
 

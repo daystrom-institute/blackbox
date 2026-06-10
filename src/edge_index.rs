@@ -954,7 +954,8 @@ pub(crate) fn append_project_edges(
     }
     fs::create_dir_all(edges_dir)?;
     let path = edges_dir.join(format!("{project_id}.jsonl"));
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut writer = BufWriter::new(file);
     for edge in edges {
         let persisted = Edge {
             source: edge.source.clone(),
@@ -964,9 +965,10 @@ pub(crate) fn append_project_edges(
             confidence: edge.confidence,
             metadata: BTreeMap::new(),
         };
-        serde_json::to_writer(&mut file, &persisted)?;
-        file.write_all(b"\n")?;
+        serde_json::to_writer(&mut writer, &persisted)?;
+        writer.write_all(b"\n")?;
     }
+    writer.flush()?;
     Ok(())
 }
 
@@ -989,11 +991,14 @@ pub(crate) fn replace_project_edges(
     }
 
     let tmp_path = path.with_extension("jsonl.tmp");
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&tmp_path)?;
+    // Buffered: one syscall per ~8KiB instead of one per serialized fragment
+    // (the unbuffered loop dominated reindex project phases; thread-935b467d).
+    let mut writer = BufWriter::new(file);
     for edge in edges {
         let persisted = Edge {
             source: edge.source.clone(),
@@ -1003,9 +1008,10 @@ pub(crate) fn replace_project_edges(
             confidence: edge.confidence,
             metadata: BTreeMap::new(),
         };
-        serde_json::to_writer(&mut file, &persisted)?;
-        file.write_all(b"\n")?;
+        serde_json::to_writer(&mut writer, &persisted)?;
+        writer.write_all(b"\n")?;
     }
+    let file = writer.into_inner().map_err(|err| err.into_error())?;
     file.sync_all()?;
     drop(file);
     fs::rename(tmp_path, path)?;
@@ -1018,11 +1024,13 @@ pub(crate) fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -
     }
     fs::create_dir_all(edges_dir)?;
     let path = edges_dir.join(format!("{project_id}.jsonl"));
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut writer = BufWriter::new(file);
     for edge in edges {
-        serde_json::to_writer(&mut file, edge)?;
-        file.write_all(b"\n")?;
+        serde_json::to_writer(&mut writer, edge)?;
+        writer.write_all(b"\n")?;
     }
+    writer.flush()?;
     Ok(())
 }
 
@@ -1045,16 +1053,18 @@ pub(crate) fn append_edges_dedup(
             }
         }
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut writer = BufWriter::new(file);
     let mut written = 0usize;
     for edge in edges {
         if !seen.insert(edge_import_key(edge)) {
             continue;
         }
-        serde_json::to_writer(&mut file, edge)?;
-        file.write_all(b"\n")?;
+        serde_json::to_writer(&mut writer, edge)?;
+        writer.write_all(b"\n")?;
         written += 1;
     }
+    writer.flush()?;
     Ok(written)
 }
 
