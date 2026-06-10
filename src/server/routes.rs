@@ -1186,18 +1186,15 @@ pub(crate) async fn control_roster_handler(
     use axum::response::IntoResponse;
     use bro_protocol::RosterSnapshotV1;
 
-    // Read the generation before the task snapshot. A concurrent delta may
-    // make the task data newer than `version`, which can produce a duplicate
-    // delta after the client connects, but it will not make the client miss one.
+    // Read the view first, then the generation. `RosterEventSink`
+    // builds the summary, writes the view, *then* bumps the
+    // generation, so reading the version after the snapshot means
+    // a snapshot's `version` is never older than the tasks it lists.
+    // The lock here is the view's brief read guard, NOT a per-task
+    // inner mutex — fleet polling no longer contends with event
+    // ingest on busy tasks (wave 6a).
+    let tasks = state.roster_view.snapshot();
     let version = state.roster_events().current_version();
-    let tasks = {
-        let store = state.task_store.read();
-        store
-            .all_tasks()
-            .into_iter()
-            .map(|task| orchestration::roster_summary_from_task(&task))
-            .collect()
-    };
 
     let snapshot = RosterSnapshotV1 { version, tasks };
     axum::Json(snapshot).into_response()
@@ -3177,6 +3174,12 @@ mod tests {
                 )
                 .expect("insert task-b");
         }
+        // Wave 6a: the handler serves from the RosterView. Tests
+        // that bypass the spawn path (and its emit_added) must seed
+        // the view the same way cold-start does.
+        state
+            .roster_view
+            .rebuild_from_store(&state.task_store.read());
 
         let resp = control_roster_handler(AxumState(state.clone()))
             .await
@@ -3262,6 +3265,10 @@ mod tests {
                 )
                 .expect("insert terminal");
         }
+        // Wave 6a: see note in `control_roster_returns_one_summary_per_task`.
+        state
+            .roster_view
+            .rebuild_from_store(&state.task_store.read());
 
         let running_resp = control_roster_forget_handler(
             AxumState(state.clone()),
@@ -3448,6 +3455,10 @@ mod tests {
                 .insert("task-workflow".to_string(), task_b)
                 .expect("insert task-workflow");
         }
+        // Wave 6a: see note in `control_roster_returns_one_summary_per_task`.
+        state
+            .roster_view
+            .rebuild_from_store(&state.task_store.read());
 
         let resp = control_roster_handler(AxumState(state.clone()))
             .await
@@ -3517,6 +3528,10 @@ mod tests {
             .write()
             .insert("task-meta".to_string(), task)
             .expect("insert task-meta");
+        // Wave 6a: see note in `control_roster_returns_one_summary_per_task`.
+        state
+            .roster_view
+            .rebuild_from_store(&state.task_store.read());
 
         let resp = control_roster_handler(AxumState(state.clone()))
             .await
@@ -3536,5 +3551,200 @@ mod tests {
             Some("/tmp/managed/task-meta")
         );
         assert!(summary.workflow_owned);
+    }
+
+    // ── /control/roster — wave 6a RosterView contract ────────────────────
+    //
+    // The endpoint serves from `SharedState::roster_view`, not from
+    // iterating `task_store` and re-locking each inner mutex. These
+    // tests pin the wave-6a contract:
+    //   - the handler's response is field-identical to a fresh
+    //     `roster_summary_from_task` projection
+    //   - the view is updated by RosterEventSink emit_* so a
+    //     just-dispatched task appears without the handler ever
+    //     touching the per-task mutex
+    //   - the view is updated by RosterEventSink emit_removed so a
+    //     pruned task disappears
+    //   - the startup rebuild path seeds cold tasks from a
+    //     pre-populated store
+    #[tokio::test]
+    async fn control_roster_view_matches_field_by_field_projection() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use bro_protocol::RosterSnapshotV1;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        // Seed two tasks with distinct inner state so a mis-projection
+        // is visible field-for-field.
+        let task_a =
+            orchestration::test_task("task-a", orchestration::TaskStatus::Running, Provider::Glm);
+        {
+            let mut inner = task_a.inner.lock();
+            inner.bro_label = Some("bro-alpha".to_string());
+            inner.managed_worktree = Some("/wt/alpha".to_string());
+            inner.cwd = Some("/work/alpha".to_string());
+            inner.cost_usd = Some(0.12);
+            inner.num_turns = Some(4);
+            inner.last_assistant_message = Some("hello".to_string());
+            inner.model = Some("glm-pro".to_string());
+            inner.origin = bro_core::Origin::Cockpit;
+        }
+        let task_b = orchestration::test_task(
+            "task-b",
+            orchestration::TaskStatus::Completed,
+            Provider::Deepseek,
+        );
+        {
+            let mut inner = task_b.inner.lock();
+            inner.bro_label = Some("bro-beta".to_string());
+            inner.managed_worktree = None;
+            inner.cwd = None;
+            inner.cost_usd = None;
+            inner.num_turns = None;
+            inner.last_assistant_message = None;
+            inner.model = None;
+            inner.origin = bro_core::Origin::AgentDispatch;
+        }
+        {
+            let mut store = state.task_store.write();
+            store
+                .insert("task-a".into(), task_a.clone())
+                .expect("insert task-a");
+            store
+                .insert("task-b".into(), task_b.clone())
+                .expect("insert task-b");
+        }
+
+        // Drive the view through the same sink path that live ingest
+        // uses — emit_added for each task, then a status flip on
+        // task-a followed by emit_updated.
+        let sink = state.roster_events();
+        sink.emit_added(&task_a);
+        sink.emit_added(&task_b);
+        {
+            let mut inner = task_a.inner.lock();
+            inner.last_assistant_message = Some("running update".to_string());
+        }
+        sink.emit_updated(&task_a);
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let snapshot: RosterSnapshotV1 = serde_json::from_slice(&body_bytes)
+            .expect("roster body must decode as RosterSnapshotV1");
+
+        let by_id: std::collections::HashMap<_, _> = snapshot
+            .tasks
+            .iter()
+            .map(|s| (s.task_id.as_str().to_string(), s.clone()))
+            .collect();
+        assert_eq!(by_id.len(), 2);
+
+        // task-a must match the projection byte-for-byte.
+        let expected_a = orchestration::roster_summary_from_task(&task_a);
+        let served_a = by_id.get("task-a").expect("task-a in snapshot");
+        assert_eq!(
+            served_a, &expected_a,
+            "view must be field-identical to roster_summary_from_task"
+        );
+
+        // task-b must match too — covers the no-update, no-aux-fields
+        // case.
+        let expected_b = orchestration::roster_summary_from_task(&task_b);
+        let served_b = by_id.get("task-b").expect("task-b in snapshot");
+        assert_eq!(served_b, &expected_b);
+
+        // Sanity: the served a was the post-update projection
+        // (snippet == "running update"), proving emit_updated
+        // replaced the entry.
+        assert_eq!(
+            served_a.last_message_snippet.as_deref(),
+            Some("running update")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_roster_view_evicts_on_emit_removed() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use bro_protocol::RosterSnapshotV1;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        let task = orchestration::test_task(
+            "task-evict",
+            orchestration::TaskStatus::Running,
+            Provider::Glm,
+        );
+        state
+            .task_store
+            .write()
+            .insert("task-evict".into(), task.clone())
+            .expect("insert");
+
+        let sink = state.roster_events();
+        sink.emit_added(&task);
+        assert_eq!(state.roster_view.snapshot().len(), 1);
+
+        sink.emit_removed("task-evict");
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let snapshot: RosterSnapshotV1 = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            snapshot.tasks.is_empty(),
+            "evicted task must not appear in the served snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_roster_view_serves_from_seeded_store_on_startup() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use bro_protocol::RosterSnapshotV1;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        // Cold-start: populate the store BEFORE rebuilding the view.
+        // (The real daemon does this in the same order: load store
+        // from disk, then call `rebuild_from_store`.)
+        let task =
+            orchestration::test_task("cold", orchestration::TaskStatus::Running, Provider::Glm);
+        {
+            let mut inner = task.inner.lock();
+            inner.bro_label = Some("bro-cold".to_string());
+            inner.managed_worktree = Some("/wt/cold".to_string());
+        }
+        state
+            .task_store
+            .write()
+            .insert("cold".into(), task.clone())
+            .expect("insert cold");
+
+        // View is empty until rebuild (for_test does not auto-rebuild).
+        assert!(state.roster_view.snapshot().is_empty());
+
+        state
+            .roster_view
+            .rebuild_from_store(&state.task_store.read());
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let snapshot: RosterSnapshotV1 = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(snapshot.tasks.len(), 1);
+        let served = &snapshot.tasks[0];
+        assert_eq!(served.task_id.as_str(), "cold");
+        assert_eq!(served.managed_worktree.as_deref(), Some("/wt/cold"));
+        assert_eq!(served.label.as_deref(), Some("bro-cold"));
     }
 }

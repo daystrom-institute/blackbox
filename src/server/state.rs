@@ -67,6 +67,12 @@ pub(crate) struct SharedState {
     pub(crate) tail_tx: broadcast::Sender<TailEvent>,
     pub(crate) roster_version: Arc<AtomicU64>,
     pub(crate) roster_tx: broadcast::Sender<bro_protocol::RosterDelta>,
+    /// Daemon-side cache of `RosterSummaryV1` projections. Ingest
+    /// maintains it from the same call sites that emit `RosterDelta`
+    /// events (via `RosterEventSink`); `/control/roster` reads it
+    /// directly to avoid locking every task's inner mutex on each
+    /// fleet poll. See `src/orchestration/mod.rs::RosterView`.
+    pub(crate) roster_view: Arc<orchestration::RosterView>,
     pub(crate) store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
     /// In-flight workflow arcs keyed by `arc_thread_id`. Updated at
     /// every node boundary by the engine so /orchestrate/peek can
@@ -267,7 +273,15 @@ impl SharedState {
     }
 
     pub(crate) fn roster_events(&self) -> orchestration::RosterEventSink {
-        orchestration::RosterEventSink::new(self.roster_version.clone(), self.roster_tx.clone())
+        // Wire the view into the sink so every emit_* call also
+        // updates the daemon-side cache. Sinks created before the
+        // view is attached (none in production — for_test is the
+        // only path) keep working via the no-view constructor.
+        orchestration::RosterEventSink::with_view(
+            self.roster_version.clone(),
+            self.roster_tx.clone(),
+            self.roster_view.clone(),
+        )
     }
 
     /// Register a cancel token for a freshly-spawned arc. Returns the
@@ -402,6 +416,7 @@ impl SharedState {
             tail_tx,
             roster_version: Arc::new(AtomicU64::new(0)),
             roster_tx,
+            roster_view: Arc::new(orchestration::RosterView::new()),
             store_dir: store_dir.to_path_buf(),
             running_arcs: RwLock::new(HashMap::new()),
             wait_store: Arc::new(workflow::wait::WaitStore::new()),

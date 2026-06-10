@@ -223,6 +223,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         tail_tx,
         roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         roster_tx,
+        roster_view: Arc::new(orchestration::RosterView::new()),
         store_dir: store_dir.clone(),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
@@ -280,6 +281,15 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // `task_store.read().persist(dir)` on a tokio worker. Production only — tests
     // build SharedState via `for_test` and keep the synchronous fallback.
     orchestration::init_task_persister(shared.task_store.clone(), shared.store_dir.clone());
+
+    // Cold-start roster rebuild: tasks restored from `tasks.json` need to
+    // appear in `/control/roster` immediately, before any in-process delta
+    // arrives. Walk the loaded store once and seed the view. Cheap O(N) over
+    // the task store and runs before routes bind, so the first poll sees
+    // the full set.
+    shared
+        .roster_view
+        .rebuild_from_store(&shared.task_store.read());
 
     Ok(OpenedServer {
         cfg,

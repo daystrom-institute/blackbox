@@ -514,18 +514,113 @@ fn retain_recent_events(mut events: Vec<Value>, limit: usize) -> Vec<Value> {
     events
 }
 
+/// Daemon-side cache of `RosterSummaryV1` projections, keyed by `task_id`.
+///
+/// The `/control/roster` handler serves from this view instead of
+/// re-deriving every summary on each request — without it, the fleet
+/// cockpit poll would lock every task's inner mutex once per request,
+/// contending with event ingest on busy tasks (wave 6a).
+///
+/// Ingest maintains the view from the same call sites that emit
+/// `RosterDelta` events (`RosterEventSink::emit_added` /
+/// `emit_updated` / `emit_removed`): the summary is built while the
+/// emitter already holds (or has just released) the inner lock, then
+/// inserted under the view's brief write lock. The handler read path
+/// only takes a read guard and clones; it never touches a per-task
+/// mutex.
+///
+/// Staleness: the view can lag an in-flight mutation by one round —
+/// a snapshot served between an `emit_updated` and the next delta may
+/// carry the prior summary. This is acceptable for a polling fleet
+/// dashboard: subsequent deltas re-converge the client, and `version`
+/// reads after the view write so a snapshot's `version` is never
+/// older than the tasks it lists.
+///
+/// Field parity: every field of the projection is computed by the
+/// same `roster_summary_from_task` that the broadcast delta uses, so
+/// `view[&task_id] == delta.summary` field-for-field for any update.
+#[derive(Default)]
+pub struct RosterView {
+    summaries: RwLock<HashMap<String, bro_protocol::RosterSummaryV1>>,
+}
+
+impl RosterView {
+    pub fn new() -> Self {
+        Self {
+            summaries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Insert or replace the summary for `task_id`. Called from the
+    /// event sink with the summary it just computed.
+    pub fn upsert(&self, task_id: String, summary: bro_protocol::RosterSummaryV1) {
+        self.summaries.write().insert(task_id, summary);
+    }
+
+    /// Drop the summary for `task_id`. No-op if absent.
+    pub fn evict(&self, task_id: &str) {
+        self.summaries.write().remove(task_id);
+    }
+
+    /// Snapshot the view into a `Vec` in unspecified order. The
+    /// handler sorts/clones/serializes the result; we don't pay a
+    /// per-task lock for any element.
+    pub fn snapshot(&self) -> Vec<bro_protocol::RosterSummaryV1> {
+        self.summaries.read().values().cloned().collect()
+    }
+
+    /// Seed the view from a live task store at startup. Builds one
+    /// summary per task and inserts; cold tasks restored from
+    /// `tasks.json` appear in the view without waiting for a delta.
+    pub fn rebuild_from_store(&self, store: &TaskStore) {
+        let mut view = self.summaries.write();
+        view.clear();
+        for task in store.all_tasks() {
+            let summary = roster_summary_from_task(&task);
+            view.insert(summary.task_id.as_str().to_string(), summary);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RosterEventSink {
     seq: Arc<AtomicU64>,
     tx: tokio::sync::broadcast::Sender<bro_protocol::RosterDelta>,
+    view: Option<Arc<RosterView>>,
 }
 
 impl RosterEventSink {
+    /// Construct a sink without a backing view. Test seam for
+    /// scenarios that want the broadcast channel but no cache
+    /// (e.g. constructing a sink in unit tests where a `RosterView`
+    /// would be over-machinery). Production sinks go through
+    /// `with_view`.
+    #[allow(dead_code)]
     pub fn new(
         seq: Arc<AtomicU64>,
         tx: tokio::sync::broadcast::Sender<bro_protocol::RosterDelta>,
     ) -> Self {
-        Self { seq, tx }
+        Self {
+            seq,
+            tx,
+            view: None,
+        }
+    }
+
+    /// Build a sink wired to the daemon's `RosterView`. The view is
+    /// updated synchronously from `emit_added` / `emit_updated` /
+    /// `emit_removed` so `/control/roster` reads see the projection
+    /// before the broadcast delta goes out.
+    pub fn with_view(
+        seq: Arc<AtomicU64>,
+        tx: tokio::sync::broadcast::Sender<bro_protocol::RosterDelta>,
+        view: Arc<RosterView>,
+    ) -> Self {
+        Self {
+            seq,
+            tx,
+            view: Some(view),
+        }
     }
 
     pub fn current_version(&self) -> u64 {
@@ -537,27 +632,279 @@ impl RosterEventSink {
     }
 
     pub fn emit_added(&self, task: &Task) {
+        let summary = roster_summary_from_task(task);
+        if let Some(view) = &self.view {
+            view.upsert(summary.task_id.as_str().to_string(), summary.clone());
+        }
         let delta = bro_protocol::RosterDelta::Added {
             seq: self.next_seq(),
-            task: roster_summary_from_task(task),
+            task: summary,
         };
         let _ = self.tx.send(delta);
     }
 
     pub fn emit_updated(&self, task: &Task) {
+        let summary = roster_summary_from_task(task);
+        if let Some(view) = &self.view {
+            view.upsert(summary.task_id.as_str().to_string(), summary.clone());
+        }
         let delta = bro_protocol::RosterDelta::Updated {
             seq: self.next_seq(),
-            task: roster_summary_from_task(task),
+            task: summary,
         };
         let _ = self.tx.send(delta);
     }
 
     pub fn emit_removed(&self, task_id: impl Into<String>) {
+        let task_id = task_id.into();
+        if let Some(view) = &self.view {
+            view.evict(&task_id);
+        }
         let delta = bro_protocol::RosterDelta::Removed {
             seq: self.next_seq(),
-            task_id: bro_core::TaskId::new(task_id.into()),
+            task_id: bro_core::TaskId::new(task_id),
         };
         let _ = self.tx.send(delta);
+    }
+}
+
+#[cfg(test)]
+mod roster_view_tests {
+    //! Wave 6a: RosterView is the daemon-side cache that lets
+    //! `/control/roster` serve a snapshot without locking every
+    //! task's inner mutex. These tests pin the field-parity
+    //! contract between the view, the broadcast delta, and
+    //! `roster_summary_from_task`.
+
+    use super::*;
+
+    fn make_task(id: &str, status: TaskStatus, provider: Provider) -> Arc<Task> {
+        Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: id.to_string(),
+                provider,
+                session_id: format!("sess-{id}"),
+                events: EventRing::new(),
+                model: None,
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: Some(0.42),
+                num_turns: Some(7),
+                stderr: String::new(),
+                status,
+                started_at: 1_700_000_000_000,
+                completed_at: Some(1_700_000_001_000),
+                exit_code: Some(0),
+                cwd: Some(format!("/tmp/{id}")),
+                managed_worktree: Some(format!("/wt/{id}")),
+                bro_label: Some(format!("bro-{id}")),
+                name: None,
+                agent_label: Some(format!("agent-{id}")),
+                report: None,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                live_cursor: 0,
+                supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Cockpit,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Cockpit),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+            roster_events: None,
+        })
+    }
+
+    fn make_sink(view: Arc<RosterView>) -> (Arc<AtomicU64>, RosterEventSink) {
+        let seq = Arc::new(AtomicU64::new(0));
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let sink = RosterEventSink::with_view(seq.clone(), tx, view);
+        (seq, sink)
+    }
+
+    #[test]
+    fn view_upsert_then_snapshot_round_trips_summary() {
+        let view = RosterView::new();
+        let summary = bro_protocol::RosterSummaryV1 {
+            task_id: bro_core::TaskId::new("t1"),
+            status: bro_protocol::TaskStatus::Running,
+            provider: Provider::Glm,
+            cost: Some(0.10),
+            turns: Some(1),
+            cwd: None,
+            label: None,
+            name: None,
+            session_id: None,
+            last_message_snippet: None,
+            model: None,
+            report: None,
+            last_event_at: Some(42),
+            origin: bro_core::Origin::Unknown,
+            managed_worktree: None,
+            workflow_owned: false,
+        };
+        view.upsert("t1".into(), summary.clone());
+        let snap = view.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0], summary);
+    }
+
+    #[test]
+    fn view_evict_drops_entry() {
+        let view = RosterView::new();
+        view.upsert(
+            "t1".into(),
+            bro_protocol::RosterSummaryV1 {
+                task_id: bro_core::TaskId::new("t1"),
+                status: bro_protocol::TaskStatus::Running,
+                provider: Provider::Glm,
+                cost: None,
+                turns: None,
+                cwd: None,
+                label: None,
+                name: None,
+                session_id: None,
+                last_message_snippet: None,
+                model: None,
+                report: None,
+                last_event_at: None,
+                origin: bro_core::Origin::Unknown,
+                managed_worktree: None,
+                workflow_owned: false,
+            },
+        );
+        assert_eq!(view.snapshot().len(), 1);
+        view.evict("t1");
+        assert!(view.snapshot().is_empty());
+        // Idempotent.
+        view.evict("t1");
+        assert!(view.snapshot().is_empty());
+    }
+
+    #[test]
+    fn sink_emit_added_inserts_summary_into_view() {
+        let view = Arc::new(RosterView::new());
+        let (_seq, sink) = make_sink(view.clone());
+        let task = make_task("t1", TaskStatus::Running, Provider::Glm);
+
+        sink.emit_added(&task);
+        let snap = view.snapshot();
+        assert_eq!(snap.len(), 1);
+        let expected = roster_summary_from_task(&task);
+        assert_eq!(
+            snap[0], expected,
+            "view entry must match the field-parity summary"
+        );
+        assert_eq!(snap[0].task_id.as_str(), "t1");
+        assert_eq!(snap[0].provider, Provider::Glm);
+        assert_eq!(snap[0].status, bro_protocol::TaskStatus::Running);
+    }
+
+    #[test]
+    fn sink_emit_updated_replaces_existing_entry() {
+        let view = Arc::new(RosterView::new());
+        let (_seq, sink) = make_sink(view.clone());
+        let task = make_task("t1", TaskStatus::Running, Provider::Glm);
+        sink.emit_added(&task);
+        assert_eq!(view.snapshot().len(), 1);
+
+        // Mutate inner state and emit_updated — view entry must
+        // reflect the new summary field-for-field.
+        {
+            let mut inner = task.inner.lock();
+            inner.status = TaskStatus::Completed;
+            inner.last_assistant_message = Some("done".to_string());
+        }
+        sink.emit_updated(&task);
+        let snap = view.snapshot();
+        assert_eq!(snap.len(), 1, "update should not duplicate the entry");
+        let expected = roster_summary_from_task(&task);
+        assert_eq!(snap[0], expected);
+        assert_eq!(snap[0].status, bro_protocol::TaskStatus::Completed);
+        assert_eq!(snap[0].last_message_snippet.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn sink_emit_removed_drops_entry_from_view() {
+        let view = Arc::new(RosterView::new());
+        let (_seq, sink) = make_sink(view.clone());
+        let task = make_task("t1", TaskStatus::Running, Provider::Glm);
+        sink.emit_added(&task);
+        assert_eq!(view.snapshot().len(), 1);
+
+        sink.emit_removed("t1");
+        assert!(view.snapshot().is_empty(), "eviction must drop the entry");
+    }
+
+    #[test]
+    fn rebuild_from_store_seeds_view_with_every_task() {
+        let view = RosterView::new();
+        let mut store = TaskStore::new();
+        store
+            .insert(
+                "t1".into(),
+                make_task("t1", TaskStatus::Running, Provider::Glm),
+            )
+            .expect("insert t1");
+        store
+            .insert(
+                "t2".into(),
+                make_task("t2", TaskStatus::Completed, Provider::Deepseek),
+            )
+            .expect("insert t2");
+
+        view.rebuild_from_store(&store);
+        let snap = view.snapshot();
+        assert_eq!(snap.len(), 2, "every task in the store must appear");
+        let mut by_id: std::collections::HashMap<_, _> = snap
+            .iter()
+            .map(|s| (s.task_id.as_str().to_string(), s.clone()))
+            .collect();
+        let t1 = by_id.remove("t1").expect("t1 present");
+        let t2 = by_id.remove("t2").expect("t2 present");
+        assert_eq!(t1.status, bro_protocol::TaskStatus::Running);
+        assert_eq!(t1.provider, Provider::Glm);
+        assert_eq!(t2.status, bro_protocol::TaskStatus::Completed);
+        assert_eq!(t2.provider, Provider::Deepseek);
+    }
+
+    #[test]
+    fn rebuild_from_store_clears_stale_entries() {
+        let view = RosterView::new();
+        // Seed a stale entry that isn't in the store.
+        view.upsert(
+            "stale".into(),
+            bro_protocol::RosterSummaryV1 {
+                task_id: bro_core::TaskId::new("stale"),
+                status: bro_protocol::TaskStatus::Completed,
+                provider: Provider::Glm,
+                cost: None,
+                turns: None,
+                cwd: None,
+                label: None,
+                name: None,
+                session_id: None,
+                last_message_snippet: None,
+                model: None,
+                report: None,
+                last_event_at: None,
+                origin: bro_core::Origin::Unknown,
+                managed_worktree: None,
+                workflow_owned: false,
+            },
+        );
+        let mut store = TaskStore::new();
+        store
+            .insert(
+                "t1".into(),
+                make_task("t1", TaskStatus::Running, Provider::Glm),
+            )
+            .expect("insert t1");
+
+        view.rebuild_from_store(&store);
+        let snap = view.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].task_id.as_str(), "t1");
     }
 }
 

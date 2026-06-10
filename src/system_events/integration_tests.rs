@@ -88,6 +88,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         tail_tx,
         roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         roster_tx,
+        roster_view: Arc::new(orchestration::RosterView::new()),
         store_dir: tmp.path().join("bro"),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
