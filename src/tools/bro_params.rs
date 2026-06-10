@@ -173,6 +173,7 @@ pub(crate) struct ResumeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyExecParams {
     /// Project root / scope Badgey should consult against.
     #[serde(default)]
@@ -183,6 +184,7 @@ pub(crate) struct BadgeyExecParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyResumeParams {
     /// Badgey instance id returned by badgey_exec.
     pub(crate) badgey_id: String,
@@ -194,6 +196,7 @@ pub(crate) struct BadgeyResumeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyAskParams {
     /// Badgey instance id returned by badgey_exec.
     pub(crate) badgey_id: String,
@@ -205,6 +208,7 @@ pub(crate) struct BadgeyAskParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyDismissParams {
     /// Badgey instance id returned by badgey_exec.
     pub(crate) badgey_id: String,
@@ -214,6 +218,7 @@ pub(crate) struct BadgeyDismissParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyStatusParams {
     /// Badgey instance id. If omitted, returns the active list summary.
     #[serde(default)]
@@ -221,6 +226,7 @@ pub(crate) struct BadgeyStatusParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyListParams {
     /// Include dismissed instances. Default false.
     #[serde(default)]
@@ -228,6 +234,7 @@ pub(crate) struct BadgeyListParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyScoutParams {
     /// Badgey instance id returned by badgey_exec.
     pub(crate) badgey_id: String,
@@ -239,6 +246,7 @@ pub(crate) struct BadgeyScoutParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyCollectParams {
     /// Scout id to collect, or omit to list scout/sub-bro events for a Badgey instance.
     #[serde(default)]
@@ -249,6 +257,7 @@ pub(crate) struct BadgeyCollectParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyTriageInboxParams {
     /// Project path or registered scope. Defaults to current working directory.
     #[serde(default)]
@@ -262,6 +271,7 @@ pub(crate) struct BadgeyTriageInboxParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyProposalsListParams {
     /// Badgey instance id (`bg-<8hex>-<8hex>`) whose proposals to list.
     pub(crate) badgey_id: String,
@@ -276,6 +286,7 @@ pub(crate) struct BadgeyProposalsListParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyCloseLoopsParams {
     /// Window in days. Default 14.
     #[serde(default)]
@@ -286,6 +297,7 @@ pub(crate) struct BadgeyCloseLoopsParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WaitParams {
     /// Task ID from exec or resume
     pub(crate) task_id: String,
@@ -295,6 +307,7 @@ pub(crate) struct WaitParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WhenParams {
     /// Team name — waits on each member's most recent task
     #[serde(default)]
@@ -308,6 +321,7 @@ pub(crate) struct WhenParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BroadcastParams {
     /// Team name
     pub(crate) team: String,
@@ -327,6 +341,7 @@ pub(crate) struct BroadcastParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StatusParams {
     /// Task ID to check
     pub(crate) task_id: String,
@@ -336,6 +351,7 @@ pub(crate) struct StatusParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReportParams {
     /// Task ID to attach the report to.
     pub(crate) task_id: String,
@@ -350,6 +366,7 @@ pub(crate) struct ReportParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AllocatorStatusParams {
     /// Optional project path whose .bro/allocator.json overlay should be included.
     #[serde(default)]
@@ -402,12 +419,14 @@ pub(crate) struct AllocatorStatusParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AllocatorTraceParams {
     /// Selection trace id returned by allocated bro_exec responses.
     pub(crate) selection_trace_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AllocatorProbeParams {
     /// Provider alias whose allocator probe state should be read or updated.
     pub(crate) provider: String,
@@ -448,6 +467,7 @@ pub(crate) struct AllocatorProbeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DashboardParams {
     #[serde(default)]
     pub(crate) provider: Option<String>,
@@ -460,6 +480,7 @@ pub(crate) struct DashboardParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CouncilListParams {
     /// Filter to councils whose `project` matches this exact path.
     #[serde(default)]
@@ -467,12 +488,14 @@ pub(crate) struct CouncilListParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CouncilOpenParams {
     /// Council ID (e.g. `council-7f01324e`).
     pub(crate) id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CouncilPostsParams {
     pub(crate) id: String,
     /// Return only posts with `sequence > since_seq`. Default 0 (all).
@@ -484,12 +507,14 @@ pub(crate) struct CouncilPostsParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CancelParams {
     /// Task ID to cancel
     pub(crate) task_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SteerParams {
     /// Running task ID to steer.
     pub(crate) task_id: String,
@@ -498,6 +523,7 @@ pub(crate) struct SteerParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InterruptParams {
     /// Running task ID to interrupt.
     pub(crate) task_id: String,
@@ -508,6 +534,7 @@ pub(crate) struct InterruptParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PruneParams {
     /// Status to prune (failed, completed, cancelled). Defaults to
     /// "failed" — the only status that's almost always safe to drop
@@ -550,6 +577,7 @@ pub(crate) struct PruneParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RetroParams {
     /// Terminal (or any resumable) task to ask for a workload retrospective.
     /// Resumes that task's own provider session with the reflection prompt;
@@ -558,6 +586,7 @@ pub(crate) struct RetroParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentListParams {
     #[serde(default)]
     pub(crate) include_superseded: Option<bool>,
@@ -570,16 +599,19 @@ pub(crate) struct AgentListParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentGetParams {
     pub(crate) name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentDescribeParams {
     pub(crate) agent: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentDispatchParams {
     pub(crate) agent: String,
     #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
@@ -600,6 +632,7 @@ pub(crate) struct AgentDispatchParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentSearchParams {
     pub(crate) query: String,
     #[serde(default)]
@@ -624,6 +657,7 @@ pub(crate) struct AgentVectorPlan {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BrofileParams {
     /// Operation: create, list, get, delete, set_account, list_accounts,
     /// set_provider_default, get_provider_default, list_provider_defaults,
@@ -679,6 +713,7 @@ pub(crate) struct BrofileParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BroSlackBindParams {
     /// Operation: bind, unbind, list, lookup
     pub(crate) action: String,
@@ -712,6 +747,7 @@ pub(crate) struct BroSlackBindParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnsureBadgeyForChannelParams {
     /// Slack workspace id (T-prefix). Required.
     pub(crate) team_id: String,
@@ -726,6 +762,7 @@ pub(crate) struct EnsureBadgeyForChannelParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SlackProposalLinkLookupParams {
     /// Slack workspace id (T-prefix).
     pub(crate) team_id: String,
@@ -737,6 +774,7 @@ pub(crate) struct SlackProposalLinkLookupParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyApplyProposalParams {
     /// Badgey instance id (`bg-<8hex>-<8hex>`) that owns the
     /// proposal.
@@ -750,6 +788,7 @@ pub(crate) struct BadgeyApplyProposalParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyProposalBeginApplyParams {
     /// Badgey instance id (`bg-<8hex>-<8hex>`).
     pub(crate) badgey_id: String,
@@ -761,6 +800,7 @@ pub(crate) struct BadgeyProposalBeginApplyParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BadgeyProposalCompleteApplyParams {
     /// Badgey instance id.
     pub(crate) badgey_id: String,
@@ -789,6 +829,7 @@ pub(crate) struct BadgeyProposalCompleteApplyParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SlackProposalLinkRecordParams {
     /// Slack workspace id (T-prefix).
     pub(crate) team_id: String,
@@ -816,6 +857,7 @@ pub(crate) struct SlackProposalLinkRecordParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TeamParams {
     /// Operation: save_template, list_templates, delete_template, create, list, dissolve, roster
     pub(crate) action: String,
@@ -836,6 +878,7 @@ pub(crate) struct TeamParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TeamMemberSlot {
     pub(crate) brofile: String,
     #[serde(default)]
@@ -845,6 +888,7 @@ pub(crate) struct TeamMemberSlot {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AdvisorSpecParams {
     /// Special brofile designated as the advisor for this team.
     pub(crate) brofile: String,
@@ -924,6 +968,7 @@ pub(crate) struct AdvisorCheckpoint {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AtomListParams {
     #[serde(default)]
     pub(crate) include_superseded: Option<bool>,
@@ -938,16 +983,19 @@ pub(crate) struct AtomListParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AtomGetParams {
     pub(crate) name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AtomDescribeParams {
     pub(crate) atom: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AtomSearchParams {
     pub(crate) query: String,
     #[serde(default)]
