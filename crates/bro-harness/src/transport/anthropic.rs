@@ -107,6 +107,13 @@ impl AnthropicTransport {
                 "type": "text", "text": stable, "cache_control": cache_control(),
             }));
         }
+        // Ambient (deferred-tool manifest) renders as its own uncached block:
+        // the Anthropic system param stands alone per request, so it must be
+        // carried every turn here (unlike Responses, which persists it into
+        // the buffer on change).
+        if let Some(ambient) = opts.system.ambient_text() {
+            system_blocks.push(json!({ "type": "text", "text": ambient }));
+        }
         if let Some(volatile) = opts.system.volatile_text() {
             system_blocks.push(json!({ "type": "text", "text": volatile }));
         }
@@ -1005,6 +1012,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: Some("MANIFEST".into()),
             }),
         );
@@ -1033,6 +1041,7 @@ mod tests {
                 "BASE",
                 SystemPrompt {
                     stable: Some("OVERLAY".into()),
+                    ambient: None,
                     volatile: Some("MANIFEST".into()),
                 },
             ),
@@ -1053,6 +1062,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: None,
             }),
         );
@@ -1067,6 +1077,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: None,
+                ambient: None,
                 volatile: Some("V".into()),
             }),
         );

@@ -37,6 +37,14 @@ pub(super) struct ResponsesState {
     /// Flat Responses `input[]` buffer.
     pub input: Vec<Value>,
     custom_tool_call_ids: HashSet<String>,
+    /// Hash of the ambient system section (deferred-tool manifest) currently
+    /// persisted in `input`. The manifest is injected as a buffer-persisted
+    /// `developer` item once and re-injected only when its content changes
+    /// (codex idiom: persistent developer context, not per-request ephemera) —
+    /// re-delivering it every request made the model treat the catalog as a
+    /// fresh event each turn (thread-9dfe1da5). Reset on compaction so the
+    /// rebuilt buffer regains the manifest.
+    pub ambient_hash: Option<u64>,
 }
 
 impl ResponsesState {
@@ -47,7 +55,29 @@ impl ResponsesState {
             thread_id: new_id(),
             input: Vec::new(),
             custom_tool_call_ids: HashSet::new(),
+            ambient_hash: None,
         }
+    }
+
+    /// Persist the ambient section into the buffer when it changed since the
+    /// last injection. Call once per turn before building the request body.
+    pub(super) fn sync_ambient(&mut self, ambient: Option<&str>) {
+        let Some(text) = ambient.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        let hash = h.finish();
+        if self.ambient_hash == Some(hash) {
+            return;
+        }
+        self.input.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": text}],
+        }));
+        self.ambient_hash = Some(hash);
     }
 
     pub(super) fn push_user_text(&mut self, text: &str) {
@@ -93,13 +123,25 @@ impl ResponsesState {
     }
 
     pub(super) fn snapshot(&self) -> Value {
-        json!(self.input)
+        // v2 shape carries the ambient hash so resume doesn't re-inject an
+        // unchanged manifest. restore() still accepts the legacy bare array.
+        json!({
+            "input": self.input,
+            "ambient_hash": self.ambient_hash,
+        })
     }
 
     pub(super) fn restore(&mut self, snapshot: Value) {
         if let Some(arr) = snapshot.as_array() {
+            // Legacy snapshot (bare input array): no recorded hash — the next
+            // sync_ambient re-injects once, which is safe.
             self.input = arr.clone();
             self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
+            self.ambient_hash = None;
+        } else if let Some(arr) = snapshot.get("input").and_then(Value::as_array) {
+            self.input = arr.clone();
+            self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
+            self.ambient_hash = snapshot.get("ambient_hash").and_then(Value::as_u64);
         }
     }
 
@@ -215,9 +257,11 @@ pub(super) fn build_body(
     }
 
     // The base prompt and cache-stable overlay go in `instructions` (cached via
-    // prompt_cache_key); the volatile tail (manifest/nudges) rides as a
-    // trailing `developer` input item, appended per-request only so it never
-    // persists into the buffer and can't disturb the cached prefix.
+    // prompt_cache_key). The ambient manifest is buffer-persisted by
+    // `sync_ambient` (hash-gated on change), so the only per-request ephemera
+    // left is the volatile tail (nudges / structured-output reminders),
+    // appended as a trailing `developer` item that never persists into the
+    // buffer. On most turns volatile is empty and no ephemeral item is sent.
     let mut input = input.to_vec();
     if let Some(volatile) = opts.system.volatile_text() {
         input.push(json!({
@@ -827,6 +871,90 @@ mod tests {
         }
     }
 
+    fn developer_texts(input: &[Value]) -> Vec<String> {
+        input
+            .iter()
+            .filter(|it| it["role"] == "developer")
+            .map(|it| it["content"][0]["text"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn sync_ambient_injects_once_and_regates_on_change() {
+        let mut s = state();
+        s.sync_ambient(Some("MANIFEST v1"));
+        assert_eq!(developer_texts(&s.input), vec!["MANIFEST v1"]);
+
+        // Same content: no duplicate item.
+        s.sync_ambient(Some("MANIFEST v1"));
+        assert_eq!(developer_texts(&s.input).len(), 1);
+
+        // None / empty: no change, hash retained.
+        s.sync_ambient(None);
+        s.sync_ambient(Some(""));
+        assert_eq!(developer_texts(&s.input).len(), 1);
+
+        // Changed content: re-injected.
+        s.sync_ambient(Some("MANIFEST v2"));
+        assert_eq!(
+            developer_texts(&s.input),
+            vec!["MANIFEST v1", "MANIFEST v2"]
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trips_ambient_hash_and_accepts_legacy_shape() {
+        let mut s = state();
+        s.sync_ambient(Some("MANIFEST"));
+        let snap = s.snapshot();
+
+        let mut restored = ResponsesState::new(Auth::ApiKey("k".into()));
+        restored.restore(snap);
+        assert_eq!(restored.ambient_hash, s.ambient_hash);
+        // Unchanged manifest after resume: no re-injection.
+        let before = developer_texts(&restored.input).len();
+        restored.sync_ambient(Some("MANIFEST"));
+        assert_eq!(developer_texts(&restored.input).len(), before);
+
+        // Legacy bare-array snapshot: hash cleared → one safe re-injection.
+        let mut legacy = ResponsesState::new(Auth::ApiKey("k".into()));
+        legacy.restore(json!([{"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}]}]));
+        assert_eq!(legacy.ambient_hash, None);
+        legacy.sync_ambient(Some("MANIFEST"));
+        assert_eq!(developer_texts(&legacy.input).len(), 1);
+    }
+
+    #[test]
+    fn build_body_sends_no_ephemeral_item_without_volatile() {
+        // Ambient rides the persisted buffer, not the per-request ephemera:
+        // with no volatile tail, the request input matches the buffer exactly.
+        let mut s = state();
+        s.sync_ambient(Some("MANIFEST"));
+        let body = s.build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: Some("S".into()),
+                ambient: Some("MANIFEST".into()),
+                volatile: None,
+            }),
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), s.input.len(), "no ephemeral developer item");
+        // With a volatile nudge, exactly one ephemeral item is appended.
+        let body = s.build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: Some("S".into()),
+                ambient: Some("MANIFEST".into()),
+                volatile: Some("NUDGE".into()),
+            }),
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), s.input.len() + 1);
+        assert_eq!(input.last().unwrap()["content"][0]["text"], "NUDGE");
+    }
+
     fn grammar_spec(name: &str) -> ToolSpec {
         ToolSpec {
             name: name.into(),
@@ -845,6 +973,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: Some("MANIFEST".into()),
             }),
         );
@@ -866,6 +995,7 @@ mod tests {
                 "BASE",
                 SystemPrompt {
                     stable: Some("OVERLAY".into()),
+                    ambient: None,
                     volatile: Some("MANIFEST".into()),
                 },
             ),
@@ -888,6 +1018,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: None,
+                ambient: None,
                 volatile: Some("V".into()),
             }),
         );
@@ -905,6 +1036,7 @@ mod tests {
                 "",
                 SystemPrompt {
                     stable: Some("OVERLAY".into()),
+                    ambient: None,
                     volatile: None,
                 },
             ),
@@ -955,6 +1087,7 @@ mod tests {
             &[grammar_spec("exec"), function_spec("wait")],
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: None,
             }),
         );
@@ -1049,6 +1182,7 @@ mod tests {
     fn modern_body_carries_cache_key_service_tier_and_reasoning() {
         let mut o = opts(SystemPrompt {
             stable: Some("BASE".into()),
+            ambient: None,
             volatile: None,
         });
         o.effort = Some("medium".into());
@@ -1066,6 +1200,7 @@ mod tests {
     fn default_service_tier_is_dropped() {
         let mut o = opts(SystemPrompt {
             stable: Some("BASE".into()),
+            ambient: None,
             volatile: None,
         });
         o.service_tier = Some(SERVICE_TIER_DEFAULT.into());
@@ -1077,6 +1212,7 @@ mod tests {
     fn reasoning_omitted_for_non_reasoning_model() {
         let mut o = opts(SystemPrompt {
             stable: Some("BASE".into()),
+            ambient: None,
             volatile: None,
         });
         o.model = "gpt-4o".into();
@@ -1218,6 +1354,7 @@ mod tests {
             &tools,
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: Some("VOL".into()),
             }),
         );

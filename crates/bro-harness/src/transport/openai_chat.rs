@@ -146,9 +146,17 @@ impl OpenAiChatTransport {
         // turn. Verified against the live Mistral API: only system-after-tool is
         // rejected.
         let leading = leading_system_message(opts);
-        let volatile = opts.system.volatile_text();
-        let ends_with_tool =
-            self.messages.last().and_then(|m| m["role"].as_str()) == Some("tool");
+        // Chat keeps ambient+volatile together as the trailing tail: this
+        // transport has no buffer-persistence lane, so the manifest rides the
+        // same system-tail message it always did.
+        let merged_tail = match (opts.system.ambient_text(), opts.system.volatile_text()) {
+            (Some(a), Some(v)) => Some(format!("{a}\n{v}")),
+            (Some(a), None) => Some(a.to_string()),
+            (None, Some(v)) => Some(v.to_string()),
+            (None, None) => None,
+        };
+        let volatile = merged_tail.as_deref();
+        let ends_with_tool = self.messages.last().and_then(|m| m["role"].as_str()) == Some("tool");
 
         let mut msgs: Vec<Value> = Vec::with_capacity(self.messages.len() + 2);
         let leading = if ends_with_tool {
@@ -165,9 +173,7 @@ impl OpenAiChatTransport {
             msgs.push(json!({"role": "system", "content": system}));
         }
         msgs.extend(self.messages.iter().cloned());
-        if !ends_with_tool
-            && let Some(volatile) = volatile
-        {
+        if !ends_with_tool && let Some(volatile) = volatile {
             msgs.push(json!({"role": "system", "content": volatile}));
         }
 
@@ -751,6 +757,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: Some("MANIFEST".into()),
             }),
         );
@@ -778,6 +785,7 @@ mod tests {
                 "BASE",
                 SystemPrompt {
                     stable: Some("OVERLAY".into()),
+                    ambient: None,
                     volatile: Some("MANIFEST".into()),
                 },
             ),
@@ -796,6 +804,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: None,
             }),
         );
@@ -831,6 +840,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: Some("BASE".into()),
+                ambient: None,
                 volatile: Some("MANIFEST".into()),
             }),
         );
@@ -844,9 +854,7 @@ mod tests {
         // No `system` message appears after the `tool` message.
         let tool_idx = msgs.iter().position(|m| m["role"] == "tool").unwrap();
         assert!(
-            !msgs[tool_idx + 1..]
-                .iter()
-                .any(|m| m["role"] == "system"),
+            !msgs[tool_idx + 1..].iter().any(|m| m["role"] == "system"),
             "no system message may follow the tool message"
         );
     }
@@ -857,6 +865,7 @@ mod tests {
             &[],
             &opts(SystemPrompt {
                 stable: None,
+                ambient: None,
                 volatile: Some("MANIFEST".into()),
             }),
         );

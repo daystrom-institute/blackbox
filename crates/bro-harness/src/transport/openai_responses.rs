@@ -402,6 +402,9 @@ impl OpenAiResponsesTransport {
             .map(str::to_string)
             .unwrap_or_default();
         self.state.input = output;
+        // The rebuilt buffer no longer carries the persisted ambient manifest;
+        // reset the hash so the next turn re-injects it.
+        self.state.ambient_hash = None;
         // A compaction rewrites history out from under the WS delta baseline;
         // force the next WS turn to full-replay.
         if let Some(ws) = self.ws.as_mut() {
@@ -443,6 +446,10 @@ impl Transport for OpenAiResponsesTransport {
         opts: &TurnOpts,
         sink: &dyn super::TurnSink,
     ) -> Result<TurnOutput> {
+        // Persist the ambient manifest into the buffer when it changed —
+        // before either the WS or HTTP path builds its request from
+        // `state.input`. Hash-gated: a no-op on the vast majority of turns.
+        self.state.sync_ambient(opts.system.ambient_text());
         if let Some(ws) = self.ws.as_mut() {
             match ws.run(&mut self.state, tools, opts, sink).await {
                 WsOutcome::Done(out) => return Ok(out),
@@ -516,6 +523,9 @@ impl Transport for OpenAiResponsesTransport {
         }));
         rebuilt.extend_from_slice(&self.state.input[split..]);
         self.state.input = rebuilt;
+        // The rebuilt buffer no longer carries the persisted ambient manifest;
+        // reset the hash so the next turn re-injects it.
+        self.state.ambient_hash = None;
         // A compaction rewrites history out from under the WS delta baseline;
         // force the next WS turn to full-replay.
         if let Some(ws) = self.ws.as_mut() {
@@ -567,6 +577,7 @@ mod tests {
             base_instructions: None,
             system: SystemPrompt {
                 stable: Some("You are a helpful assistant.".into()),
+                ambient: None,
                 volatile: None,
             },
             effort: None,

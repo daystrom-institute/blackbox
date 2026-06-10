@@ -1730,21 +1730,26 @@ fn compose_system(base: Option<&str>, reg: &Registry, has_structured_output: boo
         volatile.push_str(STRUCTURED_OUTPUT_INSTRUCTION);
         volatile.push('\n');
     }
+    // The deferred-tool manifest is AMBIENT, not volatile: it changes only
+    // when the loaded-tool set changes, so transports can deliver it
+    // hash-gated instead of re-sending it as a fresh item every turn.
+    let mut ambient = String::new();
     let manifest = reg.manifest();
     if !manifest.is_empty() {
-        volatile.push_str(&format!(
+        ambient.push_str(&format!(
             "## Additional tools ({} available, not yet loaded)\n\
              Call `tool_search(\"<keywords>\")` (or `tool_search(\"select:name1,name2\")`) to load \
              any of these before using them:\n",
             manifest.len()
         ));
         for (name, desc) in manifest {
-            volatile.push_str(&format!("- {name}: {desc}\n"));
+            ambient.push_str(&format!("- {name}: {desc}\n"));
         }
     }
 
     SystemPrompt {
         stable: (!stable.is_empty()).then_some(stable),
+        ambient: (!ambient.is_empty()).then_some(ambient),
         volatile: (!volatile.is_empty()).then_some(volatile),
     }
 }

@@ -187,20 +187,28 @@ pub struct ToolSpec {
     pub grammar: Option<bro_tools::FreeformGrammar>,
 }
 
-/// The system prompt, split into a cache-stable prefix and a volatile tail.
+/// The system prompt, split into a cache-stable prefix, a slow-changing
+/// ambient section, and a volatile tail.
 ///
 /// `stable` (the daemon-supplied system text + the pinned-tools section) does
 /// not change across a session, so it carries the prompt-cache breakpoint.
-/// `volatile` (the deferred-tool manifest, and later ambient nudges) is
-/// recomposed every turn and is never cached — placing it after the breakpoint
-/// keeps a changing tail from invalidating the cached prefix. Each transport
-/// renders the split natively after [`BaseInstructions`] (Anthropic: cached
-/// `system` blocks; OpenAI Chat: leading system message + trailing system
-/// message; Responses: `instructions` + trailing `developer` input item). See
+/// `ambient` (the deferred-tool manifest) changes only when the loaded-tool
+/// set changes; transports that resend the whole conversation each request
+/// (Responses) persist it into the buffer hash-gated-on-change instead of
+/// re-delivering it as a fresh item every turn — per-turn redelivery made
+/// Responses-shaped models treat the catalog as a new event each turn
+/// (thread-9dfe1da5). `volatile` (tail nudges, structured-output reminders)
+/// is true per-request ephemera: recomposed every turn, never cached, never
+/// persisted. Each transport renders the split natively after
+/// [`BaseInstructions`] (Anthropic: cached `system` blocks + uncached
+/// ambient/volatile blocks; OpenAI Chat: leading system message + trailing
+/// system message; Responses: `instructions` + buffer-persisted ambient +
+/// trailing `developer` input item for volatile). See
 /// design/bro-harness/bro-harness-hooks.md §1.
 #[derive(Debug, Default, Clone)]
 pub struct SystemPrompt {
     pub stable: Option<String>,
+    pub ambient: Option<String>,
     pub volatile: Option<String>,
 }
 
@@ -208,6 +216,10 @@ impl SystemPrompt {
     /// Non-empty stable text, if any.
     pub fn stable_text(&self) -> Option<&str> {
         self.stable.as_deref().filter(|s| !s.is_empty())
+    }
+    /// Non-empty ambient text, if any.
+    pub fn ambient_text(&self) -> Option<&str> {
+        self.ambient.as_deref().filter(|s| !s.is_empty())
     }
     /// Non-empty volatile text, if any.
     pub fn volatile_text(&self) -> Option<&str> {
