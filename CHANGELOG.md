@@ -10,6 +10,27 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- In-process harness tool execution no longer blocks the daemon's async
+  runtime: the sync-bodied builtins (`content_search`, `glob`,
+  `sandbox_status`, `sandbox_grounding` — tree walks, capped reads, sync git
+  captures) now run on the blocking pool. Under compile-free streaming-agent
+  load these inline bodies degraded mean worker poll time from ~130µs to
+  6–11ms with ~40% of polls over 900µs.
+- A model turn that ends with no text and no tool calls (e.g. an output-token
+  cap hit mid-thinking) no longer silently terminates the session as a clean
+  success carrying stale narration as its result. The harness nudges the model
+  once to produce its final answer; if the retry also returns nothing, the
+  turn ends with the empty-output stop flagged in turn-end diagnostics and a
+  `suspicious_turn_end` block on the result event. The detector previously
+  tested session-accumulated text, so any earlier narration masked the
+  condition entirely.
+- Remaining MCP handlers doing disk I/O inline on tokio workers moved to the
+  blocking pool: the five packet tools (`bbox_compile`/`bbox_apply`/
+  `bbox_audit` append fsync'd events; `bbox_packet_list`/`bbox_packet_events`
+  re-read the store/event log), `bbox_inbox` (gap-spool import rewrites the
+  gap store under its write lock), and `bbox_artifact_supersede`/
+  `bbox_artifact_remove` (flock'd catalog rewrites).
+
 - Edge-index rebuilds no longer stall the daemon under load: the store read
   guards now cover only the fast in-memory projections, while the multi-GB
   sidecar parse (measured 13–109s per rebuild in production) runs with no
