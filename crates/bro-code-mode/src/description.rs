@@ -18,7 +18,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Runs raw JavaScript -- no Node, no file system, no network access, no console.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
-- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
+- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call in flight never triggers a yield; the window restarts when the call returns.
 - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
 - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
 
@@ -28,17 +28,21 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` can be an HTTPS URL or a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`. When provided, the second `detail` argument overrides any detail embedded in the first argument.
 - `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls in the same session.
 - `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing.
-- `notify(value: string | number | boolean | undefined | null)`: immediately injects an extra `custom_tool_call_output` for the current `exec` call. Values are stringified like `text(...)`.
+- `notify(value: string | number | boolean | undefined | null)`: queues a notification for this cell; it is delivered in a `[notifications]` section of the next `exec`/`wait` result for the cell. Values are stringified like `text(...)`.
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
-- `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
+- `yield_control()`: yields the accumulated output to the model immediately while the script keeps running.
+
+- Side-channel notes (e.g. a `done` note for an orchestrator): when the host exposes a note tool it is a nested tool like any other — `await tools.mcp__blackbox__bbox_note({ kind: "done", body: "..." })`. If it is not listed above, filter `ALL_TOOLS` by `name` for `bbox_note` to confirm the exact identifier; do not search the web or the filesystem for it."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
 - `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
 - `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
+- Queued `notify(...)` payloads from the cell are delivered in a `[notifications]` section of the result.
+- A nested tool call in flight never triggers a yield; the yield window restarts when the call returns.
 - If the cell is still running, `wait` may yield again with the same `cell_id`.
 - If the cell has already finished, `wait` returns the completed result and closes the cell."#;
 // Based off of https://modelcontextprotocol.io/specification/draft/schema#calltoolresult
@@ -884,6 +888,27 @@ bar"
         );
         assert!(description.contains("`setTimeout(callback: () => void, delayMs?: number)`"));
         assert!(description.contains("`clearTimeout(timeoutId?: number)`"));
+    }
+
+    #[test]
+    fn exec_description_documents_note_emission_and_notify_delivery() {
+        let description = build_exec_tool_description(
+            &[],
+            &BTreeMap::new(),
+            /*code_mode_only*/ false,
+            /*deferred_tools_available*/ false,
+        );
+        // Exec-note idiom: bbox_note is reachable as a nested tool.
+        assert!(description.contains("tools.mcp__blackbox__bbox_note"));
+        assert!(description.contains("filter `ALL_TOOLS` by `name` for `bbox_note`"));
+        // Long-running cells: raise yield_time_ms via the pragma.
+        assert!(description.contains(r#"// @exec: {"yield_time_ms": 60000}"#));
+        // notify() is buffered into the next exec/wait result, not injected.
+        assert!(description.contains("[notifications]"));
+        assert!(!description.contains("immediately injects an extra `custom_tool_call_output`"));
+        // The wait description carries the same delivery contract.
+        let wait = super::build_wait_tool_description();
+        assert!(wait.contains("[notifications]"));
     }
 
     #[test]

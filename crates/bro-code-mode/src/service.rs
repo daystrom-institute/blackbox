@@ -572,6 +572,13 @@ async fn run_cell_control(
     let mut termination_requested = false;
     let mut runtime_closed = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    // Most recently requested yield window. A delegated tool invocation is
+    // atomic with respect to cell yield: while any nested tool call is in
+    // flight the yield timer is suppressed (the nested tool's own
+    // yield/timeout contract governs how long it blocks), and when the last
+    // in-flight call returns the timer is re-armed with a fresh window.
+    let mut yield_window_ms: Option<u64> = initial_yield_time_ms;
+    let mut tool_call_tasks = JoinSet::new();
     let mut notification_tasks = JoinSet::new();
 
     loop {
@@ -684,7 +691,7 @@ async fn run_cell_control(
                         let delegate = Arc::clone(&inner.delegate);
                         let runtime_tx = runtime_tx.clone();
                         let cancellation_token = cancellation_token.child_token();
-                        tokio::spawn(async move {
+                        tool_call_tasks.spawn(async move {
                             let response = tokio::select! {
                                 response = delegate.invoke_tool(tool_call, cancellation_token.clone()) => response,
                                 _ = cancellation_token.cancelled() => return,
@@ -739,6 +746,21 @@ async fn run_cell_control(
                     warn!("code mode notification task failed: {err}");
                 }
             }
+            task_result = tool_call_tasks.join_next(), if !tool_call_tasks.is_empty() => {
+                if let Some(Err(err)) = task_result
+                    && !err.is_cancelled()
+                {
+                    warn!("code mode nested tool call task failed: {err}");
+                }
+                // The nested call is back: re-arm a fresh yield window from
+                // tool-return (only if a window is active — i.e. the cell has
+                // not already yielded and is not in pause-until-resumed mode).
+                if tool_call_tasks.is_empty() && yield_timer.is_some() {
+                    yield_timer = yield_window_ms.map(|window_ms| {
+                        Box::pin(tokio::time::sleep(Duration::from_millis(window_ms)))
+                    });
+                }
+            }
             maybe_command = control_rx.recv() => {
                 let Some(command) = maybe_command else {
                     break;
@@ -753,6 +775,7 @@ async fn run_cell_control(
                             break;
                         }
                         response_tx = Some(CellResponseSender::Runtime(next_response_tx));
+                        yield_window_ms = Some(yield_time_ms);
                         yield_timer = Some(Box::pin(tokio::time::sleep(Duration::from_millis(yield_time_ms))));
                         resume_paused_runtime(&runtime_control_tx, pending_mode);
                     }
@@ -767,6 +790,7 @@ async fn run_cell_control(
                         }
                         response_tx =
                             Some(CellResponseSender::ExecuteToPending(next_response_tx));
+                        yield_window_ms = None;
                         yield_timer = None;
                         resume_paused_runtime(&runtime_control_tx, pending_mode);
                     }
@@ -798,13 +822,16 @@ async fn run_cell_control(
                     }
                 }
             }
+            // Suppressed while a nested tool call is in flight: the in-flight
+            // invocation is atomic w.r.t. cell yield, so the timer must not
+            // force a "still running" yield mid-call.
             _ = async {
                 if let Some(yield_timer) = yield_timer.as_mut() {
                     yield_timer.await;
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => {
+            }, if tool_call_tasks.is_empty() => {
                 yield_timer = None;
                 send_yield_response(&cell_id, &mut content_items, &mut response_tx);
             }
@@ -916,6 +943,124 @@ mod tests {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             next_cell_id: AtomicU64::new(1),
         })
+    }
+
+    /// Delegate whose nested tool calls block for `delay` before returning
+    /// `"slow-result"`. Used to prove a delegated invocation is atomic with
+    /// respect to the cell yield timer.
+    struct SlowToolDelegate {
+        delay: Duration,
+    }
+
+    impl super::CodeModeSessionDelegate for SlowToolDelegate {
+        fn invoke_tool<'a>(
+            &'a self,
+            _invocation: crate::runtime::CodeModeNestedToolCall,
+            _cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> super::ToolInvocationFuture<'a> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(serde_json::Value::String("slow-result".to_string()))
+            })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            _call_id: String,
+            _cell_id: CellId,
+            _text: String,
+            _cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> super::NotificationFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cell_closed(&self, _cell_id: &CellId) {}
+    }
+
+    fn slow_tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "slow".to_string(),
+            tool_name: ToolName::plain("slow"),
+            description: String::new(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            output_schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_tool_call_in_flight_suppresses_yield_timer() {
+        // The nested tool call (500 ms) outlives the cell yield window
+        // (100 ms). The cell must NOT yield "still running" mid-call; it must
+        // return the tool's result as a terminal Result.
+        let service = CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
+            delay: Duration::from_millis(500),
+        }));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            execute(
+                &service,
+                ExecuteRequest {
+                    enabled_tools: vec![slow_tool_definition()],
+                    source: "const r = await tools.slow({}); text(String(r));".to_string(),
+                    yield_time_ms: Some(100),
+                    ..execute_request("")
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "slow-result".to_string(),
+                }],
+                error_text: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_window_rearms_after_nested_tool_returns() {
+        // After the nested call (300 ms) returns, a fresh yield window
+        // (100 ms) is armed from tool-return; the still-pending cell then
+        // yields with the output produced so far.
+        let service = CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
+            delay: Duration::from_millis(300),
+        }));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            execute(
+                &service,
+                ExecuteRequest {
+                    enabled_tools: vec![slow_tool_definition()],
+                    source: "await tools.slow({}); text(\"tool-returned\"); await new Promise(() => {});"
+                        .to_string(),
+                    yield_time_ms: Some(100),
+                    ..execute_request("")
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response,
+            RuntimeResponse::Yielded {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "tool-returned".to_string(),
+                }],
+            }
+        );
+
+        let _ = service.terminate(cell_id("1")).await;
     }
 
     #[tokio::test]

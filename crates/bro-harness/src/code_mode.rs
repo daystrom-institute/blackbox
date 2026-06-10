@@ -11,8 +11,8 @@
 //! and runs the real [`Tool`] against the session `ToolCx`. The deny-filter is
 //! honored: a tool absent from the seam fails closed, with no in-cell bypass.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bro_capabilities::{ToolCapability, ToolInvocation};
@@ -98,11 +98,19 @@ NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 "#;
 
+/// Per-session buffer of `notify(...)` payloads keyed by cell id.
+///
+/// There is no mid-turn injection hook in the harness turn loop, so notify()
+/// is delivered model-visibly by riding the next `exec`/`wait` tool result for
+/// the cell as a `[notifications]` section (drained on delivery).
+type NotificationBuffer = Mutex<HashMap<String, Vec<String>>>;
+
 /// Delegate that dispatches a cell's nested `tools.X(...)` call into the harness
 /// tool seam. Holds the already-filtered [`ToolCapability`] (`HostTools`), so a
 /// denied/unknown tool fails closed exactly as it does on the flat surface.
 struct HarnessDelegate {
     seam: Arc<dyn ToolCapability>,
+    notifications: Arc<NotificationBuffer>,
 }
 
 impl CodeModeSessionDelegate for HarnessDelegate {
@@ -148,12 +156,17 @@ impl CodeModeSessionDelegate for HarnessDelegate {
         text: String,
         _cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a> {
-        // First landing: notifications are logged, not injected as extra
-        // tool_call_output blocks (that requires a turn-loop hook). Non-fatal.
-        Box::pin(async move {
-            tracing::info!(cell = %cell_id, "code-mode notify: {text}");
-            Ok(())
-        })
+        // Buffered, not injected mid-turn: the payload is delivered as a
+        // `[notifications]` section on the next `exec`/`wait` result for this
+        // cell (drained by ExecTool/WaitTool). Non-fatal.
+        tracing::debug!(cell = %cell_id, "code-mode notify queued: {text}");
+        self.notifications
+            .lock()
+            .expect("code-mode notification buffer poisoned")
+            .entry(cell_id.as_str().to_string())
+            .or_default()
+            .push(text);
+        Box::pin(async { Ok(()) })
     }
 
     fn cell_closed(&self, _cell_id: &CellId) {}
@@ -164,15 +177,30 @@ impl CodeModeSessionDelegate for HarnessDelegate {
 struct CodeModeSurface {
     service: CodeModeService,
     catalog: Vec<ToolDefinition>,
+    notifications: Arc<NotificationBuffer>,
 }
 
 impl CodeModeSurface {
     fn new(seam: Arc<dyn ToolCapability>, catalog: Vec<ToolDefinition>) -> Self {
-        let delegate = Arc::new(HarnessDelegate { seam });
+        let notifications = Arc::new(NotificationBuffer::default());
+        let delegate = Arc::new(HarnessDelegate {
+            seam,
+            notifications: Arc::clone(&notifications),
+        });
         Self {
             service: CodeModeService::with_delegate(delegate),
             catalog,
+            notifications,
         }
+    }
+
+    /// Remove and return the buffered `notify(...)` payloads for one cell.
+    fn drain_notifications(&self, cell_id: &CellId) -> Vec<String> {
+        self.notifications
+            .lock()
+            .expect("code-mode notification buffer poisoned")
+            .remove(cell_id.as_str())
+            .unwrap_or_default()
     }
 }
 
@@ -200,16 +228,37 @@ fn join_content(items: &[FunctionCallOutputContentItem]) -> String {
     out
 }
 
+/// Render queued `notify(...)` payloads as a clearly-delimited section
+/// appended to the cell output body. Empty when nothing was queued.
+fn render_notifications(notifications: &[String]) -> String {
+    if notifications.is_empty() {
+        return String::new();
+    }
+    format!("\n\n[notifications]\n{}", notifications.join("\n"))
+}
+
+/// The cell a runtime response belongs to (every variant carries one).
+fn response_cell_id(response: &RuntimeResponse) -> &CellId {
+    match response {
+        RuntimeResponse::Result { cell_id, .. }
+        | RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::Terminated { cell_id, .. } => cell_id,
+    }
+}
+
 /// Map a runtime response into a harness tool result. A still-running cell
-/// surfaces its `cell_id` so the model can `wait`.
-fn response_to_result(response: RuntimeResponse) -> ToolResult {
+/// surfaces its `cell_id` so the model can `wait`. `notifications` are the
+/// drained `notify(...)` payloads for the cell, delivered as a delimited
+/// section alongside the cell output.
+fn response_to_result(response: RuntimeResponse, notifications: Vec<String>) -> ToolResult {
+    let notifications = render_notifications(&notifications);
     match response {
         RuntimeResponse::Result {
             content_items,
             error_text,
             ..
         } => {
-            let body = join_content(&content_items);
+            let body = format!("{}{notifications}", join_content(&content_items));
             match error_text {
                 Some(err) if body.is_empty() => ToolResult::Error(err),
                 Some(err) => ToolResult::Error(format!("{body}\n{err}")),
@@ -220,7 +269,7 @@ fn response_to_result(response: RuntimeResponse) -> ToolResult {
             cell_id,
             content_items,
         } => {
-            let body = join_content(&content_items);
+            let body = format!("{}{notifications}", join_content(&content_items));
             ToolResult::Text(format!(
                 "{body}\n\nScript running with cell ID {cell_id}. Call `wait` with this cell_id for more output.",
             ))
@@ -229,7 +278,7 @@ fn response_to_result(response: RuntimeResponse) -> ToolResult {
             cell_id,
             content_items,
         } => {
-            let body = join_content(&content_items);
+            let body = format!("{}{notifications}", join_content(&content_items));
             ToolResult::Text(format!("{body}\n\n[cell {cell_id} terminated]"))
         }
     }
@@ -291,7 +340,12 @@ impl Tool for ExecTool {
             Err(e) => return ToolResult::Error(format!("exec failed: {e}")),
         };
         match started.initial_response().await {
-            Ok(response) => response_to_result(response),
+            Ok(response) => {
+                let notifications = self
+                    .surface
+                    .drain_notifications(response_cell_id(&response));
+                response_to_result(response, notifications)
+            }
             Err(e) => ToolResult::Error(format!("exec failed: {e}")),
         }
     }
@@ -356,8 +410,12 @@ impl Tool for WaitTool {
                 .await
         };
         match outcome {
-            Ok(WaitOutcome::LiveCell(response)) => response_to_result(response),
-            Ok(WaitOutcome::MissingCell(response)) => response_to_result(response),
+            Ok(WaitOutcome::LiveCell(response)) | Ok(WaitOutcome::MissingCell(response)) => {
+                let notifications = self
+                    .surface
+                    .drain_notifications(response_cell_id(&response));
+                response_to_result(response, notifications)
+            }
             Err(e) => ToolResult::Error(format!("wait failed: {e}")),
         }
     }
@@ -530,6 +588,45 @@ mod tests {
             .await;
         match result {
             ToolResult::Text(t) => assert!(t.contains("\"n\":7"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_payloads_ride_the_exec_result() {
+        // notify() is buffered and delivered as a `[notifications]` section of
+        // the exec result, not silently logged.
+        let exec = exec_with(vec![Arc::new(Echo) as Arc<dyn Tool>]);
+        let result = exec
+            .call(
+                json!({ "source": "notify('ping'); notify('pong'); text('done');" }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Text(t) => {
+                assert!(t.contains("done"), "got: {t}");
+                assert!(t.contains("[notifications]"), "got: {t}");
+                assert!(t.contains("ping") && t.contains("pong"), "got: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_payloads_ride_a_yielded_exec_result() {
+        // A still-running cell's queued notifications surface on the yield,
+        // alongside the "Script running with cell ID" handle.
+        let exec = exec_with(vec![Arc::new(Echo) as Arc<dyn Tool>]);
+        let source =
+            "// @exec: {\"yield_time_ms\": 200}\nnotify('bg-ping'); await new Promise(() => {});";
+        let result = exec.call(json!({ "source": source }), &test_cx()).await;
+        match result {
+            ToolResult::Text(t) => {
+                assert!(t.contains("Script running with cell ID"), "got: {t}");
+                assert!(t.contains("[notifications]"), "got: {t}");
+                assert!(t.contains("bg-ping"), "got: {t}");
+            }
             other => panic!("expected text, got {other:?}"),
         }
     }
