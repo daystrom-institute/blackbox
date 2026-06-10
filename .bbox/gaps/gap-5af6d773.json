@@ -1,0 +1,23 @@
+{
+  "id": "gap-5af6d773",
+  "title": "Interactive Claude/Codex/Gemini transcripts no longer indexed — provider-removal deleted their transcript adapters, registry-only pipeline indexes nothing for them",
+  "gap_kind": "tooling",
+  "domain": "index/transcripts",
+  "wanted_capability": "Indexing of the host's interactive Claude Code / Codex / Gemini session transcripts into the tantivy corpus. fef32d2 (2026-06-02, \"Restrict dispatch to bro-harness providers\") deleted ClaudeTranscriptAdapter/CodexTranscriptAdapter/opencode (~2,548 lines) as part of the beta provider-removal arc (thread-36035d25), leaving TranscriptAdapterRegistry::from_reindex_config with zero adapters; the reindex transcript phase (index_transcripts_via_adapters, src/index/reindex.rs:285) is now adapter-registry-only, so NO provider transcripts were indexed between June 2 and June 10 (every pass logged transcript phase indexed_files=0). The regression went live in prod with the 2026-06-10 w8 redeploy. Removing Claude/Codex as DISPATCH providers was the arc's intent, but the host's interactive sessions still accumulate (~/.claude/projects, ~/.codex/sessions) and transcript search across them is blackbox's core function — bbox_search/bbox_cite now silently miss everything after June 2 (latest indexed codex docs are June 5, indexed by the pre-cutover prod binary). Aggravating: scan_source_files (reindex.rs:130) still STATs the claude/codex roots for change detection, so constantly-changing interactive transcripts trigger a reindex pass every tick that indexes nothing from them but holds the writer lock through the ~40-minute project phase. Wanted: transcript adapters for claude/codex(/gemini) roots reimplemented against the registry contract (the harness-sessions adapter, src/transcripts/harness_sessions.rs, is now a working reference), or an explicit operator decision that interactive-transcript indexing is out of scope for the v2 beta — in which case the roots should also leave the needs_reindex scan set.",
+  "missing_primitive": "TranscriptReadAdapter implementations for claude/codex/gemini interactive session roots (registry has only harness-session adapters)",
+  "fallback_used": "bbox_messages/bbox_session still read live files directly via roots lookup (search.rs), so explicit-session reads work; only index-backed search/cite/recency surfaces are stale.",
+  "evidence": [
+    "fef32d2 src/transcripts/adapters.rs -1431 lines",
+    "src/index/reindex.rs:285 index_transcripts_via_adapters",
+    "src/index/reindex.rs:130 scan_source_files still scans roots",
+    "~/Library/Logs/blackbox.err.log: every transcript phase 2026-06-02..10 indexed_files=0",
+    "thread-36035d25 note 1 (arc scope: remove dispatch providers)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/index/provider-transcript-indexing-removed",
+  "resolution": "unresolved",
+  "thread_id": "thread-36035d25",
+  "created_at": "2026-06-10T17:12:26Z",
+  "updated_at": "2026-06-10T17:12:26Z"
+}
