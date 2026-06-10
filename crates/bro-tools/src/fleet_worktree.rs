@@ -69,7 +69,11 @@ impl Tool for SandboxGrounding {
             Ok(args) => args,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        ToolResult::from_result(sandbox_grounding(cx, args))
+        // Delegates to sandbox_status_manifest's sync git captures — keep the
+        // child-process waits off the runtime workers.
+        let cx = cx.clone();
+        crate::tool::call_blocking(move || ToolResult::from_result(sandbox_grounding(&cx, args)))
+            .await
     }
 }
 
@@ -559,7 +563,9 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
     if req.dry_run {
         let preflight = phase_preflight(req);
         return if preflight.ok {
-            CloseoutOutcome::Success { phases: vec![preflight] }
+            CloseoutOutcome::Success {
+                phases: vec![preflight],
+            }
         } else {
             CloseoutOutcome::Failed(preflight)
         };
@@ -1437,7 +1443,11 @@ fn enter_worktree(cx_root: &Path, args: EnterWorktreeInput) -> anyhow::Result<Va
     if let Some(fork_base) = fork_base {
         let _ = git_run(
             &base_repo,
-            &["config", &format!("branch.{branch}.broFleetBase"), &fork_base],
+            &[
+                "config",
+                &format!("branch.{branch}.broFleetBase"),
+                &fork_base,
+            ],
         );
     }
     let status = git_capture(&path, &["status", "--short", "--branch"]).unwrap_or_default();
@@ -2742,7 +2752,11 @@ mod tests {
         // Preflight must surface the branch_commits_ahead count (the
         // same content the non-dry-run merge/adopt path returns).
         let preflight = &results[0];
-        assert!(preflight.ok, "preflight must be ok: {:?}", preflight.content);
+        assert!(
+            preflight.ok,
+            "preflight must be ok: {:?}",
+            preflight.content
+        );
         assert_eq!(preflight.content["branch_commits_ahead"], json!(1));
 
         // Capture the worktree's new HEAD (the commit the dry-run would
@@ -2764,8 +2778,8 @@ mod tests {
         //    commit landed, so `origin_main == base_head_before` at start
         //    and must still equal `base_head_before` after — the worktree
         //    commit (`worktree_head`) must NOT have reached origin.
-        let origin_main = git_capture(origin.path(), &["rev-parse", "refs/heads/main"])
-            .unwrap_or_default();
+        let origin_main =
+            git_capture(origin.path(), &["rev-parse", "refs/heads/main"]).unwrap_or_default();
         assert_eq!(
             origin_main, base_head_before,
             "origin should still be on the pre-dry-run base head; the worktree commit must NOT have been pushed"
@@ -3260,7 +3274,11 @@ mod tests {
         );
         run_git(
             &worktree,
-            &["config", "branch.bro-fleet/fork-test.broFleetBase", "feature-x"],
+            &[
+                "config",
+                "branch.bro-fleet/fork-test.broFleetBase",
+                "feature-x",
+            ],
         );
 
         // A peer moves the base checkout back to main between dispatch and
@@ -3377,8 +3395,8 @@ mod tests {
 
     /// Set up a repo with a bare origin and a committed worktree branch ready to
     /// `adopt`-fold, returning `(repo, origin, worktree_value, cwd, branch)`.
-    async fn seed_foldable_worktree() -> (tempfile::TempDir, tempfile::TempDir, Value, PathBuf, String)
-    {
+    async fn seed_foldable_worktree()
+    -> (tempfile::TempDir, tempfile::TempDir, Value, PathBuf, String) {
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
         run_git(origin.path(), &["init", "--bare"]);
@@ -3425,7 +3443,10 @@ mod tests {
             dry_run: false,
             closeout_hooks: Some(hooks_for(
                 "post_success",
-                vec![format!("printf '%s' \"$BBOX_WORKTREE\" > {}", marker.display())],
+                vec![format!(
+                    "printf '%s' \"$BBOX_WORKTREE\" > {}",
+                    marker.display()
+                )],
                 HookOnFail::Warn,
             )),
         };

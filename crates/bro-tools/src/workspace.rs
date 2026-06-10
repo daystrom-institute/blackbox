@@ -91,7 +91,10 @@ impl Tool for SandboxStatus {
             Ok(args) => args,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        ToolResult::from_result(sandbox_status(cx, args))
+        // git_status_manifest shells out via sync `Command::output` — keep
+        // the child-process wait off the runtime workers.
+        let cx = cx.clone();
+        crate::tool::call_blocking(move || ToolResult::from_result(sandbox_status(&cx, args))).await
     }
 }
 
@@ -1072,111 +1075,117 @@ impl Tool for ContentSearch {
         }
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: ContentSearchInput = match serde_json::from_value(input) {
-            Ok(a) => a,
-            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
-        };
-        let re = match regex::RegexBuilder::new(&args.pattern)
-            .case_insensitive(args.case_insensitive)
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => return ToolResult::Error(format!("bad regex: {e}")),
-        };
-        let name_matcher = match args.glob.as_deref() {
-            Some(g) => match GlobPattern::new(g) {
-                Ok(gp) => Some(gp.compile_matcher()),
-                Err(e) => return ToolResult::Error(format!("bad glob: {e}")),
-            },
-            None => None,
-        };
-        let base = match walk_base(&cx.root, args.path.as_deref()) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::Error(e.to_string()),
-        };
-        let root = effective_root(&cx.root);
-        let cap = args.max_results.unwrap_or(200).min(5000);
-        let ctx = args.context_lines.unwrap_or(0).min(50);
+        // Sync tree walk + capped reads over the whole worktree — the single
+        // heaviest builtin; keep it off the runtime workers.
+        let cx = cx.clone();
+        crate::tool::call_blocking(move || {
+            let args: ContentSearchInput = match serde_json::from_value(input) {
+                Ok(a) => a,
+                Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+            };
+            let re = match regex::RegexBuilder::new(&args.pattern)
+                .case_insensitive(args.case_insensitive)
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => return ToolResult::Error(format!("bad regex: {e}")),
+            };
+            let name_matcher = match args.glob.as_deref() {
+                Some(g) => match GlobPattern::new(g) {
+                    Ok(gp) => Some(gp.compile_matcher()),
+                    Err(e) => return ToolResult::Error(format!("bad glob: {e}")),
+                },
+                None => None,
+            };
+            let base = match walk_base(&cx.root, args.path.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::Error(e.to_string()),
+            };
+            let root = effective_root(&cx.root);
+            let cap = args.max_results.unwrap_or(200).min(5000);
+            let ctx = args.context_lines.unwrap_or(0).min(50);
 
-        let mut hits: Vec<String> = Vec::new();
-        // `files`/`count` modes count files; `content` counts lines.
-        let mut total_matches = 0usize;
-        let mut matched_files = 0usize;
-        'walk: for entry in hardened_walk(&base).flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let p = entry.path();
-            if let Some(m) = &name_matcher {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !m.is_match(name) {
+            let mut hits: Vec<String> = Vec::new();
+            // `files`/`count` modes count files; `content` counts lines.
+            let mut total_matches = 0usize;
+            let mut matched_files = 0usize;
+            'walk: for entry in hardened_walk(&base).flatten() {
+                if !entry.file_type().is_some_and(|t| t.is_file()) {
                     continue;
                 }
-            }
-            let Some(text) = read_text_capped(p, 2_000_000) else {
-                continue;
-            };
-            let rel = p.strip_prefix(&root).unwrap_or(p).display().to_string();
-            let lines: Vec<&str> = text.lines().collect();
+                let p = entry.path();
+                if let Some(m) = &name_matcher {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !m.is_match(name) {
+                        continue;
+                    }
+                }
+                let Some(text) = read_text_capped(p, 2_000_000) else {
+                    continue;
+                };
+                let rel = p.strip_prefix(&root).unwrap_or(p).display().to_string();
+                let lines: Vec<&str> = text.lines().collect();
 
-            match args.mode {
-                SearchMode::Files => {
-                    if lines.iter().any(|l| re.is_match(l)) {
-                        hits.push(rel);
-                        if hits.len() >= cap {
-                            hits.push(format!("[truncated at {cap} files]"));
-                            break 'walk;
-                        }
-                    }
-                }
-                SearchMode::Count => {
-                    let n = lines.iter().filter(|l| re.is_match(l)).count();
-                    if n > 0 {
-                        total_matches += n;
-                        matched_files += 1;
-                        hits.push(format!("{rel}:{n}"));
-                        if hits.len() >= cap {
-                            hits.push(format!("[truncated at {cap} files]"));
-                            break 'walk;
-                        }
-                    }
-                }
-                SearchMode::Content => {
-                    for (i, line) in lines.iter().enumerate() {
-                        if re.is_match(line) {
-                            if ctx > 0 {
-                                let lo = i.saturating_sub(ctx);
-                                let hi = (i + ctx).min(lines.len().saturating_sub(1));
-                                for (j, ctx_line) in lines[lo..=hi].iter().enumerate() {
-                                    let n = lo + j + 1;
-                                    let sep = if lo + j == i { ':' } else { '-' };
-                                    hits.push(format!("{rel}:{n}{sep}{ctx_line}"));
-                                }
-                                hits.push("--".into());
-                            } else {
-                                hits.push(format!("{rel}:{}:{}", i + 1, line));
-                            }
-                            total_matches += 1;
-                            if total_matches >= cap {
-                                hits.push(format!("[truncated at {cap} matches]"));
+                match args.mode {
+                    SearchMode::Files => {
+                        if lines.iter().any(|l| re.is_match(l)) {
+                            hits.push(rel);
+                            if hits.len() >= cap {
+                                hits.push(format!("[truncated at {cap} files]"));
                                 break 'walk;
                             }
                         }
                     }
+                    SearchMode::Count => {
+                        let n = lines.iter().filter(|l| re.is_match(l)).count();
+                        if n > 0 {
+                            total_matches += n;
+                            matched_files += 1;
+                            hits.push(format!("{rel}:{n}"));
+                            if hits.len() >= cap {
+                                hits.push(format!("[truncated at {cap} files]"));
+                                break 'walk;
+                            }
+                        }
+                    }
+                    SearchMode::Content => {
+                        for (i, line) in lines.iter().enumerate() {
+                            if re.is_match(line) {
+                                if ctx > 0 {
+                                    let lo = i.saturating_sub(ctx);
+                                    let hi = (i + ctx).min(lines.len().saturating_sub(1));
+                                    for (j, ctx_line) in lines[lo..=hi].iter().enumerate() {
+                                        let n = lo + j + 1;
+                                        let sep = if lo + j == i { ':' } else { '-' };
+                                        hits.push(format!("{rel}:{n}{sep}{ctx_line}"));
+                                    }
+                                    hits.push("--".into());
+                                } else {
+                                    hits.push(format!("{rel}:{}:{}", i + 1, line));
+                                }
+                                total_matches += 1;
+                                if total_matches >= cap {
+                                    hits.push(format!("[truncated at {cap} matches]"));
+                                    break 'walk;
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        if hits.is_empty() {
-            return ToolResult::Text("no matches".into());
-        }
-        if args.mode == SearchMode::Count {
-            hits.push(format!(
-                "[total: {total_matches} matches across {matched_files} files]"
-            ));
-        }
-        let output = hits.join("\n");
-        ToolResult::Text(output)
+            if hits.is_empty() {
+                return ToolResult::Text("no matches".into());
+            }
+            if args.mode == SearchMode::Count {
+                hits.push(format!(
+                    "[total: {total_matches} matches across {matched_files} files]"
+                ));
+            }
+            let output = hits.join("\n");
+            ToolResult::Text(output)
+        })
+        .await
     }
 }
 
@@ -1250,71 +1259,77 @@ impl Tool for Glob {
         }
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: GlobInput = match serde_json::from_value(input) {
-            Ok(a) => a,
-            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
-        };
-        let matcher = match relpath_glob(&args.pattern) {
-            Ok(m) => m,
-            Err(e) => return ToolResult::Error(format!("bad glob: {e}")),
-        };
-        // A slash-less pattern (e.g. "*.rs", "Cargo.toml") is also matched
-        // against the file NAME at any depth — ripgrep/fd `-g` ergonomics — so
-        // an agent doesn't have to write "**/" for the common "find files of
-        // this kind anywhere" case. Patterns with a separator stay full-path.
-        let match_basename = !args.pattern.contains('/');
-        let base = match walk_base(&cx.root, args.path.as_deref()) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::Error(e.to_string()),
-        };
-        let root = effective_root(&cx.root);
-        // Collect (relpath, mtime) so we can order before formatting.
-        let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
-        for entry in hardened_walk(&base).flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let p = entry.path();
-            let rel = p.strip_prefix(&base).unwrap_or(p);
-            let name_hit = match_basename
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| matcher.is_match(n));
-            if matcher.is_match(rel) || name_hit {
-                let mtime = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                out.push((
-                    p.strip_prefix(&root).unwrap_or(p).display().to_string(),
-                    mtime,
-                ));
-                if out.len() >= GLOB_SCAN_CEILING {
-                    break;
+        // Sync tree walk with per-entry stat (mtime sort) — keep it off the
+        // runtime workers.
+        let cx = cx.clone();
+        crate::tool::call_blocking(move || {
+            let args: GlobInput = match serde_json::from_value(input) {
+                Ok(a) => a,
+                Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+            };
+            let matcher = match relpath_glob(&args.pattern) {
+                Ok(m) => m,
+                Err(e) => return ToolResult::Error(format!("bad glob: {e}")),
+            };
+            // A slash-less pattern (e.g. "*.rs", "Cargo.toml") is also matched
+            // against the file NAME at any depth — ripgrep/fd `-g` ergonomics — so
+            // an agent doesn't have to write "**/" for the common "find files of
+            // this kind anywhere" case. Patterns with a separator stay full-path.
+            let match_basename = !args.pattern.contains('/');
+            let base = match walk_base(&cx.root, args.path.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::Error(e.to_string()),
+            };
+            let root = effective_root(&cx.root);
+            // Collect (relpath, mtime) so we can order before formatting.
+            let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
+            for entry in hardened_walk(&base).flatten() {
+                if !entry.file_type().is_some_and(|t| t.is_file()) {
+                    continue;
+                }
+                let p = entry.path();
+                let rel = p.strip_prefix(&base).unwrap_or(p);
+                let name_hit = match_basename
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| matcher.is_match(n));
+                if matcher.is_match(rel) || name_hit {
+                    let mtime = entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    out.push((
+                        p.strip_prefix(&root).unwrap_or(p).display().to_string(),
+                        mtime,
+                    ));
+                    if out.len() >= GLOB_SCAN_CEILING {
+                        break;
+                    }
                 }
             }
-        }
-        match args.sort {
-            // Most recent first; tie-break by path for determinism.
-            GlobSort::Mtime => out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
-            GlobSort::Name => out.sort_by(|a, b| a.0.cmp(&b.0)),
-        }
-        if out.is_empty() {
-            return ToolResult::Text("no files matched".into());
-        }
-        // Cap AFTER sorting, so the returned slice is the true top-N by the
-        // chosen order (not an arbitrary walk-order prefix).
-        let cap = args.max_results.unwrap_or(1000);
-        let total = out.len();
-        let mut lines: Vec<String> = out.into_iter().take(cap).map(|(rel, _)| rel).collect();
-        if total > lines.len() {
-            lines.push(format!(
-                "[showing {} of {total} matches; raise max_results for more]",
-                lines.len()
-            ));
-        }
-        ToolResult::Text(lines.join("\n"))
+            match args.sort {
+                // Most recent first; tie-break by path for determinism.
+                GlobSort::Mtime => out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
+                GlobSort::Name => out.sort_by(|a, b| a.0.cmp(&b.0)),
+            }
+            if out.is_empty() {
+                return ToolResult::Text("no files matched".into());
+            }
+            // Cap AFTER sorting, so the returned slice is the true top-N by the
+            // chosen order (not an arbitrary walk-order prefix).
+            let cap = args.max_results.unwrap_or(1000);
+            let total = out.len();
+            let mut lines: Vec<String> = out.into_iter().take(cap).map(|(rel, _)| rel).collect();
+            if total > lines.len() {
+                lines.push(format!(
+                    "[showing {} of {total} matches; raise max_results for more]",
+                    lines.len()
+                ));
+            }
+            ToolResult::Text(lines.join("\n"))
+        })
+        .await
     }
 }
 
@@ -1530,9 +1545,11 @@ impl Tool for ApplyPatch {
                 FileAction::Moved => "moved",
             };
             match (&ch.moved_from, ch.action) {
-                (Some(from), FileAction::Moved) => {
-                    summary.push(format!("{verb} {} -> {}", from.display(), ch.path.display()))
-                }
+                (Some(from), FileAction::Moved) => summary.push(format!(
+                    "{verb} {} -> {}",
+                    from.display(),
+                    ch.path.display()
+                )),
                 _ => summary.push(format!("{verb} {}", ch.path.display())),
             }
         }

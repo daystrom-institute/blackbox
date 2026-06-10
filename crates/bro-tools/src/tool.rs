@@ -54,6 +54,21 @@ pub struct ToolCx {
     pub tool_arg_defaults: Arc<crate::tool_defaults::ToolArgDefaults>,
 }
 
+/// Run a synchronous, I/O-heavy tool body on tokio's blocking pool.
+///
+/// In-process harness loops share the host daemon's runtime; a sync fs walk
+/// or child-process wait inside an async `call` body blocks a runtime worker
+/// for its full duration (measured 1–90ms worker polls under streaming agent
+/// load — blackbox concurrency-model §4.6). Tool bodies that are pure sync
+/// work (tree walks, capped reads, sync git capture) go through this; bodies
+/// already on `tokio::fs`/`tokio::process` stay direct.
+pub async fn call_blocking(f: impl FnOnce() -> ToolResult + Send + 'static) -> ToolResult {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(r) => r,
+        Err(e) => ToolResult::Error(format!("tool execution task failed: {e}")),
+    }
+}
+
 /// Result of a tool call. Maps onto the content of an Anthropic
 /// `tool_result` block; `Error` sets `is_error: true`.
 #[derive(Debug, Clone)]
