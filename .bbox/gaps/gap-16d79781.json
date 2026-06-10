@@ -1,15 +1,17 @@
 {
   "id": "gap-16d79781",
-  "title": "Worktree dispatch: harness file tools silently resolve relative paths against the launch cwd",
+  "title": "Dispatch cwd hazards: silent unknown-param drop + daemon-cwd default (worktree facet ADDRESSED)",
   "gap_kind": "tooling",
   "domain": "bro-harness/sandbox-cwd",
-  "wanted_capability": "A first-class working-directory override for dispatched sessions (dispatch-time cwd param, or an in-session chdir/workdir tool affecting file_read/file_edit/content_search and shell default cwd), so a bro instructed to work in a self-created git worktree actually operates there. Today file tools resolve relative paths against the LAUNCH cwd: in a 4-bro worktree fan-out, one bro silently edited five files in the primary checkout mid-flight (caught by orchestrator IDE diagnostics + steer), a second applied edits to primary AND made an accidental commit there before self-correcting, and a third only avoided it because the shell layer rejected a ../ escape loudly, forcing absolute paths. Silent-wrong-tree is a data-hazard class: it defeats worktree isolation and risks clobbering peer/orchestrator state in the primary tree.",
+  "wanted_capability": "Original facet ADDRESSED and live-verified 2026-06-10: in-session worktree creation is host-owned (a72a216 fails closed) and dispatch project_dir flows --cwd → ToolCx.root, so file/content/shell tools resolve in the dispatched worktree (probe d09ad4f8: relative file_write landed in /tmp/ts-cwd-probe, primary + $HOME untouched). TWO RESIDUAL FACETS, same silent-wrong-tree hazard class, found by negative probe 05ee55e7: (1) bro_exec silently DROPS unknown params — dispatching with cwd: instead of project_dir: raised no error, and the bro ran somewhere else entirely; want serde deny_unknown_fields (or equivalent) on dispatch param structs, plus accepting cwd as an alias for project_dir since both the roster DTO and the harness call it cwd. (2) When project_dir is omitted, in-process harness sessions default to the DAEMON's process cwd — $HOME under launchd — so a file-capable bro gets the operator's home directory as its confinement root and writes land there (probe wrote $HOME/probe-cwd-marker.txt). Want: file-capable dispatches without project_dir to fail closed (or default to a neutral scratch dir), with an explicit opt-in for daemon-cwd if any legit use exists.",
   "missing_primitive": "dispatch-time cwd override / session workdir tool",
   "fallback_used": "Brief-level instruction to use absolute paths + --manifest-path/--target-dir pinning on every cargo command; orchestrator mid-run bro_steer recovery (copy-to-worktree + git checkout -- restore of primary) when a bro falls into the trap.",
   "evidence": [
-    "wave-7 fan-out thread-9dfe1da5: W7b narration 'changes were applied to the primary checkout... commit went to the primary checkout... undo the accidental commit'",
-    "W7c live-caught editing 5 primary files (bro-protocol/fleet-client/orchestration/roster) while briefed into ../ts-w7c",
-    "W7a narration: shell helper refused relative ../ts-w7a wd escape; succeeded only via absolute paths + manifest-path pinning"
+    "probe 05ee55e7-6043-49ac-abe6-76c147643b6e: bro_exec with cwd:/tmp/ts-cwd-probe silently ignored; INSPECTED=/Users/invidious; wrote $HOME/probe-cwd-marker.txt",
+    "probe d09ad4f8-191a-4bf7-9066-9f486184ef20: bro_exec with project_dir:/tmp/ts-cwd-probe; INSPECTED=/private/tmp/ts-cwd-probe; relative file_write confined correctly",
+    "a72a216 Remove model-facing worktree lifecycle tools (host-owned worktree creation)",
+    "crates/bro-harness/src/agent_loop.rs:633-640 (--cwd → ToolCx.root; falls back to process cwd)",
+    "src/tools/bro_params.rs (project_dir params; no deny_unknown_fields)"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
@@ -17,5 +19,5 @@
   "resolution": "unresolved",
   "thread_id": "thread-9dfe1da5",
   "created_at": "2026-06-10T06:10:29Z",
-  "updated_at": "2026-06-10T06:10:29Z"
+  "updated_at": "2026-06-10T18:54:18Z"
 }
