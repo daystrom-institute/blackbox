@@ -52,7 +52,16 @@ impl BlackboxServer {
         Parameters(p): Parameters<ReindexParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_reindex", move || server.state.idx.write().reindex(&p)).await
+        Self::run_blocking("bbox_reindex", move || {
+            // Runs on the writer actor: unified with the background pass
+            // (which also picks up thread/roadmap store docs the old manual
+            // path skipped) and never contends for the writer lock.
+            server
+                .state
+                .index_writer
+                .run_reindex_pass(p.full.unwrap_or(false), true)
+        })
+        .await
     }
 
     #[tool(

@@ -146,9 +146,13 @@ pub struct TranscriptIndex {
     /// walking every account's `projects/` tree — dominates the call
     /// time for a corpus of any size. Wrapped in an inner Mutex so
     /// stats() can mutate it through a shared `&TranscriptIndex`
-    /// (the whole struct is already behind RwLock in SharedState).
-    pub(super) stats_cache: Mutex<Option<(Instant, String)>>,
+    /// (the whole struct is already behind RwLock in SharedState), and
+    /// in an Arc so the IndexWriterActor can invalidate it post-commit.
+    pub(super) stats_cache: StatsCache,
 }
+
+/// Shared stats TTL cache; the writer actor clears it after every commit.
+pub(crate) type StatsCache = std::sync::Arc<Mutex<Option<(Instant, String)>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeProjectionDoc {
@@ -244,8 +248,22 @@ impl TranscriptIndex {
             schema,
             fields,
             config,
-            stats_cache: Mutex::new(None),
+            stats_cache: std::sync::Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Spawn the daemon's single tantivy writer actor (concurrency-model
+    /// §4.3). All production index mutations and reindex passes flow
+    /// through the returned handle; the facade's synchronous `index_*` /
+    /// `delete_*` methods remain for tests.
+    pub(crate) fn spawn_writer_actor(&self) -> IndexWriterActor {
+        IndexWriterActor::spawn(
+            self.index.clone(),
+            self.fields,
+            self.config.clone(),
+            self.reader.clone(),
+            self.stats_cache.clone(),
+        )
     }
 
     /// Get a clone of the Index handle for the background thread.
@@ -287,66 +305,6 @@ impl TranscriptIndex {
     /// (and therefore disabled) in hermetic test indexes.
     pub fn set_harness_sessions_dir(&mut self, dir: PathBuf) {
         self.config.harness_sessions_dir = Some(dir);
-    }
-
-    pub(crate) fn index_knowledge_entry(
-        &mut self,
-        entry: &crate::knowledge::KnowledgeEntry,
-    ) -> Result<()> {
-        knowledge_docs::upsert_knowledge_entry(
-            &self.index,
-            self.fields,
-            &self.config.knowledge_path,
-            entry,
-        )?;
-        self.reader.reload()?;
-        *self.stats_cache.lock() = None;
-        Ok(())
-    }
-
-    pub(crate) fn delete_knowledge_entry(&mut self, entry_id: &str) -> Result<()> {
-        knowledge_docs::delete_knowledge_entry(&self.index, self.fields, entry_id)?;
-        self.reader.reload()?;
-        *self.stats_cache.lock() = None;
-        Ok(())
-    }
-
-    pub(crate) fn index_roadmap_item(&mut self, item: &crate::roadmap::RoadmapItem) -> Result<()> {
-        roadmap_docs::upsert_roadmap_item(
-            &self.index,
-            self.fields,
-            &self.config.roadmap_path,
-            item,
-        )?;
-        self.reader.reload()?;
-        *self.stats_cache.lock() = None;
-        Ok(())
-    }
-
-    pub(crate) fn delete_roadmap_item(&mut self, item_id: &str) -> Result<()> {
-        roadmap_docs::delete_roadmap_item(&self.index, self.fields, item_id)?;
-        self.reader.reload()?;
-        *self.stats_cache.lock() = None;
-        Ok(())
-    }
-
-    pub(crate) fn index_threads_store(&mut self, threads: &crate::threads::Threads) -> Result<()> {
-        thread_docs::upsert_threads_store(
-            &self.index,
-            self.fields,
-            &self.config.threads_path,
-            threads,
-        )?;
-        self.reader.reload()?;
-        *self.stats_cache.lock() = None;
-        Ok(())
-    }
-
-    pub(crate) fn index_thread(&mut self, thread: &crate::threads::Thread) -> Result<()> {
-        thread_docs::upsert_thread(&self.index, self.fields, &self.config.threads_path, thread)?;
-        self.reader.reload()?;
-        *self.stats_cache.lock() = None;
-        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1020,7 +978,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("index");
         let knowledge_path = dir.path().join("knowledge.json");
-        let mut index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create(
             &index_path,
             Vec::new(),
             None,
@@ -1058,7 +1016,9 @@ mod tests {
             last_recalled: None,
         };
 
-        index.index_knowledge_entry(&entry).unwrap();
+        let actor = index.spawn_writer_actor();
+        actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(entry)));
+        actor.flush_blocking().unwrap();
         let hits = index
             .search(&SearchParams {
                 query: "tombstone searchable".into(),
@@ -1074,7 +1034,8 @@ mod tests {
         assert!(hits.contains("tombstone"), "{hits}");
         assert!(hits.contains("searchable"), "{hits}");
 
-        index.delete_knowledge_entry("abc12345").unwrap();
+        actor.enqueue(IndexWriteOp::DeleteKnowledge("abc12345".to_string()));
+        actor.flush_blocking().unwrap();
         let hits = index
             .search(&SearchParams {
                 query: "tombstone searchable".into(),
@@ -1104,13 +1065,15 @@ mod roadmap_docs;
 mod search;
 mod thread_docs;
 mod tool_edges;
+mod writer_actor;
 
 pub use helpers::find_session_file;
 pub(crate) use knowledge_docs::{
     indexable_knowledge_entry, knowledge_chunk_hash, knowledge_entity_id,
 };
 pub(crate) use reindex::backfill_tool_edges_for_project;
-pub use reindex::spawn_reindex_thread;
+pub(crate) use reindex::spawn_reindex_thread;
+pub(crate) use writer_actor::{IndexWriteOp, IndexWriterActor};
 pub(crate) use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
 pub use search::{
     CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ReindexParams, SearchParams,

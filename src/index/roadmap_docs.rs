@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tantivy::schema::Term;
-use tantivy::{Index, IndexWriter, TantivyDocument};
+use tantivy::{IndexWriter, TantivyDocument};
 
 use super::{FieldHandles, FileMeta};
 use crate::entity_ref::{EntityRef, PARSER_VERSION};
@@ -74,33 +74,31 @@ pub(crate) fn reindex_roadmap_store_standalone(
     Ok(docs)
 }
 
-pub(crate) fn upsert_roadmap_item(
-    index: &Index,
+/// Apply a roadmap upsert to an already-held writer (no commit).
+pub(crate) fn apply_roadmap_upsert(
+    writer: &mut IndexWriter,
     fields: FieldHandles,
     roadmap_path: &Path,
     item: &RoadmapItem,
 ) -> Result<()> {
-    let mut writer: IndexWriter = index.writer(50_000_000)?;
     let entity_id = roadmap_entity_id(&item.id);
     writer.delete_term(Term::from_field_text(fields.entity_id, &entity_id));
     if indexable_roadmap_item(item) {
         writer.add_document(build_roadmap_doc(item, roadmap_path, fields))?;
     }
-    writer.commit()?;
     Ok(())
 }
 
-pub(crate) fn delete_roadmap_item(
-    index: &Index,
+/// Apply a roadmap delete to an already-held writer (no commit).
+pub(crate) fn apply_roadmap_delete(
+    writer: &mut IndexWriter,
     fields: FieldHandles,
     item_id: &str,
 ) -> Result<()> {
-    let mut writer: IndexWriter = index.writer(50_000_000)?;
     writer.delete_term(Term::from_field_text(
         fields.entity_id,
         &roadmap_entity_id(item_id),
     ));
-    writer.commit()?;
     Ok(())
 }
 

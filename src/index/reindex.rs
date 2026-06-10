@@ -14,6 +14,7 @@ use walkdir::WalkDir;
 use super::knowledge_docs;
 use super::project_files;
 use super::tool_edges::ToolEdgeContext;
+use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::orchestration::providers::Provider;
 use crate::projects::ProjectRecord;
@@ -219,22 +220,24 @@ impl Drop for DirtyRestore<'_> {
     }
 }
 
-/// Background reindex: speculative scan → try-lock → reload meta → index → commit.
-/// Returns Ok(()) even when skipped (lock busy, no changes). Errors only on real failures.
+/// Gate + dispatch for one scheduled reindex tick. The cheap speculative
+/// scan runs here on the scheduler thread; the pass itself executes inside
+/// the IndexWriterActor (the daemon's only in-process tantivy writer), so
+/// the in-process LockBusy/silent-skip class is gone — small ops queued
+/// during a pass drain into the pass's own commit.
 ///
 /// `reindex_dirty` lets out-of-band sources (the `.bbox/knowledge` watcher,
 /// daemon startup) force one pass even when `needs_reindex` sees no tracked
 /// source-file change — repo-owned `.bbox/knowledge` files are deliberately not
 /// in the meta-tracked source set, so they can only be picked up this way.
-fn try_background_reindex(
-    index: &Index,
+fn scheduled_reindex_tick(
+    actor: &IndexWriterActor,
     config: &ReindexConfig,
-    fields: FieldHandles,
     full: bool,
     reindex_dirty: &AtomicBool,
 ) -> Result<()> {
-    // 1. Speculative scan — cheap, no writer allocation. `dirty` forces a pass
-    //    (and is consumed here); a failed/lock-busy pass restores it via the guard.
+    // Speculative scan — cheap, no writer allocation. `dirty` forces a pass
+    // (and is consumed here); a failed pass restores it via the guard.
     let dirty = reindex_dirty.swap(false, Ordering::Relaxed);
     if !full && !needs_reindex(config) && !dirty {
         tracing::debug!("auto-reindex: no changes detected");
@@ -244,25 +247,27 @@ fn try_background_reindex(
         flag: reindex_dirty,
         armed: dirty,
     };
+    actor.run_reindex_pass(full, dirty)?;
+    // Committed (or a genuine no-op) — the trigger is satisfied; don't replay it.
+    dirty_guard.disarm();
+    Ok(())
+}
 
-    // 2. Acquire writer — returns LockBusy immediately if another process holds it
-    let mut writer: IndexWriter = match index.writer(100_000_000) {
-        Ok(w) => w,
-        Err(tantivy::TantivyError::LockFailure(_, _)) => {
-            tracing::debug!("auto-reindex: writer lock busy, skipping");
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
-    if !full {
-        // Keep incremental ingest from eagerly merging large segments while
-        // still bounding long-running segment fanout. The default policy was
-        // too aggressive for the backfill workload; NoMergePolicy was too lax
-        // for a daemon that runs for days.
-        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
-    }
-
-    // 3. Reload meta AFTER acquiring lock (another process may have committed)
+/// Execute one reindex pass with a writer owned by the caller (the
+/// IndexWriterActor). `drain` is invoked at phase boundaries so small ops
+/// queued behind the pass land in the same commit instead of waiting for
+/// the next cycle. Returns the human-readable summary line.
+pub(super) fn execute_reindex_pass(
+    index: &Index,
+    config: &ReindexConfig,
+    fields: FieldHandles,
+    full: bool,
+    dirty: bool,
+    writer: &mut IndexWriter,
+    drain: &mut dyn FnMut(&mut IndexWriter),
+) -> Result<String> {
+    // Reload meta at pass start (a prior pass may have committed since the
+    // scheduler's speculative scan).
     let mut meta = if full {
         tracing::info!("auto-reindex: periodic full rebuild requested");
         writer.delete_all_documents()?;
@@ -285,7 +290,7 @@ fn try_background_reindex(
     index_transcripts_via_adapters(
         config,
         fields,
-        &mut writer,
+        writer,
         &mut meta,
         &mut indexed_files,
         &mut indexed_docs,
@@ -302,11 +307,13 @@ fn try_background_reindex(
         "auto-reindex: transcript phase complete"
     );
 
+    drain(writer);
+
     let project_phase = Instant::now();
     let project_stats = project_files::index_registered_projects_standalone(
         config,
         fields,
-        &mut writer,
+        &mut *writer,
         &mut meta,
         full,
     )?;
@@ -333,12 +340,14 @@ fn try_background_reindex(
         );
     }
 
+    drain(writer);
+
     let stores_phase = Instant::now();
     let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
         &config.knowledge_path,
         &config.projects_path,
         fields,
-        &mut writer,
+        &mut *writer,
         &mut meta,
     )?;
     if knowledge_docs > 0 {
@@ -348,7 +357,7 @@ fn try_background_reindex(
     let thread_docs = super::thread_docs::reindex_threads_store_standalone(
         &config.threads_path,
         fields,
-        &mut writer,
+        &mut *writer,
         &mut meta,
     )?;
     if thread_docs > 0 {
@@ -359,13 +368,13 @@ fn try_background_reindex(
         &config.projects_path,
         &config.threads_path,
         fields,
-        &mut writer,
+        &mut *writer,
     )?;
     indexed_docs += record_docs;
     let roadmap_docs = super::roadmap_docs::reindex_roadmap_store_standalone(
         &config.roadmap_path,
         fields,
-        &mut writer,
+        &mut *writer,
         &mut meta,
     )?;
     if roadmap_docs > 0 {
@@ -406,22 +415,28 @@ fn try_background_reindex(
         "auto-reindex: purge phase complete"
     );
 
+    drain(writer);
+
     // A dirty-triggered pass must still commit even when no *tracked* source
     // file changed: the knowledge reindex above may have deleted/re-added repo
     // entries (e.g. a deleted `.bbox/knowledge` file) whose delete_term must
-    // land. Only short-circuit when nothing triggered us.
+    // land. Only short-circuit when nothing triggered us. (Drained small ops
+    // still need a commit, but the actor commits its own batches; an op that
+    // landed in this no-op pass commits with the actor's next cycle or the
+    // pass's caller — never lost, reconciled by the next triggered pass.)
     if !full && indexed_files == 0 && purged == 0 && !dirty {
-        tracing::debug!("auto-reindex: no changes after post-lock re-check");
-        dirty_guard.disarm();
-        return Ok(());
+        let summary = "auto-reindex: no changes after re-check".to_string();
+        tracing::debug!("{}", summary);
+        // Commit anyway when ops were drained into this writer mid-pass;
+        // detecting that precisely isn't worth the bookkeeping — an empty
+        // commit is cheap and keeps drained ops from straddling passes.
+        writer.commit()?;
+        return Ok(summary);
     }
 
-    // 5. Commit + atomic meta save (while still holding writer lock)
+    // 5. Commit + atomic meta save
     let commit_phase = Instant::now();
     writer.commit()?;
-    if full {
-        writer.wait_merging_threads()?;
-    }
     save_meta(&config.meta_path, &meta)?;
     tracing::info!(
         full,
@@ -429,19 +444,12 @@ fn try_background_reindex(
         "auto-reindex: commit phase complete"
     );
 
-    // Committed successfully — the trigger is satisfied; don't replay it.
-    dirty_guard.disarm();
-
     let segments = segment_count(index);
-    tracing::info!(
-        "auto-reindex: indexed {} files ({} docs), skipped {} unchanged, purged {} deleted, segments {}",
-        indexed_files,
-        indexed_docs,
-        skipped,
-        purged,
-        segments
+    let summary = format!(
+        "auto-reindex: indexed {indexed_files} files ({indexed_docs} docs), skipped {skipped} unchanged, purged {purged} deleted, segments {segments}"
     );
-    Ok(())
+    tracing::info!("{}", summary);
+    Ok(summary)
 }
 
 /// Spawn the background reindex thread. Runs every `interval` seconds.
@@ -449,10 +457,9 @@ fn try_background_reindex(
 /// `reindex_dirty` is a shared out-of-band trigger: the `.bbox/knowledge`
 /// watcher (and daemon startup) set it so repo-owned knowledge changes that
 /// `needs_reindex` cannot see still drive one incremental pass.
-pub fn spawn_reindex_thread(
-    index: Index,
+pub(crate) fn spawn_reindex_thread(
+    actor: super::writer_actor::IndexWriterActor,
     config: ReindexConfig,
-    fields: FieldHandles,
     interval: Duration,
     reindex_dirty: Arc<AtomicBool>,
 ) {
@@ -486,9 +493,7 @@ pub fn spawn_reindex_thread(
                 tick = tick.wrapping_add(1);
                 let full =
                     full_reindex_every_ticks != 0 && tick.is_multiple_of(full_reindex_every_ticks);
-                if let Err(e) =
-                    try_background_reindex(&index, &config, fields, full, &reindex_dirty)
-                {
+                if let Err(e) = scheduled_reindex_tick(&actor, &config, full, &reindex_dirty) {
                     tracing::error!("background reindex failed: {:#}", e);
                 }
                 std::thread::sleep(interval);

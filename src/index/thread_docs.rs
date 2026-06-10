@@ -5,7 +5,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use tantivy::{Index, IndexWriter, TantivyDocument, Term};
+use tantivy::{IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta};
 use crate::entity_ref::EntityRef;
@@ -243,35 +243,34 @@ pub(crate) fn reindex_threads_store_standalone(
     Ok(threads.all().len() as u64)
 }
 
-pub(crate) fn upsert_threads_store(
-    index: &Index,
+/// Apply a full thread-store replacement to an already-held writer (no
+/// commit). `threads` is a point-in-time snapshot of every thread.
+pub(crate) fn apply_threads_store_upsert(
+    writer: &mut IndexWriter,
     f: FieldHandles,
     threads_path: &Path,
-    threads: &Threads,
+    threads: &[Thread],
 ) -> Result<()> {
     let path_str = threads_path.to_string_lossy().to_string();
-    let mut writer = index.writer(50_000_000)?;
     writer.delete_term(Term::from_field_text(f.file_path, &path_str));
-    for thread in threads.all() {
+    for thread in threads {
         writer.add_document(build_thread_doc(thread, threads_path, f))?;
     }
-    writer.commit()?;
     Ok(())
 }
 
-pub(crate) fn upsert_thread(
-    index: &Index,
+/// Apply a single-thread upsert to an already-held writer (no commit).
+pub(crate) fn apply_thread_upsert(
+    writer: &mut IndexWriter,
     f: FieldHandles,
     threads_path: &Path,
     thread: &Thread,
 ) -> Result<()> {
-    let mut writer = index.writer(50_000_000)?;
     writer.delete_term(Term::from_field_text(
         f.entity_id,
         &thread_entity_id(&thread.id),
     ));
     writer.add_document(build_thread_doc(thread, threads_path, f))?;
-    writer.commit()?;
     Ok(())
 }
 

@@ -36,6 +36,10 @@ const ROSTER_BROADCAST_BUFFER: usize = 1024;
 
 pub(crate) struct SharedState {
     pub(crate) idx: RwLock<TranscriptIndex>,
+    /// Handle to the daemon's single tantivy writer actor. All production
+    /// index mutations and reindex passes flow through it; nothing else in
+    /// the process opens an `IndexWriter` (concurrency-model §4.3).
+    pub(crate) index_writer: crate::index::IndexWriterActor,
     pub(crate) kb: Arc<RwLock<Knowledge>>,
     pub(crate) kb_persister: StorePersister<Knowledge>,
     /// First-class substrate gap-note store. Project-scoped gaps are repo-owned
@@ -353,6 +357,7 @@ impl SharedState {
             store_dir.join("roadmap.json"),
         )
         .unwrap();
+        let index_writer = idx.spawn_writer_actor();
         // Load committed `.bbox/knowledge/` for every registered project into
         // the knowledge query surface at startup (project durable knowledge is
         // repo-owned; the central store holds only global entries).
@@ -397,6 +402,7 @@ impl SharedState {
 
         SharedState {
             idx: RwLock::new(idx),
+            index_writer,
             kb: kb_store,
             kb_persister,
             gaps: RwLock::new(gaps),

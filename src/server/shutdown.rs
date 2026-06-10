@@ -123,6 +123,9 @@ fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
     if let Err(err) = shared.notes_persister.flush_blocking() {
         tracing::warn!(error = %err, "notes persister flush on shutdown failed");
     }
+    if let Err(err) = shared.index_writer.flush_blocking() {
+        tracing::warn!(error = %err, "index writer flush at shutdown failed");
+    }
     flush_vectors_with_timeout();
 }
 

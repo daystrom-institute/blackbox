@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tantivy::schema::Term;
-use tantivy::{Index, IndexWriter, TantivyDocument};
+use tantivy::{IndexWriter, TantivyDocument};
 
 use super::{FieldHandles, FileMeta};
 use crate::entity_ref::{EntityRef, PARSER_VERSION};
@@ -103,41 +103,32 @@ pub(crate) fn reindex_knowledge_store_standalone(
     Ok(docs)
 }
 
-pub(crate) fn upsert_knowledge_entry(
-    index: &Index,
+/// Apply a knowledge upsert to an already-held writer (no commit). The
+/// IndexWriterActor is the production caller; it batches ops and commits once.
+pub(crate) fn apply_knowledge_upsert(
+    writer: &mut IndexWriter,
     fields: FieldHandles,
     knowledge_path: &Path,
     entry: &KnowledgeEntry,
 ) -> Result<()> {
-    // NOTE: opens a fresh writer per call. Acceptable at low knowledge-write volume
-    // (typical: <10 writes/min from operator + agent activity). If burst writes start
-    // appearing in logs, share a long-lived writer in SharedState with debounced
-    // commits, or hand off to the existing reindex thread via a channel.
-    let mut writer: IndexWriter = index.writer(50_000_000)?;
     let entity_id = knowledge_entity_id(&entry.id);
     writer.delete_term(Term::from_field_text(fields.entity_id, &entity_id));
     if indexable_knowledge_entry(entry) {
         writer.add_document(build_knowledge_doc(entry, knowledge_path, fields))?;
     }
-    writer.commit()?;
     Ok(())
 }
 
-pub(crate) fn delete_knowledge_entry(
-    index: &Index,
+/// Apply a knowledge delete to an already-held writer (no commit).
+pub(crate) fn apply_knowledge_delete(
+    writer: &mut IndexWriter,
     fields: FieldHandles,
     entry_id: &str,
 ) -> Result<()> {
-    // NOTE: opens a fresh writer per call. Acceptable at low knowledge-write volume
-    // (typical: <10 writes/min from operator + agent activity). If burst writes start
-    // appearing in logs, share a long-lived writer in SharedState with debounced
-    // commits, or hand off to the existing reindex thread via a channel.
-    let mut writer: IndexWriter = index.writer(50_000_000)?;
     writer.delete_term(Term::from_field_text(
         fields.entity_id,
         &knowledge_entity_id(entry_id),
     ));
-    writer.commit()?;
     Ok(())
 }
 

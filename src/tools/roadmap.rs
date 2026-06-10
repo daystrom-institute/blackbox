@@ -249,10 +249,12 @@ impl BlackboxServer {
         // Sync to index + embed
         let entity_id = roadmap_entity_id(&item.id);
         let chunk_hash = roadmap_chunk_hash(&item);
-        if let Err(err) = self.state.idx.write().index_roadmap_item(&item) {
-            tracing::warn!(error = %err, item = %item.id, "roadmap index sync failed");
-        }
         embed_queue::enqueue_roadmap(&item, &entity_id, &chunk_hash);
+        self.state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::UpsertRoadmap(Box::new(
+                item.clone(),
+            )));
 
         Ok(serde_json::json!({
             "id": item.id,
@@ -443,10 +445,12 @@ impl BlackboxServer {
         // Sync to index
         let entity_id = roadmap_entity_id(&item.id);
         let chunk_hash = roadmap_chunk_hash(&item);
-        if let Err(err) = self.state.idx.write().index_roadmap_item(&item) {
-            tracing::warn!(error = %err, item = %item.id, "roadmap index sync failed");
-        }
         embed_queue::enqueue_roadmap(&item, &entity_id, &chunk_hash);
+        self.state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::UpsertRoadmap(Box::new(
+                item.clone(),
+            )));
 
         Ok(serde_json::json!({
             "id": item.id,
@@ -468,10 +472,10 @@ impl BlackboxServer {
         self.state.persist_roadmap_durable().await?;
 
         // Tombstone in index
-        if let Err(err) = self.state.idx.write().delete_roadmap_item(&p.id) {
-            tracing::warn!(error = %err, item = %p.id, "roadmap index delete failed");
-        }
         embed_queue::tombstone_roadmap(&entity_id);
+        self.state
+            .index_writer
+            .enqueue(crate::index::IndexWriteOp::DeleteRoadmap(p.id.clone()));
 
         Ok(serde_json::json!({
             "deleted": p.id,

@@ -61,13 +61,11 @@ impl BlackboxServer {
         }
 
         if let Some(thread) = mutation.changed_thread.as_ref() {
-            if let Err(err) = self.state.idx.write().index_thread(thread) {
-                tracing::warn!(
-                    thread_id = %thread.id,
-                    error = %err,
-                    "thread index sync failed after bbox_thread mutation"
-                );
-            }
+            self.state
+                .index_writer
+                .enqueue(crate::index::IndexWriteOp::UpsertThread(Box::new(
+                    thread.clone(),
+                )));
         }
         if mutation.changed_edges {
             self.rebuild_edge_index_from_stores();

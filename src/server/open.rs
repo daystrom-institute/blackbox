@@ -74,6 +74,10 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // provider transcript. Same dir the BRO_HOME export below points the
     // in-process harness at.
     idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
+    // The daemon's single tantivy writer: every index mutation and reindex
+    // pass flows through this actor (concurrency-model §4.3). Spawned AFTER
+    // all ReindexConfig mutation — the actor clones the config at spawn.
+    let index_writer = idx.spawn_writer_actor();
     let (projects_store, projects_needs_persist) =
         ProjectRegistry::open_with_backfill_status(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());
@@ -127,9 +131,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
 
     let th = Threads::open(&th_path)?;
     tracing::info!("Thread store: {}", th_path.display());
-    if let Err(err) = idx.index_threads_store(&th) {
-        tracing::warn!(error = %err, "thread index sync failed; will retry on next reindex cycle");
-    }
+    // Queued on the writer actor: boot no longer races the reindex thread
+    // (or a winding-down previous daemon) for tantivy's single-writer lock.
+    index_writer.enqueue(index::IndexWriteOp::UpsertThreadsStore(th.all().to_vec()));
     let threads_store = Arc::new(RwLock::new(th));
     let threads_persister =
         StorePersister::spawn("threads", threads_store.clone(), th_path.clone());
@@ -195,7 +199,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // and `needs_reindex` does not track them). The `.bbox/knowledge` watcher
     // sets it on live changes; the same `Arc` is stored in `SharedState`.
     let reindex_dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    spawn_reindex_thread(&cfg, &idx, reindex_dirty.clone());
+    spawn_reindex_thread(&cfg, &idx, index_writer.clone(), reindex_dirty.clone());
 
     let bind_host = cfg.daemon.bind.clone();
     let bind_is_loopback = is_loopback_bind(&bind_host);
@@ -213,6 +217,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
 
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
+        index_writer,
         kb: kb_store,
         kb_persister,
         gaps: RwLock::new(gaps_store),
@@ -367,13 +372,13 @@ fn backfill_artifact_hashes(artifacts_store: &artifacts::ArtifactCatalog) {
 fn spawn_reindex_thread(
     cfg: &config::Config,
     idx: &TranscriptIndex,
+    index_writer: index::IndexWriterActor,
     reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let reindex_interval = cfg.index.reindex_interval_secs;
     index::spawn_reindex_thread(
-        idx.index_handle(),
+        index_writer,
         idx.reindex_config(),
-        idx.field_handles(),
         std::time::Duration::from_secs(reindex_interval),
         reindex_dirty,
     );

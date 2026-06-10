@@ -36,6 +36,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         tmp.path().join("roadmap.json"),
     )
     .unwrap();
+    let index_writer = index.spawn_writer_actor();
     let kb_path = tmp.path().join("knowledge.json");
     let kb = Arc::new(RwLock::new(Knowledge::open(&kb_path).unwrap()));
     let kb_persister = StorePersister::spawn("knowledge-test", kb.clone(), kb_path);
@@ -65,6 +66,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let (roster_tx, _) = broadcast::channel::<bro_protocol::RosterDelta>(16);
     let state = Arc::new(SharedState {
         idx: RwLock::new(index),
+        index_writer,
         kb,
         kb_persister,
         gaps: RwLock::new(gaps),
