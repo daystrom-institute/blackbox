@@ -1844,6 +1844,14 @@ impl AmbientContext {
         }
         parts
     }
+
+    pub fn tool_arg_defaults(&self) -> Option<BTreeMap<String, String>> {
+        let session_id = self.session_field()?;
+        Some(BTreeMap::from([(
+            "default:mcp.bbox_note.session_id".to_string(),
+            session_id.to_string(),
+        )]))
+    }
 }
 
 /// Wrap a prompt with the per-turn ambient prefix (scope block +
@@ -2367,6 +2375,7 @@ pub fn spawn_task(
         bro_label,
         agent_label,
         None,
+        None,
         system_events,
         origin,
     )
@@ -2387,6 +2396,7 @@ pub fn spawn_task_with_tool_placement(
     bro_label: Option<String>,
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, String>>,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2437,6 +2447,7 @@ pub fn spawn_task_with_tool_placement(
             bro_label,
             agent_label,
             tool_placement,
+            tool_defaults,
             system_events,
             origin,
         );
@@ -2493,6 +2504,7 @@ fn spawn_harness_in_process_task(
     bro_label: Option<String>,
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, String>>,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2554,7 +2566,16 @@ fn spawn_harness_in_process_task(
         let mut args = args;
         let result = async {
             let mcp_config = build_in_process_mcp_config(&mut args, tool_placement)?;
-            run_harness_in_process(args, cwd, env_overrides, callback, control_rx, mcp_config).await
+            run_harness_in_process(
+                args,
+                cwd,
+                env_overrides,
+                callback,
+                control_rx,
+                mcp_config,
+                tool_defaults,
+            )
+            .await
         }
         .await;
         let (mut status, stderr) = match result {
@@ -2698,6 +2719,7 @@ async fn run_harness_in_process(
     callback: bro_harness::emit::EventCallback,
     input_rx: bro_harness::agent_loop::SessionInputReceiver,
     mcp_config: Option<bro_harness::mcp::McpConfig>,
+    tool_defaults: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<()> {
     use clap::Parser;
 
@@ -2728,7 +2750,11 @@ async fn run_harness_in_process(
         bro_harness::transport::with_session_env(
             session_env,
             bro_harness::agent_loop::run_with_event_callback_and_input_mcp(
-                cli, input_rx, callback, mcp_config,
+                cli,
+                input_rx,
+                callback,
+                mcp_config,
+                tool_defaults,
             ),
         ),
     )
@@ -5491,6 +5517,29 @@ mod tests {
         assert!(out.contains("bro: executor"));
         assert!(out.contains("do stuff"));
         assert!(!out.contains("STRUCTURED SIDE CHANNEL"));
+    }
+
+    #[test]
+    fn ambient_tool_defaults_emit_only_session_id_for_bbox_note() {
+        let ctx = AmbientContext {
+            session_id: Some("sess-abc".into()),
+            task_id: Some("task-abc".into()),
+            project_dir: Some("/repo/x".into()),
+            bro_name: Some("executor".into()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("session default");
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(
+            defaults.get("default:mcp.bbox_note.session_id").map(String::as_str),
+            Some("sess-abc")
+        );
+
+        let pending = AmbientContext {
+            session_id: Some("pending".into()),
+            ..Default::default()
+        };
+        assert!(pending.tool_arg_defaults().is_none());
     }
 
     #[test]

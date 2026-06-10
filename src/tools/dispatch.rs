@@ -412,6 +412,7 @@ impl BlackboxServer {
             request.spawn_bro_label,
             request.spawn_agent_label,
             request.tool_placement,
+            ambient_ctx.tool_arg_defaults(),
             Some(self.state.system_events.clone()),
             request.origin,
         );
@@ -736,7 +737,7 @@ impl BlackboxServer {
         };
         args.extend(dispatch_filters.args);
 
-        let task = orch::spawn_task(
+        let task = orch::spawn_task_with_tool_placement(
             task_id,
             provider,
             args,
@@ -749,6 +750,8 @@ impl BlackboxServer {
             Some(self.state.roster_events()),
             None,
             None,
+            None,
+            ambient_ctx.tool_arg_defaults(),
             Some(self.state.system_events.clone()),
             // bro_resume is the user-facing MCP tool for resuming
             // an existing session — same source class as bro_exec.
