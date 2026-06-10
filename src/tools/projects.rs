@@ -367,7 +367,18 @@ impl BlackboxServer {
                 // Re-point kb roots at the new path now that migration has
                 // rewritten entries into the renamed repo's `.bbox/`, and
                 // re-enqueue embeds under the new path.
-                crate::server::routes::sync_kb_project_roots(&server.state);
+                // Use update_project_roots (no reload) because in-memory
+                // mutations from migrate_rename are still live; reload would
+                // clobber them.
+                let roots: Vec<std::path::PathBuf> = server
+                    .state
+                    .projects
+                    .read()
+                    .list()
+                    .into_iter()
+                    .map(|r| std::path::PathBuf::from(r.canonical_path))
+                    .collect();
+                server.state.kb.write().update_project_roots(roots);
                 crate::server::routes::enqueue_project_knowledge_embeds(
                     &server.state,
                     &new_project,

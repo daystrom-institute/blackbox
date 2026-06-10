@@ -964,9 +964,18 @@ impl Knowledge {
 
     /// Register the repos whose committed `.bbox/knowledge/` should load into
     /// the query surface, then reload so their entries are immediately visible.
+    /// Use `update_project_roots` instead when in-memory mutations are in flight
+    /// (e.g. during a rename migration) to avoid clobbering them with a reload.
     pub fn set_project_roots(&mut self, roots: Vec<PathBuf>) -> Result<()> {
         self.project_roots = roots;
         self.reload()
+    }
+
+    /// Update the project roots list without reloading. Safe when the caller
+    /// has already adjusted in-memory entries to match the new roots (e.g. a
+    /// rename migration that just called `rename_project_refs`).
+    pub fn update_project_roots(&mut self, roots: Vec<PathBuf>) {
+        self.project_roots = roots;
     }
 
     fn central_snapshot(&self) -> KnowledgeStore {
@@ -1113,38 +1122,30 @@ impl Knowledge {
     /// `project_is_repo_owned` gate), then `save` routes the project's entries
     /// there and drops them from central. Idempotent. Returns the count moved.
     pub fn eject_project_to_repo(&mut self, project_dir: &str) -> Result<usize> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let count = self.count_project_entries(project_dir);
-            // Create .bbox/knowledge/ up front so the project is repo-owned and
-            // `save` routes its entries there (even when there are zero to move,
-            // this marks the project repo-owned for future writes).
-            fs::create_dir_all(repo_kb_dir(Path::new(project_dir)))
-                .with_context(|| format!("creating .bbox/knowledge under {project_dir}"))?;
-            self.persist_repo_owned_entries()?;
-            Ok(count)
-        })
+        let count = self.count_project_entries(project_dir);
+        // Create .bbox/knowledge/ up front so the project is repo-owned and
+        // `save` routes its entries there (even when there are zero to move,
+        // this marks the project repo-owned for future writes).
+        fs::create_dir_all(repo_kb_dir(Path::new(project_dir)))
+            .with_context(|| format!("creating .bbox/knowledge under {project_dir}"))?;
+        self.persist_repo_owned_entries()?;
+        Ok(count)
     }
 
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let mut updated = 0usize;
-            let now = Self::now_iso();
-            for entry in &mut self.store.entries {
-                if entry.project.as_deref() == Some(old_project) {
-                    entry.project = Some(new_project.to_string());
-                    entry.updated_at = now.clone();
-                    updated += 1;
-                }
+        let mut updated = 0usize;
+        let now = Self::now_iso();
+        for entry in &mut self.store.entries {
+            if entry.project.as_deref() == Some(old_project) {
+                entry.project = Some(new_project.to_string());
+                entry.updated_at = now.clone();
+                updated += 1;
             }
-            if updated > 0 {
-                self.persist_repo_owned_entries()?;
-            }
-            Ok(updated)
-        })
+        }
+        if updated > 0 {
+            self.persist_repo_owned_entries()?;
+        }
+        Ok(updated)
     }
 
     pub fn entry(&self, id: &str) -> Option<&KnowledgeEntry> {
@@ -1152,47 +1153,43 @@ impl Knowledge {
     }
 
     pub fn append_link(&mut self, p: &KnowledgeLinkParams) -> Result<KnowledgeEdge> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let source_id = match EntityRef::parse(&p.source) {
-                Ok(EntityRef::Knowledge { id }) => id,
-                Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
-                Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
-            };
-            if source_id.trim().is_empty() {
-                anyhow::bail!("source knowledge id is required");
-            }
-            EntityRef::parse(&p.target)
-                .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
-            let kind = KnowledgeEdgeKind::parse(&p.kind)?;
-            let confidence = parse_edge_confidence(p.confidence.as_deref())?;
-            let edge = KnowledgeEdge {
-                target: p.target.clone(),
-                kind,
-                note: p.note.clone(),
-                source_arc: p.source_arc.clone(),
-                confidence,
-            };
-            let now = Self::now_iso();
-            let entry = self
-                .store
-                .entries
-                .iter_mut()
-                .find(|entry| entry.id == source_id)
-                .ok_or_else(|| anyhow::anyhow!("source knowledge entry not found: {source_id}"))?;
-            let duplicate = entry.links.iter().any(|existing| {
-                existing.target == edge.target
-                    && existing.kind == edge.kind
-                    && existing.source_arc == edge.source_arc
-            });
-            if !duplicate {
-                entry.links.push(edge.clone());
-                entry.updated_at = now;
-                self.persist_repo_owned_entries()?;
-            }
-            Ok(edge)
-        })
+        let source_id = match EntityRef::parse(&p.source) {
+            Ok(EntityRef::Knowledge { id }) => id,
+            Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
+            Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
+        };
+        if source_id.trim().is_empty() {
+            anyhow::bail!("source knowledge id is required");
+        }
+        EntityRef::parse(&p.target)
+            .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
+        let kind = KnowledgeEdgeKind::parse(&p.kind)?;
+        let confidence = parse_edge_confidence(p.confidence.as_deref())?;
+        let edge = KnowledgeEdge {
+            target: p.target.clone(),
+            kind,
+            note: p.note.clone(),
+            source_arc: p.source_arc.clone(),
+            confidence,
+        };
+        let now = Self::now_iso();
+        let entry = self
+            .store
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == source_id)
+            .ok_or_else(|| anyhow::anyhow!("source knowledge entry not found: {source_id}"))?;
+        let duplicate = entry.links.iter().any(|existing| {
+            existing.target == edge.target
+                && existing.kind == edge.kind
+                && existing.source_arc == edge.source_arc
+        });
+        if !duplicate {
+            entry.links.push(edge.clone());
+            entry.updated_at = now;
+            self.persist_repo_owned_entries()?;
+        }
+        Ok(edge)
     }
 
     /// Insert-or-replace a code-generated entry by its stable ID.
@@ -1200,16 +1197,12 @@ impl Knowledge {
     /// defaulting). Used by `tool_docs::sync_into_knowledge` to keep
     /// the auto-generated tool reference in sync with the binary.
     pub fn upsert_generated(&mut self, entry: KnowledgeEntry) -> Result<()> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
-                *existing = entry;
-            } else {
-                self.store.entries.push(entry);
-            }
-            self.persist_repo_owned_entries()
-        })
+        if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
+            *existing = entry;
+        } else {
+            self.store.entries.push(entry);
+        }
+        self.persist_repo_owned_entries()
     }
 
     /// Active entries that should be rendered into markdown (excludes indexed-only).
@@ -1220,11 +1213,7 @@ impl Knowledge {
     // ── CRUD ───────────────────────────────────────────────────────
 
     pub fn learn_result(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.learn_result_locked(p, from_agent)
-        })
+        self.learn_result_locked(p, from_agent)
     }
 
     /// Commit-this rider for a just-written entry, when it persisted into a
@@ -1454,11 +1443,7 @@ impl Knowledge {
         p: &RememberParams,
         from_agent: bool,
     ) -> Result<KnowledgeWriteResult> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.remember_result_locked(p, from_agent)
-        })
+        self.remember_result_locked(p, from_agent)
     }
 
     fn remember_result_locked(
@@ -1537,11 +1522,7 @@ impl Knowledge {
         p: &DecideParams,
         from_agent: bool,
     ) -> Result<KnowledgeWriteResult> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.decide_result_locked(p, from_agent)
-        })
+        self.decide_result_locked(p, from_agent)
     }
 
     fn decide_result_locked(
@@ -1637,25 +1618,21 @@ impl Knowledge {
     }
 
     pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            let id = &p.id;
+        let id = &p.id;
 
-            if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
-                if let Some(by) = p.superseded_by.as_deref() {
-                    entry.status = Status::Superseded;
-                    entry.supersedes = Some(by.to_string());
-                } else {
-                    entry.status = Status::Deleted;
-                }
-                entry.updated_at = Self::now_iso();
-                self.persist_repo_owned_entries()?;
-                Ok(format!("Removed entry {id}"))
+        if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
+            if let Some(by) = p.superseded_by.as_deref() {
+                entry.status = Status::Superseded;
+                entry.supersedes = Some(by.to_string());
             } else {
-                Ok(format!("Entry {id} not found"))
+                entry.status = Status::Deleted;
             }
-        })
+            entry.updated_at = Self::now_iso();
+            self.persist_repo_owned_entries()?;
+            Ok(format!("Removed entry {id}"))
+        } else {
+            Ok(format!("Entry {id} not found"))
+        }
     }
 
     pub fn list(&mut self, p: &KnowledgeListParams) -> Result<String> {
@@ -2158,11 +2135,7 @@ impl Knowledge {
     // ── Absorb ─────────────────────────────────────────────────────
 
     pub fn absorb(&mut self, p: &AbsorbParams) -> Result<String> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.absorb_locked(p)
-        })
+        self.absorb_locked(p)
     }
 
     fn absorb_locked(&mut self, p: &AbsorbParams) -> Result<String> {
@@ -2287,11 +2260,7 @@ impl Knowledge {
     // ── Review ─────────────────────────────────────────────────────
 
     pub fn review(&mut self, p: &ReviewParams) -> Result<String> {
-        let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
-            self.reload()?;
-            self.review_locked(p)
-        })
+        self.review_locked(p)
     }
 
     fn review_locked(&mut self, p: &ReviewParams) -> Result<String> {
