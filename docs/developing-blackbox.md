@@ -63,15 +63,28 @@ repo opts into sccache, a Java repo sets `GRADLE_USER_HOME`, most set nothing:
 {
   "project_dispatch": {
     "/Users/you/repos/transcript-search": {
-      "env": { "RUSTC_WRAPPER": "sccache" }
+      "env": { "RUSTC_WRAPPER": "sccache" },
+      "seed_dirs": ["target"]
     }
   }
 }
 ```
 
-Reserved `BRO_FLEET_*` vars are never overridden by `project_dispatch`. This is
-read best-effort at dispatch time (a malformed `fleet.json` never blocks a
-dispatch). The closeout side of the same per-project surface
+`env` is resolved **daemon-side at task spawn** for every dispatch path
+(`bro_exec`, agent dispatch, workflows, and the fleet cockpit), keyed by the
+task cwd with worktree→base-repo mapping, and delivered to harness shell
+children on the dedicated non-secret `shell_env` lane (never the transport
+session env). Reserved `BRO_FLEET_*` vars are never overridden.
+
+`seed_dirs` lists repo-relative directories to copy-on-write clone from the
+base repo into each freshly created worktree (fleet cockpit and workflow
+`WorktreeCreate`). Seeding a warm `target/` turns the dispatched agent's
+first build from a cold full-workspace compile into an incremental one
+(measured: a 56G target clones in ~13s on APFS; `cargo check` drops from
+10+ minutes to ~30s of first-party recompiles). Best-effort: missing dirs,
+already-present dirs, and non-CoW filesystems are skipped — there is
+deliberately no plain-copy fallback, and a malformed `fleet.json` never
+blocks a dispatch. The closeout side of the same per-project surface
 (`project_closeout` — fold target, branch prefixes, and `closeout_hooks`) is
 documented in [`design/fleet-tui/closeout-command.md`](../design/fleet-tui/closeout-command.md);
 it is strict-loaded so a typo fails the `/closeout` command loudly.

@@ -112,6 +112,84 @@ pub struct FleetConfig {
 pub struct ProjectDispatch {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Repo-relative directories to copy-on-write clone from the base
+    /// repository into freshly created worktrees (e.g. `["target"]` so a
+    /// dispatched bro's first cargo build is incremental instead of cold —
+    /// measured: a 56G `target/` clones in ~13s and turns a 10+ minute cold
+    /// `cargo check` into ~30s of first-party-only recompiles). Best-effort:
+    /// seeding never blocks a dispatch. Empty (the default) disables seeding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_dirs: Vec<String>,
+}
+
+/// Copy-on-write clone `dirs` (repo-relative) from `base_repo` into
+/// `worktree`. Best-effort by contract: every failure is reported in the
+/// returned outcome lines and skipped — a seeding problem must never block
+/// worktree creation or dispatch. There is deliberately NO plain-copy
+/// fallback: physically copying a multi-GB target dir would cost more than
+/// the cold build it is meant to avoid, so non-CoW filesystems just skip.
+pub fn seed_worktree_dirs(base_repo: &Path, worktree: &Path, dirs: &[String]) -> Vec<String> {
+    let mut outcomes = Vec::new();
+    for dir in dirs {
+        let rel = Path::new(dir);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            outcomes.push(format!("seed {dir}: refused (must be repo-relative)"));
+            continue;
+        }
+        let src = base_repo.join(rel);
+        let dst = worktree.join(rel);
+        if !src.is_dir() {
+            outcomes.push(format!("seed {dir}: skipped (missing in base repo)"));
+            continue;
+        }
+        if dst.exists() {
+            outcomes.push(format!("seed {dir}: skipped (already present)"));
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let status = clone_dir_cow(&src, &dst);
+        match status {
+            Ok(()) => outcomes.push(format!(
+                "seed {dir}: cloned in {:.1}s",
+                started.elapsed().as_secs_f32()
+            )),
+            Err(err) => {
+                // A partial clone is worse than none: cargo would trust a
+                // half-populated target. Remove any partial output.
+                let _ = std::fs::remove_dir_all(&dst);
+                outcomes.push(format!("seed {dir}: skipped ({err})"));
+            }
+        }
+    }
+    outcomes
+}
+
+/// `cp` with the platform's copy-on-write flag. macOS: `-c` (clonefile,
+/// APFS). Other unices: `--reflink=always` (btrfs/xfs); `always` not `auto`
+/// so a non-CoW filesystem fails fast instead of physically copying.
+fn clone_dir_cow(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("cp");
+    #[cfg(target_os = "macos")]
+    cmd.arg("-Rc");
+    #[cfg(not(target_os = "macos"))]
+    cmd.args(["-R", "--reflink=always"]);
+    let out = cmd
+        .arg(src)
+        .arg(dst)
+        .output()
+        .map_err(|e| format!("cp spawn failed: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cow clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
 }
 
 /// A closeout lifecycle event a hook can bind to (config-side mirror of the
@@ -2633,6 +2711,40 @@ mod tests {
         );
         // The boot/dispatch path stays best-effort (never blocks the cockpit).
         assert!(FleetConfig::load_from(&p).project_closeout.is_empty());
+    }
+
+    #[test]
+    fn seed_worktree_dirs_clones_skips_and_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(base.join("target").join("debug")).unwrap();
+        std::fs::write(base.join("target").join("debug").join("artifact"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("present")).unwrap();
+        std::fs::create_dir_all(wt.join("present")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let outcomes = seed_worktree_dirs(
+            &base,
+            &wt,
+            &[
+                "target".to_string(),
+                "missing".to_string(),
+                "present".to_string(),
+                "../escape".to_string(),
+                "/abs".to_string(),
+            ],
+        );
+
+        assert!(
+            wt.join("target").join("debug").join("artifact").is_file(),
+            "target must be cloned: {outcomes:?}"
+        );
+        assert!(outcomes[0].contains("cloned"), "{outcomes:?}");
+        assert!(outcomes[1].contains("missing in base"), "{outcomes:?}");
+        assert!(outcomes[2].contains("already present"), "{outcomes:?}");
+        assert!(outcomes[3].contains("refused"), "{outcomes:?}");
+        assert!(outcomes[4].contains("refused"), "{outcomes:?}");
     }
 
     #[test]

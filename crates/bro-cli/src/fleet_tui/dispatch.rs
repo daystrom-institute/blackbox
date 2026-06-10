@@ -403,6 +403,21 @@ pub(super) fn prepare_dispatch_worktree(
             ])
             .output();
     }
+    // Opt-in build-cache seeding (fleet.json project_dispatch.seed_dirs):
+    // CoW-clone warm dirs (e.g. target/) from the base repo so the bro's
+    // first build is incremental, not cold. Best-effort; outcomes logged.
+    let seed_dirs = FleetConfig::load()
+        .project_dispatch_for(&git_root)
+        .map(|d| d.seed_dirs.clone())
+        .unwrap_or_default();
+    if !seed_dirs.is_empty() {
+        for outcome in
+            bro_fleet_client::seed_worktree_dirs(&git_root, &worktree_path, &seed_dirs)
+        {
+            tracing::info!(worktree = %worktree_path.display(), "{outcome}");
+        }
+    }
+
     let worktree_status = git_capture(&worktree_path, &["status", "--short", "--branch"])
         .unwrap_or_else(|e| format!("git status unavailable: {e}"));
 

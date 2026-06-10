@@ -23,7 +23,7 @@ pub use fleet::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, CloseoutEvent, DEFAULT_CLASSIFIER_PROMPT,
     DispatchSpec, FleetConfig, FleetOrchestrator, FocusedTranscriptBuffer,
     FocusedTranscriptStreamEvent, HookOnFail, HookPolicy, INTERN_PREFIX, ProjectCloseout,
-    ProjectDispatch, Provider, ResumeSpec, TaskSnapshot, TaskStatus, TodoItem, TodoItemStatus,
+    ProjectDispatch, Provider, ResumeSpec, seed_worktree_dirs, TaskSnapshot, TaskStatus, TodoItem, TodoItemStatus,
     TodoState, TranscriptHistoryPageV1, TranscriptItem, intern_rider, parse_transcript,
     provider_supports_bidi,
 };

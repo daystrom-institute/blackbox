@@ -62,6 +62,27 @@ pub(super) async fn exec_worktree_create(args: &Value, ctx: &ArcContext) -> Resu
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    // Opt-in build-cache seeding (fleet.json project_dispatch.seed_dirs):
+    // CoW-clone warm dirs from the base repo so the arc's first build is
+    // incremental instead of cold. Best-effort and off the async runtime —
+    // the clone is pure blocking fs work.
+    let seed_dirs = bro_fleet_client::FleetConfig::load()
+        .project_dispatch_for(Path::new(&repo_root))
+        .map(|d| d.seed_dirs.clone())
+        .unwrap_or_default();
+    if !seed_dirs.is_empty() {
+        let base = std::path::PathBuf::from(&repo_root);
+        let wt = std::path::PathBuf::from(&path);
+        let outcomes = tokio::task::spawn_blocking(move || {
+            bro_fleet_client::seed_worktree_dirs(&base, &wt, &seed_dirs)
+        })
+        .await
+        .unwrap_or_else(|e| vec![format!("seed: join error: {e}")]);
+        for outcome in outcomes {
+            tracing::info!(worktree = %path, "{outcome}");
+        }
+    }
     Ok(OpEffect::SetWorktree(Some(path)))
 }
 
