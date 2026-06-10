@@ -60,8 +60,23 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(web::WebFetch),
         Arc::new(crate::todo::TodoWrite),
         Arc::new(crate::fleet_worktree::SandboxGrounding),
-        Arc::new(crate::fleet_worktree::EnterWorktree),
-        Arc::new(crate::fleet_worktree::ExitWorktree),
     ];
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worktree_lifecycle_tools_are_not_model_facing_builtins() {
+        let names = builtin_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(names.contains("sandbox_grounding"));
+        assert!(!names.contains("enter_worktree"));
+        assert!(!names.contains("exit_worktree"));
+    }
 }

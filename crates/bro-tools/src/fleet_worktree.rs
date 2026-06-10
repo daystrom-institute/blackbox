@@ -30,22 +30,11 @@ struct EnterWorktreeInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SandboxGroundingInput {
-    /// Whether to create a managed worktree as part of the grounding sequence.
-    /// Use true before tasks that may edit files. Use false for read-only
-    /// orientation.
+    /// Deprecated: model-facing worktree creation is disabled. Worktrees are
+    /// created mechanically by fleet dispatch or workflow ops before the
+    /// harness session runs.
     #[serde(default)]
     enter_worktree: Option<bool>,
-    /// Short human-readable reason for the isolated worktree. Used only when
-    /// enter_worktree=true.
-    #[serde(default)]
-    purpose: Option<String>,
-    /// Base ref for the optional worktree: current (default), main, or
-    /// parent_head.
-    #[serde(default)]
-    base: Option<String>,
-    /// Optional explicit branch prefix. Must still live under bro-fleet/.
-    #[serde(default)]
-    branch_prefix: Option<String>,
     /// Number of dirty git status entries to include in each manifest.
     /// Default 12.
     #[serde(default)]
@@ -61,7 +50,7 @@ impl Tool for SandboxGrounding {
     }
 
     fn description(&self) -> &str {
-        "Run the sandbox-boundary phase of the agentic grounding sequence. Returns launch sandbox_status, and when enter_worktree=true creates a managed worktree then returns sandbox_status(root=<worktree cwd>). Pair this with blackbox retrieval/evidence bundling when the task depends on prior decisions, design docs, threads, or code graph facts."
+        "Run the sandbox-boundary phase of the agentic grounding sequence. Returns launch sandbox_status for the current harness root. Worktree creation is host-owned: bro fleet dispatch and workflow ops create worktrees mechanically before the harness session runs."
     }
 
     fn input_schema(&self) -> Value {
@@ -70,7 +59,7 @@ impl Tool for SandboxGrounding {
 
     fn annotations(&self) -> ToolAnnotations {
         ToolAnnotations {
-            destructive: true,
+            read_only: true,
             ..Default::default()
         }
     }
@@ -85,49 +74,26 @@ impl Tool for SandboxGrounding {
 }
 
 fn sandbox_grounding(cx: &ToolCx, args: SandboxGroundingInput) -> anyhow::Result<Value> {
+    if args.enter_worktree.unwrap_or(false) {
+        anyhow::bail!(
+            "sandbox_grounding no longer creates worktrees from inside a harness session; use bro fleet dispatch or workflow WorktreeCreate so the harness starts with the correct cwd"
+        );
+    }
     let before =
         crate::workspace::sandbox_status_manifest(cx, None, args.status_limit).map_err(|err| {
             anyhow::anyhow!("launch sandbox_status failed before worktree entry: {err:#}")
         })?;
-    let mut out = json!({
+    let out = json!({
         "sequence": "sandbox_grounding_v1",
         "launch": before,
         "worktree": Value::Null,
         "worktree_status": Value::Null,
         "next_steps": [
-            "Use launch.inspected_root for read-only work unless a managed worktree was entered.",
+            "Use launch.inspected_root for this session's file, shell, and git tools.",
             "If the task depends on prior decisions, design docs, threads, or code graph facts, run the blackbox opening sequence and bundle evidence before making provenance-sensitive claims.",
-            "For edits, use worktree.cwd and prefer work_* tools or absolute paths under that cwd.",
+            "For edits, rely on the harness launch root. Fleet dispatch and workflow ops create isolated worktrees before launching editable sessions.",
         ],
     });
-    if args.enter_worktree.unwrap_or(false) {
-        let worktree = enter_worktree(
-            &cx.root,
-            EnterWorktreeInput {
-                purpose: args
-                    .purpose
-                    .unwrap_or_else(|| "sandbox grounding".to_string()),
-                base: args.base,
-                branch_prefix: args.branch_prefix,
-            },
-        )?;
-        let cwd = worktree
-            .get("cwd")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("enter_worktree did not return cwd"))?;
-        let after = crate::workspace::sandbox_status_manifest(cx, Some(cwd), args.status_limit)
-            .map_err(|err| {
-                anyhow::anyhow!("sandbox_status for entered worktree failed: {err:#}")
-            })?;
-        out["worktree"] = worktree;
-        out["worktree_status"] = after;
-        out["next_steps"] = json!([
-            "If the task depends on prior decisions, design docs, threads, or code graph facts, run the blackbox opening sequence and bundle evidence before making provenance-sensitive claims.",
-            "Treat worktree.cwd as authoritative for file reads, writes, shell commands, and project-scoped bbox calls.",
-            "Uncommitted parent-checkout files are not copied into this worktree; report that as context/filesystem divergence instead of editing the parent checkout.",
-            "Prefer work_* tools or absolute paths under worktree.cwd; generic file tools may still target the launch root.",
-        ]);
-    }
     Ok(out)
 }
 
@@ -2022,7 +1988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_grounding_can_enter_and_reground_worktree() {
+    async fn sandbox_grounding_refuses_in_session_worktree_creation() {
         let repo = seed_repo();
         let tool = SandboxGrounding;
         let result = tool
@@ -2036,30 +2002,14 @@ mod tests {
             )
             .await;
         let (content, is_error) = result.into_content();
-        assert!(!is_error, "{content}");
-        let value: Value = serde_json::from_str(&content).unwrap();
-        let cwd = PathBuf::from(value["worktree"]["cwd"].as_str().unwrap());
-        assert!(cwd.join("README.md").is_file());
-        assert_eq!(value["worktree_status"]["root_source"], "explicit");
-        assert_eq!(
-            value["worktree_status"]["inspected_root"].as_str().unwrap(),
-            cwd.to_str().unwrap()
+        assert!(
+            is_error,
+            "enter_worktree=true should now fail closed, got: {content}"
         );
         assert!(
-            value["worktree_status"]["git"]["branch"]
-                .as_str()
-                .unwrap()
-                .starts_with("bro-fleet/grounding-test-")
+            content.contains("no longer creates worktrees"),
+            "unexpected error: {content}"
         );
-
-        run_git(
-            repo.path(),
-            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
-        );
-        std::fs::remove_dir_all(PathBuf::from(
-            value["worktree"]["worktree_root"].as_str().unwrap(),
-        ))
-        .ok();
     }
 
     #[tokio::test]

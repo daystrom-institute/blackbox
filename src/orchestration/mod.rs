@@ -1608,13 +1608,10 @@ injected.\n\
 run sandbox grounding; use blackbox retrieval/evidence bundling when claims \
 depend on prior decisions, design docs, threads, code graph facts, or \
 conversation history; then edit/validate in the grounded cwd.\n\
-  - For the sandbox boundary, call `sandbox_grounding` when available: \
-`sandbox_grounding(enter_worktree=false)` for read-only orientation, or \
-`sandbox_grounding(enter_worktree=true, purpose=<short reason>)` before work \
-that may edit files. It returns the launch manifest and, when a worktree is \
-entered, the managed worktree plus `sandbox_status(root=<worktree cwd>)`. If \
-that tool is unavailable, fall back to manual `sandbox_status`, `enter_worktree`, \
-then `sandbox_status(root=<returned cwd>)`.\n\
+  - For the sandbox boundary, call `sandbox_grounding` when available. It \
+returns the launch manifest for the harness root. Worktree creation is \
+host-owned: fleet dispatch and workflow ops create isolated worktrees \
+mechanically before launching editable sessions.\n\
   - For blackbox evidence, use the opening sequence instead of memory when \
 provenance matters: `bbox_describe_schema` once per session, \
 `bbox_hybrid_search`, `bbox_inspect_entity`, conditional `bbox_find_paths`, then \
@@ -1649,9 +1646,9 @@ or an LSP-backed refactor plan stays `tool_running` after a wait timeout, call \
   - Prefer `work_bash` over `Bash` for shell commands.\n\
   - Prefer `work_git_status` / `work_git_diff` / `work_git_log` over \
 bare `Bash(\"git …\")` invocations.\n\
-After `enter_worktree`, treat the returned `cwd` as authoritative. Generic \
-file tools may still be rooted at the original checkout; prefer work_* tools \
-or pass absolute paths under the returned worktree.\n\
+Treat the harness launch root as authoritative for generic file, shell, and git \
+tools. Do not create worktrees from inside the agent session; use fleet/workflow \
+mechanical worktree creation before dispatch.\n\
 When a workspace tool is not available in the current session, fall back to \
 the standard tool and emit `bbox_note(kind=learned, body=\"work_* unavailable, \
 used <standard_tool> as fallback\")` so the orchestrator can track coverage.\n\
