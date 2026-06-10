@@ -222,8 +222,19 @@ impl Emitter {
         }));
     }
 
-    /// Terminal `result` event with usage/turns/cost.
-    pub fn result(&self, text: &str, usage: &Usage, num_turns: u64, cost_usd: Option<f64>) {
+    /// Terminal `result` event with usage/turns/cost. `suspicious_turn_end`
+    /// carries the turn-end diagnostics when the loop flagged the stop as
+    /// suspicious (empty-output stop, outstanding async work) — the session
+    /// still ends `subtype: success`, but orchestrators can see the
+    /// deliverable may be missing instead of trusting `result` blindly.
+    pub fn result(
+        &self,
+        text: &str,
+        usage: &Usage,
+        num_turns: u64,
+        cost_usd: Option<f64>,
+        suspicious_turn_end: Option<&Value>,
+    ) {
         // Emit the Anthropic-native usage shape (fresh `input_tokens` plus
         // `cache_read_input_tokens` / `cache_creation_input_tokens`) so the
         // daemon's claude parser captures the cache breakdown identically to a
@@ -243,6 +254,9 @@ impl Emitter {
         });
         if let Some(c) = cost_usd {
             v["total_cost_usd"] = json!(c);
+        }
+        if let Some(diag) = suspicious_turn_end {
+            v["suspicious_turn_end"] = diag.clone();
         }
         self.write_line(v);
     }
@@ -288,7 +302,7 @@ mod tests {
         let emitter = Emitter::with_callback("session-1".into(), sink);
 
         emitter.system_init();
-        emitter.result("done", &Usage::default(), 1, None);
+        emitter.result("done", &Usage::default(), 1, None, None);
 
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 2);

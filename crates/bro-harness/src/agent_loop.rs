@@ -413,10 +413,9 @@ async fn session_loop(
             Ok(body) => {
                 let path = session.store_path().to_path_buf();
                 // Move the write off the async runtime.
-                let write_res = tokio::task::spawn_blocking(move || {
-                    crate::session::write_atomic(&path, &body)
-                })
-                .await;
+                let write_res =
+                    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
+                        .await;
                 if let Err(e) = match write_res {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(e)) => Err(e.context("write session")),
@@ -465,10 +464,9 @@ async fn session_loop_until_idle(
         match session.persist_body() {
             Ok(body) => {
                 let path = session.store_path().to_path_buf();
-                let write_res = tokio::task::spawn_blocking(move || {
-                    crate::session::write_atomic(&path, &body)
-                })
-                .await;
+                let write_res =
+                    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
+                        .await;
                 if let Err(e) = match write_res {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(e)) => Err(e.context("write session")),
@@ -724,7 +722,8 @@ impl Session {
             .context(
                 "no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL",
             )?;
-        let tool_arg_defaults = load_tool_arg_defaults(additional_context, cli.additional_context.as_deref())?;
+        let tool_arg_defaults =
+            load_tool_arg_defaults(additional_context, cli.additional_context.as_deref())?;
         let shell_env = load_shell_env(shell_env, cli.shell_env.as_deref())?;
 
         let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
@@ -1019,6 +1018,13 @@ impl Session {
         }));
 
         let mut final_text = String::new();
+        // The TERMINAL step's text, tracked separately from `final_text`:
+        // `final_text` keeps the last NON-EMPTY text of the whole turn (it is
+        // the result payload), so it cannot detect a model that ends on an
+        // output-free step — any earlier narration masks it (gap-aa032081).
+        let mut last_step_text = String::new();
+        // One-shot guard for the empty-output nudge below.
+        let mut empty_output_nudged = false;
         let mut turn_steps = 0u64;
         let mut last_model_stop: Option<StopReason> = None;
         let mut last_model_tool_call_count = 0usize;
@@ -1173,6 +1179,7 @@ impl Session {
             self.pending_input_estimate = 0;
             last_model_stop = Some(out.stop.clone());
             last_model_tool_call_count = out.tool_calls.len();
+            last_step_text = out.text.clone();
 
             for n in self.hooks.on_assistant_turn(&out.text, &out.tool_calls) {
                 if n.delivery == Delivery::SystemTail {
@@ -1207,6 +1214,33 @@ impl Session {
             let has_tool_work = out.stop == StopReason::ToolCalls && !out.tool_calls.is_empty();
             let wants_follow_up = out.end_turn == Some(false);
             if !has_tool_work && !wants_follow_up {
+                // Empty-output stop: the model ended its response with NO text
+                // and NO tool calls — e.g. an output cap hit mid-thinking, or a
+                // reasoning model that burned the response on a thinking block.
+                // Breaking here would terminate the session as a clean success
+                // with stale earlier narration as the result (gap-aa032081).
+                // Nudge once for a real final answer before accepting the stop.
+                if out.text.trim().is_empty() && !empty_output_nudged {
+                    empty_output_nudged = true;
+                    tracing::warn!(
+                        stop = ?out.stop,
+                        thinking_len = out.thinking.len(),
+                        "model ended step with no text and no tool calls; nudging once"
+                    );
+                    let nudge = "Your previous response contained no visible output (no text, \
+                                 no tool calls). Continue now: produce your final answer, or \
+                                 proceed with tool calls.";
+                    self.event_log.append_event(&json!({
+                        "type": "user",
+                        "session_id": self.session_id(),
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": nudge}],
+                        },
+                    }));
+                    self.push_user_text_raw(nudge);
+                    continue;
+                }
                 break if out.stop == StopReason::ToolCalls {
                     "tool_calls_empty"
                 } else {
@@ -1258,6 +1292,7 @@ impl Session {
                         &serde_json::to_string(&structured).unwrap_or_default(),
                         &self.total_usage,
                         self.turns,
+                        None,
                         None,
                     );
                     return Ok(());
@@ -1411,16 +1446,24 @@ impl Session {
             last_model_tool_call_count,
             turn_steps,
             &last_tool_results,
-            &final_text,
+            // The TERMINAL step's text — `final_text` would mask an
+            // empty-output stop behind earlier narration (gap-aa032081).
+            &last_step_text,
         );
         tracing::info!(turn_end = %turn_end, "turn ending");
-        if turn_end["suspicious"].as_bool().unwrap_or(false) {
+        let suspicious = turn_end["suspicious"].as_bool().unwrap_or(false);
+        if suspicious {
             tracing::warn!(turn_end = %turn_end, "suspicious turn end");
-            self.emitter.turn_end_diagnostics(turn_end);
+            self.emitter.turn_end_diagnostics(turn_end.clone());
         }
 
-        self.emitter
-            .result(&final_text, &self.total_usage, self.turns, None);
+        self.emitter.result(
+            &final_text,
+            &self.total_usage,
+            self.turns,
+            None,
+            suspicious.then_some(&turn_end),
+        );
         Ok(())
     }
 
@@ -1518,7 +1561,10 @@ impl Session {
         last_model_tool_call_count: usize,
         turn_steps: u64,
         last_tool_results: &[Value],
-        final_text: &str,
+        // Text of the TERMINAL model step only — not the session-accumulated
+        // result text. Using the accumulated text here masks empty-output
+        // stops behind any earlier narration (gap-aa032081).
+        last_turn_text: &str,
     ) -> Value {
         let shell_ids = self.cx.shell_sessions.lock().unwrap().ids();
         let last_tool_running = last_tool_results
@@ -1533,7 +1579,7 @@ impl Session {
         // outstanding-async heuristic above does not catch. A `tool_calls_empty`
         // break is abnormal by construction (stop=tool_calls yet zero calls);
         // for it we flag regardless of text.
-        let produced_text = !final_text.trim().is_empty();
+        let produced_text = !last_turn_text.trim().is_empty();
         let model_ended = matches!(break_reason, "model_stop" | "tool_calls_empty");
         let empty_output_stop = model_ended && last_model_tool_call_count == 0 && !produced_text;
 
@@ -1556,7 +1602,7 @@ impl Session {
             "last_model_tool_call_count": last_model_tool_call_count,
             "turn_steps": turn_steps,
             "harness_turns_total": self.turns,
-            "final_text_len": final_text.len(),
+            "last_turn_text_len": last_turn_text.len(),
             "produced_text": produced_text,
             "empty_output_stop": empty_output_stop,
             "outstanding_shell_sessions": {
@@ -1718,7 +1764,9 @@ fn validate_tool_arg_defaults(defaults: &bro_tools::ToolArgDefaults, reg: &Regis
         return;
     }
     let schemas = reg.schemas();
-    for warning in defaults.validation_warnings(schemas.iter().map(|(name, schema)| (name.as_str(), schema))) {
+    for warning in
+        defaults.validation_warnings(schemas.iter().map(|(name, schema)| (name.as_str(), schema)))
+    {
         tracing::warn!(warning = %warning, "tool arg default schema validation warning");
         eprintln!("BRO_HARNESS_TOOL_DEFAULTS warning: {warning}");
     }
@@ -2003,7 +2051,12 @@ mod tests {
 
     #[tokio::test]
     async fn web_search_flag_session_value_semantics() {
-        for (value, expected) in [("0", false), ("false", false), ("FALSE", false), ("1", true)] {
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("1", true),
+        ] {
             transport::with_session_env(
                 std::collections::BTreeMap::from([(
                     "BRO_HARNESS_WEB_SEARCH".to_string(),
@@ -2372,16 +2425,53 @@ mod tests {
         assert_eq!(types.iter().filter(|t| **t == "user").count(), 1);
         assert!(types.contains(&"assistant"), "{types:?}");
         assert!(types.contains(&"result"), "{types:?}");
-        let user = lines
-            .iter()
-            .find(|l| l["event"]["type"] == "user")
-            .unwrap();
-        assert_eq!(
-            user["event"]["message"]["content"][0]["text"],
-            "what is up"
-        );
+        let user = lines.iter().find(|l| l["event"]["type"] == "user").unwrap();
+        assert_eq!(user["event"]["message"]["content"][0]["text"], "what is up");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn empty_output_stop_is_nudged_once_then_recovers() {
+        // gap-aa032081: a model step that ends with NO text and NO tool calls
+        // (e.g. an output cap hit mid-thinking) must not silently terminate
+        // the session as success with stale text. The loop nudges once; here
+        // the model recovers with a real answer on the retry.
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::Text(String::new()),
+            MockTurn::Text("recovered answer".into()),
+        ]);
+
+        run_user_turn(&mut session, "do the thing").await;
+
+        assert_eq!(
+            shared.started.load(Ordering::SeqCst),
+            2,
+            "empty-output stop should trigger exactly one retry"
+        );
+        let pushed = shared.pushed_users.lock().unwrap().clone();
+        assert!(
+            pushed.iter().any(|p| p.contains("no visible output")),
+            "the nudge must reach the transport buffer: {pushed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_output_stop_nudges_only_once_then_breaks() {
+        // If the model returns nothing AGAIN after the nudge, the turn must
+        // end (no nudge loop) — and the terminal-turn-text detector flags it.
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::Text(String::new()),
+            MockTurn::Text(String::new()),
+        ]);
+
+        run_user_turn(&mut session, "do the thing").await;
+
+        assert_eq!(
+            shared.started.load(Ordering::SeqCst),
+            2,
+            "exactly one nudge retry, then the turn breaks"
+        );
     }
 
     #[tokio::test]
@@ -2927,7 +3017,7 @@ mod tests {
             session.turn_end_diagnostics("model_stop", Some(&StopReason::Done), 0, 1, &[], "");
 
         assert_eq!(diag["produced_text"], false);
-        assert_eq!(diag["final_text_len"], 0);
+        assert_eq!(diag["last_turn_text_len"], 0);
         assert_eq!(diag["empty_output_stop"], true);
         assert_eq!(diag["suspicious"], true);
         assert_eq!(diag["suspicion_reasons"][0], "empty_output_stop");
@@ -3088,8 +3178,7 @@ mod shell_env_tests {
     #[test]
     fn load_shell_env_precedence_explicit_then_cli() {
         let explicit = BTreeMap::from([("A".to_string(), "explicit".to_string())]);
-        let via_explicit =
-            load_shell_env(Some(explicit), Some(r#"{"A":"cli"}"#)).unwrap();
+        let via_explicit = load_shell_env(Some(explicit), Some(r#"{"A":"cli"}"#)).unwrap();
         assert_eq!(via_explicit.get("A").map(String::as_str), Some("explicit"));
 
         let via_cli = load_shell_env(None, Some(r#"{"A":"cli"}"#)).unwrap();
