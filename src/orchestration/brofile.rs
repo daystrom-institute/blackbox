@@ -418,16 +418,6 @@ fn default_claude_compatible_env(
     };
     let mut env = HashMap::from([("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string())]);
 
-    // GLM only: Z.ai's server-side `web_search` tool degrades dispatched code
-    // bros (observed degenerate repeated web_search invocations), so the lane
-    // defaults it off. Account-level env overrides (`load_account(..).env`,
-    // applied after this default in `resolve_provider_env_inner`) can still
-    // re-enable it with BRO_HARNESS_WEB_SEARCH=1. DeepSeek/MiniMax keep the
-    // harness default (enabled) — no evidence of the same degenerate builtin.
-    if provider == Provider::Glm {
-        env.insert("BRO_HARNESS_WEB_SEARCH".to_string(), "0".to_string());
-    }
-
     let settings = home_dir.join(rel_path).join("settings.json");
     if let Ok(body) = std::fs::read_to_string(&settings)
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
@@ -1400,48 +1390,16 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_provider_env_glm_disables_web_search_by_default() {
-        let store = temp_store();
-        let home = temp_store();
-
-        let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
-        });
-        // Z.ai's server-side web_search degrades dispatched glm code bros;
-        // the lane default requests no server-side search (gap-c21e34a3).
-        assert_eq!(
-            resolved.get("BRO_HARNESS_WEB_SEARCH").map(String::as_str),
-            Some("0")
-        );
-    }
-
-    #[test]
-    fn test_resolve_provider_env_web_search_default_is_glm_only() {
-        let store = temp_store();
-        let home = temp_store();
-
-        for provider in [Provider::Deepseek, Provider::Minimax] {
-            let resolved = with_fake_home(home.path(), || {
-                resolve_provider_env(provider, None, None, store.path(), None).unwrap()
-            });
-            assert!(
-                !resolved.contains_key("BRO_HARNESS_WEB_SEARCH"),
-                "{provider:?} must not inherit the glm web-search opt-out"
-            );
-        }
-    }
-
-    #[test]
-    fn test_resolve_provider_env_glm_account_override_reenables_web_search() {
+    fn test_resolve_provider_env_account_env_carries_web_search_flag() {
         let store = temp_store();
         let home = temp_store();
         let mut config = load_config(store.path());
         config.accounts.insert(
-            "zai-search".into(),
+            "zai-nosearch".into(),
             Account {
                 env: Some(HashMap::from([(
                     "BRO_HARNESS_WEB_SEARCH".into(),
-                    "1".into(),
+                    "0".into(),
                 )])),
                 ..Default::default()
             },
@@ -1449,14 +1407,15 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Glm, Some("zai-search"), None, store.path(), None)
+            resolve_provider_env(Provider::Glm, Some("zai-nosearch"), None, store.path(), None)
                 .unwrap()
         });
-        // Explicit account env overrides are merged after the lane default,
-        // so the operator can re-enable server-side search.
+        // No lane-level default exists for BRO_HARNESS_WEB_SEARCH; the knob is
+        // operator-scoped (account env here, or per-dispatch env_overrides),
+        // and the harness resolves it via session env (web_search_enabled).
         assert_eq!(
             resolved.get("BRO_HARNESS_WEB_SEARCH").map(String::as_str),
-            Some("1")
+            Some("0")
         );
     }
 
