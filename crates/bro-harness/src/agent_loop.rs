@@ -163,7 +163,7 @@ async fn run_with_emitter(
         .await?;
     let body = session.persist_body()?;
     let path = session.store_path().to_path_buf();
-    tokio::task::spawn_blocking(move || std::fs::write(&path, &body))
+    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
         .await
         .context("persist task panicked")?
         .context("write session")?;
@@ -206,7 +206,7 @@ async fn run_session(
     session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
     let body = session.persist_body()?;
     let path = session.store_path().to_path_buf();
-    tokio::task::spawn_blocking(move || std::fs::write(&path, &body))
+    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
         .await
         .context("persist task panicked")?
         .context("write session")?;
@@ -233,7 +233,7 @@ async fn run_controlled_session(
     session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
     let body = session.persist_body()?;
     let path = session.store_path().to_path_buf();
-    tokio::task::spawn_blocking(move || std::fs::write(&path, &body))
+    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
         .await
         .context("persist task panicked")?
         .context("write session")?;
@@ -381,7 +381,7 @@ async fn session_loop(
                 let path = session.store_path().to_path_buf();
                 // Move the write off the async runtime.
                 let write_res = tokio::task::spawn_blocking(move || {
-                    std::fs::write(&path, &body).map_err(|e| anyhow::anyhow!(e))
+                    crate::session::write_atomic(&path, &body)
                 })
                 .await;
                 if let Err(e) = match write_res {
@@ -433,7 +433,7 @@ async fn session_loop_until_idle(
             Ok(body) => {
                 let path = session.store_path().to_path_buf();
                 let write_res = tokio::task::spawn_blocking(move || {
-                    std::fs::write(&path, &body).map_err(|e| anyhow::anyhow!(e))
+                    crate::session::write_atomic(&path, &body)
                 })
                 .await;
                 if let Err(e) = match write_res {

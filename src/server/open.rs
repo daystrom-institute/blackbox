@@ -165,6 +165,14 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     backfill_artifact_hashes(&artifacts_store);
 
     let store_dir = cfg.paths.bro_home.clone();
+    // Export BRO_HOME so that the in-process bro-harness library sees the
+    // correct sessions dir. Must run during single-threaded startup before any
+    // dispatch task could spawn.
+    if std::env::var("BRO_HOME").is_err() {
+        unsafe {
+            std::env::set_var("BRO_HOME", store_dir.to_string_lossy().as_ref());
+        }
+    }
     let task_ttl = cfg.daemon.task_ttl_ms;
     let task_store = TaskStore::load(&store_dir, task_ttl);
     let badgey_proposals = Arc::new(orchestration::badgey::ProposalStore::new(
