@@ -457,13 +457,38 @@ pub fn resolve_target_or(target: Option<&str>, default: &str) -> String {
 }
 
 /// Read the current branch of `repo` via `git symbolic-ref`. Used by the
-/// daemon endpoint to default `target` to the base repo's current branch
-/// (the operator-decided default; the tool keeps "main" as its default —
-/// only the endpoint uses this resolver).
+/// daemon endpoint as the *fallback* default for `target` (the base repo's
+/// current branch) when the worktree carries no captured fork-point; the
+/// tool keeps "main" as its default — only the endpoint uses this resolver.
 pub fn current_branch(repo: &Path) -> anyhow::Result<String> {
     let raw = git_capture(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .or_else(|_| git_capture(repo, &["rev-parse", "--abbrev-ref", "HEAD"]))?;
     Ok(raw.trim().to_string())
+}
+
+/// Read the fork-point base branch persisted at dispatch under
+/// `branch.<branch>.broFleetBase` (written by the cockpit's
+/// `prepare_dispatch_worktree` and by [`enter_worktree`]). This is the branch
+/// the worktree's work diverged from — the operator-decided closeout default.
+///
+/// Preferred over [`current_branch`] for the endpoint `target` default because
+/// it is captured once at dispatch and is immune to later base-repo HEAD
+/// movement (the working tree is multi-tenant — a peer agent or the operator
+/// may switch/advance the base checkout between dispatch and closeout).
+///
+/// Returns `None` when the worktree is detached, the key is absent (a worktree
+/// created before this was wired, or by a path that did not persist it), or
+/// git errors — callers then fall back to [`current_branch`].
+pub fn fleet_base_branch(worktree: &Path) -> Option<String> {
+    let branch = git_capture(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    let key = format!("branch.{branch}.broFleetBase");
+    let val = git_capture(worktree, &["config", "--get", &key]).ok()?;
+    let val = val.trim().to_string();
+    if val.is_empty() { None } else { Some(val) }
 }
 
 /// Pre-driver guard + resolver used by BOTH `exit_worktree` and the
@@ -475,7 +500,8 @@ pub fn current_branch(repo: &Path) -> anyhow::Result<String> {
 /// 3. Resolve the base repo from `cx_root` (`fleet_base_repo`).
 /// 4. Read the worktree's current branch (`git rev-parse --abbrev-ref HEAD`).
 /// 5. Resolve `target` via `target_resolver` (tool default "main"; endpoint
-///    default = base repo's current branch).
+///    default = worktree fork-point branch, then base repo's current branch,
+///    then "main").
 /// 6. Validate `allow_branch_prefixes` (default `["bro-fleet/"]`; empty list
 ///    rejected).
 /// 7. Refuse detached HEAD (always — even if "HEAD" is in the allowed
@@ -1431,6 +1457,23 @@ fn enter_worktree(cx_root: &Path, args: EnterWorktreeInput) -> anyhow::Result<Va
         .unwrap_or_else(|_| "unknown".to_string());
     let base_sha = git_capture(&parent_worktree, &["rev-parse", "--short=12", "HEAD"])
         .unwrap_or_else(|_| "unknown".to_string());
+    // Persist the fork-point base branch keyed to this worktree's branch so the
+    // closeout endpoint can default `target` to "the branch this work diverged
+    // from" (see [`fleet_base_branch`]). For `base = main` the fork point is
+    // main itself; otherwise it is the parent checkout's branch. Best-effort.
+    let fork_base = match args.base.as_deref().unwrap_or("current") {
+        "main" => Some("main".to_string()),
+        _ if base_branch != "unknown" && base_branch != "HEAD" && !base_branch.is_empty() => {
+            Some(base_branch.clone())
+        }
+        _ => None,
+    };
+    if let Some(fork_base) = fork_base {
+        let _ = git_run(
+            &base_repo,
+            &["config", &format!("branch.{branch}.broFleetBase"), &fork_base],
+        );
+    }
     let status = git_capture(&path, &["status", "--short", "--branch"]).unwrap_or_default();
     // Per-worktree build isolation: no shared CARGO_TARGET_DIR (or any
     // language-specific build env) is injected — each worktree gets its own
@@ -3166,6 +3209,132 @@ mod tests {
         );
 
         // Cleanup.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&base_repo)
+            .args(["worktree", "remove", "--force", worktree.to_str().unwrap()])
+            .output();
+    }
+
+    /// `fleet_base_branch` reads the fork-point base persisted under
+    /// `branch.<branch>.broFleetBase` (the key dispatch/`enter_worktree` write),
+    /// and returns `None` before any capture exists.
+    #[test]
+    fn fleet_base_branch_reads_persisted_fork_point() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let base_repo = sandbox.path().join("repo");
+        std::fs::create_dir_all(&base_repo).unwrap();
+        run_git(&base_repo, &["init", "-b", "main"]);
+        run_git(&base_repo, &["config", "user.email", "test@example.com"]);
+        run_git(&base_repo, &["config", "user.name", "Test User"]);
+        std::fs::write(base_repo.join("README.md"), "base\n").unwrap();
+        run_git(&base_repo, &["add", "."]);
+        run_git(&base_repo, &["commit", "-m", "init"]);
+
+        let worktree = sandbox.path().join("wt");
+        run_git(
+            &base_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/wt",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        // No capture yet → None (legacy / tool-path worktrees fall back).
+        assert_eq!(fleet_base_branch(&worktree), None);
+
+        // Persist exactly as the dispatch path does, then read it back.
+        run_git(
+            &worktree,
+            &["config", "branch.bro-fleet/wt.broFleetBase", "main"],
+        );
+        assert_eq!(fleet_base_branch(&worktree), Some("main".to_string()));
+
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&base_repo)
+            .args(["worktree", "remove", "--force", worktree.to_str().unwrap()])
+            .output();
+    }
+
+    /// The endpoint-style resolver defaults `target` to the captured fork-point
+    /// branch, NOT the base repo's live HEAD — proving immunity to base-repo
+    /// branch movement between dispatch and closeout (the multi-tenant footgun
+    /// that option 2 — "current branch in project dir" — would hit).
+    #[test]
+    fn closeout_target_defaults_to_fork_point_not_current_branch() {
+        let mut _env = EnvGuard::new();
+        _env.clear("BRO_FLEET_BASE_REPO");
+        _env.clear("BRO_FLEET_WORKTREE_ROOT");
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo_name = "managed-repo";
+        let base_repo = sandbox.path().join(repo_name);
+        std::fs::create_dir_all(&base_repo).unwrap();
+        run_git(&base_repo, &["init", "-b", "main"]);
+        run_git(&base_repo, &["config", "user.email", "test@example.com"]);
+        run_git(&base_repo, &["config", "user.name", "Test User"]);
+        std::fs::write(base_repo.join("README.md"), "base\n").unwrap();
+        run_git(&base_repo, &["add", "."]);
+        run_git(&base_repo, &["commit", "-m", "init"]);
+
+        // Diverge the work from a feature branch (the fork-point).
+        run_git(&base_repo, &["checkout", "-b", "feature-x"]);
+        std::fs::write(base_repo.join("feat.txt"), "x\n").unwrap();
+        run_git(&base_repo, &["add", "."]);
+        run_git(&base_repo, &["commit", "-m", "feat"]);
+
+        // Managed worktree forked from feature-x HEAD; persist the fork-point.
+        let worktree = sandbox
+            .path()
+            .join(".bro-fleet-worktrees")
+            .join(repo_name)
+            .join("fork-test");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        run_git(
+            &base_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/fork-test",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        run_git(
+            &worktree,
+            &["config", "branch.bro-fleet/fork-test.broFleetBase", "feature-x"],
+        );
+
+        // A peer moves the base checkout back to main between dispatch and
+        // closeout — `current_branch(base_repo)` would now say "main".
+        run_git(&base_repo, &["checkout", "main"]);
+        assert_eq!(current_branch(&base_repo).unwrap(), "main");
+
+        // Endpoint resolver: fork-point first, current-branch fallback, "main".
+        let req = prepare_closeout_request(
+            &worktree,
+            Some(worktree.to_str().unwrap()),
+            |base_repo| {
+                fleet_base_branch(&worktree)
+                    .or_else(|| current_branch(base_repo).ok())
+                    .unwrap_or_else(|| "main".to_string())
+            },
+            None,
+            &[],
+        )
+        .expect("prepare_closeout_request returns Ok");
+        assert_eq!(
+            req.target, "feature-x",
+            "target must default to the fork-point branch, not the base repo's \
+             current branch (which a peer moved to main)"
+        );
+
         let _ = Command::new("git")
             .arg("-C")
             .arg(&base_repo)

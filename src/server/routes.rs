@@ -897,8 +897,10 @@ pub(crate) async fn control_resume_handler(
 // (managed-worktree, branch-prefix eligibility, detached-HEAD refusal,
 // confirm gate) by reusing `bro_tools::fleet_worktree::prepare_closeout_request`
 // (the shared entry extracted in Phase 1) — no silent duplication-with-drift.
-// It then resolves `target` to the base repo's CURRENT BRANCH when the caller
-// omits it (operator-decided default; the tool's default stays "main").
+// It then resolves `target` to the worktree's FORK-POINT branch (the branch it
+// diverged from at dispatch, persisted in branch-scoped config) when the caller
+// omits it, falling back to the base repo's current branch and then "main"
+// (operator-decided default; the tool's default stays "main").
 // Finally it calls `run_closeout_phases` and returns the STRUCTURED
 // `CloseoutOutcome` directly (§4.3 — NOT a collapsed/rendered legacy tool
 // JSON). Guard/validation failures return a 4xx with a clear error body.
@@ -993,15 +995,22 @@ pub(crate) async fn control_closeout_handler(
     let extra_managed_roots = crate::managed_worktrees::cockpit_managed_worktree_roots();
 
     // Shared pre-driver guard: managed-worktree, branch-prefix, detached-HEAD,
-    // target resolution. The endpoint's target default is the base repo's
-    // CURRENT branch (operator-decided) — the tool's default stays "main".
+    // target resolution. The endpoint's target default is the worktree's
+    // fork-point branch, then the base repo's current branch, then "main"
+    // (operator-decided) — the tool's default stays "main".
     let mut driver_req = match prepare_closeout_request(
         &cx_root,
         worktree_arg,
         |base_repo| match req.target.as_deref() {
             Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-            _ => bro_tools::fleet_worktree::current_branch(base_repo)
-                .unwrap_or_else(|_| "main".to_string()),
+            // Default to the branch this worktree diverged from at dispatch
+            // (fork-point, persisted in branch-scoped config), which is immune
+            // to base-repo HEAD movement. Fall back to the base repo's current
+            // branch only when no fork-point was captured (legacy worktrees /
+            // tool-path dispatch), then to "main".
+            _ => bro_tools::fleet_worktree::fleet_base_branch(&cx_root)
+                .or_else(|| bro_tools::fleet_worktree::current_branch(base_repo).ok())
+                .unwrap_or_else(|| "main".to_string()),
         },
         req.allow_branch_prefixes.clone(),
         &extra_managed_roots,

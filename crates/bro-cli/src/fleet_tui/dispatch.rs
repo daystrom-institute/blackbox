@@ -385,6 +385,24 @@ pub(super) fn prepare_dispatch_worktree(
     let worktree_path = worktree_path
         .canonicalize()
         .map_err(|e| format!("canonicalizing worktree path: {e}"))?;
+    // Persist the fork-point base branch (captured above) keyed to THIS
+    // worktree's branch, so closeout can default `target` to "the branch this
+    // work diverged from" instead of reading the base repo's live HEAD (which
+    // is multi-tenant — a peer agent or the operator may switch/advance the
+    // base checkout between dispatch and closeout). Branch-scoped config is
+    // unique per worktree-branch and is removed by `git branch -D` at closeout.
+    // Best-effort: a failed write just falls back to the endpoint's resolver.
+    if base_branch != "unknown" && base_branch != "HEAD" && !base_branch.is_empty() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&worktree_path)
+            .args([
+                "config",
+                &format!("branch.{branch}.broFleetBase"),
+                &base_branch,
+            ])
+            .output();
+    }
     let worktree_status = git_capture(&worktree_path, &["status", "--short", "--branch"])
         .unwrap_or_else(|e| format!("git status unavailable: {e}"));
 
