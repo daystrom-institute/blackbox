@@ -1585,6 +1585,14 @@ mod agentic_project_file_tests {
         let projects_path = dir.path().join("projects.json");
         let mut projects = ProjectRegistry::open(&projects_path).unwrap();
         projects.register_path(env!("CARGO_MANIFEST_DIR")).unwrap();
+        // register_path is memory-only post-persister-conversion; flush so the
+        // disk-reading index scan sees the registration.
+        crate::json_store::atomic_write_json_locked(
+            &projects_path,
+            &<ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&projects)
+                .unwrap(),
+        )
+        .unwrap();
 
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),
@@ -1613,9 +1621,13 @@ mod agentic_project_file_tests {
             .unwrap();
         assert!(design_hits.contains("design/corpus/agentic-corpus/agentic-corpus.md"));
 
+        // Anchor on a trait that lives in the root package's src/ today.
+        // (The original anchor, SourceFormatChunker in src/chunker/, was
+        // refactored away when the chunker moved to the bbox-chunker crate —
+        // this test indexes the live repo, so anchors must track it.)
         let trait_hits = index
             .search(&SearchParams {
-                query: "trait SourceFormatChunker".into(),
+                query: "trait StoreSnapshot".into(),
                 mode: None,
                 account: None,
                 project: None,
@@ -1625,9 +1637,7 @@ mod agentic_project_file_tests {
                 exclude_self: None,
             })
             .unwrap();
-        assert!(trait_hits.contains("design/corpus/agentic-corpus/agentic-corpus.md"));
-        let chunker_source = format!("{}/src/chunker/mod.rs", env!("CARGO_MANIFEST_DIR"));
-        assert!(trait_hits.contains(&format!("File: {chunker_source}")));
+        assert!(trait_hits.contains("src/store_persister.rs"));
 
         let display_hits = index
             .search(&SearchParams {
@@ -1730,6 +1740,14 @@ mod agentic_project_file_tests {
         let projects_path = dir.path().join("projects.json");
         let mut projects = ProjectRegistry::open(&projects_path).unwrap();
         projects.register_path(&repo).unwrap();
+        // register_path is memory-only post-persister-conversion; flush so the
+        // disk-reading index scan sees the registration.
+        crate::json_store::atomic_write_json_locked(
+            &projects_path,
+            &<ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&projects)
+                .unwrap(),
+        )
+        .unwrap();
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),
             Vec::new(),

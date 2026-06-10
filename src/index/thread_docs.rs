@@ -352,6 +352,14 @@ mod tests {
     fn register(projects_path: &Path, repo_root: &Path) {
         let mut reg = ProjectRegistry::open(projects_path).unwrap();
         reg.register_path(repo_root).unwrap();
+        // register_path is memory-only post-persister-conversion; the
+        // standalone reindex reads projects.json from disk, so flush the
+        // snapshot explicitly (the production path persists via the actor).
+        crate::json_store::atomic_write_json_locked(
+            projects_path,
+            &<ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&reg).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
