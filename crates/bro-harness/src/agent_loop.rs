@@ -21,7 +21,7 @@ use crate::hooks::{Delivery, HookEngine, NudgeLedger};
 use crate::lsp_baselines::LspBaselines;
 use crate::mcp;
 use crate::registry::{PinPolicy, Registry};
-use crate::session::{SaveState, SessionStore};
+use crate::session::SessionStore;
 use crate::transport::{self, StopReason, SystemPrompt, Transport, TransportKind, TurnOpts, Usage};
 use anyhow::{Context, Result};
 use bro_tools::{SafetyPolicy, Tool, ToolCx, builtin_tools};
@@ -161,7 +161,12 @@ async fn run_with_emitter(
     session
         .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
         .await?;
-    session.persist()?;
+    let body = session.persist_body()?;
+    let path = session.store_path().to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::write(&path, &body))
+        .await
+        .context("persist task panicked")?
+        .context("write session")?;
     Ok(())
 }
 
@@ -199,7 +204,12 @@ async fn run_session(
     }
 
     session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
-    session.persist()?;
+    let body = session.persist_body()?;
+    let path = session.store_path().to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::write(&path, &body))
+        .await
+        .context("persist task panicked")?
+        .context("write session")?;
     Ok(())
 }
 
@@ -221,7 +231,12 @@ async fn run_controlled_session(
     let input_rx = map_session_input(input_rx);
 
     session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
-    session.persist()?;
+    let body = session.persist_body()?;
+    let path = session.store_path().to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::write(&path, &body))
+        .await
+        .context("persist task panicked")?
+        .context("write session")?;
     Ok(())
 }
 
@@ -361,8 +376,25 @@ async fn session_loop(
         // completed turn is lost and a `--resume` finds no session file and
         // starts cold. Per-turn persistence bounds the loss to at most the
         // single in-flight turn.
-        if let Err(e) = session.persist() {
-            tracing::warn!("failed to persist session after turn: {e:#}");
+        match session.persist_body() {
+            Ok(body) => {
+                let path = session.store_path().to_path_buf();
+                // Move the write off the async runtime.
+                let write_res = tokio::task::spawn_blocking(move || {
+                    std::fs::write(&path, &body).map_err(|e| anyhow::anyhow!(e))
+                })
+                .await;
+                if let Err(e) = match write_res {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e.context("write session")),
+                    Err(je) => Err(anyhow::anyhow!("persist task panicked: {je}")),
+                } {
+                    tracing::warn!("failed to persist session after turn: {e:#}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to serialize session after turn: {e:#}");
+            }
         }
         if stdin_closed && pending.is_empty() {
             break;
@@ -397,8 +429,24 @@ async fn session_loop_until_idle(
 
         run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt)
             .await?;
-        if let Err(e) = session.persist() {
-            tracing::warn!("failed to persist session after controlled turn: {e:#}");
+        match session.persist_body() {
+            Ok(body) => {
+                let path = session.store_path().to_path_buf();
+                let write_res = tokio::task::spawn_blocking(move || {
+                    std::fs::write(&path, &body).map_err(|e| anyhow::anyhow!(e))
+                })
+                .await;
+                if let Err(e) = match write_res {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e.context("write session")),
+                    Err(je) => Err(anyhow::anyhow!("persist task panicked: {je}")),
+                } {
+                    tracing::warn!("failed to persist session after controlled turn: {e:#}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to serialize session after controlled turn: {e:#}");
+            }
         }
     }
     Ok(())
@@ -930,7 +978,11 @@ impl Session {
                 self.prepare_context_for_user_turn();
                 self.push_user_text_raw(prompt);
             }
-            let mut sys = compose_system(self.explicit_system.as_deref(), &self.reg, self.output_schema.is_some());
+            let mut sys = compose_system(
+                self.explicit_system.as_deref(),
+                &self.reg,
+                self.output_schema.is_some(),
+            );
             if let Some(t) = self.tail_nudge.take() {
                 let v = sys.volatile.get_or_insert_with(String::new);
                 if !v.is_empty() {
@@ -1058,7 +1110,11 @@ impl Session {
             // the turn cleanly. The model should only call this once; ignore
             // subsequent calls if it fires multiple times.
             if self.output_schema.is_some() {
-                if let Some(fr) = out.tool_calls.iter().find(|tc| tc.name == FINAL_RESULT_TOOL) {
+                if let Some(fr) = out
+                    .tool_calls
+                    .iter()
+                    .find(|tc| tc.name == FINAL_RESULT_TOOL)
+                {
                     let structured = fr.args.clone();
                     tracing::info!("final_result captured; terminating turn");
                     // Emit a tool_result so the transport buffer stays valid
@@ -1441,15 +1497,23 @@ impl Session {
         }
     }
 
-    fn persist(&self) -> Result<()> {
-        self.store.save(&SaveState {
-            transport: self.tx.name(),
-            model: &self.base_opts.model,
-            code_mode: self.code_mode.as_str(),
-            service_tier: self.base_opts.service_tier.as_deref(),
-            snapshot: self.tx.snapshot(),
-            side: self.side_state(),
-        })
+    /// Serialize session state to a JSON string without performing I/O.
+    /// Callers should write the returned body to `store_path()` via
+    /// `tokio::task::spawn_blocking` to keep the write off the runtime.
+    fn persist_body(&self) -> Result<String> {
+        serde_json::to_string(&json!({
+            "transport": self.tx.name(),
+            "model": &self.base_opts.model,
+            "code_mode": self.code_mode.as_str(),
+            "service_tier": self.base_opts.service_tier.as_deref(),
+            "snapshot": self.tx.snapshot(),
+            "side": self.side_state(),
+        }))
+        .context("serialize session")
+    }
+
+    fn store_path(&self) -> &std::path::PathBuf {
+        self.store.store_path()
     }
 
     fn side_state(&self) -> Value {

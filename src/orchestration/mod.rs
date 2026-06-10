@@ -3918,12 +3918,13 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
 
 const STATUS_RESULT_BUDGET_BYTES: usize = 16 * 1024;
 const STATUS_RECENT_EVENTS_BUDGET_BYTES: usize = 56 * 1024;
+const STATUS_REPORT_BUDGET_BYTES: usize = 8 * 1024;
 
 // `/control/status` is returned through `server/response.rs::cap_response_text`,
 // which caps MCP responses at 80 KiB. Keep the status producer comfortably below
-// that cap by budgeting the two chatty fields together: 16 KiB for the final
-// `result` tail, 56 KiB for serialized `recentEvents`, 2 KiB for `stderrTail`,
-// and the remaining space for snapshot/scalars/truncation metadata.
+// that cap by budgeting the chatty fields together: 16 KiB for the final
+// `result` tail, 56 KiB for serialized `recentEvents`, 8 KiB for `report`,
+// 2 KiB for `stderrTail`, and the remaining space for snapshot/scalars/metadata.
 fn budget_status_result(obj: &mut Value) {
     let Some(result) = obj.get("result").and_then(Value::as_str) else {
         return;
@@ -3940,6 +3941,54 @@ fn budget_status_result(obj: &mut Value) {
     obj["result"] = Value::String(format!("…{}", &result[start..]));
     obj["resultTruncated"] = Value::Bool(true);
     obj["resultBytes"] = Value::from(result_bytes);
+}
+
+/// Replace the `report` value with a compact envelope when its serialized form
+/// exceeds [`STATUS_REPORT_BUDGET_BYTES`]. Keeps the message field (char-safe
+/// tail, within budget) and attaches truncation metadata so callers can detect
+/// the compaction. The full report remains in `task_result_json` (data plane)
+/// unchanged.
+fn budget_status_report(obj: &mut Value) {
+    let Some(report) = obj.get("report") else {
+        return;
+    };
+    let report_str = serde_json::to_string(report).unwrap_or_default();
+    let report_bytes = report_str.len();
+    if report_bytes <= STATUS_REPORT_BUDGET_BYTES {
+        return;
+    }
+    let message = report
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // Reserve space for the envelope keys + numeric field. Over-estimate the
+    // integer width so a wide `reportBytes` doesn't overflow the budget.
+    let overhead = format!(
+        r#"{{"reportTruncated":true,"reportBytes":{},"message":""}}"#,
+        report_bytes
+    )
+    .len();
+    let msg_budget = STATUS_REPORT_BUDGET_BYTES.saturating_sub(overhead);
+    let msg_tail = tail_str_safe(&message, msg_budget);
+    obj["report"] = serde_json::json!({
+        "reportTruncated": true,
+        "reportBytes": report_bytes,
+        "message": msg_tail,
+    });
+}
+
+/// Return the tail of `s` that fits within `max_bytes` while staying on a
+/// char boundary.
+fn tail_str_safe(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
 }
 
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
@@ -3989,6 +4038,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
     };
 
     budget_status_result(&mut obj);
+    budget_status_report(&mut obj);
     // Typed wire snapshot. The flat taskId/sessionId/status/result fields above
     // already carry its task_id/session_id/status/last_message, and the fleet
     // cockpit reads dispatch facets (origin/managed_worktree/workflow_owned)
@@ -6014,6 +6064,51 @@ mod tests {
         apply_cwd_updates_from_event(&mut inner, &evt);
 
         assert_eq!(inner.cwd.as_deref(), Some("/repo/base"));
+    }
+
+    #[test]
+    fn report_truncated_when_oversized() {
+        let huge_message = "x".repeat(STATUS_REPORT_BUDGET_BYTES * 2);
+        let task = task_with(TaskStatus::Running, "", vec![]);
+        {
+            let mut inner = task.inner.lock();
+            inner.report = Some(BroReport {
+                message: huge_message.clone(),
+                needs: None,
+                data: None,
+                reported_at: now_ms(),
+            });
+        }
+        let json = task_status_json(&task, 0);
+        let report = &json["report"];
+        assert_eq!(report["reportTruncated"], true);
+        assert!(report["reportBytes"].as_u64().unwrap() > STATUS_REPORT_BUDGET_BYTES as u64);
+        let msg = report["message"].as_str().unwrap();
+        // Message must be a tail substring of the original and fit within budget.
+        assert!(huge_message.ends_with(msg));
+        assert!(msg.len() <= STATUS_REPORT_BUDGET_BYTES);
+        // The whole status object must still be valid JSON and under the 80K cap.
+        let status_str = serde_json::to_string(&json).unwrap();
+        assert!(status_str.len() <= 80 * 1024);
+    }
+
+    #[test]
+    fn report_unchanged_when_small() {
+        let task = task_with(TaskStatus::Running, "", vec![]);
+        {
+            let mut inner = task.inner.lock();
+            inner.report = Some(BroReport {
+                message: "short".into(),
+                needs: Some("input".into()),
+                data: None,
+                reported_at: now_ms(),
+            });
+        }
+        let json = task_status_json(&task, 0);
+        let report = &json["report"];
+        assert_eq!(report["message"], "short");
+        assert_eq!(report["needs"], "input");
+        assert!(report.get("reportTruncated").is_none());
     }
 }
 

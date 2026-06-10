@@ -154,12 +154,28 @@ impl BlackboxServer {
         Parameters(p): Parameters<ProjectRegisterParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
-        let result: anyhow::Result<String> = async {
-            let record = {
-                let mut projects = self.state.projects.write();
-                projects.register_path(&p.path)?
-            };
-            self.state.persist_projects_durable().await?;
+        // Phase 1: register + persist — light lock ops + async I/O on the runtime.
+        let res = {
+            let mut projects = self.state.projects.write();
+            projects.register_path(&p.path)
+        };
+        let record = match res {
+            Ok(record) => record,
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
+            }
+        };
+        if let Err(e) = self.state.persist_projects_durable().await {
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+            return Self::err_text(&format!("Error: {e:#}"));
+        }
+        // Phase 2: heavy fs work (MCP migration, config load, artifact discovery,
+        // provenance import, watcher, kb sync) on the blocking pool.
+        let server = self.clone();
+        let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
             orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(&record.canonical_path))?;
             let project_config = config::load_project(Path::new(&record.canonical_path))?;
             let project_config_loaded = true;
@@ -174,7 +190,7 @@ impl BlackboxServer {
             }
             // Auto-discover and install .bbox/ artifacts unless explicitly disabled.
             if project_config.artifacts.auto_discover != Some(false) {
-                let catalog = self.state.artifacts.read();
+                let catalog = server.state.artifacts.read();
                 match artifacts::discover_and_install_project_artifacts(
                     Path::new(&record.canonical_path),
                     &record.project_id,
@@ -193,7 +209,7 @@ impl BlackboxServer {
                     }
                 }
             }
-            let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
+            let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
             let provenance_params = ProvenanceParams {
                 project_id: Some(record.project_id.clone()),
             };
@@ -204,7 +220,7 @@ impl BlackboxServer {
             )?;
             // Register with the live .bbox/ watcher so future file changes
             // are picked up without a daemon restart.
-            if let Ok(mut guard) = self.state.bbox_watcher.lock() {
+            if let Ok(mut guard) = server.state.bbox_watcher.lock() {
                 if let Some(w) = guard.as_mut() {
                     if let Err(e) =
                         w.watch_project(&record.project_id, Path::new(&record.canonical_path))
@@ -217,9 +233,9 @@ impl BlackboxServer {
             // surface (project-scoped durable knowledge is repo-owned) and
             // enqueue its embeds so a freshly-cloned repo is vector-searchable
             // without a manual reembed.
-            crate::server::routes::sync_kb_project_roots(&self.state);
+            crate::server::routes::sync_kb_project_roots(&server.state);
             crate::server::routes::enqueue_project_knowledge_embeds(
-                &self.state,
+                &server.state,
                 &record.canonical_path,
             );
             // P1 backfill: retroactively emit observed tool-call edges for the
@@ -227,7 +243,7 @@ impl BlackboxServer {
             // in a background thread so the registration response is immediate.
             // Uses append_edges_dedup so re-running is safe.
             {
-                let reindex_cfg = self.state.idx.read().reindex_config();
+                let reindex_cfg = server.state.idx.read().reindex_config();
                 let project_for_backfill = record.clone();
                 std::thread::spawn(move || {
                     match index::backfill_tool_edges_for_project(
@@ -248,7 +264,7 @@ impl BlackboxServer {
                 });
             }
 
-            trigger_project_bootstrap_arc(self.state.clone(), record.clone());
+            trigger_project_bootstrap_arc(server.state.clone(), record.clone());
             let response = json!({
                 "record": record,
                 "project_config_loaded": project_config_loaded,
@@ -259,8 +275,11 @@ impl BlackboxServer {
                 },
             });
             Ok(serde_json::to_string_pretty(&response)?)
-        }
-        .await;
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+        .and_then(std::convert::identity);
+
         match result {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -279,11 +298,11 @@ impl BlackboxServer {
         name = "bbox_project_init",
         description = "Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories. Idempotent by default; set force=true to overwrite skeleton files while preserving subdirectory contents."
     )]
-    pub(crate) fn bbox_project_init(
+    pub(crate) async fn bbox_project_init(
         &self,
         Parameters(p): Parameters<ProjectInitParams>,
     ) -> CallToolResult {
-        Self::run("bbox_project_init", || {
+        Self::run_blocking("bbox_project_init", move || {
             let path = Path::new(&p.path);
             if !path.is_absolute() {
                 anyhow::bail!("project path must be absolute: {}", p.path);
@@ -298,6 +317,7 @@ impl BlackboxServer {
                 "skipped": result.skipped,
             }))?)
         })
+        .await
     }
 
     #[tool(
@@ -309,22 +329,37 @@ impl BlackboxServer {
         Parameters(p): Parameters<ProjectRenameParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
-        let result: anyhow::Result<String> = async {
-            let response = {
-                let mut projects = self.state.projects.write();
-                projects.rename_project(&p)?
-            };
-            if !response.dry_run {
-                self.state.persist_projects_durable().await?;
+        // Phase 1: rename in registry + async persist.
+        let res = {
+            let mut projects = self.state.projects.write();
+            projects.rename_project(&p)
+        };
+        let response = match res {
+            Ok(response) => response,
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
             }
+        };
+        if !response.dry_run {
+            if let Err(e) = self.state.persist_projects_durable().await {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
+                return Self::err_text(&format!("Error: {e:#}"));
+            }
+        }
+        // Phase 2: heavy fs migration + reindex on the blocking pool.
+        let server = self.clone();
+        let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
             let old_project = response.old_record.canonical_path.clone();
             let new_project = response.record.canonical_path.clone();
 
             let counts = if response.dry_run {
-                project_ref_counts(&self.state, &old_project)?
+                project_ref_counts(&server.state, &old_project)?
             } else {
                 let counts = migrate_project_refs(
-                    &self.state,
+                    &server.state,
                     &old_project,
                     &new_project,
                     &response.record,
@@ -332,20 +367,23 @@ impl BlackboxServer {
                 // Re-point kb roots at the new path now that migration has
                 // rewritten entries into the renamed repo's `.bbox/`, and
                 // re-enqueue embeds under the new path.
-                crate::server::routes::sync_kb_project_roots(&self.state);
-                crate::server::routes::enqueue_project_knowledge_embeds(&self.state, &new_project);
+                crate::server::routes::sync_kb_project_roots(&server.state);
+                crate::server::routes::enqueue_project_knowledge_embeds(
+                    &server.state,
+                    &new_project,
+                );
                 counts
             };
 
             let reindex = if response.dry_run {
                 None
             } else {
-                let result = self
+                let result = server
                     .state
                     .idx
                     .write()
                     .reindex(&ReindexParams { full: Some(false) })?;
-                self.rebuild_edge_index_from_stores();
+                server.rebuild_edge_index_from_stores();
                 Some(result)
             };
 
@@ -358,8 +396,11 @@ impl BlackboxServer {
                 "migrated_refs": counts,
                 "reindex": reindex,
             }))?)
-        }
-        .await;
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+        .and_then(std::convert::identity);
+
         match result {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -476,8 +517,10 @@ impl BlackboxServer {
         Parameters(p): Parameters<ProjectEjectParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
-        let result = (|| {
-            let record = self
+        let server = self.clone();
+        // Phase 1: fs + store work on the blocking pool.
+        let fs_result = tokio::task::spawn_blocking(move || {
+            let record = server
                 .state
                 .projects
                 .read()
@@ -488,19 +531,23 @@ impl BlackboxServer {
 
             // Ensure the project's repo is in kb roots so already-ejected files
             // are accounted for and the post-eject reload loads from the repo.
-            crate::server::routes::sync_kb_project_roots(&self.state);
+            crate::server::routes::sync_kb_project_roots(&server.state);
 
             let entries = if dry_run {
-                self.state.kb.read().count_project_entries(&dir)
+                server.state.kb.read().count_project_entries(&dir)
             } else {
-                self.state.kb.write().eject_project_to_repo(&dir)?
+                server.state.kb.write().eject_project_to_repo(&dir)?
             };
 
             Ok::<_, anyhow::Error>((record, dir, dry_run, entries))
-        })();
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task failed: {e}"))
+        .and_then(std::convert::identity);
 
-        match result {
+        match fs_result {
             Ok((record, dir, dry_run, entries)) => {
+                // Phase 2: await the kb persister durable ack on the runtime.
                 if !dry_run && let Err(e) = self.state.kb_persister.request_durable().await {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
                     tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %e, "err");

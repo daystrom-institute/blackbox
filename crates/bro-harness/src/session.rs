@@ -122,6 +122,11 @@ impl SessionStore {
         std::fs::write(&self.path, body).context("write session")?;
         Ok(())
     }
+
+    /// The filesystem path this store writes to.
+    pub fn store_path(&self) -> &PathBuf {
+        &self.path
+    }
 }
 
 #[cfg(test)]
