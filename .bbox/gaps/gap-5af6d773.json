@@ -16,8 +16,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/index/provider-transcript-indexing-removed",
+  "suggested_owner": "indexing agent (tmux default-socket session 5, wave-9 IndexWriterActor owner)",
+  "notes": "OWNERSHIP (operator, 2026-06-10): the indexing-side agent (tmux default socket session 5, owner of the wave-9 IndexWriterActor work on beta) has taken on historical/interactive transcript indexing, including this gap. The w8 agent (session 10) stands down on it; coordination context delivered to session 5 via tmux brief at ~17:15Z. Adapter reference implementation: src/transcripts/harness_sessions.rs (44a3bef).",
   "resolution": "unresolved",
   "thread_id": "thread-36035d25",
   "created_at": "2026-06-10T17:12:26Z",
-  "updated_at": "2026-06-10T17:12:26Z"
+  "updated_at": "2026-06-10T17:21:35Z"
 }
