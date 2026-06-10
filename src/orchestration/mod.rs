@@ -378,6 +378,12 @@ pub struct TaskInner {
     /// provider transcript-file cursors because `tail_tx` carries task summary
     /// events, not raw provider transcript records.
     pub live_cursor: u64,
+    /// Last wall-clock ms a roster update was emitted from the stream-delta
+    /// ingest path. Deltas arrive at token-chunk rate; rebuilding +
+    /// broadcasting a roster summary per chunk is pure overhead, so delta
+    /// ingest throttles roster emits to ~1/s (step-boundary events still
+    /// emit unconditionally). In-memory only.
+    pub last_delta_roster_emit_ms: u64,
     pub supervision: SupervisionState,
     /// Where this task was spawned FROM (Slice 1b of the daemon roster
     /// design). Persisted via `PersistedTask` so the origin survives a
@@ -705,6 +711,7 @@ mod roster_view_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Cockpit,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Cockpit),
@@ -1141,6 +1148,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -1443,6 +1451,7 @@ impl TaskStore {
                     transcript_location: rec.transcript_location,
                     transcript_cursor: rec.transcript_cursor,
                     live_cursor: rec.live_cursor,
+                    last_delta_roster_emit_ms: 0,
                     supervision: rec.supervision,
                     origin: rec.origin,
                     workflow_owned: rec
@@ -2046,6 +2055,7 @@ fn failed_duplicate_task(
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin,
             workflow_owned: workflow_owned_for_origin(origin),
@@ -2121,6 +2131,7 @@ pub fn spawn_in_process_task(
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin,
             workflow_owned: workflow_owned_for_origin(origin),
@@ -2389,7 +2400,9 @@ pub fn spawn_task(
 /// `gitdir: <base>/.git/worktrees/<name>`. Best-effort by contract — a
 /// missing/malformed fleet.json or unreadable cwd yields None, never an
 /// error. This runs once per dispatch at spawn, off the hot path.
-fn project_dispatch_shell_env(cwd: Option<&str>) -> Option<std::collections::BTreeMap<String, String>> {
+fn project_dispatch_shell_env(
+    cwd: Option<&str>,
+) -> Option<std::collections::BTreeMap<String, String>> {
     let cwd = std::path::Path::new(cwd?);
     let base = worktree_base_repo(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let cfg = bro_fleet_client::FleetConfig::load();
@@ -2664,6 +2677,36 @@ fn spawn_harness_in_process_task(
     task
 }
 
+/// Session id extraction matching `parse_claude_event`'s lookup paths —
+/// used to decide fork-acceptance BEFORE the (mutating) parse runs.
+fn emitted_session_id_from_event(evt: &Value) -> Option<String> {
+    evt["session_id"]
+        .as_str()
+        .or_else(|| evt["sessionId"].as_str())
+        .or_else(|| evt["message"]["session_id"].as_str())
+        .or_else(|| evt["message"]["sessionId"].as_str())
+        .map(|s| s.to_string())
+}
+
+/// Last `n` chars of `msg` (ellipsis-prefixed when truncated) in O(n) — this
+/// runs per ingested event, so it must not scan the whole accumulated
+/// message (`chars().count()` is O(message)).
+fn snippet_tail(msg: &str, n: usize) -> String {
+    let mut iter = msg.char_indices().rev();
+    let mut start = msg.len();
+    for _ in 0..n {
+        match iter.next() {
+            Some((i, _)) => start = i,
+            None => return msg.to_string(), // fits whole
+        }
+    }
+    if iter.next().is_some() {
+        format!("\u{2026}{}", &msg[start..])
+    } else {
+        msg.to_string()
+    }
+}
+
 fn ingest_harness_event(
     task: &Task,
     provider: Provider,
@@ -2672,22 +2715,17 @@ fn ingest_harness_event(
     task_id: &str,
     system_events: Option<crate::system_events::SharedEventHub>,
 ) {
-    let snippet_to_emit = {
+    // Stream deltas arrive at token-chunk rate while a bro streams (50+/s);
+    // everything inside the lock below must be O(chunk), never O(message) —
+    // per-delta O(accumulated-message) work measurably degraded runtime
+    // worker poll times (thread-935b467d §4.6 measurements).
+    let is_stream_delta = evt.get("type").and_then(Value::as_str) == Some("stream_event");
+    let (snippet_to_emit, emit_roster) = {
         let mut inner = task.inner.lock();
-        inner.events.push(evt.clone());
-        let mut sink = EventSink {
-            last_assistant_message: inner.last_assistant_message.clone(),
-            usage: inner.usage.clone(),
-            cost_usd: inner.cost_usd,
-            num_turns: inner.num_turns,
-            session_id: if inner.session_id != "pending" {
-                Some(inner.session_id.clone())
-            } else {
-                None
-            },
-        };
-        provider.parse_event(&evt, &mut sink);
-        let emitted_session_id = sink.session_id.clone();
+        // Decide fork-acceptance BEFORE parsing so the parse can mutate the
+        // task's accumulated message in place (taken, not cloned) — a
+        // rejected forked event must never touch it.
+        let emitted_session_id = emitted_session_id_from_event(&evt);
         let mut accepted = true;
         let mut session_id_observed = false;
         if let Some(sid) = emitted_session_id {
@@ -2700,6 +2738,21 @@ fn ingest_harness_event(
             }
         }
         if accepted {
+            let mut sink = EventSink {
+                // Zero-copy seed: take the accumulated message so delta
+                // appends are amortized O(chunk). apply_sink_updates below
+                // (unconditional on this path) writes it back.
+                last_assistant_message: inner.last_assistant_message.take(),
+                usage: inner.usage.clone(),
+                cost_usd: inner.cost_usd,
+                num_turns: inner.num_turns,
+                session_id: if inner.session_id != "pending" {
+                    Some(inner.session_id.clone())
+                } else {
+                    None
+                },
+            };
+            provider.parse_event(&evt, &mut sink);
             apply_cwd_updates_from_event(&mut inner, &evt);
             inner.supervision.observe_event(&evt, &sink, now_ms());
             apply_sink_updates(&mut inner, sink);
@@ -2721,19 +2774,31 @@ fn ingest_harness_event(
                     inner.stderr.push('\n');
                 }
             }
+            // Store the event LAST so it moves instead of deep-cloning.
+            // Stream deltas are not stored at all: every ring consumer
+            // either filters them at read time (compact_status_event) or
+            // skips them structurally (no message/model field) — see the
+            // wave-15 consumer inventory in thread-935b467d. Storing one
+            // per text chunk made the 512-slot ring all-deltas under
+            // streaming and deep-cloned every chunk.
+            if !is_stream_delta {
+                inner.events.push(evt);
+            }
         }
-        accepted
+        // Roster summaries rebuild + broadcast per emit; throttle the
+        // delta-rate path to ~1/s (step-boundary events always emit).
+        let now = now_ms();
+        let emit_roster = !is_stream_delta
+            || session_id_observed
+            || now.saturating_sub(inner.last_delta_roster_emit_ms) >= 1000;
+        if is_stream_delta && emit_roster {
+            inner.last_delta_roster_emit_ms = now;
+        }
+        let snippet = accepted
             .then(|| {
                 inner.last_assistant_message.as_ref().map(|msg| {
                     const TAIL_CHARS: usize = 160;
-                    let count = msg.chars().count();
-                    if count > TAIL_CHARS {
-                        let skip = count - TAIL_CHARS;
-                        let tail: String = msg.chars().skip(skip).collect();
-                        format!("…{tail}")
-                    } else {
-                        msg.clone()
-                    }
+                    snippet_tail(msg, TAIL_CHARS)
                 })
             })
             .flatten()
@@ -2746,10 +2811,13 @@ fn ingest_harness_event(
                 };
                 (snippet, session_id_observed, cursor)
             })
-            .or_else(|| session_id_observed.then(|| (String::new(), true, None)))
+            .or_else(|| session_id_observed.then(|| (String::new(), true, None)));
+        (snippet, emit_roster)
     };
 
-    task.emit_roster_updated();
+    if emit_roster {
+        task.emit_roster_updated();
+    }
 
     if let Some((snippet, session_id_observed, cursor)) = snippet_to_emit {
         if session_id_observed {
@@ -2766,7 +2834,11 @@ fn ingest_harness_event(
             task_id: task_id.to_string(),
             activity: snippet.clone(),
         });
-        if let Some(ref hub) = system_events {
+        // System events journal every emit (fs append + reaction matching);
+        // a task.progress per text DELTA wrote one journal line per token
+        // chunk (20,495 of 20,513 prod journal lines were task.progress).
+        // Step-boundary events still emit at turn cadence.
+        if !is_stream_delta && let Some(ref hub) = system_events {
             emit_task_progress_event(hub, task_id.to_string(), snippet);
         }
     }
@@ -3204,6 +3276,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     transcript_location: None,
                     transcript_cursor: None,
                     live_cursor: 0,
+                    last_delta_roster_emit_ms: 0,
                     supervision: SupervisionState::default(),
                     origin,
                     workflow_owned: workflow_owned_for_origin(origin),
@@ -3262,6 +3335,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin,
             workflow_owned: workflow_owned_for_origin(origin),
@@ -4903,6 +4977,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -5343,6 +5418,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -5377,6 +5453,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -5429,6 +5506,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -5450,6 +5528,137 @@ mod tests {
         let inner = task.inner.lock();
         assert!(matches!(inner.status, TaskStatus::Failed));
         assert!(inner.stderr.contains("400 Bad Request: boom"));
+    }
+
+    fn mk_ingest_task(id: &str, session_id: &str) -> Arc<Task> {
+        Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: id.to_string(),
+                provider: Provider::Minimax,
+                session_id: session_id.to_string(),
+                events: EventRing::new(),
+                model: None,
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Running,
+                started_at: now_ms(),
+                completed_at: None,
+                exit_code: None,
+                cwd: None,
+                managed_worktree: None,
+                bro_label: None,
+                name: None,
+                agent_label: None,
+                report: None,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
+                supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+            roster_events: None,
+        })
+    }
+
+    #[test]
+    fn ingest_stream_deltas_accumulate_without_ring_storage() {
+        // Wave 15: text deltas mutate the accumulated message via the taken
+        // (not cloned) buffer, and stream_event envelopes are NOT stored in
+        // the event ring — only step-boundary events are.
+        let task = mk_ingest_task("task-deltas", "sess-d");
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let delta = |text: &str| {
+            serde_json::json!({
+                "type": "stream_event",
+                "session_id": "sess-d",
+                "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}},
+            })
+        };
+        ingest_harness_event(
+            &task,
+            Provider::Minimax,
+            delta("hel"),
+            &tx,
+            "task-deltas",
+            None,
+        );
+        ingest_harness_event(
+            &task,
+            Provider::Minimax,
+            delta("lo"),
+            &tx,
+            "task-deltas",
+            None,
+        );
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "session_id": "sess-d",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        });
+        ingest_harness_event(
+            &task,
+            Provider::Minimax,
+            assistant,
+            &tx,
+            "task-deltas",
+            None,
+        );
+
+        let inner = task.inner.lock();
+        assert_eq!(inner.last_assistant_message.as_deref(), Some("hello"));
+        let stored: Vec<&str> = inner
+            .events
+            .iter()
+            .filter_map(|e| e["type"].as_str())
+            .collect();
+        assert_eq!(stored, vec!["assistant"], "only step events stored");
+    }
+
+    #[test]
+    fn ingest_forked_session_event_leaves_message_and_ring_untouched() {
+        // The fork-acceptance decision now happens BEFORE parse, so a
+        // rejected forked event must neither mutate the accumulated message
+        // (which is taken, not cloned, on the accept path) nor be stored.
+        let task = mk_ingest_task("task-fork", "sess-real");
+        task.inner.lock().last_assistant_message = Some("real text".to_string());
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let forked = serde_json::json!({
+            "type": "stream_event",
+            "session_id": "sess-FORK",
+            "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "evil"}},
+        });
+        ingest_harness_event(&task, Provider::Minimax, forked, &tx, "task-fork", None);
+
+        let inner = task.inner.lock();
+        assert_eq!(inner.last_assistant_message.as_deref(), Some("real text"));
+        assert!(inner.events.iter().count() == 0, "forked event not stored");
+        assert!(matches!(inner.status, TaskStatus::Failed));
+        assert!(inner.stderr.contains("session fork detected"));
+    }
+
+    #[test]
+    fn snippet_tail_is_bounded_and_char_safe() {
+        assert_eq!(snippet_tail("short", 160), "short");
+        let long: String = "x".repeat(200);
+        let tail = snippet_tail(&long, 160);
+        assert!(tail.starts_with('\u{2026}'));
+        assert_eq!(tail.chars().count(), 161);
+        // Multibyte boundary safety.
+        let uni: String = "é".repeat(200);
+        let tail = snippet_tail(&uni, 160);
+        assert!(tail.starts_with('\u{2026}'));
+        assert_eq!(tail.chars().count(), 161);
+        // Exactly n chars: no ellipsis.
+        let exact: String = "y".repeat(160);
+        assert_eq!(snippet_tail(&exact, 160), exact);
     }
 
     #[test]
@@ -5482,6 +5691,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -5620,7 +5830,9 @@ mod tests {
         let defaults = ctx.tool_arg_defaults().expect("session default");
         assert_eq!(defaults.len(), 1);
         assert_eq!(
-            defaults.get("default:mcp.bbox_note.session_id").map(String::as_str),
+            defaults
+                .get("default:mcp.bbox_note.session_id")
+                .map(String::as_str),
             Some("sess-abc")
         );
 
@@ -5929,6 +6141,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6024,6 +6237,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6076,6 +6290,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6128,6 +6343,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6182,6 +6398,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6248,6 +6465,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6302,6 +6520,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6404,6 +6623,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6444,6 +6664,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6490,6 +6711,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6532,6 +6754,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
@@ -6586,6 +6809,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),

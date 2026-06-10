@@ -10,6 +10,17 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Stream-delta ingest no longer does O(message) work per token chunk on the
+  daemon's async runtime. Per accepted event the ingest path: seeds the
+  parse sink by taking (not cloning) the accumulated assistant message,
+  computes the live-tail snippet in O(tail) instead of O(message), stores
+  the event by move instead of deep clone — and stream_event envelopes are
+  no longer stored in the per-task event ring at all (every consumer
+  already filtered or structurally skipped them). Roster summaries throttle
+  to ~1/s on the delta path, and `task.progress` system events are emitted
+  only at step boundaries — previously every text delta appended a line to
+  the system-events journal (99.9% of the production journal was
+  task.progress).
 - The harness sidecar event log no longer writes on the daemon's async
   runtime: appends enqueue on a bounded channel drained by a dedicated
   writer thread (serialization + ordered `write_all` happen there), with a
