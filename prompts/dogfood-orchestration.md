@@ -155,10 +155,58 @@ decide, and steer/resume. A blocker in one track often reshapes another.
    by explicit path (the repo's multi-tenant working-tree invariant).
 6. **Mind build contention.** N build-heavy bros serialize on the shared build
    lock; per-worktree `target/` + sccache mitigate it, but keep concurrent
-   build-heavy bros few and prefer `cargo check` over full builds.
+   build-heavy bros few and prefer `cargo check` over full builds. The full
+   measured economics live in **Dispatch economics** below.
 7. **Verify single-process before trusting a display.** Orphan cockpits dueling
    over a shared fleet store corrupt state and make "validations" lie. Confirm
    one cockpit per store.
+
+## Dispatch economics — where bro wall-clock actually goes
+
+Measured across nine ~10–50 min code-wave bro runs (thread-935b467d postmortem,
+2026-06-09). The intuitive read — "the bro is slow because it's poll-spamming" —
+is **wrong**: polls *fill* compile time, they don't extend it (poll cadence runs
+at model latency underneath cargo; poll count is a consequence of compile wall
+time, not a cause). The real decomposition, dominant term first:
+
+1. **Σ cargo wall time** — a single conversion wave ran 10–14 cargo invocations
+   (multi-suite validation, a rustfmt→revalidate loop, timeout-killed compiles
+   restarted from scratch), ×2 under build-lock contention with a peer bro.
+   This is ~60–80% of a cargo-heavy run. **Levers, in order:**
+   - Brief **one full validation pass at the end**; mid-flight gate is
+     `cargo check` (or one targeted test) only.
+   - **No rustfmt in the bro loop** — the orchestrator formats at fold. Every
+     bro-side rustfmt pass risks reflow drift outside its hunks, and the
+     revert+revalidate loop costs a full extra compile cycle. (The same file
+     was drift-reflowed by four different bros in one campaign.)
+   - **Long command timeouts upfront** (cargo: 600s+). A timeout-killed compile
+     restarts from scratch — the one way waiting truly becomes wasted wall.
+   - **Sequential drivers for cargo-heavy tranches** (or per-worktree
+     `target/`). Two build-heavy bros in one tree do not parallelize the
+     compile-bound majority — they serialize on the lock and cross-contaminate
+     each other's validation runs.
+   - **`RUSTC_WRAPPER=sccache` in the brief** for full rebuilds (RUSTFLAGS
+     matrix flips, release builds). Note: `bro_exec` dispatches do NOT inherit
+     `fleet.json` `project_dispatch` env — that auto-load is the fleet-cockpit
+     path only — so the brief must carry it. sccache barely helps incremental
+     dev test cycles; fewer executions is the lever there.
+2. **Work-turn latency** — 80–130 genuine turns × 8–28s. `effort=high` pays a
+   reasoning premium on *every* turn including no-op waits; use
+   **`effort=medium` for mechanical waves**, `high` only where the brief demands
+   analysis (consumer inventories, interleaving arguments).
+3. **Token/context tax, not wall tax** — the deferred-tool-catalog re-injection
+   (~7–12K fresh tokens/turn; gap-8a6f752c) and shell-poll turn churn
+   (gap-c6dbc03f) burn budget and bloat context until **mid-run compaction**
+   fires — a quality risk and re-read cost, but mostly absorbed into compile
+   waits on the wall clock. File them as cost/quality fixes, not speed fixes.
+
+**Postmortem instrumentation** (until gap-4629bbeb lands): per-run usage ledger
+(`elapsed / numTurns / fresh-vs-cached input`) gives turn pacing; the harness
+session snapshot (`~/.bro-harness/sessions/<sessionId>.json`) gives the
+tool-call mix (e.g. 82/133 calls = `shell_poll` in one retained window) — but
+items carry **no timestamps** and compaction rewrites the file, so true
+time-bucketing needs the observability gap fixed. Harness tasks currently have
+`transcript_location: null`; the transcript corpus cannot see bro work.
 
 ## Validation & fold gates
 
