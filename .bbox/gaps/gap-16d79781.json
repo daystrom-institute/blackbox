@@ -16,8 +16,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/worktree-cwd-override",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-9dfe1da5",
   "created_at": "2026-06-10T06:10:29Z",
-  "updated_at": "2026-06-10T18:54:18Z"
+  "updated_at": "2026-06-10T22:42:21Z",
+  "resolved_at": "2026-06-10T22:42:21Z",
+  "resolution_note": "All three facets fixed and live-probed. Facet 1 (in-session worktree creation → file tools sticky to launch root): closed by a72a216 (host-owned worktree creation, in-session fails closed) + project_dir→--cwd→ToolCx.root wiring; positive probe d09ad4f8 confirmed relative file writes confine to the dispatched worktree. Facet 2 (silent unknown-param drop): 830c2c0 deny_unknown_fields + cwd alias on ExecParams/ResumeParams, extended by 4dda50a to all 48 bro param structs after a third same-day incident (bro_wait timeout_secs misspelling → unbounded wait); live-verified when the fresh binary loudly rejected the verifier's own misnamed param. Facet 3 ($HOME default): 830c2c0 scratch-dir fail-closed at the spawn choke point — no project_dir ⇒ per-task <store>/scratch/<task-id>, never the daemon's process cwd. Forward work (pin:*.project_dir population so wrong-tree model args get refused, not just defaulted) tracked in thread-55d51135 / design/bro-harness/tool-arg-defaulting.md."
 }
