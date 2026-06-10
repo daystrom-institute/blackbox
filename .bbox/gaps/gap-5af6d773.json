@@ -18,8 +18,10 @@
   "dedupe_key": "tooling/index/provider-transcript-indexing-removed",
   "suggested_owner": "indexing agent (tmux default-socket session 5, wave-9 IndexWriterActor owner)",
   "notes": "OWNERSHIP (operator, 2026-06-10): the indexing-side agent (tmux default socket session 5, owner of the wave-9 IndexWriterActor work on beta) has taken on historical/interactive transcript indexing, including this gap. The w8 agent (session 10) stands down on it; coordination context delivered to session 5 via tmux brief at ~17:15Z. Adapter reference implementation: src/transcripts/harness_sessions.rs (44a3bef).",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-36035d25",
   "created_at": "2026-06-10T17:12:26Z",
-  "updated_at": "2026-06-10T17:21:35Z"
+  "updated_at": "2026-06-10T18:28:10Z",
+  "resolved_at": "2026-06-10T18:28:10Z",
+  "resolution_note": "Interactive Claude/Codex/Gemini adapters restored on beta (8cf46ed) and deployed 2026-06-10 ~18:15Z. Design: TranscriptSource { Harness(Provider) | Claude | Codex | Gemini } decouples transcript identity from dispatch Provider (no dispatch variants resurrected; serde wire-compatible with old label strings/field names). Adapters ported from fef32d2^ into src/transcripts/interactive.rs against the registry contract; all source roots explicit in ReindexConfig (gemini_tmp_root joins harness_sessions_dir's hermetic-by-default contract); from_runtime_config stays harness-only. Companion fixes shipped in the same restart: BufWriter on edge/snapshot writes (613dca2 — pre-fix project phase 58.7min for 41 files, post-fix 27.8s for 16) and the w8 agent's purge-scan fix (7bd118f). LIVE EVIDENCE: first post-deploy pass indexed 604 transcript files / 76,625 docs in ~5min (June 2–10 interactive backfill), purged 0; bbox_search returns hits from a 2026-06-10 15:34Z interactive Claude session (account=claude). needs_reindex churn from live interactive sessions is productive again."
 }
