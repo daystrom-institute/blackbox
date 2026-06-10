@@ -10,6 +10,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- The harness sidecar event log no longer writes on the daemon's async
+  runtime: appends enqueue on a bounded channel drained by a dedicated
+  writer thread (serialization + ordered `write_all` happen there), with a
+  turn-boundary flush bounding the crash-durability gap to the current
+  turn. Previously every protocol event paid a full-envelope serialize +
+  sync write inline in the agent loop (40–65 events/sec while a bro
+  streams, events up to ~100KB).
 - In-process harness tool execution no longer blocks the daemon's async
   runtime: the sync-bodied builtins (`content_search`, `glob`,
   `sandbox_status`, `sandbox_grounding` — tree walks, capped reads, sync git
