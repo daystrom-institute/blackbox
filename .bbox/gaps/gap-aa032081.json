@@ -1,0 +1,23 @@
+{
+  "id": "gap-aa032081",
+  "title": "Thinking-only terminal turn ends session as success with stale text as result (empty_output_stop detector blind)",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "A session whose model emits a thinking-only turn (no text, no tool_use) must not terminate as a clean success carrying stale mid-work narration as its result. Either auto-continue once (nudge the model to act/produce the final answer), or surface the empty-output stop in the result envelope (subtype/flag) so orchestrators see the deliverable is missing.",
+  "missing_primitive": "Correct empty-output detection at turn end. Today `empty_output_stop` (agent_loop.rs:1515-1517) tests `final_text`, but `final_text` is assigned only on text-producing turns (agent_loop.rs:1172) — it is the LAST NON-EMPTY text of the whole session, not the terminal turn's text. Any session that narrated at least once can silently end on a thinking-only/empty turn with empty_output_stop=false, no suspicious-turn-end warning, and `result` = stale narration. The predicate needs the terminal turn's own text (track last_turn_text separately), and the suspicion needs to reach the result envelope — currently it only fires a tracing warn + diagnostics event when suspicious (agent_loop.rs:1396-1400).",
+  "fallback_used": "Orchestrator-side: treat hasResult/completed as untrusted; verify the deliverable exists in the final message and bro_resume the session to demand the report when missing (worked — resume task 7d826c32 produced it).",
+  "evidence": [
+    "Live repro 2026-06-10: deepseek-v4-pro session 557fdac2-9ce5-410f-9406-486aa12071f8 task 27f6c86d — invariant-audit run ended at 38 turns subtype=success; terminal assistant event (events.jsonl line 77) contained ONLY a 9,499-char thinking block (likely output-token cap mid-thinking); result field = stale narration from an earlier turn; orchestrator received completed-with-result and the actual report was never produced (session had to be bro_resume'd).",
+    "crates/bro-harness/src/agent_loop.rs:1172 (final_text only updated on text turns)",
+    "crates/bro-harness/src/agent_loop.rs:1515-1517 (empty_output_stop tests session-stale final_text)",
+    "crates/bro-harness/src/agent_loop.rs:1396-1402 (suspicion only logged, result envelope unconditionally success)",
+    "Secondary observability hole: persisted assistant events carry stop_reason=None/usage=None — the daemon-side envelope drops the fields needed to distinguish max_tokens cuts from natural stops (harness tracks last_model_stop internally but only emits it in suspicious turn_end diagnostics)."
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/thinking-only-turn-terminates-success",
+  "suggested_owner": "bro-harness / harness-dispatch-economics thread (9dfe1da5) — peer's active area, coordinate before editing agent_loop.rs",
+  "resolution": "unresolved",
+  "created_at": "2026-06-10T21:53:46Z",
+  "updated_at": "2026-06-10T21:53:46Z"
+}
