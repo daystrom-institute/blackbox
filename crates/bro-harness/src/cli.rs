@@ -113,6 +113,13 @@ pub struct Cli {
     #[arg(long = "additional-context")]
     pub additional_context: Option<String>,
 
+    /// Host-supplied NON-SECRET env overlay for shell children, as a JSON
+    /// string map (e.g. '{"RUSTC_WRAPPER":"sccache"}'). Separate lane from
+    /// transport/session env: build env reaches shells, credentials do not.
+    /// Env fallback: `BRO_HARNESS_SHELL_ENV`.
+    #[arg(long = "shell-env")]
+    pub shell_env: Option<String>,
+
     // --- accepted, no-op (we always stream NDJSON; safety is the denylist) ---
     #[arg(long = "verbose", default_value_t = false)]
     pub verbose: bool,

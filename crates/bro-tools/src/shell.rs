@@ -368,7 +368,7 @@ where
 /// Apply the standard child-process environment for a non-interactive shell
 /// command: augmented PATH, clean/uncolored output, and the host scrub set.
 /// Per-command `args.env` is layered on top by the caller and wins.
-fn apply_child_env(cmd: &mut tokio::process::Command) {
+fn apply_child_env(cmd: &mut tokio::process::Command, shell_env: &std::collections::BTreeMap<String, String>) {
     // Non-interactive execution: deterministic, uncolored output for the model.
     cmd.env("NO_COLOR", "1");
     cmd.env("FORCE_COLOR", "0");
@@ -382,6 +382,12 @@ fn apply_child_env(cmd: &mut tokio::process::Command) {
             cmd.env_remove(k);
         }
     });
+    // Host-supplied non-secret overlay (ToolCx::shell_env), applied after the
+    // scrub so an explicit host choice is never scrubbed away. Callers apply
+    // the model's per-call `env` after this, so the model still wins.
+    for (k, v) in shell_env {
+        cmd.env(k, v);
+    }
 }
 
 fn augmented_path_env(
@@ -479,7 +485,7 @@ impl Tool for ShellRun {
             // (codex-rs does the equivalent via setsid/setpgid in pre_exec).
             // kill_on_drop alone only reaps the direct bash child.
             .process_group(0);
-        apply_child_env(&mut cmd);
+        apply_child_env(&mut cmd, &cx.shell_env);
         for (k, v) in &args.env {
             cmd.env(k, v);
         }
@@ -835,6 +841,7 @@ mod tests {
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(crate::tool_defaults::ToolArgDefaults::default()),
+            shell_env: Arc::new(Default::default()),
         }
     }
 
@@ -843,6 +850,42 @@ mod tests {
             ToolResult::Json(v) => v,
             other => panic!("expected json, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn shell_env_overlay_reaches_children_and_model_env_wins() {
+        let mut cx = cx();
+        cx.shell_env = Arc::new(std::collections::BTreeMap::from([(
+            "ENV_UNIFY_PROBE".to_string(),
+            "from-host".to_string(),
+        )]));
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "echo $ENV_UNIFY_PROBE"}), &cx)
+                .await,
+        );
+        assert_eq!(v["exit_code"], 0);
+        assert!(
+            v["stdout"].as_str().unwrap_or("").contains("from-host"),
+            "host shell_env must reach shell children: {v}"
+        );
+
+        // Model-supplied per-call env takes precedence over the host overlay.
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({
+                        "command": "echo $ENV_UNIFY_PROBE",
+                        "env": {"ENV_UNIFY_PROBE": "from-model"}
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(
+            v["stdout"].as_str().unwrap_or("").contains("from-model"),
+            "per-call env must win over the host overlay: {v}"
+        );
     }
 
     #[tokio::test]

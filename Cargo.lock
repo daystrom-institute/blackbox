@@ -528,6 +528,7 @@ dependencies = [
  "bincode",
  "bro-capabilities",
  "bro-core",
+ "bro-fleet-client",
  "bro-harness",
  "bro-protocol",
  "bro-tools",

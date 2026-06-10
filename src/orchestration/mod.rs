@@ -2381,6 +2381,44 @@ pub fn spawn_task(
     )
 }
 
+/// Resolve the project's opt-in dispatch shell env (fleet.json
+/// `project_dispatch`, e.g. `RUSTC_WRAPPER=sccache`) for a task cwd.
+///
+/// Worktree cwds map to their base repository first (fleet.json keys are
+/// canonical repo paths): a linked worktree's `.git` is a file containing
+/// `gitdir: <base>/.git/worktrees/<name>`. Best-effort by contract — a
+/// missing/malformed fleet.json or unreadable cwd yields None, never an
+/// error. This runs once per dispatch at spawn, off the hot path.
+fn project_dispatch_shell_env(cwd: Option<&str>) -> Option<std::collections::BTreeMap<String, String>> {
+    let cwd = std::path::Path::new(cwd?);
+    let base = worktree_base_repo(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let cfg = bro_fleet_client::FleetConfig::load();
+    let env = cfg.project_dispatch_for(&base)?.env.clone();
+    (!env.is_empty()).then_some(env)
+}
+
+/// Map a linked-worktree path to its base repository (the directory whose
+/// `.git` *directory* backs the worktree). Returns None for non-worktrees.
+fn worktree_base_repo(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dot_git = path.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = raw.strip_prefix("gitdir:")?.trim();
+    // <base>/.git/worktrees/<name> → <base>
+    let p = std::path::Path::new(gitdir);
+    let worktrees = p.parent()?; // .../.git/worktrees
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let git_dir = worktrees.parent()?; // .../.git
+    if git_dir.file_name()? != ".git" {
+        return None;
+    }
+    git_dir.parent().map(|b| b.to_path_buf())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_task_with_tool_placement(
     task_id: String,
@@ -2425,6 +2463,12 @@ pub fn spawn_task_with_tool_placement(
             }
         }
     });
+    // Project-scoped dispatch env (fleet.json project_dispatch): the harness
+    // lane carries it as ToolCx::shell_env (shell children only — never the
+    // transport/session env); CLI providers get it merged into the child
+    // process env below. Resolved here so every dispatch path — bro_exec,
+    // agent dispatch, workflows, cockpit — behaves identically.
+    let dispatch_shell_env = project_dispatch_shell_env(cwd.as_deref());
     if matches!(
         provider,
         Provider::Glm
@@ -2440,6 +2484,7 @@ pub fn spawn_task_with_tool_placement(
             session_id,
             cwd,
             env_overrides,
+            dispatch_shell_env,
             store_dir,
             task_store,
             tail_tx,
@@ -2452,6 +2497,19 @@ pub fn spawn_task_with_tool_placement(
             origin,
         );
     }
+
+    // CLI providers: shells inherit the spawned child's process env, so the
+    // project dispatch env merges into env_overrides directly.
+    let env_overrides = match dispatch_shell_env {
+        Some(extra) => {
+            let mut merged = env_overrides.unwrap_or_default();
+            for (k, v) in extra {
+                merged.entry(k).or_insert(v);
+            }
+            Some(merged)
+        }
+        None => env_overrides,
+    };
 
     if let Err(err) = task_store.write().reserve_id(&task_id) {
         if let Some(existing) = task_store.read().get(&task_id) {
@@ -2497,6 +2555,7 @@ fn spawn_harness_in_process_task(
     session_id: String,
     cwd: Option<String>,
     env_overrides: Option<HashMap<String, String>>,
+    shell_env: Option<std::collections::BTreeMap<String, String>>,
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
@@ -2570,6 +2629,7 @@ fn spawn_harness_in_process_task(
                 args,
                 cwd,
                 env_overrides,
+                shell_env,
                 callback,
                 control_rx,
                 mcp_config,
@@ -2716,6 +2776,7 @@ async fn run_harness_in_process(
     args: Vec<String>,
     cwd: Option<String>,
     env_overrides: Option<HashMap<String, String>>,
+    shell_env: Option<std::collections::BTreeMap<String, String>>,
     callback: bro_harness::emit::EventCallback,
     input_rx: bro_harness::agent_loop::SessionInputReceiver,
     mcp_config: Option<bro_harness::mcp::McpConfig>,
@@ -2755,6 +2816,7 @@ async fn run_harness_in_process(
                 callback,
                 mcp_config,
                 tool_defaults,
+                shell_env,
             ),
         ),
     )
@@ -5517,6 +5579,33 @@ mod tests {
         assert!(out.contains("bro: executor"));
         assert!(out.contains("do stuff"));
         assert!(!out.contains("STRUCTURED SIDE CHANNEL"));
+    }
+
+    #[test]
+    fn worktree_base_repo_maps_linked_worktrees_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        // Linked worktree: .git is a FILE pointing into <base>/.git/worktrees/<n>.
+        let base = root.join("repo");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(base.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", base.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        assert_eq!(super::worktree_base_repo(&wt), Some(base.clone()));
+
+        // Primary checkout (.git is a directory) is not a linked worktree.
+        assert_eq!(super::worktree_base_repo(&base), None);
+
+        // Malformed gitdir file: fail closed to None.
+        let bad = root.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join(".git"), "gitdir: /nowhere/special\n").unwrap();
+        assert_eq!(super::worktree_base_repo(&bad), None);
     }
 
     #[test]

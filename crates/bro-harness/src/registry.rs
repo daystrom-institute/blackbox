@@ -439,6 +439,7 @@ mod tests {
             edits: Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(defaults),
+            shell_env: Arc::new(Default::default()),
         }
     }
 

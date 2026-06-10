@@ -1156,27 +1156,4 @@ Trailing paragraph.";
         );
     }
 
-    /// Leading edge: project-declared dispatch env (e.g. sccache) is merged into
-    /// the worktree env, but reserved BRO_FLEET_* vars are never clobbered.
-    #[test]
-    fn apply_dispatch_env_adds_project_env_without_clobbering_reserved() {
-        let mut env = std::collections::HashMap::new();
-        env.insert(
-            "BRO_FLEET_BASE_REPO".to_string(),
-            "/repo".to_string(),
-        );
-        let mut project = std::collections::BTreeMap::new();
-        project.insert("RUSTC_WRAPPER".to_string(), "sccache".to_string());
-        // A project entry must NOT be able to override a reserved fleet var.
-        project.insert(
-            "BRO_FLEET_BASE_REPO".to_string(),
-            "/evil".to_string(),
-        );
-        apply_dispatch_env(&mut env, &project);
-        assert_eq!(env.get("RUSTC_WRAPPER").map(String::as_str), Some("sccache"));
-        assert_eq!(
-            env.get("BRO_FLEET_BASE_REPO").map(String::as_str),
-            Some("/repo"),
-            "reserved BRO_FLEET_* must win over project_dispatch"
-        );
-    }
+    

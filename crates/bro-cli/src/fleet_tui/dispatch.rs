@@ -424,8 +424,10 @@ pub(super) fn prepare_dispatch_worktree(
     // (or any language-specific build env). Each worktree gets its own target dir
     // (the cargo default), so concurrent worktree builds never serialize on a
     // shared build lock, and the cockpit stays project-agnostic. Project-specific
-    // dispatch env is opt-in via fleet.json `project_dispatch` (merged below).
-    merge_project_dispatch_env(&mut env, &git_root);
+    // dispatch env (fleet.json `project_dispatch`) is resolved DAEMON-SIDE at
+    // task spawn — keyed by the task cwd, worktree→base-repo aware — so every
+    // dispatch path (cockpit, bro_exec, agent dispatch, workflows) gets it and
+    // it lands in the harness shell-env lane, not the transport session env.
     let env_overrides = Some(env);
 
     let grounding = format!(
@@ -498,7 +500,7 @@ pub(super) fn resume_env_overrides(
     env.insert("BRO_FLEET_WORKTREE_BRANCH".to_string(), branch);
     // Per-worktree build isolation on resume too — no shared CARGO_TARGET_DIR.
     // Project-specific dispatch env is merged from fleet.json `project_dispatch`.
-    merge_project_dispatch_env(&mut env, &base_repo);
+    // project_dispatch env now resolved daemon-side at spawn (see above).
     Some(env)
 }
 
@@ -506,24 +508,6 @@ pub(super) fn resume_env_overrides(
 /// canonical repo path) into the worktree dispatch env. Best-effort: a missing or
 /// malformed `fleet.json` must never block a dispatch, and reserved `BRO_FLEET_*`
 /// vars (already inserted) are never overridden.
-fn merge_project_dispatch_env(env: &mut HashMap<String, String>, repo: &Path) {
-    if let Some(dispatch) = FleetConfig::load().project_dispatch_for(repo) {
-        apply_dispatch_env(env, &dispatch.env);
-    }
-}
-
-/// Merge project-declared env into the dispatch env without clobbering reserved
-/// `BRO_FLEET_*` vars (already present). Pure half of
-/// [`merge_project_dispatch_env`] so the precedence is unit-testable.
-pub(super) fn apply_dispatch_env(
-    env: &mut HashMap<String, String>,
-    project_env: &std::collections::BTreeMap<String, String>,
-) {
-    for (k, v) in project_env {
-        env.entry(k.clone()).or_insert_with(|| v.clone());
-    }
-}
-
 pub(super) fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .arg("-C")

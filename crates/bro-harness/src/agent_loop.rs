@@ -132,7 +132,7 @@ pub async fn run_with_event_callback_and_input(
     input_rx: SessionInputReceiver,
     callback: EventCallback,
 ) -> Result<()> {
-    run_with_event_callback_and_input_mcp(cli, input_rx, callback, None, None).await
+    run_with_event_callback_and_input_mcp(cli, input_rx, callback, None, None, None).await
 }
 
 pub async fn run_with_event_callback_and_input_mcp(
@@ -141,8 +141,17 @@ pub async fn run_with_event_callback_and_input_mcp(
     callback: EventCallback,
     mcp_config: Option<mcp::McpConfig>,
     additional_context: Option<BTreeMap<String, String>>,
+    shell_env: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
-    run_controlled_session(cli, input_rx, Some(callback), mcp_config, additional_context).await
+    run_controlled_session(
+        cli,
+        input_rx,
+        Some(callback),
+        mcp_config,
+        additional_context,
+        shell_env,
+    )
+    .await
 }
 
 async fn run_with_emitter(
@@ -156,7 +165,7 @@ async fn run_with_emitter(
 
     // One-shot: a single prompt, one user turn, then persist and exit.
     let prompt = resolve_prompt(&cli)?;
-    let mut session = Session::build(&cli, callback, mcp_config, None).await?;
+    let mut session = Session::build(&cli, callback, mcp_config, None, None).await?;
     session.emitter.system_init();
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -195,7 +204,8 @@ async fn run_session(
     additional_context: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
     let replay = cli.replay_user_messages;
-    let mut session = Session::build(&cli, callback.clone(), mcp_config, additional_context).await?;
+    let mut session =
+        Session::build(&cli, callback.clone(), mcp_config, additional_context, None).await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
 
@@ -233,8 +243,16 @@ async fn run_controlled_session(
     callback: Option<EventCallback>,
     mcp_config: Option<mcp::McpConfig>,
     additional_context: Option<BTreeMap<String, String>>,
+    shell_env: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
-    let mut session = Session::build(&cli, callback.clone(), mcp_config, additional_context).await?;
+    let mut session = Session::build(
+        &cli,
+        callback.clone(),
+        mcp_config,
+        additional_context,
+        shell_env,
+    )
+    .await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
     let ctrl_emitter = make_emitter(sid, callback, Some(session.event_log()));
@@ -618,6 +636,7 @@ impl Session {
         callback: Option<EventCallback>,
         injected_mcp: Option<mcp::McpConfig>,
         additional_context: Option<BTreeMap<String, String>>,
+        shell_env: Option<BTreeMap<String, String>>,
     ) -> Result<Self> {
         if let Some(fmt) = cli.output_format.as_deref()
             && fmt != "stream-json"
@@ -706,6 +725,7 @@ impl Session {
                 "no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL",
             )?;
         let tool_arg_defaults = load_tool_arg_defaults(additional_context, cli.additional_context.as_deref())?;
+        let shell_env = load_shell_env(shell_env, cli.shell_env.as_deref())?;
 
         let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
         let cx = ToolCx {
@@ -717,6 +737,7 @@ impl Session {
             edits: edits.clone(),
             session_env: Arc::new(transport::session_env_snapshot()),
             tool_arg_defaults: Arc::new(tool_arg_defaults),
+            shell_env: Arc::new(shell_env),
         };
         // Stage 1 has no rollout reconstruction yet. On resume, seed the
         // context baseline gate for legacy sessions with no persisted
@@ -1665,6 +1686,28 @@ fn load_tool_arg_defaults(
         .context("parse tool arg default table")
 }
 
+/// Host-supplied shell env overlay: explicit in-process map > `--shell-env`
+/// JSON > `BRO_HARNESS_SHELL_ENV`. Same precedence ladder as the tool-arg
+/// default table; values are plain env pairs, no grammar.
+fn load_shell_env(
+    explicit: Option<BTreeMap<String, String>>,
+    cli_json: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    match explicit {
+        Some(map) => Ok(map),
+        None => match cli_json {
+            Some(raw) => {
+                parse_tool_arg_defaults_json(raw).context("parse --shell-env as JSON string map")
+            }
+            None => match std::env::var("BRO_HARNESS_SHELL_ENV") {
+                Ok(raw) if !raw.trim().is_empty() => parse_tool_arg_defaults_json(&raw)
+                    .context("parse BRO_HARNESS_SHELL_ENV as JSON string map"),
+                _ => Ok(BTreeMap::new()),
+            },
+        },
+    }
+}
+
 fn parse_tool_arg_defaults_json(raw: &str) -> Result<BTreeMap<String, String>> {
     serde_json::from_str::<BTreeMap<String, String>>(raw)
         .context("expected a JSON object with string keys and string values")
@@ -2222,6 +2265,7 @@ mod tests {
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
+            shell_env: Arc::new(Default::default()),
         };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3034,5 +3078,23 @@ mod tests {
         let mut content = "{\"ok\":true}".to_string();
         session.append_edit_diagnostics(&mut content).await;
         assert_eq!(content, "{\"ok\":true}", "no edits -> no rider appended");
+    }
+}
+
+#[cfg(test)]
+mod shell_env_tests {
+    use super::*;
+
+    #[test]
+    fn load_shell_env_precedence_explicit_then_cli() {
+        let explicit = BTreeMap::from([("A".to_string(), "explicit".to_string())]);
+        let via_explicit =
+            load_shell_env(Some(explicit), Some(r#"{"A":"cli"}"#)).unwrap();
+        assert_eq!(via_explicit.get("A").map(String::as_str), Some("explicit"));
+
+        let via_cli = load_shell_env(None, Some(r#"{"A":"cli"}"#)).unwrap();
+        assert_eq!(via_cli.get("A").map(String::as_str), Some("cli"));
+
+        assert!(load_shell_env(None, Some("not json")).is_err());
     }
 }

@@ -42,6 +42,12 @@ pub struct ToolCx {
     /// separate from process env so shell children do not inherit credentials.
     /// Tools that expose it must redact sensitive values.
     pub session_env: Arc<BTreeMap<String, String>>,
+    /// Host-supplied, NON-SECRET env overlay for shell children (e.g. a
+    /// project's `RUSTC_WRAPPER=sccache` from fleet.json `project_dispatch`).
+    /// Deliberately a separate lane from `session_env`: credentials stay out
+    /// of shells, build env stays out of transports. Model-supplied per-call
+    /// `env` still wins over this overlay.
+    pub shell_env: Arc<BTreeMap<String, String>>,
     /// Per-session host-supplied tool arg default/pin table. Like
     /// `session_env`, this is daemon-trusted context and is never inherited by
     /// shell children.
