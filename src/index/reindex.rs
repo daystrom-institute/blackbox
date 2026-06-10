@@ -154,6 +154,38 @@ pub(super) fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64
     files
 }
 
+/// Collect (path, mtime, size) for every transcript file owned by a
+/// registered transcript adapter (harness session event logs, gemini tmp
+/// sessions — anything not covered by the legacy roots walk above).
+///
+/// This scan is load-bearing for two consumers, not just change detection:
+/// the purge phase treats any indexed `file_path` absent from
+/// `scan_all_source_files` as a deleted source and removes its docs, so an
+/// adapter source missing here is silently purged in the same pass that
+/// indexed it (observed live: gap-4629bbeb probe sessions, 2026-06-10
+/// 18:09 pass "purged 2 deleted").
+fn scan_adapter_source_files(config: &ReindexConfig, files: &mut Vec<(String, u64, u64)>) {
+    let registry = TranscriptAdapterRegistry::from_reindex_config(config);
+    for adapter in registry.adapters() {
+        for target in [TranscriptScanTarget::Sessions, TranscriptScanTarget::History] {
+            match adapter.scan_locations(target) {
+                Ok(locations) => {
+                    for location in locations {
+                        scan_single_file(&location.path, files);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        source = ?adapter.source(),
+                        error = %err,
+                        "adapter source scan failed; its indexed sessions are purge-exposed this pass"
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
     let mut files = scan_source_files(config);
     if config.knowledge_path.exists() {
@@ -169,6 +201,12 @@ pub(super) fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64,
         Ok(mut project_files) => files.append(&mut project_files),
         Err(err) => tracing::warn!(error = %err, "failed to scan registered project files"),
     }
+    scan_adapter_source_files(config, &mut files);
+    // Adapter-owned files can overlap the roots walk (interactive claude/codex
+    // adapters discover the same jsonl files); purge and needs_reindex both
+    // treat this as a set, so dedupe by path.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.dedup_by(|a, b| a.0 == b.0);
     files
 }
 
@@ -912,5 +950,54 @@ mod tests {
             }
         }
         assert!(saw_user, "user prompt doc present");
+    }
+
+    /// Purge contract: every adapter-discovered transcript file must appear in
+    /// `scan_all_source_files`, because the purge phase deletes index docs for
+    /// any indexed `file_path` absent from that set. Regression for the live
+    /// 2026-06-10 18:09 pass where two freshly indexed harness session logs
+    /// were purged in the same pass ("purged 2 deleted") and their meta
+    /// entries removed, leaving them permanently unindexed.
+    #[test]
+    fn adapter_sources_are_in_the_purge_scan_set_and_trigger_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sessions_dir = root.join("bro-home").join("harness-sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let log_path = sessions_dir.join("sess-purge.events.jsonl");
+        std::fs::write(
+            &log_path,
+            concat!(
+                r#"{"ts":"2026-06-10T01:00:00.000Z","event":{"type":"harness_milestone","milestone":"session_start","session_id":"sess-purge","transport":"anthropic","model":"glm-5.1","cwd":"/repo/p","provider":"glm"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let config = ReindexConfig {
+            roots: Vec::new(),
+            codex_root: None,
+            meta_path: root.join("_meta.json"),
+            projects_path: root.join("projects.json"),
+            knowledge_path: root.join("kb.json"),
+            threads_path: root.join("threads.json"),
+            roadmap_path: root.join("roadmap.json"),
+            harness_sessions_dir: Some(sessions_dir),
+            gemini_tmp_root: None,
+        };
+
+        let files = scan_all_source_files(&config);
+        let log_path_str = log_path.to_string_lossy().to_string();
+        assert!(
+            files.iter().any(|(p, _, _)| *p == log_path_str),
+            "adapter-owned event log must be in the purge scan set; got {files:?}"
+        );
+
+        // The same scan drives change detection: an adapter session unknown to
+        // meta must mark the index dirty.
+        assert!(
+            needs_reindex(&config),
+            "new harness session log must trigger needs_reindex"
+        );
     }
 }
