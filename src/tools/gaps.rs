@@ -37,14 +37,20 @@ impl BlackboxServer {
         name = "bbox_gap",
         description = "File a first-class substrate gap note into the repo-owned gap store."
     )]
-    pub(crate) fn bbox_gap(&self, Parameters(mut p): Parameters<GapFileParams>) -> CallToolResult {
-        Self::run("bbox_gap", || {
+    pub(crate) async fn bbox_gap(
+        &self,
+        Parameters(mut p): Parameters<GapFileParams>,
+    ) -> CallToolResult {
+        // Gap mutations are disk-authoritative: reload + full-store rewrite
+        // under a flock. Run on the blocking pool, not a tokio worker.
+        let server = self.clone();
+        Self::run_blocking("bbox_gap", move || {
             if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                let (project, write_dir) = self.resolve_gap_project(&raw);
+                let (project, write_dir) = server.resolve_gap_project(&raw);
                 p.project = Some(project);
                 p.write_dir = write_dir;
             }
-            let (id, created) = self.state.gaps.write().file(&p)?;
+            let (id, created) = server.state.gaps.write().file(&p)?;
             if created {
                 Ok(format!("Gap {id} filed (dedupe_key={})", p.dedupe_key))
             } else {
@@ -53,6 +59,7 @@ impl BlackboxServer {
                 ))
             }
         })
+        .await
     }
 
     #[tool(
@@ -83,22 +90,30 @@ impl BlackboxServer {
         name = "bbox_gap_resolve",
         description = "Resolve a gap note (acknowledged/addressed); optionally wire a structured supersession link."
     )]
-    pub(crate) fn bbox_gap_resolve(
+    pub(crate) async fn bbox_gap_resolve(
         &self,
         Parameters(p): Parameters<GapResolveParams>,
     ) -> CallToolResult {
-        Self::run("bbox_gap_resolve", || self.state.gaps.write().resolve(&p))
+        let server = self.clone();
+        Self::run_blocking("bbox_gap_resolve", move || {
+            server.state.gaps.write().resolve(&p)
+        })
+        .await
     }
 
     #[tool(
         name = "bbox_gap_update",
         description = "Edit an existing gap note's fields in place."
     )]
-    pub(crate) fn bbox_gap_update(
+    pub(crate) async fn bbox_gap_update(
         &self,
         Parameters(p): Parameters<GapUpdateParams>,
     ) -> CallToolResult {
-        Self::run("bbox_gap_update", || self.state.gaps.write().update(&p))
+        let server = self.clone();
+        Self::run_blocking("bbox_gap_update", move || {
+            server.state.gaps.write().update(&p)
+        })
+        .await
     }
 }
 
@@ -150,8 +165,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bbox_gap_from_worktree_keys_base_writes_worktree_and_list_normalizes() {
+    #[tokio::test]
+    async fn bbox_gap_from_worktree_keys_base_writes_worktree_and_list_normalizes() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("repo");
         std::fs::create_dir_all(&base).unwrap();
@@ -186,7 +201,7 @@ mod tests {
             .register_path(&base_canon)
             .unwrap();
 
-        let filed = server.bbox_gap(Parameters(gap_params(wt.clone())));
+        let filed = server.bbox_gap(Parameters(gap_params(wt.clone()))).await;
         assert_ne!(filed.is_error, Some(true), "bbox_gap failed: {filed:?}");
 
         let (id, project, write_dir) = {
