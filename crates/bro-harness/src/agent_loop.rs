@@ -132,7 +132,7 @@ pub async fn run_with_event_callback_and_input(
     input_rx: SessionInputReceiver,
     callback: EventCallback,
 ) -> Result<()> {
-    run_with_event_callback_and_input_mcp(cli, input_rx, callback, None).await
+    run_with_event_callback_and_input_mcp(cli, input_rx, callback, None, None).await
 }
 
 pub async fn run_with_event_callback_and_input_mcp(
@@ -140,8 +140,9 @@ pub async fn run_with_event_callback_and_input_mcp(
     input_rx: SessionInputReceiver,
     callback: EventCallback,
     mcp_config: Option<mcp::McpConfig>,
+    additional_context: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
-    run_controlled_session(cli, input_rx, Some(callback), mcp_config).await
+    run_controlled_session(cli, input_rx, Some(callback), mcp_config, additional_context).await
 }
 
 async fn run_with_emitter(
@@ -150,12 +151,12 @@ async fn run_with_emitter(
     mcp_config: Option<mcp::McpConfig>,
 ) -> Result<()> {
     if cli.input_format.as_deref() == Some("stream-json") {
-        return run_session(cli, callback, mcp_config).await;
+        return run_session(cli, callback, mcp_config, None).await;
     }
 
     // One-shot: a single prompt, one user turn, then persist and exit.
     let prompt = resolve_prompt(&cli)?;
-    let mut session = Session::build(&cli, callback, mcp_config).await?;
+    let mut session = Session::build(&cli, callback, mcp_config, None).await?;
     session.emitter.system_init();
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -191,9 +192,10 @@ async fn run_session(
     cli: Cli,
     callback: Option<EventCallback>,
     mcp_config: Option<mcp::McpConfig>,
+    additional_context: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
     let replay = cli.replay_user_messages;
-    let mut session = Session::build(&cli, callback.clone(), mcp_config).await?;
+    let mut session = Session::build(&cli, callback.clone(), mcp_config, additional_context).await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
 
@@ -230,8 +232,9 @@ async fn run_controlled_session(
     input_rx: SessionInputReceiver,
     callback: Option<EventCallback>,
     mcp_config: Option<mcp::McpConfig>,
+    additional_context: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
-    let mut session = Session::build(&cli, callback.clone(), mcp_config).await?;
+    let mut session = Session::build(&cli, callback.clone(), mcp_config, additional_context).await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
     let ctrl_emitter = make_emitter(sid, callback, Some(session.event_log()));
@@ -614,6 +617,7 @@ impl Session {
         cli: &Cli,
         callback: Option<EventCallback>,
         injected_mcp: Option<mcp::McpConfig>,
+        additional_context: Option<BTreeMap<String, String>>,
     ) -> Result<Self> {
         if let Some(fmt) = cli.output_format.as_deref()
             && fmt != "stream-json"
@@ -701,6 +705,7 @@ impl Session {
             .context(
                 "no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL",
             )?;
+        let tool_arg_defaults = load_tool_arg_defaults(additional_context, cli.additional_context.as_deref())?;
 
         let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
         let cx = ToolCx {
@@ -711,6 +716,7 @@ impl Session {
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             edits: edits.clone(),
             session_env: Arc::new(transport::session_env_snapshot()),
+            tool_arg_defaults: Arc::new(tool_arg_defaults),
         };
         // Stage 1 has no rollout reconstruction yet. On resume, seed the
         // context baseline gate for legacy sessions with no persisted
@@ -832,6 +838,7 @@ impl Session {
             &tool_filter,
             code_mode.defers_builtins(),
         );
+        validate_tool_arg_defaults(&cx.tool_arg_defaults, &reg);
 
         let base_opts = TurnOpts {
             base_instructions: Some(transport::base_instructions_for(&model)),
@@ -1637,6 +1644,43 @@ fn reference_context_item_for_restore(
     })
 }
 
+fn load_tool_arg_defaults(
+    explicit: Option<BTreeMap<String, String>>,
+    cli_json: Option<&str>,
+) -> Result<bro_tools::ToolArgDefaults> {
+    let raw = match explicit {
+        Some(map) => map,
+        None => match cli_json {
+            Some(raw) => parse_tool_arg_defaults_json(raw)
+                .context("parse --additional-context as JSON string map")?,
+            None => match std::env::var("BRO_HARNESS_TOOL_DEFAULTS") {
+                Ok(raw) if !raw.trim().is_empty() => parse_tool_arg_defaults_json(&raw)
+                    .context("parse BRO_HARNESS_TOOL_DEFAULTS as JSON string map")?,
+                _ => BTreeMap::new(),
+            },
+        },
+    };
+    bro_tools::ToolArgDefaults::parse_map(raw)
+        .map_err(anyhow::Error::msg)
+        .context("parse tool arg default table")
+}
+
+fn parse_tool_arg_defaults_json(raw: &str) -> Result<BTreeMap<String, String>> {
+    serde_json::from_str::<BTreeMap<String, String>>(raw)
+        .context("expected a JSON object with string keys and string values")
+}
+
+fn validate_tool_arg_defaults(defaults: &bro_tools::ToolArgDefaults, reg: &Registry) {
+    if defaults.is_empty() {
+        return;
+    }
+    let schemas = reg.schemas();
+    for warning in defaults.validation_warnings(schemas.iter().map(|(name, schema)| (name.as_str(), schema))) {
+        tracing::warn!(warning = %warning, "tool arg default schema validation warning");
+        eprintln!("BRO_HARNESS_TOOL_DEFAULTS warning: {warning}");
+    }
+}
+
 fn stop_reason_label(stop: Option<&StopReason>) -> Value {
     match stop {
         Some(StopReason::ToolCalls) => json!("tool_calls"),
@@ -2177,6 +2221,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(BTreeMap::new()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
         };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

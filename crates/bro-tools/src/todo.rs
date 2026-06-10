@@ -153,6 +153,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
             session_env: Arc::new(std::collections::BTreeMap::new()),
+            tool_arg_defaults: Arc::new(crate::tool_defaults::ToolArgDefaults::default()),
         }
     }
 

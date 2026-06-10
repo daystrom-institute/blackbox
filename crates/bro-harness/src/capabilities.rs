@@ -111,7 +111,14 @@ impl ToolCapability for HostTools {
             )
         })?;
         let (content, is_error, content_type) =
-            match tool.call(invocation.input_json, &self.cx).await {
+            match crate::registry::call_tool_with_arg_defaults(
+                tool.as_ref(),
+                &invocation.name,
+                invocation.input_json,
+                &self.cx,
+            )
+            .await
+            {
                 ToolResult::Text(t) => (t, false, "text/plain"),
                 ToolResult::Json(v) => (
                     serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
@@ -386,6 +393,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(std::collections::BTreeMap::new()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
         }
     }
 

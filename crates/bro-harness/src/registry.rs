@@ -243,9 +243,19 @@ impl Registry {
         self.tools.contains_key(name)
     }
 
+    pub fn schemas(&self) -> Vec<(String, Value)> {
+        let mut schemas: Vec<_> = self
+            .tools
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.tool.input_schema()))
+            .collect();
+        schemas.sort_by(|a, b| a.0.cmp(&b.0));
+        schemas
+    }
+
     pub async fn dispatch(&self, name: &str, input: Value, cx: &ToolCx) -> ToolResult {
         match self.tools.get(name) {
-            Some(e) => e.tool.call(input, cx).await,
+            Some(e) => call_tool_with_arg_defaults(e.tool.as_ref(), name, input, cx).await,
             None => ToolResult::Error(format!("unknown tool: {name}")),
         }
     }
@@ -262,6 +272,20 @@ impl Registry {
             .map(|e| e.tool.annotations().read_only)
             .unwrap_or(false)
     }
+}
+
+pub(crate) async fn call_tool_with_arg_defaults(
+    tool: &dyn Tool,
+    name: &str,
+    input: Value,
+    cx: &ToolCx,
+) -> ToolResult {
+    let (input, rider) = match cx.tool_arg_defaults.apply(name, input) {
+        Ok(applied) => applied,
+        Err(conflict) => return conflict.into_tool_result(name),
+    };
+    let result = tool.call(input, cx).await;
+    bro_tools::apply_rider(result, &rider)
 }
 
 fn short_desc(d: &str) -> String {
@@ -403,6 +427,98 @@ mod tests {
             }
         }
         Arc::new(T(name, desc))
+    }
+
+    fn test_cx(defaults: bro_tools::ToolArgDefaults) -> ToolCx {
+        ToolCx {
+            root: std::env::temp_dir(),
+            safety: Arc::new(bro_tools::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Arc::new(std::sync::Mutex::new(bro_tools::TodoList::default())),
+            shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
+            edits: Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(std::collections::BTreeMap::new()),
+            tool_arg_defaults: Arc::new(defaults),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_applies_defaults_and_adds_json_rider() {
+        struct Echo;
+        #[async_trait]
+        impl Tool for Echo {
+            fn name(&self) -> &str {
+                "mcp__blackbox__bbox_note"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn input_schema(&self) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "session_id": {"type": "string"}
+                    }
+                })
+            }
+            async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+                ToolResult::Json(json!({"input": input}))
+            }
+        }
+
+        let defaults = bro_tools::ToolArgDefaults::parse_map(std::collections::BTreeMap::from([(
+            "default:mcp.bbox_note.session_id".to_string(),
+            "host-session".to_string(),
+        )]))
+        .unwrap();
+        let reg = Registry::new(
+            vec![],
+            vec![Arc::new(Echo) as Arc<dyn Tool>],
+            &PinPolicy { patterns: vec![] },
+            &ToolFilter::default(),
+        );
+        let result = reg
+            .dispatch(
+                "mcp__blackbox__bbox_note",
+                json!({"kind": "done"}),
+                &test_cx(defaults),
+            )
+            .await;
+        let ToolResult::Json(v) = result else {
+            panic!("expected json result");
+        };
+        assert_eq!(v["input"]["session_id"], "host-session");
+        assert_eq!(v["defaults_applied"]["session_id"], "host-session");
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_pin_conflict_error_with_rider() {
+        let defaults = bro_tools::ToolArgDefaults::parse_map(std::collections::BTreeMap::from([(
+            "pin:mcp.bbox_note.session_id".to_string(),
+            "host-session".to_string(),
+        )]))
+        .unwrap();
+        let reg = Registry::new(
+            vec![],
+            vec![mk("mcp__blackbox__bbox_note", "note")],
+            &PinPolicy { patterns: vec![] },
+            &ToolFilter::default(),
+        );
+        let result = reg
+            .dispatch(
+                "mcp__blackbox__bbox_note",
+                json!({"session_id": "model-session"}),
+                &test_cx(defaults),
+            )
+            .await;
+        let ToolResult::Error(text) = result else {
+            panic!("expected pin conflict error");
+        };
+        assert!(text.contains("pin conflict"));
+        assert!(text.contains("pin_conflict"));
+        assert!(text.contains("host-session"));
+        assert!(text.contains("model-session"));
     }
 
     #[test]

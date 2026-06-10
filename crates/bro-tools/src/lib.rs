@@ -17,6 +17,7 @@ pub mod shell;
 pub mod slice_core;
 pub mod todo;
 pub mod tool;
+pub mod tool_defaults;
 pub mod web;
 pub mod workspace;
 
@@ -26,6 +27,7 @@ pub use safety::SafetyPolicy;
 pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
 pub use tool::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
+pub use tool_defaults::{PinConflict, ToolArgDefaults, ToolArgRider, apply_rider};
 
 use std::sync::Arc;
 

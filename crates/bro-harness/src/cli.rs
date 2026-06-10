@@ -107,6 +107,12 @@ pub struct Cli {
     #[arg(long = "output-schema")]
     pub output_schema: Option<String>,
 
+    /// Host-supplied tool arg default/pin table as a JSON object whose keys are
+    /// `<flavor>:<tool-pattern>.<param>`. Env fallback:
+    /// `BRO_HARNESS_TOOL_DEFAULTS`.
+    #[arg(long = "additional-context")]
+    pub additional_context: Option<String>,
+
     // --- accepted, no-op (we always stream NDJSON; safety is the denylist) ---
     #[arg(long = "verbose", default_value_t = false)]
     pub verbose: bool,

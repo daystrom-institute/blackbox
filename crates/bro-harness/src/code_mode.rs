@@ -498,6 +498,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(BTreeMap::new()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
         }
     }
 
@@ -552,6 +553,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(BTreeMap::new()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
         };
         let callable: Vec<Arc<dyn Tool>> =
             vec![Arc::new(bro_tools::workspace::FileRead) as Arc<dyn Tool>];

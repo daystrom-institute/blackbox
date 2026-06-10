@@ -42,6 +42,10 @@ pub struct ToolCx {
     /// separate from process env so shell children do not inherit credentials.
     /// Tools that expose it must redact sensitive values.
     pub session_env: Arc<BTreeMap<String, String>>,
+    /// Per-session host-supplied tool arg default/pin table. Like
+    /// `session_env`, this is daemon-trusted context and is never inherited by
+    /// shell children.
+    pub tool_arg_defaults: Arc<crate::tool_defaults::ToolArgDefaults>,
 }
 
 /// Result of a tool call. Maps onto the content of an Anthropic
