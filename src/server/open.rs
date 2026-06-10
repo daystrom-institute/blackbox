@@ -74,6 +74,16 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // provider transcript. Same dir the BRO_HOME export below points the
     // in-process harness at.
     idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
+    // Interactive Gemini chats (claude/codex roots already travel inside
+    // ReindexConfig; gemini's tmp root is resolved here, same explicit-only
+    // contract — gap-5af6d773).
+    if let Some(gemini_tmp) = std::env::var("GEMINI_TMP_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".gemini").join("tmp")))
+    {
+        idx.set_gemini_tmp_root(gemini_tmp);
+    }
     // The daemon's single tantivy writer: every index mutation and reindex
     // pass flows through this actor (concurrency-model §4.3). Spawned AFTER
     // all ReindexConfig mutation — the actor clones the config at spawn.

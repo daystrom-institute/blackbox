@@ -119,7 +119,7 @@ impl TranscriptCursorStore {
 
 pub(crate) fn location_fingerprint(location: &TranscriptLocation) -> String {
     let mut h = DefaultHasher::new();
-    location.provider.hash(&mut h);
+    location.source.hash(&mut h);
     location.storage.hash(&mut h);
     canonical_path(&location.path).hash(&mut h);
     location.session_id.hash(&mut h);
@@ -140,6 +140,7 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::TranscriptSource;
     use tempfile::tempdir;
 
     use crate::orchestration::providers::Provider;
@@ -149,7 +150,7 @@ mod tests {
 
     fn location(path: PathBuf) -> TranscriptLocation {
         TranscriptLocation {
-            provider: Provider::Glm,
+            source: TranscriptSource::Harness(Provider::Glm),
             storage: TranscriptStorage::JsonlFile,
             path,
             account: Some("claude".into()),

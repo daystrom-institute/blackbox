@@ -43,6 +43,7 @@ pub fn find_session_file(
     }
 
     let registry_config = ReindexConfig {
+        gemini_tmp_root: None,
         roots: roots.to_vec(),
         codex_root: codex_root.map(Path::to_path_buf),
         meta_path: PathBuf::new(),

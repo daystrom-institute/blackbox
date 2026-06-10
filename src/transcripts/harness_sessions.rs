@@ -39,7 +39,7 @@ use crate::parser::parse_transcript_line_rich;
 use super::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
 use super::types::{
     NormalizedTranscriptEvent, RawTranscriptRef, TranscriptBatch, TranscriptCursor,
-    TranscriptLocation, TranscriptReadError, TranscriptStorage,
+    TranscriptLocation, TranscriptReadError, TranscriptSource, TranscriptStorage,
 };
 
 /// File suffix of the harness sidecar event log.
@@ -100,7 +100,7 @@ impl HarnessSessionsAdapter {
 
     fn location_for(&self, session_id: &str, path: PathBuf, meta: &SessionMeta) -> TranscriptLocation {
         TranscriptLocation {
-            provider: self.provider,
+            source: TranscriptSource::Harness(self.provider),
             storage: TranscriptStorage::JsonlFile,
             path,
             account: None,
@@ -209,8 +209,8 @@ fn session_id_from_path(path: &Path) -> Option<String> {
 }
 
 impl TranscriptReadAdapter for HarnessSessionsAdapter {
-    fn provider(&self) -> Provider {
-        self.provider
+    fn source(&self) -> TranscriptSource {
+        TranscriptSource::Harness(self.provider)
     }
 
     fn locate(&self, session_id: &str) -> Result<Option<TranscriptLocation>, TranscriptReadError> {
@@ -263,7 +263,7 @@ impl TranscriptReadAdapter for HarnessSessionsAdapter {
             Some(TranscriptCursor::ByteOffset { offset }) => *offset,
             Some(other) => {
                 return Err(TranscriptReadError::UnsupportedCursor {
-                    provider: self.provider,
+                    source: TranscriptSource::Harness(self.provider),
                     cursor: other.clone(),
                 });
             }
@@ -302,13 +302,13 @@ impl TranscriptReadAdapter for HarnessSessionsAdapter {
                 record["ts"].as_str(),
                 &fallback_session_id,
                 meta.cwd.as_deref(),
-                self.provider,
+                TranscriptSource::Harness(self.provider),
             )
             .into_iter()
             .enumerate()
             {
                 let raw = RawTranscriptRef::jsonl(
-                    self.provider,
+                    TranscriptSource::Harness(self.provider),
                     TranscriptStorage::JsonlFile,
                     &location.path,
                     line_offset,
@@ -336,7 +336,7 @@ fn project_envelope(
     ts: Option<&str>,
     fallback_session_id: &str,
     cwd: Option<&str>,
-    provider: Provider,
+    provider: TranscriptSource,
 ) -> Vec<NormalizedTranscriptEvent> {
     let Some(event_type) = envelope["type"].as_str() else {
         return Vec::new();
@@ -463,7 +463,7 @@ mod tests {
         let glm_locs = glm.scan_locations(TranscriptScanTarget::Sessions).unwrap();
         assert_eq!(glm_locs.len(), 1);
         assert_eq!(glm_locs[0].session_id.as_deref(), Some("sess-glm"));
-        assert_eq!(glm_locs[0].provider, Provider::Glm);
+        assert_eq!(glm_locs[0].source, TranscriptSource::Harness(Provider::Glm));
         assert_eq!(glm_locs[0].cwd.as_deref(), Some("/repo/x"));
 
         let brodex_locs = brodex

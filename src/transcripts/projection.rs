@@ -211,6 +211,7 @@ fn tool_target(input: &serde_json::Value, kind: ToolCallKind, tool_name: &str) -
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::TranscriptSource;
     use serde_json::json;
 
     use crate::orchestration::providers::Provider;
@@ -238,10 +239,10 @@ mod tests {
             }),
         };
         let normalized = NormalizedTranscriptEvent::from_parsed_event(
-            Provider::Glm,
+            TranscriptSource::Harness(Provider::Glm),
             parsed.clone(),
             RawTranscriptRef::jsonl(
-                Provider::Glm,
+                TranscriptSource::Harness(Provider::Glm),
                 super::super::types::TranscriptStorage::JsonlFile,
                 "/tmp/session.jsonl",
                 7,
@@ -296,10 +297,10 @@ mod tests {
             }),
         };
         let normalized = NormalizedTranscriptEvent::from_parsed_event(
-            Provider::Glm,
+            TranscriptSource::Harness(Provider::Glm),
             parsed,
             RawTranscriptRef::jsonl(
-                Provider::Glm,
+                TranscriptSource::Harness(Provider::Glm),
                 super::super::types::TranscriptStorage::JsonlFile,
                 "/tmp/session.jsonl",
                 7,

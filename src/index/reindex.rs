@@ -16,7 +16,6 @@ use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, FileMeta, ReindexConfig};
-use crate::orchestration::providers::Provider;
 use crate::projects::ProjectRecord;
 use crate::transcripts::adapters::{
     TranscriptAdapterRegistry, TranscriptReadAdapter, TranscriptScanTarget,
@@ -606,8 +605,8 @@ fn index_adapter_location(
         writer.delete_term(Term::from_field_text(fields.file_path, &path_str));
     }
 
-    let provider_label = provider_label(location.provider);
-    let account = location.account.as_deref().unwrap_or(provider_label);
+    let source_label = location.source.label();
+    let account = location.account.as_deref().unwrap_or(source_label);
     let project_fallback = location.project.as_deref().unwrap_or("");
 
     let snapshot = match adapter.load_snapshot(location) {
@@ -631,7 +630,7 @@ fn index_adapter_location(
         if let Err(err) = tool_edges.emit_event_edges(&parsed, account, line_offset, event_idx) {
             tracing::debug!(
                 error = %err,
-                provider = ?location.provider,
+                source = %location.source,
                 "failed to emit transcript tool-call edge"
             );
         }
@@ -706,8 +705,8 @@ pub(crate) fn backfill_tool_edges_for_project(
                 }
             };
             for location in locations {
-                let provider_label = provider_label(location.provider);
-                let account = location.account.as_deref().unwrap_or(provider_label);
+                let source_label = location.source.label();
+                let account = location.account.as_deref().unwrap_or(source_label);
                 let snapshot = match adapter.load_snapshot(&location) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -741,17 +740,6 @@ pub(crate) fn backfill_tool_edges_for_project(
     crate::edge_index::append_edges_dedup(&observed_dir, &project.project_id, &collected)
 }
 
-fn provider_label(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Brodex => "brodex",
-        Provider::VibeBh => "vibebh",
-        Provider::Glm => "glm",
-        Provider::Deepseek => "deepseek",
-        Provider::Minimax => "minimax",
-        Provider::Workflow => "workflow",
-    }
-}
-
 pub(super) fn human_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
@@ -769,6 +757,7 @@ pub(super) fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::orchestration::providers::Provider;
     use super::*;
     use crate::entity_ref;
     use crate::parser::{MessageRole, ParsedEvent};
@@ -792,7 +781,7 @@ mod tests {
             tool_call: None,
         };
         let raw = RawTranscriptRef::jsonl(
-            Provider::Brodex,
+            crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
             TranscriptStorage::JsonlFile,
             "/tmp/session.jsonl",
             0,
@@ -800,7 +789,11 @@ mod tests {
             0,
         );
         let normalized =
-            NormalizedTranscriptEvent::from_parsed_event(Provider::Brodex, parsed, raw);
+            NormalizedTranscriptEvent::from_parsed_event(
+                crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
+                parsed,
+                raw,
+            );
         let doc = normalized_to_doc(
             &normalized,
             "codex",
@@ -859,6 +852,7 @@ mod tests {
             threads_path: root.join("threads.json"),
             roadmap_path: root.join("roadmap.json"),
             harness_sessions_dir: Some(sessions_dir),
+            gemini_tmp_root: None,
         };
 
         let (schema, fields) = crate::index::build_schema();

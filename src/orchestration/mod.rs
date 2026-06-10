@@ -4438,7 +4438,10 @@ mod tests {
             .transcript_location
             .as_ref()
             .expect("harness task resolves its event-log transcript location");
-        assert_eq!(location.provider, Provider::Brodex);
+        assert_eq!(
+            location.source,
+            crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex)
+        );
         assert_eq!(location.path, log_path);
         assert_eq!(location.session_id.as_deref(), Some("sess-t-loc"));
         assert_eq!(location.cwd.as_deref(), Some("/repo/x"));

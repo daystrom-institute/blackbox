@@ -18,9 +18,76 @@ pub(crate) enum TranscriptStorage {
     ProviderCommand,
 }
 
+/// Identity of a transcript-producing source. Dispatch lanes (bro-harness
+/// providers) and interactive CLI sources (the operator's Claude/Codex/Gemini
+/// sessions) are deliberately distinct: the `Provider` enum models what the
+/// daemon can DISPATCH to, and the provider-removal arc (fef32d2) narrowed it
+/// to harness lanes — interactive transcripts are an index-time corpus
+/// source, not a dispatch target, so they get their own identity here instead
+/// of resurrecting dispatch variants (gap-5af6d773).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TranscriptSource {
+    Harness(Provider),
+    Claude,
+    Codex,
+    Gemini,
+}
+
+impl TranscriptSource {
+    /// Stable lowercase label: indexed `account` fallback, entity-id prefix,
+    /// and serialized form.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Harness(Provider::Brodex) => "brodex",
+            Self::Harness(Provider::VibeBh) => "vibebh",
+            Self::Harness(Provider::Glm) => "glm",
+            Self::Harness(Provider::Deepseek) => "deepseek",
+            Self::Harness(Provider::Minimax) => "minimax",
+            Self::Harness(Provider::Workflow) => "workflow",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
+impl fmt::Display for TranscriptSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+// Serialized as the bare label string. The harness arm reuses the Provider
+// wire names, so locations persisted before this enum existed ("glm",
+// "brodex", ...) deserialize unchanged; "claude"/"codex"/"gemini" map to the
+// interactive sources (Provider's own serde would alias them to harness
+// lanes, which is exactly what this enum exists to avoid).
+impl Serialize for TranscriptSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscriptSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "gemini" => Ok(Self::Gemini),
+            other => other
+                .parse::<Provider>()
+                .map(Self::Harness)
+                .map_err(|_| serde::de::Error::custom(format!("unknown transcript source: {other}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TranscriptLocation {
-    pub provider: Provider,
+    /// Field keeps its historical wire name; see [`TranscriptSource`] serde.
+    #[serde(rename = "provider")]
+    pub source: TranscriptSource,
     pub storage: TranscriptStorage,
     pub path: PathBuf,
     pub account: Option<String>,
@@ -79,22 +146,22 @@ pub(crate) enum TranscriptReadError {
         message: String,
     },
     InvalidLocation {
-        provider: Provider,
+        source: TranscriptSource,
         path: PathBuf,
         reason: &'static str,
     },
     UnsupportedCursor {
-        provider: Provider,
+        source: TranscriptSource,
         cursor: TranscriptCursor,
     },
     SchemaDrift {
-        provider: Provider,
+        source: TranscriptSource,
         path: PathBuf,
         expected: &'static str,
         observed: Vec<String>,
     },
     InvalidJsonLine {
-        provider: Provider,
+        source: TranscriptSource,
         path: PathBuf,
         byte_offset: u64,
         line_len: usize,
@@ -128,40 +195,40 @@ impl fmt::Debug for TranscriptReadError {
                 .field("message", &abbrev(message, 240))
                 .finish(),
             Self::InvalidLocation {
-                provider,
+                source,
                 path,
                 reason,
             } => f
                 .debug_struct("InvalidLocation")
-                .field("provider", provider)
+                .field("source", source)
                 .field("path", path)
                 .field("reason", reason)
                 .finish(),
-            Self::UnsupportedCursor { provider, cursor } => f
+            Self::UnsupportedCursor { source, cursor } => f
                 .debug_struct("UnsupportedCursor")
-                .field("provider", provider)
+                .field("source", source)
                 .field("cursor", cursor)
                 .finish(),
             Self::InvalidJsonLine {
-                provider,
+                source,
                 path,
                 byte_offset,
                 line_len,
             } => f
                 .debug_struct("InvalidJsonLine")
-                .field("provider", provider)
+                .field("source", source)
                 .field("path", path)
                 .field("byte_offset", byte_offset)
                 .field("line_len", line_len)
                 .finish(),
             Self::SchemaDrift {
-                provider,
+                source,
                 path,
                 expected,
                 observed,
             } => f
                 .debug_struct("SchemaDrift")
-                .field("provider", provider)
+                .field("source", source)
                 .field("path", path)
                 .field("expected", expected)
                 .field("observed", observed)
@@ -185,38 +252,38 @@ impl fmt::Display for TranscriptReadError {
                 abbrev(message, 240)
             ),
             Self::InvalidLocation {
-                provider,
+                source,
                 path,
                 reason,
             } => write!(
                 f,
-                "invalid {provider:?} transcript location {}: {reason}",
+                "invalid {source} transcript location {}: {reason}",
                 path.display()
             ),
-            Self::UnsupportedCursor { provider, cursor } => {
+            Self::UnsupportedCursor { source, cursor } => {
                 write!(
                     f,
-                    "{provider:?} transcript adapter does not support cursor {cursor:?}"
+                    "{source} transcript adapter does not support cursor {cursor:?}"
                 )
             }
             Self::InvalidJsonLine {
-                provider,
+                source,
                 path,
                 byte_offset,
                 line_len,
             } => write!(
                 f,
-                "invalid {provider:?} JSONL record at {} byte {byte_offset} ({line_len} bytes)",
+                "invalid {source} JSONL record at {} byte {byte_offset} ({line_len} bytes)",
                 path.display()
             ),
             Self::SchemaDrift {
-                provider,
+                source,
                 path,
                 expected,
                 observed,
             } => write!(
                 f,
-                "{provider:?} transcript schema drift at {}: expected {expected}, observed {:?}",
+                "{source} transcript schema drift at {}: expected {expected}, observed {:?}",
                 path.display(),
                 observed
             ),
@@ -303,7 +370,7 @@ impl From<NormalizedToolCall> for ToolCallInfo {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RawTranscriptRef {
-    pub provider: Provider,
+    pub source: TranscriptSource,
     pub storage: TranscriptStorage,
     pub path: PathBuf,
     pub byte_offset: Option<u64>,
@@ -315,7 +382,7 @@ pub(crate) struct RawTranscriptRef {
 
 impl RawTranscriptRef {
     pub(crate) fn jsonl(
-        provider: Provider,
+        source: TranscriptSource,
         storage: TranscriptStorage,
         path: impl Into<PathBuf>,
         byte_offset: u64,
@@ -323,7 +390,7 @@ impl RawTranscriptRef {
         line_len: usize,
     ) -> Self {
         Self {
-            provider,
+            source,
             storage,
             path: path.into(),
             byte_offset: Some(byte_offset),
@@ -335,14 +402,14 @@ impl RawTranscriptRef {
     }
 
     pub(crate) fn provider_event(
-        provider: Provider,
+        source: TranscriptSource,
         storage: TranscriptStorage,
         path: impl Into<PathBuf>,
         provider_event_id: impl Into<String>,
         entity_id: impl Into<String>,
     ) -> Self {
         Self {
-            provider,
+            source,
             storage,
             path: path.into(),
             byte_offset: None,
@@ -356,7 +423,7 @@ impl RawTranscriptRef {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NormalizedTranscriptEvent {
-    pub provider: Provider,
+    pub source: TranscriptSource,
     pub role: TranscriptRole,
     pub kind: TranscriptEventKind,
     pub content: String,
@@ -372,13 +439,13 @@ pub(crate) struct NormalizedTranscriptEvent {
 
 impl NormalizedTranscriptEvent {
     pub(crate) fn from_parsed_event(
-        provider: Provider,
+        source: TranscriptSource,
         event: ParsedEvent,
         raw: RawTranscriptRef,
     ) -> Self {
         let kind = event_kind_for(event.role, event.tool_call.as_ref());
         Self {
-            provider,
+            source,
             role: event.role.into(),
             kind,
             content: event.content,
@@ -394,28 +461,21 @@ impl NormalizedTranscriptEvent {
     }
 
     pub(crate) fn from_transcript_event(
-        provider: Provider,
+        source: TranscriptSource,
         event: &TranscriptEvent,
         raw: RawTranscriptRef,
     ) -> Option<Self> {
         event
             .to_parsed()
-            .map(|parsed| Self::from_parsed_event(provider, parsed, raw))
+            .map(|parsed| Self::from_parsed_event(source, parsed, raw))
     }
 
     pub(crate) fn jsonl_entity_id(&self) -> Option<String> {
         let byte_offset = self.raw.byte_offset?;
         let event_idx = self.raw.event_idx?;
-        let provider = match self.provider {
-            Provider::Brodex => "brodex",
-            Provider::VibeBh => "vibebh",
-            Provider::Glm => "glm",
-            Provider::Deepseek => "deepseek",
-            Provider::Minimax => "minimax",
-            Provider::Workflow => "workflow",
-        };
         Some(format!(
-            "{provider}:{}:{byte_offset}:{event_idx}",
+            "{}:{}:{byte_offset}:{event_idx}",
+            self.source.label(),
             self.session_id
         ))
     }
@@ -452,7 +512,7 @@ mod tests {
     #[test]
     fn transcript_read_error_display_and_debug_do_not_leak_large_payloads() {
         let err = TranscriptReadError::InvalidJsonLine {
-            provider: Provider::Glm,
+            source: TranscriptSource::Harness(Provider::Glm),
             path: PathBuf::from("/tmp/session.jsonl"),
             byte_offset: 42,
             line_len: 40_000,

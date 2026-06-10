@@ -228,7 +228,7 @@ fn provider_event_payload(task_id: &str, actor: &str, event: &NormalizedTranscri
     json!({
         "taskId": task_id,
         "actor": actor,
-        "provider": event.provider,
+        "provider": event.source,
         "sessionId": event.session_id,
         "kind": transcript_event_kind_name(event),
         "role": format!("{:?}", event.role).to_lowercase(),
