@@ -1,0 +1,21 @@
+{
+  "id": "gap-8500c221",
+  "title": "Resolving discarded workflow threads emits repo-owned thread records",
+  "gap_kind": "workflow",
+  "domain": "threads",
+  "wanted_capability": "A way to discard stale workflow-origin wf-* threads without producing repo-owned .bbox/record artifacts or other reviewable exhaust for transient workflow scaffolding.",
+  "missing_primitive": "discard/purge lifecycle for workflow-origin thread scaffolding that stays out of repo-owned record output",
+  "fallback_used": "Manually removed the untracked .bbox/record/thread-*.json files produced while resolving stale wf-* workflow threads.",
+  "evidence": [
+    "thread-c0bc3542",
+    "thread-6b8bf8c8",
+    "thread-52b23a10"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "workflow/threads/repo-owned-records-for-discarded-workflow-exhaust",
+  "notes": "During cleanup of stale wf-* workflow threads, bbox_thread(action=resolve) wrote 28 untracked .bbox/record/thread-*.json files for transcript-search workflow scaffolding. The operator characterized these as discardable workflow exhaust and likely defect; tmux workflow test arcs resolved without the same repo record output.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-10T17:50:43Z",
+  "updated_at": "2026-06-10T17:50:43Z"
+}
