@@ -13,8 +13,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-tools/shell-timeout-process-group",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-9dfe1da5",
   "created_at": "2026-06-10T07:37:39Z",
-  "updated_at": "2026-06-10T07:37:39Z"
+  "updated_at": "2026-06-10T18:28:00Z",
+  "resolved_at": "2026-06-10T18:28:00Z",
+  "resolution_note": "Addressed in 5b84b5c (w8, folded to beta, deployed 2026-06-10): shell commands spawn as their own process-group leader (process_group(0)) and every kill path signals the whole group via negative-pid kill(2) — timeout escalation in drive(), signal_child (shell_poll signal= / shell_kill), the overflow rejection path, and a new ShellSession Drop covering abandoned live sessions (kill_on_drop only reaps the direct child). Mirrors codex-rs's killpg-based group cleanup (utils/pty/src/process_group.rs). Regression test timeout_kills_backgrounded_grandchildren proves a timed-out command's backgrounded children die with the group. A timed-out cargo no longer leaves sccache/rustc holding the target-dir lock."
 }
