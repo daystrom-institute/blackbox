@@ -169,10 +169,19 @@ fn default_entries() -> BTreeMap<String, Entry> {
             compact_at: Some(DEFAULT_RATIO),
         },
     );
+    // Windows track the model's actual capacity; compaction is an overflow
+    // guard, not a tuning knob (thread-9dfe1da5: compacting 1M-class models at
+    // a stale 128K/200K default caused premature compaction and a
+    // false-memory summary). gpt-5* = 400K per the codex-rs reference
+    // (`protocol/src/openai_models.rs`); deepseek-v4* and MiniMax-M* are
+    // 1M-class; older deepseek ids stay 128K.
     for (k, w) in [
         ("claude-*", 200_000),
         ("glm-*", 200_000),
+        ("deepseek-v4*", 1_000_000),
         ("deepseek-*", 128_000),
+        ("MiniMax-M*", 1_000_000),
+        ("gpt-5*", 400_000),
     ] {
         m.insert(
             k.into(),
@@ -240,6 +249,27 @@ mod tests {
             tool_render_cap: DEFAULT_TOOL_RENDER_CAP,
             enabled: true,
         }
+    }
+
+    #[test]
+    fn default_table_matches_model_generations() {
+        let p = CompactionPolicy {
+            entries: super::default_entries(),
+            keep_tail: DEFAULT_KEEP_TAIL,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            tool_render_cap: DEFAULT_TOOL_RENDER_CAP,
+            enabled: true,
+        };
+        // 1M-class models must not inherit the stale small windows
+        // (thread-9dfe1da5: premature compaction at ~10% of capacity).
+        assert_eq!(p.resolve("deepseek-v4-pro").0, 1_000_000);
+        assert_eq!(p.resolve("MiniMax-M3").0, 1_000_000);
+        // codex-rs reference: gpt-5 family is 400K.
+        assert_eq!(p.resolve("gpt-5.5").0, 400_000);
+        assert_eq!(p.resolve("gpt-5.1-codex-max").0, 400_000);
+        // older deepseek ids keep the 128K window.
+        assert_eq!(p.resolve("deepseek-reasoner").0, 128_000);
+        assert_eq!(p.resolve("claude-sonnet-4-6").0, 200_000);
     }
 
     #[test]
