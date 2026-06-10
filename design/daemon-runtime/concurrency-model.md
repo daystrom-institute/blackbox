@@ -20,13 +20,26 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > purge; ~60 heavy sync handlers moved to run_blocking); Phase 3 dispatch
 > plane (bounded EventRing + monotonic counter, tee via per-task writer
 > thread, allocator/cooldown off-path, /tail decoration caches, harness
-> session persist via spawn_blocking) and the §4.5 RosterView. Measured:
-> under-load mean poll ~16.1ms → ~7.2ms (load not strictly comparable; see
-> thread). REMAINING: Phase 2 IndexWriterActor (tantivy LockBusy class),
-> status-snapshot publication (evidence-gated), bro_dashboard on RosterView,
-> gaps-store treatment, Phase 4 enforcement, the §4.6 runtime-split decision
-> (still open, instrumented). File:line citations are point-in-time from the
-> original survey at commit 9cb5228; verify against code.
+> session persist via spawn_blocking) and the §4.5 RosterView. Wave 7 added
+> bro_dashboard on RosterView, the poll-time histogram builder opt-in, and
+> atomic harness session writes. Wave 8 (2026-06-10) closed the MCP wire-head
+> tax: SurfaceDecisionCache (generation-validated, packet-store scans off the
+> request path) + idempotent packet-artifact boot restore + duplicate-packet
+> GC. Wave 9 landed **Phase 2**: the §4.3 IndexWriterActor
+> (src/index/writer_actor.rs) — all in-process tantivy writes serialize
+> through one actor thread; the reindex pass executes inside the actor with
+> phase-boundary drains; bbox_reindex unified onto the same pass; the
+> LockBusy/silent-skip class is structurally gone. §4.3 delta as built: the
+> actor creates its writer per batch/pass with retry-on-busy instead of
+> holding it for the daemon lifetime (keeps boot initial build + cross-process
+> guard semantics; the queue, not the held lock, provides serialization).
+> Measured: idle mean poll 1791µs → ~236µs across the campaign; under-load
+> samples confounded by host rustc storms (see thread note 22). REMAINING:
+> status-snapshot publication (evidence-gated), gaps-store treatment,
+> edge-rebuild guard-stacking (§4.3 tail), Phase 4 enforcement, the §4.6
+> runtime-split decision (needs a compile-free streaming load test).
+> File:line citations are point-in-time from the original survey at commit
+> 9cb5228; verify against code.
 
 ## 0. Thesis
 
