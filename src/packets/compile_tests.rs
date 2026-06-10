@@ -524,3 +524,191 @@ fn classification_info_explicitly_preserved_over_prefix_inference() {
         "no classification declared -> infer from prefix"
     );
 }
+
+// ── compile_idempotent / generation / duplicate GC ───────────────────
+
+use super::super::CompileOutcome;
+
+fn extract_packet_id(compile_msg: &str) -> String {
+    // "Packet packet-xxxxxxxx compiled (...)"
+    compile_msg
+        .split_whitespace()
+        .nth(1)
+        .expect("compile message carries the packet id")
+        .to_string()
+}
+
+#[test]
+fn compile_idempotent_skips_identical_content() {
+    let (_dir, store) = tmp_packets();
+    let params = compile_params(
+        "idem-test",
+        json!([
+            {"id": "pass_ok", "antecedent": {"op": "True"}, "consequent": "OK"}
+        ]),
+    );
+
+    let first = store.compile_idempotent(&params).unwrap();
+    let CompileOutcome::Created(first_id) = first else {
+        panic!("first compile must create");
+    };
+    assert_eq!(
+        store.compile_idempotent(&params).unwrap(),
+        CompileOutcome::UnchangedExisting(first_id),
+        "identical re-compile must reuse the existing packet"
+    );
+    assert_eq!(store.list_all().unwrap().len(), 1);
+
+    // Changed content must still write a new packet.
+    let changed = compile_params(
+        "idem-test",
+        json!([
+            {"id": "pass_ok", "antecedent": {"op": "True"}, "consequent": "CHANGED"}
+        ]),
+    );
+    assert!(matches!(
+        store.compile_idempotent(&changed).unwrap(),
+        CompileOutcome::Created(_)
+    ));
+    assert_eq!(store.list_all().unwrap().len(), 2);
+}
+
+#[test]
+fn generation_bumps_on_writes_not_on_idempotent_skip() {
+    let (_dir, store) = tmp_packets();
+    let params = compile_params(
+        "gen-test",
+        json!([
+            {"id": "pass_ok", "antecedent": {"op": "True"}, "consequent": "OK"}
+        ]),
+    );
+    let g0 = store.generation();
+    store.compile(&params).unwrap();
+    let g1 = store.generation();
+    assert!(g1 > g0, "save must bump the generation");
+
+    store.compile_idempotent(&params).unwrap();
+    assert_eq!(
+        store.generation(),
+        g1,
+        "idempotent skip must not bump the generation"
+    );
+
+    store.remove_domain("gen-test").unwrap();
+    assert!(
+        store.generation() > g1,
+        "remove must bump the generation"
+    );
+}
+
+#[test]
+fn gc_duplicate_packets_keeps_newest_copy() {
+    let (_dir, store) = tmp_packets();
+    let params = compile_params(
+        "dup-test",
+        json!([
+            {"id": "pass_ok", "antecedent": {"op": "True"}, "consequent": "OK"}
+        ]),
+    );
+    // created_at has millisecond precision; space the copies out so
+    // "newest" is well-defined.
+    store.compile(&params).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.compile(&params).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let newest_id = extract_packet_id(&store.compile(&params).unwrap());
+
+    let dry = store.gc_duplicate_packets(false).unwrap();
+    assert!(!dry.applied);
+    assert_eq!(dry.scanned, 3);
+    assert_eq!(dry.deleted, 2);
+    assert_eq!(
+        store.list_all().unwrap().len(),
+        3,
+        "dry-run must not delete"
+    );
+
+    let report = store.gc_duplicate_packets(true).unwrap();
+    assert!(report.applied);
+    assert_eq!(report.deleted, 2);
+    assert_eq!(report.per_domain.get("dup-test"), Some(&2));
+    let rest = store.list_all().unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].id, newest_id, "the newest copy survives");
+}
+
+#[test]
+fn gc_protects_apply_referenced_duplicates() {
+    let (_dir, store) = tmp_packets();
+    let sub_params = compile_params(
+        "gc-sub",
+        json!([
+            {"id": "fail_bad", "antecedent": {"op": "Eq", "field": "x", "value": "bad"}, "consequent": "NO"}
+        ]),
+    );
+    let old_id = extract_packet_id(&store.compile(&sub_params).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.compile(&sub_params).unwrap();
+
+    // Reference the OLD duplicate from another packet's Apply antecedent.
+    let referrer = compile_params(
+        "gc-referrer",
+        json!([
+            {
+                "id": "fail_sub_failed",
+                "antecedent": {"op": "Apply", "packet_id": old_id, "expect": ["fail"]},
+                "consequent": "STOP"
+            }
+        ]),
+    );
+    store.compile(&referrer).unwrap();
+
+    let report = store.gc_duplicate_packets(true).unwrap();
+    assert_eq!(
+        report.deleted, 0,
+        "the only duplicate candidate is Apply-referenced and must survive"
+    );
+    assert_eq!(report.protected_by_refs, 1);
+    // The referenced packet still resolves.
+    assert!(store.load(&old_id).is_ok());
+}
+
+#[test]
+fn gc_sweeps_orphaned_lock_files() {
+    let (dir, store) = tmp_packets();
+    let params = compile_params(
+        "lock-test",
+        json!([
+            {"id": "pass_ok", "antecedent": {"op": "True"}, "consequent": "OK"}
+        ]),
+    );
+    store.compile(&params).unwrap();
+    // remove_domain deletes packet jsons but leaves .json.lock siblings.
+    store.remove_domain("lock-test").unwrap();
+    let global = dir.path().join("global");
+    let orphans = std::fs::read_dir(&global)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".json.lock")
+        })
+        .count();
+    assert!(orphans > 0, "precondition: remove_domain leaves lock files");
+
+    let report = store.gc_duplicate_packets(true).unwrap();
+    assert_eq!(report.orphan_locks_removed, orphans);
+    let remaining = std::fs::read_dir(&global)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".json.lock")
+        })
+        .count();
+    assert_eq!(remaining, 0);
+}

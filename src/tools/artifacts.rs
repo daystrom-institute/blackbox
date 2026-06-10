@@ -332,6 +332,18 @@ mod tests {
                 .is_ok(),
             "active packet artifact must compile into the runtime packet registry"
         );
+
+        // Boot restore runs on every daemon start: re-running it must not
+        // mint another copy of an unchanged packet (the pre-fix behavior
+        // grew the store by one file per artifact per restart).
+        let count_after_first = server.state.packets.read().list_all().unwrap().len();
+        let restored_again = restore_runtime_artifacts_from_catalog(&server.state).unwrap();
+        assert_eq!(restored_again, 1);
+        assert_eq!(
+            server.state.packets.read().list_all().unwrap().len(),
+            count_after_first,
+            "second restore of an unchanged packet artifact must be idempotent"
+        );
     }
     #[tokio::test]
     async fn artifact_install_wires_project_bootstrap_arc() {

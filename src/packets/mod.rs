@@ -13,9 +13,10 @@
 //! Storage: one JSON file per packet under `<state>/packets/<scope>/<id>.json`.
 //! IDs are canonical `packet-<8hex>`, matching the `note-` / `thread-` shape.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 pub use apply::*;
@@ -153,6 +154,48 @@ pub struct Packet {
     pub merged_from: Vec<String>,
 }
 
+/// Canonical serialization of a packet's durable content, with the volatile
+/// identity/bookkeeping fields (`id`, `created_at`, `updated_at`,
+/// `self_audit_fidelity`) removed. Two packets with equal fingerprints carry
+/// the same rules, tables, lattice, and scope — they are interchangeable for
+/// evaluation. `superseded_by`/`merged_from` are deliberately retained: a
+/// superseded packet is not a duplicate of its live sibling.
+pub fn content_fingerprint(packet: &Packet) -> String {
+    let mut v = serde_json::to_value(packet).unwrap_or_default();
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("id");
+        obj.remove("created_at");
+        obj.remove("updated_at");
+        obj.remove("self_audit_fidelity");
+    }
+    v.to_string()
+}
+
+/// Result of [`Packets::compile_idempotent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileOutcome {
+    /// A new packet was written; carries the new packet id.
+    Created(String),
+    /// An identical-content packet already existed; carries its id.
+    UnchangedExisting(String),
+}
+
+/// Report from [`Packets::gc_duplicate_packets`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PacketGcReport {
+    pub applied: bool,
+    /// Total packets scanned across both scopes.
+    pub scanned: usize,
+    /// Duplicate copies deleted (or that would be deleted in dry-run).
+    pub deleted: usize,
+    /// Duplicates kept because another packet's `Apply` references them.
+    pub protected_by_refs: usize,
+    /// Lock files without a backing packet json swept up.
+    pub orphan_locks_removed: usize,
+    /// Deleted-duplicate counts by domain.
+    pub per_domain: BTreeMap<String, usize>,
+}
+
 fn slugify(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars().take(48) {
@@ -178,6 +221,13 @@ fn default_threshold_lookup_key() -> String {
 /// share a single JSON).
 pub struct Packets {
     packets_dir: PathBuf,
+    /// Monotonic mutation counter. Bumped on every durable store change
+    /// (save/remove/gc) so read-side caches — notably the MCP wire head's
+    /// surface-decision cache — can validate without rescanning the
+    /// directory. Starts at 1 so a zero-initialized cache slot is always
+    /// treated as stale. Interior-atomic because mutators take `&self`
+    /// behind the SharedState read lock.
+    generation: AtomicU64,
 }
 
 impl Packets {
@@ -188,7 +238,18 @@ impl Packets {
             .with_context(|| format!("creating {}", actual_dir.display()))?;
         Ok(Self {
             packets_dir: actual_dir,
+            generation: AtomicU64::new(1),
         })
+    }
+
+    /// Current mutation generation. Equal values across two reads guarantee
+    /// no packet was saved or removed through this handle in between.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn gen_id() -> String {
@@ -390,9 +451,13 @@ impl Packets {
 
     fn save_packet(&self, packet: &Packet) -> Result<()> {
         let path = packet_path(&self.packets_dir, &packet.scope, &packet.id);
-        crate::json_store::with_store_lock(&path, || {
+        let result = crate::json_store::with_store_lock(&path, || {
             crate::json_store::atomic_write_json_locked(&path, packet)
-        })
+        });
+        if result.is_ok() {
+            self.bump_generation();
+        }
+        result
     }
 
     /// Search both scopes for a packet by canonical ID or bare suffix.
@@ -527,6 +592,9 @@ impl Packets {
                 removed += 1;
             }
         }
+        if removed > 0 {
+            self.bump_generation();
+        }
         Ok(removed)
     }
 
@@ -538,27 +606,7 @@ impl Packets {
         // I/O errors are swallowed inside append_event so they can't
         // mask the real result.
         match &result {
-            Ok(packet) => {
-                let mut refs = Vec::new();
-                for rule in &packet.rules {
-                    collect_apply_refs(&rule.antecedent, &mut refs);
-                }
-                refs.sort();
-                refs.dedup();
-                let details = serde_json::json!({
-                    "rules_count": packet.rules.len(),
-                    "lattice_size": packet.classification_lattice.len(),
-                    "lattice": packet.classification_lattice,
-                    "referenced_packets": refs,
-                    "scope": packet.scope,
-                });
-                self.append_event(
-                    &PacketEvent::now("compile", "ok")
-                        .with_packet_id(packet.id.clone())
-                        .with_domain(p.domain.clone())
-                        .with_details(details),
-                );
-            }
+            Ok(packet) => self.log_compile_ok(packet),
             Err(e) => {
                 let details = serde_json::json!({
                     "error": format!("{e:#}"),
@@ -581,7 +629,69 @@ impl Packets {
         })
     }
 
+    fn log_compile_ok(&self, packet: &Packet) {
+        let mut refs = Vec::new();
+        for rule in &packet.rules {
+            collect_apply_refs(&rule.antecedent, &mut refs);
+        }
+        refs.sort();
+        refs.dedup();
+        let details = serde_json::json!({
+            "rules_count": packet.rules.len(),
+            "lattice_size": packet.classification_lattice.len(),
+            "lattice": packet.classification_lattice,
+            "referenced_packets": refs,
+            "scope": packet.scope,
+        });
+        self.append_event(
+            &PacketEvent::now("compile", "ok")
+                .with_packet_id(packet.id.clone())
+                .with_domain(packet.domain.clone())
+                .with_details(details),
+        );
+    }
+
+    /// Compile, but skip the write when an identical-content packet already
+    /// exists for the same domain/scope/project. This is the boot-restore
+    /// entry point: `restore_runtime_artifacts_from_catalog` re-compiles
+    /// every active packet artifact on every daemon start, and the
+    /// unconditional `compile` minted a fresh packet id each time — 33
+    /// artifacts × N restarts grew the store to thousands of byte-identical
+    /// files (see thread-935b467d).
+    pub fn compile_idempotent(&self, p: &CompileParams) -> Result<CompileOutcome> {
+        let packet = self.build_packet(p)?;
+        if let Some(existing_id) = self.find_identical(&packet)? {
+            return Ok(CompileOutcome::UnchangedExisting(existing_id));
+        }
+        self.save_packet(&packet)?;
+        self.log_compile_ok(&packet);
+        Ok(CompileOutcome::Created(packet.id))
+    }
+
+    /// Newest existing packet whose durable content matches `candidate`
+    /// (same domain/scope/project, equal [`content_fingerprint`]).
+    fn find_identical(&self, candidate: &Packet) -> Result<Option<String>> {
+        let fp = content_fingerprint(candidate);
+        // list_all is newest-first; first hit is the newest identical copy.
+        for existing in self.list_all()? {
+            if existing.domain == candidate.domain
+                && existing.scope == candidate.scope
+                && existing.project == candidate.project
+                && content_fingerprint(&existing) == fp
+            {
+                return Ok(Some(existing.id));
+            }
+        }
+        Ok(None)
+    }
+
     fn compile_inner(&self, p: &CompileParams) -> Result<Packet> {
+        let packet = self.build_packet(p)?;
+        self.save_packet(&packet)?;
+        Ok(packet)
+    }
+
+    fn build_packet(&self, p: &CompileParams) -> Result<Packet> {
         if p.domain.trim().is_empty() {
             anyhow::bail!("'domain' is required and cannot be empty");
         }
@@ -701,9 +811,117 @@ impl Packets {
             merged_from: Vec::new(),
         };
 
-        self.save_packet(&packet)?;
-
         Ok(packet)
+    }
+
+    /// Dry-run or apply duplicate-packet garbage collection.
+    ///
+    /// Groups packets by (scope, project, domain, content fingerprint) and
+    /// keeps the newest of each group; older byte-identical copies are
+    /// deletion candidates. A candidate referenced by any other packet's
+    /// `Apply{packet_id}` antecedent is protected (kept) so composition
+    /// references can never dangle. Sibling `.json.lock` files are removed
+    /// with their packet, and orphaned lock files (packet json already gone,
+    /// e.g. from `remove_domain`) are swept opportunistically.
+    pub fn gc_duplicate_packets(&self, apply: bool) -> Result<PacketGcReport> {
+        let all = self.list_all()?;
+
+        // Ids referenced from any packet's Apply antecedents are protected.
+        let mut referenced: HashSet<String> = HashSet::new();
+        for packet in &all {
+            let mut refs = Vec::new();
+            for rule in &packet.rules {
+                collect_apply_refs(&rule.antecedent, &mut refs);
+            }
+            for r in refs {
+                referenced.insert(normalize_id(&r));
+            }
+        }
+
+        // list_all is newest-first; the first packet seen per group is the
+        // keeper, the rest are duplicate candidates.
+        let mut keepers: HashMap<(String, Option<String>, String, String), String> = HashMap::new();
+        let mut candidates: Vec<&Packet> = Vec::new();
+        for packet in &all {
+            let key = (
+                packet.scope.clone(),
+                packet.project.clone(),
+                packet.domain.clone(),
+                content_fingerprint(packet),
+            );
+            match keepers.entry(key) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(packet.id.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(_) => candidates.push(packet),
+            }
+        }
+
+        let mut deleted = 0usize;
+        let mut protected_by_refs = 0usize;
+        let mut per_domain: BTreeMap<String, usize> = BTreeMap::new();
+        for packet in &candidates {
+            if referenced.contains(&normalize_id(&packet.id)) {
+                protected_by_refs += 1;
+                continue;
+            }
+            if apply {
+                let path = packet_path(&self.packets_dir, &packet.scope, &packet.id);
+                if path.exists() {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("removing packet {}", path.display()))?;
+                }
+                let lock_path = path.with_extension("json.lock");
+                if lock_path.exists() {
+                    let _ = fs::remove_file(&lock_path);
+                }
+            }
+            deleted += 1;
+            *per_domain.entry(packet.domain.clone()).or_insert(0) += 1;
+        }
+
+        // Sweep lock files whose packet json no longer exists.
+        let mut orphan_locks_removed = 0usize;
+        for scope in &["global", "project"] {
+            let dir = scope_dir(&self.packets_dir, scope);
+            if !dir.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(&dir)? {
+                let path = entry?.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let Some(stem) = name.strip_suffix(".json.lock") else {
+                    continue;
+                };
+                if !dir.join(format!("{stem}.json")).exists() {
+                    if apply {
+                        let _ = fs::remove_file(&path);
+                    }
+                    orphan_locks_removed += 1;
+                }
+            }
+        }
+
+        if apply && deleted > 0 {
+            self.bump_generation();
+            self.append_event(
+                &PacketEvent::now("gc", "ok").with_details(serde_json::json!({
+                    "deleted": deleted,
+                    "duplicate_groups": per_domain.len(),
+                    "protected_by_refs": protected_by_refs,
+                    "orphan_locks_removed": orphan_locks_removed,
+                })),
+            );
+        }
+
+        Ok(PacketGcReport {
+            applied: apply,
+            scanned: all.len(),
+            deleted,
+            protected_by_refs,
+            orphan_locks_removed,
+            per_domain,
+        })
     }
 
     // ── bbox_apply ─────────────────────────────────────────────────

@@ -71,6 +71,12 @@ pub(crate) struct StorageGcParams {
     /// reported as operator-review only; it is not auto-deleted.
     #[serde(default)]
     pub max_observed_bytes_per_project: Option<u64>,
+    /// Prune duplicate rule-packets: among byte-identical copies for the same
+    /// domain/scope/project, keep only the newest (boot-restore used to mint
+    /// one copy per daemon restart). Copies referenced by another packet's
+    /// Apply antecedent are protected. Honors dry_run. Default false.
+    #[serde(default)]
+    pub prune_duplicate_packets: bool,
 }
 
 fn default_true() -> bool {
@@ -184,10 +190,25 @@ impl BlackboxServer {
                 delete_errors,
             };
 
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
+            let packet_gc = if p.prune_duplicate_packets {
+                let report = server
+                    .state
+                    .packets
+                    .read()
+                    .gc_duplicate_packets(!p.dry_run)?;
+                Some(report)
+            } else {
+                None
+            };
+
+            let mut out = serde_json::json!({
                 "status": if p.dry_run { "dry_run" } else { "applied" },
                 "result": result,
-            }))?)
+            });
+            if let Some(report) = packet_gc {
+                out["packet_gc"] = serde_json::to_value(&report)?;
+            }
+            Ok(serde_json::to_string_pretty(&out)?)
         })
         .await
     }

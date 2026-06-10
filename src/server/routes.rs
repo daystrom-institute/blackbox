@@ -1608,11 +1608,22 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
             artifacts::ArtifactKind::Packet => {
                 let params: packets::CompileParams = serde_json::from_value(value.clone())
                     .with_context(|| format!("parsing packet artifact '{}'", entry.name))?;
-                state
+                // Idempotent on purpose: this runs on every daemon boot, and
+                // the unconditional compile used to mint a new packet file
+                // per restart (33 artifacts × N restarts ≈ 2k duplicates).
+                match state
                     .packets
                     .read()
-                    .compile(&params)
-                    .with_context(|| format!("compiling packet artifact '{}'", entry.name))?;
+                    .compile_idempotent(&params)
+                    .with_context(|| format!("compiling packet artifact '{}'", entry.name))?
+                {
+                    packets::CompileOutcome::Created(id) => {
+                        tracing::info!(artifact = %entry.name, packet = %id, "packet artifact compiled");
+                    }
+                    packets::CompileOutcome::UnchangedExisting(id) => {
+                        tracing::debug!(artifact = %entry.name, packet = %id, "packet artifact unchanged; reusing existing packet");
+                    }
+                }
                 restored += 1;
             }
             artifacts::ArtifactKind::Brofile => {
