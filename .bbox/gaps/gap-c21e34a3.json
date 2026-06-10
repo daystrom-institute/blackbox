@@ -12,8 +12,9 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/glm-server-builtin-suppression",
+  "notes": "CORRECTION (operator review, 2026-06-10, w8/harness-fixes): the facet-1 claim \"the harness never requested web_search\" is FALSE. The harness injects the server-side web_search tool by default on every Anthropic-transport request (anthropic.rs build_body, gated by TurnOpts.web_search, default true via BRO_HARNESS_WEB_SEARCH at agent_loop). Z.ai renders that offer as its web_search_prime builtin. Session d98ee38a evidence: all six degenerate calls sit in ONE assistant message (snapshot item 182, search_query=\"test\"), and the session's first tool call was tool_search hunting for bbox_note — a lost model pulling the nearest offered lever, not a provider forcing builtins. ROOT CAUSE was facet 2 (exec-note discoverability), fixed in the code-mode exec/wait descriptions (exec-note idiom + \"do not search the web for it\"). A lane-wide default-off for glm was implemented and then REVERTED by operator decision (62c19c1) as capability sabotage treating a symptom; what landed instead: BRO_HARNESS_WEB_SEARCH now resolves through the per-session env resolver, so the knob is operator-scoped (account env / per-dispatch env_overrides) and actually reachable for in-process dispatches. If degenerate server-side searches recur AFTER the discoverability fix, that evidence would justify revisiting a lane default.",
   "resolution": "unresolved",
   "thread_id": "thread-9dfe1da5",
   "created_at": "2026-06-10T07:37:48Z",
-  "updated_at": "2026-06-10T07:37:48Z"
+  "updated_at": "2026-06-10T15:58:20Z"
 }
