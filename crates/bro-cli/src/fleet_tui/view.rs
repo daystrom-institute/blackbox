@@ -154,6 +154,7 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
     let shortcut_lines: Vec<Line<'static>> = match app.zone {
         Zone::Roster => vec![
             Line::from("  ↑/↓           navigate agents"),
+            Line::from("  1-9           jump to agent row (index column)"),
             Line::from("  PgUp/PgDn     page agents (half-page)"),
             Line::from("  Home/End      first / last agent"),
             Line::from("  Tab           switch origin tab"),
@@ -163,9 +164,10 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
             Line::from("  Ctrl+R        rename agent"),
             Line::from("  Ctrl+X        stop / delete agent"),
             Line::from("  Ctrl+K        prune terminal agents"),
+            Line::from("  Ctrl+U / Esc  clear composer"),
             Line::from("  /stop-running interrupt all running agents"),
             Line::from("  /closeout     fold selected worktree → target"),
-            Line::from("  Ctrl+Q / Esc  quit"),
+            Line::from("  Ctrl+Q        quit (Esc never quits)"),
         ],
         Zone::SingleAgent => vec![
             Line::from("  ←             back to roster"),
@@ -394,6 +396,7 @@ pub(super) fn draw_roster(
     // last stream event.
     let widths = [
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(4),
         Constraint::Length(30),
         Constraint::Length(13),
@@ -401,7 +404,7 @@ pub(super) fn draw_roster(
         Constraint::Length(7),
         Constraint::Length(7),
     ];
-    let header = Row::new(["", "prov", "agent", "model", "report", "started", "last"]).style(
+    let header = Row::new(["", "", "prov", "agent", "model", "report", "started", "last"]).style(
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -431,6 +434,7 @@ pub(super) fn draw_roster(
         let caret = if collapsed { "▸" } else { "▾" };
         // Section header — the bucket label sits in the (wide) name column.
         rows.push(Row::new(vec![
+            Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(format!("{caret} {} ({})", bucket.label(), in_bucket.len()))
@@ -463,8 +467,16 @@ pub(super) fn draw_roster(
                 .last_activity_ms
                 .map(age)
                 .unwrap_or_else(|| started.clone());
+            // Jump index: 1-9 match the digit-key jump binding; rows past 9
+            // show no index (still reachable by arrows/paging).
+            let jump_label = if sel_idx < 9 {
+                (sel_idx + 1).to_string()
+            } else {
+                String::new()
+            };
             rows.push(Row::new(vec![
                 Cell::from(glyph).style(Style::default().fg(gcolor)),
+                Cell::from(jump_label).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(provider_tag(a.provider))
                     .style(Style::default().fg(provider_color(a.provider))),
                 Cell::from(truncate(&a.name, 30))

@@ -2267,6 +2267,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         start_rename(app);
         return;
     }
+    // Ctrl+U clears the composer wholesale. Load-bearing for driveability:
+    // a non-empty composer claims the arrow keys for text editing, so without
+    // a one-keystroke clear the only way back to roster navigation is
+    // char-by-char backspace.
+    if ctrl && key.code == KeyCode::Char('u') {
+        app.clear_input();
+        app.prune_armed_until = None;
+        return;
+    }
     // Ctrl+X: stop a live agent (→ Interrupted), or delete an already-stopped
     // one from the roster (Claude-agents idiom, §5).
     if ctrl && key.code == KeyCode::Char('x') {
@@ -2334,16 +2343,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('?') if app.input.is_empty() && app.zone != Zone::SingleAgent => {
             app.help_visible = !app.help_visible;
         }
-        // Esc cancels a pending rename, else interrupts the running turn in the
-        // single-agent view (§1.1), else quits. Ctrl+Q/Ctrl+C always quit.
+        // Esc is a predictable de-escalation ladder and NEVER quits: cancel a
+        // pending rename → clear a non-empty composer → interrupt the running
+        // turn (single-agent view) → back out of a selector → no-op with a
+        // hint at roster home. Quitting is exclusively Ctrl+Q / Ctrl+C —
+        // a habitual Esc must not nuke the cockpit (it used to: an operator
+        // reaching for "interrupt" from the roster lost the whole session).
         KeyCode::Esc if app.rename_target.is_some() => {
             app.rename_target = None;
             app.clear_input();
         }
+        KeyCode::Esc if !app.input.is_empty() => app.clear_input(),
         KeyCode::Esc if app.zone == Zone::SingleAgent => interrupt_selected(app),
-        // In the provider/model/effort selectors, Esc cancels the drill-down back
-        // to the roster (a habitual Esc shouldn't nuke the whole cockpit). Esc
-        // still quits from the roster home below.
         KeyCode::Esc
             if matches!(
                 app.zone,
@@ -2352,7 +2363,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         {
             app.zone = Zone::Roster;
         }
-        KeyCode::Esc => app.quit = true,
+        KeyCode::Esc => {
+            app.set_status("Ctrl+Q quits the cockpit", Duration::from_secs(3));
+        }
 
         // Slash menu owns ↑/↓ while it's up.
         KeyCode::Up if slash => slash_move(app, -1),
@@ -2439,6 +2452,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.history_cursor = None;
             }
         }
+        // 1-9 jump-select the Nth roster row (display order, matching the
+        // index column) when the composer is empty. With text present digits
+        // type normally, so the binding never steals characters from a prompt.
+        KeyCode::Char(c @ '1'..='9')
+            if app.zone == Zone::Roster && app.input.is_empty() && !alt =>
+        {
+            roster_jump(app, c.to_digit(10).unwrap() as usize - 1);
+        }
         // Typing exits history-recall mode (you're now editing the line) and
         // resets the slash selection to the top match.
         KeyCode::Char(c) => {
@@ -2451,6 +2472,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         _ => {}
     }
+}
+
+/// Jump the roster cursor straight to display position `pos` (0-based), as
+/// labeled by the index column. Out-of-range jumps land on the last row
+/// rather than no-op, so a stale index is still a useful gesture.
+fn roster_jump(app: &mut App, pos: usize) {
+    let (_, order) = app.ordered_roster_agents();
+    if order.is_empty() {
+        return;
+    }
+    app.roster_selected = pos.min(order.len() - 1);
+    app.anchor_roster_selection();
 }
 
 fn delete_previous_word(app: &mut App) {
