@@ -12,8 +12,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/dispatch/cwd-advertised-name-flip",
   "notes": "Item 3 of thread-55d51135. Mechanical but must be done as one pass (schema + docs + prompts + atom templates) to avoid split priors.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-55d51135",
   "created_at": "2026-06-11T17:09:00Z",
-  "updated_at": "2026-06-11T17:09:00Z"
+  "updated_at": "2026-06-11T21:04:32Z",
+  "resolved_at": "2026-06-11T21:04:32Z",
+  "resolution_note": "Fixed in 1cab57b (worktree-scope-cluster): bro_exec/bro_resume/bro_agent_dispatch/bro_broadcast schemas advertise cwd; project_dir kept as deprecated serde alias (no caller/atom/workflow breakage). Tool docs, prompts, examples, design docs migrated same-pass. Load-bearing finding: the ToolArgDefaults table applies BEFORE daemon-side alias normalization, so the managed-worktree pin now emits both pin:*.cwd and pin:*.project_dir; glob-rule validation made param-existence-scoped so *-glob pins stay quiet on profiles without dispatch tools. Closes thread-55d51135 item 3 (design doc §4 conformity pass)."
 }
