@@ -20,7 +20,6 @@ use crate::artifacts::{
 use crate::chunker;
 use crate::crons;
 use crate::edge_index;
-use crate::embed_queue;
 use crate::entity_ref;
 use crate::index;
 use crate::orchestration;
@@ -1523,7 +1522,7 @@ pub(crate) async fn install_artifact_value(
                 .parse::<u32>()
                 .map_err(|_| anyhow::anyhow!("agent artifact version must parse as u32"))?;
             let agent_ref = orchestration::agents::types::AgentRef { name, version };
-            manifest.embedding = Some(embed_queue::agent_manifest_embedding(&agent_ref, &manifest));
+            manifest.embedding = Some(crate::embed_runtime::agent_manifest_embedding(&agent_ref, &manifest));
             value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
             let install_warnings = agent_install_warnings(state, &manifest);
             installed_agent = Some((agent_ref, manifest, install_warnings));
@@ -1572,7 +1571,7 @@ pub(crate) async fn install_artifact_value(
                 install_warnings,
             )?;
         }
-        embed_queue::enqueue_agent_manifest(&agent_ref, &manifest);
+        crate::embed_runtime::enqueue_agent_manifest(&agent_ref, &manifest);
         persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
     }
     Ok(meta)

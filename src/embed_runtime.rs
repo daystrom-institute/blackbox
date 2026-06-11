@@ -1,0 +1,1112 @@
+//! Daemon-side embedding runtime — the upward-coupled half of the embed
+//! surface. The contract (Bucket, EmbeddingRouter, the queue handle and
+//! enqueue helpers) lives in `crate::embed` / `crate::embed_queue`; this
+//! module owns everything that needs `SharedState`, orchestration agent
+//! types, or routing-verdict dispatch: reembed orchestration, embedding
+//! route coverage, agent-manifest embeddings, and the knowledge
+//! contradiction detector (registered into the queue worker's hook at
+//! SharedState construction).
+
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use parking_lot::RwLock;
+use rmcp::schemars;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::OnceLock;
+
+use crate::embed::queue::{EmbedRequest, EmbedStatusResponse};
+use crate::embed::{
+    Bucket, EmbeddingRouter,
+};
+use crate::embed_queue::status_response;
+use crate::orchestration::agents::types::{AgentManifest, AgentRef};
+use crate::routing::RoutingVerdict;
+use crate::server::dispatch::dispatch_routing_verdict_direct;
+use crate::server::state::SharedState;
+use std::path::PathBuf;
+
+use bbox_chunker::Chunk;
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_corpus_index::index::EmbeddingSourceDoc;
+use bbox_threads::notes::NoteParams;
+use crate::embed::queue;
+use bbox_knowledge::knowledge::KnowledgeEntry;
+use crate::embed_queue::content_hash;
+use crate::orchestration::agents::types::{AgentEmbedding, AgentEmbeddingComponents};
+
+/// Adapter with the queue worker's hook signature; registered via
+/// `embed::queue::register_contradiction_hook` at SharedState construction.
+pub(crate) fn contradiction_hook(request: &EmbedRequest, vector_route: &str, vector: &[f32]) {
+    maybe_detect_knowledge_contradiction(request, vector_route, vector);
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReembedParams {
+    pub route: String,
+    #[serde(default)]
+    pub include_transcripts: bool,
+    #[serde(default)]
+    pub max_entities: Option<usize>,
+}
+
+pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<String> {
+    let buckets = buckets_for_reembed_route(&p.route)?;
+    if buckets.contains(&Bucket::Transcripts) && !p.include_transcripts {
+        bail!(
+            "transcript re-embed is intentionally guarded because it reads the transcript corpus; rerun with include_transcripts=true only when you explicitly want that heavy rebuild"
+        );
+    }
+    let route = p.route.trim().to_string();
+    let max_entities = p.max_entities;
+    tokio::spawn(async move {
+        match enqueue_reembed_routes(&state, &buckets, max_entities) {
+            Ok(enqueued) => {
+                tracing::info!(route = %route, ?max_entities, enqueued, "embedding rebuild queue refill completed");
+            }
+            Err(err) => {
+                tracing::warn!(route = %route, error = %err, "embedding rebuild queue refill failed");
+            }
+        }
+    });
+    Ok(serde_json::to_string_pretty(&json!({
+        "status": "ok",
+        "route": p.route,
+        "max_entities": p.max_entities,
+        "message": "rebuild queue refill started; final enqueue count will be logged",
+    }))?)
+}
+
+fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
+    let route = route.trim();
+    if route.is_empty() {
+        bail!("route is required");
+    }
+    if route == "all" {
+        return Ok(Bucket::ALL.to_vec());
+    }
+    Bucket::ALL
+        .iter()
+        .copied()
+        .find(|bucket| bucket.as_str() == route)
+        .map(|bucket| vec![bucket])
+        .with_context(|| {
+            format!(
+                "unknown embedding route `{route}`; expected one of: all, {}",
+                Bucket::ALL
+                    .iter()
+                    .map(|bucket| bucket.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RouteCoverage {
+    pub source_count: u64,
+    pub indexed_count: u64,
+}
+
+pub(crate) fn route_coverage(
+    stores: &crate::providers::CorpusStores<'_>,
+    buckets: &[Bucket],
+) -> Result<BTreeMap<String, RouteCoverage>> {
+    let router = EmbeddingRouter::load_default()?;
+    let mut coverage = BTreeMap::new();
+    let mut active_by_route = BTreeMap::new();
+    if buckets.contains(&Bucket::Knowledge) {
+        for entry in stores.kb.read().all_entries() {
+            // Non-indexable entries (Deleted/Draft/Disabled) aren't in the
+            // searchable index — skip so coverage reflects indexable knowledge.
+            if !crate::index::indexable_knowledge_entry(entry) {
+                continue;
+            }
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Knowledge,
+                None,
+                &crate::index::knowledge_entity_id(&entry.id),
+                &crate::index::knowledge_chunk_hash(entry),
+            )?;
+        }
+        for item in stores.roadmap.read().all_items() {
+            // Rejected items are not indexed — skip
+            if matches!(item.status, crate::roadmap::RoadmapStatus::Rejected) {
+                continue;
+            }
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Knowledge,
+                None,
+                &crate::index::roadmap_entity_id(&item.id),
+                &crate::index::roadmap_chunk_hash(item),
+            )?;
+        }
+    }
+    if buckets.contains(&Bucket::Notes) {
+        for note in stores.notes.read().all() {
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Notes,
+                None,
+                &EntityRef::Note {
+                    note_id: note.id.clone(),
+                }
+                .to_string(),
+                &crate::embed_queue::note_chunk_hash(note),
+            )?;
+        }
+    }
+    if buckets.contains(&Bucket::Threads) {
+        for thread in stores.threads.read().all() {
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Threads,
+                None,
+                &EntityRef::Thread {
+                    thread_id: thread.id.clone(),
+                }
+                .to_string(),
+                &crate::embed_queue::thread_chunk_hash(thread),
+            )?;
+        }
+    }
+    if buckets.contains(&Bucket::AgentManifest) {
+        record_agent_manifest_coverage(stores, &router, &mut coverage, &mut active_by_route)?;
+    }
+    let doc_types = reembed_index_doc_types(buckets);
+    if !doc_types.is_empty() {
+        stores
+            .idx
+            .read()
+            .for_each_embedding_source_doc_for_doc_types(&doc_types, None, |doc| {
+                record_index_doc_coverage(
+                    &router,
+                    &mut coverage,
+                    &mut active_by_route,
+                    buckets,
+                    &doc,
+                )?;
+                Ok(())
+            })?;
+    }
+    Ok(coverage)
+}
+
+fn record_agent_manifest_coverage(
+    stores: &crate::providers::CorpusStores<'_>,
+    router: &EmbeddingRouter,
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+) -> Result<()> {
+    let catalog = stores.artifacts.read();
+    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
+        kind: Some(crate::artifacts::ArtifactKind::Agent),
+        name: None,
+        include_superseded: true,
+    })?;
+    for entry in entries {
+        // TODO(phase-4-shadowing): plumb project_id when caller has it to enable local shadowing.
+        let Some(value) =
+            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
+        else {
+            continue;
+        };
+        let manifest_value = value.get("manifest").unwrap_or(&value);
+        let Ok(manifest) = serde_json::from_value::<
+            crate::orchestration::agents::types::AgentManifest,
+        >(manifest_value.clone()) else {
+            continue;
+        };
+        let Ok(version) = entry.version.parse::<u32>() else {
+            continue;
+        };
+        let agent = crate::orchestration::agents::types::AgentRef {
+            name: entry.name,
+            version,
+        };
+        for component in [
+            AgentManifestComponent::Primary,
+            AgentManifestComponent::WhenToUse,
+            AgentManifestComponent::AntiPatterns,
+        ] {
+            let Some(chunk_hash) = agent_component_hash(&manifest, component)
+            else {
+                continue;
+            };
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                Bucket::AgentManifest,
+                None,
+                &agent_component_entity_id(&agent, component),
+                &chunk_hash,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn record_index_doc_coverage(
+    router: &EmbeddingRouter,
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+    buckets: &[Bucket],
+    doc: &EmbeddingSourceDoc,
+) -> Result<()> {
+    let Some(bucket) = reembed_index_doc_bucket(doc) else {
+        return Ok(());
+    };
+    if !buckets.contains(&bucket) {
+        return Ok(());
+    }
+    match bucket {
+        Bucket::Code | Bucket::Docs => {
+            let Some(chunk) = chunk_from_embedding_doc(doc) else {
+                return Ok(());
+            };
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                bucket,
+                Some(&chunk.project_id),
+                &crate::embed_queue::project_file_entity_id(&chunk),
+                &chunk.chunk_hash,
+            )
+        }
+        Bucket::Transcripts => {
+            let chunk_hash = doc
+                .chunk_hash
+                .clone()
+                .unwrap_or_else(|| crate::embed_queue::content_hash(&doc.content));
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                Bucket::Transcripts,
+                None,
+                &EntityRef::Transcript {
+                    provider: doc.account.clone(),
+                    session_id: doc.session_id.clone(),
+                    line_offset: doc.byte_offset,
+                    event_idx: 0,
+                }
+                .to_string(),
+                &chunk_hash,
+            )
+        }
+        Bucket::GitMessage => {
+            let (Some(entity_id), Some(chunk_hash)) = (&doc.entity_id, &doc.chunk_hash) else {
+                return Ok(());
+            };
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                Bucket::GitMessage,
+                None,
+                entity_id,
+                chunk_hash,
+            )
+        }
+        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => Ok(()),
+    }
+}
+
+fn record_coverage(
+    router: &EmbeddingRouter,
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+    bucket: Bucket,
+    project_id: Option<&str>,
+    entity_id: &str,
+    chunk_hash: &str,
+) -> Result<()> {
+    let (queue_route, vector_route) = router.queue_and_vector_route(bucket, project_id)?;
+    let entry = coverage.entry(queue_route).or_default();
+    entry.source_count = entry.source_count.saturating_add(1);
+    if !active_by_route.contains_key(&vector_route) {
+        active_by_route.insert(
+            vector_route.clone(),
+            crate::vectors::active_entity_hashes(&vector_route)?
+                .into_iter()
+                .collect(),
+        );
+    }
+    if active_by_route
+        .get(&vector_route)
+        .is_some_and(|active| active.contains(&(entity_id.to_string(), chunk_hash.to_string())))
+    {
+        entry.indexed_count = entry.indexed_count.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn enqueue_reembed_routes(
+    state: &Arc<SharedState>,
+    buckets: &[Bucket],
+    max_entities: Option<usize>,
+) -> Result<usize> {
+    let mut enqueued = 0usize;
+    if buckets.contains(&Bucket::Knowledge) {
+        for entry in state.kb.read().all_entries() {
+            // Don't re-embed retired entries — `all_entries()` includes Deleted,
+            // which would revive a forgotten entry in vector search. Mirror the
+            // tantivy reindex's indexable filter (Active|Superseded only).
+            if !crate::index::indexable_knowledge_entry(entry) {
+                continue;
+            }
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
+            let entity_id = crate::index::knowledge_entity_id(&entry.id);
+            let chunk_hash = crate::index::knowledge_chunk_hash(entry);
+            crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
+            enqueued += 1;
+        }
+        for item in state.roadmap.read().all_items() {
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
+            if matches!(item.status, crate::roadmap::RoadmapStatus::Rejected) {
+                continue;
+            }
+            let entity_id = crate::index::roadmap_entity_id(&item.id);
+            let chunk_hash = crate::index::roadmap_chunk_hash(item);
+            crate::embed_queue::enqueue_roadmap(item, &entity_id, &chunk_hash);
+            enqueued += 1;
+        }
+    }
+    if buckets.contains(&Bucket::Notes) {
+        for note in state.notes.read().all() {
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
+            crate::embed_queue::enqueue_note(note);
+            enqueued += 1;
+        }
+    }
+    if buckets.contains(&Bucket::Threads) {
+        for thread in state.threads.read().all() {
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
+            crate::embed_queue::enqueue_thread(thread);
+            enqueued += 1;
+        }
+    }
+    if buckets.contains(&Bucket::AgentManifest) {
+        let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
+        enqueued += enqueue_agent_manifest_artifacts(state, remaining)?;
+        if limit_reached(max_entities, enqueued) {
+            return Ok(enqueued);
+        }
+    }
+    let doc_types = reembed_index_doc_types(buckets);
+    if !doc_types.is_empty() {
+        let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
+        let mut index_enqueued = 0usize;
+        state
+            .idx
+            .read()
+            .for_each_embedding_source_doc_for_doc_types(&doc_types, remaining, |doc| {
+                if limit_reached(remaining, index_enqueued) {
+                    return Ok(());
+                }
+                if enqueue_reembed_index_doc(buckets, &doc) {
+                    index_enqueued += 1;
+                }
+                Ok(())
+            })?;
+        enqueued += index_enqueued;
+    }
+    Ok(enqueued)
+}
+
+
+fn enqueue_agent_manifest_artifacts(
+    state: &Arc<SharedState>,
+    max_entities: Option<usize>,
+) -> Result<usize> {
+    let catalog = state.artifacts.read();
+    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
+        kind: Some(crate::artifacts::ArtifactKind::Agent),
+        name: None,
+        include_superseded: true,
+    })?;
+    let mut enqueued = 0usize;
+    for entry in entries {
+        if limit_reached(max_entities, enqueued) {
+            break;
+        }
+        let Some(value) =
+            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
+        else {
+            continue;
+        };
+        let manifest_value = value.get("manifest").unwrap_or(&value);
+        let Ok(manifest) = serde_json::from_value::<
+            crate::orchestration::agents::types::AgentManifest,
+        >(manifest_value.clone()) else {
+            continue;
+        };
+        let Ok(version) = entry.version.parse::<u32>() else {
+            continue;
+        };
+        let agent = crate::orchestration::agents::types::AgentRef {
+            name: entry.name,
+            version,
+        };
+        enqueued += agent_manifest_component_count(&manifest);
+        enqueue_agent_manifest(&agent, &manifest);
+    }
+    Ok(enqueued)
+}
+
+#[cfg(test)]
+fn count_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -> usize {
+    docs.iter()
+        .filter(|doc| reembed_index_doc_bucket(doc).is_some_and(|bucket| buckets.contains(&bucket)))
+        .count()
+}
+
+#[cfg(test)]
+fn enqueue_reembed_index_docs(
+    buckets: &[Bucket],
+    docs: &[EmbeddingSourceDoc],
+    max_entities: Option<usize>,
+) -> usize {
+    let mut enqueued = 0usize;
+    for doc in docs {
+        if limit_reached(max_entities, enqueued) {
+            break;
+        }
+        if enqueue_reembed_index_doc(buckets, doc) {
+            enqueued += 1;
+        }
+    }
+    enqueued
+}
+
+fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bool {
+    let Some(bucket) = reembed_index_doc_bucket(doc) else {
+        return false;
+    };
+    if !buckets.contains(&bucket) {
+        return false;
+    }
+    match bucket {
+        Bucket::Code | Bucket::Docs => {
+            let Some(chunk) = chunk_from_embedding_doc(doc) else {
+                return false;
+            };
+            let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+            crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
+            true
+        }
+        Bucket::Transcripts => {
+            let chunk_hash = doc
+                .chunk_hash
+                .clone()
+                .unwrap_or_else(|| crate::embed_queue::content_hash(&doc.content));
+            crate::embed_queue::enqueue_transcript(
+                &doc.account,
+                &doc.session_id,
+                doc.byte_offset,
+                &doc.content,
+                &chunk_hash,
+            );
+            true
+        }
+        Bucket::GitMessage => {
+            let (Some(entity_id), Some(chunk_hash)) = (&doc.entity_id, &doc.chunk_hash) else {
+                return false;
+            };
+            crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
+            true
+        }
+        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => false,
+    }
+}
+
+fn limit_reached(max_entities: Option<usize>, enqueued: usize) -> bool {
+    max_entities.is_some_and(|max| enqueued >= max)
+}
+
+fn reembed_index_doc_types(buckets: &[Bucket]) -> Vec<&'static str> {
+    let mut doc_types = Vec::new();
+    if buckets.contains(&Bucket::Code) || buckets.contains(&Bucket::Docs) {
+        doc_types.push("project_file");
+    }
+    if buckets.contains(&Bucket::Transcripts) {
+        doc_types.push("transcript");
+    }
+    if buckets.contains(&Bucket::GitMessage) {
+        doc_types.push("commit");
+    }
+    doc_types
+}
+
+fn reembed_index_doc_bucket(doc: &EmbeddingSourceDoc) -> Option<Bucket> {
+    match doc.doc_type.as_str() {
+        "transcript" if !doc.session_id.is_empty() && !doc.content.is_empty() => {
+            Some(Bucket::Transcripts)
+        }
+        "commit" if doc.chunk_kind == "git_message" && !doc.content.is_empty() => {
+            Some(Bucket::GitMessage)
+        }
+        "knowledge" | "roadmap" => Some(Bucket::Knowledge),
+        "project_file" => {
+            let path = Path::new(&doc.file_path);
+            if crate::chunker::code::language_for_path(path).is_some() {
+                Some(Bucket::Code)
+            } else if is_docs_path(path) {
+                Some(Bucket::Docs)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_docs_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("md" | "mdx" | "rst" | "txt")
+    )
+}
+
+fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
+    let entity = doc
+        .entity_id
+        .as_deref()
+        .and_then(|id| EntityRef::parse(id).ok())?;
+    let (project_id, rel_path_hash, chunk_hash, occurrence_idx) = match entity {
+        EntityRef::ProjectFile {
+            project_id,
+            rel_path_hash,
+            chunk_hash,
+            occurrence_idx,
+        }
+        | EntityRef::ProjectFileV2 {
+            project_id,
+            rel_path_hash,
+            chunk_hash,
+            occurrence_idx,
+            ..
+        } => (project_id, rel_path_hash, chunk_hash, occurrence_idx),
+        _ => return None,
+    };
+    let byte_end = doc.byte_offset.saturating_add(doc.content.len() as u64);
+    Some(Chunk {
+        project_id,
+        file_path: PathBuf::from(&doc.file_path),
+        rel_path_hash,
+        chunk_kind: doc.chunk_kind.clone(),
+        chunk_hash,
+        occurrence_idx,
+        language: doc.language.clone(),
+        symbol: doc.symbol.clone(),
+        symbol_exact: doc.symbol_exact.clone(),
+        // The new chunk-metadata fields are not yet stored in tantivy
+        // (lands in CN-D3) and not yet projected onto the document
+        // model used here. Leave them None until the schema bump.
+        symbol_kind: None,
+        parent_kind: None,
+        line_start: None,
+        line_end: None,
+        content: doc.content.clone(),
+        byte_start: doc.byte_offset,
+        byte_end,
+    })
+}
+
+
+static CONTRADICTION_STATE: OnceLock<RwLock<Option<std::sync::Arc<SharedState>>>> = OnceLock::new();
+static CONTRADICTION_THRESHOLD: OnceLock<RwLock<f32>> = OnceLock::new();
+const DEFAULT_TIER0_COSINE_THRESHOLD: f32 = 0.85;
+
+pub(crate) fn install_contradiction_state(state: std::sync::Arc<SharedState>) {
+    *CONTRADICTION_STATE
+        .get_or_init(|| RwLock::new(None))
+        .write() = Some(state);
+}
+
+pub(crate) fn install_contradiction_threshold(threshold: f32) {
+    *CONTRADICTION_THRESHOLD
+        .get_or_init(|| RwLock::new(DEFAULT_TIER0_COSINE_THRESHOLD))
+        .write() = threshold.clamp(0.0, 1.0);
+}
+
+fn contradiction_threshold() -> f32 {
+    *CONTRADICTION_THRESHOLD
+        .get_or_init(|| RwLock::new(DEFAULT_TIER0_COSINE_THRESHOLD))
+        .read()
+}
+
+
+pub(crate) fn status_response_for_buckets(
+    stores: &crate::providers::CorpusStores<'_>,
+    buckets: &[Bucket],
+) -> Result<EmbedStatusResponse> {
+    let mut response = status_response();
+    let coverage = route_coverage(stores, buckets)?;
+    for (route, counts) in coverage {
+        let status = response.routes.entry(route).or_default();
+        status.session_indexed_count = Some(status.indexed_count);
+        status.indexed_count = counts.indexed_count;
+        status.source_count = Some(counts.source_count);
+        status.coverage_ratio = if counts.source_count == 0 {
+            None
+        } else {
+            Some(counts.indexed_count as f32 / counts.source_count as f32)
+        };
+    }
+    queue::normalize_route_statuses(&mut response);
+    Ok(response)
+}
+
+pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
+    const STATUS_COVERAGE_BUCKETS: &[Bucket] = &[
+        Bucket::Knowledge,
+        Bucket::Code,
+        Bucket::Docs,
+        Bucket::GitMessage,
+        Bucket::Notes,
+        Bucket::Threads,
+        Bucket::AgentManifest,
+    ];
+    Ok(serde_json::to_string_pretty(&status_response_for_buckets(
+        &state.corpus_stores(),
+        STATUS_COVERAGE_BUCKETS,
+    )?)?)
+}
+
+
+pub(crate) fn agent_manifest_embedding(
+    agent: &AgentRef,
+    manifest: &AgentManifest,
+) -> AgentEmbedding {
+    let route = crate::embed::EmbeddingRouter::load_default()
+        .and_then(|router| router.route(Bucket::AgentManifest, None))
+        .ok();
+    let model = route
+        .as_ref()
+        .map(|route| route.model.clone())
+        .unwrap_or_else(|| "unavailable".into());
+    let vector_route = route.map(|route| route.vector_route_id());
+    let primary = agent_component_entity_id(agent, AgentManifestComponent::Primary);
+    let when_to_use = if manifest.when_to_use.is_empty() {
+        None
+    } else {
+        Some(agent_component_entity_id(
+            agent,
+            AgentManifestComponent::WhenToUse,
+        ))
+    };
+    let anti_patterns = if manifest.anti_patterns.is_empty() {
+        None
+    } else {
+        Some(agent_component_entity_id(
+            agent,
+            AgentManifestComponent::AntiPatterns,
+        ))
+    };
+    AgentEmbedding {
+        model,
+        computed_at: crate::util::now_iso(),
+        vector_ref: primary.clone(),
+        vector_route,
+        components: AgentEmbeddingComponents {
+            primary,
+            when_to_use,
+            anti_patterns,
+        },
+    }
+}
+
+pub(crate) fn enqueue_agent_manifest(agent: &AgentRef, manifest: &AgentManifest) {
+    for component in agent_manifest_components(manifest) {
+        crate::embed_queue::enqueue(EmbedRequest {
+            bucket: Bucket::AgentManifest,
+            project_id: None,
+            entity_id: agent_component_entity_id(agent, component.kind),
+            chunk_hash: content_hash(&component.text),
+            text: component.text,
+        });
+    }
+}
+
+pub(crate) fn agent_manifest_component_count(manifest: &AgentManifest) -> usize {
+    agent_manifest_components(manifest).len()
+}
+
+pub(crate) fn agent_component_entity_id(
+    agent: &AgentRef,
+    component: AgentManifestComponent,
+) -> String {
+    format!(
+        "agent_embed:{}:v{}:{}",
+        agent.name,
+        agent.version,
+        component.as_str()
+    )
+}
+
+pub(crate) fn parse_agent_component_entity_id(
+    entity_id: &str,
+) -> Option<(AgentRef, AgentManifestComponent)> {
+    let (name, version, component) =
+        crate::embed_queue::parse_agent_component_entity_id_parts(entity_id)?;
+    Some((
+        AgentRef { name, version },
+        AgentManifestComponent::parse(&component)?,
+    ))
+}
+
+pub(crate) fn agent_component_hash(
+    manifest: &AgentManifest,
+    component: AgentManifestComponent,
+) -> Option<String> {
+    let text = agent_manifest_component_text(manifest, component)?;
+    Some(content_hash(&text))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AgentManifestComponent {
+    Primary,
+    WhenToUse,
+    AntiPatterns,
+}
+
+impl AgentManifestComponent {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::WhenToUse => "when_to_use",
+            Self::AntiPatterns => "anti_patterns",
+        }
+    }
+
+    pub(crate) fn parse(input: &str) -> Option<Self> {
+        match input {
+            "primary" => Some(Self::Primary),
+            "when_to_use" => Some(Self::WhenToUse),
+            "anti_patterns" => Some(Self::AntiPatterns),
+            _ => None,
+        }
+    }
+}
+
+struct AgentComponentText {
+    kind: AgentManifestComponent,
+    text: String,
+}
+
+fn agent_manifest_components(manifest: &AgentManifest) -> Vec<AgentComponentText> {
+    let mut components = Vec::new();
+    for kind in [
+        AgentManifestComponent::Primary,
+        AgentManifestComponent::WhenToUse,
+        AgentManifestComponent::AntiPatterns,
+    ] {
+        if let Some(text) = agent_manifest_component_text(manifest, kind) {
+            components.push(AgentComponentText { kind, text });
+        }
+    }
+    components
+}
+
+fn agent_manifest_component_text(
+    manifest: &AgentManifest,
+    component: AgentManifestComponent,
+) -> Option<String> {
+    match component {
+        AgentManifestComponent::Primary => Some(format!(
+            "description: {}\nwhen_to_use:\n{}\nanti_patterns:\n{}",
+            manifest.description,
+            manifest.when_to_use.join("\n"),
+            manifest.anti_patterns.join("\n")
+        )),
+        AgentManifestComponent::WhenToUse => {
+            if manifest.when_to_use.is_empty() {
+                None
+            } else {
+                Some(manifest.when_to_use.join("\n"))
+            }
+        }
+        AgentManifestComponent::AntiPatterns => {
+            if manifest.anti_patterns.is_empty() {
+                None
+            } else {
+                Some(manifest.anti_patterns.join("\n"))
+            }
+        }
+    }
+}
+
+
+pub(crate) fn maybe_detect_knowledge_contradiction(
+    request: &EmbedRequest,
+    vector_route: &str,
+    vector: &[f32],
+) {
+    if request.bucket != Bucket::Knowledge {
+        return;
+    }
+    let Some(state) = CONTRADICTION_STATE
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .clone()
+    else {
+        return;
+    };
+    let Some(entry_a) = request.entity_id.strip_prefix("knowledge:") else {
+        return;
+    };
+    let hits = match crate::vectors::search(vector_route, vector, 5) {
+        Ok(hits) => hits,
+        Err(err) => {
+            tracing::debug!(error = %err, "knowledge contradiction nearest-neighbor scan failed");
+            return;
+        }
+    };
+    let kb = state.kb.read();
+    let Some(source) = kb.entry(entry_a).cloned() else {
+        return;
+    };
+    let threshold = contradiction_threshold();
+    let Some((entry_b, cosine)) = hits.into_iter().find_map(|hit| {
+        let cosine = 1.0 - hit.distance;
+        if hit.id == request.entity_id || cosine < threshold {
+            return None;
+        }
+        let id = hit.id.strip_prefix("knowledge:")?;
+        let target = kb.entry(id)?.clone();
+        if supersession_related(&source, &target) {
+            return None;
+        }
+        Some((target, cosine))
+    }) else {
+        return;
+    };
+    drop(kb);
+
+    let payload = json!({
+        "entry_a": format!("knowledge:{}", source.id),
+        "entry_b": format!("knowledge:{}", entry_b.id),
+        "cosine": cosine,
+        "vector_route": vector_route,
+    });
+    if state
+        .workflow_registry
+        .read()
+        .contains_key("contradiction-review-arc")
+    {
+        let state_for_task = state.clone();
+        let mut initial_vars = serde_json::Map::new();
+        initial_vars.insert("entry_a".into(), json!(format!("knowledge:{}", source.id)));
+        initial_vars.insert("entry_b".into(), json!(format!("knowledge:{}", entry_b.id)));
+        initial_vars.insert("cosine".into(), json!(cosine));
+        tokio::spawn(async move {
+            let _ = dispatch_routing_verdict_direct(
+                state_for_task,
+                "contradiction-detected",
+                RoutingVerdict::StartArc {
+                    workflow: "contradiction-review-arc".into(),
+                    initial_vars,
+                },
+                payload,
+            )
+            .await;
+        });
+    } else {
+        let project = source.project.clone().or(entry_b.project.clone());
+        let body = format!(
+            "Tier-0 contradiction detected between knowledge:{} and knowledge:{} (cosine {:.3}), but contradiction-review-arc is not installed.",
+            source.id, entry_b.id, cosine
+        );
+        if let Err(err) = state.notes.write().create(&NoteParams {
+            kind: "surprise".into(),
+            body,
+            task_id: None,
+            session_id: None,
+            project,
+            thread_id: None,
+            provider: None,
+            bro: None,
+        }) {
+            tracing::warn!(error = %err, "failed to surface contradiction fallback note");
+        }
+    }
+}
+
+fn supersession_related(a: &KnowledgeEntry, b: &KnowledgeEntry) -> bool {
+    a.supersedes.as_deref() == Some(b.id.as_str()) || b.supersedes.as_deref() == Some(a.id.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::embed_queue::thread_chunk_hash;
+    use bbox_threads::threads::ThreadParams;
+    use crate::vectors::{VectorStore, install_test_global};
+
+    #[test]
+    fn reembed_route_validation_accepts_all_and_rejects_unknown() {
+        assert_eq!(buckets_for_reembed_route("all").unwrap(), Bucket::ALL);
+        assert_eq!(
+            buckets_for_reembed_route("knowledge").unwrap(),
+            vec![Bucket::Knowledge]
+        );
+        assert_eq!(
+            buckets_for_reembed_route("threads").unwrap(),
+            vec![Bucket::Threads]
+        );
+        let err = buckets_for_reembed_route("missing").unwrap_err();
+        assert!(err.to_string().contains("unknown embedding route"));
+    }
+
+    #[test]
+    fn reembed_empty_index_doc_enumeration_counts_zero() {
+        assert_eq!(count_reembed_index_docs(&[Bucket::Code], &[]), 0);
+        assert_eq!(count_reembed_index_docs(&Bucket::ALL, &[]), 0);
+    }
+
+    #[test]
+    fn reembed_index_enqueue_honors_max_entities() {
+        let docs = vec![
+            EmbeddingSourceDoc {
+                doc_type: "transcript".into(),
+                account: "claude".into(),
+                session_id: "s1".into(),
+                project: String::new(),
+                file_path: String::new(),
+                byte_offset: 0,
+                chunk_kind: String::new(),
+                language: None,
+                symbol: None,
+                symbol_exact: None,
+                chunk_hash: Some("h1".into()),
+                entity_id: None,
+                content: "one".into(),
+            },
+            EmbeddingSourceDoc {
+                doc_type: "transcript".into(),
+                account: "claude".into(),
+                session_id: "s2".into(),
+                project: String::new(),
+                file_path: String::new(),
+                byte_offset: 0,
+                chunk_kind: String::new(),
+                language: None,
+                symbol: None,
+                symbol_exact: None,
+                chunk_hash: Some("h2".into()),
+                entity_id: None,
+                content: "two".into(),
+            },
+        ];
+        assert_eq!(
+            enqueue_reembed_index_docs(&[Bucket::Transcripts], &docs, Some(1)),
+            1
+        );
+    }
+
+    #[test]
+    fn reembed_index_doc_types_only_selects_needed_sources() {
+        assert_eq!(
+            reembed_index_doc_types(&[Bucket::Knowledge]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            reembed_index_doc_types(&[Bucket::Code]),
+            vec!["project_file"]
+        );
+        assert_eq!(
+            reembed_index_doc_types(&[Bucket::Code, Bucket::Docs, Bucket::GitMessage]),
+            vec!["project_file", "commit"]
+        );
+    }
+
+    #[test]
+    fn embed_status_reports_thread_coverage_from_vector_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = SharedState::for_test(tmp.path());
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store.clone());
+        let created = state
+            .threads
+            .write()
+            .thread(&ThreadParams {
+                action: "open".into(),
+                name: Some("coverage-thread".into()),
+                id: None,
+                topic: Some("status coverage thread".into()),
+                project: Some("/repo".into()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: Some("handoff marker".into()),
+                note: Some("note marker".into()),
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("investigation".into()),
+                origin: None,
+            })
+            .unwrap();
+        let thread_id = regex::Regex::new(r"thread-[0-9a-f]{8}")
+            .unwrap()
+            .find(&created)
+            .unwrap()
+            .as_str()
+            .to_string();
+        let thread = state
+            .threads
+            .read()
+            .all()
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .unwrap()
+            .clone();
+        let route = EmbeddingRouter::default()
+            .route(Bucket::Threads, None)
+            .unwrap()
+            .vector_route_id();
+        let entity_id = EntityRef::Thread { thread_id }.to_string();
+        store
+            .upsert(
+                &route,
+                &entity_id,
+                &thread_chunk_hash(&thread),
+                vec![1.0, 0.0],
+            )
+            .unwrap();
+
+        let status = status_response_for_buckets(&state.corpus_stores(), &[Bucket::Threads]).unwrap();
+        let threads = status.routes.get("threads").unwrap();
+        assert_eq!(threads.source_count, Some(1));
+        assert_eq!(threads.indexed_count, 1);
+        assert_eq!(threads.coverage_ratio, Some(1.0));
+    }
+}

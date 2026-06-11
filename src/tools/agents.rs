@@ -990,7 +990,7 @@ mod tests {
     use crate::artifacts::ArtifactInstallParams;
     use crate::server::install_artifact_value;
     use crate::server::state::SharedState;
-    use crate::{embed_queue, entity_ref, vectors};
+    use crate::{entity_ref, vectors};
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
@@ -1838,9 +1838,9 @@ mod tests {
         vector_store
             .upsert(
                 &route,
-                &embed_queue::agent_component_entity_id(
+                &crate::embed_runtime::agent_component_entity_id(
                     &agent,
-                    embed_queue::AgentManifestComponent::Primary,
+                    crate::embed_runtime::AgentManifestComponent::Primary,
                 ),
                 "h1",
                 vec![1.0, 0.0, 0.0],

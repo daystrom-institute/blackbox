@@ -1,9 +1,8 @@
-use crate::embed::ReembedParams;
+use crate::embed_runtime::ReembedParams;
 use crate::index::{
     MessagesParams, ReindexParams, SessionParams, SessionsListParams, TopicsParams,
 };
 use crate::server::BlackboxServer;
-use crate::{embed, embed_queue};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -74,7 +73,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_reembed", move || {
-            embed::reembed_start(&p, server.state)
+            crate::embed_runtime::reembed_start(&p, server.state)
         })
         .await
     }
@@ -85,7 +84,7 @@ impl BlackboxServer {
     )]
     pub(crate) fn bbox_embed_status(&self) -> CallToolResult {
         Self::run("bbox_embed_status", || {
-            embed_queue::status_json_for_state(&self.state)
+            crate::embed_runtime::status_json_for_state(&self.state)
         })
     }
 

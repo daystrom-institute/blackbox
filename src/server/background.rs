@@ -56,8 +56,8 @@ fn install_badgey_adapter(shared: &Arc<SharedState>) {
 }
 
 fn configure_embed_queue(shared: &Arc<SharedState>) {
-    embed_queue::install_contradiction_threshold(tier0_cosine_threshold_from_env());
-    embed_queue::install_contradiction_state(shared.clone());
+    crate::embed_runtime::install_contradiction_threshold(tier0_cosine_threshold_from_env());
+    crate::embed_runtime::install_contradiction_state(shared.clone());
     embed_queue::install(embed::queue::EmbedQueueHandle::start_default_without_store());
 }
 

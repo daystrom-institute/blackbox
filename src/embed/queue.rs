@@ -73,6 +73,19 @@ pub struct EmbedStatusResponse {
     pub routes: BTreeMap<String, RouteStatus>,
 }
 
+/// Post-upsert contradiction hook: the daemon registers its
+/// knowledge-contradiction detector here at boot (dependency inversion —
+/// detection needs daemon state this layer must not name). Unregistered
+/// means no detection, matching a daemon that never installed state.
+static CONTRADICTION_HOOK: std::sync::OnceLock<fn(&EmbedRequest, &str, &[f32])> =
+    std::sync::OnceLock::new();
+
+/// Register the contradiction detector. Idempotent; first registration wins.
+pub fn register_contradiction_hook(hook: fn(&EmbedRequest, &str, &[f32])) {
+    let _ = CONTRADICTION_HOOK.set(hook);
+}
+
+
 #[derive(Clone)]
 pub struct EmbedQueueHandle {
     inner: Arc<EmbedQueueInner>,
@@ -810,11 +823,9 @@ fn persist_vectors(
     };
     store.upsert_batch(&spec.vector_route, records)?;
     for (request, vector) in contradiction_checks {
-        crate::embed_queue::maybe_detect_knowledge_contradiction(
-            &request,
-            &spec.vector_route,
-            &vector,
-        );
+        if let Some(hook) = CONTRADICTION_HOOK.get() {
+            hook(&request, &spec.vector_route, &vector);
+        }
     }
     Ok(())
 }

@@ -483,15 +483,15 @@ fn manifest_embedding_pending(name: &str, version: &str, manifest: &AgentManifes
     };
     let checks = [
         (
-            crate::embed_queue::AgentManifestComponent::Primary,
+            crate::embed_runtime::AgentManifestComponent::Primary,
             Some(embedding.components.primary.as_str()),
         ),
         (
-            crate::embed_queue::AgentManifestComponent::WhenToUse,
+            crate::embed_runtime::AgentManifestComponent::WhenToUse,
             when_to_use_ref,
         ),
         (
-            crate::embed_queue::AgentManifestComponent::AntiPatterns,
+            crate::embed_runtime::AgentManifestComponent::AntiPatterns,
             anti_patterns_ref,
         ),
     ];
@@ -499,11 +499,11 @@ fn manifest_embedding_pending(name: &str, version: &str, manifest: &AgentManifes
         let Some(vector_ref) = vector_ref else {
             continue;
         };
-        let expected = crate::embed_queue::agent_component_entity_id(&agent, component);
+        let expected = crate::embed_runtime::agent_component_entity_id(&agent, component);
         if vector_ref != expected {
             return true;
         }
-        let Some(hash) = crate::embed_queue::agent_component_hash(manifest, component) else {
+        let Some(hash) = crate::embed_runtime::agent_component_hash(manifest, component) else {
             continue;
         };
         match crate::vectors::contains_active(route, vector_ref, &hash) {
@@ -522,20 +522,20 @@ fn agent_component_scores(
     let hits = crate::vectors::search(vector_route, query_vector, fetch)?;
     let mut out = BTreeMap::<String, ComponentScores>::new();
     for hit in hits {
-        let Some((agent, component)) = crate::embed_queue::parse_agent_component_entity_id(&hit.id)
+        let Some((agent, component)) = crate::embed_runtime::parse_agent_component_entity_id(&hit.id)
         else {
             continue;
         };
         let score = (1.0 - hit.distance).max(0.0) as f64;
         let entry = out.entry(agent.render()).or_default();
         match component {
-            crate::embed_queue::AgentManifestComponent::Primary => {
+            crate::embed_runtime::AgentManifestComponent::Primary => {
                 entry.primary = entry.primary.max(score);
             }
-            crate::embed_queue::AgentManifestComponent::WhenToUse => {
+            crate::embed_runtime::AgentManifestComponent::WhenToUse => {
                 entry.when_to_use = entry.when_to_use.max(score);
             }
-            crate::embed_queue::AgentManifestComponent::AntiPatterns => {
+            crate::embed_runtime::AgentManifestComponent::AntiPatterns => {
                 entry.anti_patterns = entry.anti_patterns.max(score);
             }
         }

@@ -565,7 +565,7 @@ fn queue_status_for_hybrid(
     let Some(buckets) = status_buckets_for_doc_type(doc_type) else {
         return embed_queue::status_response();
     };
-    embed_queue::status_response_for_buckets(stores, &buckets).unwrap_or_else(|err| {
+    crate::embed_runtime::status_response_for_buckets(stores, &buckets).unwrap_or_else(|err| {
         tracing::warn!(error = %err, "embedding coverage status failed; falling back to queue-local status");
         embed_queue::status_response()
     })

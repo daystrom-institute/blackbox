@@ -2,7 +2,6 @@ use super::*;
 use crate::artifacts::{self, ArtifactInstallParams};
 use crate::edge_index;
 use crate::embed;
-use crate::embed_queue;
 use crate::entity_ref;
 use crate::knowledge;
 use crate::server::install_artifact_value;
@@ -1312,8 +1311,8 @@ async fn write_semantic_edge_projects_describes_sidecar() {
 async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
-    embed_queue::install_contradiction_threshold(0.85);
-    embed_queue::install_contradiction_state(server.state.clone());
+    crate::embed_runtime::install_contradiction_threshold(0.85);
+    crate::embed_runtime::install_contradiction_state(server.state.clone());
     let vector_store = Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
     let _guard = vectors::install_test_global(vector_store.clone());
     let now = "2026-01-01T00:00:00Z".to_string();
@@ -1377,7 +1376,7 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
         chunk_hash: "h-new".into(),
         text: "use provider A for embeddings".into(),
     };
-    embed_queue::maybe_detect_knowledge_contradiction(&request, "knowledge-test", &[0.99, 0.01]);
+    crate::embed_runtime::maybe_detect_knowledge_contradiction(&request, "knowledge-test", &[0.99, 0.01]);
 
     assert!(server.state.notes.read().all().iter().any(|note| {
         note.body.contains("Tier-0 contradiction detected")
@@ -1385,9 +1384,9 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
             && note.body.contains("knowledge:ccccdddd")
     }));
 
-    embed_queue::install_contradiction_threshold(1.0);
+    crate::embed_runtime::install_contradiction_threshold(1.0);
     let note_count = server.state.notes.read().all().len();
-    embed_queue::maybe_detect_knowledge_contradiction(&request, "knowledge-test", &[0.99, 0.01]);
+    crate::embed_runtime::maybe_detect_knowledge_contradiction(&request, "knowledge-test", &[0.99, 0.01]);
     assert_eq!(server.state.notes.read().all().len(), note_count);
-    embed_queue::install_contradiction_threshold(0.85);
+    crate::embed_runtime::install_contradiction_threshold(0.85);
 }
