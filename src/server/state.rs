@@ -413,6 +413,9 @@ impl SharedState {
         );
         crate::providers::register_extra_providers(crate::providers_ext::extra_providers());
         crate::embed::queue::register_contradiction_hook(crate::embed_runtime::contradiction_hook);
+        crate::mcp_tools::hybrid_search::register_coverage_status_hook(
+            crate::embed_runtime::status_response_for_buckets,
+        );
         let notes_path = store_dir.join("notes.json");
         let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
         let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);

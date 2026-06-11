@@ -5,10 +5,10 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::edge_index::{Edge, EdgeIndex};
-use crate::entity_loader;
-use crate::entity_ref::EntityRef;
-use crate::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_providers::entity_loader;
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_providers::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InspectEntityParams {
@@ -287,7 +287,7 @@ fn render_edges(ctx: &ProviderContext<'_>, edges: &[Edge], direction: &str) -> V
         .collect()
 }
 
-pub(crate) fn compact_label(
+pub fn compact_label(
     ctx: &ProviderContext<'_>,
     r: &EntityRef,
     loaded: Option<&BTreeMap<String, String>>,
@@ -435,7 +435,10 @@ mod tests {
 
     #[test]
     fn inspect_system_memory_ref() {
-        crate::init_system_memory_for_tests();
+        bbox_system_memory::init_for_tests_from(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../system-defaults/memories"
+        )));
         let params = InspectEntityParams {
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
             edge_types: None,
@@ -467,7 +470,10 @@ mod tests {
         // An entity with no edges in the index: every optional expected family
         // resolves to count 0. Those rows are padding and must not reach the
         // structured payload; only present (count > 0) or required families do.
-        crate::init_system_memory_for_tests();
+        bbox_system_memory::init_for_tests_from(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../system-defaults/memories"
+        )));
         let params = InspectEntityParams {
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
             edge_types: None,

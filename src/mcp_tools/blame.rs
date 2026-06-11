@@ -5,12 +5,12 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::edge_index::{Edge, EdgeIndex};
-use crate::entity_loader;
-use crate::entity_ref::EntityRef;
-use crate::git::GitBlameLine;
-use crate::projects::ProjectRecord;
-use crate::providers::ProviderContext;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_providers::entity_loader;
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_corpus_core::git::GitBlameLine;
+use bbox_indexing::projects::ProjectRecord;
+use bbox_providers::providers::ProviderContext;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BlameParams {
@@ -32,7 +32,7 @@ pub fn blame(
         Ok(target) => target,
         Err(err) => return Ok(bad_input(err.to_string())),
     };
-    let Some(blame) = crate::git::blame_for_line(&target.file_path, target.line)? else {
+    let Some(blame) = bbox_corpus_core::git::blame_for_line(&target.file_path, target.line)? else {
         return Ok(serde_json::to_string_pretty(&json!({
             "status": "error.not_found",
             "error": {
@@ -382,7 +382,7 @@ fn bad_input(message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::{EdgeConfidence, EdgeProvenance};
+    use bbox_chunker::{EdgeConfidence, EdgeProvenance};
     use std::collections::BTreeMap;
 
     #[test]

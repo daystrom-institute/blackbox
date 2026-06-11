@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entity_ref::EntityRef;
+use bbox_corpus_core::entity_ref::EntityRef;
 
 const DEFAULT_CACHE_SIZE: usize = 100;
 const EVICT_BATCH: usize = 30;

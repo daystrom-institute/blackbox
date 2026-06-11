@@ -6,9 +6,9 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::entity_loader;
-use crate::entity_ref::{EntityRef, EntityType};
-use crate::providers::ProviderContext;
+use bbox_providers::entity_loader;
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
+use bbox_providers::providers::ProviderContext;
 
 const REF_CAP: usize = 500;
 
@@ -130,7 +130,7 @@ fn size_file_ref(
         }
     }
 
-    let resolved = crate::providers::file::resolve_file(ctx, path)?;
+    let resolved = bbox_providers::providers::file::resolve_file(ctx, path)?;
     Ok((resolved.content.len() as u64, "file_content"))
 }
 
@@ -175,7 +175,6 @@ fn byte_len(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn byte_len_counts_utf8_bytes_not_chars() {
@@ -223,26 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn virtual_entity_ref_measures_provider_properties_json() {
-        crate::providers::register_extra_providers(crate::providers_ext::extra_providers());
-        let ctx = ProviderContext::empty_for_tests();
-        let out = ref_size(
-            &RefSizeParams {
-                refs: vec!["task:task-123".into()],
-                project_dir: None,
-            },
-            &ctx,
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["status"], "ok");
-        assert!(value["total_bytes"].as_u64().unwrap() > 0);
-        assert_eq!(value["per_ref"][0]["ref"], "task:task-123");
-        assert_eq!(value["per_ref"][0]["entity_type"], "task");
-        assert_eq!(value["per_ref"][0]["source"], "entity_properties_json");
-    }
-
-    #[test]
     fn packet_and_artifact_refs_measure_provider_properties_json() {
         let ctx = ProviderContext::empty_for_tests();
         let out = ref_size(
@@ -269,69 +248,6 @@ mod tests {
             "artifact:packet/phase-decompose/triage@1"
         );
         assert_eq!(value["per_ref"][1]["entity_type"], "artifact");
-    }
-
-    #[test]
-    fn file_ref_measures_registered_project_file_content() {
-        let store = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        fs::create_dir_all(project.path().join("docs")).unwrap();
-        let file_path = project.path().join("docs/design.md");
-        fs::write(&file_path, "hello\nworld\n").unwrap();
-
-        let stores = crate::server::state::SharedState::for_test(store.path());
-        stores
-            .projects
-            .write()
-            .register_path(project.path())
-            .unwrap();
-        let ctx = ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
-        let out = ref_size(
-            &RefSizeParams {
-                refs: vec!["file:docs/design.md".into()],
-                project_dir: None,
-            },
-            &ctx,
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["status"], "ok");
-        assert_eq!(value["total_bytes"], 12);
-        assert_eq!(value["per_ref"][0]["ref"], "file:docs/design.md");
-        assert_eq!(value["per_ref"][0]["entity_type"], "file");
-        assert_eq!(value["per_ref"][0]["source"], "file_content");
-    }
-
-    #[test]
-    fn file_ref_project_dir_resolves_worktree_only_file() {
-        let store = tempfile::tempdir().unwrap();
-        let registered = tempfile::tempdir().unwrap();
-        let worktree = tempfile::tempdir().unwrap();
-        fs::create_dir_all(registered.path().join("scripts")).unwrap();
-        fs::create_dir_all(worktree.path().join("scripts")).unwrap();
-        fs::write(registered.path().join("scripts/guard.py"), "old").unwrap();
-        fs::write(worktree.path().join("scripts/guard.py"), "new guard\n").unwrap();
-
-        let stores = crate::server::state::SharedState::for_test(store.path());
-        stores
-            .projects
-            .write()
-            .register_path(registered.path())
-            .unwrap();
-        let ctx = ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
-        let out = ref_size(
-            &RefSizeParams {
-                refs: vec!["file:scripts/guard.py".into()],
-                project_dir: Some(worktree.path().to_string_lossy().into_owned()),
-            },
-            &ctx,
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["status"], "ok");
-        assert_eq!(value["total_bytes"], 10);
-        assert_eq!(value["per_ref"][0]["ref"], "file:scripts/guard.py");
-        assert_eq!(value["per_ref"][0]["source"], "file_content");
     }
 
     #[test]

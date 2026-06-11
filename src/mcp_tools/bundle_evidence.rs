@@ -5,12 +5,12 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::edge_index::EdgeIndex;
-use crate::entity_loader;
-use crate::entity_ref::EntityRef;
+use bbox_edge_index::edge_index::EdgeIndex;
+use bbox_providers::entity_loader;
+use bbox_corpus_core::entity_ref::EntityRef;
 use crate::mcp_tools::find_paths::{render_node, render_path};
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
-use crate::providers::ProviderContext;
+use bbox_providers::providers::ProviderContext;
 
 const ENTITY_CAP: usize = 50;
 const PATH_CAP: usize = 20;
@@ -450,7 +450,10 @@ mod tests {
         // A single resolvable ref, full property mode, no paths: nothing
         // degraded and no intra-bundle structure. The padding blocks should
         // be absent entirely.
-        crate::init_system_memory_for_tests();
+        bbox_system_memory::init_for_tests_from(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../system-defaults/memories"
+        )));
         let params = BundleEvidenceParams {
             question: "what is the opening sequence?".into(),
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
@@ -504,7 +507,10 @@ mod tests {
 
     #[test]
     fn system_memory_refs_are_bundleable() {
-        crate::init_system_memory_for_tests();
+        bbox_system_memory::init_for_tests_from(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../system-defaults/memories"
+        )));
         let params = BundleEvidenceParams {
             question: "what is the opening sequence?".into(),
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],

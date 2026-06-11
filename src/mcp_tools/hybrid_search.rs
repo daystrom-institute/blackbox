@@ -5,17 +5,18 @@ use chrono::Utc;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::embed::{Bucket, EmbeddingProvider, EmbeddingRouter};
-use crate::embed_queue;
-use crate::entity_loader;
-use crate::entity_ref::EntityRef;
-use crate::index::{HybridBm25Hit, TranscriptIndex};
-use crate::knowledge::Knowledge;
-use crate::projects::ProjectRecord;
-use crate::providers::ProviderContext;
-use crate::search::rerank::{self, RerankFeatures};
-use crate::search::rrf::{self, RankedHit, RankedList};
-use crate::vectors::{self, PartitionMetrics};
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_corpus_core::search::rerank::{self, RerankFeatures};
+use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
+use bbox_embed::embed::queue::EmbedStatusResponse;
+use bbox_embed::embed::{Bucket, EmbeddingProvider, EmbeddingRouter};
+use bbox_embed::embed_queue;
+use bbox_indexing::index::{HybridBm25Hit, TranscriptIndex};
+use bbox_indexing::projects::ProjectRecord;
+use bbox_knowledge::knowledge::Knowledge;
+use bbox_providers::entity_loader;
+use bbox_providers::providers::ProviderContext;
+use bbox_vectors::{self as vectors, PartitionMetrics};
 
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
@@ -55,74 +56,74 @@ pub struct HybridSearchParams {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct HybridSearchResponse {
-    pub(crate) text: String,
+pub struct HybridSearchResponse {
+    pub text: String,
     /// Response breadcrumbs: the next tools in the locate-information funnel,
     /// carrying the actual top-seed refs. Mirrors inspect_entity's
     /// `recommended_next_hops` — injected at the decision point so the agent is
     /// pulled through discover → inspect → (paths) → bundle rather than
     /// recalling the opening sequence from memory.
-    pub(crate) next_steps: Vec<String>,
-    pub(crate) results: Vec<HybridResult>,
+    pub next_steps: Vec<String>,
+    pub results: Vec<HybridResult>,
     /// Vector-lane health. Omitted entirely when no vector partitions were
     /// searched (the common BM25-only / vectors-disabled path), so a healthy
     /// response doesn't carry three empty collections.
     #[serde(skip_serializing_if = "HybridVectorStatus::is_empty")]
-    pub(crate) vector_status: HybridVectorStatus,
+    pub vector_status: HybridVectorStatus,
     /// Per-route vector degradation. Omitted entirely when nothing degraded —
     /// the overwhelmingly common case — so green responses stay terse.
     #[serde(skip_serializing_if = "HybridDegraded::is_empty")]
-    pub(crate) degraded: HybridDegraded,
+    pub degraded: HybridDegraded,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct HybridResult {
-    pub(crate) rank: usize,
-    pub(crate) entity_id: String,
-    pub(crate) score: f32,
-    pub(crate) base_score: f32,
-    pub(crate) label: String,
+pub struct HybridResult {
+    pub rank: usize,
+    pub entity_id: String,
+    pub score: f32,
+    pub base_score: f32,
+    pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) doc_type: Option<String>,
+    pub doc_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) chunk_kind: Option<String>,
+    pub chunk_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) role: Option<String>,
+    pub role: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) sources: BTreeMap<String, f32>,
+    pub sources: BTreeMap<String, f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) excerpt: Option<String>,
+    pub excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub(crate) struct HybridVectorStatus {
+pub struct HybridVectorStatus {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) queues: BTreeMap<String, crate::embed::queue::RouteStatus>,
+    pub queues: BTreeMap<String, bbox_embed::embed::queue::RouteStatus>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) partitions: BTreeMap<String, PartitionMetrics>,
+    pub partitions: BTreeMap<String, PartitionMetrics>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) searched_partitions: Vec<String>,
+    pub searched_partitions: Vec<String>,
 }
 
 impl HybridVectorStatus {
     /// True when no vector lane activity is worth surfacing — every sub-field
     /// empty. Gates whether the wrapper is serialized at all.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.queues.is_empty() && self.partitions.is_empty() && self.searched_partitions.is_empty()
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub(crate) struct HybridDegraded {
+pub struct HybridDegraded {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) vector_errors: BTreeMap<String, String>,
+    pub vector_errors: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) skipped_partitions: BTreeMap<String, String>,
+    pub skipped_partitions: BTreeMap<String, String>,
 }
 
 impl HybridDegraded {
     /// True when nothing degraded — no vector errors and no skipped partitions.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.vector_errors.is_empty() && self.skipped_partitions.is_empty()
     }
 }
@@ -138,7 +139,7 @@ pub fn hybrid_search(
     )?)?)
 }
 
-pub(crate) fn hybrid_search_typed(
+pub fn hybrid_search_typed(
     index: &TranscriptIndex,
     knowledge: &Knowledge,
     ctx: &ProviderContext<'_>,
@@ -362,7 +363,7 @@ fn build_next_steps(results: &[HybridResult]) -> Vec<String> {
 /// ranked list keyed on the highest-scoring chunk per file. Chunks of
 /// non-project_file entities (commits, transcripts, knowledge) pass through
 /// individually so they're not double-counted in the file aggregation.
-fn aggregate_bm25_by_file(chunks: &[crate::index::HybridBm25Hit]) -> Vec<RankedHit> {
+fn aggregate_bm25_by_file(chunks: &[bbox_indexing::index::HybridBm25Hit]) -> Vec<RankedHit> {
     use std::collections::HashMap;
     // Group project_file chunks by (project_id, rel_path_hash). Track
     // sum-of-scores AND count, then rank by `sum * sqrt(count)` so a file
@@ -371,8 +372,8 @@ fn aggregate_bm25_by_file(chunks: &[crate::index::HybridBm25Hit]) -> Vec<RankedH
     // across many sections) ranks above a file with fewer but slightly
     // denser chunks. Score sum alone underweights breadth; sqrt(count)
     // alone overweights it. The geometric blend lifts coverage cleanly.
-    let mut by_file: HashMap<String, (f32, usize, &crate::index::HybridBm25Hit)> = HashMap::new();
-    let mut non_file_hits: Vec<&crate::index::HybridBm25Hit> = Vec::new();
+    let mut by_file: HashMap<String, (f32, usize, &bbox_indexing::index::HybridBm25Hit)> = HashMap::new();
+    let mut non_file_hits: Vec<&bbox_indexing::index::HybridBm25Hit> = Vec::new();
     for hit in chunks {
         let Some(key) = file_dedup_key(&hit.entity_id) else {
             non_file_hits.push(hit);
@@ -396,7 +397,7 @@ fn aggregate_bm25_by_file(chunks: &[crate::index::HybridBm25Hit]) -> Vec<RankedH
         // the ranking.
         return Vec::new();
     }
-    let mut aggregated: Vec<(String, f32, &crate::index::HybridBm25Hit)> = by_file
+    let mut aggregated: Vec<(String, f32, &bbox_indexing::index::HybridBm25Hit)> = by_file
         .into_iter()
         .map(|(_, (score, count, repr))| {
             let combined = score * (count as f32).sqrt();
@@ -454,7 +455,7 @@ fn resolve_project_filter_path(raw: &str, projects: &[ProjectRecord]) -> Option<
     }
     // Fall back to the deterministic path-derived id even when the project
     // hasn't been registered yet — useful for one-shot scoped searches.
-    crate::entity_ref::project_id_for_path(raw).ok()
+    bbox_corpus_core::entity_ref::project_id_for_path(raw).ok()
 }
 
 /// Decides whether a search hit survives the project filter. Project-file
@@ -487,7 +488,7 @@ fn thread_matches_project_filter(
     let Some(thread) = threads.all().iter().find(|thread| thread.id == thread_id) else {
         return true;
     };
-    crate::entity_ref::project_id_for_path(&thread.project)
+    bbox_corpus_core::entity_ref::project_id_for_path(&thread.project)
         .ok()
         .as_deref()
         == Some(target_project_id)
@@ -555,17 +556,35 @@ fn diversify_by_chunk_kind(results: &mut [HybridResult], limit: usize) {
     }
 }
 
+
+/// Coverage-status hook: the daemon registers
+/// `embed_runtime::status_response_for_buckets` here at SharedState
+/// construction (dependency inversion — coverage walks daemon-side
+/// reembed routing this layer must not name). Unregistered means
+/// queue-local status only.
+type CoverageStatusFn =
+    fn(&bbox_providers::providers::CorpusStores<'_>, &[Bucket]) -> anyhow::Result<EmbedStatusResponse>;
+static COVERAGE_STATUS_HOOK: std::sync::OnceLock<CoverageStatusFn> = std::sync::OnceLock::new();
+
+/// Register the embedding coverage-status source. Idempotent; first wins.
+pub fn register_coverage_status_hook(hook: CoverageStatusFn) {
+    let _ = COVERAGE_STATUS_HOOK.set(hook);
+}
+
 fn queue_status_for_hybrid(
     ctx: &ProviderContext<'_>,
     doc_type: Option<&str>,
-) -> crate::embed::queue::EmbedStatusResponse {
+) -> bbox_embed::embed::queue::EmbedStatusResponse {
     let Some(stores) = ctx.stores() else {
         return embed_queue::status_response();
     };
     let Some(buckets) = status_buckets_for_doc_type(doc_type) else {
         return embed_queue::status_response();
     };
-    crate::embed_runtime::status_response_for_buckets(stores, &buckets).unwrap_or_else(|err| {
+    (match COVERAGE_STATUS_HOOK.get() {
+        Some(hook) => hook(stores, &buckets),
+        None => Ok(embed_queue::status_response()),
+    }).unwrap_or_else(|err| {
         tracing::warn!(error = %err, "embedding coverage status failed; falling back to queue-local status");
         embed_queue::status_response()
     })
@@ -917,10 +936,10 @@ fn sanitize_status_error(err: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::{
+    use bbox_knowledge::knowledge::{
         Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,
     };
-    use crate::search::rrf::{FusedHit, RankedList};
+    use bbox_corpus_core::search::rrf::{FusedHit, RankedList};
 
     #[test]
     fn response_shape_includes_vector_status() {
@@ -1003,24 +1022,24 @@ mod tests {
         let mut queues = BTreeMap::new();
         queues.insert(
             "code".into(),
-            crate::embed::queue::RouteStatus {
+            bbox_embed::embed::queue::RouteStatus {
                 available: false,
                 health: "unavailable".into(),
                 health_reason: Some("queue_full".into()),
                 queue_depth: 10_000,
                 indexed_count: 12,
                 last_error: Some("embedding route queue full: depth=10000".into()),
-                ..crate::embed::queue::RouteStatus::default()
+                ..bbox_embed::embed::queue::RouteStatus::default()
             },
         );
         queues.insert(
             "notes".into(),
-            crate::embed::queue::RouteStatus {
+            bbox_embed::embed::queue::RouteStatus {
                 available: false,
                 health: "unavailable".into(),
                 health_reason: Some("credential_missing".into()),
                 last_error: Some("VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required".into()),
-                ..crate::embed::queue::RouteStatus::default()
+                ..bbox_embed::embed::queue::RouteStatus::default()
             },
         );
         let vector_status = HybridVectorStatus {
@@ -1112,7 +1131,7 @@ mod tests {
             }],
         }];
         assert_eq!(
-            crate::search::rrf::fuse_rrf(&lists, 60.0, 10)[0].entity_id,
+            bbox_corpus_core::search::rrf::fuse_rrf(&lists, 60.0, 10)[0].entity_id,
             fused[0].entity_id
         );
     }
@@ -1124,7 +1143,7 @@ mod tests {
             "route-a".into(),
             PartitionMetrics {
                 route: "route-a".into(),
-                state: crate::vectors::PartitionState::Active { dims: 3 },
+                state: bbox_vectors::PartitionState::Active { dims: 3 },
                 dims: 3,
                 wal_records: 1,
                 active_count: 1,

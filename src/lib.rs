@@ -41,7 +41,6 @@ use bbox_edge_index::edge_index;
 use bbox_embed::embed;
 use bbox_embed::embed_queue;
 mod embed_runtime;
-use bbox_providers::entity_loader;
 // `entity_ref` extracted into the bbox-corpus-core foundation crate (stage 0).
 // Aliased back so existing `crate::entity_ref::*` paths resolve unchanged.
 pub use bbox_corpus_core::entity_ref;
@@ -92,7 +91,6 @@ use bbox_refactor as refactor;
 pub use bbox_knowledge::render;
 use bbox_stores::roadmap;
 mod routing;
-use bbox_corpus_core::search;
 pub use bbox_config::secrets;
 pub mod server;
 pub use bbox_slack::slack_channel_bindings;

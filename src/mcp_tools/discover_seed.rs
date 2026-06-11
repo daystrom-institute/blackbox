@@ -4,15 +4,15 @@ use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::edge_index::{Edge, EdgeIndex};
-use crate::entity_loader;
-use crate::entity_ref::EntityRef;
-use crate::index::TranscriptIndex;
-use crate::knowledge::Knowledge;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_providers::entity_loader;
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_indexing::index::TranscriptIndex;
+use bbox_knowledge::knowledge::Knowledge;
 use crate::mcp_tools::hybrid_search::{
     self, HybridDegraded, HybridResult, HybridSearchParams, HybridVectorStatus,
 };
-use crate::providers::{self, Neighborhood, ProviderContext};
+use bbox_providers::providers::{self, Neighborhood, ProviderContext};
 
 const DEFAULT_LIMIT: u64 = 8;
 const MAX_LIMIT: u64 = 30;
@@ -278,7 +278,7 @@ fn render_text(query: &str, seeds: &[SeedEntity]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::{EdgeConfidence, EdgeProvenance};
+    use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 
     fn edge(source: &str, kind: &str, target: &str) -> Edge {
         Edge {

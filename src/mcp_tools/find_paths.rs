@@ -5,11 +5,11 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::edge_index::EdgeIndex;
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_edge_index::edge_index::EdgeIndex;
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use crate::mcp_tools::inspect::compact_label;
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection, PathStep};
-use crate::providers::ProviderContext;
+use bbox_providers::providers::ProviderContext;
 
 const RENDERED_TEXT_CAP_BYTES: usize = 30 * 1024;
 
@@ -253,7 +253,7 @@ fn cap_rendered_text(text: String) -> String {
     out
 }
 
-pub(crate) fn render_path(ctx: &ProviderContext<'_>, path: &CachedPath) -> String {
+pub fn render_path(ctx: &ProviderContext<'_>, path: &CachedPath) -> String {
     path.steps
         .iter()
         .map(|step| {
@@ -268,7 +268,7 @@ pub(crate) fn render_path(ctx: &ProviderContext<'_>, path: &CachedPath) -> Strin
         .join(" | ")
 }
 
-pub(crate) fn render_node(ctx: &ProviderContext<'_>, r: &EntityRef) -> String {
+pub fn render_node(ctx: &ProviderContext<'_>, r: &EntityRef) -> String {
     match compact_label(ctx, r, None) {
         Some(label) => format!("{r} ({label})"),
         None => r.to_string(),
@@ -291,8 +291,8 @@ fn bad_input(field: &str, message: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::{EdgeConfidence, EdgeProvenance};
-    use crate::edge_index::Edge;
+    use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+    use bbox_edge_index::edge_index::Edge;
 
     #[test]
     fn bfs_finds_direction_preserving_path() {

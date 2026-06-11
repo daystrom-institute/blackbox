@@ -6,10 +6,10 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::chunker::{EdgeConfidence, EdgeProvenance};
-use crate::edge_index::{Edge, EdgeIndex};
-use crate::entity_ref::EntityRef;
-use crate::projects::ProjectRecord;
+use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_indexing::projects::ProjectRecord;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProvenanceParams {
@@ -87,7 +87,7 @@ pub fn export_provenance(
             .push(edge);
     }
 
-    let notes_ref = crate::git::notes_ref("provenance");
+    let notes_ref = bbox_corpus_core::git::notes_ref("provenance");
     let mut notes_written = 0u64;
     // Track which roots we've already configured to avoid redundant git calls.
     let mut configured_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -99,7 +99,7 @@ pub fn export_provenance(
         // Auto-configure notes.mergeStrategy=union once per repo so
         // cross-machine provenance merges union rather than abort.
         if configured_roots.insert(project.canonical_path.clone()) {
-            if let Err(e) = crate::git::ensure_notes_merge_strategy_union(root) {
+            if let Err(e) = bbox_corpus_core::git::ensure_notes_merge_strategy_union(root) {
                 tracing::warn!(
                     path = %root.display(),
                     "could not set notes.mergeStrategy union: {e:#}"
@@ -108,7 +108,7 @@ pub fn export_provenance(
         }
         let note = note_from_edges(&commit, &edges, edge_index);
         let body = serde_json::to_string_pretty(&note)? + "\n";
-        crate::git::write_note(root, &notes_ref, &commit, &body)?;
+        bbox_corpus_core::git::write_note(root, &notes_ref, &commit, &body)?;
         notes_written += 1;
     }
 
@@ -119,18 +119,18 @@ pub fn export_provenance(
     }))?)
 }
 
-pub(crate) fn import_provenance_to_edges_dir(
+pub fn import_provenance_to_edges_dir(
     p: &ProvenanceParams,
     projects: &[ProjectRecord],
     edges_dir: &Path,
 ) -> Result<u64> {
     let project_map = project_map(projects, p.project_id.as_deref());
-    let notes_ref = crate::git::notes_ref("provenance");
+    let notes_ref = bbox_corpus_core::git::notes_ref("provenance");
     let mut edges_imported = 0u64;
     for project in project_map.values() {
         let root = Path::new(&project.canonical_path);
-        for (_note_sha, commit) in crate::git::list_notes(root, &notes_ref)? {
-            let Some(raw) = crate::git::show_note(root, &notes_ref, &commit)? else {
+        for (_note_sha, commit) in bbox_corpus_core::git::list_notes(root, &notes_ref)? {
+            let Some(raw) = bbox_corpus_core::git::show_note(root, &notes_ref, &commit)? else {
                 continue;
             };
             for raw_note in split_note_documents(&raw) {
@@ -138,7 +138,7 @@ pub(crate) fn import_provenance_to_edges_dir(
                     continue;
                 };
                 let edges = edges_from_note(project, root, &note)?;
-                edges_imported += crate::edge_index::append_explicit_edges(
+                edges_imported += bbox_edge_index::edge_index::append_explicit_edges(
                     edges_dir,
                     &project.project_id,
                     &edges,
@@ -150,7 +150,7 @@ pub(crate) fn import_provenance_to_edges_dir(
 }
 
 fn split_note_documents(raw: &str) -> Vec<&str> {
-    raw.split(crate::git::NOTE_DOCUMENT_SEPARATOR)
+    raw.split(bbox_corpus_core::git::NOTE_DOCUMENT_SEPARATOR)
         .map(str::trim)
         .filter(|doc| !doc.is_empty())
         .collect()
@@ -279,7 +279,7 @@ fn edges_from_note(
             continue;
         };
         let absolute_path = root.join(file);
-        let target = match crate::index::resolve_current_project_chunk_entity(
+        let target = match bbox_indexing::index::resolve_current_project_chunk_entity(
             project,
             root,
             &absolute_path,
@@ -356,7 +356,7 @@ mod tests {
     fn split_note_documents_accepts_appended_git_notes() {
         let raw = format!(
             "{{\"commit\":\"a\"}}\n{}\n{{\"commit\":\"b\"}}\n",
-            crate::git::NOTE_DOCUMENT_SEPARATOR
+            bbox_corpus_core::git::NOTE_DOCUMENT_SEPARATOR
         );
 
         assert_eq!(
