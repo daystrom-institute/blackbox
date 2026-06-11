@@ -61,6 +61,16 @@ impl AnthropicTransport {
         })
     }
 
+    /// True when this transport points at MiniMax's Anthropic-compatible
+    /// endpoint (`https://api.minimax.io/anthropic`, or the CN
+    /// `api.minimaxi.com` variant). MiniMax deviates from Anthropic on
+    /// prompt-cache mechanics (see [`cache_control`]), so the cache_control
+    /// wire shape is keyed off the dispatch base URL set by
+    /// `resolve_provider_env`.
+    fn is_minimax(&self) -> bool {
+        self.base_url.to_ascii_lowercase().contains("minimax")
+    }
+
     /// Build the Messages request body (pure; no I/O), so the wire shape —
     /// notably the system-block cache-control placement — is unit-testable.
     fn build_body(&self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Value {
@@ -91,10 +101,11 @@ impl AnthropicTransport {
             }));
         }
 
+        let cc = cache_control(self.is_minimax());
         let mut body = json!({
             "model": opts.model,
             "max_tokens": opts.max_tokens,
-            "messages": messages_with_cache_breakpoint(&self.messages),
+            "messages": messages_with_cache_breakpoints(&self.messages, &cc),
             "stream": true,
         });
         // System is ordered base -> stable overlay -> volatile tail. Base and
@@ -107,12 +118,12 @@ impl AnthropicTransport {
             .and_then(super::BaseInstructions::text)
         {
             system_blocks.push(json!({
-                "type": "text", "text": base, "cache_control": cache_control(),
+                "type": "text", "text": base, "cache_control": cc.clone(),
             }));
         }
         if let Some(stable) = opts.system.stable_text() {
             system_blocks.push(json!({
-                "type": "text", "text": stable, "cache_control": cache_control(),
+                "type": "text", "text": stable, "cache_control": cc.clone(),
             }));
         }
         // Ambient (deferred-tool manifest) renders as its own uncached block:
@@ -899,7 +910,19 @@ fn anthropic_betas() -> String {
 /// next turn. Tunable via `BRO_HARNESS_CACHE_TTL`: any value (`"5m"`) sets that
 /// TTL; an **empty** value emits plain `{"type":"ephemeral"}` (no TTL field, no
 /// beta needed) for a provider that rejects the extended-TTL shape.
-fn cache_control() -> Value {
+///
+/// MiniMax's Anthropic-compatible endpoint takes the plain shape ONLY: its
+/// documented cache lifetime is server-managed (5-minute window, refreshed on
+/// every read, load-adjusted) and there is no extended-TTL beta, so the `ttl`
+/// field is an unknown extension there — and an unrecognized field risks the
+/// whole breakpoint being discarded (cf. the strict error-2013 `input_schema`
+/// validation above). `minimax=true` forces `{"type":"ephemeral"}` regardless
+/// of `BRO_HARNESS_CACHE_TTL`.
+/// See <https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache>.
+fn cache_control(minimax: bool) -> Value {
+    if minimax {
+        return json!({"type": "ephemeral"});
+    }
     match std::env::var("BRO_HARNESS_CACHE_TTL") {
         Ok(t) if t.is_empty() => json!({"type": "ephemeral"}),
         Ok(t) => json!({"type": "ephemeral", "ttl": t}),
@@ -907,21 +930,39 @@ fn cache_control() -> Value {
     }
 }
 
-/// Return a clone of the conversation with an ephemeral cache breakpoint on the
-/// final content block of the last message, so the growing history prefix is
-/// served from cache on subsequent turns (Anthropic matches the longest cached
-/// prefix). Combined with the system-block breakpoint this uses 2 of the 4
-/// allowed breakpoints. No-op when there are no array-content messages.
-fn messages_with_cache_breakpoint(messages: &[Value]) -> Vec<Value> {
+/// Rolling message breakpoints carried per request. Two, not one: both
+/// Anthropic and MiniMax locate a cached prefix by scanning only ~20 content
+/// blocks back from each explicit breakpoint. A single rolling breakpoint
+/// moves to the new conversation tail every request, so any turn that appends
+/// more than the lookback window (one assistant message full of tool_use
+/// blocks plus a batched tool_result message easily does) strands the entire
+/// cached prefix — the observed all-miss economics on MiniMax. Marking the
+/// last TWO messages keeps the previous request's breakpoint position (or a
+/// position within one message of it) present in the next request, so the
+/// lookback only ever has to span a single message.
+const ROLLING_CACHE_BREAKPOINTS: usize = 2;
+
+/// Return a clone of the conversation with an ephemeral cache breakpoint on
+/// the final content block of each of the last [`ROLLING_CACHE_BREAKPOINTS`]
+/// array-content messages, so the growing history prefix is served from cache
+/// on subsequent turns (longest-prefix match, ~20-block lookback per
+/// breakpoint). Combined with the two system-block breakpoints this uses all
+/// 4 allowed breakpoints (MiniMax honors the most recent 4; Anthropic rejects
+/// >4). No-op when there are no array-content messages.
+fn messages_with_cache_breakpoints(messages: &[Value], cc: &Value) -> Vec<Value> {
     let mut msgs = messages.to_vec();
-    if let Some(content) = msgs
-        .last_mut()
-        .and_then(|m| m.get_mut("content"))
-        .and_then(|c| c.as_array_mut())
-        && let Some(block) = content.last_mut()
-        && block.is_object()
-    {
-        block["cache_control"] = cache_control();
+    let mut remaining = ROLLING_CACHE_BREAKPOINTS;
+    for msg in msgs.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut())
+            && let Some(block) = content.last_mut()
+            && block.is_object()
+        {
+            block["cache_control"] = cc.clone();
+            remaining -= 1;
+        }
     }
     msgs
 }
@@ -1177,7 +1218,8 @@ mod tests {
     }
 
     #[test]
-    fn last_message_gets_rolling_cache_breakpoint() {
+    fn last_two_messages_get_rolling_cache_breakpoints() {
+        let cc = json!({"type": "ephemeral"});
         let msgs = vec![
             json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
             json!({"role": "assistant", "content": [{"type": "text", "text": "b"}]}),
@@ -1185,29 +1227,60 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": "r"},
             ]}),
         ];
-        let out = messages_with_cache_breakpoint(&msgs);
-        // Breakpoint lands on the final block of the last message.
-        let last = out.last().unwrap()["content"].as_array().unwrap();
+        let out = messages_with_cache_breakpoints(&msgs, &cc);
+        // Breakpoints land on the final block of each of the last two messages:
+        // the older one re-asserts the previous request's breakpoint position so
+        // the provider's ~20-block lookback never has to span more than one
+        // message of growth.
+        let last = out[2]["content"].as_array().unwrap();
         assert_eq!(last.last().unwrap()["cache_control"]["type"], "ephemeral");
+        let prev = out[1]["content"].as_array().unwrap();
+        assert_eq!(prev.last().unwrap()["cache_control"]["type"], "ephemeral");
         // Earlier messages are untouched (the prefix stays stable across turns).
         assert!(out[0]["content"][0].get("cache_control").is_none());
-        assert!(out[1]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn rolling_breakpoints_skip_string_content_messages() {
+        // String-content messages (legacy shape) must not panic or mutate; an
+        // earlier array-content message still gets marked.
+        let cc = json!({"type": "ephemeral"});
+        let msgs = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let out = messages_with_cache_breakpoints(&msgs, &cc);
+        assert_eq!(out[1]["content"], "hi");
+        assert_eq!(out[0]["content"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
     fn cache_breakpoint_noop_on_string_content() {
-        // String-content messages (legacy shape) must not panic or mutate.
+        // All-string conversations must pass through untouched.
+        let cc = json!({"type": "ephemeral"});
         let msgs = vec![json!({"role": "user", "content": "hi"})];
-        let out = messages_with_cache_breakpoint(&msgs);
+        let out = messages_with_cache_breakpoints(&msgs, &cc);
         assert_eq!(out[0]["content"], "hi");
     }
 
     #[test]
     fn minimax_request_keeps_anthropic_cache_control_breakpoints() {
+        // MiniMax's documented mechanics
+        // (platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache):
+        // plain {"type":"ephemeral"} only — no `ttl` field (lifetime is
+        // server-managed: 5-minute window refreshed on read; no extended-TTL
+        // beta), max 4 breakpoints (most recent 4 honored), ~20-block lookback
+        // per breakpoint, 512-token minimum.
         let mut t = transport();
-        t.messages = vec![json!({"role": "user", "content": [
-            {"type": "text", "text": "question"}
-        ]})];
+        t.base_url = "https://api.minimax.io/anthropic".into();
+        t.messages = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "question"}
+            ]}),
+            json!({"role": "assistant", "content": [
+                {"type": "text", "text": "answer"}
+            ]}),
+        ];
         let mut o = opts_with_base(
             "BASE",
             SystemPrompt {
@@ -1226,9 +1299,65 @@ mod tests {
         assert!(sys[2].get("cache_control").is_none());
         assert!(sys[3].get("cache_control").is_none());
 
+        // Both rolling message breakpoints present.
+        let msgs = body["messages"].as_array().unwrap();
+        for m in msgs {
+            let last_block = m["content"].as_array().unwrap().last().unwrap();
+            assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+        }
+
+        // Every breakpoint is the plain MiniMax shape: no `ttl` field, even
+        // though the default (Anthropic) shape carries ttl=1h.
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("\"ttl\""),
+            "MiniMax body must not carry a ttl field: {rendered}"
+        );
+        // Exactly 4 breakpoints — MiniMax honors only the most recent 4.
+        assert_eq!(rendered.matches("cache_control").count(), 4);
+    }
+
+    #[test]
+    fn non_minimax_request_keeps_extended_ttl_breakpoints() {
+        // Guarded like cache_control_defaults_to_extended_ttl: a host that
+        // exports BRO_HARNESS_CACHE_TTL would change the expected shape.
+        if std::env::var_os("BRO_HARNESS_CACHE_TTL").is_some() {
+            return;
+        }
+        let mut t = transport();
+        t.messages = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "question"}
+        ]})];
+        let body = t.build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: Some("STABLE".into()),
+                ambient: None,
+                volatile: None,
+            }),
+        );
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
         let last_msg = body["messages"].as_array().unwrap().last().unwrap();
         let last_block = last_msg["content"].as_array().unwrap().last().unwrap();
-        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+        assert_eq!(last_block["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn minimax_detection_keys_off_base_url() {
+        let mut t = transport();
+        assert!(!t.is_minimax());
+        t.base_url = "https://api.minimax.io/anthropic".into();
+        assert!(t.is_minimax());
+        t.base_url = "https://api.minimaxi.com/anthropic".into();
+        assert!(t.is_minimax());
+    }
+
+    #[test]
+    fn minimax_cache_control_is_plain_ephemeral_regardless_of_env() {
+        // minimax=true short-circuits before the BRO_HARNESS_CACHE_TTL read,
+        // so this holds whatever the host exports.
+        let cc = cache_control(true);
+        assert_eq!(cc, json!({"type": "ephemeral"}));
     }
 
     #[test]
@@ -1279,7 +1408,7 @@ mod tests {
         // multi-minute gap between turns can't expire the cached prefix.
         // Guarded so a host that exports the var doesn't fail the strict check.
         if std::env::var_os("BRO_HARNESS_CACHE_TTL").is_none() {
-            let cc = cache_control();
+            let cc = cache_control(false);
             assert_eq!(cc["type"], "ephemeral");
             assert_eq!(cc["ttl"], "1h");
         }
