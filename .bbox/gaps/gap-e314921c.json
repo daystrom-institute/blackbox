@@ -11,7 +11,9 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/opencode/sqlite-session-db-lock",
   "notes": "Two opencode bros running concurrently get \"database is locked\" errors.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:06:26Z",
-  "updated_at": "2026-06-11T18:06:26Z"
+  "updated_at": "2026-06-11T20:17:39Z",
+  "resolved_at": "2026-06-11T20:17:39Z",
+  "resolution_note": "Obsolete — opencode provider removed entirely in the beta provider-removal arc (fef32d2, \"Restrict dispatch to bro-harness providers\"; §4 deletion ledger in design/bro-harness/harness-daemon-boundary.md). No opencode code remains in src/ or crates/; the SQLite session-DB lock concern no longer applies."
 }

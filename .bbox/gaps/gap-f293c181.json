@@ -11,7 +11,9 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/opencode/blackbox-md-imports",
   "notes": "Opencode bros (glm, deepseek) have access to bbox MCP tools per `~/.config/opencode/opencode.json` but their behavioral default is `grep`/`read`. The rendered guidance in `~/.claude-shared/BLACKBOX.md` reaches them only if opencode honors AGENTS.md @-imports.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:06:24Z",
-  "updated_at": "2026-06-11T18:06:24Z"
+  "updated_at": "2026-06-11T20:17:40Z",
+  "resolved_at": "2026-06-11T20:17:40Z",
+  "resolution_note": "Obsolete — opencode provider removed entirely in the beta provider-removal arc (fef32d2; §4 deletion ledger in design/bro-harness/harness-daemon-boundary.md). No opencode dispatch path exists, so BLACKBOX.md @-import behavior for opencode bros is moot."
 }

@@ -12,7 +12,9 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/edge-projection/streaming-at-100k",
   "notes": "Codex added `tracing::warn!` at 100k; refactor to streaming/segment iteration before that fires in production.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:05:02Z",
-  "updated_at": "2026-06-11T18:05:02Z"
+  "updated_at": "2026-06-11T20:29:01Z",
+  "resolved_at": "2026-06-11T20:29:01Z",
+  "resolution_note": "Replaced AllQuery + TopDocs::with_limit with for_each_edge_projection_doc — streaming segment doc-store iteration (StoreReader::iter with alive-bitset, sequential block decompression, one doc live at a time). edge_index now projects transcript IN_SESSION edges inline and buffers only project_file chunks for the chunk[0] file-proxy grouping; mid-stream errors drop the partial buffer rather than emitting wrong file proxies. Commit 9c630f6 on worktree-edge-projection-streaming (based on beta/blackbox-v2). Covered by 3 new tests (multi-segment + deleted-doc skip, callback error propagation, end-to-end IN_SESSION/IN_FILE projection semantics)."
 }

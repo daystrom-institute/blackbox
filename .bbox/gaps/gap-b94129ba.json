@@ -1,0 +1,21 @@
+{
+  "id": "gap-b94129ba",
+  "title": "Gap mutation paths (resolve/update) bypass worktree write-targeting; harness .claude/worktrees/* not a recognized worktree class",
+  "gap_kind": "tooling",
+  "domain": "gaps-store",
+  "wanted_capability": "Gap mutations issued from a worktree session should land the repo-owned .bbox/gaps file change in that worktree so the branch carries the resolution. Two coverage holes vs the existing worktree-write effort: (1) bbox_gap_resolve / bbox_gap_update have no project/write_dir resolution at all — GapResolveParams carries only {id, resolution, note, superseded_by}, the handler calls gaps.write().resolve(&p) directly, and the rewrite lands at the gap record's durable project field (registered base). Only the bbox_gap filing path calls resolve_gap_project() for a worktree write_dir. (2) The worktree recognition set (resolve_managed_fleet_worktree, src/projects.rs:406) requires a bro-fleet/* branch and a worktree outside the registered root; harness-managed worktrees (.claude/worktrees/* on worktree-* branches, inside the root) hit the registered-root-descendant early return and resolve to the base — so even filing from an EnterWorktree worktree writes the primary checkout. Observed 2026-06-11: bbox_gap_resolve(gap-859ce761) from a session cwd'd into .claude/worktrees/edge-projection-streaming mutated the primary checkout's .bbox/gaps/gap-859ce761.json (uncommitted exhaust in the shared multi-tenant tree); the worktree stayed clean and was later removed — had the write landed there without being committed, ExitWorktree(remove) would have destroyed it, so the fix likely wants commit-or-carry semantics, not just write redirection.",
+  "missing_primitive": "resolve_gap_project()-style write-dir resolution on the resolve/update mutation handlers (keyed by session/ambient cwd, since the params carry no project), plus widening resolve_managed_fleet_worktree (or a sibling resolver) to recognize harness-managed linked worktrees inside the registered root",
+  "fallback_used": "Left the mutated gap JSONs uncommitted in the primary checkout and flagged them to the operator for a chore(gaps) commit after the beta line reconciles",
+  "evidence": [
+    "src/tools/gaps.rs:95-104 (bbox_gap_resolve, no resolve_gap_project call)",
+    "src/tools/gaps.rs:20-33 (resolve_gap_project, filing path only)",
+    "src/projects.rs:406-425 (resolve_managed_fleet_worktree bro-fleet/* + outside-root requirements)",
+    ".bbox/gaps/gap-859ce761.json (resolution landed in primary while session was in worktree)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/gaps-store/mutation-paths-worktree-write-target",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T20:52:42Z",
+  "updated_at": "2026-06-11T20:52:42Z"
+}
