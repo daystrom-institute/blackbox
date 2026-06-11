@@ -105,13 +105,26 @@ Rebuild release binaries and reinstall the **production** surfaces:
 binary; this resets prod from the beta code.)
 
 ```bash
-cargo build --release                 # blackboxd, bro, bro-irc, bro-slack (root package)
+cargo build --release                 # blackboxd, bro-slack (root package)
+cargo build --release -p bro-cli      # bro (fleet/orchestration CLI — split out of the root package 2026-06-03)
 cargo build --release -p bro-harness  # bro-harness (workspace member crate)
+
+ls -l target/release/blackboxd target/release/bro target/release/bro-harness   # ALL THREE must exist, freshly built
 
 install -m 755 target/release/blackboxd   ~/.local/bin/blackboxd
 install -m 755 target/release/bro         ~/.local/bin/bro
 install -m 755 target/release/bro-harness ~/.local/bin/bro-harness
 ```
+
+> ⛔ **If any expected binary is missing from `target/release/` after the
+> builds, STOP and surface it.** Do not narrow the install list to make the
+> command succeed, and do not infer an explanation (e.g. "it must be a
+> subcommand now") — a missing binary almost always means the bin target moved
+> to a different workspace crate (exactly what happened when `bro` moved to
+> `bro-cli`, dfa907a). Find the crate that declares the bin
+> (`grep -rl 'name = "bro' crates/*/Cargo.toml Cargo.toml`), build it with
+> `-p <crate>`, and install from there. A skipped reinstall leaves a stale
+> binary that silently passes `bro --version` while running week-old code.
 
 Refresh runtime-loaded system memories to the current checkout (part of a full
 reset). `cp` is interactive-aliased on this host — bypass it:
@@ -150,7 +163,11 @@ Return a tight summary:
   worktrees (listed, untouched).
 - **Disk:** `target/` size before → after clean; total reclaimed.
 - **Installed:** `blackboxd --version` / `bro --version` / `bro-harness`
-  version, and whether the prod service was restarted (or deferred at the gate).
+  version, PLUS the install mtimes
+  (`ls -l ~/.local/bin/blackboxd ~/.local/bin/bro ~/.local/bin/bro-harness`) —
+  all three must postdate this cleaning run; `--version` alone cannot detect a
+  stale binary. Note whether the prod service was restarted (or deferred at the
+  gate).
 - **Daemon health:** `is-active` + `/roster` probe result.
 
 Keep the report operational; do not narrate every command.
