@@ -6812,3 +6812,425 @@ fn do_something() -> Result<(), OldErr> { Ok(()) }
         );
     }
 }
+
+#[cfg(test)]
+mod extract_rust_crate_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn record(path: &Path) -> ProjectRecord {
+        ProjectRecord {
+            project_id: "test-project".to_string(),
+            repo_id: None,
+            canonical_path: fs::canonicalize(path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            registered_at: "2026-06-10T00:00:00Z".to_string(),
+            is_git_repo: false,
+            languages: Default::default(),
+        }
+    }
+
+    /// Root manifest + lib + one file module (uses serde) + one dir module.
+    fn fixture(dir: &Path) {
+        fs::write(
+            dir.join("Cargo.toml"),
+            r#"[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [
+    "crates/existing",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+existing = { path = "crates/existing" }
+"#,
+        )
+        .unwrap();
+        let existing = dir.join("crates/existing/src");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(
+            dir.join("crates/existing/Cargo.toml"),
+            "[package]\nname = \"existing\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(existing.join("lib.rs"), "pub fn nine() -> i32 { 9 }\n").unwrap();
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("beta")).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "mod alpha;\npub mod beta;\nmod gamma;\n\npub fn entry() -> i32 { crate::alpha::one() + crate::beta::two() }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("alpha.rs"),
+            "#[derive(serde::Serialize)]\npub struct A;\n\npub fn one() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("beta/mod.rs"),
+            "mod inner;\n\npub fn two() -> i32 { inner::two() }\n",
+        )
+        .unwrap();
+        fs::write(src.join("beta/inner.rs"), "pub(crate) fn two() -> i32 { 2 }\n").unwrap();
+        fs::write(src.join("gamma.rs"), "pub fn three() -> i32 { 3 }\n").unwrap();
+    }
+
+    #[test]
+    fn extract_rust_crate_scaffold_plans_and_applies_full_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fixture(&root);
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_crate_scaffold".into(),
+            source: String::new(),
+            item_names: Some(vec!["alpha".into(), "beta".into()]),
+            module_name: Some("my-extracted".into()),
+            project_dir: Some(path_string(&root)),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert_eq!(plan_value["file_creates"].as_array().unwrap().len(), 2);
+        assert_eq!(plan_value["file_moves"].as_array().unwrap().len(), 3);
+        let manifest = plan_value["file_creates"][0]["content"].as_str().unwrap();
+        assert!(manifest.contains("name = \"my-extracted\""));
+        assert!(manifest.contains("serde = { version = \"1\", features = [\"derive\"] }"));
+        assert!(
+            !manifest.contains("anyhow"),
+            "anyhow is unused by moved modules and must not be inferred"
+        );
+        let lib_rs = plan_value["file_creates"][1]["content"].as_str().unwrap();
+        assert!(lib_rs.contains("pub mod alpha;"));
+        assert!(lib_rs.contains("pub mod beta;"));
+
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: None,
+                plan_path: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[record(&root)],
+        )
+        .unwrap();
+        let applied: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied["status"], "ok", "apply failed: {response}");
+
+        assert!(root.join("crates/my-extracted/src/alpha.rs").is_file());
+        assert!(root.join("crates/my-extracted/src/beta/inner.rs").is_file());
+        assert!(!root.join("src/alpha.rs").exists());
+        assert!(!root.join("src/beta/mod.rs").exists());
+        assert!(!root.join("src/beta/inner.rs").exists());
+        let origin_lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(origin_lib.contains("use my_extracted::alpha;"));
+        assert!(origin_lib.contains("pub use my_extracted::beta;"));
+        assert!(origin_lib.contains("mod gamma;"));
+        let root_manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(root_manifest.contains("\"crates/my-extracted\""));
+        assert!(root_manifest.contains("my-extracted = { path = \"crates/my-extracted\" }"));
+        // Existing member/dep untouched.
+        assert!(root_manifest.contains("\"crates/existing\""));
+    }
+
+    #[test]
+    fn extract_rust_crate_scaffold_refuses_coupled_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fixture(&root);
+        fs::write(
+            root.join("src/alpha.rs"),
+            "pub fn one() -> i32 { crate::gamma::three() }\n",
+        )
+        .unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "extract_rust_crate_scaffold".into(),
+            source: String::new(),
+            item_names: Some(vec!["alpha".into()]),
+            module_name: Some("my-extracted".into()),
+            project_dir: Some(path_string(&root)),
+            ..Default::default()
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("leaf invariant"), "unexpected error: {msg}");
+        assert!(msg.contains("crate::gamma"), "offender missing: {msg}");
+        assert!(msg.contains("src/alpha.rs:1"), "location missing: {msg}");
+    }
+
+    #[test]
+    fn extract_rust_crate_scaffold_path_dep_rebased_and_manifest_dir_warned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fixture(&root);
+        fs::write(
+            root.join("src/alpha.rs"),
+            "pub fn one() -> i32 { existing::nine() }\n\npub fn fixture_dir() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_crate_scaffold".into(),
+            source: String::new(),
+            item_names: Some(vec!["alpha".into()]),
+            module_name: Some("my-extracted".into()),
+            project_dir: Some(path_string(&root)),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let manifest = plan_value["file_creates"][0]["content"].as_str().unwrap();
+        assert!(
+            manifest.contains("existing = { path = \"../existing\" }"),
+            "workspace path dep not rebased: {manifest}"
+        );
+        let leftovers = plan_value["leftovers"].as_array().unwrap();
+        assert!(
+            leftovers
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("CARGO_MANIFEST_DIR")),
+            "manifest-dir hazard not warned: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_rust_crate_paths_splits_mixed_use_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("consumer.rs");
+        fs::write(
+            &file,
+            "use crate::{alpha, gamma};\npub use crate::{alpha, beta};\n\npub fn go() -> i32 { crate::alpha::one() + crate::gamma::three() }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_crate_paths".into(),
+            source: path_string(&file),
+            item_names: Some(vec!["alpha".into(), "beta".into()]),
+            module_name: Some("my-extracted".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: None,
+                plan_path: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[record(&root)],
+        )
+        .unwrap();
+        let applied: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied["status"], "ok", "apply failed: {response}");
+
+        let rewritten = fs::read_to_string(&file).unwrap();
+        assert!(rewritten.contains("use crate::{gamma};\nuse my_extracted::alpha;"));
+        assert!(rewritten.contains("pub use my_extracted::{alpha, beta};"));
+        assert!(rewritten.contains("my_extracted::alpha::one() + crate::gamma::three()"));
+    }
+
+    #[test]
+    fn rust_workspace_dag_check_passes_acyclic_and_detects_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for (name, dep) in [("aa", Some("bb")), ("bb", None)] {
+            let crate_dir = root.join("crates").join(name);
+            fs::create_dir_all(crate_dir.join("src")).unwrap();
+            let dep_line = dep
+                .map(|d| format!("{d} = {{ path = \"../{d}\" }}\n"))
+                .unwrap_or_default();
+            fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{dep_line}"
+                ),
+            )
+            .unwrap();
+            fs::write(crate_dir.join("src/lib.rs"), "").unwrap();
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/aa\", \"crates/bb\"]\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_workspace_dag_check".into(),
+            source: String::new(),
+            project_dir: Some(path_string(&root)),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert!(
+            plan_value["title"].as_str().unwrap().contains("acyclic"),
+            "unexpected title: {}",
+            plan_value["title"]
+        );
+
+        // Introduce the cycle: bb -> aa while aa -> bb.
+        fs::write(
+            root.join("crates/bb/Cargo.toml"),
+            "[package]\nname = \"bb\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\naa = { path = \"../aa\" }\n",
+        )
+        .unwrap();
+        let err = plan(&RefactorPlanParams {
+            kind: "rust_workspace_dag_check".into(),
+            source: String::new(),
+            project_dir: Some(path_string(&root)),
+            ..Default::default()
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "unexpected error: {msg}");
+        assert!(msg.contains("aa") && msg.contains("bb"), "cycle names missing: {msg}");
+    }
+
+    #[test]
+    fn refactor_run_expands_extract_rust_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fixture(&root);
+
+        let response = run(
+            &RefactorRunParams {
+                title: "extract alpha".into(),
+                project_dir: path_string(&root),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "extract_rust_crate".into(),
+                        source: String::new(),
+                        item_names: Some(vec!["alpha".into()]),
+                        module_name: Some("my-extracted".into()),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[record(&root)],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "planned");
+        let kinds: Vec<&str> = run_response
+            .steps
+            .iter()
+            .filter_map(|step| step.kind.as_deref())
+            .collect();
+        assert!(kinds.contains(&"extract_rust_crate_scaffold"));
+        assert!(kinds.contains(&"rust_workspace_dag_check"));
+        assert!(kinds.contains(&"rust_compile_fix_round"));
+        assert!(run_response.steps.iter().any(|step| {
+            step.title.as_deref() == Some("cargo check --workspace --message-format=json")
+        }));
+        assert!(
+            run_response
+                .steps
+                .iter()
+                .any(|step| step.title.as_deref() == Some("cargo check --workspace"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod extract_rust_crate_e2e {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn record(path: &Path) -> ProjectRecord {
+        ProjectRecord {
+            project_id: "test-project".to_string(),
+            repo_id: None,
+            canonical_path: fs::canonicalize(path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            registered_at: "2026-06-10T00:00:00Z".to_string(),
+            is_git_repo: false,
+            languages: Default::default(),
+        }
+    }
+
+    /// Full compound pipeline against a real (dep-free) cargo workspace:
+    /// scaffold + DAG guard + cargo check --workspace all execute for real.
+    #[test]
+    fn extract_rust_crate_end_to_end_compiles_extracted_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("src/util")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"monolith\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub mod util;\n\npub fn answer() -> i32 { crate::util::math::add(40, 2) }\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/util/mod.rs"), "pub mod math;\n").unwrap();
+        fs::write(
+            root.join("src/util/math.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn adds() { assert_eq!(add(1, 2), 3); }\n}\n",
+        )
+        .unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "extract util into monolith-util".into(),
+                project_dir: path_string(&root),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "extract_rust_crate".into(),
+                        source: String::new(),
+                        item_names: Some(vec!["util".into()]),
+                        module_name: Some("monolith-util".into()),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: None,
+                dispatch_origin: None,
+            },
+            &[record(&root)],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "ok", "run failed: {response}");
+
+        assert!(root.join("crates/monolith-util/src/util/math.rs").is_file());
+        let origin_lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(origin_lib.contains("pub use monolith_util::util;"));
+        let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(manifest.contains("[workspace]"));
+        assert!(manifest.contains("\"crates/monolith-util\""));
+        assert!(manifest.contains("monolith-util = { path = \"crates/monolith-util\" }"));
+    }
+}

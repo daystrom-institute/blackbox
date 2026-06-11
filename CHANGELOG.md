@@ -10,6 +10,17 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `extract_rust_crate` refactor compound (gap-fe4dd97f): peel leaf root
+  modules of a monolithic crate into a new workspace-member crate via
+  `bbox_refactor_run`. New primitives: `extract_rust_crate_scaffold` (atomic
+  crate scaffold + dependency inference + module file moves + visibility-
+  preserving `mod`→`use <crate>::<mod>;` alias swap + `[workspace].members`
+  merge + consumer dep wiring; fails closed on non-leaf modules with
+  file:line offenders), `rewrite_rust_crate_paths` (crate-path rewriting
+  with mixed-group use-tree splitting), and `rust_workspace_dag_check`
+  (path-dependency acyclicity guard, dev-deps excluded). Analysis-only plan
+  kinds are now valid `bbox_refactor_run` steps (the runner and apply
+  previously rejected every edit-less plan).
 - Root-crate split (continued): runtime system memories moved to a new
   `bbox-system-memory` leaf crate, and the dependency-free `query`,
   `template`, and `search` (rrf/rerank) modules moved into `bbox-corpus-core`

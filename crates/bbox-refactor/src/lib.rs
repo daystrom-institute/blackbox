@@ -42,7 +42,8 @@ pub(crate) mod rust_deep;
 pub(crate) mod rust_delegate_field;
 pub(crate) mod rust_error_migrate;
 pub(crate) mod rust_extract_region;
-pub(crate) mod rust_extract_to_submodule;
+pub(crate) mod rust_extract_crate;
+mod rust_extract_to_submodule;
 pub(crate) mod rust_extract_trait;
 pub(crate) mod rust_inline_mod;
 pub(crate) mod rust_lift_free;
@@ -1301,6 +1302,7 @@ pub fn plan_kinds(p: &RefactorPlanKindsParams) -> Result<String> {
             "rust_impl_partition_analysis",
             "rust_top_level_dependency_analysis",
             "rust_public_api_guard",
+            "rust_workspace_dag_check",
         ],
         "rust",
         "analysis_only",
@@ -1356,6 +1358,24 @@ pub fn plan_kinds(p: &RefactorPlanKindsParams) -> Result<String> {
         &["source"],
         &["bbox_refactor_status", "sm-refactor-rust"],
         "Rust structural plans. Some kinds require target, item_names, old_text/new_text, module_name, or operator opt-out flags; consult sm-refactor-rust for the exact contract.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "extract_rust_crate",
+            "extract_rust_crate_scaffold",
+            "rewrite_rust_crate_paths",
+        ],
+        "rust",
+        "syntax_only",
+        "text",
+        &["mod_item", "use_declaration"],
+        &["item_names", "module_name"],
+        &["bbox_refactor_status", "sm-refactor-rust", "rust_workspace_dag_check"],
+        "Workspace crate extraction (monolith -> workspace member). extract_rust_crate \
+         is run-only (bbox_refactor_run): it expands to the scaffold plan + DAG guard + \
+         cargo check --workspace + compile-fix round. The scaffold refuses non-leaf \
+         modules (remaining crate::<other> references) — decouple first.",
     );
     add_plan_kind_group(
         &mut kinds,
@@ -1560,6 +1580,23 @@ fn plan_kind_when_to_use(name: &str) -> &'static str {
         "create_file" => "Use to create a new file through a reviewable dry-run plan.",
         "move_file" => "Use for file relocation/rename plans where path movement is the refactor.",
         "ensure_toml_table" => "Use for minimal structured TOML table/key creation.",
+        "extract_rust_crate" => {
+            "Use to peel one or more leaf root modules of a monolithic crate into a new \
+             workspace-member crate (run-only compound; origin call sites keep working \
+             via a `use <crate>::<mod>;` alias)."
+        }
+        "extract_rust_crate_scaffold" => {
+            "Use to plan/review the atomic extraction (crate scaffold, file moves, alias \
+             swap, workspace wiring) without the cargo validation pipeline."
+        }
+        "rewrite_rust_crate_paths" => {
+            "Use to rewrite crate::<module> paths to <new_crate>::<module> with \
+             mixed-group use-tree splitting (alias-free extraction cleanup)."
+        }
+        "rust_workspace_dag_check" => {
+            "Use to verify the workspace path-dependency graph is acyclic \
+             (dev-dependencies excluded; cargo permits dev cycles)."
+        }
         "rust_impl_partition_analysis" => {
             "Use when deciding whether an impl or named module cluster can be split; requires impl_name or module_name."
         }
@@ -1698,6 +1735,11 @@ fn plan_kind_optional_fields(name: &str) -> Vec<&'static str> {
         "write_file" | "create_file" => vec!["new_text", "output_path"],
         "move_file" => vec!["target", "output_path"],
         "ensure_toml_table" => vec!["toml_table", "toml_entries", "output_path"],
+        "extract_rust_crate" | "extract_rust_crate_scaffold" => {
+            vec!["target", "source", "toml_entries", "output_path"]
+        }
+        "rewrite_rust_crate_paths" => vec!["output_path"],
+        "rust_workspace_dag_check" => vec!["source", "output_path"],
         _ => vec![
             "target",
             "item_names",
@@ -1924,6 +1966,16 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "rust_public_api_guard" => plan_rust_public_api_guard(p),
         "rust_minimize_imports" => rust_minimize_imports::plan_minimize_imports(p),
         "rewrite_rust_bin_crate_paths" => plan_rewrite_rust_bin_crate_paths(p),
+        "extract_rust_crate_scaffold" => {
+            rust_extract_crate::plan_extract_rust_crate_scaffold(p)
+        }
+        "rewrite_rust_crate_paths" => rust_extract_crate::plan_rewrite_rust_crate_paths(p),
+        "rust_workspace_dag_check" => rust_extract_crate::plan_rust_workspace_dag_check(p),
+        "extract_rust_crate" => bail!(
+            "extract_rust_crate is a compound kind: dispatch it as a bbox_refactor_run \
+             step (it expands to extract_rust_crate_scaffold + rust_workspace_dag_check \
+             + cargo check --workspace + rust_compile_fix_round)"
+        ),
         // ── Elixir refactor surface (EX-G1..EX-G19) ───────────────────────────
         // Alphabetized by plan-kind name within the elixir block for
         // grep-ability; design IDs documented in
@@ -2217,7 +2269,9 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
             bail!("either `plan` or `plan_path` must be provided")
         }
     };
-    validate_plan_shape(&plan)?;
+    if !plan_kind_is_analysis_only(&plan.kind) {
+        validate_plan_shape(&plan)?;
+    }
 
     // G15: refuse to apply across git-worktree boundaries unless the
     // caller explicitly opted in. The plan stores absolute paths at
@@ -2781,7 +2835,9 @@ pub fn run_with_ctx(
                 };
                 let plan_value: serde_json::Value = serde_json::from_str(&plan_text)?;
                 let refactor_plan: RefactorPlan = serde_json::from_value(plan_value.clone())?;
-                validate_plan_shape(&refactor_plan)?;
+                if !plan_kind_is_analysis_only(&refactor_plan.kind) {
+                    validate_plan_shape(&refactor_plan)?;
+                }
                 let mut step_files = refactor_plan
                     .file_moves
                     .iter()
@@ -3334,6 +3390,15 @@ fn expand_refactor_run_steps(
                 if params.kind == "migrate_rust_mods_to_lib" =>
             {
                 expanded.extend(expand_migrate_rust_mods_to_lib_step(
+                    params,
+                    *optional,
+                    project_dir,
+                )?);
+            }
+            RefactorRunStep::Plan { params, optional }
+                if params.kind == "extract_rust_crate" =>
+            {
+                expanded.extend(rust_extract_crate::expand_extract_rust_crate_step(
                     params,
                     *optional,
                     project_dir,
@@ -4863,6 +4928,25 @@ fn select_items<'a>(
     Ok(selected)
 }
 
+/// Plan kinds whose contract is read-only analysis: they return no writes by
+/// design, so shape checks that exist to catch buggy WRITE planners (the run
+/// executor validates every step plan) do not apply to them. Keep in sync
+/// with the `analysis_only` groups in `plan_kinds()`.
+fn plan_kind_is_analysis_only(kind: &str) -> bool {
+    matches!(
+        kind,
+        "rust_impl_partition_analysis"
+            | "rust_top_level_dependency_analysis"
+            | "rust_public_api_guard"
+            | "rust_workspace_dag_check"
+            | "java_class_dependency_analysis"
+            | "java_public_api_guard"
+            | "java_concurrency_antipattern_audit"
+            | "java_vaadin_route_inventory"
+            | "java_jooq_query_structure_analysis"
+    )
+}
+
 pub fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
     if plan.edits.is_empty() && plan.file_moves.is_empty() && plan.file_creates.is_empty() {
         bail!("plan has no edits, file moves, or file creates");
@@ -5504,7 +5588,7 @@ mod plan_kind_catalog_tests {
             safety_class: Some("analysis_only".into()),
             backend: None,
         });
-        assert_eq!(value["count"], 3);
+        assert_eq!(value["count"], 4);
         let kinds = value["kinds"].as_array().expect("kinds array");
         let top_level = kinds
             .iter()

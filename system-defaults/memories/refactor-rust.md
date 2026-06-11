@@ -86,13 +86,17 @@ Plan kinds, grouped by intent:
 - Analysis only (no FileEdits): `rust_impl_partition_analysis` (impl-method
   graph for split planning), `rust_top_level_dependency_analysis` (top-level
   item graph + external reference hints + suggested clusters),
-  `rust_public_api_guard` (advisory for visibility changes touching public API).
+  `rust_public_api_guard` (advisory for visibility changes touching public API),
+  `rust_workspace_dag_check` (workspace path-dependency acyclicity guard;
+  dev-dependencies excluded because cargo permits dev cycles).
 - Run-loop integration: `rust_compile_fix_round` (classify a `capture=rustc_json`
   step's diagnostics into use-decl / visibility / replace proposals),
   `split_rust_impl_methods_to_submodule` (a `bbox_refactor_run` plan-step macro
   that expands to method extraction + wiring + cargo-check repair),
   `migrate_rust_mods_to_lib` (a `bbox_refactor_run` macro for moving selected
-  binary-root `mod` declarations into `src/lib.rs` and validating all bins).
+  binary-root `mod` declarations into `src/lib.rs` and validating all bins),
+  `extract_rust_crate` (a `bbox_refactor_run` macro for peeling leaf root
+  modules of a monolith into a new workspace-member crate).
 - Generic primitives (language-agnostic, useful in compound runs):
   `replace_text`, `write_file`, `ensure_toml_table`.
 
@@ -156,6 +160,28 @@ Writable plan kinds:
   grouped `use crate::{module_a, module_b};` imports when every grouped entry
   is in `item_names`. Mixed grouped imports are reported in `leftovers` for
   manual cleanup after.
+- `extract_rust_crate`: use inside `bbox_refactor_run`, not
+  `bbox_refactor_plan`. Inputs: `item_names` are root modules to extract,
+  `module_name` is the new crate name, `target` defaults to
+  `crates/<module_name>`, `source` defaults to `src/lib.rs`. The expansion runs
+  `extract_rust_crate_scaffold`, `rust_workspace_dag_check`,
+  `cargo check --workspace` with rustc JSON capture, `rust_compile_fix_round`,
+  then a final `cargo check --workspace`. The scaffold is the atomic plan: it
+  creates `crates/<name>/Cargo.toml` (dependencies inferred by intersecting
+  moved-source `<ident>::` references with the origin manifest; workspace path
+  deps are rebased) and `src/lib.rs` (`pub mod <m>;` per module), moves the
+  module file trees, swaps each origin `mod <m>;` for `use <crate>::<m>;`
+  (visibility-preserving) so every `crate::<m>::...` call site keeps resolving,
+  merges `[workspace].members`, and wires the root (plus optional
+  `toml_entries.consumers`) path dependency. FAILS CLOSED on non-leaf modules:
+  remaining `crate::<other>` references are listed with file:line and the plan
+  refuses — decouple first. Leftover warnings flag `env!("CARGO_MANIFEST_DIR")`
+  re-rooting and the empty source directory left after the move.
+- `rewrite_rust_crate_paths`: standalone generalization of
+  `rewrite_rust_bin_crate_paths` for alias-free cleanup: rewrites
+  `crate::<module>` to `<new_crate>::<module>` and SPLITS mixed grouped
+  imports (`use crate::{kept, moved};` becomes a kept `crate::{...}` line plus
+  a `use <new_crate>::...` line). Nested groups are left as leftovers.
 - `rust_module_wiring`: one conservative module-graph edit in a Rust module
   file. `toml_entries.action` supports `add_mod`, `remove_mod`, `add_use`, and
   `remove_use`; `module_name` drives mod actions and `use_path` drives use or
