@@ -190,20 +190,21 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
         ],
         Zone::ProviderSelector => vec![
             Line::from("  ↑/↓           cycle providers"),
-            Line::from("  Enter         confirm + home"),
-            Line::from("  →             confirm + home"),
-            Line::from("  ←             back (model selector)"),
+            Line::from("  Enter/Space   quick-select shown defaults + home"),
+            Line::from("  →             drill into models"),
+            Line::from("  ←             back to roster"),
         ],
         Zone::ModelSelector => vec![
             Line::from("  ↑/↓           cycle models"),
-            Line::from("  Enter         confirm + home"),
-            Line::from("  →             confirm + home"),
-            Line::from("  ←             effort selector"),
+            Line::from("  Enter/Space   quick-select model + default effort"),
+            Line::from("  →             drill into efforts"),
+            Line::from("  ←             back to providers"),
         ],
         Zone::EffortSelector => vec![
             Line::from("  ↑/↓           cycle efforts"),
-            Line::from("  Enter         confirm + home"),
-            Line::from("  →             back"),
+            Line::from("  Enter/Space   confirm + home"),
+            Line::from("  →             confirm + home"),
+            Line::from("  ←             back to models"),
         ],
     };
     let h = (shortcut_lines.len() as u16 + 2).min(f.area().height);
@@ -516,7 +517,7 @@ pub(super) fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::RIGHT | Borders::TOP)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            " provider · model · effort ",
+            " provider · defaults shown ",
             Style::default().fg(Color::Cyan),
         ));
     let inner = block.inner(area);
@@ -561,6 +562,11 @@ pub(super) fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter quick   → models   ← roster",
+        Style::default().fg(Color::DarkGray),
+    )));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -602,10 +608,9 @@ pub(super) fn draw_model_selector(f: &mut Frame, area: Rect, app: &App) {
             ]));
         }
     }
-    // Hint line
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Enter: confirm  ←: effort  →: back",
+        " Enter quick   → efforts  ← provider",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -658,10 +663,9 @@ pub(super) fn draw_effort_selector(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    // Hint line
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Enter: confirm  →: back",
+        " Enter/→: confirm  ←: models",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);

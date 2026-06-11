@@ -578,6 +578,90 @@ Trailing paragraph.";
     }
 
     #[test]
+    fn selector_right_drills_and_left_backs_out() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::ProviderSelector);
+
+        zoom_right(&mut app);
+        assert_eq!(app.zone, Zone::ModelSelector);
+
+        zoom_right(&mut app);
+        assert_eq!(app.zone, Zone::EffortSelector);
+
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::ModelSelector);
+
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::ProviderSelector);
+
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::Roster);
+    }
+
+    #[test]
+    fn selector_enter_commits_from_each_depth() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+        let provider_idx = FLEET_PROVIDERS
+            .iter()
+            .position(|p| !p.models().is_empty())
+            .expect("fleet provider with models");
+        let provider = FLEET_PROVIDERS[provider_idx];
+
+        app.zone = Zone::ProviderSelector;
+        app.provider_cursor = provider_idx;
+        app.model_cursor = usize::MAX;
+        app.effort_cursor = usize::MAX;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(app.zone, Zone::Roster);
+        assert_eq!(app.next_provider, provider);
+        assert_eq!(app.next_model.as_deref(), default_model_for(provider));
+        assert_eq!(app.next_effort.as_deref(), default_effort_for(provider));
+
+        let model_idx = (provider.models().len() > 1) as usize;
+        let selected_model = provider.models()[model_idx].id;
+        app.zone = Zone::ModelSelector;
+        app.provider_cursor = provider_idx;
+        app.model_cursor = model_idx;
+        app.effort_cursor = usize::MAX;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert_eq!(app.zone, Zone::Roster);
+        assert_eq!(app.next_provider, provider);
+        assert_eq!(app.next_model.as_deref(), Some(selected_model));
+        assert_eq!(app.next_effort.as_deref(), default_effort_for(provider));
+
+        let effort_idx = provider.efforts().len().saturating_sub(1);
+        let selected_effort = provider.efforts().get(effort_idx).map(|e| e.id);
+        app.zone = Zone::EffortSelector;
+        app.provider_cursor = provider_idx;
+        app.model_cursor = model_idx;
+        app.effort_cursor = effort_idx;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(app.zone, Zone::Roster);
+        assert_eq!(app.next_provider, provider);
+        assert_eq!(app.next_model.as_deref(), Some(selected_model));
+        assert_eq!(app.next_effort.as_deref(), selected_effort);
+    }
+
+    #[test]
     fn single_agent_steer_title_names_target_agent() {
         let title = Line::from(single_agent_steer_title_spans("review api"));
 

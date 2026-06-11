@@ -280,11 +280,11 @@ const DEFAULT_FLEET_PROVIDER: Provider = Provider::Brodex;
 /// Left/right is a zoom axis; up/down selects within the current zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Zone {
-    /// `←` from effort selector: ↑/↓ cycle efforts, `→` commits + home, Enter/Space commits + home.
+    /// Effort selector: ↑/↓ cycle efforts, `←` backs to models, `→` commits + home.
     EffortSelector,
-    /// `←` from model selector: ↑/↓ cycle efforts for the selected model, `→` pops to model, Enter/Space commits + home.
+    /// Model selector: ↑/↓ cycle models, `←` backs to providers, `→` drills into efforts.
     ModelSelector,
-    /// `←` from provider selector: ↑/↓ cycle models for the selected provider, `→` pops to provider, Enter/Space commits + home (assumes default effort).
+    /// Provider selector: ↑/↓ cycle providers, `←` backs home, `→` drills into models.
     ProviderSelector,
     /// Home: ↑/↓ cycle agents, `←` provider selector, `→` enter agent.
     Roster,
@@ -2444,14 +2444,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.input.push('\n');
             app.cursor_pos = app.input.len();
         }
-        // Enter/Space in sub-selectors: commit selection and jump home to roster.
+        // Enter/Space in sub-selectors: commit at the current depth and jump home.
         KeyCode::Enter | KeyCode::Char(' ')
             if matches!(
                 app.zone,
                 Zone::ProviderSelector | Zone::ModelSelector | Zone::EffortSelector
             ) =>
         {
-            commit_full_selection(app);
+            commit_current_selector(app);
             app.zone = Zone::Roster;
         }
         KeyCode::Enter => submit(app),
@@ -3790,17 +3790,9 @@ fn zoom_left(app: &mut App) {
             sync_provider_cursor(app);
             Zone::ProviderSelector
         }
-        Zone::ProviderSelector => {
-            // Drill into model selector for the selected provider.
-            sync_model_cursor(app);
-            Zone::ModelSelector
-        }
-        Zone::ModelSelector => {
-            // Drill into effort selector for the selected model's provider.
-            sync_effort_cursor(app);
-            Zone::EffortSelector
-        }
-        Zone::EffortSelector => Zone::EffortSelector,
+        Zone::ProviderSelector => Zone::Roster,
+        Zone::ModelSelector => Zone::ProviderSelector,
+        Zone::EffortSelector => Zone::ModelSelector,
         Zone::Config => Zone::Config,
     };
 }
@@ -3853,15 +3845,16 @@ fn zoom_right(app: &mut App) {
             app.zone = Zone::Roster;
         }
         Zone::ModelSelector => {
-            // Pop back to provider selector without committing model.
-            // User is exploring; right = undo drill-down.
-            app.zone = Zone::ProviderSelector;
+            // Drill into effort selector for the selected model.
+            commit_model_without_flash(app);
+            sync_effort_cursor(app);
+            app.zone = Zone::EffortSelector;
         }
         Zone::ProviderSelector => {
-            // Confirm sticky-next provider, return to roster.
+            // Drill into model selector for the selected provider.
             set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
-            app.flash_provider();
-            app.zone = Zone::Roster;
+            sync_model_cursor(app);
+            app.zone = Zone::ModelSelector;
         }
         Zone::Roster => {
             if let Some(idx) = app.selected_agent() {
@@ -3876,6 +3869,43 @@ fn zoom_right(app: &mut App) {
         Zone::SingleAgent => {}
         Zone::Config => {}
     }
+}
+
+/// Commit the selection implied by the current selector depth and jump home.
+fn commit_current_selector(app: &mut App) {
+    match app.zone {
+        Zone::ProviderSelector => commit_provider_selection(app),
+        Zone::ModelSelector => commit_model_selection(app),
+        Zone::EffortSelector => commit_full_selection(app),
+        _ => {}
+    }
+}
+
+/// Quick-select a provider using its visible default model + effort.
+fn commit_provider_selection(app: &mut App) {
+    set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
+    sync_model_cursor(app);
+    sync_effort_cursor(app);
+    app.flash_provider();
+}
+
+/// Quick-select a provider/model pair using the provider's default effort.
+fn commit_model_selection(app: &mut App) {
+    commit_model_without_flash(app);
+    sync_effort_cursor(app);
+    app.flash_provider();
+}
+
+fn commit_model_without_flash(app: &mut App) {
+    let provider = FLEET_PROVIDERS[app.provider_cursor];
+    app.next_provider = provider;
+
+    let models = provider.models();
+    app.next_model = models
+        .get(app.model_cursor)
+        .map(|m| m.id.to_string())
+        .or_else(|| default_model_for(provider).map(str::to_string));
+    app.next_effort = default_effort_for(provider).map(str::to_string);
 }
 
 /// Commit the full provider + model + effort selection and flash.
