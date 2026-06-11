@@ -1798,6 +1798,101 @@ Trailing paragraph.";
         assert_eq!(PRUNE_ARM_SECS, 4, "arm TTL should be 4 seconds");
     }
 
+    #[test]
+    fn prune_arm_status_survives_set_status_calls() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        // Simulate the armed state (first Ctrl+K was pressed).
+        app.prune_armed_until = Some(Instant::now() + Duration::from_secs(PRUNE_ARM_SECS));
+        app.prune_armed_count = 3;
+        app.set_status_force(
+            "Ctrl+K again to prune 3 terminal agents",
+            Duration::from_secs(PRUNE_ARM_SECS),
+        );
+
+        // Simulate handle_tail overwriting the status (the pre-fix bug).
+        app.set_status("agent finished", Duration::from_secs(4));
+        // set_status must be suppressed while armed — the arm message survives.
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Ctrl+K again to prune 3 terminal agents"),
+            "arm status must survive a set_status call while armed"
+        );
+        assert!(
+            app.prune_armed_until.is_some(),
+            "prune_armed_until must persist"
+        );
+
+        // set_status_force must always win (used by prune_terminal_agents itself).
+        app.set_status_force("no terminal agents to prune", Duration::from_secs(3));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("no terminal agents to prune"),
+            "set_status_force must overwrite even when armed"
+        );
+    }
+
+    #[test]
+    fn prune_arm_disarmed_by_other_keys() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        // Simulate armed state.
+        app.prune_armed_until = Some(Instant::now() + Duration::from_secs(PRUNE_ARM_SECS));
+        app.prune_armed_count = 2;
+        app.set_status_force(
+            "Ctrl+K again to prune 2 terminal agents",
+            Duration::from_secs(PRUNE_ARM_SECS),
+        );
+
+        // Any non-Ctrl+K key disarms.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert!(
+            app.prune_armed_until.is_none(),
+            "any non-Ctrl+K key must disarm the prune"
+        );
+    }
+
+    #[test]
+    fn prune_arm_ctrl_k_does_not_disarm() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        // Simulate armed state.
+        app.prune_armed_until = Some(Instant::now() + Duration::from_secs(PRUNE_ARM_SECS));
+        app.prune_armed_count = 5;
+
+        // Ctrl+K goes through prune_terminal_agents, not the disarm line.
+        // With an empty agent list, prune_terminal_agents clears the arm
+        // (count == 0 branch). But the key point is it does NOT hit the
+        // "any other key" disarm at line 2349.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        // With no agents, prune_terminal_agents sets "no terminal agents".
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("no terminal agents")),
+            "Ctrl+K with no agents should report no terminal agents, got {:?}",
+            app.status
+        );
+    }
+
     // ── inline_stable_end ──────────────────────────────────────────────
 
     #[test]

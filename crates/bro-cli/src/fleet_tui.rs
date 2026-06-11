@@ -723,7 +723,20 @@ impl App {
         );
     }
 
+    /// Set the footer status flash unless a Ctrl+K prune arm is active — the
+    /// arm message must survive until the operator confirms or disarms, so
+    /// transient "agent finished" / classifier messages must not overwrite it.
     fn set_status(&mut self, msg: impl Into<String>, ttl: Duration) {
+        if self.prune_armed_until.is_some() {
+            return;
+        }
+        self.status = Some(msg.into());
+        self.status_until = Some(Instant::now() + ttl);
+    }
+
+    /// Force-set status regardless of prune arm state. Used by the prune
+    /// function itself (arm message, no-terminal message, result message).
+    fn set_status_force(&mut self, msg: impl Into<String>, ttl: Duration) {
         self.status = Some(msg.into());
         self.status_until = Some(Instant::now() + ttl);
     }
@@ -2797,10 +2810,11 @@ fn prune_terminal_agents(app: &mut App) {
         .collect();
     let count = terminal.len();
     if count == 0 {
+        tracing::debug!(prune_action = "skip", reason = "no terminal agents");
         app.prune_armed_until = None;
         app.prune_armed_count = 0;
         app.clear_input();
-        app.set_status("no terminal agents to prune", Duration::from_secs(3));
+        app.set_status_force("no terminal agents to prune", Duration::from_secs(3));
         return;
     }
 
@@ -2811,9 +2825,10 @@ fn prune_terminal_agents(app: &mut App) {
         .is_some_and(|until| now < until && app.prune_armed_count == count);
 
     if !armed {
+        tracing::debug!(prune_action = "arm", terminal_count = count);
         app.prune_armed_count = count;
         app.prune_armed_until = Some(now + Duration::from_secs(PRUNE_ARM_SECS));
-        app.set_status(
+        app.set_status_force(
             format!("Ctrl+K again to prune {count} terminal agents"),
             Duration::from_secs(PRUNE_ARM_SECS),
         );
@@ -2902,6 +2917,14 @@ fn prune_terminal_agents(app: &mut App) {
         msg = format!("{msg}, {worktrees_failed} worktree removals failed");
     }
     let ttl = if worktrees_dirty > 0 { 8 } else { 5 };
+    tracing::debug!(
+        prune_action = "executed",
+        pruned,
+        failed,
+        worktrees_removed,
+        worktrees_dirty,
+        worktrees_failed,
+    );
     app.set_status(msg, Duration::from_secs(ttl));
 }
 
