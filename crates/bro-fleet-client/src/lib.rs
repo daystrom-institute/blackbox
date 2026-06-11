@@ -22,6 +22,7 @@ pub use config::{bro_home, daemon_port};
 pub use fleet::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, CloseoutEvent, DEFAULT_CLASSIFIER_PROMPT,
     DispatchSpec, FleetConfig, FleetOrchestrator, FocusedTranscriptBuffer,
+    FocusedTranscriptLiveEventV1, FocusedTranscriptMemoryEventV1, FocusedTranscriptSnapshotV1,
     FocusedTranscriptStreamEvent, HookOnFail, HookPolicy, INTERN_PREFIX, ProjectCloseout,
     ProjectDispatch, Provider, ResumeSpec, seed_worktree_dirs, TaskSnapshot, TaskStatus, TodoItem, TodoItemStatus,
     TodoState, TranscriptHistoryPageV1, TranscriptItem, intern_rider, parse_transcript,

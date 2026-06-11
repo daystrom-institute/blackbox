@@ -246,13 +246,22 @@ Trailing paragraph.";
     }
 
     #[test]
-    fn inline_stable_end_holds_back_only_active_last_item() {
-        assert_eq!(inline_stable_end(0, true), 0);
-        assert_eq!(inline_stable_end(1, true), 0);
-        assert_eq!(inline_stable_end(3, true), 2);
-        assert_eq!(inline_stable_end(0, false), 0);
-        assert_eq!(inline_stable_end(1, false), 1);
-        assert_eq!(inline_stable_end(3, false), 3);
+    fn inline_stable_end_active_turn_holds_back_all_items_until_result() {
+        // turn_active = true, no TurnFooter → nothing is stable (first turn).
+        assert_eq!(inline_stable_end(&[], true), 0);
+        assert_eq!(inline_stable_end(&[
+            TranscriptItem::AssistantText("hi".into()),
+        ], true), 0);
+        assert_eq!(inline_stable_end(&[
+            TranscriptItem::AssistantText("hi".into()),
+            TranscriptItem::ToolCall { name: "f".into(), args: "{}".into() },
+        ], true), 0);
+        // turn_active = false → everything is stable.
+        assert_eq!(inline_stable_end(&[], false), 0);
+        assert_eq!(inline_stable_end(&[
+            TranscriptItem::AssistantText("hi".into()),
+            TranscriptItem::TurnFooter { num_turns: Some(1), cost_usd: None },
+        ], false), 2);
     }
 
     #[test]
@@ -1245,11 +1254,18 @@ Trailing paragraph.";
     #[test]
     fn stale_commit_cursor_does_not_panic() {
         // Simulate: committed=10 but transcript only has 5 items, turn inactive.
-        let transcript_len = 5;
+        let items: Vec<TranscriptItem> = vec![
+            TranscriptItem::UserSteer("a".into()),
+            TranscriptItem::AssistantText("b".into()),
+            TranscriptItem::ToolCall { name: "c".into(), args: "{}".into() },
+            TranscriptItem::ToolResult { tool: Some("c".into()), content: "d".into(), is_error: false, rider: None },
+            TranscriptItem::TurnFooter { num_turns: Some(1), cost_usd: None },
+        ];
         let committed: usize = 10;
-        let stable_end = inline_stable_end(transcript_len, false);
+        let stable_end = inline_stable_end(&items, false);
 
         // The bounds clamp in commit_inline_history: min(committed, transcript.len())
+        let transcript_len = items.len();
         let start = committed.min(transcript_len); // → 5
         let end = stable_end.min(transcript_len); // → 5
         // An empty slice is valid — no panic.
@@ -1268,20 +1284,43 @@ Trailing paragraph.";
     /// skips already-committed items and only emits new ones.
     #[test]
     fn superset_snapshot_preserves_cursor_and_only_emits_new_items() {
-        // Simulated state: transcript has 8 items, we committed 5.
-        // After a terminal-transition resnapshot, transcript now has 12 items
-        // (super-set: same first 8 + 4 new ones). The cursor at committed=5
-        // is preserved, so only items [5..12) get committed.
-        let transcript_len = 12;
+        // Build a transcript with two completed turns (each sealed by a
+        // TurnFooter), then one active turn in progress.  The first 8 items
+        // are from completed turns; items [8..12] are the in-progress turn.
+        let items: Vec<TranscriptItem> = {
+            let mut v = Vec::new();
+            // Turn 1 (complete, 4 items)
+            v.push(TranscriptItem::UserSteer("t1 steer".into()));
+            v.push(TranscriptItem::AssistantText("t1 text".into()));
+            v.push(TranscriptItem::ToolCall { name: "t1".into(), args: "{}".into() });
+            v.push(TranscriptItem::TurnFooter { num_turns: Some(1), cost_usd: None });
+            // Turn 2 (complete, 4 items)
+            v.push(TranscriptItem::UserSteer("t2 steer".into()));
+            v.push(TranscriptItem::AssistantText("t2 text".into()));
+            v.push(TranscriptItem::ToolCall { name: "t2".into(), args: "{}".into() });
+            v.push(TranscriptItem::TurnFooter { num_turns: Some(2), cost_usd: None });
+            // Turn 3 (active, 4 items)
+            v.push(TranscriptItem::UserSteer("t3 steer".into()));
+            v.push(TranscriptItem::AssistantText("t3 text".into()));
+            v.push(TranscriptItem::ToolCall { name: "t3".into(), args: "{}".into() });
+            v.push(TranscriptItem::ToolResult { tool: Some("t3".into()), content: "ok".into(), is_error: false, rider: None });
+            v
+        };
+        assert_eq!(items.len(), 12);
         let committed: usize = 5;
-        let stable_end = inline_stable_end(transcript_len, true); // turn active → last item not stable
+        let stable_end = inline_stable_end(&items, true); // turn active → last TurnFooter at idx 7
 
-        let start = committed.min(transcript_len); // → 5
-        let end = stable_end.min(transcript_len);
-        // New items to commit: transcript[5..end]
+        let start = committed.min(items.len()); // → 5
+        let end = stable_end.min(items.len());
+        // Last TurnFooter at index 7 → stable_end = 8.
+        assert_eq!(stable_end, 8);
+        // New items to commit: transcript[5..8] (items from completed turn 2
+        // that were not yet committed).
         assert_eq!(start, 5);
         assert!(end > start, "should commit new items beyond the cursor");
-        assert!(end <= transcript_len);
+        assert_eq!(end, 8);
+        // Active turn items [8..12] remain in the live region.
+        assert!(end <= items.len());
         // Already-committed items [0..5) are skipped.
         assert_eq!(start - 0, committed);
     }
@@ -1422,3 +1461,77 @@ Trailing paragraph.";
         // Instead, test the constants and helpers are correct.
         assert_eq!(PRUNE_ARM_SECS, 4, "arm TTL should be 4 seconds");
     }
+
+    // ── inline_stable_end ──────────────────────────────────────────────
+
+    #[test]
+    fn stable_end_returns_all_when_turn_inactive() {
+        let items = vec![
+            TranscriptItem::UserSteer("go".into()),
+            TranscriptItem::AssistantText("done".into()),
+            TranscriptItem::TurnFooter {
+                num_turns: Some(1),
+                cost_usd: None,
+            },
+        ];
+        assert_eq!(inline_stable_end(&items, false), 3);
+    }
+
+    #[test]
+    fn stable_end_empty_active_turn() {
+        // No turns completed yet — everything is in-progress.
+        let items = vec![
+            TranscriptItem::UserSteer("go".into()),
+            TranscriptItem::AssistantText("working".into()),
+            TranscriptItem::ToolCall {
+                name: "shell_run".into(),
+                args: "{\"command\": \"ls\"}".into(),
+            },
+        ];
+        // turn_active = true, no TurnFooter → nothing is stable.
+        assert_eq!(inline_stable_end(&items, true), 0);
+    }
+
+    #[test]
+    fn stable_end_excludes_active_turn_after_completed_turn() {
+        // One completed turn, then a new active turn in progress.
+        let items = vec![
+            TranscriptItem::UserSteer("first".into()),
+            TranscriptItem::AssistantText("response".into()),
+            TranscriptItem::TurnFooter {
+                num_turns: Some(1),
+                cost_usd: None,
+            },
+            TranscriptItem::UserSteer("second".into()),
+            TranscriptItem::AssistantText("working on it".into()),
+            TranscriptItem::ToolCall {
+                name: "grep".into(),
+                args: "{\"pattern\": \"foo\"}".into(),
+            },
+        ];
+        // Last TurnFooter at index 2 → stable_end = 3 (items 0..3 stable).
+        assert_eq!(inline_stable_end(&items, true), 3);
+    }
+
+    #[test]
+    fn stable_end_includes_multiple_completed_turns() {
+        let items = vec![
+            TranscriptItem::UserSteer("turn 1".into()),
+            TranscriptItem::AssistantText("done 1".into()),
+            TranscriptItem::TurnFooter {
+                num_turns: Some(1),
+                cost_usd: None,
+            },
+            TranscriptItem::UserSteer("turn 2".into()),
+            TranscriptItem::AssistantText("done 2".into()),
+            TranscriptItem::TurnFooter {
+                num_turns: Some(2),
+                cost_usd: None,
+            },
+            TranscriptItem::UserSteer("turn 3".into()),
+            TranscriptItem::AssistantText("active".into()),
+        ];
+        // Last TurnFooter at index 5 → stable_end = 6 (items 0..6 stable).
+        assert_eq!(inline_stable_end(&items, true), 6);
+    }
+    

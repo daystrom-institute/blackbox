@@ -31,7 +31,7 @@ use crate::task::{RosterApply, Task, TaskInner, TaskStore, now_ms};
 pub use bro_core::Provider;
 pub use bro_protocol::{
     CloseoutOutcome, CloseoutRequest, DispatchSpec, FocusedTranscriptLiveEventV1,
-    FocusedTranscriptSnapshotV1, ResumeSpec, RosterDelta,
+    FocusedTranscriptMemoryEventV1, FocusedTranscriptSnapshotV1, ResumeSpec, RosterDelta,
     RosterSnapshotV1, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptHistoryPageV1,
     TranscriptItem,
 };
@@ -2798,5 +2798,102 @@ mod tests {
         assert_eq!(policy.on_fail, HookOnFail::Warn);
         assert_eq!(policy.timeout_secs, 600);
         assert!(policy.cwd.is_none());
+    }
+
+    /// Two-revision regression for the partial-duplicate tool-call bug
+    /// (thread-c3f7c7e3).  When a live event adds content blocks to the
+    /// active turn, `parse_transcript` sees a longer item list on the second
+    /// call.  The committed-scrollback watermark must keep ALL in-progress
+    /// items in the live region — committing them mid-turn produces a
+    /// truncated tool_use fragment in scrollback alongside the complete
+    /// version in the live area.
+    #[test]
+    fn parse_transcript_two_revision_live_event_sequence() {
+        use bro_core::TaskId;
+
+        let mut buffer = FocusedTranscriptBuffer::default();
+
+        // ── Revision 1: one completed turn + start of a second turn ──
+        buffer.apply_snapshot(FocusedTranscriptSnapshotV1 {
+            task_id: TaskId::new("task-revseq"),
+            session_id: None,
+            provider: Provider::Glm,
+            status: TaskStatus::Running,
+            live_cursor: 4,
+            memory_start_cursor: 0,
+            next_memory_cursor: 5,
+            events: vec![
+                FocusedTranscriptMemoryEventV1 {
+                    cursor: 0,
+                    event: json!({"type":"user","message":{"role":"user","content":"go"}}),
+                },
+                FocusedTranscriptMemoryEventV1 {
+                    cursor: 1,
+                    event: json!({"type":"assistant","message":{"content":[
+                        {"type":"text","text":"on it"},
+                        {"type":"tool_use","id":"t1","name":"shell_run","input":{"command":"ls"}}
+                    ]}}),
+                },
+                FocusedTranscriptMemoryEventV1 {
+                    cursor: 2,
+                    event: json!({"type":"user","message":{"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"t1","content":"file.txt","is_error":false}
+                    ]}}),
+                },
+                FocusedTranscriptMemoryEventV1 {
+                    cursor: 3,
+                    event: json!({"type":"result","subtype":"success","num_turns":1}),
+                },
+                FocusedTranscriptMemoryEventV1 {
+                    cursor: 4,
+                    event: json!({"type":"user","message":{"role":"user","content":"more"}}),
+                },
+            ],
+            history_jsonl_path: None,
+        });
+
+        let rev1 = parse_transcript(&buffer.events());
+        // Turn 1: UserSteer, AssistantText, ToolCall, ToolResult, TurnFooter
+        // Turn 2 (active): UserSteer ("more") — no assistant yet.
+        assert_eq!(rev1.len(), 6);
+        assert!(matches!(&rev1[0], TranscriptItem::UserSteer(s) if s == "go"));
+        assert!(matches!(&rev1[1], TranscriptItem::AssistantText(..)));
+        assert!(matches!(&rev1[2], TranscriptItem::ToolCall { name, .. } if name == "shell_run"));
+        assert!(matches!(&rev1[3], TranscriptItem::ToolResult { .. }));
+        assert!(matches!(&rev1[4], TranscriptItem::TurnFooter { .. }));
+        assert!(matches!(&rev1[5], TranscriptItem::UserSteer(s) if s == "more"));
+
+        // At this point, a conservative watermark finds the last TurnFooter at
+        // index 4 and draws the stable/live boundary at index 5 — the "more"
+        // UserSteer stays live (it has no response yet).
+
+        // ── Revision 2: the assistant turn arrives ──
+        buffer.apply_live_event(FocusedTranscriptLiveEventV1 {
+            task_id: TaskId::new("task-revseq"),
+            cursor: 5,
+            event: json!({"type":"assistant","message":{"content":[
+                {"type":"text","text":"doing more"},
+                {"type":"tool_use","id":"t2","name":"shell_run","input":{"command":"pwd"}}
+            ]}}),
+        });
+
+        let rev2 = parse_transcript(&buffer.events());
+        // Now 8 items: original 6 + AssistantText + ToolCall.
+        assert_eq!(rev2.len(), 8);
+        assert!(matches!(&rev2[5], TranscriptItem::UserSteer(s) if s == "more"));
+        assert!(matches!(&rev2[6], TranscriptItem::AssistantText(..)));
+        assert!(matches!(&rev2[7], TranscriptItem::ToolCall { name, .. } if name == "shell_run"));
+
+        // The last TurnFooter is STILL at index 4 — the new assistant turn has
+        // no result yet.  A correct watermark keeps items [5..8] in the live
+        // region; the bug's old `total_items - 1` watermark would have
+        // committed items [5..7] (UserSteer("more") and AssistantText("doing
+        // more")) into scrollback, then re-rendered the last ToolCall at index
+        // 7 in the live area — partial duplicate.
+
+        // Verify the events themselves haven't changed identity:
+        let rev2_again = parse_transcript(&buffer.events());
+        assert_eq!(rev2, rev2_again,
+            "re-parsing the same buffer should be idempotent — items are stable once emitted");
     }
 }

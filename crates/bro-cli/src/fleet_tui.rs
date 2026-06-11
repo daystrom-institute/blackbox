@@ -1736,7 +1736,7 @@ fn inline_seed_viewport(app: &mut App, screen_w: u16, screen_h: u16) -> Rect {
     let active_lines = if let Some(idx) = inline_focus_idx(app) {
         let transcript = app.agents[idx].task.transcript();
         let turn_active = app.agents[idx].task.snapshot().turn_active;
-        let stable_end = inline_stable_end(transcript.len(), turn_active);
+        let stable_end = inline_stable_end(&transcript, turn_active);
         let queued = queued_user_turns(&mut app.agents[idx], &transcript);
         let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
         let active = &transcript[stable_end..];
@@ -1911,7 +1911,7 @@ where
         let active_lines = if let Some(idx) = focus {
             let transcript = focused_transcript_items(app, idx);
             let turn_active = app.agents[idx].task.snapshot().turn_active;
-            let stable_end = inline_stable_end(transcript.len(), turn_active);
+            let stable_end = inline_stable_end(&transcript, turn_active);
             committed_now =
                 commit_inline_history(app, terminal, idx, &transcript, stable_end, width)?;
 
@@ -2094,12 +2094,20 @@ fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
     app.activity_frame = app.activity_frame.wrapping_add(1);
 }
 
-fn inline_stable_end(total_items: usize, turn_active: bool) -> usize {
-    if turn_active && total_items > 0 {
-        total_items - 1
-    } else {
-        total_items
+fn inline_stable_end(items: &[TranscriptItem], turn_active: bool) -> usize {
+    if !turn_active {
+        return items.len();
     }
+    // Find the last turn boundary — items beyond it belong to the current
+    // active turn and may be appended to (or revised) by later provider
+    // events.  Committing them to scrollback while the turn is still in
+    // flight produces a partial-stale duplicate in the transcript when a
+    // subsequent event adds more content blocks or tool results (§5.4).
+    items
+        .iter()
+        .rposition(|item| matches!(item, TranscriptItem::TurnFooter { .. }))
+        .map(|i| i + 1)
+        .unwrap_or(0)
 }
 
 /// Drop every per-agent commit cursor — used when the standalone view installs a
