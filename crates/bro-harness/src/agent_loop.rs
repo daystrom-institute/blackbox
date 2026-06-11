@@ -1441,7 +1441,26 @@ impl Session {
         // leaves the buffer ending on a user-role message with no assistant
         // reply. Repair alternation now so the next turn — a steer, or a
         // `--resume` continuation — does not stack two user messages and 400.
+        // A cancelled model call also drops the run_turn future mid-stream,
+        // which would discard the usage accumulated for the in-flight
+        // segment; recover it from the transport so the session total reflects
+        // the tokens the underlying provider actually charged.
         if matches!(break_reason, "cancelled" | "interrupted_dispatch") {
+            let partial = self.tx.take_interrupted_usage();
+            if partial.input_tokens > 0
+                || partial.output_tokens > 0
+                || partial.cached_input_tokens > 0
+                || partial.cache_creation_input_tokens > 0
+            {
+                self.total_usage.add(&partial);
+                if partial.input_tokens > 0
+                    || partial.cached_input_tokens > 0
+                    || partial.cache_creation_input_tokens > 0
+                {
+                    self.last_prompt_tokens = partial.total_input_tokens();
+                    self.pending_input_estimate = 0;
+                }
+            }
             self.tx.note_interrupted();
         }
 

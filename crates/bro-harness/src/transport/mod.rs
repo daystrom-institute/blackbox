@@ -80,7 +80,7 @@ pub fn session_env_snapshot() -> BTreeMap<String, String> {
 /// consistent cache semantics. Transports whose native counter is
 /// cache-inclusive (OpenAI `prompt_tokens` / Responses `input_tokens`) must
 /// subtract the cached subset before populating `input_tokens`.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -414,6 +414,21 @@ pub trait Transport: Send {
     /// turn was cut short. Default: no-op (transports with no alternation
     /// constraint).
     fn note_interrupted(&mut self) {}
+
+    /// Recover usage accumulated for a segment that was dropped mid-`run_turn`
+    /// (cancel, mid-stream interrupt, or any future that never reached a
+    /// `return Ok(TurnOutput)`). The agent loop adds it to its session
+    /// accumulator so a cancelled turn doesn't burn tokens silently — the
+    /// alternative is reporting zero usage for a turn that streamed thousands
+    /// of events and charged the underlying provider.
+    ///
+    /// Default: returns `Usage::default()`. Streaming transports that update
+    /// the running usage incrementally inside `run_turn` should override this
+    /// to return the most recent segment state and reset their internal
+    /// accumulator.
+    fn take_interrupted_usage(&mut self) -> Usage {
+        Usage::default()
+    }
 
     /// Compact the conversation when the context window is filling: summarize
     /// the older prefix via a model call and replace it with a single synthetic

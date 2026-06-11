@@ -84,6 +84,23 @@ out explicitly under `Changed` or `Removed`.
   re-read the store/event log), `bbox_inbox` (gap-spool import rewrites the
   gap store under its write lock), and `bbox_artifact_supersede`/
   `bbox_artifact_remove` (flock'd catalog rewrites).
+- bro-harness Anthropic transport input-token accounting for GLM (and any
+  other Anthropic-compatible endpoint that doesn't place `input_tokens`
+  exactly where the canonical shape expects it). The SSE fold now reads
+  `input_tokens` from the four candidate paths observed in production
+  (`message.usage.input_tokens`, flat `usage.input_tokens`,
+  `message.usage.prompt_tokens`, flat `usage.prompt_tokens`), treats a
+  zero value in `message_start` as a placeholder rather than a real
+  count, and also captures `input_tokens` / `cache_read_input_tokens` /
+  `cache_creation_input_tokens` from `message_delta.usage` (the field the
+  previous parser ignored) so the end-of-stream snapshot overrides the
+  start-of-stream placeholder. DeepSeek on the same transport is
+  unaffected. Also: a cancelled or interrupted turn now reports the
+  usage accumulated up to the drop point instead of zeros — the running
+  segment usage is mirrored onto the transport after every fold and
+  recovered via a new `Transport::take_interrupted_usage` trait method
+  (default returns zeros for transports that don't track segment
+  state).
 
 - Edge-index rebuilds no longer stall the daemon under load: the store read
   guards now cover only the fast in-memory projections, while the multi-GB
