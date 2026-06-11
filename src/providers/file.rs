@@ -8,18 +8,18 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, schema, truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use crate::projects::ProjectRecord;
 
 pub struct FileProvider;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedFile {
-    pub(crate) project_id: String,
-    pub(crate) project_root: PathBuf,
-    pub(crate) file_path: PathBuf,
-    pub(crate) relative_path: String,
-    pub(crate) content: Vec<u8>,
+pub struct ResolvedFile {
+    pub project_id: String,
+    pub project_root: PathBuf,
+    pub file_path: PathBuf,
+    pub relative_path: String,
+    pub content: Vec<u8>,
 }
 
 impl InspectableEntityProvider for FileProvider {
@@ -38,7 +38,7 @@ impl InspectableEntityProvider for FileProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("path".into(), path.clone());
-        if ctx.state().is_some() {
+        if ctx.stores().is_some() {
             let resolved = resolve_file(ctx, path)?;
             properties.insert("project_id".into(), resolved.project_id);
             properties.insert(
@@ -93,11 +93,11 @@ impl InspectableEntityProvider for FileProvider {
     }
 }
 
-pub(crate) fn resolve_file(ctx: &ProviderContext<'_>, path: &str) -> Result<ResolvedFile> {
-    let state = ctx
-        .state()
+pub fn resolve_file(ctx: &ProviderContext<'_>, path: &str) -> Result<ResolvedFile> {
+    let stores = ctx
+        .stores()
         .ok_or_else(|| anyhow!("file refs require a registered project context"))?;
-    let projects = state.projects.read().list();
+    let projects = stores.projects.read().list();
     if projects.is_empty() {
         bail!("file refs require at least one registered project");
     }

@@ -69,11 +69,11 @@ pub(crate) fn status_response() -> EmbedStatusResponse {
 }
 
 pub(crate) fn status_response_for_buckets(
-    state: &SharedState,
+    stores: &crate::providers::CorpusStores<'_>,
     buckets: &[Bucket],
 ) -> Result<EmbedStatusResponse> {
     let mut response = status_response();
-    let coverage = crate::embed::route_coverage(state, buckets)?;
+    let coverage = crate::embed::route_coverage(stores, buckets)?;
     for (route, counts) in coverage {
         let status = response.routes.entry(route).or_default();
         status.session_indexed_count = Some(status.indexed_count);
@@ -100,7 +100,7 @@ pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
         Bucket::AgentManifest,
     ];
     Ok(serde_json::to_string_pretty(&status_response_for_buckets(
-        state,
+        &state.corpus_stores(),
         STATUS_COVERAGE_BUCKETS,
     )?)?)
 }
@@ -821,7 +821,7 @@ mod tests {
             )
             .unwrap();
 
-        let status = status_response_for_buckets(&state, &[Bucket::Threads]).unwrap();
+        let status = status_response_for_buckets(&state.corpus_stores(), &[Bucket::Threads]).unwrap();
         let threads = status.routes.get("threads").unwrap();
         assert_eq!(threads.source_count, Some(1));
         assert_eq!(threads.indexed_count, 1);

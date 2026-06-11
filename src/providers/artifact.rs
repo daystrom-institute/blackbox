@@ -8,7 +8,7 @@ use super::{
     truncate_label,
 };
 use crate::artifacts::ArtifactKind;
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct ArtifactProvider;
 
@@ -38,8 +38,8 @@ impl InspectableEntityProvider for ArtifactProvider {
         if let Some(version) = version {
             properties.insert("version".into(), version.clone());
         }
-        if let Some(state) = ctx.state() {
-            let catalog = state.artifacts.read();
+        if let Some(stores) = ctx.stores() {
+            let catalog = stores.artifacts.read();
             let meta = match version {
                 Some(version) => catalog.metadata_for_version(artifact_kind, name, version)?,
                 None => catalog.metadata_for(artifact_kind, name)?,

@@ -6,7 +6,7 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, schema, truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct SystemMemoryProvider;
 

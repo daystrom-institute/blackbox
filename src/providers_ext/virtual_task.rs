@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use super::{
+use crate::providers::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct TaskProvider;
 
@@ -32,7 +32,10 @@ impl InspectableEntityProvider for TaskProvider {
         let mut properties = BTreeMap::new();
         properties.insert("task_id".into(), task_id.clone());
         properties.insert("virtual".into(), "true".into());
-        if let Some(state) = ctx.state() {
+        if let Some(state) = ctx
+            .ext()
+            .and_then(|ext| ext.downcast_ref::<crate::server::state::SharedState>())
+        {
             let task = state
                 .task_store
                 .read()
@@ -77,7 +80,10 @@ impl InspectableEntityProvider for TaskProvider {
         let EntityRef::Task { task_id } = r else {
             return None;
         };
-        if let Some(state) = ctx.state() {
+        if let Some(state) = ctx
+            .ext()
+            .and_then(|ext| ext.downcast_ref::<crate::server::state::SharedState>())
+        {
             if let Some(task) = state.task_store.read().get(task_id) {
                 if let serde_json::Value::Object(obj) =
                     crate::orchestration::task_result_json(&task)

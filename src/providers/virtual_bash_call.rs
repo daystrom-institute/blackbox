@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct BashCallProvider;
 

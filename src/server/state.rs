@@ -354,6 +354,24 @@ impl SharedState {
         }
     }
 
+    /// Borrowed store view for the entity-provider layer
+    /// (`providers::CorpusStores`) — the daemon side of the provider
+    /// crate's dependency inversion.
+    pub(crate) fn corpus_stores(&self) -> crate::providers::CorpusStores<'_> {
+        crate::providers::CorpusStores {
+            idx: &self.idx,
+            kb: self.kb.as_ref(),
+            roadmap: self.roadmap.as_ref(),
+            threads: self.threads.as_ref(),
+            notes: self.notes.as_ref(),
+            projects: self.projects.as_ref(),
+            packets: &self.packets,
+            artifacts: &self.artifacts,
+            whiteboards: self.whiteboards.as_ref(),
+            store_dir: &self.store_dir,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(store_dir: &std::path::Path) -> SharedState {
         use std::collections::VecDeque;
@@ -393,6 +411,7 @@ impl SharedState {
         crate::index::writer_actor::register_embed_bootstrap(
             crate::embed_queue::register_index_embed_hooks,
         );
+        crate::providers::register_extra_providers(crate::providers_ext::extra_providers());
         let notes_path = store_dir.join("notes.json");
         let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
         let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);

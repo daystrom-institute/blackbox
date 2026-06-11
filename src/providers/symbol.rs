@@ -6,7 +6,7 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, empty_neighborhood_view, expected, next_hops, schema, truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct SymbolProvider;
 pub struct SymbolV2Provider;
@@ -137,8 +137,8 @@ fn symbol_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>
     }
     properties.insert("qualified_name".into(), qualified_name.to_string());
     properties.insert("defn_hash".into(), defn_hash.to_string());
-    if let Some(state) = ctx.state() {
-        let indexed = state
+    if let Some(stores) = ctx.stores() {
+        let indexed = stores
             .idx
             .read()
             .entity_properties(&r.to_string())?

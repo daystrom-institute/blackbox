@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct TranscriptProvider;
 
@@ -36,8 +36,8 @@ impl InspectableEntityProvider for TranscriptProvider {
         properties.insert("session_id".into(), session_id.clone());
         properties.insert("line_offset".into(), line_offset.to_string());
         properties.insert("event_idx".into(), event_idx.to_string());
-        if let Some(state) = ctx.state() {
-            let indexed = state
+        if let Some(stores) = ctx.stores() {
+            let indexed = stores
                 .idx
                 .read()
                 .transcript_properties(provider, session_id, *line_offset)?
@@ -86,9 +86,9 @@ impl InspectableEntityProvider for TranscriptProvider {
         else {
             return None;
         };
-        if let Some(state) = ctx.state() {
+        if let Some(stores) = ctx.stores() {
             if let Ok(Some(properties)) =
-                state
+                stores
                     .idx
                     .read()
                     .transcript_properties(provider, session_id, *line_offset)

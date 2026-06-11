@@ -2,16 +2,16 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use crate::entity_ref::EntityRef;
+use bbox_corpus_core::entity_ref::EntityRef;
 use crate::providers::{self, EntityView, ProviderContext};
 
 const LABEL_KEYS: &[&str] = &["title", "name", "qualified_name", "topic", "subject"];
 
-pub(crate) fn load(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
+pub fn load(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
     providers::provider_for(r.entity_type()).get_entity(ctx, r)
 }
 
-pub(crate) fn label_from_properties(properties: &BTreeMap<String, String>) -> Option<String> {
+pub fn label_from_properties(properties: &BTreeMap<String, String>) -> Option<String> {
     LABEL_KEYS
         .iter()
         .find_map(|key| properties.get(*key))
@@ -19,7 +19,7 @@ pub(crate) fn label_from_properties(properties: &BTreeMap<String, String>) -> Op
         .map(providers::truncate_label)
 }
 
-pub(crate) fn compact_label(
+pub fn compact_label(
     ctx: &ProviderContext<'_>,
     r: &EntityRef,
     loaded: Option<&BTreeMap<String, String>>,

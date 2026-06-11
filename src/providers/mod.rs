@@ -2,7 +2,6 @@
 
 pub mod agent;
 pub mod artifact;
-pub mod brofile;
 pub mod commit;
 pub mod file;
 pub mod knowledge;
@@ -16,7 +15,6 @@ pub mod system_memory;
 pub mod thread;
 pub mod transcript;
 pub mod virtual_bash_call;
-pub mod virtual_task;
 pub mod whiteboard;
 
 use std::collections::BTreeMap;
@@ -24,9 +22,18 @@ use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 
-use crate::edge_index::Edge;
-use crate::entity_ref::{EntityRef, EntityType};
-use crate::server::state::SharedState;
+use bbox_edge_index::edge_index::Edge;
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
+use bbox_artifacts::artifacts::ArtifactCatalog;
+use bbox_corpus_index::index::TranscriptIndex;
+use bbox_indexing::projects::ProjectRegistry;
+use bbox_knowledge::knowledge::Knowledge;
+use bbox_packets::Packets;
+use bbox_stores::roadmap::Roadmap;
+use bbox_threads::notes::Notes;
+use bbox_threads::threads::Threads;
+use bbox_whiteboards::whiteboards::WhiteboardRegistry;
+use parking_lot::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityView {
@@ -64,22 +71,64 @@ pub struct EdgeFamilyExpectation {
     pub required: bool,
 }
 
-pub(crate) struct ProviderContext<'a> {
-    state: Option<&'a SharedState>,
+/// Borrowed view over the corpus stores the entity providers read.
+/// The daemon builds one from `SharedState` (`SharedState::corpus_stores`);
+/// the struct itself names only peeled store types so the provider layer
+/// sits below the daemon core in the crate DAG.
+#[derive(Clone, Copy)]
+pub struct CorpusStores<'a> {
+    pub idx: &'a RwLock<TranscriptIndex>,
+    pub kb: &'a RwLock<Knowledge>,
+    pub roadmap: &'a RwLock<Roadmap>,
+    pub threads: &'a RwLock<Threads>,
+    pub notes: &'a RwLock<Notes>,
+    pub projects: &'a RwLock<ProjectRegistry>,
+    pub packets: &'a RwLock<Packets>,
+    pub artifacts: &'a RwLock<ArtifactCatalog>,
+    pub whiteboards: &'a WhiteboardRegistry,
+    pub store_dir: &'a std::path::Path,
+}
+
+pub struct ProviderContext<'a> {
+    stores: Option<CorpusStores<'a>>,
+    /// Opaque daemon extension: providers registered via
+    /// `register_extra_providers` (task, brofile) downcast this to the
+    /// daemon state type they were registered with. Keeps per-call state
+    /// without this crate naming the daemon's types.
+    ext: Option<&'a (dyn std::any::Any + Send + Sync)>,
 }
 
 impl<'a> ProviderContext<'a> {
-    pub(crate) fn new(state: &'a SharedState) -> Self {
-        Self { state: Some(state) }
+    pub fn new(stores: CorpusStores<'a>) -> Self {
+        Self {
+            stores: Some(stores),
+            ext: None,
+        }
     }
 
-    #[cfg(test)]
-    pub(crate) fn empty_for_tests() -> Self {
-        Self { state: None }
+    pub fn new_with_ext(
+        stores: CorpusStores<'a>,
+        ext: &'a (dyn std::any::Any + Send + Sync),
+    ) -> Self {
+        Self {
+            stores: Some(stores),
+            ext: Some(ext),
+        }
     }
 
-    pub(crate) fn state(&self) -> Option<&'a SharedState> {
-        self.state
+    pub fn empty_for_tests() -> Self {
+        Self {
+            stores: None,
+            ext: None,
+        }
+    }
+
+    pub fn stores(&self) -> Option<&CorpusStores<'a>> {
+        self.stores.as_ref()
+    }
+
+    pub fn ext(&self) -> Option<&'a (dyn std::any::Any + Send + Sync)> {
+        self.ext
     }
 }
 
@@ -119,10 +168,24 @@ pub fn all_providers() -> &'static [Box<dyn InspectableEntityProvider>] {
     registry().as_slice()
 }
 
+/// Daemon-side providers (task, brofile, ...) registered before the first
+/// registry use. The daemon owns types this crate must not name; it hands
+/// them in at boot (and test setup), and `registry()` drains them into the
+/// static provider set on first access.
+static EXTRA_PROVIDERS: std::sync::Mutex<Vec<Box<dyn InspectableEntityProvider>>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn register_extra_providers(extras: Vec<Box<dyn InspectableEntityProvider>>) {
+    EXTRA_PROVIDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(extras);
+}
+
 fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
     static REGISTRY: OnceLock<Vec<Box<dyn InspectableEntityProvider>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        vec![
+        let mut providers: Vec<Box<dyn InspectableEntityProvider>> = vec![
             Box::new(knowledge::KnowledgeProvider),
             Box::new(system_memory::SystemMemoryProvider),
             Box::new(file::FileProvider),
@@ -134,27 +197,31 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(note::NoteProvider),
             Box::new(symbol::SymbolProvider),
             Box::new(symbol::SymbolV2Provider),
-            Box::new(brofile::BrofileProvider),
             Box::new(whiteboard::WhiteboardProvider),
             Box::new(commit::CommitProvider),
-            Box::new(virtual_task::TaskProvider),
             Box::new(virtual_bash_call::BashCallProvider),
             Box::new(agent::AgentProvider),
             Box::new(packet::PacketProvider),
             Box::new(artifact::ArtifactProvider),
             Box::new(roadmap_item::RoadmapItemProvider),
-        ]
+        ];
+        providers.append(
+            &mut EXTRA_PROVIDERS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        providers
     })
 }
 
-pub(crate) fn ensure_type(r: &EntityRef, ty: EntityType) -> Result<()> {
+pub fn ensure_type(r: &EntityRef, ty: EntityType) -> Result<()> {
     if r.entity_type() != ty {
         bail!("provider for {ty} cannot inspect {}", r.entity_type());
     }
     Ok(())
 }
 
-pub(crate) fn empty_neighborhood_view(
+pub fn empty_neighborhood_view(
     r: &EntityRef,
     properties: BTreeMap<String, String>,
 ) -> EntityView {
@@ -166,7 +233,7 @@ pub(crate) fn empty_neighborhood_view(
     }
 }
 
-pub(crate) fn schema(
+pub fn schema(
     entity_type: EntityType,
     properties: &[&str],
     edge_families: &[&str],
@@ -189,7 +256,7 @@ pub(crate) fn schema(
     }
 }
 
-pub(crate) fn expected(family_name: &str, required: bool) -> EdgeFamilyExpectation {
+pub fn expected(family_name: &str, required: bool) -> EdgeFamilyExpectation {
     EdgeFamilyExpectation {
         family_name: family_name.to_string(),
         min_count: required.then_some(1),
@@ -198,7 +265,7 @@ pub(crate) fn expected(family_name: &str, required: bool) -> EdgeFamilyExpectati
     }
 }
 
-pub(crate) fn next_hops(neighborhood: &Neighborhood, families: &[&str]) -> Vec<NextHop> {
+pub fn next_hops(neighborhood: &Neighborhood, families: &[&str]) -> Vec<NextHop> {
     families
         .iter()
         .map(|family| {
@@ -216,7 +283,7 @@ pub(crate) fn next_hops(neighborhood: &Neighborhood, families: &[&str]) -> Vec<N
         .collect()
 }
 
-pub(crate) fn truncate_label(value: impl AsRef<str>) -> String {
+pub fn truncate_label(value: impl AsRef<str>) -> String {
     let value = value.as_ref().trim();
     let mut out = String::new();
     for ch in value.chars() {
@@ -226,66 +293,4 @@ pub(crate) fn truncate_label(value: impl AsRef<str>) -> String {
         out.push(ch);
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_refs() -> Vec<&'static str> {
-        vec![
-            "knowledge:abc12345",
-            "system_memory:sm-agentic-opening-sequence",
-            "file:README.md",
-            "project_file:proj1234:relhash:chunkhash:0",
-            "transcript:claude:session123:42:0",
-            "session:claude:session123",
-            "thread:thread-12345678",
-            "note:note-12345678",
-            "symbol:proj1234:crate::Type::method:defhash",
-            "brofile:auditor",
-            "whiteboard:board-12345678",
-            "commit:repo1234:abcdef1234567890",
-            "task:task-12345678",
-            "bash_call:session123:7",
-            "agent:code-reviewer@v3",
-            "packet:domain:phase-decompose/triage",
-            "artifact:packet/phase-decompose/triage@1",
-        ]
-    }
-
-    #[test]
-    fn registry_dispatches_every_entity_type() {
-        crate::init_system_memory_for_tests();
-        let ctx = ProviderContext::empty_for_tests();
-        for raw in sample_refs() {
-            let parsed = EntityRef::parse(raw).unwrap();
-            assert_eq!(parsed.render(), raw);
-            let provider = provider_for(parsed.entity_type());
-            assert!(provider.owns_ref(&parsed));
-            assert_eq!(provider.handles_virtual(), parsed.is_virtual());
-            let view = provider.get_entity(&ctx, &parsed).unwrap();
-            assert_eq!(view.entity_type, parsed.entity_type());
-        }
-    }
-
-    #[test]
-    fn compact_labels_fit_inline_budget() {
-        crate::init_system_memory_for_tests();
-        let ctx = ProviderContext::empty_for_tests();
-        for raw in sample_refs() {
-            let parsed = EntityRef::parse(raw).unwrap();
-            let provider = provider_for(parsed.entity_type());
-            let label = provider.compact_label(&ctx, &parsed).unwrap();
-            assert!(label.len() <= 80, "{raw}: {label}");
-        }
-    }
-
-    #[test]
-    fn registry_covers_entity_type_enum() {
-        for entity_type in EntityType::ALL {
-            provider_for(entity_type);
-        }
-        assert_eq!(all_providers().len(), EntityType::ALL.len());
-    }
 }

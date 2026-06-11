@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use super::{
+use crate::providers::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct BrofileProvider;
 
@@ -27,7 +27,10 @@ impl InspectableEntityProvider for BrofileProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("name".into(), name.clone());
-        if let Some(state) = ctx.state() {
+        if let Some(state) = ctx
+            .ext()
+            .and_then(|ext| ext.downcast_ref::<crate::server::state::SharedState>())
+        {
             let brofile =
                 crate::orchestration::brofile::list_brofiles("global", &state.store_dir, None)
                     .into_iter()

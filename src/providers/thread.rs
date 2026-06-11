@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct ThreadProvider;
 
@@ -27,8 +27,8 @@ impl InspectableEntityProvider for ThreadProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("thread_id".into(), thread_id.clone());
-        if let Some(state) = ctx.state() {
-            let threads = state.threads.read();
+        if let Some(stores) = ctx.stores() {
+            let threads = stores.threads.read();
             let thread = threads
                 .all()
                 .iter()
@@ -163,8 +163,8 @@ impl InspectableEntityProvider for ThreadProvider {
         let EntityRef::Thread { thread_id } = r else {
             return None;
         };
-        if let Some(state) = ctx.state() {
-            if let Some(thread) = state
+        if let Some(stores) = ctx.stores() {
+            if let Some(thread) = stores
                 .threads
                 .read()
                 .all()

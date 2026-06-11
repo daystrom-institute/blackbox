@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct NoteProvider;
 
@@ -27,8 +27,8 @@ impl InspectableEntityProvider for NoteProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("note_id".into(), note_id.clone());
-        if let Some(state) = ctx.state() {
-            let notes = state.notes.read();
+        if let Some(stores) = ctx.stores() {
+            let notes = stores.notes.read();
             let note = notes
                 .all()
                 .iter()
@@ -92,8 +92,8 @@ impl InspectableEntityProvider for NoteProvider {
         let EntityRef::Note { note_id } = r else {
             return None;
         };
-        if let Some(state) = ctx.state() {
-            if let Some(note) = state
+        if let Some(stores) = ctx.stores() {
+            if let Some(note) = stores
                 .notes
                 .read()
                 .all()

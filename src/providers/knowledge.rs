@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct KnowledgeProvider;
 
@@ -27,8 +27,8 @@ impl InspectableEntityProvider for KnowledgeProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("id".into(), id.clone());
-        if let Some(state) = ctx.state() {
-            let kb = state.kb.read();
+        if let Some(stores) = ctx.stores() {
+            let kb = stores.kb.read();
             let entry = kb
                 .entry(id)
                 .ok_or_else(|| anyhow::anyhow!("knowledge entry {id} not found"))?;
@@ -94,8 +94,8 @@ impl InspectableEntityProvider for KnowledgeProvider {
         let EntityRef::Knowledge { id } = r else {
             return None;
         };
-        if let Some(state) = ctx.state() {
-            if let Some(entry) = state.kb.read().entry(id) {
+        if let Some(stores) = ctx.stores() {
+            if let Some(entry) = stores.kb.read().entry(id) {
                 return Some(truncate_label(&entry.title));
             }
         }

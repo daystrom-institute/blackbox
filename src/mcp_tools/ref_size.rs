@@ -81,10 +81,10 @@ fn size_one_ref(
     let entity_ref = EntityRef::parse(raw)?;
     let (bytes, source) = match entity_ref.entity_type() {
         EntityType::ProjectFile | EntityType::ProjectFileV2 => {
-            let state = ctx
-                .state()
+            let stores = ctx
+                .stores()
                 .ok_or_else(|| anyhow!("project_file refs require an index-backed context"))?;
-            let doc = state
+            let doc = stores
                 .idx
                 .read()
                 .embedding_source_doc_for_entity_id(&entity_ref.to_string())?
@@ -224,6 +224,7 @@ mod tests {
 
     #[test]
     fn virtual_entity_ref_measures_provider_properties_json() {
+        crate::providers::register_extra_providers(crate::providers_ext::extra_providers());
         let ctx = ProviderContext::empty_for_tests();
         let out = ref_size(
             &RefSizeParams {
@@ -278,13 +279,13 @@ mod tests {
         let file_path = project.path().join("docs/design.md");
         fs::write(&file_path, "hello\nworld\n").unwrap();
 
-        let state = crate::server::state::SharedState::for_test(store.path());
-        state
+        let stores = crate::server::state::SharedState::for_test(store.path());
+        stores
             .projects
             .write()
             .register_path(project.path())
             .unwrap();
-        let ctx = ProviderContext::new(&state);
+        let ctx = ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
         let out = ref_size(
             &RefSizeParams {
                 refs: vec!["file:docs/design.md".into()],
@@ -311,13 +312,13 @@ mod tests {
         fs::write(registered.path().join("scripts/guard.py"), "old").unwrap();
         fs::write(worktree.path().join("scripts/guard.py"), "new guard\n").unwrap();
 
-        let state = crate::server::state::SharedState::for_test(store.path());
-        state
+        let stores = crate::server::state::SharedState::for_test(store.path());
+        stores
             .projects
             .write()
             .register_path(registered.path())
             .unwrap();
-        let ctx = ProviderContext::new(&state);
+        let ctx = ProviderContext::new_with_ext(stores.corpus_stores(), &stores);
         let out = ref_size(
             &RefSizeParams {
                 refs: vec!["file:scripts/guard.py".into()],

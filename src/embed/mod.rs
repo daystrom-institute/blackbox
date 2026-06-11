@@ -528,14 +528,14 @@ pub(crate) struct RouteCoverage {
 }
 
 pub(crate) fn route_coverage(
-    state: &SharedState,
+    stores: &crate::providers::CorpusStores<'_>,
     buckets: &[Bucket],
 ) -> Result<BTreeMap<String, RouteCoverage>> {
     let router = EmbeddingRouter::load_default()?;
     let mut coverage = BTreeMap::new();
     let mut active_by_route = BTreeMap::new();
     if buckets.contains(&Bucket::Knowledge) {
-        for entry in state.kb.read().all_entries() {
+        for entry in stores.kb.read().all_entries() {
             // Non-indexable entries (Deleted/Draft/Disabled) aren't in the
             // searchable index — skip so coverage reflects indexable knowledge.
             if !crate::index::indexable_knowledge_entry(entry) {
@@ -551,7 +551,7 @@ pub(crate) fn route_coverage(
                 &crate::index::knowledge_chunk_hash(entry),
             )?;
         }
-        for item in state.roadmap.read().all_items() {
+        for item in stores.roadmap.read().all_items() {
             // Rejected items are not indexed — skip
             if matches!(item.status, crate::roadmap::RoadmapStatus::Rejected) {
                 continue;
@@ -568,7 +568,7 @@ pub(crate) fn route_coverage(
         }
     }
     if buckets.contains(&Bucket::Notes) {
-        for note in state.notes.read().all() {
+        for note in stores.notes.read().all() {
             record_coverage(
                 &router,
                 &mut coverage,
@@ -584,7 +584,7 @@ pub(crate) fn route_coverage(
         }
     }
     if buckets.contains(&Bucket::Threads) {
-        for thread in state.threads.read().all() {
+        for thread in stores.threads.read().all() {
             record_coverage(
                 &router,
                 &mut coverage,
@@ -600,11 +600,11 @@ pub(crate) fn route_coverage(
         }
     }
     if buckets.contains(&Bucket::AgentManifest) {
-        record_agent_manifest_coverage(state, &router, &mut coverage, &mut active_by_route)?;
+        record_agent_manifest_coverage(stores, &router, &mut coverage, &mut active_by_route)?;
     }
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
-        state
+        stores
             .idx
             .read()
             .for_each_embedding_source_doc_for_doc_types(&doc_types, None, |doc| {
@@ -622,12 +622,12 @@ pub(crate) fn route_coverage(
 }
 
 fn record_agent_manifest_coverage(
-    state: &SharedState,
+    stores: &crate::providers::CorpusStores<'_>,
     router: &EmbeddingRouter,
     coverage: &mut BTreeMap<String, RouteCoverage>,
     active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
 ) -> Result<()> {
-    let catalog = state.artifacts.read();
+    let catalog = stores.artifacts.read();
     let entries = catalog.list(&crate::artifacts::ArtifactListParams {
         kind: Some(crate::artifacts::ArtifactKind::Agent),
         name: None,

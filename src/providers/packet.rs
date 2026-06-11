@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct PacketProvider;
 
@@ -27,8 +27,8 @@ impl InspectableEntityProvider for PacketProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("selector".into(), selector.clone());
-        if let Some(state) = ctx.state() {
-            let packet = state.packets.read().load(selector)?;
+        if let Some(stores) = ctx.stores() {
+            let packet = stores.packets.read().load(selector)?;
             properties.insert("id".into(), packet.id);
             properties.insert("domain".into(), packet.domain);
             properties.insert("scope".into(), packet.scope);

@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct AgentProvider;
 
@@ -28,8 +28,8 @@ impl InspectableEntityProvider for AgentProvider {
         let mut properties = BTreeMap::new();
         properties.insert("name".into(), name.clone());
         properties.insert("version".into(), version.to_string());
-        if let Some(state) = ctx.state() {
-            let catalog = state.artifacts.read();
+        if let Some(stores) = ctx.stores() {
+            let catalog = stores.artifacts.read();
             // TODO(phase-4-shadowing): plumb project_id when caller has it to enable local shadowing.
             if let Some(v) = catalog
                 .load_artifact_value(crate::artifacts::ArtifactKind::Agent, name)

@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct WhiteboardProvider;
 
@@ -27,8 +27,8 @@ impl InspectableEntityProvider for WhiteboardProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("board_id".into(), board_id.clone());
-        if let Some(state) = ctx.state() {
-            let board = state
+        if let Some(stores) = ctx.stores() {
+            let board = stores
                 .whiteboards
                 .get(board_id)
                 .ok_or_else(|| anyhow::anyhow!("whiteboard entity {board_id} not found"))?;
@@ -71,8 +71,8 @@ impl InspectableEntityProvider for WhiteboardProvider {
         let EntityRef::Whiteboard { board_id } = r else {
             return None;
         };
-        if let Some(state) = ctx.state() {
-            if let Some(board) = state.whiteboards.get(board_id) {
+        if let Some(stores) = ctx.stores() {
+            if let Some(board) = stores.whiteboards.get(board_id) {
                 return Some(truncate_label(&board.read().topic));
             }
         }

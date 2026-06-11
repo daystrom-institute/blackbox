@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct CommitProvider;
 
@@ -28,8 +28,8 @@ impl InspectableEntityProvider for CommitProvider {
         let mut properties = BTreeMap::new();
         properties.insert("repo_id".into(), repo_id.clone());
         properties.insert("sha".into(), sha.clone());
-        if let Some(state) = ctx.state() {
-            let indexed = state
+        if let Some(stores) = ctx.stores() {
+            let indexed = stores
                 .idx
                 .read()
                 .entity_properties(&r.to_string())?
@@ -80,8 +80,8 @@ impl InspectableEntityProvider for CommitProvider {
             return None;
         };
         let short = sha.chars().take(7).collect::<String>();
-        if let Some(state) = ctx.state() {
-            if let Ok(Some(properties)) = state.idx.read().entity_properties(&r.to_string()) {
+        if let Some(stores) = ctx.stores() {
+            if let Ok(Some(properties)) = stores.idx.read().entity_properties(&r.to_string()) {
                 if let Some(preview) = properties.get("content_preview") {
                     let subject = preview.lines().next().unwrap_or(preview);
                     return Some(truncate_label(format!("{short} {subject}")));

@@ -6,7 +6,7 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, schema,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct RoadmapItemProvider;
 
@@ -26,8 +26,8 @@ impl InspectableEntityProvider for RoadmapItemProvider {
         };
         let mut properties = BTreeMap::new();
         properties.insert("id".into(), id.clone());
-        if let Some(state) = ctx.state() {
-            let rm = state.roadmap.read();
+        if let Some(stores) = ctx.stores() {
+            let rm = stores.roadmap.read();
             if let Some(item) = rm.item(id) {
                 properties.insert("title".into(), item.title.clone());
                 properties.insert("body".into(), item.body.clone());

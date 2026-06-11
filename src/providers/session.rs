@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct SessionProvider;
 
@@ -32,8 +32,8 @@ impl InspectableEntityProvider for SessionProvider {
         let mut properties = BTreeMap::new();
         properties.insert("provider".into(), provider.clone());
         properties.insert("session_id".into(), session_id.clone());
-        if let Some(state) = ctx.state() {
-            let indexed = state
+        if let Some(stores) = ctx.stores() {
+            let indexed = stores
                 .idx
                 .read()
                 .session_properties(provider, session_id)?
@@ -80,8 +80,8 @@ impl InspectableEntityProvider for SessionProvider {
             return None;
         };
         let short = session_id.chars().take(12).collect::<String>();
-        if let Some(state) = ctx.state() {
-            if let Ok(Some(properties)) = state.idx.read().session_properties(provider, session_id)
+        if let Some(stores) = ctx.stores() {
+            if let Ok(Some(properties)) = stores.idx.read().session_properties(provider, session_id)
             {
                 if let Some(prompt) = properties.get("first_user_prompt") {
                     return Some(truncate_label(prompt));

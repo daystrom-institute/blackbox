@@ -432,8 +432,8 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
         return Some(raw.to_lowercase());
     }
     // Try the registry first so symlink aliases collapse to the same id.
-    if let Some(state) = ctx.state() {
-        let projects = state.projects.read().list();
+    if let Some(stores) = ctx.stores() {
+        let projects = stores.projects.read().list();
         let canonical = std::fs::canonicalize(raw).ok()?;
         if let Some(record) = projects.iter().find(|r| r.canonical_path == canonical) {
             return Some(record.project_id.clone());
@@ -467,10 +467,10 @@ fn thread_matches_project_filter(
     target_project_id: &str,
     ctx: &ProviderContext<'_>,
 ) -> bool {
-    let (Some(thread_id), Some(state)) = (thread_id, ctx.state()) else {
+    let (Some(thread_id), Some(stores)) = (thread_id, ctx.stores()) else {
         return true;
     };
-    let threads = state.threads.read();
+    let threads = stores.threads.read();
     let Some(thread) = threads.all().iter().find(|thread| thread.id == thread_id) else {
         return true;
     };
@@ -546,13 +546,13 @@ fn queue_status_for_hybrid(
     ctx: &ProviderContext<'_>,
     doc_type: Option<&str>,
 ) -> crate::embed::queue::EmbedStatusResponse {
-    let Some(state) = ctx.state() else {
+    let Some(stores) = ctx.stores() else {
         return embed_queue::status_response();
     };
     let Some(buckets) = status_buckets_for_doc_type(doc_type) else {
         return embed_queue::status_response();
     };
-    embed_queue::status_response_for_buckets(state, &buckets).unwrap_or_else(|err| {
+    embed_queue::status_response_for_buckets(stores, &buckets).unwrap_or_else(|err| {
         tracing::warn!(error = %err, "embedding coverage status failed; falling back to queue-local status");
         embed_queue::status_response()
     })

@@ -6,7 +6,7 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, empty_neighborhood_view, expected, next_hops, schema, truncate_label,
 };
-use crate::entity_ref::{EntityRef, EntityType};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct ProjectFileProvider;
 pub struct ProjectFileV2Provider;
@@ -194,8 +194,8 @@ fn project_file_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<Entit
     properties.insert("rel_path_hash".into(), rel_path_hash.to_string());
     properties.insert("chunk_hash".into(), chunk_hash.to_string());
     properties.insert("occurrence_idx".into(), occurrence_idx.to_string());
-    if let Some(state) = ctx.state() {
-        let indexed = state
+    if let Some(stores) = ctx.stores() {
+        let indexed = stores
             .idx
             .read()
             .entity_properties(&r.to_string())?
@@ -207,8 +207,8 @@ fn project_file_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<Entit
 
 fn project_file_label(ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
     let (_, snapshot_id, rel_path_hash, _, occurrence_idx) = project_file_parts(r)?;
-    if let Some(state) = ctx.state() {
-        if let Ok(Some(properties)) = state.idx.read().entity_properties(&r.to_string()) {
+    if let Some(stores) = ctx.stores() {
+        if let Ok(Some(properties)) = stores.idx.read().entity_properties(&r.to_string()) {
             if let Some(path) = properties.get("file_path") {
                 return Some(truncate_label(path));
             }
