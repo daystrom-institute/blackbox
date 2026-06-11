@@ -530,6 +530,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-slack"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-stores"
 version = "0.0.1"
 dependencies = [
@@ -725,6 +737,7 @@ dependencies = [
  "bbox-macros",
  "bbox-packets",
  "bbox-refactor",
+ "bbox-slack",
  "bbox-stores",
  "bbox-system-memory",
  "bbox-threads",

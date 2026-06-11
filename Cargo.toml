@@ -39,6 +39,7 @@ members = [
     "crates/bbox-threads",
     "crates/bbox-gaps",
     "crates/bbox-inbox",
+    "crates/bbox-slack",
 ]
 
 [package]
@@ -199,6 +200,7 @@ bbox-knowledge = { path = "crates/bbox-knowledge" }
 bbox-threads = { path = "crates/bbox-threads" }
 bbox-gaps = { path = "crates/bbox-gaps" }
 bbox-inbox = { path = "crates/bbox-inbox" }
+bbox-slack = { path = "crates/bbox-slack" }
 
 [dev-dependencies]
 filetime = "0.2"
