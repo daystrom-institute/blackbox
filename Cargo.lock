@@ -393,6 +393,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-knowledge"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-chunker",
+ "bbox-corpus-core",
+ "bbox-stores",
+ "bbox-util",
+ "chrono",
+ "dirs",
+ "parking_lot",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "strum 0.26.3",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-lsp"
 version = "0.0.1"
 dependencies = [
@@ -637,6 +659,7 @@ dependencies = [
  "bbox-corpus-core",
  "bbox-corpus-index",
  "bbox-edge-sidecar",
+ "bbox-knowledge",
  "bbox-lsp",
  "bbox-macros",
  "bbox-packets",

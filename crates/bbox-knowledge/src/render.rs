@@ -56,7 +56,7 @@ pub fn global_target_path(provider: &str) -> Option<Result<PathBuf>> {
 /// Env override: `BLACKBOX_GLOBAL_COMMON_MD`.
 pub fn global_common_target_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("home directory not found")?;
-    Ok(crate::util::blackbox_global_common_md_path(&home))
+    Ok(bbox_util::util::blackbox_global_common_md_path(&home))
 }
 
 /// A planned managed-region patch. Each variant carries exactly the data
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_apply_patch_preserves_surrounding_content_and_backs_up() {
-        let _env = crate::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let backup_dir = dir.path().join("backups");
         unsafe {
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_empty_render_over_populated_managed_region_is_refused() {
-        let _env = crate::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let backup_dir = root.join("backups");
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_allow_empty_overrides_clobber_guard() {
-        let _env = crate::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let backup_dir = root.join("backups");
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_nonempty_render_still_succeeds() {
-        let _env = crate::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let backup_dir = root.join("backups");

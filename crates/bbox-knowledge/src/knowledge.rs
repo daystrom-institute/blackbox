@@ -9,11 +9,11 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::chunker::EdgeConfidence;
-use crate::entity_ref::EntityRef;
-use crate::store_persister::StoreSnapshot;
+use bbox_chunker::EdgeConfidence;
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_stores::store_persister::StoreSnapshot;
 
-use crate::query::{QueryAtom, QueryNode, parse_query};
+use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -742,7 +742,7 @@ fn persist_repo_kb_stats(
     if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
         return Ok(());
     }
-    crate::json_store::atomic_write_json_locked(&path, stats)
+    bbox_corpus_core::json_store::atomic_write_json_locked(&path, stats)
 }
 
 /// A project is "repo-owned" once its `.bbox/knowledge/` directory exists —
@@ -910,7 +910,7 @@ fn persist_repo_kb_entries(
         if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
             continue;
         }
-        crate::json_store::atomic_write_json_locked(&path, &on_disk)?;
+        bbox_corpus_core::json_store::atomic_write_json_locked(&path, &on_disk)?;
     }
     persist_repo_kb_stats(project_dir, &stats)?;
     Ok(())
@@ -1024,7 +1024,7 @@ impl Knowledge {
     #[cfg(test)]
     fn save(&self) -> Result<()> {
         let central = self.central_snapshot();
-        crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
+        bbox_corpus_core::json_store::atomic_write_json_locked(&self.store_path, &central)?;
         self.persist_repo_owned_entries()
     }
 
@@ -1067,7 +1067,7 @@ impl Knowledge {
     }
 
     fn now_iso() -> String {
-        crate::util::now_iso()
+        bbox_util::util::now_iso()
     }
 
     fn gen_id() -> String {
@@ -1231,7 +1231,7 @@ impl Knowledge {
             return None;
         }
         let path = repo_kb_dir(project_dir).join(format!("{id}.json"));
-        Some(crate::util::repo_artifact_rider(dir, &path))
+        Some(bbox_util::util::repo_artifact_rider(dir, &path))
     }
 
     fn learn_result_locked(
@@ -2670,7 +2670,7 @@ impl Knowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_persister::StorePersister;
+    use bbox_stores::store_persister::StorePersister;
     use parking_lot::RwLock;
     use std::sync::Arc;
 
@@ -2962,7 +2962,7 @@ mod tests {
 
     #[test]
     fn absorb_global_extracts_only_managed_region() {
-        let _env = crate::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         let _env_guard = global_env_lock();
         let (_t, mut kb) = mk_kb();
         // Stand up a fake claude global memory file. Use the env override
@@ -3119,7 +3119,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
     #[test]
     fn absorb_global_no_managed_region_is_noop() {
-        let _env = crate::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         let _env_guard = global_env_lock();
         let (_t, mut kb) = mk_kb();
         let tmpdir = tempfile::tempdir().unwrap();

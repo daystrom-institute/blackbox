@@ -57,7 +57,7 @@ mod index;
 // `json_store` extracted into bbox-corpus-core; aliased back to
 // `crate::json_store` so existing call sites resolve unchanged.
 pub use bbox_corpus_core::json_store;
-mod knowledge;
+use bbox_knowledge::knowledge;
 // `lsp` extracted into bbox-lsp (stage 2); aliased back to `crate::lsp`.
 use bbox_lsp as lsp;
 // `macros` extracted into bbox-macros (stage 5); aliased back to
@@ -82,13 +82,13 @@ use bbox_stores::pins;
 mod pollers;
 mod projects;
 mod providers;
-// `query`, `search` (rrf/rerank), and `template` extracted into
-// bbox-corpus-core; aliased back so existing call sites resolve unchanged.
-use bbox_corpus_core::query;
+// `search` (rrf/rerank) and `template` extracted into bbox-corpus-core;
+// aliased back so existing call sites resolve unchanged. (`query` callers
+// now use bbox_corpus_core::query directly.)
 // `refactor` extracted into bbox-refactor (stage 3); aliased back to
 // `crate::refactor` so existing call sites resolve unchanged.
 use bbox_refactor as refactor;
-pub mod render;
+pub use bbox_knowledge::render;
 use bbox_stores::roadmap;
 mod routing;
 use bbox_corpus_core::search;
