@@ -24,3 +24,4 @@ bbox-threads = { path = "../bbox-threads" }
 
 [dev-dependencies]
 filetime = "0.2"
+tantivy = "0.22"

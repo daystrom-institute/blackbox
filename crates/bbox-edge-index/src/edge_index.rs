@@ -77,9 +77,7 @@ impl EdgeIndex {
         index.project_task_edges(&stores.session_brofile_rows, &mut seen);
         index.project_roadmap_edges(stores.roadmap, &mut seen);
         if stores.include_tantivy_projection {
-            if let Ok(docs) = stores.index.edge_projection_docs() {
-                index.project_tantivy_edges(&docs, &mut seen);
-            }
+            index.project_tantivy_edges(stores.index, &mut seen);
         } else {
             tracing::debug!("rebuilt EdgeIndex without Tantivy stored-doc projection");
         }
@@ -521,9 +519,14 @@ impl EdgeIndex {
         }
     }
 
-    fn project_tantivy_edges(&mut self, docs: &[EdgeProjectionDoc], seen: &mut HashSet<EdgeKey>) {
-        let mut by_file: HashMap<String, Vec<&EdgeProjectionDoc>> = HashMap::new();
-        for doc in docs {
+    fn project_tantivy_edges(&mut self, index: &TranscriptIndex, seen: &mut HashSet<EdgeKey>) {
+        // Docs stream off the segment doc stores one at a time
+        // (for_each_edge_projection_doc): transcript docs project straight to
+        // IN_SESSION edges and are dropped, so only project_file chunks are
+        // buffered — the IN_FILE target (chunk[0] as file proxy) isn't known
+        // until every chunk of a file has been seen.
+        let mut by_file: HashMap<String, Vec<EdgeProjectionDoc>> = HashMap::new();
+        let streamed = index.for_each_edge_projection_doc(|doc| {
             if doc.doc_type == "transcript" && !doc.session_id.is_empty() {
                 self.insert(
                     exact_edge(
@@ -536,8 +539,8 @@ impl EdgeIndex {
                         },
                         "IN_SESSION",
                         EntityRef::Session {
-                            provider: doc.account.clone(),
-                            session_id: doc.session_id.clone(),
+                            provider: doc.account,
+                            session_id: doc.session_id,
                         },
                         EdgeProvenance::Derived,
                     ),
@@ -546,6 +549,16 @@ impl EdgeIndex {
             } else if doc.doc_type == "project_file" {
                 by_file.entry(doc.file_path.clone()).or_default().push(doc);
             }
+            Ok(())
+        });
+        if let Err(err) = streamed {
+            // Don't project IN_FILE edges from a partial buffer: a file whose
+            // chunk[0] was never streamed would get the wrong file proxy.
+            tracing::warn!(
+                error = %err,
+                "tantivy edge projection failed mid-stream; skipping stored-doc file edges"
+            );
+            return;
         }
 
         for (_path, mut chunks) in by_file {
@@ -833,6 +846,71 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn tantivy_projection_streams_session_and_file_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+
+        let mut transcript = tantivy::TantivyDocument::new();
+        transcript.add_text(fields.doc_type, "transcript");
+        transcript.add_text(fields.account, "claude");
+        transcript.add_text(fields.session_id, "sess-1");
+        transcript.add_u64(fields.byte_offset, 7);
+        writer.add_document(transcript).unwrap();
+
+        for idx in 0..3u32 {
+            let mut chunk = tantivy::TantivyDocument::new();
+            chunk.add_text(fields.doc_type, "project_file");
+            chunk.add_text(fields.file_path, "src/lib.rs");
+            chunk.add_text(
+                fields.entity_id,
+                format!("project_file:proj1:relhash:chunk{idx}:{idx}"),
+            );
+            writer.add_document(chunk).unwrap();
+        }
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let mut edge_index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        edge_index.project_tantivy_edges(&index, &mut seen);
+
+        let session = EntityRef::Session {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+        };
+        assert_eq!(
+            edge_index
+                .reverse_edges_filtered(&session, &["IN_SESSION"])
+                .len(),
+            1
+        );
+
+        let file_target = EntityRef::parse("project_file:proj1:relhash:chunk0:0").unwrap();
+        assert_eq!(
+            edge_index
+                .reverse_edges_filtered(&file_target, &["IN_FILE"])
+                .len(),
+            2,
+            "chunk[1] and chunk[2] point at the chunk[0] file proxy"
+        );
+        assert!(
+            edge_index.forward_edges(&file_target).is_empty(),
+            "chunk[0] -> chunk[0] self-loop must be skipped"
+        );
+    }
 
     #[test]
     fn forward_and_reverse_lookup_are_indexed() {

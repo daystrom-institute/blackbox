@@ -329,38 +329,36 @@ impl TranscriptIndex {
         self.reader.searcher().num_docs()
     }
 
-    pub fn edge_projection_docs(&self) -> Result<Vec<EdgeProjectionDoc>> {
+    /// Stream every doc's edge-projection fields through `f`, walking each
+    /// segment's doc store in storage order (sequential block decompression,
+    /// deleted docs skipped via the alive bitset). One decompressed block and
+    /// one projected doc are live at a time, so memory stays flat regardless
+    /// of corpus size — unlike the previous AllQuery + TopDocs::with_limit
+    /// implementation, which built an O(N) score heap and materialized every
+    /// doc into a single Vec.
+    pub fn for_each_edge_projection_doc<F>(&self, mut f: F) -> Result<usize>
+    where
+        F: FnMut(EdgeProjectionDoc) -> Result<()>,
+    {
         let searcher = self.reader.searcher();
-        let limit = searcher.num_docs() as usize;
-        if limit > 100_000 {
-            tracing::warn!(
-                doc_count = limit,
-                "EdgeIndex projection is materializing all index docs at startup"
-            );
+        let mut emitted = 0usize;
+        for segment_reader in searcher.segment_readers() {
+            // Sequential scan never revisits a block; the minimum cache works.
+            let store_reader = segment_reader.get_store_reader(1)?;
+            for doc in store_reader.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
+                let doc = doc?;
+                f(EdgeProjectionDoc {
+                    doc_type: first_text(&doc, self.fields.doc_type),
+                    account: first_text(&doc, self.fields.account),
+                    session_id: first_text(&doc, self.fields.session_id),
+                    byte_offset: first_u64(&doc, self.fields.byte_offset),
+                    file_path: first_text(&doc, self.fields.file_path),
+                    entity_id: optional_text(&doc, self.fields.entity_id),
+                })?;
+                emitted += 1;
+            }
         }
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        // NOTE: AllQuery + TopDocs::with_limit materializes every doc into memory at once.
-        // Acceptable at <50k doc scale (current corpus); refactor to streaming/segment
-        // iteration before this crosses ~100k.
-        let top_docs = searcher.search(
-            &tantivy::query::AllQuery,
-            &tantivy::collector::TopDocs::with_limit(limit),
-        )?;
-        let mut docs = Vec::with_capacity(top_docs.len());
-        for (_score, addr) in top_docs {
-            let doc: TantivyDocument = searcher.doc(addr)?;
-            docs.push(EdgeProjectionDoc {
-                doc_type: first_text(&doc, self.fields.doc_type),
-                account: first_text(&doc, self.fields.account),
-                session_id: first_text(&doc, self.fields.session_id),
-                byte_offset: first_u64(&doc, self.fields.byte_offset),
-                file_path: first_text(&doc, self.fields.file_path),
-                entity_id: optional_text(&doc, self.fields.entity_id),
-            });
-        }
-        Ok(docs)
+        Ok(emitted)
     }
 
     pub fn embedding_source_docs_for_doc_types(
@@ -762,6 +760,98 @@ mod tests {
         assert!(!index_path.join("stale-file").exists());
         let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
         assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn for_each_edge_projection_doc_streams_all_segments_and_skips_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+
+        // Segment 1: a transcript doc.
+        let mut transcript = TantivyDocument::new();
+        transcript.add_text(fields.doc_type, "transcript");
+        transcript.add_text(fields.account, "claude");
+        transcript.add_text(fields.session_id, "sess-1");
+        transcript.add_u64(fields.byte_offset, 42);
+        writer.add_document(transcript).unwrap();
+        writer.commit().unwrap();
+
+        // Segment 2: a project_file chunk plus a doc that gets deleted, so the
+        // iterator must both cross segment boundaries and honor the alive bitset.
+        let mut chunk = TantivyDocument::new();
+        chunk.add_text(fields.doc_type, "project_file");
+        chunk.add_text(fields.file_path, "src/lib.rs");
+        chunk.add_text(fields.entity_id, "pfile:proj1234:src/lib.rs:0");
+        writer.add_document(chunk).unwrap();
+        let mut deleted = TantivyDocument::new();
+        deleted.add_text(fields.doc_type, "transcript");
+        deleted.add_text(fields.session_id, "sess-deleted");
+        writer.add_document(deleted).unwrap();
+        writer.commit().unwrap();
+        writer.delete_term(Term::from_field_text(fields.session_id, "sess-deleted"));
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let mut docs = Vec::new();
+        let emitted = index
+            .for_each_edge_projection_doc(|doc| {
+                docs.push(doc);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(emitted, 2);
+        assert_eq!(docs.len(), 2);
+        docs.sort_by(|a, b| a.doc_type.cmp(&b.doc_type));
+        assert_eq!(docs[0].doc_type, "project_file");
+        assert_eq!(docs[0].file_path, "src/lib.rs");
+        assert_eq!(docs[0].entity_id.as_deref(), Some("pfile:proj1234:src/lib.rs:0"));
+        assert_eq!(docs[1].doc_type, "transcript");
+        assert_eq!(docs[1].account, "claude");
+        assert_eq!(docs[1].session_id, "sess-1");
+        assert_eq!(docs[1].byte_offset, 42);
+        assert!(
+            !docs.iter().any(|d| d.session_id == "sess-deleted"),
+            "deleted doc must be skipped via the alive bitset"
+        );
+    }
+
+    #[test]
+    fn for_each_edge_projection_doc_callback_error_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        let mut doc = TantivyDocument::new();
+        doc.add_text(fields.doc_type, "transcript");
+        doc.add_text(fields.session_id, "sess-1");
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let result =
+            index.for_each_edge_projection_doc(|_| anyhow::bail!("stop"));
+        assert!(result.is_err());
     }
 
     #[test]
