@@ -9,8 +9,7 @@ The crate is `blackbox` (`Cargo.toml`). Binary entry points:
 
 - `blackboxd` (`src/main.rs`) - daemon entry point; real startup lives in
   `blackbox::server::run()`.
-- `bro` (`src/cli.rs`) - terminal client for tailing orchestration, workflows,
-  and councils.
+- `bro` (`src/cli.rs`) - terminal client for tailing orchestration and workflows.
 - `bro-irc` (`src/irc_bridge.rs`) - IRC bridge sidecar.
 - `bro-slack` (`src/slack_bridge.rs`) - Slack Socket Mode bridge sidecar.
 
@@ -113,7 +112,7 @@ help an agent choose the right validation.
 `blackboxd` is a single long-lived user service, not a per-session stdio child.
 It listens on `127.0.0.1:${BBOX_PORT:-7264}/mcp` by default and also serves
 operator HTTP routes such as `/tail`, `/roster`, `/orchestrate`, `/webhook`,
-`/control/*`, `/admin/*`, and `/council/*`. `/control/*` is the neutral
+`/control/*`, and `/admin/*`. `/control/*` is the neutral
 orchestration control plane (thin HTTP adapters over the `bro_*` dispatch/control
 tools) shared by every external driver — the bro-irc sidecar and the fleet
 client both depend on it. `/irc/*` is retained as a back-compat alias for the
@@ -263,7 +262,7 @@ or system memories and link/pointer from here.
 - `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md`,
   `docs/rule-packets.md` - orchestration and event routing.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
-  `docs/councils-whiteboards.md` - agentic coordination surfaces.
+  `docs/whiteboards.md` - agentic coordination surfaces.
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
 - `research/research-corpus.md` - map for the research corpus: a point-in-time,
   evidence-graded study of the external problem space (reference harnesses,

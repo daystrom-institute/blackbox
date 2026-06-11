@@ -8,6 +8,14 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Removed
+
+- Councils feature removed (`bro_council_list`, `bro_council_open`,
+  `bro_council_posts` MCP tools; `/council/*` HTTP routes; `bro council` CLI;
+  `CouncilPosted` / `CouncilMention` system event kinds; `src/council/` store
+  and drain machinery). Orphaned state at `$STORE_DIR/councils/` is left on
+  disk and can be deleted manually.
+
 ### Added
 
 - `extract_rust_crate` refactor compound (gap-fe4dd97f): peel leaf root

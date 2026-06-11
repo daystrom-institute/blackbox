@@ -1696,9 +1696,9 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
     // first frame, before any tail event drives handle_tail.
     app.refresh_daemon_build_health();
 
-    // Forward roster-change/status signals into the sync TUI loop (mirrors
-    // council_tui's SSE fan-in). State is derived by reading the in-memory
-    // daemon roster projection each tick; signals wake redraws.
+    // Forward roster-change/status signals into the sync TUI loop.
+    // State is derived by reading the in-memory daemon roster projection
+    // each tick; signals wake redraws.
     let (tx, rx) = mpsc::channel::<TailEvent>();
     let mut sub = orch.subscribe();
     let forward = tokio::spawn(async move {

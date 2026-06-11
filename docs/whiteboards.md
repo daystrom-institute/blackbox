@@ -1,15 +1,10 @@
-# Councils & Whiteboards
+# Whiteboards
 
-Structured deliberation tools for multi-agent reasoning. Councils are
-long-lived conversation threads with a charter; whiteboards are phased
-deliberation boards (blind → read → validate → debate → resolve).
+Structured deliberation tool for multi-agent reasoning. A whiteboard collects
+structured posts from registered agents through a fixed phase sequence. Each
+phase gates what agents can see and do.
 
-## Whiteboards
-
-A whiteboard collects structured posts from registered agents through a
-fixed phase sequence. Each phase gates what agents can see and do.
-
-### Phase sequence
+## Phase sequence
 
 ```
 blind ──► read ──► validate ──► debate ──► resolve ──► archived
@@ -24,7 +19,7 @@ blind ──► read ──► validate ──► debate ──► resolve ─�
 | **resolve** | Post resolutions; archive the board | Full board visible |
 | **archived** | Read-only | Board moved to archive |
 
-### Opening a board
+## Opening a board
 
 ```json
 whiteboard_open(
@@ -34,7 +29,7 @@ whiteboard_open(
 )
 ```
 
-### Registering agents
+## Registering agents
 
 Agents must register before they can post, annotate, or vote:
 
@@ -55,7 +50,7 @@ Roles:
 | `facilitator` | Transition phases + post + annotate + vote |
 | `operator` | Same as facilitator (convention: human / external joiner) |
 
-### Posting
+## Posting
 
 During the blind phase, each agent posts independently:
 
@@ -81,7 +76,7 @@ Optional structured fields enable conflict detection downstream:
 | `finding_refs` | References to shared findings |
 | `cascade_targets` | Files that would be impacted |
 
-### Annotating
+## Annotating
 
 ```json
 // Validation (validate phase only)
@@ -104,7 +99,7 @@ whiteboard_annotate(
 )
 ```
 
-### Voting
+## Voting
 
 During the debate phase, each agent casts one vote per post:
 
@@ -120,7 +115,7 @@ whiteboard_vote(
 
 Votes: `accept`, `reject`, `defer`.
 
-### Transitioning phases
+## Transitioning phases
 
 Only facilitators and operators can advance the board:
 
@@ -132,7 +127,7 @@ whiteboard_transition(
 )
 ```
 
-### Conflict detection
+## Conflict detection
 
 ```json
 whiteboard_conflicts(
@@ -146,7 +141,7 @@ Returns three kinds:
 - `cascade_collision` - post A cascades to post B's direct target
 - `severity_disagreement` - same finding_ref, distinct severities
 
-### Inspecting state
+## Inspecting state
 
 ```json
 // Full state (filtered for the requesting agent's visibility)
@@ -156,45 +151,18 @@ whiteboard_state(board_id = "adr-2026-05-07", agent_name = "mkdocs-advocate")
 whiteboard_summarize(board_id = "adr-2026-05-07", agent_name = "facilitator-claude")
 ```
 
-### Archiving
+## Archiving
 
 ```json
 whiteboard_archive(board_id = "adr-2026-05-07", agent_name = "facilitator-claude")
 ```
 
-## Councils
-
-Councils are long-lived conversation threads between multiple agents.
-Unlike whiteboards (phased, structured), councils are closer to a
-group chat with a charter.
-
-### Opening a council
-
-```json
-bro_council_open(id = "council-7f01324e")
-```
-
-### Listing active councils
-
-```json
-bro_council_list()
-bro_council_list(project = "/path/to/repo")
-```
-
-### Reading posts
-
-```json
-bro_council_posts(id = "council-7f01324e", since_seq = 0, limit = 100)
-```
-
 ## Integration with workflows
 
-Both councils and whiteboards integrate into the workflow engine:
+Whiteboards integrate into the workflow engine:
 
 - **Whiteboard nodes** - workflow nodes can open boards, register agents,
   wait for transitions, and collect results
-- **Council posts** - workflow nodes can post to councils as part of
-  their execution
 - **Board-transitioned signals** - when a facilitator transitions a
   whiteboard phase, a `board-transitioned` signal fires correlated to
   `(board_id, target_phase)`. Any `Wait` node observing that board
@@ -215,12 +183,11 @@ Both councils and whiteboards integrate into the workflow engine:
 10. PostOutcome - dispatch the accepted proposal
 ```
 
-## When to use which
+## When to use whiteboards
 
 | Situation | Tool |
 |---|---|
 | Multiple agents need to independently propose + critique | Whiteboard |
 | Structured ADR (architecture decision record) | Whiteboard |
-| Ongoing multi-agent chat with a charter | Council |
 | One agent needs to deliberate with itself across turns | Neither - use `bbox_thread` |
 | Simple yes/no from one agent | Neither - just `bro exec` |

@@ -20,7 +20,7 @@ use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::tools::bro_runtime_params::*;
 use crate::{
-    artifacts, council, crons, edge_index, path_cache, pollers, slack_channel_bindings,
+    artifacts, crons, edge_index, path_cache, pollers, slack_channel_bindings,
     slack_proposal_links, slack_thread_store, system_events, webhooks, whiteboards, workflow,
 };
 use tokio::sync::broadcast;
@@ -108,7 +108,6 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             WEBHOOK_LOG_CAP,
         )),
         arc_cancel_tokens: RwLock::new(HashMap::new()),
-        councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         agent_adapter_registry: Arc::new(RwLock::new(
             orchestration::agents::adapter::AgentAdapterRegistry::new(),

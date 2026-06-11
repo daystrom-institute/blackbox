@@ -18,7 +18,7 @@ use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, config, council, crons, edge_index, index, lsp, orchestration, path_cache, pollers,
+    artifacts, config, crons, edge_index, index, lsp, orchestration, path_cache, pollers,
     slack_channel_bindings, slack_proposal_links, slack_thread_store, system_events, system_memory,
     tool_docs, vectors, webhooks, whiteboards,
 };
@@ -270,7 +270,6 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
             WEBHOOK_LOG_CAP,
         )),
         arc_cancel_tokens: RwLock::new(HashMap::new()),
-        councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         agent_adapter_registry,
         badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),

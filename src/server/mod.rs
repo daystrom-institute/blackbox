@@ -52,7 +52,6 @@ impl BlackboxServer {
                 + crate::tools::agents::router()
                 + crate::tools::atoms::router()
                 + crate::tools::orchestrate::router()
-                + crate::tools::councils::router()
                 + crate::tools::roster::router()
                 + crate::tools::config::router()
                 + crate::tools::dispatch::router()

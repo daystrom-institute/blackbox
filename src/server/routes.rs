@@ -2114,7 +2114,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|team| team.project_dir.as_deref() == Some(project))
         .count();
-    let councils = state.councils.list_summaries(Some(project)).len();
     let whiteboards = state
         .whiteboards
         .list_ids()
@@ -2148,7 +2147,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
-        "councils": councils,
         "whiteboards": whiteboards,
         "pollers": pollers,
         "crons": crons,
@@ -2248,9 +2246,6 @@ pub(crate) fn migrate_project_refs(
         .rename_project_refs(old_project, new_project)?;
     let teams =
         orchestration::team::rename_project_refs(&state.store_dir, old_project, new_project);
-    let councils = state
-        .councils
-        .rename_project_refs(old_project, new_project)?;
     let whiteboards = state
         .whiteboards
         .rename_project_refs(old_project, new_project)?;
@@ -2280,7 +2275,6 @@ pub(crate) fn migrate_project_refs(
         "slack_channel_bindings": slack_channel_bindings,
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
-        "councils": councils,
         "whiteboards": whiteboards,
         "pollers": poller_count,
         "crons": cron_count,

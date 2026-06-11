@@ -23,7 +23,7 @@ use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, council, crons, edge_index, lsp, path_cache, pollers, slack_channel_bindings,
+    artifacts, crons, edge_index, lsp, path_cache, pollers, slack_channel_bindings,
     slack_proposal_links, slack_thread_store, system_events, webhooks, whiteboards, workflow,
 };
 
@@ -154,11 +154,6 @@ pub(crate) struct SharedState {
     /// (via `tokio::select!`), bails out with status `cancelled`, and
     /// runs `on_arc_cancel` + `on_arc_exit` hooks on the way out.
     pub(crate) arc_cancel_tokens: RwLock<HashMap<String, CancellationToken>>,
-    /// Multi-peer chat councils — TUI-driven deliberation surface.
-    /// One drain worker per (council × bro) serializes resumes for
-    /// that bro; daemon-wide collisions on the same provider session
-    /// are prevented via `resume_leases`.
-    pub(crate) councils: council::SharedRegistry,
     /// Daemon-wide resume lease registry keyed `(provider, session_id)`.
     /// All resume paths must acquire this before spawning a provider
     /// resume process and hold it until the task reaches a terminal
@@ -460,7 +455,6 @@ impl SharedState {
             signal_log: RwLock::new(VecDeque::with_capacity(SIGNAL_LOG_CAP)),
             webhook_delivery_log: RwLock::new(VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
             arc_cancel_tokens: RwLock::new(HashMap::new()),
-            councils: Arc::new(council::CouncilRegistry::new()),
             resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
             agent_adapter_registry: Arc::new(RwLock::new(
                 orchestration::agents::adapter::AgentAdapterRegistry::new(),

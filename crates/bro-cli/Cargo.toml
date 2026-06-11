@@ -1,4 +1,4 @@
-# The `bro` terminal client (fleet cockpit, tail, council TUI).
+# The `bro` terminal client (fleet cockpit, tail).
 #
 # §7 thin-client extraction COMPLETE (harness-daemon-boundary.md §7): the `bro`
 # binary no longer depends on the `blackbox` daemon crate. It links the fleet

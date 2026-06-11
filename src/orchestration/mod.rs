@@ -954,9 +954,7 @@ impl Task {
 
     /// PID of the spawned provider child while the task is running.
     /// `None` once the process has exited or `cancel_task` has taken
-    /// the handle. Council uses this to poll for actual child exit
-    /// after a SIGTERM, so the resume lease can be held until the
-    /// session jsonl writer is truly gone.
+    /// the handle.
     pub fn child_pid(&self) -> Option<u32> {
         *self.child_id.lock()
     }
@@ -2135,8 +2133,8 @@ fn failed_duplicate_task(
 /// dashboards, persistence, and tail subscribers can observe it.
 ///
 /// `origin` (Slice 1b) is propagated so the daemon-internal harness
-/// tasks (workflow executor / atom / council drain) carry the same
-/// origin label as the spawn site that called them.
+/// tasks (workflow executor / atom) carry the same origin label as
+/// the spawn site that called them.
 pub fn spawn_in_process_task(
     task_id: String,
     provider: Provider,

@@ -749,7 +749,6 @@ mod tests {
             "mcp__blackbox__bro_webhook_list",
             "mcp__blackbox__bro_poller_list",
             "mcp__blackbox__bro_signals",
-            "mcp__blackbox__bro_council_list",
             "mcp__blackbox__whiteboard_open",
             "mcp__blackbox__work_bash",
             "mcp__blackbox__system_event_list",

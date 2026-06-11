@@ -35,7 +35,6 @@ pub enum ToolCategory {
     Orchestration,
     Workflows,
     Whiteboards,
-    Councils,
     Roadmap,
     StorageHealth,
     Workspace,
@@ -59,7 +58,6 @@ impl ToolCategory {
             Self::Orchestration => "Bro orchestration",
             Self::Workflows => "Workflow orchestration",
             Self::Whiteboards => "Whiteboards",
-            Self::Councils => "Councils",
             Self::Roadmap => "Roadmap",
             Self::StorageHealth => "Storage health",
             Self::Workspace => "Workspace tools",
@@ -107,9 +105,6 @@ impl ToolCategory {
             Self::Whiteboards => {
                 "Multi-agent deliberation surface. Posts (proposals / claims / concerns / informational), annotations (challenge / corroborate / resolve / validation), and votes accumulate on a board, advanced through phases (blind → read → validate → debate → resolve → archived) by a facilitator-or-operator role. Three audiences share one surface: in-workflow ensemble specialists (their structured outputs auto-post when the node has a `board:` field), in-workflow facilitators (single bro, drives transitions), and external agents — operator's Claude session, dispatched help, eventually humans through slack / ntfy adapters — that read state via `whiteboard_state` and act via `whiteboard_post` / `whiteboard_vote` / `whiteboard_transition`. Phase transitions emit `board-transitioned` signals through the same `dispatch_routed_event` pipeline webhooks use; arcs `wait_for_phase` to resume when the board advances. Replaces phaser as a peer external MCP server."
             }
-            Self::Councils => {
-                "Multi-peer chat councils — TUI-driven conversational coordination over a team. Read-only MCP surface for external observers; the human-facing CRUD lives in the `bro council` CLI. Distinct from whiteboards: a council is a chat log (turns, @-mentions, riffing), not a structured decision artifact. If a deliberation produces a claim worth durable record, post it to a whiteboard separately. Councils compose with whiteboards; they do not replace them."
-            }
             Self::Roadmap => {
                 "Operator-directed prospective work tracker: designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Roadmap interactions are performed only at the express direction of the operator; never use the roadmap to defer, postpone, or avoid requested implementation work. Inbox is reactive; threads are active work; knowledge is atemporal. Use `action=\"next\"` to rank accepted items, and `action=\"promote\"` to spin a roadmap item into a work thread."
             }
@@ -151,7 +146,6 @@ const HOT_RENDER_CATEGORIES: &[ToolCategory] = &[
     ToolCategory::Orchestration,
     ToolCategory::Workflows,
     ToolCategory::Whiteboards,
-    ToolCategory::Councils,
     ToolCategory::Roadmap,
 ];
 
@@ -349,7 +343,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_rename",
         category: ToolCategory::Projects,
-        summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, councils, whiteboards, pollers, and crons, then reindexes project files.",
+        summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files.",
         when_to_use: "Use after renaming a repo directory, or with `move_on_disk=true` to let bbox move the directory first. Prefer `dry_run=true` before changing several project names so the affected state counts are visible.",
         example: Some(
             r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#,
@@ -372,7 +366,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_unregister",
         category: ToolCategory::Projects,
-        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, councils, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry.",
+        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry.",
         when_to_use: "Use to drop a stale or accidentally-registered project root without hand-editing projects.json. Prefer `dry_run=true` first to see what is still attached, then `bbox_project_rename` to migrate or `force=true` to accept orphaning.",
         example: Some(
             r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,
@@ -1466,28 +1460,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Archive the board. Resolve phase only. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics.",
         when_to_use: "Use after the deliberation completes and any synthesis artifact (ADR markdown, PR body, etc.) has been produced. Archived boards stay readable on disk for audit but no longer count toward inbox attention.",
         example: Some(r#"whiteboard_archive(board_id="adr-2026-04-27", agent_name="facilitator")"#),
-    },
-    // ── Councils ──────────────────────────────────────────────────
-    ToolDoc {
-        name: "bro_council_list",
-        category: ToolCategory::Councils,
-        summary: "List active and closed councils. Optional `project` filter narrows by project_dir.",
-        when_to_use: "Use to find a council before reading its transcript. A council is a multi-peer chat surface — distinct from a whiteboard, which is structured deliberation. Use councils for live conversational coordination; use whiteboards for decision artifacts.",
-        example: Some(r#"bro_council_list(project="/repo/x")"#),
-    },
-    ToolDoc {
-        name: "bro_council_open",
-        category: ToolCategory::Councils,
-        summary: "Read full council state: metadata, charter, posts, and current envelope status.",
-        when_to_use: "Use when an external agent is directed to observe a council deliberation. Returns the full transcript plus drain-state envelopes so you can tell which bros are mid-turn and which have responded.",
-        example: Some(r#"bro_council_open(id="council-7f01324e")"#),
-    },
-    ToolDoc {
-        name: "bro_council_posts",
-        category: ToolCategory::Councils,
-        summary: "Paginated council transcript. `since_seq` returns posts with sequence > since_seq; `limit` caps response (default 100, max 1000).",
-        when_to_use: "Use to follow a council incrementally — call with the last seen sequence to fetch only new posts. Cheaper than `bro_council_open` for long-running observation.",
-        example: Some(r#"bro_council_posts(id="council-7f01324e", since_seq=42, limit=50)"#),
     },
     // ── Workspace tools ──────────────────────────────────────────────
     ToolDoc {

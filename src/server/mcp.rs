@@ -4,7 +4,7 @@ use crate::server::tail::{
     tail_handler,
 };
 use crate::server::{BlackboxServer, SharedState};
-use crate::{config, council};
+use crate::config;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -192,22 +192,6 @@ pub(super) fn build_http_app(
             axum::routing::post(admin_brofile_upsert),
         )
         .route("/admin/team/upsert", axum::routing::post(admin_team_upsert))
-        .route(
-            "/council",
-            axum::routing::post(council::http::create).get(council::http::list),
-        )
-        .route(
-            "/council/{id}",
-            axum::routing::get(council::http::open).delete(council::http::close),
-        )
-        .route(
-            "/council/{id}/post",
-            axum::routing::post(council::http::post),
-        )
-        .route(
-            "/council/{id}/tail",
-            axum::routing::get(council::http::tail),
-        )
         .with_state(shared)
         .nest_service("/mcp", mcp_service)
 }

@@ -35,7 +35,6 @@ mod badgey_eval_check;
 use bbox_chunker as chunker;
 pub mod code_nav;
 pub mod config;
-mod council;
 mod crons;
 pub mod dispatch_mcp;
 mod edge_index;

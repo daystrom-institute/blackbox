@@ -103,8 +103,7 @@ pub fn bro_home() -> PathBuf {
     state_dir(&cfg).join("bro")
 }
 
-/// The daemon port from `[daemon].port`, else 7264. Used by the council TUI to
-/// resolve the local daemon base URL.
+/// The daemon port from `[daemon].port`, else 7264.
 pub fn daemon_port() -> u16 {
     load_partial().daemon.port.unwrap_or(7264)
 }

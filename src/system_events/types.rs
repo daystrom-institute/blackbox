@@ -69,8 +69,6 @@ known_kinds! {
     CoordinationAuditCommentRequested => "coordination.audit_comment.requested",
     WhiteboardPhaseChanged => "whiteboard.phase_changed",
     WhiteboardVoteRecorded => "whiteboard.vote_recorded",
-    CouncilPosted => "council.posted",
-    CouncilMention => "council.mention",
 }
 
 impl Serialize for SystemEventKind {
@@ -416,8 +414,6 @@ mod tests {
             SystemEventKind::CoordinationAuditCommentRequested,
             SystemEventKind::WhiteboardPhaseChanged,
             SystemEventKind::WhiteboardVoteRecorded,
-            SystemEventKind::CouncilPosted,
-            SystemEventKind::CouncilMention,
         ];
         for kind in &kinds {
             let json = serde_json::to_string(kind).unwrap();

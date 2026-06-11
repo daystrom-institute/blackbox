@@ -481,33 +481,6 @@ pub(crate) struct DashboardParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CouncilListParams {
-    /// Filter to councils whose `project` matches this exact path.
-    #[serde(default)]
-    pub(crate) project: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CouncilOpenParams {
-    /// Council ID (e.g. `council-7f01324e`).
-    pub(crate) id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CouncilPostsParams {
-    pub(crate) id: String,
-    /// Return only posts with `sequence > since_seq`. Default 0 (all).
-    #[serde(default)]
-    pub(crate) since_seq: Option<u64>,
-    /// Cap the response (default 100, max 1000).
-    #[serde(default)]
-    pub(crate) limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct CancelParams {
     /// Task ID to cancel
     pub(crate) task_id: String,

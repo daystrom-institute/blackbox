@@ -8,7 +8,6 @@ pub(super) async fn restore_runtime_state(shared: &Arc<SharedState>) {
     restore_pollers(shared);
     restore_crons(shared);
     restore_whiteboards(shared);
-    restore_councils(shared);
     restore_workflows(shared);
     restore_catalog_runtime_artifacts(shared);
     restore_reactions(shared).await;
@@ -80,21 +79,6 @@ fn restore_whiteboards(shared: &Arc<SharedState>) {
         if restored > 0 {
             tracing::info!("restored {restored} active whiteboard(s)");
         }
-    }
-}
-
-fn restore_councils(shared: &Arc<SharedState>) {
-    let council_dir = shared.store_dir.join("councils");
-    if let Err(e) = shared.councils.set_storage_dir(council_dir) {
-        tracing::warn!("council storage init failed: {e}");
-    } else {
-        let restored = shared.councils.list_ids().len();
-        if restored > 0 {
-            tracing::info!("restored {restored} council(s)");
-        }
-        shared
-            .councils
-            .respawn_workers_after_restart(shared.clone());
     }
 }
 

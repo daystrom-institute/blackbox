@@ -6,12 +6,10 @@
 //! exposes a single async mutex per `(provider, session_id)` key so
 //! every dispatch path can serialize against the same invariant.
 //!
-//! Council's drain worker uses the blocking acquire path because
-//! multi-producer collisions are expected there. Operator-facing paths
-//! such as ad-hoc `bro_resume`, workflow durable actors, and team
-//! advisor resumes use the non-blocking path and fail fast with a
-//! `bro_wait` / `bro_cancel` instruction instead of silently queuing a
-//! follow-up that can outlive the caller's tool timeout.
+//! Operator-facing paths such as ad-hoc `bro_resume`, workflow durable
+//! actors, and team advisor resumes use the non-blocking path and fail
+//! fast with a `bro_wait` / `bro_cancel` instruction instead of
+//! silently queuing a follow-up that can outlive the caller's tool timeout.
 //!
 //! Lease acquisition is async: callers `await` the guard, holding it
 //! across the full dispatch (`spawn_task` → `wait_for_task`). Drop
