@@ -13,8 +13,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/dispatch/worktree-pin-population",
   "notes": "Item 1 of thread-55d51135 (which stays OPEN as the umbrella — items 2 ambient-default expansion is operator-decision-gated on §3.1 scope semantics and stays thread-resident).",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-55d51135",
   "created_at": "2026-06-11T17:08:56Z",
-  "updated_at": "2026-06-11T17:08:56Z"
+  "updated_at": "2026-06-11T20:02:40Z",
+  "resolved_at": "2026-06-11T20:02:40Z",
+  "resolution_note": "Fixed in f513534 (worktree-scope-cluster branch): AmbientContext::tool_arg_defaults() emits pin:*.project_dir=<canonical worktree root> at one mechanical choke point whenever dispatch cwd is a managed worktree (cockpit-managed roots OR linked-git-worktree structure — covers fleet, agent, and workflow WorktreeCreate trees). Plain repo dispatches never pin. Workflow resume branch now carries the table (legacy spawn_task dropped it). Design doc tool-arg-defaulting.md bumped to lifecycle: partial per the gap's instruction. project defaulting remains decision-gated (gap-ae22a6b2)."
 }
