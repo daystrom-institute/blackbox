@@ -1,13 +1,17 @@
 # Nextest profiles for the blackbox workspace (build-cycle lever, thread-9938dffd).
 #
-#   default — mid-cycle gate: full lib suite minus the quarantined slow tests.
-#             `cargo nextest run --lib`
-#   full    — fold-time gate: the entire suite, quarantined tests included.
-#             `cargo nextest run --lib --profile full`
+#   default — mid-cycle gate: `cargo nextest run --workspace`
+#             (~24s: 3,700 tests across all crates/targets, minus the
+#             quarantined slow pair). ALWAYS pass --workspace: the root
+#             manifest is workspace+package, so a bare `cargo nextest run`
+#             silently covers the root package only and drops the ~1,800
+#             tests living in peeled crates (bbox-refactor alone holds 854).
+#   full    — fold-time gate: `cargo nextest run --workspace --profile full`
+#             (~85s: entire suite, quarantined tests included; wall-clock is
+#             pinned by the 80s index/search agentic test).
 #
-# Quarantined tests (each >45s of single-test wall-clock; together they pin the
-# suite's critical path — baseline 2026-06-10: suite 80s wall, these two 78.6s
-# and 55.2s, next-slowest 5.2s):
+# Quarantined tests (each >45s of single-test wall-clock; together they pin
+# the suite's critical path — baseline 2026-06-10: next-slowest test is 5.2s):
 #   - index::search::agentic_project_file_tests::registered_project_markdown_and_rust_source_are_searchable
 #   - system_events::store::tests::compact_caps_at_ten_thousand_keeping_newest
 #

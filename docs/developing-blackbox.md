@@ -10,22 +10,43 @@ validate changes without touching prod state, see
 ## Build and test
 
 ```bash
-cargo build --release             # binaries into target/release
-cargo check                       # fast type-check
-cargo nextest run --lib           # unit suite, mid-cycle gate (~16s execution)
-cargo nextest run --lib --profile full   # full suite incl. slow tests (fold/closeout gate)
-cargo clippy                      # lints
+cargo build --release                      # binaries into target/release
+cargo check                                # fast type-check
+cargo nextest run --workspace              # mid-cycle gate (~24s execution)
+cargo nextest run --workspace --profile full   # fold/closeout gate (~85s, full suite)
+cargo clippy                               # lints
 ```
 
 The test gates run under [cargo-nextest](https://nexte.st)
 (`brew install cargo-nextest`). Nextest runs each test in its own process and
 parallelizes across cores; `.config/nextest.toml` defines the two profiles. The
-`default` profile quarantines the handful of >45s tests behind the `full`
-profile so the mid-cycle gate stays fast, and applies per-test slow-timeouts so
-a newly slow test gets *named* in the output instead of silently stretching the
-suite. `cargo test --lib` still works as a fallback when nextest is not
-installed, but it is single-process, several times slower, and applies no
-quarantine or timeouts.
+`default` profile quarantines the two >45s tests behind the `full` profile so
+the mid-cycle gate stays fast, and applies per-test slow-timeouts so a newly
+slow test gets *named* in the output instead of silently stretching the suite.
+
+**Always pass `--workspace`.** The root manifest is workspace+package, so a
+bare `cargo nextest run` (or `cargo test`) covers the root `blackbox` package
+only — the ~1,800 tests living in the peeled `bbox-*`/`bro-*` crates silently
+drop out. There are no executable doctests in the workspace, so nextest's
+no-doctest limitation costs nothing.
+
+Measured timing story (M-series laptop, 14 threads, warm `target/`,
+2026-06-10 — re-measure rather than trust these once the suite shifts):
+
+| operation | wall |
+|---|---|
+| `cargo check` no-op | ~0.2s |
+| `cargo check` after a root-crate edit | ~3.3s |
+| `cargo check` after a leaf-crate edit (e.g. bbox-packets) | ~3.5s |
+| `cargo build --bin blackboxd` after a root edit (codegen+link) | ~31s |
+| `cargo nextest run --workspace` (3,700 tests) | ~24s |
+| `cargo nextest run --workspace --profile full` (3,702 tests) | ~85s |
+| `cargo test --lib` (legacy fallback, root package only) | ~610s |
+
+The fold gate's wall-clock is pinned by the single 80s index/search agentic
+test; the mid-cycle gate's by ~5s artifact-install tests. Cold worktree builds
+are solved separately by `project_dispatch.seed_dirs` CoW target seeding (see
+below), not by the test profiles.
 
 Use the narrowest command that proves your change, then broaden when touching
 shared behavior (see [`PROJECT.md`](../PROJECT.md) → Validation for targeted

@@ -1,7 +1,7 @@
 {
   "id": "df711bd7",
   "title": "Use nextest for test runs — never default to cargo test",
-  "content": "Use nextest for test runs — never default to `cargo test`. The unit-suite gates run under cargo-nextest (`brew install cargo-nextest`): `cargo nextest run --lib` is the mid-cycle gate (~16s; `.config/nextest.toml` quarantines the >45s tests and applies per-test slow-timeouts so newly slow tests get named), and `cargo nextest run --lib --profile full` is the fold/closeout gate running the entire suite. Plain `cargo test --lib` is a no-install fallback only: single-process, ~40x slower, no quarantine or timeouts. Note nextest is process-per-test: `test_env_lock()` no longer serializes there (per-process env isolation supersedes it) but remains required for plain `cargo test`.",
+  "content": "Use nextest for test runs — never default to `cargo test`, and ALWAYS pass `--workspace`. The test gates run under cargo-nextest (`brew install cargo-nextest`): `cargo nextest run --workspace` is the mid-cycle gate (~24s, 3,700 tests across all crates/targets; `.config/nextest.toml` quarantines the two >45s tests and applies per-test slow-timeouts so newly slow tests get named), and `cargo nextest run --workspace --profile full` is the fold/closeout gate running the entire suite (~85s, pinned by the 80s index/search agentic test). `--workspace` is load-bearing: the root manifest is workspace+package, so a bare run covers the root package only and silently drops the ~1,800 tests in the peeled bbox-*/bro-* crates. Plain `cargo test --lib` is a no-install fallback only: single-process, root-package-only, ~25x slower, no quarantine or timeouts. Note nextest is process-per-test: `test_env_lock()` no longer serializes there (per-process env isolation supersedes it) but remains required for plain `cargo test`. Measured timing story lives in docs/developing-blackbox.md → Build and test.",
   "variants": {},
   "category": "convention",
   "scope": "project",
@@ -14,6 +14,6 @@
   "decay": true,
   "source": "user",
   "created_at": "2026-06-11T01:36:05Z",
-  "updated_at": "2026-06-11T01:36:05Z",
+  "updated_at": "2026-06-11T02:10:02Z",
   "recall_count": 0
 }

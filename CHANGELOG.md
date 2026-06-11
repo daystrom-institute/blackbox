@@ -16,12 +16,16 @@ out explicitly under `Changed` or `Removed`.
   `now_iso` moved into `bbox-corpus-core`; companion gap-note ingestion
   inverted root-side (`gaps::emit_companion_packet_gap_note`) so the leaf has
   no gap-store coupling.
-- cargo-nextest test gates (`.config/nextest.toml`): the unit suite now runs
-  process-per-test under nextest — `cargo nextest run --lib` is the mid-cycle
-  gate (~16s execution; the two >45s tests are quarantined), and
-  `--profile full` is the fold/closeout gate running the entire suite.
-  Per-test slow-timeouts name newly slow tests instead of silently stretching
-  the suite. `cargo test --lib` remains the no-install fallback.
+- cargo-nextest test gates (`.config/nextest.toml`): the test suite now runs
+  process-per-test under nextest, workspace-wide —
+  `cargo nextest run --workspace` is the mid-cycle gate (~24s, 3,700 tests;
+  the two >45s tests are quarantined), and `--workspace --profile full` is
+  the fold/closeout gate running the entire suite (~85s). This also closes a
+  coverage gap: the previous `cargo test --lib` gate covered the root package
+  only, leaving ~1,800 tests in the peeled crates (854 in bbox-refactor
+  alone) outside the documented gate. Per-test slow-timeouts name newly slow
+  tests instead of silently stretching the suite. `cargo test --lib` remains
+  the no-install fallback.
 - Phase-4 concurrency enforcement (concurrency-model §5): a `clippy.toml`
   disallowed-methods gate denies blocking fs/process/tantivy-writer calls in
   MCP handler modules and the harness crates (sanctioned actor contexts carry
