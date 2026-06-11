@@ -388,6 +388,8 @@ impl SharedState {
         // project's committed `.bbox/gaps/` into the query surface at startup.
         let mut gaps = GapStore::open(&store_dir.join("blackbox-gaps.json")).unwrap();
         gaps.set_project_roots(kb_project_roots).unwrap();
+        crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread);
+        crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note);
         let notes_path = store_dir.join("notes.json");
         let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
         let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);

@@ -140,6 +140,10 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     }
 
     let th = Threads::open(&th_path)?;
+    // Wire the store-side embed sinks to the embedding queue (dependency
+    // inversion: the stores live below the embed pipeline in the crate DAG).
+    crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread);
+    crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note);
     tracing::info!("Thread store: {}", th_path.display());
     // Queued on the writer actor: boot no longer races the reindex thread
     // (or a winding-down previous daemon) for tantivy's single-writer lock.

@@ -7,7 +7,28 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::store_persister::StoreSnapshot;
+use bbox_stores::store_persister::StoreSnapshot;
+
+// ── embed-sink hook ────────────────────────────────────────────────
+//
+// The daemon registers `embed_queue::enqueue_thread` here at SharedState
+// construction (mirrors `index::embed_hook`). Inverting the dependency
+// keeps this store below the embedding pipeline in the crate DAG; before
+// registration (or in tests without one) embed scheduling is a no-op,
+// matching the uninstalled-queue behavior of `embed_queue::enqueue`.
+static THREAD_EMBED_HOOK: std::sync::OnceLock<fn(&Thread)> = std::sync::OnceLock::new();
+
+/// Register the embed sink for thread mutations. Idempotent; first
+/// registration wins.
+pub fn register_thread_embed_hook(hook: fn(&Thread)) {
+    let _ = THREAD_EMBED_HOOK.set(hook);
+}
+
+fn enqueue_thread_embed(thread: &Thread) {
+    if let Some(hook) = THREAD_EMBED_HOOK.get() {
+        hook(thread);
+    }
+}
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -296,7 +317,7 @@ fn write_thread_record(thread: &Thread) -> Result<Option<(PathBuf, PathBuf)>> {
         resolved_at: thread.resolved_at.clone().unwrap_or_default(),
     };
     let path = dir.join(format!("{}.json", thread.id));
-    crate::json_store::atomic_write_json_locked(&path, &record)?;
+    bbox_corpus_core::json_store::atomic_write_json_locked(&path, &record)?;
     Ok(Some((root, path)))
 }
 
@@ -304,7 +325,7 @@ fn write_thread_record(thread: &Thread) -> Result<Option<(PathBuf, PathBuf)>> {
 /// These are durable snapshots of settled threads that travel with the repo;
 /// on a clone (where the live thread store doesn't carry them) they are the
 /// only trace of past investigations.
-pub(crate) fn load_repo_records(project_dir: &Path) -> Vec<ThreadRecord> {
+pub fn load_repo_records(project_dir: &Path) -> Vec<ThreadRecord> {
     let dir = project_dir.join(".bbox").join("record");
     let Ok(read) = fs::read_dir(&dir) else {
         return Vec::new();
@@ -354,7 +375,7 @@ impl Threads {
     }
 
     fn now_iso() -> String {
-        crate::util::now_iso()
+        bbox_util::util::now_iso()
     }
 
     fn gen_id() -> String {
@@ -385,7 +406,7 @@ impl Threads {
         if updated > 0 {
             for thread in &self.store.threads {
                 if thread.project == new_project {
-                    crate::embed_queue::enqueue_thread(thread);
+                    enqueue_thread_embed(thread);
                 }
             }
         }
@@ -487,7 +508,7 @@ impl Threads {
 
         let changed_edges = !thread.sessions.is_empty();
         self.store.threads.push(thread.clone());
-        crate::embed_queue::enqueue_thread(&thread);
+        enqueue_thread_embed(&thread);
 
         Ok(ThreadMutation {
             message: format!("Thread created: {} — \"{}\"", id, topic),
@@ -673,7 +694,7 @@ impl Threads {
 
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
-        crate::embed_queue::enqueue_thread(&thread_for_embed);
+        enqueue_thread_embed(&thread_for_embed);
 
         Ok(ThreadMutation {
             message: format!("Thread {id} ({topic}) — added {kind_str} edge to {target}"),
@@ -752,7 +773,7 @@ impl Threads {
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
 
-        crate::embed_queue::enqueue_thread(&thread_for_embed);
+        enqueue_thread_embed(&thread_for_embed);
 
         Ok(ThreadMutation {
             message: format!("Thread {id} continued — \"{topic}\""),
@@ -795,7 +816,7 @@ impl Threads {
         let thread_for_embed = thread.clone();
 
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some((root, path))) => Some(crate::util::repo_artifact_rider(
+            Ok(Some((root, path))) => Some(bbox_util::util::repo_artifact_rider(
                 &root.to_string_lossy(),
                 &path,
             )),
@@ -805,7 +826,7 @@ impl Threads {
                 None
             }
         };
-        crate::embed_queue::enqueue_thread(&thread_for_embed);
+        enqueue_thread_embed(&thread_for_embed);
 
         let mut message = format!("Thread {id} resolved — \"{topic}\"");
         if let Some(rider) = record_rider {
@@ -856,7 +877,7 @@ impl Threads {
         let thread_for_embed = thread.clone();
 
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some((root, path))) => Some(crate::util::repo_artifact_rider(
+            Ok(Some((root, path))) => Some(bbox_util::util::repo_artifact_rider(
                 &root.to_string_lossy(),
                 &path,
             )),
@@ -866,7 +887,7 @@ impl Threads {
                 None
             }
         };
-        crate::embed_queue::enqueue_thread(&thread_for_embed);
+        enqueue_thread_embed(&thread_for_embed);
 
         let mut message = format!("Thread {id} promoted to {promoted_to} — \"{topic}\"");
         if let Some(rider) = record_rider {
@@ -899,7 +920,7 @@ impl Threads {
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
 
-        crate::embed_queue::enqueue_thread(&thread_for_embed);
+        enqueue_thread_embed(&thread_for_embed);
 
         Ok(ThreadMutation {
             message: format!("Thread {id} renamed to \"{new_name}\" (topic: {topic})"),
@@ -1142,7 +1163,7 @@ impl Threads {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_persister::StorePersister;
+    use bbox_stores::store_persister::StorePersister;
     use parking_lot::RwLock;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1470,7 +1491,7 @@ mod tests {
     fn repo_artifact_rider_renders_relative_path_and_add_hint() {
         let root = "/repo/x";
         let path = Path::new("/repo/x/.bbox/record/thread-abc.json");
-        let rider = crate::util::repo_artifact_rider(root, path);
+        let rider = bbox_util::util::repo_artifact_rider(root, path);
         assert!(rider.contains(".bbox/record/thread-abc.json"));
         assert!(rider.contains("git add .bbox/record/thread-abc.json"));
         assert!(

@@ -6,7 +6,26 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::store_persister::StoreSnapshot;
+use bbox_stores::store_persister::StoreSnapshot;
+
+// ── embed-sink hook ────────────────────────────────────────────────
+//
+// Same inversion as `threads::register_thread_embed_hook`: the daemon
+// registers `embed_queue::enqueue_note` at SharedState construction;
+// unregistered means embed scheduling is a no-op.
+static NOTE_EMBED_HOOK: std::sync::OnceLock<fn(&Note)> = std::sync::OnceLock::new();
+
+/// Register the embed sink for note mutations. Idempotent; first
+/// registration wins.
+pub fn register_note_embed_hook(hook: fn(&Note)) {
+    let _ = NOTE_EMBED_HOOK.set(hook);
+}
+
+fn enqueue_note_embed(note: &Note) {
+    if let Some(hook) = NOTE_EMBED_HOOK.get() {
+        hook(note);
+    }
+}
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -225,7 +244,7 @@ impl Notes {
     }
 
     fn now_iso() -> String {
-        crate::util::now_iso()
+        bbox_util::util::now_iso()
     }
 
     fn gen_id() -> String {
@@ -256,7 +275,7 @@ impl Notes {
         if updated > 0 {
             for note in &self.store.notes {
                 if note.project.as_deref() == Some(new_project) {
-                    crate::embed_queue::enqueue_note(note);
+                    enqueue_note_embed(note);
                 }
             }
         }
@@ -301,7 +320,7 @@ impl Notes {
         };
 
         self.store.notes.push(note.clone());
-        crate::embed_queue::enqueue_note(&note);
+        enqueue_note_embed(&note);
 
         Ok(format!("Note {id} recorded (kind={})", kind.as_ref()))
     }
@@ -502,7 +521,7 @@ impl Notes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_persister::StorePersister;
+    use bbox_stores::store_persister::StorePersister;
     use fs2::FileExt;
     use parking_lot::RwLock;
     use std::sync::Arc;
