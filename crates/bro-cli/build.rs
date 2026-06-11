@@ -40,8 +40,13 @@ fn fallback_timestamp() -> u64 {
 }
 
 fn main() {
-    // rerun when HEAD moves so rebuilds after commits get a fresh stamp
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // Rerun when HEAD moves so rebuilds after commits get a fresh stamp.
+    // Paths are relative to THIS crate dir, so reach the workspace .git two
+    // levels up; and .git/HEAD only changes on branch switches — commits
+    // append to the HEAD reflog, so watch that too (stale build ids were
+    // version-banner false positives, D30).
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
 
     let build_id = git_head_short(12)
         .unwrap_or_else(|| fallback_timestamp().to_string());

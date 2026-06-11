@@ -41,8 +41,12 @@ fn fallback_timestamp() -> u64 {
 }
 
 fn main() {
-    // rerun when HEAD moves so rebuilds after commits get a fresh stamp
+    // rerun when HEAD moves so rebuilds after commits get a fresh stamp.
+    // .git/HEAD only changes on branch switches; commits move the branch ref
+    // and append to the HEAD reflog — watch the reflog too, or build ids go
+    // stale across commits (version-banner false positives, D30).
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/logs/HEAD");
 
     let build_id = git_head_short(12)
         .unwrap_or_else(|| fallback_timestamp().to_string());
