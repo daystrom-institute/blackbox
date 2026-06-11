@@ -68,7 +68,7 @@ use bbox_edge_sidecar::manifest;
 mod mcp_client;
 mod mcp_tools;
 mod migration;
-mod notes;
+use bbox_threads::notes;
 mod orchestration;
 // `packets` extracted into bbox-packets (root-crate split); aliased back to
 // `crate::packets` so existing call sites resolve unchanged.
@@ -106,7 +106,7 @@ mod system_events;
 // unchanged.
 use bbox_system_memory as system_memory;
 use bbox_corpus_core::template;
-mod threads;
+use bbox_threads::threads;
 mod tool_docs;
 mod tools;
 use bbox_corpus_index::transcripts;

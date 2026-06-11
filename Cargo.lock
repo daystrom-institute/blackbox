@@ -523,6 +523,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-threads"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-stores",
+ "bbox-util",
+ "dirs",
+ "fs2",
+ "parking_lot",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "strum 0.26.3",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-util"
 version = "0.0.1"
 dependencies = [
@@ -666,6 +687,7 @@ dependencies = [
  "bbox-refactor",
  "bbox-stores",
  "bbox-system-memory",
+ "bbox-threads",
  "bbox-util",
  "bbox-vectors",
  "bbox-whiteboards",
