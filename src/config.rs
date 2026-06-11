@@ -147,6 +147,13 @@ fn default_daemon_mcp_name() -> String {
 fn default_daemon_shutdown_grace_secs() -> u64 {
     15
 }
+/// Task retention TTL — dropped tasks are permanently removed from the
+/// persisted `tasks.json` and the in-memory store on the next daemon
+/// startup. Retention keys off `started_at` (not `completed_at`), so a
+/// long-running task that completes near the cutoff may be reaped soon
+/// after. Applies uniformly to all origins (Cockpit, AgentDispatch,
+/// Workflow, Atom, …) — no origin-specific retention. A task reaped by
+/// TTL is gone from `bro_dashboard` and unreachable via `bro_prune`.
 fn default_daemon_task_ttl_ms() -> u64 {
     86400000
 } // 24 hours

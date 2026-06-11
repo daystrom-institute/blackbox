@@ -464,11 +464,13 @@ pub(super) fn draw_roster(
             // don't know what this is". `provider_tuple` (zoom footer)
             // already uses this richer chain; share one helper for parity.
             let model = roster_model_label_for(a, v).into_owned();
-            let report = v
-                .report_message
-                .as_deref()
-                .map(|m| truncate(m, 54))
-                .unwrap_or_else(|| "—".into());
+            let (report, report_style) = match v.report_message.as_deref() {
+                Some(m) => (truncate(m, 54), Style::default().fg(Color::LightYellow)),
+                None => match v.last_assistant_message.as_deref() {
+                    Some(m) => (truncate(m, 54), Style::default().fg(Color::DarkGray)),
+                    None => ("—".into(), Style::default().fg(Color::DarkGray)),
+                },
+            };
             let started = age(v.started_at);
             let last = v
                 .last_activity_ms
@@ -489,7 +491,7 @@ pub(super) fn draw_roster(
                 Cell::from(truncate(&a.name, 30))
                     .style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(truncate(&model, 13)).style(Style::default().fg(Color::Gray)),
-                Cell::from(report).style(Style::default().fg(Color::LightYellow)),
+                Cell::from(report).style(report_style),
                 Cell::from(started).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(last).style(Style::default().fg(Color::DarkGray)),
             ]));

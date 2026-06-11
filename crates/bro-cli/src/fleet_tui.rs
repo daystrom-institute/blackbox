@@ -185,6 +185,9 @@ struct AgentView {
     model: Option<String>,
     cwd: Option<String>,
     report_message: Option<String>,
+    /// Last assistant message teaser — used as a dimmed fallback in the
+    /// roster report column when the agent never called `bro_report`.
+    last_assistant_message: Option<String>,
     started_at: u64,
     last_activity_ms: Option<u64>,
     stderr_tail: Option<String>,
@@ -216,6 +219,7 @@ impl Agent {
             model: snap.model,
             cwd: snap.cwd,
             report_message: snap.report_message,
+            last_assistant_message: snap.last_assistant_message,
             started_at: snap.started_at,
             last_activity_ms: snap.last_event_at_ms,
             stderr_tail,
@@ -1186,6 +1190,7 @@ fn origin_tabs_partition_roster_rows() {
             model: None,
             cwd: None,
             report_message: None,
+            last_assistant_message: None,
             started_at,
             last_activity_ms: None,
             stderr_tail: None,

@@ -1437,6 +1437,17 @@ impl TaskStore {
             Ok(r) => r,
             Err(_) => return store,
         };
+        // ── Task TTL retention ───────────────────────────────────────────
+        // At daemon startup, tasks whose `started_at` is older than `ttl_ms`
+        // are permanently dropped from the store. This is the ONLY automatic
+        // task-reaping path; during runtime, tasks are only removed by an
+        // explicit `bro_prune` or `DELETE /control/task/:id`. Retention is
+        // uniform across all origins (Cockpit, AgentDispatch, Workflow, …).
+        // If a task seems to vanish mid-session, the daemon has restarted and
+        // the task's `started_at` fell below the `now - ttl_ms` horizon.
+        //
+        // Default `ttl_ms` is 86400000 (24 h), configurable via
+        // `daemon.task_ttl_ms` / `BRO_TASK_TTL_MS` env var.
         let cutoff = now_ms().saturating_sub(ttl_ms);
         for mut rec in records {
             if rec.started_at < cutoff {

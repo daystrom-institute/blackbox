@@ -876,6 +876,7 @@ Trailing paragraph.";
             model: None,
             cwd: None,
             report_message: None,
+            last_assistant_message: None,
             started_at,
             last_activity_ms,
             stderr_tail: None,

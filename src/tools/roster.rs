@@ -77,6 +77,13 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<DashboardParams>,
     ) -> CallToolResult {
+        // Dashboard row cap — tasks are sorted by `started_at` descending and
+        // truncated to `limit` rows (default 20). A completed task that falls
+        // below this horizon is NOT reaped — it remains in the store and the
+        // roster view. Raise the limit or filter by status/provider to see it.
+        // If `bro_prune(task_ids=[...])` also cannot find the task, the daemon
+        // has restarted and `TaskStore::load` dropped it via the task_ttl_ms
+        // retention cutoff (default 24 h from `started_at`).
         let limit = p.limit.unwrap_or(20);
 
         let filter_provider = p
