@@ -932,7 +932,11 @@ mod tests {
 
     #[test]
     fn git_repo_id_uses_first_commit_hash_not_realpath_hash() {
-        let repo_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Per-test repo, not the live checkout: depending on the real repo's
+        // git state races with parallel worktree churn (test isolation
+        // invariant — never touch shared working state).
+        let dir = test_repo_with_commit();
+        let repo_path = dir.path();
         let first_commit = crate::git::git_first_commit_for_path(repo_path).unwrap();
         let repo_id = repo_id_for_path(repo_path).unwrap();
         let realpath_id = realpath_hash(repo_path).unwrap();
@@ -974,9 +978,31 @@ mod tests {
         );
     }
 
+    /// Init a tempdir git repo with one commit, branch-explicit and config-free.
+    fn test_repo_with_commit() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-b", "main"]);
+        run(&["commit", "--allow-empty", "-m", "seed"]);
+        dir
+    }
+
     #[test]
     fn commit_ref_round_trips_with_repo_id() {
-        let repo_id = repo_id_for_path(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = test_repo_with_commit();
+        let repo_id = repo_id_for_path(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(repo_id.len(), 8);
         let entity = EntityRef::Commit {
             repo_id,
