@@ -242,6 +242,7 @@ mod tests {
             started_at: Some(42),
             agent_label: Some(format!("agent-{id}")),
             report_full: None,
+            interrupted: false,
         }
     }
 

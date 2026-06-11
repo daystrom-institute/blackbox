@@ -261,6 +261,27 @@ impl Emitter {
         self.write_line(v);
     }
 
+    /// Terminal `result` event for a turn interrupted by operator control. This
+    /// is deliberately not `subtype: success`: callers that key on successful
+    /// completion keep their existing behavior for natural finishes, while
+    /// interruption-aware consumers can distinguish a partial deliverable.
+    pub fn result_interrupted(&self, text: &str, usage: &Usage, num_turns: u64) {
+        self.write_line(json!({
+            "type": "result",
+            "subtype": "interrupted",
+            "interrupted": true,
+            "session_id": self.session_id,
+            "result": text,
+            "num_turns": num_turns,
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_read_input_tokens": usage.cached_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            },
+        }));
+    }
+
     /// Terminal `result` event for a turn that FAILED. Mirrors `result()` but
     /// carries `is_error: true` and the error text, so the failure is a captured
     /// protocol event (transcript + daemon ingest) rather than a stray stderr
@@ -336,5 +357,28 @@ mod tests {
             "anthropic messages 400 Bad Request: boom"
         );
         assert_eq!(events[0]["num_turns"], 3);
+    }
+
+    #[test]
+    fn result_interrupted_emits_non_success_terminal_event() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-int".into(), sink);
+
+        emitter.result_interrupted("partial answer", &Usage::default(), 0);
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "result");
+        assert_eq!(events[0]["subtype"], "interrupted");
+        assert_eq!(events[0]["interrupted"], true);
+        assert_eq!(events[0]["session_id"], "session-int");
+        assert_eq!(events[0]["result"], "partial answer");
+        assert_eq!(events[0]["num_turns"], 0);
     }
 }

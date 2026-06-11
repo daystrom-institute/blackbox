@@ -364,6 +364,11 @@ pub struct TaskInner {
     /// Latest agent-authored progress report, set through `bro_report`
     /// and surfaced in `bro_status` / `bro_dashboard`.
     pub report: Option<BroReport>,
+    /// True when the latest terminal result event represented an operator
+    /// interrupt rather than a natural finish. This is a cause marker layered on
+    /// top of `status`: finalization maps it to `Cancelled`, and status/roster
+    /// JSON surface it as `interrupted: true`.
+    pub interrupted: bool,
     /// True when this task's terminal state is "the daemon killed it
     /// because the process restarted, but the underlying provider
     /// session_id is still valid on disk (rollout / session jsonl
@@ -707,6 +712,7 @@ mod roster_view_tests {
                 name: None,
                 agent_label: Some(format!("agent-{id}")),
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -752,6 +758,7 @@ mod roster_view_tests {
             started_at: Some(42),
             agent_label: None,
             report_full: None,
+            interrupted: false,
         };
         view.upsert("t1".into(), summary.clone());
         let snap = view.snapshot();
@@ -784,6 +791,7 @@ mod roster_view_tests {
                 started_at: None,
                 agent_label: None,
                 report_full: None,
+                interrupted: false,
             },
         );
         assert_eq!(view.snapshot().len(), 1);
@@ -907,6 +915,7 @@ mod roster_view_tests {
                 started_at: None,
                 agent_label: None,
                 report_full: None,
+                interrupted: false,
             },
         );
         let mut store = TaskStore::new();
@@ -1023,6 +1032,7 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         // fleet row UI; `report_full` carries the full
         // `BroReport::to_json()` shape for the dashboard.
         report_full: inner.report.as_ref().map(bro_report_to_wire),
+        interrupted: inner.interrupted,
     }
 }
 
@@ -1144,6 +1154,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             name: None,
             agent_label: None,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -1280,6 +1291,8 @@ struct PersistedTask {
     agent_label: Option<String>,
     #[serde(default)]
     report: Option<BroReport>,
+    #[serde(default)]
+    interrupted: bool,
     /// True when the previous daemon instance was running this task
     /// at restart and the underlying provider session_id is still
     /// recoverable on disk. Set during `TaskStore::load` when it
@@ -1371,6 +1384,7 @@ impl TaskStore {
                     name: inner.name.clone(),
                     agent_label: inner.agent_label.clone(),
                     report: inner.report.clone(),
+                    interrupted: inner.interrupted,
                     recoverable: inner.recoverable,
                     transcript_location: inner.transcript_location.clone(),
                     transcript_cursor: inner.transcript_cursor.clone(),
@@ -1449,6 +1463,7 @@ impl TaskStore {
                     name: rec.name,
                     agent_label: rec.agent_label,
                     report: rec.report,
+                    interrupted: rec.interrupted,
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
                     transcript_cursor: rec.transcript_cursor,
@@ -2053,6 +2068,7 @@ fn failed_duplicate_task(
             name: None,
             agent_label,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -2129,6 +2145,7 @@ pub fn spawn_in_process_task(
             name: None,
             agent_label,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -2247,6 +2264,11 @@ pub fn finish_in_process_task(
     if let Some(stderr) = stderr {
         inner.stderr.push_str(&stderr);
     }
+    let status = if status == TaskStatus::Completed && inner.interrupted {
+        TaskStatus::Cancelled
+    } else {
+        status
+    };
     inner.status = status;
     inner.completed_at = Some(now_ms());
     let task_id = inner.id.clone();
@@ -2679,6 +2701,8 @@ fn spawn_harness_in_process_task(
             let inner = task_for_run.inner.lock();
             if matches!(inner.status, TaskStatus::Failed | TaskStatus::Cancelled) {
                 status = inner.status;
+            } else if inner.interrupted {
+                status = TaskStatus::Cancelled;
             }
         }
         finish_in_process_task(
@@ -2771,6 +2795,7 @@ fn ingest_harness_event(
                 } else {
                     None
                 },
+                interrupted: false,
             };
             provider.parse_event(&evt, &mut sink);
             apply_cwd_updates_from_event(&mut inner, &evt);
@@ -3296,6 +3321,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     name: None,
                     agent_label: agent_label.clone(),
                     report: None,
+                    interrupted: false,
                     recoverable: false,
                     transcript_location: None,
                     transcript_cursor: None,
@@ -3355,6 +3381,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             name: None,
             agent_label,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -3491,6 +3518,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                             } else {
                                 None
                             },
+                            interrupted: false,
                         };
                         provider.parse_event(&evt, &mut sink);
                         let emitted_session_id = sink.session_id.clone();
@@ -3594,6 +3622,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     cost_usd: inner.cost_usd,
                     num_turns: inner.num_turns,
                     session_id: None,
+                    interrupted: false,
                 };
                 provider.parse_bulk_output(buf.trim(), &mut sink);
                 let mut session_id_observed = false;
@@ -3909,6 +3938,11 @@ fn apply_sink_updates(inner: &mut TaskInner, sink: EventSink) {
     if sink.num_turns.is_some() {
         inner.num_turns = sink.num_turns;
     }
+    if sink.interrupted {
+        inner.interrupted = true;
+    } else if inner.status == TaskStatus::Running {
+        inner.interrupted = false;
+    }
 }
 
 fn apply_cwd_updates_from_event(inner: &mut TaskInner, evt: &Value) {
@@ -4040,8 +4074,11 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     if let Some(ref msg) = inner.last_assistant_message {
         obj["result"] = Value::String(msg.clone());
     }
+    if inner.interrupted {
+        obj["interrupted"] = Value::Bool(true);
+    }
     obj["hasResult"] = Value::Bool(inner.last_assistant_message.is_some());
-    if inner.status == TaskStatus::Completed || inner.status == TaskStatus::Failed {
+    if matches!(inner.status, TaskStatus::Completed | TaskStatus::Failed) || inner.interrupted {
         if let Some(ref u) = inner.usage {
             // `input_tokens` is fresh (cache-exclusive). Surface the cache
             // breakdown only when present so cache-free providers stay terse.
@@ -4180,6 +4217,7 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
         origin: inner.origin,
         managed_worktree: inner.managed_worktree.clone(),
         workflow_owned: inner.workflow_owned,
+        interrupted: inner.interrupted,
     }
 }
 
@@ -4317,6 +4355,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
         || snapshot.origin != bro_core::Origin::Unknown
         || snapshot.managed_worktree.is_some()
         || snapshot.workflow_owned
+        || snapshot.interrupted
     {
         obj["snapshot"] = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
     }
@@ -4440,6 +4479,7 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
         "eventCount": event_count,
         "keep_going": keep_going,
         "lastAssistantSnippet": last_activity,
+        "interrupted": inner.interrupted,
         "supervision": inner.supervision.snapshot_for_response(now_ms()),
     })
 }
@@ -5010,6 +5050,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -5451,6 +5492,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -5486,6 +5528,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -5539,6 +5582,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -5590,6 +5634,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -5603,6 +5648,69 @@ mod tests {
             child_id: Mutex::new(None),
             roster_events: None,
         })
+    }
+
+    #[test]
+    fn interrupted_result_finalizes_in_process_task_as_cancelled() {
+        let task = mk_ingest_task("task-int", "sess-int");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let evt = serde_json::json!({
+            "type": "result",
+            "subtype": "interrupted",
+            "interrupted": true,
+            "session_id": "sess-int",
+            "result": "partial text before escape",
+            "num_turns": 0,
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        });
+
+        ingest_harness_event(&task, Provider::Minimax, evt, &tx, "task-int", None);
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.status, TaskStatus::Running);
+            assert!(inner.interrupted);
+            assert_eq!(
+                inner.last_assistant_message.as_deref(),
+                Some("partial text before escape")
+            );
+            assert_eq!(inner.num_turns, Some(0));
+        }
+
+        let store = RwLock::new(TaskStore::new());
+        let tmp = tempfile::tempdir().unwrap();
+        finish_in_process_task(
+            &task,
+            TaskStatus::Completed,
+            None,
+            None,
+            &store,
+            tmp.path(),
+            &tx,
+            None,
+        );
+
+        let status = task_status_json(&task, 5);
+        assert_eq!(status["status"], "cancelled");
+        assert_eq!(status["interrupted"], true);
+        assert_eq!(status["result"], "partial text before escape");
+        assert_eq!(status["numTurns"], 0);
+        assert_eq!(status["snapshot"]["status"], "cancelled");
+        assert_eq!(status["snapshot"]["interrupted"], true);
+
+        let mut saw_cancelled = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, tail::TailEvent::TaskCancelled { task_id, .. } if task_id == "task-int")
+            {
+                saw_cancelled = true;
+                break;
+            }
+        }
+        assert!(saw_cancelled);
     }
 
     #[test]
@@ -5724,6 +5832,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6174,6 +6283,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6270,6 +6380,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6323,6 +6434,7 @@ mod tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6376,6 +6488,7 @@ mod tests {
             name: None,
             agent_label: None,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -6431,6 +6544,7 @@ mod tests {
             name: None,
             agent_label: None,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -6451,6 +6565,7 @@ mod tests {
             cost_usd: Some(0.02),
             num_turns: Some(2),
             session_id: Some("s1".into()),
+            interrupted: false,
         };
 
         apply_sink_updates(&mut inner, sink);
@@ -6498,6 +6613,7 @@ mod tests {
             name: None,
             agent_label: None,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -6553,6 +6669,7 @@ mod tests {
             name: None,
             agent_label: None,
             report: None,
+            interrupted: false,
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
@@ -6656,6 +6773,7 @@ mod async_tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6697,6 +6815,7 @@ mod async_tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6744,6 +6863,7 @@ mod async_tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6787,6 +6907,7 @@ mod async_tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
@@ -6842,6 +6963,7 @@ mod async_tests {
                 name: None,
                 agent_label: None,
                 report: None,
+                interrupted: false,
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,

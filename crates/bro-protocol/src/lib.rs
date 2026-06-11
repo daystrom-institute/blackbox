@@ -62,6 +62,10 @@ pub struct TaskSnapshot {
     /// True when a workflow or atom owns this task's lifecycle.
     #[serde(default)]
     pub workflow_owned: bool,
+    /// True when the latest terminal result was interrupted by operator
+    /// control, rather than naturally completed.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// Summary DTO for one fleet task, projected by the daemon for the
@@ -143,6 +147,10 @@ pub struct RosterSummaryV1 {
     /// omitted for tasks that never called `bro_report`.
     #[serde(default)]
     pub report_full: Option<BroReportV1>,
+    /// True when the latest terminal result was interrupted by operator
+    /// control. Additive marker layered on top of `status=cancelled`.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// Structured form of a `bro_report` payload, projected into the
@@ -282,6 +290,7 @@ mod tests {
             started_at: Some(1_700_000_000_000),
             agent_label: Some("team-x::member-y".to_string()),
             report_full: None,
+            interrupted: false,
         };
         let value = serde_json::to_value(&summary).unwrap();
         let obj = value.as_object().expect("summary must serialize as object");
@@ -307,6 +316,7 @@ mod tests {
             "started_at",
             "agent_label",
             "report_full",
+            "interrupted",
         ] {
             assert!(
                 obj.contains_key(key),

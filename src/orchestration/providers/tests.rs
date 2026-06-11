@@ -14,6 +14,7 @@ fn empty_sink() -> EventSink {
         cost_usd: None,
         num_turns: None,
         session_id: None,
+        interrupted: false,
     }
 }
 
@@ -158,6 +159,29 @@ fn harness_result_event_updates_sink() {
     assert_eq!(usage.total_input_tokens(), 125);
     assert_eq!(sink.cost_usd, Some(0.05));
     assert_eq!(sink.num_turns, Some(3));
+    assert!(!sink.interrupted);
+}
+
+#[test]
+fn harness_interrupted_result_marks_sink() {
+    let evt = serde_json::json!({
+        "type": "result",
+        "subtype": "interrupted",
+        "interrupted": true,
+        "session_id": "harness-session",
+        "result": "partial answer",
+        "num_turns": 0
+    });
+    let mut sink = empty_sink();
+    Provider::Brodex.parse_event(&evt, &mut sink);
+
+    assert_eq!(sink.session_id.as_deref(), Some("harness-session"));
+    assert_eq!(
+        sink.last_assistant_message.as_deref(),
+        Some("partial answer")
+    );
+    assert_eq!(sink.num_turns, Some(0));
+    assert!(sink.interrupted);
 }
 
 #[test]

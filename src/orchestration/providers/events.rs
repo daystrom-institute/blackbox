@@ -10,6 +10,7 @@ pub struct EventSink {
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
     pub session_id: Option<String>,
+    pub interrupted: bool,
 }
 
 /// Normalized per-task token usage.
@@ -215,6 +216,7 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         }
     }
     if evt["type"].as_str() == Some("result") {
+        sink.interrupted = result_event_interrupted(evt);
         if let Some(result) = evt["result"].as_str() {
             let already_have_streamed_text = sink
                 .last_assistant_message
@@ -252,6 +254,12 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         sink.cost_usd = evt["total_cost_usd"].as_f64();
         sink.num_turns = evt["num_turns"].as_u64();
     }
+}
+
+pub fn result_event_interrupted(evt: &Value) -> bool {
+    evt["type"].as_str() == Some("result")
+        && (evt["subtype"].as_str() == Some("interrupted")
+            || evt["interrupted"].as_bool() == Some(true))
 }
 
 #[cfg(test)]

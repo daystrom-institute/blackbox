@@ -208,6 +208,9 @@ impl BlackboxServer {
                 if let Some(ref report) = s.report_full {
                     entry["report"] = bro_report_v1_to_dashboard_json(report);
                 }
+                if s.interrupted {
+                    entry["interrupted"] = Value::Bool(true);
+                }
                 // Sort key: legacy used `started_at`. Fall back to
                 // `last_event_at` when `started_at` is somehow
                 // missing (older summaries before the wave-7c DTO
@@ -1508,6 +1511,7 @@ mod tests {
                     reported_at: started_at,
                     reported_ago: "0s".to_string(),
                 }),
+                interrupted: false,
             }
         }
 
@@ -1537,6 +1541,7 @@ mod tests {
                 started_at: Some(started_at),
                 agent_label: Some(format!("agent-{id}@v1")),
                 report_full: None,
+                interrupted: false,
             }
         }
 
@@ -1693,6 +1698,36 @@ mod tests {
             let tasks = body["tasks"].as_array().unwrap();
             assert_eq!(tasks.len(), 1);
             assert_eq!(tasks[0]["taskId"], "c");
+        }
+
+        #[test]
+        fn dashboard_surfaces_interrupted_cancelled_rows() {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            let t = 1_700_000_000_000_u64;
+            let mut interrupted = terminal_summary("interrupted", Provider::Brodex, t, t + 1000);
+            interrupted.status = WireTaskStatus::Cancelled;
+            interrupted.interrupted = true;
+            interrupted.last_message_snippet = Some("partial output".to_string());
+            server
+                .state
+                .roster_view
+                .upsert("interrupted".to_string(), interrupted);
+
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: None,
+                status: Some("cancelled".into()),
+                team: None,
+            }));
+            assert_ne!(dash.is_error, Some(true));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let tasks = body["tasks"].as_array().expect("tasks must be array");
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["taskId"], "interrupted");
+            assert_eq!(tasks[0]["status"], "cancelled");
+            assert_eq!(tasks[0]["interrupted"], true);
+            assert_eq!(tasks[0]["hasResult"], true);
         }
 
         #[test]

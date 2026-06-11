@@ -847,6 +847,7 @@ mod tests {
             cost_usd: None,
             num_turns: None,
             session_id: None,
+            interrupted: false,
         }
     }
 
@@ -857,6 +858,7 @@ mod tests {
             cost_usd: None,
             num_turns: None,
             session_id: None,
+            interrupted: false,
         }
     }
 
@@ -1196,6 +1198,7 @@ mod tests {
             cost_usd: None,
             num_turns: None,
             session_id: None,
+            interrupted: false,
         };
         state.observe_event(&serde_json::json!({"note": "n"}), &sink, 1_000);
 

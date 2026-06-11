@@ -1462,13 +1462,18 @@ impl Session {
             self.emitter.turn_end_diagnostics(turn_end.clone());
         }
 
-        self.emitter.result(
-            &final_text,
-            &self.total_usage,
-            self.turns,
-            None,
-            suspicious.then_some(&turn_end),
-        );
+        if matches!(break_reason, "cancelled" | "interrupted_dispatch") {
+            self.emitter
+                .result_interrupted(&final_text, &self.total_usage, self.turns);
+        } else {
+            self.emitter.result(
+                &final_text,
+                &self.total_usage,
+                self.turns,
+                None,
+                suspicious.then_some(&turn_end),
+            );
+        }
         // Drain the sidecar event-log writer at the turn boundary — bounds
         // the crash-durability gap to the current turn while keeping
         // per-event appends off the runtime workers (event_log.rs).
