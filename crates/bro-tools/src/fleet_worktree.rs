@@ -2137,7 +2137,7 @@ mod tests {
     async fn exit_merge_folds_down_committed_branch_and_removes_worktree() {
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
@@ -2262,7 +2262,7 @@ mod tests {
         // and leaves origin/main untouched.
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
@@ -2324,7 +2324,7 @@ mod tests {
         // supplied.
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
@@ -2487,7 +2487,7 @@ mod tests {
         // Rebase → FfMerge → Push → Remove.
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
@@ -2619,7 +2619,7 @@ mod tests {
         // have succeeded.
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
@@ -2704,7 +2704,7 @@ mod tests {
     async fn run_closeout_phases_dry_run_returns_preflight_only_and_mutates_nothing() {
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
@@ -2816,7 +2816,7 @@ mod tests {
     async fn run_closeout_phases_dry_run_publish_without_message_fails_in_preflight() {
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
@@ -2875,7 +2875,7 @@ mod tests {
         let repo_root = repo.path().canonicalize().unwrap();
         let origin = tempfile::tempdir().unwrap();
         let origin_root = origin.path().canonicalize().unwrap();
-        run_git(&origin_root, &["init", "--bare"]);
+        run_git(&origin_root, &["init", "--bare", "-b", "main"]);
         run_git(
             &repo_root,
             &["remote", "add", "origin", origin_root.to_str().unwrap()],
@@ -2966,7 +2966,7 @@ mod tests {
         let repo_root = repo.path().canonicalize().unwrap();
         let origin = tempfile::tempdir().unwrap();
         let origin_root = origin.path().canonicalize().unwrap();
-        run_git(&origin_root, &["init", "--bare"]);
+        run_git(&origin_root, &["init", "--bare", "-b", "main"]);
         run_git(
             &repo_root,
             &["remote", "add", "origin", origin_root.to_str().unwrap()],
@@ -3409,7 +3409,7 @@ mod tests {
     -> (tempfile::TempDir, tempfile::TempDir, Value, PathBuf, String) {
         let repo = seed_repo();
         let origin = tempfile::tempdir().unwrap();
-        run_git(origin.path(), &["init", "--bare"]);
+        run_git(origin.path(), &["init", "--bare", "-b", "main"]);
         run_git(
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],

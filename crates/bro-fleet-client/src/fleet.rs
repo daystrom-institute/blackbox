@@ -2738,15 +2738,66 @@ mod tests {
             ],
         );
 
-        assert!(
-            wt.join("target").join("debug").join("artifact").is_file(),
-            "target must be cloned: {outcomes:?}"
-        );
-        assert!(outcomes[0].contains("cloned"), "{outcomes:?}");
+        // The CoW branch (`cp --reflink=always` on Linux, `cp -Rc` on macOS)
+        // is best-effort and only succeeds on filesystems that support
+        // reflinks (APFS, btrfs, xfs). tmpfs/ext4/etc. have no reflink and
+        // `seed_worktree_dirs` must skip with a reason rather than fall
+        // back to a physical copy (a plain copy of a multi-GB target is
+        // more expensive than the cold build it is meant to avoid).
+        //
+        // Probe the actual filesystem by running the same `cp` invocation
+        // against a tiny file in the test's tempdir — host-config
+        // independent, runs against whatever filesystem `tempfile`
+        // happened to allocate (typically tmpfs on Linux CI).
+        let cow_supported = probe_cow_reflink_supported(tmp.path());
+        if cow_supported {
+            assert!(
+                wt.join("target").join("debug").join("artifact").is_file(),
+                "target must be cloned when CoW is supported: {outcomes:?}"
+            );
+            assert!(outcomes[0].contains("cloned"), "{outcomes:?}");
+        } else {
+            assert!(
+                !wt.join("target").join("debug").join("artifact").is_file(),
+                "target must NOT be cloned when CoW is unsupported: {outcomes:?}"
+            );
+            assert!(outcomes[0].contains("skipped"), "{outcomes:?}");
+            assert!(
+                outcomes[0].contains("cow clone failed")
+                    || outcomes[0].contains("reflink")
+                    || outcomes[0].contains("cp"),
+                "skip reason must reference the CoW failure: {outcomes:?}"
+            );
+        }
         assert!(outcomes[1].contains("missing in base"), "{outcomes:?}");
         assert!(outcomes[2].contains("already present"), "{outcomes:?}");
         assert!(outcomes[3].contains("refused"), "{outcomes:?}");
         assert!(outcomes[4].contains("refused"), "{outcomes:?}");
+    }
+
+    /// Detect whether the filesystem under `dir` supports copy-on-write
+    /// reflinks via the same `cp` invocation `clone_dir_cow` uses. macOS
+    /// uses `cp -Rc` (clonefile / APFS); other unices use
+    /// `cp --reflink=always` (btrfs / xfs). Returns true iff the probe
+    /// `cp` exits 0 — failure modes include `Operation not supported`
+    /// (tmpfs, ext4) and `Invalid argument` (some FUSE mounts). The
+    /// probe always cleans up after itself.
+    fn probe_cow_reflink_supported(dir: &std::path::Path) -> bool {
+        let src = dir.join("cow_probe_src");
+        let dst = dir.join("cow_probe_dst");
+        // Use a multi-block file so filesystems that gate reflink on
+        // extent size still get a real probe.
+        std::fs::write(&src, vec![0u8; 4096 * 4]).unwrap();
+        let mut cmd = std::process::Command::new("cp");
+        #[cfg(target_os = "macos")]
+        cmd.arg("-Rc");
+        #[cfg(not(target_os = "macos"))]
+        cmd.args(["--reflink=always"]);
+        let out = cmd.arg(&src).arg(&dst).output();
+        let supported = matches!(&out, Ok(o) if o.status.success());
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+        supported
     }
 
     #[test]
