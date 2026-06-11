@@ -9,5 +9,6 @@
   "dedupe_key": "tooling/daemon-runtime/concurrency-migration-debt-allows",
   "notes": "Peeled from thread-423633a5 and thread-935b467d at concurrency campaign close. Each site is independent; no ordering constraint. Site list verified against live code 2026-06-11.",
   "resolution": "unresolved",
-  "created_at": "2026-06-11T16:33:52Z"
+  "created_at": "2026-06-11T16:33:52Z",
+  "updated_at": "2026-06-11T16:33:52Z"
 }
