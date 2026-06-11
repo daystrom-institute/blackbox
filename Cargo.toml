@@ -37,6 +37,7 @@ members = [
     "crates/bbox-artifacts",
     "crates/bbox-knowledge",
     "crates/bbox-threads",
+    "crates/bbox-gaps",
 ]
 
 [package]
@@ -195,6 +196,7 @@ bbox-config = { path = "crates/bbox-config" }
 bbox-artifacts = { path = "crates/bbox-artifacts" }
 bbox-knowledge = { path = "crates/bbox-knowledge" }
 bbox-threads = { path = "crates/bbox-threads" }
+bbox-gaps = { path = "crates/bbox-gaps" }
 
 [dev-dependencies]
 filetime = "0.2"

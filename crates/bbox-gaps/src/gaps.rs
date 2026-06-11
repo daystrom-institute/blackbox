@@ -180,7 +180,7 @@ pub struct GapNote {
     /// should carry the repo-owned gap file while `project` remains the durable
     /// base scope. Never serialized into committed gap records.
     #[serde(skip)]
-    pub(crate) write_dir: Option<String>,
+    pub write_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -414,7 +414,7 @@ pub struct GapFileParams {
     /// schema.
     #[serde(skip)]
     #[schemars(skip)]
-    pub(crate) write_dir: Option<String>,
+    pub write_dir: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
     #[serde(default)]
@@ -654,7 +654,7 @@ fn persist_repo_gap_entries(
         if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
             continue;
         }
-        crate::json_store::atomic_write_json_locked(&path, &on_disk)?;
+        bbox_corpus_core::json_store::atomic_write_json_locked(&path, &on_disk)?;
     }
     Ok(())
 }
@@ -753,7 +753,7 @@ impl GapStore {
                 _ => central.gaps.push(g.clone()),
             }
         }
-        crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
+        bbox_corpus_core::json_store::atomic_write_json_locked(&self.store_path, &central)?;
         let loaded: HashSet<&Path> = self.project_roots.iter().map(|p| p.as_path()).collect();
         let known_ids: BTreeSet<&str> = self.data.gaps.iter().map(|g| g.id.as_str()).collect();
         for (dir, entries) in &by_project {
@@ -764,7 +764,7 @@ impl GapStore {
     }
 
     fn now_iso() -> String {
-        crate::util::now_iso()
+        bbox_util::util::now_iso()
     }
 
     fn gen_id() -> String {
@@ -803,7 +803,7 @@ impl GapStore {
     /// hit). The boolean is true when a NEW gap was created.
     pub fn file(&mut self, p: &GapFileParams) -> Result<(String, bool)> {
         let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
+        bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
             self.file_locked(p)
         })
@@ -896,7 +896,7 @@ impl GapStore {
     /// same open-duplicate dedupe by key+scope. Returns (id, created).
     pub fn ingest(&mut self, mut gap: GapNote) -> Result<(String, bool)> {
         let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
+        bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
             if let Some(existing) = self.open_duplicate(&gap.dedupe_key, gap.project.as_deref()) {
                 return Ok((existing.id.clone(), false));
@@ -922,7 +922,7 @@ impl GapStore {
 
     pub fn resolve(&mut self, p: &GapResolveParams) -> Result<String> {
         let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
+        bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
             self.resolve_locked(p)
         })
@@ -998,7 +998,7 @@ impl GapStore {
 
     pub fn update(&mut self, p: &GapUpdateParams) -> Result<String> {
         let path = self.store_path.clone();
-        crate::json_store::with_store_lock(&path, || {
+        bbox_corpus_core::json_store::with_store_lock(&path, || {
             self.reload()?;
             self.update_locked(p)
         })
@@ -1240,10 +1240,10 @@ impl GapStore {
 /// gap-store coupling; the body composition stays in `Packets`.
 pub fn emit_companion_packet_gap_note(
     gaps_lock: &parking_lot::RwLock<GapStore>,
-    ev: &crate::packets::PacketEvent,
-    params: &crate::packets::GapParams,
+    ev: &bbox_packets::PacketEvent,
+    params: &bbox_packets::GapParams,
 ) -> Option<String> {
-    use crate::packets::Packets;
+    use bbox_packets::Packets;
 
     let dedupe_key = Packets::gap_dedupe_key(
         ev.domain.as_deref(),
@@ -1256,7 +1256,7 @@ pub fn emit_companion_packet_gap_note(
         Ok(v) => v,
         Err(e) => return Some(format!("companion gap note build failed: {e:#}")),
     };
-    let gap = match GapNote::from_envelope(&value, String::new(), crate::util::now_iso()) {
+    let gap = match GapNote::from_envelope(&value, String::new(), bbox_util::util::now_iso()) {
         Ok(g) => g,
         Err(e) => return Some(format!("companion gap note build failed: {e:#}")),
     };
@@ -1626,7 +1626,7 @@ mod tests {
 /// bridge, and the leaf crate must stay free of gap-store coupling.
 #[cfg(test)]
 mod packet_companion_tests {
-    use crate::packets::{GapParams, Packets};
+    use bbox_packets::{GapParams, Packets};
     use tempfile::TempDir;
 
     #[test]

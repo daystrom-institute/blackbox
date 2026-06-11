@@ -194,7 +194,7 @@ fn import_one(
     // Build the typed gap from the envelope; per-file rejection on a malformed
     // or incomplete envelope (missing required field). Open-duplicate dedupe by
     // `dedupe_key` + scope is handled inside `GapStore::ingest`.
-    let mut gap = match GapNote::from_envelope(&value, String::new(), crate::util::now_iso()) {
+    let mut gap = match GapNote::from_envelope(&value, String::new(), bbox_util::util::now_iso()) {
         Ok(gap) => gap,
         Err(err) => {
             reject_file(report, source, path, format!("invalid gap envelope: {err}"))?;
@@ -210,7 +210,7 @@ fn import_one(
             path: path.display().to_string(),
             sha256: hash,
             gap_id: gap_id.clone(),
-            imported_at: crate::util::now_iso(),
+            imported_at: bbox_util::util::now_iso(),
         });
         report.imported.push(ImportedGapFile {
             path: path.display().to_string(),
@@ -304,7 +304,7 @@ fn save_state(path: &Path, state: &ImportState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    crate::json_store::atomic_write_json_locked(path, state)
+    bbox_corpus_core::json_store::atomic_write_json_locked(path, state)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
