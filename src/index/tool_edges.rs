@@ -12,7 +12,7 @@ use crate::entity_ref::EntityRef;
 use crate::parser::{self, ParsedEvent, ToolCallInfo, ToolCallKind};
 use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
 
-pub(super) struct ToolEdgeContext {
+pub struct ToolEdgeContext {
     projects: Vec<ProjectRecord>,
     edges_dir: PathBuf,
     emit_sidecars: bool,

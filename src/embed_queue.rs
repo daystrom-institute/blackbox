@@ -407,9 +407,7 @@ pub(crate) fn enqueue_transcript(
 
 // Entity-id construction for project-file chunks lives with the index
 // engine (`index::embed_hook`); re-exported here for the embed-side callers.
-pub(crate) use crate::index::embed_hook::{
-    project_file_entity_id, project_file_entity_id_for_snapshot,
-};
+pub(crate) use crate::index::embed_hook::project_file_entity_id;
 
 pub(crate) fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();

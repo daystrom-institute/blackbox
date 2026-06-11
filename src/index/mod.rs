@@ -1079,6 +1079,7 @@ mod search;
 mod thread_docs;
 mod tool_edges;
 mod writer_actor;
+pub(crate) mod passes;
 
 pub use helpers::find_session_file;
 pub(crate) use knowledge_docs::{
