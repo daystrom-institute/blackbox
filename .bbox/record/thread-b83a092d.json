@@ -1,0 +1,11 @@
+{
+  "id": "thread-b83a092d",
+  "topic": "Concurrency campaign residuals: status-snapshot publication, Phase 4 enforcement, §4.6 runtime-split decision",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Peeled from thread-935b467d at campaign close (waves 0-12 landed; full record there). Three items remain, all gated rather than blocked:\n\n1. STATUS-SNAPSHOT PUBLICATION (evidence-gated): publish per-task status snapshots so bro_status/control reads stop taking task.inner locks at all. Only pursue if inner-mutex contention shows in poll-histogram evidence — post-A1 the marginal value was judged unclear; the wave-7 histogram opt-in (8b3dc19) is the measuring instrument.\n\n2. PHASE 4 ENFORCEMENT LINT: mechanical guard against reintroducing the defect taxonomy (P1 blocking-I/O-on-workers, P2 lock-across-I/O) — clippy lint config, custom xtask check, or review-packet over diffs. The campaign closed defects by hand; nothing stops a future bolt-on from regressing. design/daemon-runtime/concurrency-model.md §5 has the invariants to enforce.\n\n3. §4.6 RUNTIME-SPLIT DECISION (measurement-gated): dedicated tokio runtime for in-process agent loops — instrumented, undecided. REQUIRES a compile-free streaming-agent load test (note 22 of the campaign thread: every prior under-load sample was confounded by host rustc storms). NOW CHEAP to run: with sccache+seed_dirs landed, dispatched bros doing pure-LLM/tool work no longer trigger compile storms — dispatch 3-4 chatty bros on non-build tasks and read /admin/runtime-metrics. Decision rule from the campaign: under-load mean poll must drop toward the idle profile (~236µs class); if it stays 10x+ above, split.\n\nCLOSED BY PEERS (do not re-do): edge-rebuild guard-stacking + gaps-store blocking treatment (wave-12, 7fbf3af); dispatch-plane blocking under further audit in peer worktree ts-w13."
+  ],
+  "created_at": "2026-06-10T22:39:25Z",
+  "resolved_at": "2026-06-11T16:34:37Z"
+}

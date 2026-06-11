@@ -1,0 +1,13 @@
+{
+  "id": "gap-79a3edef",
+  "title": "Concurrency campaign migration-debt #[allow] site cleanup",
+  "gap_kind": "tooling",
+  "domain": "daemon-runtime",
+  "wanted_capability": "Resolve every reasoned #[allow(clippy::disallowed_methods)] and lint-concurrency exemption referencing thread-935b467d. Concrete sites: orchestrate.rs (4 webhook/poller persists → StorePersister or run_blocking), roadmap.rs (ROADMAP.md render write → blocking pool), projects.rs (3 scaffolding writes → run_blocking; std::thread::spawn backfill → server/background), bro-harness codex_auth.rs (token refresh read/write → spawn_blocking), bro-harness bound.rs (oversized-result spill → spawn_blocking). Also sweep the doc-flagged I2 instances not yet annotated: apply_patch, enter/exit_worktree, whiteboards, bro_mcp, gaps persister.",
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/daemon-runtime/concurrency-migration-debt-allows",
+  "notes": "Peeled from thread-423633a5 and thread-935b467d at concurrency campaign close. Each site is independent; no ordering constraint. Site list verified against live code 2026-06-11.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T16:33:52Z"
+}
