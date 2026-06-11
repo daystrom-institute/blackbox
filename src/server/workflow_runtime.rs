@@ -234,7 +234,7 @@ impl BlackboxServer {
         };
         args.extend(dispatch_filters.args);
 
-        let task = orch::spawn_task(
+        let task = orch::spawn_task_with_tool_placement(
             task_id,
             provider,
             args,
@@ -247,6 +247,12 @@ impl BlackboxServer {
             Some(self.state.roster_events()),
             None,
             None,
+            None,
+            // Resume turns must re-carry the tool-arg default/pin table
+            // (session default + managed-worktree project_dir pin) — the
+            // fresh branch gets it via dispatch_fresh_bro_task; the legacy
+            // spawn_task wrapper silently dropped it here.
+            ambient_ctx.tool_arg_defaults(),
             Some(self.state.system_events.clone()),
             // workflow_dispatch_executor's resume branch — also
             // workflow origin (matches the dispatch_fresh_bro_task
@@ -479,5 +485,46 @@ impl BlackboxServer {
     /// can mutate locally without affecting the registry.
     pub(crate) fn resolve_workflow_by_id(&self, id: &str) -> Option<workflow::Workflow> {
         self.state.workflow_registry.read().get(id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Behavioral coverage of `workflow_dispatch_executor` would spawn real
+    /// provider processes, so the tool-arg-default routing is pinned at the
+    /// source seam instead: both branches must go through a
+    /// `tool_defaults`-carrying spawn. The fresh branch routes through
+    /// `dispatch_fresh_bro_task` (which passes
+    /// `ambient_ctx.tool_arg_defaults()` into
+    /// `spawn_task_with_tool_placement`); the resume branch must do the same
+    /// directly — the legacy `spawn_task` wrapper hardcodes
+    /// `tool_defaults: None` and silently drops the session default +
+    /// worktree pin.
+    #[test]
+    fn workflow_dispatch_routes_through_tool_defaults_carrying_spawn() {
+        let src = include_str!("workflow_runtime.rs");
+        // Needles are concat!-split so this test's own source (included
+        // above) can't satisfy or trip them.
+        let legacy_spawn = concat!("orch::spawn_", "task(");
+        assert!(
+            !src.contains(legacy_spawn),
+            "workflow_runtime regressed to the legacy spawn_task wrapper, \
+             which drops tool_arg_defaults"
+        );
+        let placement_spawn = concat!("orch::spawn_", "task_with_tool_placement(");
+        assert!(
+            src.contains(placement_spawn),
+            "workflow resume dispatch must use the tool_defaults-carrying spawn"
+        );
+        let ambient_defaults = concat!("ambient_ctx.tool_", "arg_defaults()");
+        assert!(
+            src.contains(ambient_defaults),
+            "workflow resume dispatch must pass the ambient tool-arg default table"
+        );
+        let fresh_path = concat!("dispatch_fresh_", "bro_task");
+        assert!(
+            src.contains(fresh_path),
+            "workflow fresh dispatch must keep routing through dispatch_fresh_bro_task"
+        );
     }
 }

@@ -1,7 +1,7 @@
 ---
 title: "Tool-arg defaulting: host-bound context for dispatched sessions"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
@@ -125,3 +125,38 @@ breaking:
 5. Daemon dispatch surfaces populate the table mechanically: `cwd`/worktree
    pins from fleet/workflow worktree creation; ambient ids (session, bro,
    thread, project) as defaults for the bbox coordination tools.
+
+## 7. Status note (2026-06-11): step-5 worktree pins are live
+
+Step 5's worktree-pin half is implemented (gap-8144b4b5). Every daemon
+dispatch path that carries the table — `bro_exec`/`bro_resume`, agent
+dispatch, the workflow executor's fresh *and* resume turns (the resume branch
+previously routed through the legacy `spawn_task` wrapper and silently
+dropped the table), fleet cockpit via the control plane — now emits, from
+`AmbientContext::tool_arg_defaults()` (src/orchestration/mod.rs):
+
+- `default:mcp.bbox_note.session_id=<session>` (pre-existing), and
+- `pin:*.project_dir=<canonical worktree root>` when the dispatch cwd is a
+  daemon-managed worktree.
+
+Detection is **one mechanical choke point** (`worktree_pin_target`), not
+per-site emission at each worktree-creation surface, so fleet, agent, and
+workflow dispatches can't drift apart. Two structural signals: (1) cwd under
+a cockpit-managed parent (`bro_home/{fleet,agent}/worktrees`, the
+`managed_worktrees` helpers); (2) cwd inside a *linked* git worktree
+(nearest `.git` marker walking up is a file pointing into
+`<base>/.git/worktrees/<name>`). Signal (2) is what covers workflow
+`WorktreeCreate` worktrees — they land at arbitrary operator-chosen
+`args.path` locations a root-prefix check cannot see, but every
+daemon-created worktree is structurally a linked worktree. A plain repo
+checkout (`.git` *directory*) never pins. Operator-created linked worktrees
+also match; accepted deliberately — a dispatch confined to a worktree wants
+the same confinement semantics regardless of who ran `git worktree add`.
+The `pin:*.project_dir` glob is safe per §3.1: the project-scoped
+coordination tools (notes/knowledge) take `project`, not `project_dir`; a
+schema-drift tripwire test pins that assumption.
+
+Still pending from step 5: ambient-id *defaults* beyond
+`bbox_note.session_id` (e.g. `project` defaults for the coordination tools)
+remain decision-gated under gap-ae22a6b2 — absence of `project` means global
+scope (§3.1) and must not be mechanically filled without that decision.

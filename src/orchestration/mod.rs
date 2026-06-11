@@ -1921,11 +1921,29 @@ impl AmbientContext {
     }
 
     pub fn tool_arg_defaults(&self) -> Option<BTreeMap<String, String>> {
-        let session_id = self.session_field()?;
-        Some(BTreeMap::from([(
-            "default:mcp.bbox_note.session_id".to_string(),
-            session_id.to_string(),
-        )]))
+        let mut defaults = BTreeMap::new();
+        if let Some(session_id) = self.session_field() {
+            defaults.insert(
+                "default:mcp.bbox_note.session_id".to_string(),
+                session_id.to_string(),
+            );
+        }
+        // Worktree confinement pin (design/bro-harness/tool-arg-defaulting.md
+        // §5): when the dispatch cwd is a daemon-managed worktree, pin every
+        // tool's `project_dir` param to the canonical worktree root. A model
+        // passing a different tree (usually the primary checkout) is confused;
+        // the pin refuses with an explanatory error instead of letting the
+        // call land in the wrong tree. Safe as a glob because the
+        // project-scoped coordination tools (notes/knowledge) take `project`,
+        // not `project_dir` — see the schema-drift tripwire test. Plain repo
+        // dispatches (`.git` directory) never pin.
+        if let Some(worktree) = self.project_dir.as_deref().and_then(worktree_pin_target) {
+            defaults.insert(
+                "pin:*.project_dir".to_string(),
+                worktree.to_string_lossy().into_owned(),
+            );
+        }
+        (!defaults.is_empty()).then_some(defaults)
     }
 }
 
@@ -2504,6 +2522,57 @@ fn project_dispatch_shell_env(
     let cfg = bro_fleet_client::FleetConfig::load();
     let env = cfg.project_dispatch_for(&base)?.env.clone();
     (!env.is_empty()).then_some(env)
+}
+
+/// Resolve the worktree-confinement pin target for a dispatch cwd: the
+/// canonical worktree root when `cwd` lies inside a daemon-managed worktree,
+/// `None` otherwise (plain repos and non-repo dirs never pin).
+///
+/// ONE mechanical choke point for every dispatch path (bro_exec/bro_resume,
+/// agent dispatch, workflow executor dispatch + resume, fleet cockpit — all
+/// of which funnel through `AmbientContext::tool_arg_defaults`), rather than
+/// per-site emission at each worktree-creation surface. Two structural
+/// signals, checked in order:
+///
+/// 1. cwd under a cockpit-managed parent (`bro_home/{fleet,agent}/worktrees`)
+///    — the fleet/agent worktree layout, via `managed_worktrees`.
+/// 2. cwd inside a *linked* git worktree (nearest `.git` marker walking up is
+///    a file pointing into `<base>/.git/worktrees/<name>`). This is the
+///    structural signature of every daemon-created worktree — including
+///    workflow `WorktreeCreate` worktrees, which land at arbitrary
+///    operator-chosen paths a root-prefix check can't cover. A `.git`
+///    *directory* (primary checkout) short-circuits to `None`.
+fn worktree_pin_target(cwd: &str) -> Option<std::path::PathBuf> {
+    worktree_pin_target_with_roots(
+        cwd,
+        &crate::managed_worktrees::cockpit_managed_worktree_roots(),
+    )
+}
+
+fn worktree_pin_target_with_roots(
+    cwd: &str,
+    managed_roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    if let Some(wt) = crate::managed_worktrees::managed_worktree_path_for_cwd(cwd, managed_roots) {
+        let wt = wt.canonicalize().unwrap_or(wt);
+        return Some(wt);
+    }
+    let cwd = std::path::Path::new(cwd.trim());
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut current = cwd.as_path();
+    loop {
+        let dot_git = current.join(".git");
+        if dot_git.is_dir() {
+            // Primary checkout / plain repo: deliberately no pin.
+            return None;
+        }
+        if dot_git.is_file() {
+            // Only the linked-worktree shape qualifies; a malformed .git
+            // file fails closed to no pin.
+            return worktree_base_repo(current).map(|_| current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
 }
 
 /// Map a linked-worktree path to its base repository (the directory whose
@@ -6101,6 +6170,128 @@ mod tests {
             ..Default::default()
         };
         assert!(pending.tool_arg_defaults().is_none());
+    }
+
+    /// Build a linked-worktree pair under `root`: a base repo whose
+    /// `.git/worktrees/wt` backs a sibling worktree `wt` (`.git` file).
+    fn fake_linked_worktree(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = root.join("repo");
+        let wt = root.join("wt");
+        std::fs::create_dir_all(base.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", base.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        (base, wt)
+    }
+
+    #[test]
+    fn ambient_tool_defaults_pin_project_dir_for_worktree_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (_base, wt) = fake_linked_worktree(&root);
+
+        // Dispatch cwd is a subdir of the worktree: the pin resolves to the
+        // canonical worktree root, and the session default rides along.
+        let ctx = AmbientContext {
+            session_id: Some("sess-wt".into()),
+            project_dir: Some(wt.join("src").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("session default + pin");
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(
+            defaults
+                .get("default:mcp.bbox_note.session_id")
+                .map(String::as_str),
+            Some("sess-wt")
+        );
+        assert_eq!(
+            defaults.get("pin:*.project_dir").map(String::as_str),
+            Some(wt.to_string_lossy().as_ref())
+        );
+
+        // A pending session still carries the worktree pin (pin only).
+        let pending = AmbientContext {
+            session_id: Some("pending".into()),
+            project_dir: Some(wt.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let defaults = pending.tool_arg_defaults().expect("pin only");
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(
+            defaults.get("pin:*.project_dir").map(String::as_str),
+            Some(wt.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn ambient_tool_defaults_no_pin_for_plain_repo_cwd() {
+        // Plain repo (.git directory): session default only — a primary
+        // checkout dispatch must never get a project_dir pin.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+
+        let ctx = AmbientContext {
+            session_id: Some("sess-plain".into()),
+            project_dir: Some(repo.join("src").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("session default");
+        assert_eq!(defaults.len(), 1);
+        assert!(!defaults.contains_key("pin:*.project_dir"));
+    }
+
+    #[test]
+    fn worktree_pin_target_maps_cockpit_managed_roots() {
+        // Managed-parent branch: bro_home/{fleet,agent}/worktrees/<repo>/<slug>
+        // pins to the worktree dir even without the linked-worktree .git shape.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("fleet")
+            .join("worktrees");
+        let wt = root.join("repo").join("task-1");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: placeholder\n").unwrap();
+
+        assert_eq!(
+            super::worktree_pin_target_with_roots(
+                wt.join("src").to_str().unwrap(),
+                &[root.clone()]
+            ),
+            Some(wt.clone())
+        );
+        // The managed parent itself is not a worktree.
+        assert_eq!(
+            super::worktree_pin_target_with_roots(root.to_str().unwrap(), &[root.clone()]),
+            None
+        );
+    }
+
+    #[test]
+    fn project_dir_pin_glob_is_safe_for_project_scoped_tools() {
+        // `pin:*.project_dir` globs every tool's `project_dir` param. That is
+        // safe (design/bro-harness/tool-arg-defaulting.md §3.1) because the
+        // project-scoped coordination tools take `project`, not `project_dir`
+        // — absence there means *global scope* and must stay free. Tripwire:
+        // if these adapters ever grow a `project_dir` param, re-check the
+        // glob before shipping.
+        for (name, src) in [
+            ("notes", include_str!("../tools/notes.rs")),
+            ("knowledge", include_str!("../tools/knowledge.rs")),
+        ] {
+            assert!(
+                !src.contains("project_dir"),
+                "src/tools/{name}.rs now mentions project_dir; re-check pin:*.project_dir glob safety"
+            );
+        }
     }
 
     #[test]
