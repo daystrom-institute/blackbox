@@ -151,6 +151,13 @@ pub struct RosterSummaryV1 {
     /// control. Additive marker layered on top of `status=cancelled`.
     #[serde(default)]
     pub interrupted: bool,
+    /// Bounded error teaser for failed/cancelled tasks — populated from
+    /// `TaskInner.stderr` (trimmed, last line, capped at 200 chars).
+    /// The fleet cockpit renders this in the zoom transcript when the task
+    /// is Interrupted so the operator sees why a dispatch failed without
+    /// querying `bro_status`. Additive+optional — absent for live/healthy tasks.
+    #[serde(default)]
+    pub error_teaser: Option<String>,
 }
 
 /// Structured form of a `bro_report` payload, projected into the
@@ -291,6 +298,7 @@ mod tests {
             agent_label: Some("team-x::member-y".to_string()),
             report_full: None,
             interrupted: false,
+            error_teaser: None,
         };
         let value = serde_json::to_value(&summary).unwrap();
         let obj = value.as_object().expect("summary must serialize as object");

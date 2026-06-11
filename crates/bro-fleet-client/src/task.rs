@@ -170,9 +170,9 @@ fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
             report_message: task.report,
             cost_usd: task.cost,
             num_turns: task.turns,
-            stderr: String::new(),
+            stderr: task.error_teaser.unwrap_or_default(),
             status: task.status,
-            started_at: task.last_event_at.unwrap_or(now),
+            started_at: task.started_at.unwrap_or_else(|| task.last_event_at.unwrap_or(now)),
             completed_at,
             cwd: task.cwd,
             bro_label: task.name.or(task.label),
@@ -212,6 +212,13 @@ fn update_task_from_roster(existing: &Task, task: RosterSummaryV1) {
     inner.origin = task.origin;
     inner.managed_worktree = task.managed_worktree;
     inner.workflow_owned = task.workflow_owned;
+    // Propagate daemon-reported error teaser into stderr so the
+    // fleet TUI can render it in the zoom view. Only overwrite when
+    // the daemon provides a teaser; a local synthetic error (from
+    // handle_from_response) is preserved as-is.
+    if let Some(teaser) = task.error_teaser {
+        inner.stderr = teaser;
+    }
     drop(inner);
     existing.notify.notify_waiters();
 }
@@ -243,6 +250,7 @@ mod tests {
             agent_label: Some(format!("agent-{id}")),
             report_full: None,
             interrupted: false,
+            error_teaser: None,
         }
     }
 

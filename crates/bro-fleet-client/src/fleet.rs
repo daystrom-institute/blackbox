@@ -2570,6 +2570,7 @@ mod tests {
             agent_label: Some(format!("agent-{id}")),
             report_full: None,
             interrupted: false,
+            error_teaser: None,
         }
     }
 

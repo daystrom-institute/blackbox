@@ -194,7 +194,8 @@ impl BlackboxServer {
                     "sessionId": session_id_str,
                     "status": s.status,
                     "elapsed": elapsed,
-                    "hasResult": s.last_message_snippet.is_some(),
+                    "hasResult": s.status.is_terminal() && s.last_message_snippet.is_some(),
+                    "hasLastMessage": s.last_message_snippet.is_some(),
                 });
                 if let Some(name) = bro_name {
                     entry["bro"] = Value::String(name);
@@ -1512,6 +1513,7 @@ mod tests {
                     reported_ago: "0s".to_string(),
                 }),
                 interrupted: false,
+                error_teaser: None,
             }
         }
 
@@ -1542,6 +1544,7 @@ mod tests {
                 agent_label: Some(format!("agent-{id}@v1")),
                 report_full: None,
                 interrupted: false,
+                error_teaser: None,
             }
         }
 
@@ -1593,7 +1596,8 @@ mod tests {
             assert_eq!(live["provider"], "glm");
             assert_eq!(live["status"], "running");
             assert_eq!(live["sessionId"], "sess-live-1");
-            assert!(live["hasResult"].as_bool().unwrap_or(false));
+            assert!(!live["hasResult"].as_bool().unwrap_or(true), "live task must not report hasResult=true");
+            assert!(live["hasLastMessage"].as_bool().unwrap_or(false), "live task with snippet should have hasLastMessage=true");
             assert_eq!(live["broLabel"], "team::executor");
             assert_eq!(live["agentLabel"], "agent-live-1@v1");
             assert_eq!(live["report"]["message"], "writing focused tests");
@@ -1610,11 +1614,13 @@ mod tests {
             // Terminal task: status is `completed`, elapsed is
             // `completed_at - started_at` = 1500ms = "1s", and
             // `hasResult` is false (no last_message_snippet).
+            // `hasLastMessage` is also false (no snippet at all).
             let term = by_id.get("term-1").expect("term-1 row present");
             assert_eq!(term["provider"], "deepseek");
             assert_eq!(term["status"], "completed");
             assert_eq!(term["sessionId"], "sess-term-1");
             assert!(!term["hasResult"].as_bool().unwrap_or(true));
+            assert!(!term["hasLastMessage"].as_bool().unwrap_or(true));
             assert_eq!(term["broLabel"], "team::reviewer");
             assert_eq!(term["agentLabel"], "agent-term-1@v1");
             assert_eq!(term["elapsed"], "1s");
@@ -1876,7 +1882,8 @@ mod tests {
             assert_eq!(live["status"], "running");
             assert_eq!(live["broLabel"], "team::executor");
             assert_eq!(live["agentLabel"], "agent-live-1@v1");
-            assert!(live["hasResult"].as_bool().unwrap_or(false));
+            assert!(!live["hasResult"].as_bool().unwrap_or(true), "live task must not report hasResult");
+            assert!(live["hasLastMessage"].as_bool().unwrap_or(false), "live task with message should have hasLastMessage");
 
             let done = by_id.get("done-1").expect("done-1 row");
             assert_eq!(done["provider"], "deepseek");

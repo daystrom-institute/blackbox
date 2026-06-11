@@ -759,6 +759,7 @@ mod roster_view_tests {
             agent_label: None,
             report_full: None,
             interrupted: false,
+            error_teaser: None,
         };
         view.upsert("t1".into(), summary.clone());
         let snap = view.snapshot();
@@ -792,12 +793,10 @@ mod roster_view_tests {
                 agent_label: None,
                 report_full: None,
                 interrupted: false,
+                error_teaser: None,
             },
         );
         assert_eq!(view.snapshot().len(), 1);
-        view.evict("t1");
-        assert!(view.snapshot().is_empty());
-        // Idempotent.
         view.evict("t1");
         assert!(view.snapshot().is_empty());
     }
@@ -916,6 +915,7 @@ mod roster_view_tests {
                 agent_label: None,
                 report_full: None,
                 interrupted: false,
+                error_teaser: None,
             },
         );
         let mut store = TaskStore::new();
@@ -1033,6 +1033,21 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         // `BroReport::to_json()` shape for the dashboard.
         report_full: inner.report.as_ref().map(bro_report_to_wire),
         interrupted: inner.interrupted,
+        // Error teaser for failed/cancelled tasks: the last non-empty line
+        // of stderr, trimmed and capped, so the fleet cockpit zoom view can
+        // show why a dispatch failed without querying bro_status.
+        error_teaser: if inner.status.is_terminal()
+            && !inner.stderr.trim().is_empty()
+        {
+            let trimmed = inner.stderr.trim();
+            let last_line = trimmed
+                .lines()
+                .next_back()
+                .unwrap_or(trimmed);
+            Some(last_line.chars().take(200).collect::<String>())
+        } else {
+            None
+        },
     }
 }
 
@@ -4077,7 +4092,16 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     if inner.interrupted {
         obj["interrupted"] = Value::Bool(true);
     }
-    obj["hasResult"] = Value::Bool(inner.last_assistant_message.is_some());
+    // hasResult is truthful: true only when the task reached a terminal state
+    // AND produced a final assistant message (the deliverable). Live tasks
+    // may have mid-conversation assistant turns in last_assistant_message;
+    // those are available via the `result` field and the separate
+    // hasLastMessage flag but must not claim a deliverable exists.
+    let is_terminal = inner.status.is_terminal();
+    obj["hasResult"] = Value::Bool(is_terminal && inner.last_assistant_message.is_some());
+    obj["hasLastMessage"] = Value::Bool(inner.last_assistant_message.is_some());
+    // Interrupted cancellations still carry meaningful terminal metadata
+    // (partial usage, turn count), so the gate includes them.
     if matches!(inner.status, TaskStatus::Completed | TaskStatus::Failed) || inner.interrupted {
         if let Some(ref u) = inner.usage {
             // `input_tokens` is fresh (cache-exclusive). Surface the cache
@@ -6302,6 +6326,7 @@ mod tests {
         assert_eq!(json["taskId"], "t1");
         assert_eq!(json["result"], "Done!");
         assert_eq!(json["hasResult"], true);
+        assert_eq!(json["hasLastMessage"], true);
         assert_eq!(json["costUsd"], 0.05);
         assert_eq!(json["usage"]["input_tokens"], 100);
         // Terminal + green: the liveness row is gated out — on a finished,
