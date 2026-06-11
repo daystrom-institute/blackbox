@@ -4497,13 +4497,17 @@ fn roster_status_spans(app: &App, views: &[AgentView], order: &[usize]) -> Vec<S
     // identity disagrees with the cockpit's — keeps the warning
     // visible in every frame, not only the first time a tail event
     // fires. Same-version = zero visual change (banner is None).
-    if let Some(banner) = app.build_mismatch_banner() {
-        spans.push(Span::styled("──", dim));
-        spans.push(banner);
-    }
+    // Status flashes take precedence: when a transient status
+    // message is active, it claims this slot and the banner
+    // is suppressed for its duration; the banner returns when
+    // the flash expires. The one-time durable cockpit line
+    // already covers discoverability of the mismatch.
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
         spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
+    } else if let Some(banner) = app.build_mismatch_banner() {
+        spans.push(Span::styled("──", dim));
+        spans.push(banner);
     }
     // Scroll affordance: only when the roster overflows its visible body, so the
     // list reads as scrollable (the Table auto-scrolls to the selection; this
@@ -4611,13 +4615,14 @@ fn single_agent_status_spans(
     // D27: single-agent footer mirrors the roster footer's
     // build-mismatch banner. Long-lived cockpits in single-agent
     // zoom must see the same warning. Same-version = zero change.
-    if let Some(banner) = app.build_mismatch_banner() {
-        spans.push(Span::styled("──", dim));
-        spans.push(banner);
-    }
+    // Status flashes take precedence over the banner (see
+    // roster_status_spans for rationale).
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
         spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
+    } else if let Some(banner) = app.build_mismatch_banner() {
+        spans.push(Span::styled("──", dim));
+        spans.push(banner);
     }
     spans
 }

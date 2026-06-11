@@ -2284,3 +2284,84 @@ Trailing paragraph.";
         );
     }
 
+    // ---- N5: git-derived build identity + footer precedence -------
+
+    /// N5: the build_id is derived from `git rev-parse --short=12 HEAD`
+    /// (falling back to a Unix-seconds timestamp only when git is
+    /// unavailable). In-repo, the stamp must be a hex string (git SHA),
+    /// not a raw numeric timestamp — this verifies the build.rs
+    /// git-derivation path is active and the false-positive from
+    /// per-invocation SystemTime is gone.
+    #[test]
+    fn build_id_is_git_sha_not_timestamp() {
+        let (_cv, cb) = own_id();
+        assert!(
+            !cb.is_empty(),
+            "build_id must be non-empty"
+        );
+        // A git short SHA is all hex chars [0-9a-f]; a timestamp is all
+        // decimal digits. A build_id that starts with a hex letter
+        // (e.g. 'a'..'f') is definitively from git — timestamps never
+        // start with a-f. But we can't assume the SHA always leads
+        // with a letter (could be all decimal digits). Instead:
+        // timestamps are strictly decimal digits; git SHAs are hex.
+        assert!(
+            cb.chars().any(|c| c.is_ascii_hexdigit() && c.is_ascii_alphabetic()),
+            "build_id '{}' must contain at least one hex letter; \
+             an all-decimal string suggests the timestamp fallback \
+             is incorrectly active",
+            cb,
+        );
+    }
+
+    /// N5: when both a status flash and a build-mismatch banner
+    /// would occupy the footer slot, the transient status flash
+    /// takes precedence — the banner is suppressed for the
+    /// duration of the flash and returns when it expires.
+    #[test]
+    fn footer_status_flash_precedes_mismatch_banner() {
+        let (cv, _cb) = own_id();
+        // Construct an app with a mismatched daemon identity
+        // AND an active status flash.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        app.last_daemon_build = (Some(cv.clone()), Some("deadbeefcafe".to_string()));
+        app.status =
+            Some("Ctrl+K again to prune 3".to_string());
+
+        let views: Vec<AgentView> = Vec::new();
+        let order: Vec<usize> = Vec::new();
+        let spans = roster_status_spans(&app, &views, &order);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("");
+        assert!(
+            text.contains("Ctrl+K again to prune 3"),
+            "status flash must be visible in footer, got: {text}"
+        );
+        assert!(
+            !text.contains("restart cockpit"),
+            "build-mismatch banner must be suppressed while status flash is active, got: {text}"
+        );
+    }
+
+    /// N5: when no status flash is active, the build-mismatch banner
+    /// renders normally in the footer slot.
+    #[test]
+    fn footer_banner_shows_when_no_status_flash() {
+        let (cv, _cb) = own_id();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        app.last_daemon_build = (Some(cv.clone()), Some("deadbeefcafe".to_string()));
+        app.status = None;
+
+        let views: Vec<AgentView> = Vec::new();
+        let order: Vec<usize> = Vec::new();
+        let spans = roster_status_spans(&app, &views, &order);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("");
+        assert!(
+            text.contains("restart cockpit"),
+            "build-mismatch banner must be visible when no status flash, got: {text}"
+        );
+    }
+
