@@ -3601,9 +3601,9 @@ fn interrupt_selected(app: &mut App) {
             Some(text) if provider_supports_bidi(provider) => resume_agent(app, idx, text),
             Some(text) => {
                 app.set_input(text);
-                app.set_status("nothing running to interrupt", Duration::from_secs(3));
+                app.push_cockpit_line(interrupt_not_running_line());
             }
-            None => app.set_status("nothing running to interrupt", Duration::from_secs(2)),
+            None => app.push_cockpit_line(interrupt_not_running_line()),
         }
         return;
     }
@@ -3703,34 +3703,38 @@ fn install_ctrl(app: &mut App, outcome: CtrlOutcome) {
                         app.agents[idx].task = app.agents[idx].task.without_stdin();
                         match redirect {
                             Some(text) if provider_supports_bidi(provider) => {
-                                app.set_status(
-                                    "turn already ended; resuming with your turn",
-                                    Duration::from_secs(2),
+                                app.push_cockpit_line(
+                                    "interrupt: task not running; resuming with your turn",
                                 );
                                 resume_agent(app, idx, text);
                             }
                             Some(text) => {
                                 app.set_input(text);
-                                app.set_status("turn already ended", Duration::from_secs(3));
+                                app.push_cockpit_line(interrupt_not_running_line());
                             }
-                            None => app.set_status("turn already ended", Duration::from_secs(2)),
+                            None => app.push_cockpit_line(interrupt_not_running_line()),
                         }
                     } else if err_is_broken_pipe(&e) {
                         app.agents[idx].task = app.agents[idx].task.without_stdin();
-                        app.set_status(
-                            "stdin closed; session will resume on next steer",
-                            Duration::from_secs(4),
-                        );
+                        app.push_cockpit_line(interrupt_error_line(&e));
                     } else {
                         if let Some(text) = redirect {
                             app.set_input(text);
                         }
-                        app.set_status(format!("interrupt: {e}"), Duration::from_secs(4));
+                        app.push_cockpit_line(interrupt_error_line(&e));
                     }
                 }
             }
         }
     }
+}
+
+fn interrupt_not_running_line() -> &'static str {
+    "interrupt: task not running"
+}
+
+fn interrupt_error_line(e: &str) -> String {
+    format!("interrupt failed: {e}")
 }
 
 /// A broken-pipe class error from a control write (local stdin gone).
@@ -4125,6 +4129,10 @@ fn selected_activity_spans(
 }
 
 fn roster_composer_top_titles(app: &App) -> Vec<Line<'static>> {
+    vec![roster_dispatch_title(app)]
+}
+
+fn roster_dispatch_title(app: &App) -> Line<'static> {
     let flashing = app.provider_flash_until.is_some_and(|t| Instant::now() < t);
     let next_style = if flashing {
         Style::default()
@@ -4133,19 +4141,15 @@ fn roster_composer_top_titles(app: &App) -> Vec<Line<'static>> {
     } else {
         Style::default().fg(Color::White)
     };
-    vec![
-        Line::from(Span::styled(
+    Line::from(vec![
+        Span::styled(
             " dispatch ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!(" next: {} ", next_tuple(app)),
-            next_style,
-        ))
-        .right_aligned(),
-    ]
+        ),
+        Span::styled(format!("— {} ", next_tuple(app)), next_style),
+    ])
 }
 
 fn roster_status_spans(app: &App, views: &[AgentView], order: &[usize]) -> Vec<Span<'static>> {
@@ -4208,8 +4212,16 @@ fn single_agent_composer_top_titles(
     views: &[AgentView],
     order: &[usize],
 ) -> Vec<Line<'static>> {
-    let mut titles = vec![Line::from(selected_activity_spans(app, views, order))];
-    if let Some(idx) = app.selected_agent() {
+    let selected_idx = app.selected_agent();
+    let mut activity = selected_activity_spans(app, views, order);
+    let mut title_spans = Vec::new();
+    if let Some(idx) = selected_idx {
+        title_spans.extend(single_agent_steer_title_spans(&app.agents[idx].name));
+        title_spans.push(Span::styled("──", Style::default().fg(Color::DarkGray)));
+    }
+    title_spans.append(&mut activity);
+    let mut titles = vec![Line::from(title_spans)];
+    if let Some(idx) = selected_idx {
         let a = &app.agents[idx];
         let v = &views[idx];
         titles.push(
@@ -4221,6 +4233,15 @@ fn single_agent_composer_top_titles(
         );
     }
     titles
+}
+
+fn single_agent_steer_title_spans(agent_name: &str) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        format!(" steer {agent_name} "),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]
 }
 
 fn single_agent_status_spans(

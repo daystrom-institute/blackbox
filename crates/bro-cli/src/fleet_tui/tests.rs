@@ -553,6 +553,38 @@ Trailing paragraph.";
     }
 
     #[test]
+    fn roster_composer_title_names_dispatch_target() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let app = App::new(orch, None, rt.handle().clone());
+
+        let titles = roster_composer_top_titles(&app);
+
+        assert_eq!(
+            line_text(&titles[0]),
+            format!(" dispatch — {} ", next_tuple(&app))
+        );
+    }
+
+    #[test]
+    fn single_agent_steer_title_names_target_agent() {
+        let title = Line::from(single_agent_steer_title_spans("review api"));
+
+        assert_eq!(line_text(&title), " steer review api ");
+    }
+
+    #[test]
+    fn interrupt_failure_lines_explain_why() {
+        assert_eq!(interrupt_not_running_line(), "interrupt: task not running");
+        assert_eq!(
+            interrupt_error_line("daemon rejected /control/interrupt"),
+            "interrupt failed: daemon rejected /control/interrupt"
+        );
+    }
+
+    #[test]
     fn compact_tool_call_line_quotes_shell_commands() {
         let line =
             compact_tool_call_line("shell_run", r#"{"cmd":"cargo test --lib"}"#, 100).unwrap();
@@ -1390,4 +1422,3 @@ Trailing paragraph.";
         // Instead, test the constants and helpers are correct.
         assert_eq!(PRUNE_ARM_SECS, 4, "arm TTL should be 4 seconds");
     }
-    
