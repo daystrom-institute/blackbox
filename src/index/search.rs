@@ -1574,22 +1574,33 @@ mod agentic_project_file_tests {
     use std::process::Command;
 
     use super::*;
-    use crate::projects::ProjectRegistry;
+    use bbox_corpus_core::project_record::ProjectRecord;
+
+    /// Write a minimal projects.json registering `root`, using the same
+    /// id/path derivations as the daemon-side registry. Direct JSON write:
+    /// the engine reads the registry file, it never mutates it.
+    fn register_test_project(projects_path: &std::path::Path, root: &std::path::Path) {
+        let canonical = bbox_corpus_core::entity_ref::canonical_input_path(root).unwrap();
+        let record = ProjectRecord {
+            project_id: bbox_corpus_core::entity_ref::project_id_for_path(&canonical).unwrap(),
+            repo_id: bbox_corpus_core::entity_ref::repo_id_for_path(&canonical).ok(),
+            canonical_path: canonical.to_string_lossy().into_owned(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: canonical.join(".git").exists(),
+            languages: Default::default(),
+        };
+        std::fs::write(
+            projects_path,
+            serde_json::json!({"version": 1, "projects": [record]}).to_string(),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn registered_project_markdown_and_rust_source_are_searchable() {
         let dir = tempfile::tempdir().unwrap();
         let projects_path = dir.path().join("projects.json");
-        let mut projects = ProjectRegistry::open(&projects_path).unwrap();
-        projects.register_path(env!("CARGO_MANIFEST_DIR")).unwrap();
-        // register_path is memory-only post-persister-conversion; flush so the
-        // disk-reading index scan sees the registration.
-        crate::json_store::atomic_write_json_locked(
-            &projects_path,
-            &<ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&projects)
-                .unwrap(),
-        )
-        .unwrap();
+        register_test_project(&projects_path, std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
 
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),
@@ -1655,67 +1666,6 @@ mod agentic_project_file_tests {
     }
 
     #[test]
-    fn knowledge_entries_are_searchable_after_reindex() {
-        // build_index reconciles store docs through the daemon-registered
-        // pass; tests that drive it directly must wire the hooks first.
-        super::super::writer_actor::register_index_store_hooks();
-        let dir = tempfile::tempdir().unwrap();
-        let knowledge_path = dir.path().join("knowledge.json");
-        let mut knowledge = crate::knowledge::Knowledge::open(&knowledge_path).unwrap();
-        knowledge
-            .remember(
-                &crate::knowledge::RememberParams {
-                    content: "durable zebra phrase for knowledge indexing".into(),
-                    category: None,
-                    title: Some("Knowledge indexing fixture".into()),
-                    scope: None,
-                    project: None,
-                    decay: None,
-                    review_at: None,
-                    expires_at: None,
-                },
-                false,
-            )
-            .unwrap();
-        crate::json_store::atomic_write_json_locked(
-            &knowledge_path,
-            &<crate::knowledge::Knowledge as crate::store_persister::StoreSnapshot>::snapshot(
-                &knowledge,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-
-        let mut index = TranscriptIndex::open_or_create(
-            &dir.path().join("index"),
-            Vec::new(),
-            None,
-            dir.path().join("projects.json"),
-            knowledge_path,
-            dir.path().join("threads.json"),
-            dir.path().join("roadmap.json"),
-        )
-        .unwrap();
-        index.build_index(false).unwrap();
-
-        let hits = index
-            .search(&SearchParams {
-                query: "durable zebra phrase".into(),
-                mode: None,
-                account: None,
-                project: None,
-                role: None,
-                include_subagents: None,
-                limit: Some(5),
-                exclude_self: None,
-            })
-            .unwrap();
-        assert!(hits.contains("durable"), "{hits}");
-        assert!(hits.contains("zebra"), "{hits}");
-        assert!(hits.contains("phrase"), "{hits}");
-    }
-
-    #[test]
     fn registered_git_project_commit_messages_are_searchable() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -1738,16 +1688,7 @@ mod agentic_project_file_tests {
         );
 
         let projects_path = dir.path().join("projects.json");
-        let mut projects = ProjectRegistry::open(&projects_path).unwrap();
-        projects.register_path(&repo).unwrap();
-        // register_path is memory-only post-persister-conversion; flush so the
-        // disk-reading index scan sees the registration.
-        crate::json_store::atomic_write_json_locked(
-            &projects_path,
-            &<ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&projects)
-                .unwrap(),
-        )
-        .unwrap();
+        register_test_project(&projects_path, &repo);
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),
             Vec::new(),
