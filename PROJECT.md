@@ -64,9 +64,16 @@ Baseline commands:
 
 ```bash
 cargo check
-cargo test --lib
+cargo nextest run --lib   # mid-cycle gate; quarantines slow tests (.config/nextest.toml)
 cargo clippy
 ```
+
+**USE NEXTEST for all test runs** (`brew install cargo-nextest`) — do not
+default to `cargo test`. The fold/closeout gate is the FULL suite:
+`cargo nextest run --lib --profile full` (includes the quarantined slow
+tests). Plain `cargo test --lib` is a no-install fallback only: it is
+single-process and ~40x slower wall-clock (~610s vs ~16s mid-cycle), and the
+slow-test quarantine and per-test timeouts only apply under nextest.
 
 Concurrency enforcement (Phase 4, design/daemon-runtime/concurrency-model.md
 §5) rides the baseline: `cargo clippy` enforces the `clippy.toml`

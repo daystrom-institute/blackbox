@@ -10,11 +10,22 @@ validate changes without touching prod state, see
 ## Build and test
 
 ```bash
-cargo build --release      # binaries into target/release
-cargo check                # fast type-check
-cargo test --lib           # unit suite
-cargo clippy               # lints
+cargo build --release             # binaries into target/release
+cargo check                       # fast type-check
+cargo nextest run --lib           # unit suite, mid-cycle gate (~16s execution)
+cargo nextest run --lib --profile full   # full suite incl. slow tests (fold/closeout gate)
+cargo clippy                      # lints
 ```
+
+The test gates run under [cargo-nextest](https://nexte.st)
+(`brew install cargo-nextest`). Nextest runs each test in its own process and
+parallelizes across cores; `.config/nextest.toml` defines the two profiles. The
+`default` profile quarantines the handful of >45s tests behind the `full`
+profile so the mid-cycle gate stays fast, and applies per-test slow-timeouts so
+a newly slow test gets *named* in the output instead of silently stretching the
+suite. `cargo test --lib` still works as a fallback when nextest is not
+installed, but it is single-process, several times slower, and applies no
+quarantine or timeouts.
 
 Use the narrowest command that proves your change, then broaden when touching
 shared behavior (see [`PROJECT.md`](../PROJECT.md) → Validation for targeted

@@ -10,6 +10,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- cargo-nextest test gates (`.config/nextest.toml`): the unit suite now runs
+  process-per-test under nextest — `cargo nextest run --lib` is the mid-cycle
+  gate (~16s execution; the two >45s tests are quarantined), and
+  `--profile full` is the fold/closeout gate running the entire suite.
+  Per-test slow-timeouts name newly slow tests instead of silently stretching
+  the suite. `cargo test --lib` remains the no-install fallback.
 - Phase-4 concurrency enforcement (concurrency-model §5): a `clippy.toml`
   disallowed-methods gate denies blocking fs/process/tantivy-writer calls in
   MCP handler modules and the harness crates (sanctioned actor contexts carry

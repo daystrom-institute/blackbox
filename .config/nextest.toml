@@ -1,0 +1,34 @@
+# Nextest profiles for the blackbox workspace (build-cycle lever, thread-9938dffd).
+#
+#   default — mid-cycle gate: full lib suite minus the quarantined slow tests.
+#             `cargo nextest run --lib`
+#   full    — fold-time gate: the entire suite, quarantined tests included.
+#             `cargo nextest run --lib --profile full`
+#
+# Quarantined tests (each >45s of single-test wall-clock; together they pin the
+# suite's critical path — baseline 2026-06-10: suite 80s wall, these two 78.6s
+# and 55.2s, next-slowest 5.2s):
+#   - index::search::agentic_project_file_tests::registered_project_markdown_and_rust_source_are_searchable
+#   - system_events::store::tests::compact_caps_at_ten_thousand_keeping_newest
+#
+# Nextest runs each test in its own process. Env-mutating tests guarded by
+# crate::util::test_env_lock() stay correct here — per-process env isolation
+# supersedes the in-process mutex; the lock remains required for plain
+# `cargo test`, which still shares one process.
+
+[profile.default]
+default-filter = """
+not (
+  test(=index::search::agentic_project_file_tests::registered_project_markdown_and_rust_source_are_searchable)
+  | test(=system_events::store::tests::compact_caps_at_ten_thousand_keeping_newest)
+)
+"""
+# Name slow tests instead of silently clipping: flag at 30s, hard-kill at 2min.
+slow-timeout = { period = "30s", terminate-after = 4 }
+final-status-level = "slow"
+
+[profile.full]
+default-filter = "all()"
+# The quarantined tests legitimately run 50-80s; flag at 60s, kill at 5min.
+slow-timeout = { period = "60s", terminate-after = 5 }
+final-status-level = "slow"
