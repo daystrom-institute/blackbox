@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn renders_env_var() {
-        let _env = crate::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         // SAFETY: test-only, no concurrent access to this env var
         unsafe { std::env::set_var("BBOX_TEST_TEMPLATE_PHASE3", "hello") };
         let roots = make_roots(&[]);

@@ -45,7 +45,7 @@ pub fn event_packet_entity(event: &SystemEvent) -> Value {
 }
 
 pub fn reaction_gate_allows(
-    packets_store: &crate::packets::Packets,
+    packets_store: &bbox_packets::Packets,
     reaction: &ReactionSpec,
     event: &SystemEvent,
 ) -> Result<GateDecision> {
@@ -62,7 +62,7 @@ pub fn reaction_gate_allows(
         .load(packet_ref)
         .map_err(|e| anyhow::anyhow!("loading gate packet '{}': {e:#}", packet_ref))?;
     let entity = event_packet_entity(event);
-    let prediction = crate::packets::apply_with(&packet, &entity, packets_store);
+    let prediction = bbox_packets::apply_with(&packet, &entity, packets_store);
 
     match prediction {
         Some(p) => {
@@ -102,7 +102,7 @@ pub struct DryRunResult {
 pub fn dry_run_replay(
     reaction: &ReactionSpec,
     event: &SystemEvent,
-    packets_store: &crate::packets::Packets,
+    packets_store: &bbox_packets::Packets,
     outbox_records: &[crate::system_events::types::OutboxRecord],
 ) -> Result<DryRunResult> {
     let roots = build_event_roots(event);
@@ -290,7 +290,7 @@ mod tests {
             on_failure: FailurePolicy::DeadLetter,
         };
         let tmp = tempfile::tempdir().unwrap();
-        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        let packets = bbox_packets::Packets::open(tmp.path()).unwrap();
         let event = test_event();
         let decision = reaction_gate_allows(&packets, &reaction, &event).unwrap();
         assert!(decision.allowed);

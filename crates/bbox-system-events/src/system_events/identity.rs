@@ -327,8 +327,8 @@ impl IdentityRegistry {
         } else {
             identities.push(identity.clone());
         }
-        crate::json_store::with_store_lock(&path, || {
-            crate::json_store::atomic_write_json_locked(&path, &identities)
+        bbox_corpus_core::json_store::with_store_lock(&path, || {
+            bbox_corpus_core::json_store::atomic_write_json_locked(&path, &identities)
         })?;
         self.cache.write().insert(
             (identity.scope.clone(), identity.instance.clone()),
@@ -626,7 +626,7 @@ mod tests {
         // ID.
         let readme = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/examples/system-events/system-events-example.md"
+            "/../../examples/system-events/system-events-example.md"
         ))
         .unwrap();
         assert!(

@@ -34,7 +34,9 @@ impl EventStore {
         Self::build(root)
     }
 
-    #[cfg(test)]
+    // Not `#[cfg(test)]` gated: consumer crates (the root crate's runtime
+    // and tool tests) call this from their own test modules, where this
+    // crate compiles as a normal dependency and `cfg(test)` is false.
     pub fn new_at(root: PathBuf) -> Self {
         Self::build(root)
     }

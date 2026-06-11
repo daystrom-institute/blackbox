@@ -237,7 +237,9 @@ impl EventHub {
         })
     }
 
-    #[cfg(test)]
+    // Not `#[cfg(test)]` gated: consumer crates (the root crate's runtime
+    // and tool tests) call this from their own test modules, where this
+    // crate compiles as a normal dependency and `cfg(test)` is false.
     pub fn reactions_dir(&self) -> &Path {
         &self.reactions_dir
     }
@@ -303,7 +305,7 @@ impl EventHub {
         let event = SystemEvent {
             id: new_event_id(),
             kind: draft.kind,
-            occurred_at: crate::util::now_iso(),
+            occurred_at: bbox_util::util::now_iso(),
             producer: draft.producer,
             project: draft.project,
             principal: draft.principal,
@@ -984,7 +986,7 @@ mod tests {
             external_user_id: "42".to_string(),
             username: "bro-keystone-review-claude-haiku45".to_string(),
             token_ref: "secret:forgejo-bro-bro-keystone-review-claude-haiku45".to_string(),
-            created_at: crate::util::now_iso(),
+            created_at: bbox_util::util::now_iso(),
             last_verified_at: None,
         };
         hub.identity_registry().upsert(&identity).unwrap();
@@ -1027,7 +1029,7 @@ mod tests {
             external_user_id: "99".to_string(),
             username: "bro-keystone-review-claude-haiku45".to_string(),
             token_ref: "secret:forgejo-bro-test".to_string(),
-            created_at: crate::util::now_iso(),
+            created_at: bbox_util::util::now_iso(),
             last_verified_at: None,
         };
         hub.identity_registry().upsert(&identity).unwrap();

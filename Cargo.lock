@@ -581,6 +581,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-system-events"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-packets",
+ "bbox-util",
+ "chrono",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "bbox-system-memory"
 version = "0.0.1"
 dependencies = [
@@ -770,6 +790,7 @@ dependencies = [
  "bbox-refactor",
  "bbox-slack",
  "bbox-stores",
+ "bbox-system-events",
  "bbox-system-memory",
  "bbox-threads",
  "bbox-tool-docs",

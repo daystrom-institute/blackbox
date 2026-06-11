@@ -167,7 +167,7 @@ impl OutboxStore {
             record.claimed_at = Some(now.to_string());
             record.claimed_by = Some(process_id.to_string());
             record.attempt_count += 1;
-            record.updated_at = crate::util::now_iso();
+            record.updated_at = bbox_util::util::now_iso();
             claimed = Some(record.clone());
             break;
         }
@@ -197,7 +197,7 @@ impl OutboxStore {
             record.claimed_at = Some(now.to_string());
             record.claimed_by = Some(process_id.to_string());
             record.attempt_count += 1;
-            record.updated_at = crate::util::now_iso();
+            record.updated_at = bbox_util::util::now_iso();
             claimed = Some(record.clone());
             break;
         }
@@ -216,7 +216,7 @@ impl OutboxStore {
                 record.claimed_at = None;
                 record.claimed_by = None;
                 record.response_summary = summary;
-                record.updated_at = crate::util::now_iso();
+                record.updated_at = bbox_util::util::now_iso();
                 break;
             }
         }
@@ -233,7 +233,7 @@ impl OutboxStore {
                 record.claimed_by = None;
                 record.next_attempt_at = Some(next_attempt_at.to_string());
                 record.last_error = Some(error.to_string());
-                record.updated_at = crate::util::now_iso();
+                record.updated_at = bbox_util::util::now_iso();
                 break;
             }
         }
@@ -250,7 +250,7 @@ impl OutboxStore {
                 record.last_error = error.map(|e| e.to_string());
                 record.claimed_at = None;
                 record.claimed_by = None;
-                record.updated_at = crate::util::now_iso();
+                record.updated_at = bbox_util::util::now_iso();
                 break;
             }
         }
@@ -269,7 +269,7 @@ impl OutboxStore {
                 record.claimed_at = None;
                 record.claimed_by = None;
                 record.next_attempt_at = None;
-                record.updated_at = crate::util::now_iso();
+                record.updated_at = bbox_util::util::now_iso();
                 found = true;
                 break;
             }
@@ -296,7 +296,7 @@ impl OutboxStore {
                     record.status = OutboxStatus::Pending;
                     record.claimed_at = None;
                     record.claimed_by = None;
-                    record.updated_at = crate::util::now_iso();
+                    record.updated_at = bbox_util::util::now_iso();
                     report.requeued += 1;
                 }
                 None => {
@@ -307,7 +307,7 @@ impl OutboxStore {
                     record.status = OutboxStatus::DeadLettered;
                     record.dead_letter_reason = Some("crash_recovery_non_idempotent".to_string());
                     record.last_error = Some(ctx);
-                    record.updated_at = crate::util::now_iso();
+                    record.updated_at = bbox_util::util::now_iso();
                     report.dead_lettered += 1;
                 }
             }

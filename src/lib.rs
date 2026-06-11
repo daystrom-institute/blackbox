@@ -99,7 +99,7 @@ use bbox_slack::slack_thread_store;
 mod slices;
 use bbox_edge_index::storage_health;
 use bbox_stores::store_persister;
-mod system_events;
+use bbox_system_events::system_events;
 mod system_events_runtime;
 // `system_memory` extracted into bbox-system-memory (root-crate split);
 // aliased back to `crate::system_memory` so existing call sites resolve

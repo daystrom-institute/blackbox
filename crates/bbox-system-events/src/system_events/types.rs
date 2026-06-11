@@ -3,7 +3,7 @@ use std::fmt;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::util::now_iso;
+use bbox_util::util::now_iso;
 
 pub fn new_event_id() -> String {
     format!("evt-{}", uuid::Uuid::new_v4())
@@ -153,7 +153,8 @@ impl JournalEnvelope {
     }
 }
 
-#[cfg(test)]
+// Not `#[cfg(test)]` gated: consumer-crate tests build events with this
+// helper while this crate compiles as a normal dependency (cfg(test) false).
 pub fn make_event(
     kind: SystemEventKind,
     producer: &str,
