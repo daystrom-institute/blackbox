@@ -952,13 +952,6 @@ impl Task {
         inner.live_cursor
     }
 
-    /// PID of the spawned provider child while the task is running.
-    /// `None` once the process has exited or `cancel_task` has taken
-    /// the handle.
-    pub fn child_pid(&self) -> Option<u32> {
-        *self.child_id.lock()
-    }
-
     fn emit_roster_added(&self) {
         if let Some(sink) = &self.roster_events {
             sink.emit_added(self);
