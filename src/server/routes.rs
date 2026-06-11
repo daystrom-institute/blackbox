@@ -3405,6 +3405,7 @@ mod tests {
         orchestration::push_in_process_event(
             &task,
             serde_json::json!({"type":"assistant","message":{"model":"test-model"}}),
+            &state.tail_tx,
         );
         let updated = timeout(Duration::from_secs(1), rx.recv())
             .await

@@ -193,6 +193,7 @@ Constraints:\n\
                 },
                 "timestamp": crate::util::now_iso(),
             }),
+            &self.state.tail_tx,
         );
         let state = self.state.clone();
         let task_for_run = task.clone();
@@ -201,11 +202,12 @@ Constraints:\n\
             let server = BlackboxServer::new(state.clone());
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
             let task_for_events = task_for_run.clone();
+            let tail_for_events = state.tail_tx.clone();
             let event_forwarder = tokio::spawn(async move {
                 let mut count = 0usize;
                 while let Some(event) = event_rx.recv().await {
                     count += 1;
-                    orch::push_in_process_event(&task_for_events, event);
+                    orch::push_in_process_event(&task_for_events, event, &tail_for_events);
                 }
                 count
             });
@@ -229,7 +231,7 @@ Constraints:\n\
             };
             if streamed_count == 0 {
                 for event in &result.events {
-                    orch::push_in_process_event(&task_for_run, event.clone());
+                    orch::push_in_process_event(&task_for_run, event.clone(), &state.tail_tx);
                 }
             }
             let result_text = serde_json::to_string(&result).unwrap_or_else(|err| {

@@ -480,7 +480,11 @@ fn wire_status(status: orchestration::TaskStatus) -> bro_protocol::TaskStatus {
 }
 
 fn response_error(status: StatusCode, error: impl Into<String>) -> Response {
-    (status, axum::Json(serde_json::json!({ "error": error.into() }))).into_response()
+    (
+        status,
+        axum::Json(serde_json::json!({ "error": error.into() })),
+    )
+        .into_response()
 }
 
 fn transcript_file_for_session(state: &SharedState, session_id: &str) -> Option<String> {
@@ -496,11 +500,9 @@ fn focused_transcript_snapshot(
     state: &SharedState,
     task_id: &str,
 ) -> Result<bro_protocol::FocusedTranscriptSnapshotV1, Response> {
-    let task = state
-        .task_store
-        .read()
-        .get(task_id)
-        .ok_or_else(|| response_error(StatusCode::NOT_FOUND, format!("unknown task id: {task_id}")))?;
+    let task = state.task_store.read().get(task_id).ok_or_else(|| {
+        response_error(StatusCode::NOT_FOUND, format!("unknown task id: {task_id}"))
+    })?;
 
     let (
         task_id,
@@ -569,7 +571,10 @@ fn focused_live_payload_after_snapshot(
     if cursor <= snapshot_live_cursor {
         return None;
     }
-    let event_value = serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({}));
+    let event_value = match event {
+        orchestration::tail::TailEvent::TaskEvent { event, .. } => event.clone(),
+        other => serde_json::to_value(other).unwrap_or_else(|_| serde_json::json!({})),
+    };
     Some(bro_protocol::FocusedTranscriptLiveEventV1 {
         task_id: bro_core::TaskId::new(task_id.to_string()),
         cursor,
@@ -639,7 +644,9 @@ pub(crate) async fn focused_transcript_history_handler(
 ) -> Response {
     let task = match state.task_store.read().get(&task_id) {
         Some(task) => task,
-        None => return response_error(StatusCode::NOT_FOUND, format!("unknown task id: {task_id}")),
+        None => {
+            return response_error(StatusCode::NOT_FOUND, format!("unknown task id: {task_id}"));
+        }
     };
     let session_id = {
         let inner = task.inner.lock();
@@ -687,7 +694,9 @@ fn read_history_page(
         let line = line.map_err(|err| format!("read transcript file {path}: {err}"))?;
         let cursor = idx as u64;
         let line_offset = byte_offset;
-        byte_offset = byte_offset.saturating_add(line.len() as u64).saturating_add(1);
+        byte_offset = byte_offset
+            .saturating_add(line.len() as u64)
+            .saturating_add(1);
         if cursor < from_cursor {
             continue;
         }
@@ -882,36 +891,24 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let expected = "/tmp/sess-cache.jsonl".to_string();
 
-        let first = resolve_session_file_cached(
-            &cache,
-            "sess-cache",
-            &[],
-            None,
-            {
-                let calls = calls.clone();
-                let expected = expected.clone();
-                move |_, _, _| {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
-                }
-            },
-        )
+        let first = resolve_session_file_cached(&cache, "sess-cache", &[], None, {
+            let calls = calls.clone();
+            let expected = expected.clone();
+            move |_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(expected)
+            }
+        })
         .await;
         assert_eq!(first, Some(expected.clone()));
 
-        let second = resolve_session_file_cached(
-            &cache,
-            "sess-cache",
-            &[],
-            None,
-            {
-                let calls = calls.clone();
-                move |_, _, _| {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    None
-                }
-            },
-        )
+        let second = resolve_session_file_cached(&cache, "sess-cache", &[], None, {
+            let calls = calls.clone();
+            move |_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        })
         .await;
         assert_eq!(second, Some(expected));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -927,12 +924,10 @@ mod tests {
             cursor: snapshot_live_cursor,
             activity: "already snapped".to_string(),
         };
-        assert!(focused_live_payload_after_snapshot(
-            &duplicate,
-            task_id,
-            snapshot_live_cursor
-        )
-        .is_none());
+        assert!(
+            focused_live_payload_after_snapshot(&duplicate, task_id, snapshot_live_cursor)
+                .is_none()
+        );
 
         let next = TailEvent::TaskProgress {
             task_id: task_id.to_string(),
@@ -948,8 +943,43 @@ mod tests {
             cursor: snapshot_live_cursor + 2,
             activity: "not focused".to_string(),
         };
-        assert!(focused_live_payload_after_snapshot(&wrong_task, task_id, snapshot_live_cursor)
-            .is_none());
+        assert!(
+            focused_live_payload_after_snapshot(&wrong_task, task_id, snapshot_live_cursor)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn focused_live_payload_after_snapshot_forwards_inner_task_event() {
+        let task_id = "task-envelope";
+        let snapshot_live_cursor = 11;
+        let inner_event = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "live text"}]
+            }
+        });
+
+        let stale = TailEvent::TaskEvent {
+            task_id: task_id.to_string(),
+            cursor: snapshot_live_cursor,
+            event: inner_event.clone(),
+        };
+        assert!(
+            focused_live_payload_after_snapshot(&stale, task_id, snapshot_live_cursor).is_none()
+        );
+
+        let live = TailEvent::TaskEvent {
+            task_id: task_id.to_string(),
+            cursor: snapshot_live_cursor + 1,
+            event: inner_event.clone(),
+        };
+        let payload = focused_live_payload_after_snapshot(&live, task_id, snapshot_live_cursor)
+            .expect("fresh task event should stream");
+
+        assert_eq!(payload.task_id.as_str(), task_id);
+        assert_eq!(payload.cursor, snapshot_live_cursor + 1);
+        assert_eq!(payload.event, inner_event);
     }
 
     #[test]
@@ -995,7 +1025,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let state = Arc::new(SharedState::for_test(&root));
-        let task = crate::orchestration::test_task("task-stream", TaskStatus::Running, Provider::Glm);
+        let task =
+            crate::orchestration::test_task("task-stream", TaskStatus::Running, Provider::Glm);
         task.inner.lock().events.push(serde_json::json!({
             "type": "provider_event",
             "text": "hello stream"
@@ -1066,7 +1097,8 @@ mod tests {
         .unwrap();
         *state.idx.write() = index;
 
-        let task = crate::orchestration::test_task("task-history", TaskStatus::Completed, Provider::Glm);
+        let task =
+            crate::orchestration::test_task("task-history", TaskStatus::Completed, Provider::Glm);
         task.inner.lock().session_id = "sess-history".to_string();
         state
             .task_store

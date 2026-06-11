@@ -375,8 +375,8 @@ pub struct TaskInner {
     pub transcript_location: Option<TranscriptLocation>,
     pub transcript_cursor: Option<TranscriptCursor>,
     /// Monotonic per-task cursor for live tail events. This is distinct from
-    /// provider transcript-file cursors because `tail_tx` carries task summary
-    /// events, not raw provider transcript records.
+    /// provider transcript-file cursors because `tail_tx` carries task lifecycle
+    /// events plus retained envelope events.
     pub live_cursor: u64,
     /// Last wall-clock ms a roster update was emitted from the stream-delta
     /// ingest path. Deltas arrive at token-chunk rate; rebuilding +
@@ -1425,12 +1425,14 @@ impl TaskStore {
                 );
                 rec.recoverable = true;
             }
+            let events = EventRing::from_loaded(rec.events);
+            let live_cursor = rec.live_cursor.max(events.len() as u64);
             let task = Arc::new(Task {
                 inner: Mutex::new(TaskInner {
                     id: rec.id.clone(),
                     provider: rec.provider,
                     session_id: rec.session_id,
-                    events: EventRing::from_loaded(rec.events),
+                    events,
                     model,
                     last_assistant_message: rec.last_assistant_message,
                     usage: rec.usage,
@@ -1450,7 +1452,7 @@ impl TaskStore {
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
                     transcript_cursor: rec.transcript_cursor,
-                    live_cursor: rec.live_cursor,
+                    live_cursor,
                     last_delta_roster_emit_ms: 0,
                     supervision: rec.supervision,
                     origin: rec.origin,
@@ -2198,12 +2200,29 @@ pub fn spawn_in_process_task(
     task
 }
 
-pub fn push_in_process_event(task: &Task, event: Value) {
-    {
-        let mut inner = task.inner.lock();
-        update_model_cache_from_event(&mut inner, &event);
-        inner.events.push(event);
+fn append_task_event(inner: &mut TaskInner, event: Value) -> tail::TailEvent {
+    update_model_cache_from_event(inner, &event);
+    inner.live_cursor += 1;
+    let cursor = inner.live_cursor;
+    let task_id = inner.id.clone();
+    inner.events.push(event.clone());
+    tail::TailEvent::TaskEvent {
+        cursor,
+        task_id,
+        event,
     }
+}
+
+pub fn push_in_process_event(
+    task: &Task,
+    event: Value,
+    tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+) {
+    let tail_event = {
+        let mut inner = task.inner.lock();
+        append_task_event(&mut inner, event)
+    };
+    let _ = tail_tx.send(tail_event);
     task.emit_roster_updated();
 }
 
@@ -2720,7 +2739,7 @@ fn ingest_harness_event(
     // per-delta O(accumulated-message) work measurably degraded runtime
     // worker poll times (thread-935b467d §4.6 measurements).
     let is_stream_delta = evt.get("type").and_then(Value::as_str) == Some("stream_event");
-    let (snippet_to_emit, emit_roster) = {
+    let (snippet_to_emit, emit_roster, task_event_to_emit) = {
         let mut inner = task.inner.lock();
         // Decide fork-acceptance BEFORE parsing so the parse can mutate the
         // task's accumulated message in place (taken, not cloned) — a
@@ -2737,6 +2756,7 @@ fn ingest_harness_event(
                 accepted = false;
             }
         }
+        let mut task_event_to_emit = None;
         if accepted {
             let mut sink = EventSink {
                 // Zero-copy seed: take the accumulated message so delta
@@ -2782,7 +2802,7 @@ fn ingest_harness_event(
             // per text chunk made the 512-slot ring all-deltas under
             // streaming and deep-cloned every chunk.
             if !is_stream_delta {
-                inner.events.push(evt);
+                task_event_to_emit = Some(append_task_event(&mut inner, evt));
             }
         }
         // Roster summaries rebuild + broadcast per emit; throttle the
@@ -2812,8 +2832,12 @@ fn ingest_harness_event(
                 (snippet, session_id_observed, cursor)
             })
             .or_else(|| session_id_observed.then(|| (String::new(), true, None)));
-        (snippet, emit_roster)
+        (snippet, emit_roster, task_event_to_emit)
     };
+
+    if let Some(task_event) = task_event_to_emit {
+        let _ = tail_tx.send(task_event);
+    }
 
     if emit_roster {
         task.emit_roster_updated();
@@ -3454,10 +3478,9 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                             });
                         }
                     }
-                    let snippet_to_emit = {
+                    let (snippet_to_emit, task_event_to_emit) = {
                         let mut inner = task_ref.inner.lock();
-                        update_model_cache_from_event(&mut inner, &evt);
-                        inner.events.push(evt.clone());
+                        let task_event = append_task_event(&mut inner, evt.clone());
                         let mut sink = EventSink {
                             last_assistant_message: inner.last_assistant_message.clone(),
                             usage: inner.usage.clone(),
@@ -3491,7 +3514,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                             inner.supervision.observe_event(&evt, &sink, now_ms());
                             apply_sink_updates(&mut inner, sink);
                         }
-                        accepted
+                        let snippet_to_emit = accepted
                             .then(|| {
                                 inner.last_assistant_message.as_ref().map(|msg| {
                                     const TAIL_CHARS: usize = 160;
@@ -3517,9 +3540,11 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                                 };
                                 (snippet, session_id_observed, cursor)
                             })
-                            .or_else(|| session_id_observed.then(|| (String::new(), true, None)))
+                            .or_else(|| session_id_observed.then(|| (String::new(), true, None)));
+                        (snippet_to_emit, task_event)
                     };
 
+                    let _ = tail_tx_clone.send(task_event_to_emit);
                     task_ref.emit_roster_updated();
 
                     if let Some((snippet, session_id_observed, cursor)) = snippet_to_emit {
@@ -4435,6 +4460,11 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
     use super::*;
 
+    fn test_tail_tx() -> tokio::sync::broadcast::Sender<tail::TailEvent> {
+        let (tail_tx, _) = tokio::sync::broadcast::channel(16);
+        tail_tx
+    }
+
     #[test]
     fn apply_session_command_maps_protocol_variants_to_harness_input() {
         use bro_harness::agent_loop::{SessionInput, session_input_channel};
@@ -4751,10 +4781,12 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let mut store = TaskStore::new();
         let task = test_task("task-model", TaskStatus::Completed, Provider::Glm);
+        let tail_tx = test_tail_tx();
 
         push_in_process_event(
             &task,
             serde_json::json!({"message": {"model": "cached-model"}}),
+            &tail_tx,
         );
         assert_eq!(task.inner.lock().model.as_deref(), Some("cached-model"));
 
@@ -4784,11 +4816,13 @@ mod tests {
     #[test]
     fn event_ring_eviction_preserves_event_count_and_recent_events() {
         let task = test_task("task-ring", TaskStatus::Running, Provider::Glm);
+        let tail_tx = test_tail_tx();
         let total = TASK_EVENT_RING_CAPACITY + 3;
         for idx in 0..total {
             push_in_process_event(
                 &task,
                 serde_json::json!({"type": "provider_event", "idx": idx}),
+                &tail_tx,
             );
         }
 
@@ -4822,11 +4856,12 @@ mod tests {
     fn persisted_snapshot_preserves_under_limit_event_shape() {
         let mut store = TaskStore::new();
         let task = test_task("task-persist-events", TaskStatus::Completed, Provider::Glm);
+        let tail_tx = test_tail_tx();
         let expected_events: Vec<Value> = (0..3)
             .map(|idx| serde_json::json!({"type": "provider_event", "idx": idx}))
             .collect();
         for event in expected_events.clone() {
-            push_in_process_event(&task, event);
+            push_in_process_event(&task, event, &tail_tx);
         }
         store
             .insert("task-persist-events".to_string(), task)
@@ -4918,10 +4953,12 @@ mod tests {
             &task_store,
             &root,
         );
+        let tail_tx = test_tail_tx();
 
         push_in_process_event(
             &task,
             serde_json::json!({"message": {"model": "event-model"}}),
+            &tail_tx,
         );
         assert_eq!(task.inner.lock().model.as_deref(), Some("dispatch-model"));
         assert_eq!(

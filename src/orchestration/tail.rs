@@ -25,6 +25,11 @@ pub enum TailEvent {
         task_id: String,
         activity: String,
     },
+    TaskEvent {
+        cursor: u64,
+        task_id: String,
+        event: serde_json::Value,
+    },
     TaskCompleted {
         cursor: u64,
         task_id: String,
@@ -57,6 +62,7 @@ impl TailEvent {
         match self {
             TailEvent::TaskStarted { task_id, .. }
             | TailEvent::TaskProgress { task_id, .. }
+            | TailEvent::TaskEvent { task_id, .. }
             | TailEvent::TaskCompleted { task_id, .. }
             | TailEvent::TaskFailed { task_id, .. }
             | TailEvent::TaskCancelled { task_id, .. } => task_id,
@@ -67,6 +73,7 @@ impl TailEvent {
         match self {
             TailEvent::TaskStarted { cursor, .. }
             | TailEvent::TaskProgress { cursor, .. }
+            | TailEvent::TaskEvent { cursor, .. }
             | TailEvent::TaskCompleted { cursor, .. }
             | TailEvent::TaskFailed { cursor, .. }
             | TailEvent::TaskCancelled { cursor, .. } => *cursor,
@@ -101,5 +108,25 @@ mod tests {
         assert!(json.contains("\"type\":\"task_failed\""));
         assert!(json.contains("\"cursor\":2"));
         assert!(json.contains("spawn error"));
+    }
+
+    #[test]
+    fn test_tail_event_task_event_serialization() {
+        let evt = TailEvent::TaskEvent {
+            cursor: 3,
+            task_id: "t3".into(),
+            event: serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "hello"}]
+                }
+            }),
+        };
+        let json = serde_json::to_value(&evt).unwrap();
+        assert_eq!(json["type"], "task_event");
+        assert_eq!(json["cursor"], 3);
+        assert_eq!(json["task_id"], "t3");
+        assert_eq!(json["event"]["type"], "assistant");
+        assert_eq!(json["event"]["message"]["content"][0]["text"], "hello");
     }
 }
