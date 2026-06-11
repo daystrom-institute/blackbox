@@ -1642,6 +1642,20 @@ prose, not \"pending\">\n\
   bro=<`bro` from [scope], if present>\n\
   session_id=<`session` from [scope], if present>";
 
+/// Per-turn milestone-reporting nudge for every dispatch. Empirically,
+/// only brodex agents called `bro_report` mid-run across 12+ fleet
+/// cockpit dispatches — GLM/DeepSeek/MiniMax rows stayed blank the
+/// entire run, leaving the cockpit blind. The reporting instruction in
+/// the rendered AGENTS.md is session-start-only and decays at depth on
+/// weaker models; the ambient prefix survives because it rides with
+/// every turn. Positioned late (after the completion contract, before
+/// workspace-tools) per repo convention so it stays in attention.
+/// Wording is deliberately terse — shorter context survives truncation
+/// and the instruction is self-explanatory.
+pub const MILESTONE_REPORT_HINT: &str = "\
+Report at major milestones via `bro_report` with a one-line status. \
+Examples: starting implementation, tests passing, blocked on X, work complete.";
+
 /// Workspace-tools appendix injected when `AmbientContext::coerce_workspace`
 /// is true. Teaches agents to prefer workspace-scoped tool surfaces over
 /// raw filesystem access. References the implemented workspace tool surface
@@ -1967,6 +1981,12 @@ pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
         prefix.push_str(contract.trim_end());
         prefix.push_str("\n\n");
     }
+
+    // Milestone reporting nudge — late-positioned per convention so it
+    // survives attention decay on weaker providers.
+    prefix.push_str("[milestone reporting]\n");
+    prefix.push_str(MILESTONE_REPORT_HINT);
+    prefix.push_str("\n\n");
 
     if ctx.coerce_workspace {
         prefix.push_str(WORKSPACE_TOOLS_APPENDIX);
@@ -6288,6 +6308,49 @@ mod tests {
         assert!(wrapped.contains("sess-xyz"));
         assert!(wrapped.contains("work"));
         assert!(!wrapped.contains("IMPORTANT:"), "text guard retired");
+    }
+
+    #[test]
+    fn milestone_report_hint_fires_for_every_dispatch() {
+        // The reporting nudge is unconditional — fires for every provider
+        // regardless of allow_recursion, coerce_workspace, or completion
+        // contract state.
+        for p in [
+            providers::Provider::Glm,
+            providers::Provider::Deepseek,
+            providers::Provider::Minimax,
+            providers::Provider::Brodex,
+            providers::Provider::VibeBh,
+        ] {
+            let ctx = AmbientContext {
+                provider: Some(p),
+                ..Default::default()
+            };
+            let out = apply_ambient("work", &ctx);
+            assert!(
+                out.contains("[milestone reporting]"),
+                "milestone reporting missing for provider {p:?}"
+            );
+            assert!(
+                out.contains("bro_report"),
+                "bro_report reference missing for provider {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn milestone_report_placed_after_completion_contract() {
+        let ctx = AmbientContext {
+            completion_contract: Some("emit done".into()),
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        let contract_idx = out.find("[completion contract]").unwrap();
+        let report_idx = out.find("[milestone reporting]").unwrap();
+        assert!(
+            contract_idx < report_idx,
+            "milestone reporting must follow completion contract"
+        );
     }
 
     #[test]
