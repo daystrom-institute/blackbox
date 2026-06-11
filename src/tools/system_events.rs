@@ -327,7 +327,7 @@ impl BlackboxServer {
                 let Some(reaction) = reaction else {
                     anyhow::bail!("reaction '{}' not found", p.reaction);
                 };
-                let result = system_events::worker::execute_reaction_once(
+                let result = crate::system_events_runtime::worker::execute_reaction_once(
                     server.state.clone(),
                     &event,
                     &reaction,

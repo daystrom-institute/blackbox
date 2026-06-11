@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::hub::SystemEventDraft;
-use super::identity::ExternalIdentity;
-use super::types::{ActionOutcome, ActionStatus, SystemEvent, SystemEventKind};
+use crate::system_events::hub::SystemEventDraft;
+use crate::system_events::identity::ExternalIdentity;
+use crate::system_events::types::{ActionOutcome, ActionStatus, SystemEvent, SystemEventKind};
 use crate::server::state::SharedState;
 use blackbox::secrets::{SecretSources, resolve_with_sources, write_file_secret};
 
@@ -559,7 +559,7 @@ pub(super) async fn run_forgejo_ensure_user_with_sources(
             emit_provision_failed(event, state, &msg).await;
             ActionOutcome {
                 status,
-                response_summary: super::gate::redact_values(
+                response_summary: crate::system_events::gate::redact_values(
                     json!({"error": &msg[..msg.len().min(4096)]}),
                 ),
             }

@@ -187,7 +187,7 @@ impl AtomRunner for BadgeyAdapterRunner {
 }
 
 // Registered so the atom artifact validates against the schema; the actual
-// execution is intercepted by system_events::executors before this runner runs.
+// execution is intercepted by system_events_runtime::executors before this runner runs.
 struct ForgejoEnsureUserRunner;
 
 impl AtomRunner for ForgejoEnsureUserRunner {

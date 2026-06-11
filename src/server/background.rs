@@ -8,7 +8,7 @@ use crate::tools::badgey_adapter::{
     BadgeyAgentAdapter, recover_badgey_non_terminal_state, restore_badgey_registry_from_notes,
 };
 use crate::tools::bro_helpers::tier0_cosine_threshold_from_env;
-use crate::{embed, embed_queue, orchestration, system_events, util, vectors, watcher};
+use crate::{embed, embed_queue, orchestration, util, vectors, watcher};
 use std::sync::Arc;
 
 pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::Result<()> {
@@ -248,7 +248,7 @@ fn compact_system_events(shared: &Arc<SharedState>) {
 
 fn spawn_outbox_worker(shared: Arc<SharedState>) {
     tokio::spawn(async move {
-        system_events::worker::run_worker(shared).await;
+        crate::system_events_runtime::worker::run_worker(shared).await;
     });
 }
 

@@ -1609,7 +1609,7 @@ mod tests {
         assert_eq!(
             impl_kind,
             Some("deterministic"),
-            "implementation must be deterministic (builtin path handled by system_events::executors)"
+            "implementation must be deterministic (builtin path handled by system_events_runtime::executors)"
         );
         let runner = v
             .pointer("/manifest/implementation/runner")

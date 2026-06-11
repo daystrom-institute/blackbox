@@ -5,9 +5,9 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::executors;
-use super::gate;
-use super::hub::EventHub;
-use super::types::*;
+use crate::system_events::gate;
+use crate::system_events::hub::EventHub;
+use crate::system_events::types::*;
 use crate::server::state::SharedState;
 
 const WORKER_TICK_SECS: u64 = 2;
