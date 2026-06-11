@@ -1624,6 +1624,11 @@ fn run_tui_cockpit(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow:
             let backend = CrosstermBackend::new(io::stdout());
             let mut terminal = custom_terminal::Terminal::with_options(backend)?;
             let iexit = run_inline_view(app, &signals, &mut terminal, true);
+            // Clear the transient live region (composer + activity header) so
+            // stale frames don't persist into the next view. On ZoomOut the
+            // roster re-enters alt-screen (which repaints); on Quit this
+            // ensures the shell prompt resumes cleanly under committed history.
+            let _ = terminal.clear();
             // Drop the cursor below the live viewport before the next alt-screen
             // enter, so the roster does not paint over a dangling viewport row.
             let _ = write!(terminal.backend_mut(), "\r\n");
@@ -1771,6 +1776,11 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
 
     let result = run_inline_view(app, &signals, &mut terminal, false);
 
+    // Clear the transient live region (composer box + activity header) so the
+    // last rendered frame doesn't remain painted on the terminal after exit.
+    // Only the viewport area is wiped — committed transcript lines in real
+    // scrollback above the viewport are preserved.
+    let _ = terminal.clear();
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     disable_raw_mode()?;
     write!(terminal.backend_mut(), "\r\n")?;
@@ -2827,6 +2837,7 @@ fn submit(app: &mut App) {
         return;
     }
     if run_local_slash(app) {
+        app.clear_input();
         return;
     }
     match app.zone {

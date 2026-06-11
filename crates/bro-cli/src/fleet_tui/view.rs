@@ -25,7 +25,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
             .then(|| single_agent_composer_top_titles(app, &views, &order));
         let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
         draw_composer(f, chunks[1], app, top_titles, bottom_title);
-        if slash_active(app) {
+        if slash_active(app) && !app.help_visible {
             draw_slash_menu(f, chunks[1], app);
         }
     } else if config {
@@ -45,7 +45,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
             .then(|| roster_composer_top_titles(app));
         let bottom_title = Some(Line::from(roster_status_spans(app, &views, &roster_order)));
         draw_composer(f, chunks[1], app, top_titles, bottom_title);
-        if slash_active(app) {
+        if slash_active(app) && !app.help_visible {
             draw_slash_menu(f, chunks[1], app);
         } else if project_active(app) {
             draw_project_menu(f, chunks[1], app);
