@@ -1,0 +1,21 @@
+{
+  "id": "gap-9d0f9159",
+  "title": "Pathology ensemble: 3 of 4 flows never proven; heterogeneous-panel + in-band-error retry never exercised live",
+  "gap_kind": "eval_coverage",
+  "domain": "pathology-ensemble",
+  "wanted_capability": "Live proof coverage for the pathology ensemble family. (a) arch-pathology-java, perf-pathology-rust, perf-pathology-java are designed+shipped but never installed/team-instantiated/smoke-run — each needs brofiles+panel teamplates+facilitators+workflows installed, `bro_team create` for the panels, and one smoke run. (b) arch-pathology-rust was only proven end-to-end (PE-6) with the panel+validator repointed to codex during a bro-harness provider outage (~2026-06-01 08:00Z); re-run on the real heterogeneous brodex/deepseek/glm panel. (c) The bro-harness in-band SSE error surface+retry fix (anthropic.rs, commit cef654a) is unit-tested but the retry path was never exercised live — confirm on the next transient overload.",
+  "evidence": [
+    "system-defaults/workflows/refactor/arch-pathology-java.json",
+    "system-defaults/workflows/refactor/perf-pathology-rust.json",
+    "system-defaults/workflows/refactor/perf-pathology-java.json",
+    "thread-cc07f395"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "eval_coverage/pathology-ensemble/heterogeneous-flows-unproven",
+  "notes": "Extracted from thread-cc07f395 items 1, 2, 4 during thread triage. Requires the prod daemon host + healthy harness providers; not portable filesystem work.",
+  "resolution": "unresolved",
+  "thread_id": "thread-cc07f395",
+  "created_at": "2026-06-11T17:07:41Z",
+  "updated_at": "2026-06-11T17:07:41Z"
+}

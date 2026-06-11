@@ -1,0 +1,19 @@
+{
+  "id": "gap-1189200c",
+  "title": "Roster stream handling: optimistic dispatch insert not deduped against SSE delta; fixed 750ms reconnect with no backoff",
+  "gap_kind": "tooling",
+  "domain": "fleet-tui",
+  "wanted_capability": "(a) D7: dispatching from the roster briefly shows a DOUBLE ENTRY for the new agent — optimistic local insert races the /control/roster/stream RosterDelta carrying the same task; dedup by task_id (or skip optimistic insert when the subscription will deliver it). Look at dispatch_current_input/dispatch_fleet_prompt local insert vs update_task_from_roster in bro-fleet-client. (b) D6: roster_subscription_loop reconnect (fleet.rs ~1667) uses a fixed 750ms sleep, no exponential backoff — reconnect spray if the daemon is down >750ms. Display-only, self-correcting symptoms; same root smell as the zoom-view gap (optimistic local state vs authoritative daemon stream).",
+  "evidence": [
+    "crates/bro-cli/src/fleet.rs:1667",
+    "thread-4719ad45"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/fleet-tui/roster-stream-optimistic-insert-and-backoff",
+  "notes": "D7+D6 from thread-4719ad45. D7 operator-observed 2026-06-09, not yet code-confirmed. OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing.",
+  "resolution": "unresolved",
+  "thread_id": "thread-4719ad45",
+  "created_at": "2026-06-11T17:08:44Z",
+  "updated_at": "2026-06-11T17:08:44Z"
+}

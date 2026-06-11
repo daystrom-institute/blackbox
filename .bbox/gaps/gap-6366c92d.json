@@ -1,0 +1,19 @@
+{
+  "id": "gap-6366c92d",
+  "title": "Dispatch params advertise project_dir but the design contract names cwd canonical",
+  "gap_kind": "tooling",
+  "domain": "dispatch",
+  "wanted_capability": "Flip the schema-advertised dispatch-param name to cwd (contract-bottom name per design/bro-harness/tool-arg-defaulting.md) and migrate tool docs/prompts/atom templates in the same pass so model priors and docs agree. Today the schema advertises project_dir and accepts cwd as an alias (830c2c0) — the inverse of the contract.",
+  "evidence": [
+    "design/bro-harness/tool-arg-defaulting.md",
+    "thread-55d51135"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/dispatch/cwd-advertised-name-flip",
+  "notes": "Item 3 of thread-55d51135. Mechanical but must be done as one pass (schema + docs + prompts + atom templates) to avoid split priors.",
+  "resolution": "unresolved",
+  "thread_id": "thread-55d51135",
+  "created_at": "2026-06-11T17:09:00Z",
+  "updated_at": "2026-06-11T17:09:00Z"
+}

@@ -1,0 +1,21 @@
+{
+  "id": "gap-96936c27",
+  "title": "docs/perf-pathology-dispatch.md still points at superseded language-agnostic perf-pathology.json",
+  "gap_kind": "docs_runbook",
+  "domain": "pathology-ensemble",
+  "wanted_capability": "docs/perf-pathology-dispatch.md should reference the split perf-pathology-{rust,java} workflows (system-defaults/workflows/refactor/), not the superseded v1 perf-pathology.json it cites at lines 13/27/39/51/92/173. perf-pathology.json (v1) was deliberately left in place but superseded. Verified still stale 2026-06-11.",
+  "evidence": [
+    "docs/perf-pathology-dispatch.md:39",
+    "system-defaults/workflows/refactor/perf-pathology-rust.json",
+    "system-defaults/workflows/refactor/perf-pathology-java.json",
+    "thread-cc07f395"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "docs_runbook/pathology-ensemble/dispatch-doc-stale-workflow-refs",
+  "notes": "Extracted from thread-cc07f395 item 8 during thread triage. Doc rewrite needs awareness of both split workflows' dispatch shapes, so filed rather than hot-fixed during triage.",
+  "resolution": "unresolved",
+  "thread_id": "thread-cc07f395",
+  "created_at": "2026-06-11T17:07:58Z",
+  "updated_at": "2026-06-11T17:07:58Z"
+}

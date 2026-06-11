@@ -1,0 +1,19 @@
+{
+  "id": "gap-37a280a6",
+  "title": "Team artifact install doesn't auto-instantiate — ensemble actors resolve only instantiated teams",
+  "gap_kind": "tooling",
+  "domain": "teams",
+  "wanted_capability": "Ensemble actors resolve `team` via load_team (instantiated teams store) with no teamplate fallback, so adopting an ensemble requires `bro_team(action=create, name, template)` after installing the teamplate — bbox_artifact_install kind=team and save_template are NOT sufficient, nor is a daemon restart. Want: auto-instantiate on team-artifact install, or codify the create step in the adoption runbook so the footgun dies. (The design doc was updated with the manual sequence; the substrate-level fix is still open.)",
+  "fallback_used": "Manual bro_team(action=create) after artifact install, documented in the ensemble design doc",
+  "evidence": [
+    "thread-cc07f395"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/teams/team-artifact-install-auto-instantiate",
+  "notes": "Extracted from thread-cc07f395 item 5 during thread triage.",
+  "resolution": "unresolved",
+  "thread_id": "thread-cc07f395",
+  "created_at": "2026-06-11T17:07:52Z",
+  "updated_at": "2026-06-11T17:07:52Z"
+}

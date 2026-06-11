@@ -1,0 +1,20 @@
+{
+  "id": "gap-8144b4b5",
+  "title": "Worktree creation doesn't populate project_dir pins — wrong-tree dispatch class still open",
+  "gap_kind": "tooling",
+  "domain": "dispatch",
+  "wanted_capability": "Fleet/workflow worktree creation should emit `pin:*.project_dir=<worktree>` (and the workflow op its arc worktree) so a confused model passing the wrong tree gets a refusal with explanation — killing the wrong-tree class completely. The pin flavor of the ToolArgDefaults grammar is implemented and tested (w11 skinny-brodex build); only the daemon-side population at worktree-creation time is missing. Design contract: design/bro-harness/tool-arg-defaulting.md step 5 full form — bump its lifecycle to partial when picking this up.",
+  "missing_primitive": "Daemon-side pin emission in fleet cockpit + workflow WorktreeCreate paths",
+  "evidence": [
+    "design/bro-harness/tool-arg-defaulting.md",
+    "thread-55d51135"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/dispatch/worktree-pin-population",
+  "notes": "Item 1 of thread-55d51135 (which stays OPEN as the umbrella — items 2 ambient-default expansion is operator-decision-gated on §3.1 scope semantics and stays thread-resident).",
+  "resolution": "unresolved",
+  "thread_id": "thread-55d51135",
+  "created_at": "2026-06-11T17:08:56Z",
+  "updated_at": "2026-06-11T17:08:56Z"
+}

@@ -1,0 +1,22 @@
+{
+  "id": "gap-2ed75162",
+  "title": "WhiteboardRegistry::archive bypasses the Role::can_transition authority gate",
+  "gap_kind": "tooling",
+  "domain": "whiteboards",
+  "wanted_capability": "archive() should enforce the same role authority gate as transition(): Resolve→Archived is a phase transition, so only facilitator/operator roles may perform it. Today src/whiteboards.rs:1048 archive() checks only registration + phase==Resolve, while transition() enforces agent.role.can_transition() at :1023 — any registered agent can archive a board, violating the archive authority contract (RAP-WB-001..003, plan at design/refactor/plans/rap-wb-archive-role.md). Verified still present 2026-06-11.",
+  "missing_primitive": "Role::can_transition() check inside WhiteboardRegistry::archive (and the whiteboard_archive tool path that calls it directly)",
+  "evidence": [
+    "src/whiteboards.rs:1048",
+    "src/whiteboards.rs:1023",
+    "design/refactor/plans/rap-wb-archive-role.md",
+    "thread-cc07f395"
+  ],
+  "impact": "high",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/whiteboards/archive-authority-gate",
+  "notes": "This is the real bug the arch-pathology-rust PE-6 run found (its plan subject). Extracted from thread-cc07f395 item 7 during thread triage.",
+  "resolution": "unresolved",
+  "thread_id": "thread-cc07f395",
+  "created_at": "2026-06-11T17:07:28Z",
+  "updated_at": "2026-06-11T17:07:28Z"
+}

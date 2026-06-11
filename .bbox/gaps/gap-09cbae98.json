@@ -1,0 +1,19 @@
+{
+  "id": "gap-09cbae98",
+  "title": "Focused-transcript zoom view not driven by authoritative daemon stream — 4 symptoms, one subsystem",
+  "gap_kind": "tooling",
+  "domain": "fleet-tui",
+  "wanted_capability": "The single-agent zoom view's buffer + status + repaint should be faithfully driven by the daemon focused-transcript stream and authoritative task status. Four operator-observed symptoms, one tranche: D8 first user turn renders twice (backfill not deduped against optimistically-rendered turns); D9 nav out/back loses scrollback (re-focus reopens SSE but doesn't restore/re-request the history buffer — daemon supports history paging per 777c18e); D10 new lines don't appear live while zoomed (inline render loop ~fleet_tui.rs:1786 doesn't wake/repaint on FocusedTranscriptMsg::Stream events); D11 throbber shows \"working\" with climbing timer on a Finished agent (stale local active flag + wall-clock-since-focus timer, not gated on status.is_terminal()). Related: D5 — started_at for reloaded rows hydrated from last_event_at (crates/.../task.rs:175), so the \"started\" column shows last-activity time. Fix as ONE tranche on the inline/zoomed render loop + start_focused_transcript + FocusedTranscriptBuffer, not four scattered patches.",
+  "evidence": [
+    "crates/bro-cli/src/fleet_tui.rs:1786",
+    "thread-4719ad45"
+  ],
+  "impact": "high",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/fleet-tui/focused-transcript-zoom-fidelity",
+  "notes": "D8+D9+D10+D11 (+D5) from thread-4719ad45. D11 was LIVE-CONFIRMED via tmux 2026-06-09 (task 6e6ae4be: footer showed \"working 10m27s\" for a completed ~3m brodex session while the same footer's roster summary correctly said 0 active). D8-D10 operator-observed, not yet code-confirmed. OPERATOR GATE: validate each symptom against a live `bro fleet` instance via tmux MCP before fixing.",
+  "resolution": "unresolved",
+  "thread_id": "thread-4719ad45",
+  "created_at": "2026-06-11T17:08:38Z",
+  "updated_at": "2026-06-11T17:08:38Z"
+}

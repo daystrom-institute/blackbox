@@ -1,0 +1,20 @@
+{
+  "id": "gap-ddfde5c3",
+  "title": "No single-cockpit instance guard — two `bro fleet` processes over one store duel and corrupt display state",
+  "gap_kind": "tooling",
+  "domain": "fleet-tui",
+  "wanted_capability": "An advisory lock / pidfile on the fleet store dir with warn-or-refuse on a second `bro fleet` instance. No flock/pidfile/advisory-lock exists anywhere in fleet_tui.rs/main.rs/fleet.rs; two cockpits both subscribe to /control/roster/stream and issue overlapping /control/exec + /control/steer — orphan cockpits duel and corrupt display state (cost real debugging time during dogfood).",
+  "missing_primitive": "Advisory lock/pidfile on the fleet store dir at cockpit startup",
+  "evidence": [
+    "crates/bro-cli/src/fleet_tui.rs",
+    "thread-4719ad45"
+  ],
+  "impact": "high",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/fleet-tui/single-instance-guard",
+  "notes": "D2 from thread-4719ad45. OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing — but note reproducing this one requires TWO cockpits over the same store, which is itself the hazard; coordinate with the operator before any live duel repro.",
+  "resolution": "unresolved",
+  "thread_id": "thread-4719ad45",
+  "created_at": "2026-06-11T17:08:15Z",
+  "updated_at": "2026-06-11T17:08:15Z"
+}

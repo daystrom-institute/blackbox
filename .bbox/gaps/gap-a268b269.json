@@ -1,0 +1,20 @@
+{
+  "id": "gap-a268b269",
+  "title": "Fleet closeout/forget swallow git and daemon errors — branch delete reported ok unconditionally",
+  "gap_kind": "tooling",
+  "domain": "fleet-tui",
+  "wanted_capability": "Error observability on two paths. (a) fleet_worktree.rs closeout Remove phase: `let _ = git_run(base_repo, &[\"branch\",\"-D\",branch])` with content[\"deleted_branch\"] set regardless of result — PhaseResult reports ok even when the delete failed (observability nit, not a leak: closeout DOES reap branches). Capture the result, surface a warning on failure. (b) forget_standalone_agents swallows daemon DELETE errors (`let _ = app.orch.forget(&id)`) — inconsistent with remove_agent_row's fallible path.",
+  "evidence": [
+    "crates/bro-tools/src/fleet_worktree.rs:1370",
+    "crates/bro-cli/src/fleet_tui.rs",
+    "thread-4719ad45"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/fleet-tui/closeout-forget-error-observability",
+  "notes": "D3+D4 from thread-4719ad45. D3 re-verified in code 2026-06-11 (~:1370, both force and merged-branch arms). OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing.",
+  "resolution": "unresolved",
+  "thread_id": "thread-4719ad45",
+  "created_at": "2026-06-11T17:08:22Z",
+  "updated_at": "2026-06-11T17:08:22Z"
+}

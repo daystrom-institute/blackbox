@@ -1,0 +1,20 @@
+{
+  "id": "gap-d062e178",
+  "title": "Pathology plan sections render raw JSON objects; facilitator posts spurious Survey entry",
+  "gap_kind": "tooling",
+  "domain": "pathology-ensemble",
+  "wanted_capability": "Object-aware rendering for diagnosis_summary/evidence/atom_mapping/remediation/deferred plan sections — pathology_markdown (src/workflow/ops/pathology_common.rs:348) renders non-string array items as `- {json}` backtick blobs, while contradictions/refuted already render nicely via pathology_findings_markdown. Either apply finding-style object rendering to those sections or constrain the facilitator Synthesize prompt to prose strings. Secondary polish: the facilitator (rust-architecture-pathologist) posts one whiteboard entry during Survey despite the prompt — harmless to the gate (it checks lens aliases) but pollutes the board and gets validated.",
+  "evidence": [
+    "src/workflow/ops/pathology_common.rs:348",
+    "design/refactor/plans/rap-wb-archive-role.md",
+    "thread-cc07f395"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/pathology-ensemble/markdown-object-rendering",
+  "notes": "Extracted from thread-cc07f395 items 3+6 during thread triage. Rendering behavior re-verified in code 2026-06-11.",
+  "resolution": "unresolved",
+  "thread_id": "thread-cc07f395",
+  "created_at": "2026-06-11T17:07:34Z",
+  "updated_at": "2026-06-11T17:07:34Z"
+}

@@ -1,0 +1,19 @@
+{
+  "id": "gap-d7527187",
+  "title": "Fleet cockpit roster Enter dispatches any input as an agent prompt — shell-input footgun",
+  "gap_kind": "tooling",
+  "domain": "fleet-tui",
+  "wanted_capability": "A shell-vs-prompt guard (heuristic/confirm for shell-shaped input, or a clearer \"this dispatches an agent\" affordance) on the roster Enter path. In Zone::Roster any non-slash Enter calls dispatch_current_input() unguarded, so typing a shell command (e.g. `clear; bro fleet`, `cargo build`) into a pane that still owns a live cockpit dispatches it as a one-line agent prompt.",
+  "evidence": [
+    "crates/bro-cli/src/fleet_tui.rs:3181",
+    "thread-4719ad45"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/fleet-tui/roster-dispatch-shell-guard",
+  "notes": "D1 from thread-4719ad45. Code citation re-verified 2026-06-11 (drifted from :2558 at 9cb5228 to :3181-3183). OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing (repo convention + standing order 2026-06-11).",
+  "resolution": "unresolved",
+  "thread_id": "thread-4719ad45",
+  "created_at": "2026-06-11T17:08:10Z",
+  "updated_at": "2026-06-11T17:08:10Z"
+}
