@@ -237,7 +237,7 @@ static CLAUDE_EFFORTS: &[EffortInfo] = &[
     },
     EffortInfo {
         id: "xhigh",
-        description: "Extended depth (Opus 4.7 only)",
+        description: "Extended reasoning depth",
         default: true,
     },
     EffortInfo {
