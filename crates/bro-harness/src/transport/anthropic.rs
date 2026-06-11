@@ -1203,6 +1203,35 @@ mod tests {
     }
 
     #[test]
+    fn minimax_request_keeps_anthropic_cache_control_breakpoints() {
+        let mut t = transport();
+        t.messages = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "question"}
+        ]})];
+        let mut o = opts_with_base(
+            "BASE",
+            SystemPrompt {
+                stable: Some("STABLE".into()),
+                ambient: Some("AMBIENT".into()),
+                volatile: Some("VOLATILE".into()),
+            },
+        );
+        o.model = "MiniMax-M3".into();
+
+        let body = t.build_body(&[], &o);
+
+        let sys = body["system"].as_array().expect("system array");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
+        assert!(sys[2].get("cache_control").is_none());
+        assert!(sys[3].get("cache_control").is_none());
+
+        let last_msg = body["messages"].as_array().unwrap().last().unwrap();
+        let last_block = last_msg["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
     fn normalize_synthesizes_missing_tool_results_and_removes_orphans() {
         let mut messages = vec![
             json!({"role": "assistant", "content": [

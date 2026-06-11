@@ -23,6 +23,13 @@
 //! buffer, matching the Anthropic transport), and visible text is replayed as
 //! usual. The request-side `reasoning_effort` knob is provider-specific and
 //! gated by [`ReasoningProfile`].
+//!
+//! Context reuse: the chat-completions wire shape used by vibebh/Mistral has no
+//! known explicit prompt-cache breakpoint or reusable context handle analogous
+//! to Anthropic `cache_control`, and the usage payload does not expose
+//! cache-read/cache-write counters. The transport still keeps stable system
+//! content prefix-friendly, but provider catalog metadata reports vibebh as
+//! `none_known` for explicit cache capability until Mistral exposes one.
 
 use super::{StopReason, Transport, TurnOpts, TurnOutput, Usage};
 use anyhow::{Context, Result};

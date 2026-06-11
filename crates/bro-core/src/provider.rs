@@ -173,6 +173,10 @@ impl Provider {
     pub fn efforts(&self) -> &'static [EffortInfo] {
         efforts_for(*self)
     }
+
+    pub fn prompt_cache(&self) -> PromptCacheCapability {
+        prompt_cache_for(*self)
+    }
 }
 
 impl std::fmt::Display for Provider {
@@ -199,6 +203,23 @@ pub struct EffortInfo {
     pub default: bool,
 }
 
+/// Provider-level prompt/cache reuse capability advertised to schedulers and
+/// cost-aware callers. This is catalog metadata only; allocator policy chooses
+/// whether and how to use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheCapability {
+    /// Anthropic Messages-compatible `cache_control` breakpoints are emitted by
+    /// `bro-harness` and cache read/write counters are parsed when returned.
+    AnthropicCacheControl,
+    /// OpenAI Responses-style server-side prompt caching reports cached input in
+    /// `input_tokens_details.cached_tokens`; no explicit breakpoint is sent.
+    OpenAiPromptTokenDetails,
+    /// No known explicit context-reuse or cache-reporting surface for this
+    /// provider/transport.
+    NoneKnown,
+}
+
 fn models_for(provider: Provider) -> &'static [ModelInfo] {
     match provider {
         Provider::Glm => GLM_MODELS,
@@ -216,6 +237,16 @@ fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
         Provider::Brodex => CODEX_EFFORTS,
         Provider::VibeBh => VIBEBH_EFFORTS,
         Provider::Workflow => &[],
+    }
+}
+
+fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
+    match provider {
+        Provider::Glm | Provider::Deepseek | Provider::Minimax => {
+            PromptCacheCapability::AnthropicCacheControl
+        }
+        Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
+        Provider::VibeBh | Provider::Workflow => PromptCacheCapability::NoneKnown,
     }
 }
 
@@ -473,3 +504,28 @@ static VIBEBH_EFFORTS: &[EffortInfo] = &[
         default: true,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_cache_capability_tracks_transport_surfaces() {
+        assert_eq!(
+            Provider::Minimax.prompt_cache(),
+            PromptCacheCapability::AnthropicCacheControl
+        );
+        assert_eq!(
+            Provider::Deepseek.prompt_cache(),
+            PromptCacheCapability::AnthropicCacheControl
+        );
+        assert_eq!(
+            Provider::Brodex.prompt_cache(),
+            PromptCacheCapability::OpenAiPromptTokenDetails
+        );
+        assert_eq!(
+            Provider::VibeBh.prompt_cache(),
+            PromptCacheCapability::NoneKnown
+        );
+    }
+}

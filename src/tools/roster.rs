@@ -290,6 +290,7 @@ impl BlackboxServer {
             let mut entry = json!({
                 "bin": bin,
                 "found": resolved.is_some(),
+                "promptCache": p.prompt_cache(),
                 "supportsResume": p.supports_resume(),
             });
             if let Some(ref path) = resolved {
