@@ -33,6 +33,12 @@ pub(super) fn init_logging(home: &Path, migrated: Vec<String>) {
     std::panic::set_hook(Box::new(|info| {
         tracing::error!("PANIC: {}", info);
     }));
+    // rmcp's reqwest 0.13 rides the rustls no-provider variant (workspace
+    // Cargo.toml `reqwest-tls-no-provider`), so its client builder panics
+    // "No provider set" unless a process-default CryptoProvider exists.
+    // Install ring once at startup; first consumer is the dispatch-path MCP
+    // client, which otherwise kills the dispatched task's driver mid-flight.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     for msg in migrated {
         tracing::info!("migrated legacy blackbox path: {msg}");
     }
