@@ -951,7 +951,13 @@ fn handle_focused_transcript_msg(app: &mut App, msg: FocusedTranscriptMsg) {
                 .get_or_insert_with(FocusedTranscriptBuffer::default);
             buffer.apply_snapshot(snapshot);
             app.focused_transcript_task_id = Some(task_id.clone());
-            app.inline_commits.remove(&task_id);
+            // The zoom-in entry code (run_inline_view) already clears the
+            // commit cursor for fresh starts. Terminal-transition and resync
+            // restarts must preserve it so already-committed scrollback lines
+            // aren't re-emitted (which would render the initial prompt three
+            // times). commit_inline_history bounds-checks the committed count
+            // against the transcript length so a stale cursor from a resync
+            // that genuinely changed history is still safe.
             app.focused_reflow_requested |= had_events;
         }
         FocusedTranscriptMsg::Stream(FocusedTranscriptStreamEvent::Event(event)) => {
@@ -2083,19 +2089,31 @@ where
     if !cursor.committed_initial {
         let initial = initial_prompt(&app.agents[idx]);
         if !initial.is_empty() {
-            lines.extend(render_steer_with_status(
-                initial,
-                width,
-                TurnRenderStatus::Normal,
-            ));
-            lines.push(Line::from(""));
+            // When the focused transcript's first item already carries the
+            // initial prompt as a UserSteer, don't render it twice.
+            let already_in_transcript =
+                initial_prompt_already_in_transcript(initial, transcript);
+            if !already_in_transcript {
+                lines.extend(render_steer_with_status(
+                    initial,
+                    width,
+                    TurnRenderStatus::Normal,
+                ));
+                lines.push(Line::from(""));
+            }
         }
     }
     if stable_end > cursor.committed {
-        lines.extend(render_committed_items(
-            &transcript[cursor.committed..stable_end],
-            width,
-        ));
+        // Bound to transcript length so a stale cursor (from a previous zoom
+        // or resnapshot) doesn't panic on the slice.
+        let start = cursor.committed.min(transcript.len());
+        let end = stable_end.min(transcript.len());
+        if end > start {
+            lines.extend(render_committed_items(
+                &transcript[start..end],
+                width,
+            ));
+        }
     }
     let committed_now = !lines.is_empty();
     if committed_now {
@@ -2104,7 +2122,7 @@ where
     app.inline_commits.insert(
         id,
         InlineCommit {
-            committed: stable_end,
+            committed: stable_end.min(transcript.len()),
             committed_initial: true,
         },
     );
@@ -4131,6 +4149,15 @@ fn since_compact(start_ms: Option<u64>, now_ms: u64) -> Option<String> {
 /// (only stdin steers are replayed), so the renderer prepends it.
 fn initial_prompt(a: &Agent) -> &str {
     a.initial_prompt.as_deref().unwrap_or("")
+}
+
+/// Returns true when the transcript's first item is a `UserSteer` whose text
+/// matches `initial` — the focused transcript already carries it so the
+/// renderer shouldn't emit the initial prompt twice in scrollback.
+fn initial_prompt_already_in_transcript(initial: &str, transcript: &[TranscriptItem]) -> bool {
+    transcript.first().is_some_and(|item| {
+        matches!(item, TranscriptItem::UserSteer(text) if text == initial)
+    })
 }
 
 fn latest_todo_state(items: &[TranscriptItem]) -> Option<TodoState> {

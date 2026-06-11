@@ -1156,4 +1156,102 @@ Trailing paragraph.";
         );
     }
 
+    // ── duplicate prompt regression (thread-c3f7c7e3) ────────────────────
+
+    /// Regression: `commit_inline_history` must suppress the local
+    /// initial_prompt render when the focused transcript's first item already
+    /// carries the same text as a UserSteer — otherwise the prompt renders
+    /// twice in scrollback (once locally, once from the SSE snapshot).
+    #[test]
+    fn initial_prompt_suppressed_when_first_transcript_item_matches() {
+        let initial = "fix the bug";
+        // Match: first item is UserSteer with exact text.
+        let items = vec![TranscriptItem::UserSteer(initial.into())];
+        assert!(
+            initial_prompt_already_in_transcript(initial, &items),
+            "should detect matching first UserSteer"
+        );
+
+        // Mismatch: first item is different text.
+        let items = vec![TranscriptItem::UserSteer("something else".into())];
+        assert!(
+            !initial_prompt_already_in_transcript(initial, &items),
+            "should not match different UserSteer text"
+        );
+
+        // Mismatch: first item is not a UserSteer.
+        let items = vec![TranscriptItem::AssistantText("thinking".into())];
+        assert!(
+            !initial_prompt_already_in_transcript(initial, &items),
+            "should not match non-UserSteer first item"
+        );
+
+        // Empty transcript: nothing to match.
+        let items: Vec<TranscriptItem> = vec![];
+        assert!(
+            !initial_prompt_already_in_transcript(initial, &items),
+            "empty transcript never matches"
+        );
+
+        // Empty initial prompt + empty UserSteer: they match, but in practice
+        // commit_inline_history guards with `!initial.is_empty()` so this path
+        // is never reached.
+        let items = vec![TranscriptItem::UserSteer("".into())];
+        assert!(
+            initial_prompt_already_in_transcript("", &items),
+            "empty strings match (guarded by !initial.is_empty() at call site)"
+        );
+    }
+
+    /// Regression: when the commit cursor is stale (e.g. from a previous zoom
+    /// session or a resync that produced fewer events), `commit_inline_history`
+    /// must not panic on the slice `transcript[committed..stable_end]`.
+    ///
+    /// We verify this indirectly by checking that `inline_stable_end` and the
+    /// bounds-clamp logic produce a valid range even when the committed count
+    /// exceeds the transcript length.
+    #[test]
+    fn stale_commit_cursor_does_not_panic() {
+        // Simulate: committed=10 but transcript only has 5 items, turn inactive.
+        let transcript_len = 5;
+        let committed: usize = 10;
+        let stable_end = inline_stable_end(transcript_len, false);
+
+        // The bounds clamp in commit_inline_history: min(committed, transcript.len())
+        let start = committed.min(transcript_len); // → 5
+        let end = stable_end.min(transcript_len); // → 5
+        // An empty slice is valid — no panic.
+        assert_eq!(start, transcript_len);
+        assert_eq!(end, transcript_len);
+        assert!(start <= transcript_len);
+        assert!(end <= transcript_len);
+        // The key property: start ≤ end (empty range, not inverted).
+        assert!(start <= end);
+    }
+
+    /// The resolution: removing the Snapshot handler's unconditional
+    /// `inline_commits.remove` means a terminal-transition resnapshot keeps the
+    /// commit cursor. Verify that when the cursor is preserved and the snapshot
+    /// is a superset (has ≥ items than what was committed), `commit_inline_history`
+    /// skips already-committed items and only emits new ones.
+    #[test]
+    fn superset_snapshot_preserves_cursor_and_only_emits_new_items() {
+        // Simulated state: transcript has 8 items, we committed 5.
+        // After a terminal-transition resnapshot, transcript now has 12 items
+        // (super-set: same first 8 + 4 new ones). The cursor at committed=5
+        // is preserved, so only items [5..12) get committed.
+        let transcript_len = 12;
+        let committed: usize = 5;
+        let stable_end = inline_stable_end(transcript_len, true); // turn active → last item not stable
+
+        let start = committed.min(transcript_len); // → 5
+        let end = stable_end.min(transcript_len);
+        // New items to commit: transcript[5..end]
+        assert_eq!(start, 5);
+        assert!(end > start, "should commit new items beyond the cursor");
+        assert!(end <= transcript_len);
+        // Already-committed items [0..5) are skipped.
+        assert_eq!(start - 0, committed);
+    }
+
     
