@@ -1186,6 +1186,24 @@ pub struct TaskStore {
 }
 
 impl TaskStore {
+    /// (provider, session_id, bro_label) rows for the edge-index
+    /// SESSION_USED_BROFILE projection — `EdgeStoreRefs` takes plain rows
+    /// so the edge store sits below orchestration in the crate DAG.
+    pub fn session_brofile_rows(&self) -> Vec<(String, String, String)> {
+        self.all_tasks()
+            .iter()
+            .filter_map(|task| {
+                let inner = task.inner.lock();
+                let label = inner.bro_label.clone()?;
+                Some((
+                    inner.provider.as_str().to_string(),
+                    inner.session_id.clone(),
+                    label,
+                ))
+            })
+            .collect()
+    }
+
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),

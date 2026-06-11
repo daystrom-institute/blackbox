@@ -1291,7 +1291,7 @@ async fn write_semantic_edge_projects_describes_sidecar() {
         knowledge: &server.state.kb.read(),
         threads: &server.state.threads.read(),
         notes: &server.state.notes.read(),
-        task_store: &server.state.task_store.read(),
+        session_brofile_rows: server.state.task_store.read().session_brofile_rows(),
         roadmap: &server.state.roadmap.read(),
         edges_dir,
         registered_project_ids: None,

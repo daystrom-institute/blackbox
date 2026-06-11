@@ -6,15 +6,14 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::chunker::{EdgeConfidence, EdgeProvenance};
-use crate::entity_ref::EntityRef;
-use crate::index::{EdgeProjectionDoc, TranscriptIndex};
-use crate::knowledge::{Knowledge, KnowledgeEdgeKind};
-use crate::notes::Notes;
-use crate::orchestration::TaskStore;
-use crate::roadmap::Roadmap;
-use crate::threads::{EdgeKind, EdgeTarget, Threads};
-pub(crate) use crate::edge_sidecar::*;
+use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_corpus_index::index::{EdgeProjectionDoc, TranscriptIndex};
+use bbox_knowledge::knowledge::{Knowledge, KnowledgeEdgeKind};
+use bbox_threads::notes::Notes;
+use bbox_stores::roadmap::Roadmap;
+use bbox_threads::threads::{EdgeKind, EdgeTarget, Threads};
+pub use bbox_edge_sidecar::edge_sidecar::*;
 
 #[derive(Default)]
 pub struct EdgeIndex {
@@ -30,7 +29,10 @@ pub struct EdgeStoreRefs<'a> {
     pub knowledge: &'a Knowledge,
     pub threads: &'a Threads,
     pub notes: &'a Notes,
-    pub task_store: &'a TaskStore,
+    /// (provider, session_id, bro_label) rows extracted from the task
+    /// store by the caller — dependency inversion keeping this store
+    /// below orchestration in the crate DAG.
+    pub session_brofile_rows: Vec<(String, String, String)>,
     pub roadmap: &'a Roadmap,
     pub edges_dir: PathBuf,
     pub registered_project_ids: Option<HashSet<String>>,
@@ -65,14 +67,14 @@ impl EdgeIndex {
     /// writer queued behind a guard held that long blocks all new readers.
     /// Store projections must run before the sidecar load so `seen` dedup
     /// attribution matches `rebuild`.
-    pub(crate) fn project_store_edges(stores: &EdgeStoreRefs<'_>) -> (Self, HashSet<EdgeKey>) {
+    pub fn project_store_edges(stores: &EdgeStoreRefs<'_>) -> (Self, HashSet<EdgeKey>) {
         let mut index = Self::default();
         let mut seen = HashSet::new();
 
         index.project_knowledge_edges(stores.knowledge, &mut seen);
         index.project_thread_edges(stores.threads, &mut seen);
         index.project_note_edges(stores.notes, &mut seen);
-        index.project_task_edges(stores.task_store, &mut seen);
+        index.project_task_edges(&stores.session_brofile_rows, &mut seen);
         index.project_roadmap_edges(stores.roadmap, &mut seen);
         if stores.include_tantivy_projection {
             if let Ok(docs) = stores.index.edge_projection_docs() {
@@ -84,7 +86,7 @@ impl EdgeIndex {
         (index, seen)
     }
 
-    pub(crate) fn log_rebuilt(&self, include_tantivy_projection: bool, started: Instant) {
+    pub fn log_rebuilt(&self, include_tantivy_projection: bool, started: Instant) {
         tracing::info!(
             edges = self.edge_count(),
             sources = self.forward.len(),
@@ -102,7 +104,7 @@ impl EdgeIndex {
         seen: &mut HashSet<EdgeKey>,
         include_observed: bool,
     ) {
-        match crate::manifest::try_load_manifest_index(edges_dir) {
+        match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
             Ok(manifest_index) => {
                 let loadable = manifest_index.active_paths_for_loader(edges_dir);
                 let total_materialized_files = count_materialized_jsonl_files(edges_dir);
@@ -124,7 +126,7 @@ impl EdgeIndex {
             Err(reason) => {
                 if !matches!(
                     reason,
-                    crate::manifest::ManifestFallbackReason::MissingNotMigrated
+                    bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated
                 ) {
                     tracing::warn!(?reason, "manifest-index fallback to legacy sidecar loading");
                 }
@@ -224,11 +226,11 @@ impl EdgeIndex {
         counts
     }
 
-    pub(crate) fn all_edges(&self) -> impl Iterator<Item = &Edge> {
+    pub fn all_edges(&self) -> impl Iterator<Item = &Edge> {
         self.edges.iter()
     }
 
-    pub(crate) fn edges_with_anchor_commit(&self, commit_sha: &str) -> Vec<&Edge> {
+    pub fn edges_with_anchor_commit(&self, commit_sha: &str) -> Vec<&Edge> {
         self.commit_anchor_index
             .get(commit_sha)
             .map(|indices| {
@@ -241,7 +243,7 @@ impl EdgeIndex {
             .unwrap_or_default()
     }
 
-    pub(crate) fn session_tool_call_edges(&self, provider: &str, session_id: &str) -> Vec<&Edge> {
+    pub fn session_tool_call_edges(&self, provider: &str, session_id: &str) -> Vec<&Edge> {
         self.session_tool_calls
             .get(&(provider.to_string(), session_id.to_string()))
             .map(|indices| {
@@ -293,7 +295,7 @@ impl EdgeIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_edges_for_tests(edges: Vec<Edge>) -> Self {
+    pub fn from_edges_for_tests(edges: Vec<Edge>) -> Self {
         let mut index = Self::default();
         let mut seen = HashSet::new();
         for edge in edges {
@@ -464,20 +466,20 @@ impl EdgeIndex {
         }
     }
 
-    fn project_task_edges(&mut self, task_store: &TaskStore, seen: &mut HashSet<EdgeKey>) {
-        for task in task_store.all_tasks() {
-            let inner = task.inner.lock();
-            let Some(label) = inner.bro_label.as_ref() else {
-                continue;
-            };
-            if label.contains("::") || inner.session_id == "pending" {
+    fn project_task_edges(
+        &mut self,
+        rows: &[(String, String, String)],
+        seen: &mut HashSet<EdgeKey>,
+    ) {
+        for (provider, session_id, label) in rows {
+            if label.contains("::") || session_id == "pending" {
                 continue;
             }
             self.insert(
                 exact_edge(
                     EntityRef::Session {
-                        provider: inner.provider.as_str().to_string(),
-                        session_id: inner.session_id.clone(),
+                        provider: provider.clone(),
+                        session_id: session_id.clone(),
                     },
                     "SESSION_USED_BROFILE",
                     EntityRef::Brofile {
@@ -501,14 +503,14 @@ impl EdgeIndex {
                 Err(_) => continue,
             };
             let kind = match edge.kind {
-                crate::roadmap::RoadmapEdgeKind::Spawns => "ROADMAP_SPAWNS",
-                crate::roadmap::RoadmapEdgeKind::DeferredFrom => "ROADMAP_DEFERRED_FROM",
-                crate::roadmap::RoadmapEdgeKind::DesignedIn => "ROADMAP_DESIGNED_IN",
-                crate::roadmap::RoadmapEdgeKind::DependsOn => "ROADMAP_DEPENDS_ON",
-                crate::roadmap::RoadmapEdgeKind::BlockedBy => "ROADMAP_BLOCKED_BY",
-                crate::roadmap::RoadmapEdgeKind::Supersedes => "ROADMAP_SUPERSEDES",
-                crate::roadmap::RoadmapEdgeKind::Subsumes => "ROADMAP_SUBSUMES",
-                crate::roadmap::RoadmapEdgeKind::RelatedTo => "ROADMAP_RELATED_TO",
+                bbox_stores::roadmap::RoadmapEdgeKind::Spawns => "ROADMAP_SPAWNS",
+                bbox_stores::roadmap::RoadmapEdgeKind::DeferredFrom => "ROADMAP_DEFERRED_FROM",
+                bbox_stores::roadmap::RoadmapEdgeKind::DesignedIn => "ROADMAP_DESIGNED_IN",
+                bbox_stores::roadmap::RoadmapEdgeKind::DependsOn => "ROADMAP_DEPENDS_ON",
+                bbox_stores::roadmap::RoadmapEdgeKind::BlockedBy => "ROADMAP_BLOCKED_BY",
+                bbox_stores::roadmap::RoadmapEdgeKind::Supersedes => "ROADMAP_SUPERSEDES",
+                bbox_stores::roadmap::RoadmapEdgeKind::Subsumes => "ROADMAP_SUBSUMES",
+                bbox_stores::roadmap::RoadmapEdgeKind::RelatedTo => "ROADMAP_RELATED_TO",
             };
             self.insert(
                 exact_edge(source, kind, target, EdgeProvenance::Derived),
@@ -701,15 +703,15 @@ impl EdgeIndex {
 
     fn load_manifest_active_paths(
         &mut self,
-        paths: &[crate::manifest::LoadablePath],
+        paths: &[bbox_edge_sidecar::manifest::LoadablePath],
         seen: &mut HashSet<EdgeKey>,
     ) {
         for loadable in paths {
             match &loadable.mode {
-                crate::manifest::PathLoadMode::Full => {
+                bbox_edge_sidecar::manifest::PathLoadMode::Full => {
                     self.project_sidecar_edges_file(&loadable.path, seen, false);
                 }
-                crate::manifest::PathLoadMode::FilteredByHash { suppressed_hashes } => {
+                bbox_edge_sidecar::manifest::PathLoadMode::FilteredByHash { suppressed_hashes } => {
                     self.project_sidecar_edges_file_with_hash_filter(
                         &loadable.path,
                         seen,
@@ -857,7 +859,7 @@ mod tests {
 
     #[test]
     fn knowledge_links_project_authored_edges() {
-        use crate::knowledge::{
+        use bbox_knowledge::knowledge::{
             Approval, Category, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry, Priority, Scope,
             Status,
         };
@@ -924,7 +926,7 @@ mod tests {
 
     #[test]
     fn thread_store_edges_project_into_agentic_graph() {
-        use crate::threads::{ThreadParams, Threads};
+        use bbox_threads::threads::{ThreadParams, Threads};
 
         fn params(action: &str) -> ThreadParams {
             ThreadParams {
@@ -1018,7 +1020,7 @@ mod tests {
             chunk_hash: "b".repeat(64),
             occurrence_idx: 1,
         };
-        let edge = crate::chunker::Edge {
+        let edge = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: target.clone(),
@@ -1065,7 +1067,7 @@ mod tests {
             qualified_name: "pkg.B".into(),
             defn_hash: "d".repeat(64),
         };
-        let mk = |s: EntityRef, k: &str, t: EntityRef| crate::chunker::Edge {
+        let mk = |s: EntityRef, k: &str, t: EntityRef| bbox_chunker::Edge {
             source: s,
             kind: k.into(),
             target: t,
@@ -1182,7 +1184,7 @@ mod tests {
         append_project_edges(
             dir.path(),
             "proj1234",
-            &[crate::chunker::Edge {
+            &[bbox_chunker::Edge {
                 source: registered_source.clone(),
                 kind: "NEXT_SECTION".into(),
                 target: registered_target,
@@ -1194,7 +1196,7 @@ mod tests {
         append_project_edges(
             dir.path(),
             "orphan12",
-            &[crate::chunker::Edge {
+            &[bbox_chunker::Edge {
                 source: orphan_source.clone(),
                 kind: "NEXT_SECTION".into(),
                 target: orphan_target,
@@ -1278,7 +1280,7 @@ mod tests {
             dir.path(),
             "project",
             "proj1234",
-            &[crate::chunker::Edge {
+            &[bbox_chunker::Edge {
                 source: registered_source.clone(),
                 kind: "NEXT_SECTION".into(),
                 target: registered_target,
@@ -1291,7 +1293,7 @@ mod tests {
             dir.path(),
             "project",
             "orphan12",
-            &[crate::chunker::Edge {
+            &[bbox_chunker::Edge {
                 source: orphan_source.clone(),
                 kind: "NEXT_SECTION".into(),
                 target: orphan_target,
@@ -1332,14 +1334,14 @@ mod tests {
             chunk_hash: "c".repeat(64),
             occurrence_idx: 2,
         };
-        let first = crate::chunker::Edge {
+        let first = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: first_target.clone(),
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
         };
-        let second = crate::chunker::Edge {
+        let second = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: second_target.clone(),
@@ -1398,7 +1400,7 @@ mod tests {
             chunk_hash: "c".repeat(64),
             occurrence_idx: 2,
         };
-        let legacy = crate::chunker::Edge {
+        let legacy = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: legacy_target.clone(),
@@ -1406,7 +1408,7 @@ mod tests {
             confidence: EdgeConfidence::Exact,
         };
         append_project_edges(dir.path(), "proj1234", &[legacy]).unwrap();
-        let managed = crate::chunker::Edge {
+        let managed = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: managed_target.clone(),
@@ -1459,7 +1461,7 @@ mod tests {
             confidence: EdgeConfidence::Exact,
             metadata: Default::default(),
         };
-        let legacy_derived = crate::chunker::Edge {
+        let legacy_derived = bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
                 project_id: "proj1234".into(),
                 rel_path_hash: "pathhash".into(),
@@ -1474,7 +1476,7 @@ mod tests {
         append_edges(dir.path(), "proj1234", &[legacy_explicit]).unwrap();
         append_project_edges(dir.path(), "proj1234", &[legacy_derived]).unwrap();
 
-        let managed = crate::chunker::Edge {
+        let managed = bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
                 project_id: "proj1234".into(),
                 rel_path_hash: "pathhash".into(),
@@ -1533,7 +1535,7 @@ mod tests {
             chunk_hash: "b".repeat(64),
             occurrence_idx: 1,
         };
-        let derived = crate::chunker::Edge {
+        let derived = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: target.clone(),
@@ -1638,7 +1640,7 @@ mod tests {
             chunk_hash: "a".repeat(64),
             occurrence_idx: 0,
         };
-        let legacy_derived = crate::chunker::Edge {
+        let legacy_derived = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: EntityRef::ProjectFile {
@@ -1661,7 +1663,7 @@ mod tests {
         append_project_edges(dir.path(), "proj9999", &[legacy_derived]).unwrap();
         append_edges(dir.path(), "proj9999", &[legacy_explicit]).unwrap();
 
-        let managed = crate::chunker::Edge {
+        let managed = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: EntityRef::ProjectFile {
@@ -1702,7 +1704,7 @@ mod tests {
             chunk_hash: "a".repeat(64),
             occurrence_idx: 0,
         };
-        let derived = crate::chunker::Edge {
+        let derived = bbox_chunker::Edge {
             source: source.clone(),
             kind: "NEXT_SECTION".into(),
             target: EntityRef::ProjectFile {
@@ -1826,8 +1828,8 @@ mod tests {
     // Phase 2 tests
     // -----------------------------------------------------------------------
 
-    fn derived_chunker_edge(kind: &str) -> crate::chunker::Edge {
-        crate::chunker::Edge {
+    fn derived_chunker_edge(kind: &str) -> bbox_chunker::Edge {
+        bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
                 project_id: "p1".into(),
                 rel_path_hash: "h1".into(),
@@ -2051,7 +2053,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
-        let file_a = crate::chunker::Edge {
+        let file_a = bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
                 project_id: "p1".into(),
                 rel_path_hash: "aaa".into(),
@@ -2068,7 +2070,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
         };
-        let file_b = crate::chunker::Edge {
+        let file_b = bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
                 project_id: "p1".into(),
                 rel_path_hash: "bbb".into(),
@@ -2097,7 +2099,7 @@ mod tests {
         let after_full = read_managed_derived_edges(edges_dir, "project", "p1").unwrap();
         assert_eq!(after_full.len(), 2);
 
-        let file_a_updated = crate::chunker::Edge {
+        let file_a_updated = bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
                 project_id: "p1".into(),
                 rel_path_hash: "aaa".into(),
@@ -2144,7 +2146,7 @@ mod tests {
     #[test]
     fn incremental_materialized_replace_no_duplicates_on_repeat() {
         let dir = tempfile::tempdir().unwrap();
-        let edge = crate::chunker::Edge {
+        let edge = bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
                 project_id: "p1".into(),
                 rel_path_hash: "xxx".into(),
@@ -2183,7 +2185,7 @@ mod tests {
     fn merge_materialized_git_preserves_old_commits_and_appends_new() {
         let dir = tempfile::tempdir().unwrap();
 
-        let old_commit_edge = crate::chunker::Edge {
+        let old_commit_edge = bbox_chunker::Edge {
             source: EntityRef::Commit {
                 repo_id: "repo1".into(),
                 sha: "aaaaaa".into(),
@@ -2198,7 +2200,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
         };
-        let new_commit_edge = crate::chunker::Edge {
+        let new_commit_edge = bbox_chunker::Edge {
             source: EntityRef::Commit {
                 repo_id: "repo1".into(),
                 sha: "bbbbbb".into(),
@@ -2249,7 +2251,7 @@ mod tests {
     #[test]
     fn merge_materialized_git_no_duplicates_on_repeated_ingest() {
         let dir = tempfile::tempdir().unwrap();
-        let edge = crate::chunker::Edge {
+        let edge = bbox_chunker::Edge {
             source: EntityRef::Commit {
                 repo_id: "repo1".into(),
                 sha: "cccccc".into(),
@@ -2317,7 +2319,7 @@ mod tests {
         let edges_dir = dir.path();
 
         let active_edge = make_derived_edge_line("k_active", "DESCRIBES", "k_target");
-        let snap_dir = crate::manifest::materialized_dir(edges_dir)
+        let snap_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir)
             .join("workspace")
             .join("p1")
             .join("snapshots")
@@ -2325,14 +2327,14 @@ mod tests {
         write_jsonl(&snap_dir.join("project.jsonl"), &[&active_edge]);
 
         let inactive_edge = make_derived_edge_line("k_stale", "DESCRIBES", "k_target");
-        let inactive_dir = crate::manifest::materialized_dir(edges_dir)
+        let inactive_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir)
             .join("workspace")
             .join("p1")
             .join("snapshots")
             .join("head-old");
         write_jsonl(&inactive_dir.join("project.jsonl"), &[&inactive_edge]);
 
-        let manifest = crate::manifest::WorkspaceManifest {
+        let manifest = bbox_edge_sidecar::manifest::WorkspaceManifest {
             version: 1,
             project_id: "p1".into(),
             repo_id: None,
@@ -2347,12 +2349,12 @@ mod tests {
             active_dirty_overlay_id: None,
             updated_at: None,
         };
-        crate::manifest::WorkspaceManifest::write_to(edges_dir, &manifest).unwrap();
+        bbox_edge_sidecar::manifest::WorkspaceManifest::write_to(edges_dir, &manifest).unwrap();
 
-        let mut idx = crate::manifest::ManifestIndex::new();
+        let mut idx = bbox_edge_sidecar::manifest::ManifestIndex::new();
         idx.upsert_workspace(
             "p1",
-            crate::manifest::WorkspaceIndexEntry {
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
                 manifest: "workspace/p1/manifest.json".into(),
                 active_snapshot: Some("workspace/p1/snapshots/head-abc".into()),
                 dirty_overlay: None,
@@ -2388,10 +2390,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
-        let mat_dir = crate::manifest::materialized_dir(edges_dir);
+        let mat_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir);
         fs::create_dir_all(&mat_dir).unwrap();
         fs::write(
-            crate::manifest::manifest_index_path(edges_dir),
+            bbox_edge_sidecar::manifest::manifest_index_path(edges_dir),
             b"not json{{{",
         )
         .unwrap();
@@ -2443,10 +2445,10 @@ mod tests {
         let legacy_edge = make_explicit_edge_line("k_stale_test", "DESCRIBES", "k_target");
         write_jsonl(&edges_dir.join("p1.jsonl"), &[&legacy_edge]);
 
-        let mut idx = crate::manifest::ManifestIndex::new();
+        let mut idx = bbox_edge_sidecar::manifest::ManifestIndex::new();
         idx.upsert_workspace(
             "p1",
-            crate::manifest::WorkspaceIndexEntry {
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
                 manifest: "workspace/p1/manifest.json".into(),
                 active_snapshot: None,
                 dirty_overlay: Some("workspace/p1/dirty-overlay/does-not-exist".into()),
@@ -2471,7 +2473,7 @@ mod tests {
 
     mod cross_phase {
         use super::*;
-        use crate::manifest::ManifestIndex;
+        use bbox_edge_sidecar::manifest::ManifestIndex;
         use bbox_edge_sidecar::snapshot::{
             clean_snapshot_id, snapshot_dir, switch_to_clean_snapshot, switch_to_dirty_overlay,
         };
@@ -2956,7 +2958,7 @@ mod tests {
                 }],
             );
 
-            let inactive_base = crate::manifest::materialized_dir(edges_dir)
+            let inactive_base = bbox_edge_sidecar::manifest::materialized_dir(edges_dir)
                 .join("workspace")
                 .join(project_id)
                 .join("snapshots");
@@ -2971,7 +2973,7 @@ mod tests {
                 );
             }
 
-            let mat_dir = crate::manifest::materialized_dir(edges_dir);
+            let mat_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir);
             let total_jsonl = count_materialized_jsonl_files_recursive(&mat_dir);
             assert!(
                 total_jsonl > 20,
@@ -3145,7 +3147,7 @@ mod tests {
 
     #[test]
     fn per_file_overlay_suppresses_covered_snapshot_edges() {
-        use crate::manifest::{ManifestIndex, OverlayManifest, WorkspaceIndexEntry};
+        use bbox_edge_sidecar::manifest::{ManifestIndex, OverlayManifest, WorkspaceIndexEntry};
         use bbox_edge_sidecar::snapshot::{dirty_overlay_dir, snapshot_dir};
         use std::io::Write;
 
@@ -3185,7 +3187,7 @@ mod tests {
         let manifest_path_rel = format!("workspace/{project_id}/manifest.json");
         // Create a stub workspace manifest so validation passes
         let ws_manifest_path =
-            crate::manifest::materialized_dir(edges_dir).join(&manifest_path_rel);
+            bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join(&manifest_path_rel);
         fs::create_dir_all(ws_manifest_path.parent().unwrap()).unwrap();
         fs::write(&ws_manifest_path, "{}").unwrap();
 

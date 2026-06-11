@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunker::EdgeProvenance;
+use bbox_chunker::EdgeProvenance;
 use crate::edge_index::Edge;
 
 const MIGRATION_VERSION: u32 = 1;
@@ -203,7 +203,7 @@ pub fn has_managed_replacement(edges_dir: &Path, project_id: &str) -> bool {
             .join("git")
             .join(format!("{project_id}.jsonl"))
             .exists()
-        || crate::manifest::try_load_manifest_index(edges_dir)
+        || bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir)
             .ok()
             .and_then(|idx| idx.workspaces.get(project_id).cloned())
             .is_some()
@@ -525,8 +525,8 @@ pub fn recover_pending_migrations(edges_dir: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::EdgeConfidence;
-    use crate::entity_ref::EntityRef;
+    use bbox_chunker::EdgeConfidence;
+    use bbox_corpus_core::entity_ref::EntityRef;
 
     fn derived_edge(id: &str, kind: &str, target: &str) -> Edge {
         Edge {

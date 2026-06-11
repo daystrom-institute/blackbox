@@ -1877,7 +1877,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
             knowledge: &kb,
             threads: &threads,
             notes: &notes,
-            task_store: &task_store,
+            session_brofile_rows: task_store.session_brofile_rows(),
             roadmap: &roadmap,
             edges_dir: edges_dir.clone(),
             registered_project_ids: Some(registered_project_ids.clone()),

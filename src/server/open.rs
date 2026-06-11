@@ -417,7 +417,7 @@ fn build_startup_edge_index(
             knowledge: kb,
             threads: th,
             notes: notes_store,
-            task_store,
+            session_brofile_rows: task_store.session_brofile_rows(),
             roadmap: roadmap_store,
             edges_dir: edge_index::edges_dir_from_bro_store(store_dir),
             registered_project_ids: Some(

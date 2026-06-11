@@ -195,7 +195,7 @@ fn observed_policy_warning(observed: &[ObservedProjectUsage]) -> Option<String> 
 }
 
 fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
-    let mat_dir = crate::manifest::materialized_dir(edges_dir);
+    let mat_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir);
     let mut inactive_bytes: u64 = 0;
     let mut inactive_files: u64 = 0;
     if mat_dir.is_dir() {
@@ -212,7 +212,7 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
         }
     }
 
-    match crate::manifest::try_load_manifest_index(edges_dir) {
+    match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
         Ok(idx) => {
             let workspace_count = idx.workspaces.len();
             let active_paths = idx.active_materialized_paths(edges_dir);
@@ -229,8 +229,8 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
             })
         }
         Err(reason) => match reason {
-            crate::manifest::ManifestFallbackReason::MissingNotMigrated => None,
-            crate::manifest::ManifestFallbackReason::Corrupt { error } => Some(ManifestStatus {
+            bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated => None,
+            bbox_edge_sidecar::manifest::ManifestFallbackReason::Corrupt { error } => Some(ManifestStatus {
                 index_exists: true,
                 workspace_count: 0,
                 status: "corrupt".to_string(),
@@ -240,7 +240,7 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
                 inactive_materialized_bytes: inactive_bytes,
                 inactive_materialized_files: inactive_files,
             }),
-            crate::manifest::ManifestFallbackReason::Stale {
+            bbox_edge_sidecar::manifest::ManifestFallbackReason::Stale {
                 missing_manifests,
                 missing_paths,
             } => Some(ManifestStatus {
@@ -261,7 +261,7 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
 }
 
 fn collect_protected_jsonl_prefixes(edges_dir: &Path) -> Vec<String> {
-    match crate::manifest::try_load_manifest_index(edges_dir) {
+    match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
         Ok(idx) => idx
             .protected_materialized_paths(edges_dir)
             .into_iter()
@@ -575,7 +575,7 @@ fn orphan_reason(kind: FileKind) -> &'static str {
 }
 
 fn collect_project_storage_facts(edges_dir: &Path) -> ProjectStorageFacts {
-    let workspace_dir = crate::manifest::materialized_dir(edges_dir).join("workspace");
+    let workspace_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join("workspace");
     let mut facts = ProjectStorageFacts::default();
     let Ok(entries) = fs::read_dir(workspace_dir) else {
         return facts;
@@ -585,7 +585,7 @@ fn collect_project_storage_facts(edges_dir: &Path) -> ProjectStorageFacts {
         if !manifest_path.is_file() {
             continue;
         }
-        let Ok(manifest) = crate::manifest::WorkspaceManifest::read_from(&manifest_path) else {
+        let Ok(manifest) = bbox_edge_sidecar::manifest::WorkspaceManifest::read_from(&manifest_path) else {
             continue;
         };
         facts.manifest_projects.insert(manifest.project_id.clone());
@@ -612,7 +612,7 @@ fn scan_inactive_snapshots(
     files: &mut Vec<StorageFileInfo>,
 ) {
     let active_prefixes = collect_protected_jsonl_prefixes(edges_dir);
-    let mat_dir = crate::manifest::materialized_dir(edges_dir);
+    let mat_dir = bbox_edge_sidecar::manifest::materialized_dir(edges_dir);
     if !mat_dir.is_dir() {
         return;
     }
@@ -776,7 +776,7 @@ fn extract_project_id_from_base(file_name: &str) -> Option<String> {
     Some(base.to_string())
 }
 
-pub(crate) fn find_edges_dir(store_dir: &Path, projects_path: Option<&Path>) -> PathBuf {
+pub fn find_edges_dir(store_dir: &Path, projects_path: Option<&Path>) -> PathBuf {
     let from_store = crate::edge_index::edges_dir_from_bro_store(store_dir);
     if from_store.is_dir() {
         return from_store;
@@ -1383,7 +1383,7 @@ mod tests {
     }
 
     fn write_snapshot_jsonl(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> PathBuf {
-        let path = crate::manifest::materialized_dir(edges_dir)
+        let path = bbox_edge_sidecar::manifest::materialized_dir(edges_dir)
             .join("workspace")
             .join(project_id)
             .join("snapshots")
@@ -1401,9 +1401,9 @@ mod tests {
         canonical_path: Option<&Path>,
         active_snapshot_id: &str,
     ) {
-        crate::manifest::WorkspaceManifest::write_to(
+        bbox_edge_sidecar::manifest::WorkspaceManifest::write_to(
             edges_dir,
-            &crate::manifest::WorkspaceManifest {
+            &bbox_edge_sidecar::manifest::WorkspaceManifest {
                 version: 1,
                 project_id: project_id.to_string(),
                 repo_id: repo_id.map(str::to_string),
@@ -1423,10 +1423,10 @@ mod tests {
     }
 
     fn write_manifest_index(edges_dir: &Path, project_id: &str, active_snapshot_id: &str) {
-        let mut idx = crate::manifest::ManifestIndex::new();
+        let mut idx = bbox_edge_sidecar::manifest::ManifestIndex::new();
         idx.upsert_workspace(
             project_id,
-            crate::manifest::WorkspaceIndexEntry {
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
                 manifest: format!("workspace/{project_id}/manifest.json"),
                 active_snapshot: Some(format!(
                     "workspace/{project_id}/snapshots/{active_snapshot_id}"

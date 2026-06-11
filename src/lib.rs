@@ -118,7 +118,6 @@ use bbox_artifacts::watcher;
 mod webhooks;
 use bbox_whiteboards::whiteboards;
 mod workflow;
-use bbox_edge_sidecar::edge_sidecar;
 
 /// Initialize the process-wide system-memory catalog for tests. The
 /// repo-root `system-defaults/memories` path is owned here (the root crate),
