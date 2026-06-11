@@ -711,7 +711,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_gap_resolve",
         category: ToolCategory::Gaps,
         summary: "Resolve a gap note (acknowledged/addressed); optionally wire a structured supersession link.",
-        when_to_use: "Close-out move when a gap is implemented, rejected, superseded, or intentionally closed. `addressed` hides it from default views; `acknowledged` keeps it visible as deferred. Pass `superseded_by=gap-<id>` to retire a stale gap in favor of a better-shaped successor — it sets the structured supersedes/superseded_by link on both records. The commit that fills a gap should also carry an `Addresses-Gap-Note: gap-<id>` trailer.",
+        when_to_use: "Close-out move when a gap is implemented, rejected, superseded, or intentionally closed. `addressed` hides it from default views; `acknowledged` keeps it visible as deferred. Pass `superseded_by=gap-<id>` to retire a stale gap in favor of a better-shaped successor — it sets the structured supersedes/superseded_by link on both records. `project` (session cwd / worktree path; auto-filled on dispatches) is WRITE-TARGETING only: from a recognized worktree the rewritten repo-owned gap file lands in that worktree so the session's branch carries the resolution — the gap's durable project scope never changes, and global gaps ignore it. The commit that fills a gap should also carry an `Addresses-Gap-Note: gap-<id>` trailer.",
         example: Some(
             r#"bbox_gap_resolve(id="gap-a1b2c3d4", resolution="addressed", note="implemented in commit abc123")"#,
         ),
@@ -720,7 +720,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_gap_update",
         category: ToolCategory::Gaps,
         summary: "Edit an existing gap note's fields in place.",
-        when_to_use: "Amend a gap with additional context/evidence discovered after filing — refine the title, wanted_capability, impact, blocking_level, missing_primitive, fallback_used, evidence, or notes — without creating a disjoint successor or re-filing.",
+        when_to_use: "Amend a gap with additional context/evidence discovered after filing — refine the title, wanted_capability, impact, blocking_level, missing_primitive, fallback_used, evidence, or notes — without creating a disjoint successor or re-filing. `project` (session cwd / worktree path; auto-filled on dispatches) is WRITE-TARGETING only: from a recognized worktree the rewritten repo-owned gap file lands in that worktree; the gap's durable project scope never changes, and global gaps ignore it.",
         example: Some(
             r#"bbox_gap_update(id="gap-a1b2c3d4", impact="high", evidence=["src/foo.rs:120", "thread-7f01324e"])"#,
         ),

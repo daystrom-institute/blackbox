@@ -71,7 +71,24 @@ out explicitly under `Changed` or `Removed`.
   lack the param (glob rules are "wherever the param exists" by design;
   exact-name rules still warn on unknown params). Project-dir-semantic
   params on code-nav/refactor/team/brofile/badgey/allocator tools keep
-  their names.
+  their names. Gap mutation paths now honor worktree write-targeting too
+  (gap-b94129ba): `bbox_gap_resolve` / `bbox_gap_update` accept an optional
+  `project` (session cwd / worktree path) that redirects the rewritten
+  repo-owned `.bbox/gaps/<id>.json` into the session's own worktree —
+  write redirection only, knowledge-lane style (the session commits it,
+  the branch carries it, the gap's durable project scope never changes,
+  global gaps ignore it, and the base checkout's committed copy survives
+  the save-side generation purge untouched). In-tree linked worktrees of
+  a registered repo (e.g. `<root>/.claude/worktrees/<name>`) are now a
+  recognized worktree class across the write-side surfaces
+  (`fleet_worktree_scope_and_dir`: gap filing/mutation, thread records,
+  slices, code-nav) via a structural gate — the nearest `.git` marker is
+  a FILE pointing into the registered root's `.git/worktrees/` — so a
+  plain subdirectory is never worktree-classed. Dispatches also gain
+  ambient `project` defaults for `bbox_gap` / `bbox_gap_resolve` /
+  `bbox_gap_update` from the canonicalized dispatch cwd (`bbox_gaps`
+  stays undefaulted: its `project` is a result filter), with
+  `scope="global"` winning over a defaulted `project` on filing.
 - `extract_rust_crate` refactor compound (gap-fe4dd97f): peel leaf root
   modules of a monolithic crate into a new workspace-member crate via
   `bbox_refactor_run`. New primitives: `extract_rust_crate_scaffold` (atomic

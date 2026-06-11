@@ -1894,6 +1894,19 @@ pub struct AmbientContext {
 const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] =
     &["bbox_hybrid_search", "bbox_discover_seed_entities"];
 
+/// Gap-store tools whose `project` param is write-TARGETING, not write scope
+/// (gap-b94129ba, operator-approved): the adapter resolves it through
+/// `resolve_gap_project`, so a worktree dispatch cwd redirects the repo-owned
+/// gap file into the session's own checkout while the gap's durable project
+/// never changes. Defaulting it from the dispatch cwd is therefore safe in a
+/// way the knowledge/note/learn `project` params (§3.1: absence = global
+/// write scope) are not: on `bbox_gap`, `scope="global"` wins over any
+/// supplied/defaulted `project` (the store drops both project and write
+/// target), and on resolve/update a global gap ignores the param entirely.
+/// `bbox_gaps` (list) is deliberately absent — its `project` is a result
+/// filter where None means "all projects".
+const GAP_WRITE_TARGET_DEFAULT_TOOLS: &[&str] = &["bbox_gap", "bbox_gap_resolve", "bbox_gap_update"];
+
 /// Code-nav read tools whose `project_dir` param is the read root (file
 /// resolution / parse scan / LSP session root). All read-only; the mutating
 /// refactor tools are deliberately absent. These need `default:` entries on
@@ -2021,6 +2034,15 @@ impl AmbientContext {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| cwd.to_string());
             for tool in RETRIEVAL_PROJECT_DEFAULT_TOOLS {
+                defaults.insert(
+                    format!("default:mcp.{tool}.project"),
+                    canonical_cwd.clone(),
+                );
+            }
+            // Gap write-targeting defaults (gap-b94129ba): same gating as the
+            // retrieval defaults — only filled when the model elides the
+            // param, and `scope="global"` / global gaps still win server-side.
+            for tool in GAP_WRITE_TARGET_DEFAULT_TOOLS {
                 defaults.insert(
                     format!("default:mcp.{tool}.project"),
                     canonical_cwd.clone(),
@@ -2674,24 +2696,11 @@ fn worktree_pin_target_with_roots(
 
 /// Map a linked-worktree path to its base repository (the directory whose
 /// `.git` *directory* backs the worktree). Returns None for non-worktrees.
+/// Thin wrapper over the shared structural parse in
+/// [`crate::git::linked_worktree_base`] (also used by the write-side
+/// worktree recognition in `crate::projects`).
 fn worktree_base_repo(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dot_git = path.join(".git");
-    if !dot_git.is_file() {
-        return None;
-    }
-    let raw = std::fs::read_to_string(&dot_git).ok()?;
-    let gitdir = raw.strip_prefix("gitdir:")?.trim();
-    // <base>/.git/worktrees/<name> → <base>
-    let p = std::path::Path::new(gitdir);
-    let worktrees = p.parent()?; // .../.git/worktrees
-    if worktrees.file_name()? != "worktrees" {
-        return None;
-    }
-    let git_dir = worktrees.parent()?; // .../.git
-    if git_dir.file_name()? != ".git" {
-        return None;
-    }
-    git_dir.parent().map(|b| b.to_path_buf())
+    crate::git::linked_worktree_base(path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6402,7 +6411,8 @@ mod tests {
                 "bbox_learn",
                 "bbox_remember",
                 "bbox_decide",
-                "bbox_gap",
+                // bbox_gaps (list): `project` is a result filter, None = all.
+                "bbox_gaps",
                 "bbox_thread",
             ] {
                 assert!(
@@ -6411,15 +6421,56 @@ mod tests {
                 );
             }
         }
-        // Every `.project` default targets a retrieval read tool, nothing else.
+        // Every `.project` default targets a retrieval read tool or a gap
+        // write-targeting tool (gap-b94129ba), nothing else.
         for key in defaults.keys().filter(|k| k.ends_with(".project")) {
             assert!(
                 super::RETRIEVAL_PROJECT_DEFAULT_TOOLS
                     .iter()
+                    .chain(super::GAP_WRITE_TARGET_DEFAULT_TOOLS)
                     .any(|tool| key == &format!("default:mcp.{tool}.project")),
                 "unexpected .project default: {key}"
             );
         }
+    }
+
+    #[test]
+    fn ambient_tool_defaults_fill_gap_write_targeting_from_cwd() {
+        // gap-b94129ba: the three gap mutation tools get a `project`
+        // write-targeting default from the canonicalized dispatch cwd,
+        // gated on project_dir presence exactly like the retrieval defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd_str = repo.to_string_lossy().into_owned();
+
+        let ctx = AmbientContext {
+            project_dir: Some(cwd_str.clone()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("gap write-target defaults");
+        for tool in ["bbox_gap", "bbox_gap_resolve", "bbox_gap_update"] {
+            assert_eq!(
+                defaults
+                    .get(&format!("default:mcp.{tool}.project"))
+                    .map(String::as_str),
+                Some(cwd_str.as_str()),
+                "missing gap write-target default for {tool}"
+            );
+        }
+        // The list tool's `project` is a result filter — never defaulted.
+        assert!(!defaults.contains_key("default:mcp.bbox_gaps.project"));
+
+        // No project_dir → no gap defaults (same gate as retrieval reads).
+        let no_cwd = AmbientContext {
+            session_id: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let defaults = no_cwd.tool_arg_defaults().expect("session default only");
+        assert!(
+            !defaults.keys().any(|k| k.contains("bbox_gap")),
+            "gap defaults must be gated on project_dir presence"
+        );
     }
 
     /// Build a linked-worktree pair under `root`: a base repo whose

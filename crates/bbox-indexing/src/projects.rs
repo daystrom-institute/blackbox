@@ -404,33 +404,47 @@ pub fn fleet_worktree_scope_and_dir(
 }
 
 /// Shared core: resolve a path to `(base_record, canonical_worktree)` when it is
-/// a managed worktree of a registered project. A managed worktree is one whose
-/// git common dir matches a registered project AND that carries a managed
-/// marker: either its checked-out branch is `bro-fleet/*` (fleet cockpit
-/// dispatch) or it lives under one of the cockpit-managed worktree parent roots
-/// (`$BRO_HOME/fleet/worktrees`, `$BRO_HOME/agent/worktrees` — agent dispatch
-/// uses arbitrary branch names, so the path is the signal there). Dispatch
-/// creates these outside the registered repo root (under the daemon state dir),
-/// so the literal worktree path is not a descendant of any registered root.
-/// Returns `None` when the path is already a registered root/descendant (no
-/// resolution needed — early-returns before any git call), carries no managed
-/// marker, or no registered project shares its git common dir.
+/// a recognized worktree of a registered project. Two recognized classes:
+///
+/// 1. **Out-of-tree managed worktrees** — git common dir matches a registered
+///    project AND a managed marker is present: either the checked-out branch is
+///    `bro-fleet/*` (fleet cockpit dispatch) or the path lives under one of the
+///    cockpit-managed worktree parent roots (`$BRO_HOME/fleet/worktrees`,
+///    `$BRO_HOME/agent/worktrees` — agent dispatch uses arbitrary branch names,
+///    so the path is the signal there). Dispatch creates these outside the
+///    registered repo root (under the daemon state dir), so the literal worktree
+///    path is not a descendant of any registered root.
+/// 2. **In-tree linked worktrees** — the path lies inside a *linked* git
+///    worktree nested under the registered root itself (harness worktrees such
+///    as `<root>/.claude/worktrees/<name>`). The gate is purely structural: the
+///    nearest `.git` marker walking up from the path is a FILE whose gitdir
+///    points into `<root>/.git/worktrees/<name>`. A plain subdirectory of the
+///    root (no `.git` file ancestor below the root) is NEVER worktree-classed
+///    and resolves to `None` (base behavior), as does the root itself.
+///
+/// Returns `None` for the registered root, its plain subdirectories, paths with
+/// no managed marker (out-of-tree), or paths whose repo doesn't match any
+/// registered project.
 ///
 /// Deliberately conservative: this gate guards WRITE-side aliasing (where gap
-/// files, threads, slice edits, and code-nav overlays land), so arbitrary user
-/// worktrees of a registered repo do not alias. Read-only scope resolution for
-/// retrieval uses the broader [`resolve_base_project_for_scope`].
+/// files, threads, slice edits, and code-nav overlays land), so arbitrary
+/// out-of-tree user worktrees of a registered repo do not alias. Read-only
+/// scope resolution for retrieval uses the broader
+/// [`resolve_base_project_for_scope`].
 fn resolve_managed_fleet_worktree<'a>(
     project_dir: Option<&str>,
     projects: &'a [ProjectRecord],
 ) -> Option<(&'a ProjectRecord, PathBuf)> {
     let project_dir = project_dir?;
     let worktree = fs::canonicalize(project_dir).ok()?;
-    if projects.iter().any(|project| {
+    if let Some(owner) = projects.iter().find(|project| {
         let root = Path::new(&project.canonical_path);
         worktree == root || worktree.starts_with(root)
     }) {
-        return None;
+        // In-tree path of a registered root: recognize only the linked-
+        // worktree shape (class 2 above); anything else keeps base behavior.
+        let root = PathBuf::from(&owner.canonical_path);
+        return in_tree_linked_worktree_top(&worktree, &root).map(|top| (owner, top));
     }
     let fleet_branch = bbox_corpus_core::git::current_branch(&worktree)
         .is_some_and(|branch| branch.starts_with("bro-fleet/"));
@@ -449,6 +463,33 @@ fn resolve_managed_fleet_worktree<'a>(
             .is_some_and(|common| common == worktree_common)
     })?;
     Some((base, worktree))
+}
+
+/// If `path` (canonical) lies inside a linked git worktree nested under the
+/// registered base `root` (canonical), return the worktree top: the nearest
+/// ancestor of `path` (stopping below `root`) that carries a `.git` FILE whose
+/// gitdir points into `<root>/.git/worktrees/<name>`. Structural only — no git
+/// subprocess. Fails closed to `None` for:
+/// - the root itself or a plain subdirectory (the walk reaches `root` without
+///   meeting a `.git` file — a plain directory can never be worktree-classed);
+/// - a nested independent checkout (`.git` *directory* short-circuits);
+/// - a linked worktree of a DIFFERENT repo parked inside the root (its gitdir
+///   base is not `root`).
+fn in_tree_linked_worktree_top(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut cursor = path;
+    while cursor != root {
+        let dot_git = cursor.join(".git");
+        if dot_git.is_dir() {
+            return None;
+        }
+        if dot_git.is_file() {
+            let base = crate::git::linked_worktree_base(cursor)?;
+            let base = fs::canonicalize(&base).unwrap_or(base);
+            return (base == root).then(|| cursor.to_path_buf());
+        }
+        cursor = cursor.parent()?;
+    }
+    None
 }
 
 /// Resolve a caller-supplied filesystem path to the registered project that
@@ -1210,6 +1251,72 @@ mod tests {
                 &registered
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn fleet_worktree_scope_and_dir_resolves_in_tree_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let registered = vec![record_for(&base_canon, "base-project")];
+
+        // In-tree linked worktree on an arbitrary (non-fleet) branch — the
+        // harness worktree shape. The structural .git-file gate recognizes it.
+        let in_tree = base_canon.join(".claude").join("worktrees").join("wt-in");
+        fs::create_dir_all(in_tree.parent().unwrap()).unwrap();
+        add_worktree(&base, "worktree-wt-in", &in_tree);
+        let in_canon = in_tree.canonicalize().unwrap();
+        let (scope, dir) =
+            fleet_worktree_scope_and_dir(in_canon.to_string_lossy().as_ref(), &registered)
+                .expect("in-tree linked worktree should resolve");
+        assert_eq!(scope, base_canon.to_string_lossy());
+        assert_eq!(dir, in_canon.to_string_lossy());
+
+        // A subdirectory inside the in-tree worktree maps to the worktree TOP.
+        let sub = in_canon.join("src").join("deep");
+        fs::create_dir_all(&sub).unwrap();
+        let (scope, dir) =
+            fleet_worktree_scope_and_dir(sub.to_string_lossy().as_ref(), &registered)
+                .expect("in-tree worktree subdir should resolve to the worktree top");
+        assert_eq!(scope, base_canon.to_string_lossy());
+        assert_eq!(dir, in_canon.to_string_lossy());
+
+        // The registered root itself never aliases.
+        assert!(
+            fleet_worktree_scope_and_dir(base_canon.to_string_lossy().as_ref(), &registered)
+                .is_none()
+        );
+
+        // A plain subdirectory of the root is NEVER worktree-classed.
+        let plain_sub = base_canon.join("src").join("plain");
+        fs::create_dir_all(&plain_sub).unwrap();
+        assert!(
+            fleet_worktree_scope_and_dir(plain_sub.to_string_lossy().as_ref(), &registered)
+                .is_none()
+        );
+
+        // A nested INDEPENDENT checkout (.git directory) short-circuits.
+        let nested_repo = base_canon.join("vendor").join("nested");
+        fs::create_dir_all(&nested_repo).unwrap();
+        init_git_repo(&nested_repo);
+        assert!(
+            fleet_worktree_scope_and_dir(nested_repo.to_string_lossy().as_ref(), &registered)
+                .is_none()
+        );
+
+        // A linked worktree of a DIFFERENT repo parked inside the root does
+        // not alias to this root (gitdir base mismatch fails closed).
+        let other = tmp.path().join("other-repo");
+        fs::create_dir_all(&other).unwrap();
+        init_git_repo(&other);
+        let foreign_wt = base_canon.join("foreign-wt");
+        add_worktree(&other, "worktree-foreign", &foreign_wt);
+        assert!(
+            fleet_worktree_scope_and_dir(foreign_wt.to_string_lossy().as_ref(), &registered)
+                .is_none()
         );
     }
 }

@@ -470,7 +470,7 @@ pub struct GapListParams {
     pub json: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GapResolveParams {
     /// Gap id `gap-<8hex>` (bare 8-hex suffix accepted).
     #[schemars(regex(pattern = r"^(gap-)?[0-9a-f]{8}$"))]
@@ -485,6 +485,19 @@ pub struct GapResolveParams {
     #[serde(default)]
     #[schemars(regex(pattern = r"^(gap-)?[0-9a-f]{8}$"))]
     pub superseded_by: Option<String>,
+    /// Session cwd / worktree path for WRITE-TARGETING only: when this
+    /// resolves to a recognized worktree of the gap's own project, the
+    /// rewritten repo-owned gap file lands in that worktree (the session
+    /// commits it; the branch carries it). The gap's durable project scope
+    /// never changes. Absent → the file is rewritten where it lives today
+    /// (the base checkout). Ignored for global-scope gaps.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Internal committed-file write target resolved by the MCP adapter from
+    /// `project`. Not accepted from clients and omitted from the tool schema.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) write_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -512,6 +525,19 @@ pub struct GapUpdateParams {
     pub suggested_owner: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Session cwd / worktree path for WRITE-TARGETING only: when this
+    /// resolves to a recognized worktree of the gap's own project, the
+    /// rewritten repo-owned gap file lands in that worktree (the session
+    /// commits it; the branch carries it). The gap's durable project scope
+    /// never changes. Absent → the file is rewritten where it lives today
+    /// (the base checkout). Ignored for global-scope gaps.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Internal committed-file write target resolved by the MCP adapter from
+    /// `project`. Not accepted from clients and omitted from the tool schema.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) write_dir: Option<String>,
 }
 
 // ── Persistence ────────────────────────────────────────────────────
@@ -613,11 +639,18 @@ fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
 /// to deserialize at load — in both cases the in-memory set is not
 /// authoritative for it, and deleting it destroys committed repo-owned
 /// knowledge (this exact clobber shipped once; see gap-1f3894cc).
+///
+/// `redirected_ids` are gaps whose durable project IS this dir but whose
+/// rewrite was redirected into a worktree this save (session write-
+/// targeting). Their committed base-checkout files must survive the purge
+/// untouched: redirection is not reassignment — the worktree branch carries
+/// the new copy and the merge (not the daemon) updates the base.
 fn persist_repo_gap_entries(
     project_dir: &Path,
     entries: &[&GapNote],
     purge: bool,
     known_ids: &BTreeSet<&str>,
+    redirected_ids: &BTreeSet<&str>,
 ) -> Result<()> {
     let dir = repo_gaps_dir(project_dir);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -631,6 +664,11 @@ fn persist_repo_gap_entries(
             }
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 if keep.contains(stem) {
+                    continue;
+                }
+                if redirected_ids.contains(stem) {
+                    // Write-redirected this save, not reassigned: the base
+                    // copy stays until the worktree branch merges it forward.
                     continue;
                 }
                 if !known_ids.contains(stem) {
@@ -735,6 +773,11 @@ impl GapStore {
             gaps: Vec::new(),
         };
         let mut by_project: HashMap<PathBuf, Vec<&GapNote>> = HashMap::new();
+        // Per durable-project dir: ids whose rewrite was redirected into a
+        // worktree (`write_dir != project`). Their committed base files are
+        // protected from the generation purge — redirection is not
+        // reassignment (the branch, not the daemon, updates the base).
+        let mut redirected: HashMap<PathBuf, BTreeSet<&str>> = HashMap::new();
         for g in &self.data.gaps {
             match g.project.as_deref() {
                 Some(dir) if !dir.is_empty() => {
@@ -744,6 +787,12 @@ impl GapStore {
                             .entry(PathBuf::from(write_dir))
                             .or_default()
                             .push(g);
+                        if write_dir != dir {
+                            redirected
+                                .entry(PathBuf::from(dir))
+                                .or_default()
+                                .insert(g.id.as_str());
+                        }
                     } else if project_is_repo_owned(Path::new(dir)) {
                         by_project.entry(PathBuf::from(dir)).or_default().push(g);
                     } else {
@@ -756,9 +805,11 @@ impl GapStore {
         bbox_corpus_core::json_store::atomic_write_json_locked(&self.store_path, &central)?;
         let loaded: HashSet<&Path> = self.project_roots.iter().map(|p| p.as_path()).collect();
         let known_ids: BTreeSet<&str> = self.data.gaps.iter().map(|g| g.id.as_str()).collect();
+        let no_redirects = BTreeSet::new();
         for (dir, entries) in &by_project {
             let purge = loaded.contains(dir.as_path());
-            persist_repo_gap_entries(dir, entries, purge, &known_ids)?;
+            let redirected_ids = redirected.get(dir.as_path()).unwrap_or(&no_redirects);
+            persist_repo_gap_entries(dir, entries, purge, &known_ids, redirected_ids)?;
         }
         Ok(())
     }
@@ -824,10 +875,17 @@ impl GapStore {
         let impact = parse_impact(p.impact.as_deref())?;
         let blocking_level = parse_blocking_level(p.blocking_level.as_deref())?;
 
+        // `scope=global` wins over any supplied/defaulted `project`: both the
+        // durable project AND the worktree write target are dropped, so an
+        // ambient-defaulted `project` can never project-scope (or mkdir
+        // `.bbox/gaps/` for) a global filing.
         let scope = p.scope.as_deref().unwrap_or("project");
-        let project = match scope {
-            "global" => None,
-            "project" => p.project.clone().filter(|s| !s.trim().is_empty()),
+        let (project, write_dir) = match scope {
+            "global" => (None, None),
+            "project" => (
+                p.project.clone().filter(|s| !s.trim().is_empty()),
+                p.write_dir.clone(),
+            ),
             other => anyhow::bail!("scope must be `project` or `global`, got `{other}`"),
         };
 
@@ -848,7 +906,7 @@ impl GapStore {
                     .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
             }
         }
-        if let Some(dir) = p.write_dir.as_deref() {
+        if let Some(dir) = write_dir.as_deref() {
             let p = Path::new(dir);
             if p.is_dir() {
                 fs::create_dir_all(repo_gaps_dir(p))
@@ -875,7 +933,7 @@ impl GapStore {
             superseded_by: None,
             resolution: GapResolution::Unresolved,
             project,
-            write_dir: p.write_dir.clone(),
+            write_dir,
             task_id: p.task_id.clone(),
             session_id: p.session_id.clone(),
             provider: p.provider.clone(),
@@ -919,6 +977,40 @@ impl GapStore {
     }
 
     // ── bbox_gap_resolve ───────────────────────────────────────────
+
+    /// Apply adapter-resolved write-targeting to a gap a mutation is about to
+    /// rewrite: when the session's `project` resolved to a recognized worktree
+    /// (`write_dir`) of the gap's OWN project (`resolved_base`), the rewritten
+    /// repo-owned file lands in that worktree instead of the base checkout.
+    ///
+    /// Write REDIRECTION only — mirror of the knowledge lane: the durable
+    /// `project` field never changes here and the daemon never commits. The
+    /// session commits the rewritten file, the branch carries it, and
+    /// discarding the branch discards the resolution (correct: resolutions
+    /// cite branch work). Until the branch merges, the base checkout keeps
+    /// its committed copy untouched and the daemon's loaded view reflects it.
+    ///
+    /// No-op for global gaps (`project=None`), gaps owned by a different
+    /// project than the resolved base, or when no write target was resolved.
+    fn apply_write_target(
+        gap: &mut GapNote,
+        resolved_base: Option<&str>,
+        write_dir: Option<&str>,
+    ) -> Result<()> {
+        let (Some(base), Some(dir)) = (resolved_base, write_dir) else {
+            return Ok(());
+        };
+        if gap.project.as_deref() != Some(base) {
+            return Ok(());
+        }
+        let path = Path::new(dir);
+        if path.is_dir() {
+            fs::create_dir_all(repo_gaps_dir(path))
+                .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
+        }
+        gap.write_dir = Some(dir.to_string());
+        Ok(())
+    }
 
     pub fn resolve(&mut self, p: &GapResolveParams) -> Result<String> {
         let path = self.store_path.clone();
@@ -981,12 +1073,15 @@ impl GapStore {
             if let Some(by) = &superseded_by {
                 gap.superseded_by = Some(by.clone());
             }
+            Self::apply_write_target(gap, p.project.as_deref(), p.write_dir.as_deref())?;
         }
-        // Wire the reverse link on the supersessor.
+        // Wire the reverse link on the supersessor. Its file is rewritten by
+        // this mutation too, so it honors the same session write target.
         if let Some(by) = &superseded_by {
             if let Some(other) = self.data.gaps.iter_mut().find(|g| g.matches_id(by)) {
                 other.supersedes = Some(resolved_id.clone());
                 other.updated_at = now;
+                Self::apply_write_target(other, p.project.as_deref(), p.write_dir.as_deref())?;
             }
         }
 
@@ -1065,6 +1160,7 @@ impl GapStore {
             gap.notes = Some(v.clone()).filter(|s| !s.trim().is_empty());
         }
         gap.updated_at = Self::now_iso();
+        Self::apply_write_target(gap, p.project.as_deref(), p.write_dir.as_deref())?;
         let id = gap.id.clone();
         self.save()?;
         Ok(format!("Gap {id} updated"))
@@ -1474,6 +1570,66 @@ mod tests {
         assert!(root_b.join(".bbox/gaps").join(format!("{id}.json")).exists());
     }
 
+    /// Write redirection (resolve/update from a worktree session) must leave
+    /// the base checkout's committed copy untouched: redirection is not
+    /// reassignment, so the generation purge skips the redirected id even
+    /// while it reaps genuinely reassigned files (gap-b94129ba; complements
+    /// the a9b00cf known_ids guard).
+    #[test]
+    fn resolve_write_redirection_writes_worktree_and_keeps_base_copy() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let wt_dir = tempdir().unwrap();
+        let wt = wt_dir.path().canonicalize().unwrap();
+
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store.set_project_roots(vec![root.clone()]).unwrap();
+
+        let (id, _) = store
+            .file(&project_params(
+                "redirected",
+                "tooling/test-domain/redirected",
+                &root,
+            ))
+            .unwrap();
+        // A second base-owned gap keeps `root` in the save's write set so the
+        // generation purge actually runs there.
+        store
+            .file(&project_params("stayer", "tooling/test-domain/stayer2", &root))
+            .unwrap();
+        let base_file = root.join(".bbox/gaps").join(format!("{id}.json"));
+        assert!(base_file.exists());
+        let base_before = fs::read_to_string(&base_file).unwrap();
+
+        store
+            .resolve(&GapResolveParams {
+                id: id.clone(),
+                resolution: "addressed".into(),
+                note: Some("done on branch".into()),
+                project: Some(root.to_string_lossy().into_owned()),
+                write_dir: Some(wt.to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let wt_file = wt.join(".bbox/gaps").join(format!("{id}.json"));
+        assert!(
+            wt_file.exists(),
+            "redirected resolve must write the gap file into the worktree"
+        );
+        assert!(fs::read_to_string(&wt_file).unwrap().contains("addressed"));
+        assert!(
+            base_file.exists(),
+            "redirected gap's base copy must survive the generation purge"
+        );
+        assert_eq!(
+            fs::read_to_string(&base_file).unwrap(),
+            base_before,
+            "base checkout copy must be byte-for-byte untouched"
+        );
+    }
+
     #[test]
     fn rejects_bad_dedupe_key() {
         let dir = tempdir().unwrap();
@@ -1515,6 +1671,7 @@ mod tests {
                 resolution: "addressed".into(),
                 note: Some("rolled into successor".into()),
                 superseded_by: Some(new_id.clone()),
+                ..Default::default()
             })
             .unwrap();
 
@@ -1748,8 +1905,7 @@ mod packet_companion_tests {
             .resolve(&crate::gaps::GapResolveParams {
                 id: gap_id,
                 resolution: "acknowledged".into(),
-                note: None,
-                superseded_by: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1804,7 +1960,7 @@ mod packet_companion_tests {
                 id: gap_id,
                 resolution: "addressed".into(),
                 note: Some("implemented RateCmp".into()),
-                superseded_by: None,
+                ..Default::default()
             })
             .unwrap();
 

@@ -145,6 +145,38 @@ pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
+/// Map a linked-worktree top to its base repository — the directory whose
+/// `.git` *directory* backs the worktree. Structural, no git subprocess: a
+/// linked worktree's `.git` marker is a FILE containing
+/// `gitdir: <base>/.git/worktrees/<name>`. Returns `None` for primary
+/// checkouts (`.git` directory), non-repos, and malformed `.git` files —
+/// a plain directory can never satisfy this shape. The returned base is the
+/// literal path from the gitdir line, NOT canonicalized; callers comparing
+/// against canonical roots must canonicalize it themselves.
+// One tiny marker-file read on caller threads that are already doing git
+// subprocess I/O (dispatch spawn, write-side worktree resolution) — not a
+// tokio worker hot path.
+#[allow(clippy::disallowed_methods)]
+pub fn linked_worktree_base(worktree_top: &Path) -> Option<PathBuf> {
+    let dot_git = worktree_top.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&dot_git).ok()?;
+    let gitdir = raw.strip_prefix("gitdir:")?.trim();
+    // <base>/.git/worktrees/<name> → <base>
+    let p = Path::new(gitdir);
+    let worktrees = p.parent()?; // .../.git/worktrees
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let git_dir = worktrees.parent()?; // .../.git
+    if git_dir.file_name()? != ".git" {
+        return None;
+    }
+    git_dir.parent().map(|b| b.to_path_buf())
+}
+
 pub fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<Vec<GitCommit>> {
     let mut args = vec![
         "log".to_string(),

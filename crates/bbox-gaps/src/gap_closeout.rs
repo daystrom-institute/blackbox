@@ -208,8 +208,7 @@ mod tests {
             .resolve(&crate::gaps::GapResolveParams {
                 id: addressed_id.clone(),
                 resolution: "addressed".into(),
-                note: None,
-                superseded_by: None,
+                ..Default::default()
             })
             .unwrap();
 
