@@ -185,10 +185,40 @@ pub struct BroReportV1 {
 /// fetches this snapshot, then consumes `RosterDelta` events with
 /// `seq > version`; if it observes a gap or receives a resync signal,
 /// it re-fetches the snapshot and resumes from the new version.
+///
+/// `daemon_version` and `daemon_build_id` are additive build-identity
+/// fields the fleet cockpit uses to detect long-lived cockpits still
+/// running stale binaries across upgrades (D27). Both default to
+/// `None` on the wire for backward compatibility with older daemons;
+/// the cockpit only displays a mismatch banner when BOTH sides
+/// report a value that differs from the cockpit's own compile-time
+/// value. `daemon_version` is the daemon's `CARGO_PKG_VERSION` and
+/// `daemon_build_id` is a compile-time constant (`BLACKBOX_BUILD_ID`
+/// from the daemon's `build.rs`) that distinguishes rebuilds of the
+/// same source.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RosterSnapshotV1 {
     pub version: u64,
     pub tasks: Vec<RosterSummaryV1>,
+    /// Daemon's `CARGO_PKG_VERSION` at the time of the snapshot.
+    /// Additive+optional — omitted by daemons that pre-date the
+    /// build-identity field. The cockpit compares against its own
+    /// `env!("CARGO_PKG_VERSION")`. `skip_serializing_if` keeps the
+    /// wire shape tight when a legacy daemon (or a test fixture)
+    /// constructs a snapshot with identity `None`, so a back-compat
+    /// probe of an old client still produces a 2-key body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    /// Daemon's compile-time build identifier (Unix seconds at the
+    /// time the daemon binary was last linked). Additive+optional —
+    /// omitted by daemons without a `build.rs` that emits
+    /// `BLACKBOX_BUILD_ID`. The cockpit compares against its own
+    /// `env!("BRO_CLI_BUILD_ID")`. This is the load-bearing field
+    /// when `daemon_version` matches (e.g. `0.0.1` everywhere
+    /// during early development) but the binaries were rebuilt at
+    /// different times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_build_id: Option<String>,
 }
 
 /// Versioned roster membership/summary delta for
@@ -358,18 +388,82 @@ mod tests {
         }
     }
 
-    /// Envelope shape: `{ version, tasks }`. Used by Slice 2's resync
-    /// logic, so the field names are part of the contract.
+    /// Envelope shape: `{ version, tasks, daemon_version?, daemon_build_id? }`.
+    /// Used by Slice 2's resync logic, so the field names are part of
+    /// the contract. The two `daemon_*` build-identity fields were
+    /// added in D27 (unit-N4 thread-c3f7c7e3) as
+    /// `#[serde(default)]`-optional additivities; a fresh struct
+    /// with both `None` serializes without them at all (so
+    /// back-compat probes can still decode legacy bodies, see
+    /// `roster_snapshot_v1_deserializes_legacy_body_without_build_identity`).
     #[test]
     fn roster_snapshot_v1_envelope_has_version_and_tasks() {
         let snap = RosterSnapshotV1 {
             version: 1_700_000_000_000,
             tasks: vec![],
+            daemon_version: None,
+            daemon_build_id: None,
         };
         let value = serde_json::to_value(&snap).unwrap();
         let obj = value.as_object().unwrap();
         assert!(obj.contains_key("version"));
         assert!(obj.contains_key("tasks"));
-        assert_eq!(obj.len(), 2, "envelope should carry exactly `version` and `tasks`");
+        // Both build-identity fields MUST be omitted when `None` —
+        // `#[serde(default)]` on Option<String> is what makes the
+        // legacy-body deserialization test pass, and what keeps the
+        // wire shape tight when the daemon has no build.rs.
+        assert_eq!(
+            obj.len(),
+            2,
+            "envelope with identity `None` should carry exactly `version` and `tasks`"
+        );
+
+        // With identity populated, the new fields appear on the wire.
+        let stamped = RosterSnapshotV1 {
+            version: 1,
+            tasks: vec![],
+            daemon_version: Some("0.0.1".to_string()),
+            daemon_build_id: Some("1700000000".to_string()),
+        };
+        let value = serde_json::to_value(&stamped).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("daemon_version"));
+        assert!(obj.contains_key("daemon_build_id"));
+    }
+
+    /// D27 backward compatibility: an old daemon that pre-dates the
+    /// build-identity fields still produces a JSON body that the
+    /// newer client deserializes (the `daemon_version` /
+    /// `daemon_build_id` fields `#[serde(default)]` to `None`).
+    #[test]
+    fn roster_snapshot_v1_deserializes_legacy_body_without_build_identity() {
+        let legacy = serde_json::json!({
+            "version": 42,
+            "tasks": [],
+        });
+        let snap: RosterSnapshotV1 = serde_json::from_value(legacy)
+            .expect("legacy roster body must still decode (serde-default additive fields)");
+        assert_eq!(snap.version, 42);
+        assert!(snap.tasks.is_empty());
+        assert_eq!(snap.daemon_version, None);
+        assert_eq!(snap.daemon_build_id, None);
+    }
+
+    /// D27 forward compatibility: a current daemon emits the new
+    /// fields and the client decodes them as `Some(...)`.
+    #[test]
+    fn roster_snapshot_v1_round_trips_build_identity_fields() {
+        let snap = RosterSnapshotV1 {
+            version: 1,
+            tasks: vec![],
+            daemon_version: Some("0.0.1".to_string()),
+            daemon_build_id: Some("1700000000".to_string()),
+        };
+        let value = serde_json::to_value(&snap).unwrap();
+        assert_eq!(value["daemon_version"], "0.0.1");
+        assert_eq!(value["daemon_build_id"], "1700000000");
+        let round: RosterSnapshotV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(round.daemon_version.as_deref(), Some("0.0.1"));
+        assert_eq!(round.daemon_build_id.as_deref(), Some("1700000000"));
     }
 }

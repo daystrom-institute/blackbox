@@ -574,6 +574,13 @@ struct App {
     /// with the composer text. `None` = not armed.
     steer_armed_until: Option<Instant>,
     steer_armed_agent_id: Option<String>,
+    /// D27: latest daemon build identity stamped on the most recent
+    /// `/control/roster` snapshot. `None` when the daemon pre-dates
+    /// the build-identity fields or no snapshot has been ingested
+    /// yet. Used to surface a "restart cockpit" banner in the footer
+    /// when the daemon was rebuilt but the cockpit binary wasn't
+    /// (unit-N4 thread-c3f7c7e3).
+    last_daemon_build: (Option<String>, Option<String>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -699,6 +706,7 @@ impl App {
             prune_armed_count: 0,
             steer_armed_until: None,
             steer_armed_agent_id: None,
+            last_daemon_build: (None, None),
         }
     }
 
@@ -732,6 +740,108 @@ impl App {
             self.status = None;
             self.status_until = None;
         }
+    }
+
+    /// D27: refresh the latest daemon build identity stamp and, on
+    /// the first observation of a mismatch with the cockpit's own
+    /// compile-time identity, surface a one-time durable cockpit
+    /// line so a long-lived cockpit still rendering against a
+    /// freshly rebuilt daemon is hard to miss. The persistent
+    /// footer banner is a separate read (`build_mismatch_banner`).
+    /// Called after every roster refresh — incremental, cheap, no
+    /// filesystem probing of the installed binary. When the daemon
+    /// pre-dates the build-identity fields OR the binary matches,
+    /// this is a no-op (zero visual change).
+    fn refresh_daemon_build_health(&mut self) {
+        let new = self.orch.last_daemon_build();
+        let prev = std::mem::replace(&mut self.last_daemon_build, new.clone());
+        if new == prev {
+            return;
+        }
+        if let Some(message) = Self::durable_mismatch_message(&prev, &new) {
+            self.push_cockpit_line(message);
+        }
+    }
+
+    /// Compute the one-time durable cockpit line for a transition
+    /// between two consecutive daemon build-identity stamps.
+    /// Returns `Some(message)` ONLY on the transition from a
+    /// matching (or unknown) identity to a mismatching one — a
+    /// re-emit on every roster refresh would spam scrollback (the
+    /// snapshot can land multiple times per second under active
+    /// deltas). Pure function: split out from
+    /// `refresh_daemon_build_health` so tests can exercise the
+    /// transition matrix without spinning up a real
+    /// `FleetOrchestrator`. D27.
+    fn durable_mismatch_message(
+        prev: &(Option<String>, Option<String>),
+        new: &(Option<String>, Option<String>),
+    ) -> Option<String> {
+        if !Self::build_identity_mismatch(new) {
+            return None;
+        }
+        if Self::build_identity_mismatch(prev) {
+            // Already mismatching on the prior stamp — only the
+            // first observed mismatch emits a line.
+            return None;
+        }
+        let (dv, db) = new;
+        let (cv, cb) = Self::own_build_identity();
+        Some(format!(
+            "daemon v{} (build {}) != cockpit v{} (build {}) — restart cockpit",
+            dv.as_deref().unwrap_or("?"),
+            db.as_deref().unwrap_or("?"),
+            cv,
+            cb,
+        ))
+    }
+
+    /// The cockpit's own compile-time build identity.
+    /// `CARGO_PKG_VERSION` is always present; `BRO_CLI_BUILD_ID` is
+    /// emitted by `crates/bro-cli/build.rs` so a rebuild produces a
+    /// new value.
+    fn own_build_identity() -> (String, String) {
+        (
+            env!("CARGO_PKG_VERSION").to_string(),
+            env!("BRO_CLI_BUILD_ID").to_string(),
+        )
+    }
+
+    /// True when the daemon's stamped build identity differs from
+    /// the cockpit's. Both identities must be known (i.e. non-`None`)
+    /// for a mismatch to count — an unknown daemon identity is
+    /// treated as "no comparison possible" so legacy daemons without
+    /// a `build.rs` produce zero visual change.
+    fn build_identity_mismatch(stamped: &(Option<String>, Option<String>)) -> bool {
+        let (dv, db) = stamped;
+        let (cv, cb) = Self::own_build_identity();
+        match (dv, db) {
+            (Some(dv), Some(db)) => dv.as_str() != cv.as_str() || db.as_str() != cb.as_str(),
+            _ => false,
+        }
+    }
+
+    /// Persistent footer banner span when the most-recently-stamped
+    /// daemon build identity disagrees with the cockpit's own
+    /// compile-time identity. Returns `None` when they match or when
+    /// the daemon identity is unknown, so callers can splice it in
+    /// unconditionally — same-version path stays zero-change. D27.
+    fn build_mismatch_banner(&self) -> Option<Span<'static>> {
+        if !Self::build_identity_mismatch(&self.last_daemon_build) {
+            return None;
+        }
+        let (dv, db) = self.last_daemon_build.clone();
+        let (cv, cb) = Self::own_build_identity();
+        Some(Span::styled(
+            format!(
+                " ⚠ daemon v{} (build {}) ≠ cockpit v{} (build {}) — restart cockpit ",
+                dv.unwrap_or_default(),
+                db.unwrap_or_default(),
+                cv,
+                cb,
+            ),
+            Style::default().fg(Color::Yellow),
+        ))
     }
 
     /// Push a cockpit-generated message (closeout outcome, slash-command
@@ -1567,6 +1677,11 @@ pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Res
     orch.start_roster_subscription().await?;
     let mut app = App::new(orch.clone(), cwd, tokio::runtime::Handle::current());
     refresh_agents_from_roster(&mut app);
+    // D27: the initial roster fetch is the first chance to see the
+    // daemon's build-identity stamp — refresh the health check
+    // synchronously so the footer/banner is correct on the very
+    // first frame, before any tail event drives handle_tail.
+    app.refresh_daemon_build_health();
 
     // Forward roster-change/status signals into the sync TUI loop (mirrors
     // council_tui's SSE fan-in). State is derived by reading the in-memory
@@ -1607,6 +1722,8 @@ pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
     }
     app.zone = Zone::SingleAgent;
     app.focused_agent_id = None;
+    // D27: same initial-frame health refresh as `run_fleet` above.
+    app.refresh_daemon_build_health();
     if let Some(prompt) = launch.prompt {
         app.set_input(prompt);
         launch_standalone_current_input(&mut app);
@@ -2274,6 +2391,12 @@ fn handle_tail(app: &mut App, ev: TailEvent) {
     } else {
         refresh_agents_from_roster(app);
     }
+    // D27: the roster refresh above just rewrote the task store
+    // mirror, which carries the latest daemon build identity
+    // stamp. Compare it to the cockpit's own compile-time
+    // identity and (on first observed mismatch) surface a
+    // one-time durable cockpit line — see App::refresh_daemon_build_health.
+    app.refresh_daemon_build_health();
     // The daemon's tail broadcast carries lifecycle markers only — per-task
     // envelope events never flow on the focused stream's live lane, and the
     // daemon-backed client emits only payload-free RosterChanged signals. So
@@ -4347,6 +4470,14 @@ fn roster_status_spans(app: &App, views: &[AgentView], order: &[usize]) -> Vec<S
         Span::styled("-", dim),
         Span::styled(format!(" {waiting} waiting "), byline),
     ];
+    // D27: persistent dimmed banner when the daemon's build
+    // identity disagrees with the cockpit's — keeps the warning
+    // visible in every frame, not only the first time a tail event
+    // fires. Same-version = zero visual change (banner is None).
+    if let Some(banner) = app.build_mismatch_banner() {
+        spans.push(Span::styled("──", dim));
+        spans.push(banner);
+    }
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
         spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
@@ -4454,6 +4585,13 @@ fn single_agent_status_spans(
     spans.push(Span::styled(format!(" {active} active "), byline));
     spans.push(Span::styled("-", dim));
     spans.push(Span::styled(format!(" {waiting} waiting "), byline));
+    // D27: single-agent footer mirrors the roster footer's
+    // build-mismatch banner. Long-lived cockpits in single-agent
+    // zoom must see the same warning. Same-version = zero change.
+    if let Some(banner) = app.build_mismatch_banner() {
+        spans.push(Span::styled("──", dim));
+        spans.push(banner);
+    }
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
         spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));

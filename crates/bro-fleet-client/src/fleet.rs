@@ -1905,6 +1905,17 @@ impl FleetOrchestrator {
         Ok(path)
     }
 
+    /// D27: latest daemon build identity reported by the most recent
+    /// `/control/roster` snapshot (`None, None` when no snapshot has
+    /// been ingested yet, or when the daemon pre-dates the
+    /// build-identity fields). The cockpit compares this against
+    /// its own compile-time `env!("CARGO_PKG_VERSION")` and
+    /// `env!("BRO_CLI_BUILD_ID")` to surface a "restart cockpit"
+    /// banner when the daemon was rebuilt but the cockpit wasn't.
+    pub fn last_daemon_build(&self) -> (Option<String>, Option<String>) {
+        self.task_store.read().last_daemon_build()
+    }
+
     /// Persist the fleet-wide default code-mode (`off`/`optional`/`only`, or
     /// `None` to clear → harness default) to `fleet.json`. Mirrors
     /// [`set_classifier`](Self::set_classifier): load → modify → save, so the
@@ -2651,6 +2662,8 @@ mod tests {
         let snapshot = RosterSnapshotV1 {
             version: 1,
             tasks: vec![roster_summary("task-1", TaskStatus::Running)],
+            daemon_version: None,
+            daemon_build_id: None,
         };
         store.replace_from_snapshot(snapshot);
         let task = store.all_tasks().pop().unwrap();
@@ -2669,6 +2682,8 @@ mod tests {
         let transport = MockRosterTransport::new(vec![RosterSnapshotV1 {
             version: 4,
             tasks: vec![roster_summary("fresh", TaskStatus::Running)],
+            daemon_version: None,
+            daemon_build_id: None,
         }]);
         let mut state = RosterSubscriptionState { last_seq: 1 };
 
@@ -2699,6 +2714,8 @@ mod tests {
         let transport = MockRosterTransport::new(vec![RosterSnapshotV1 {
             version: 9,
             tasks: vec![roster_summary("resynced", TaskStatus::Completed)],
+            daemon_version: None,
+            daemon_build_id: None,
         }]);
         let mut state = RosterSubscriptionState { last_seq: 5 };
 

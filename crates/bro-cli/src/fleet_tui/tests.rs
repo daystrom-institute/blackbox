@@ -2032,3 +2032,160 @@ Trailing paragraph.";
         assert_eq!(app.input, "stale", "input must stay in composer");
     }
     
+    // ---- D27: long-lived cockpits running stale binaries (unit-N4) -------
+    //
+    // The fleet cockpit now stamps the daemon's build identity from
+    // `/control/roster` and compares it to its own compile-time
+    // identity. Mismatch → persistent footer banner + one-time
+    // durable scrollback line. These tests cover the pure decision
+    // matrix: `build_identity_mismatch` (the comparison predicate)
+    // and `durable_mismatch_message` (the transition matrix that
+    // decides whether to emit a cockpit line). The persistent
+    // banner is exercised in the snapshot tests at the top of this
+    // module.
+
+    fn own_id() -> (String, String) {
+        App::own_build_identity()
+    }
+
+    fn stamped(version: &str, build: &str) -> (Option<String>, Option<String>) {
+        (Some(version.to_string()), Some(build.to_string()))
+    }
+
+    /// D27: an identity stamp that exactly matches the cockpit's
+    /// compile-time identity is NOT a mismatch — the cockpit was
+    /// rebuilt alongside the daemon and is current.
+    #[test]
+    fn build_identity_mismatch_is_false_on_exact_match() {
+        let (cv, cb) = own_id();
+        assert!(
+            !App::build_identity_mismatch(&stamped(&cv, &cb)),
+            "exact (version, build_id) match must not be a mismatch"
+        );
+    }
+
+    /// D27: a different version IS a mismatch — the most
+    /// user-visible case (a major upgrade).
+    #[test]
+    fn build_identity_mismatch_is_true_on_version_difference() {
+        let (_cv, cb) = own_id();
+        assert!(
+            App::build_identity_mismatch(&stamped("99.99.99", &cb)),
+            "different CARGO_PKG_VERSION must be a mismatch"
+        );
+    }
+
+    /// D27: a different build_id IS a mismatch — this is the
+    /// load-bearing case while both sides report `0.0.1`
+    /// (early development). A rebuild of just the daemon flips
+    /// its `BLACKBOX_BUILD_ID` but the cockpit retains its old
+    /// `BRO_CLI_BUILD_ID`, so the comparison detects the drift.
+    #[test]
+    fn build_identity_mismatch_is_true_on_build_id_difference() {
+        let (cv, _cb) = own_id();
+        assert!(
+            App::build_identity_mismatch(&stamped(&cv, "9999999999")),
+            "different BRO_CLI_BUILD_ID (daemon rebuilt, cockpit not) must be a mismatch"
+        );
+    }
+
+    /// D27: unknown daemon identity (both fields `None`) is NOT a
+    /// mismatch — a legacy daemon without a `build.rs` produces
+    /// zero visual change in the cockpit, by design.
+    #[test]
+    fn build_identity_mismatch_is_false_on_unknown_identity() {
+        assert!(
+            !App::build_identity_mismatch(&(None, None)),
+            "unknown daemon identity must not be a mismatch"
+        );
+    }
+
+    /// D27: partial identity (only version known) is NOT a
+    /// mismatch — the comparison requires BOTH sides to report a
+    /// value. The "either side has a value but the other does
+    /// not" case is treated as "cannot compare", not as drift.
+    #[test]
+    fn build_identity_mismatch_is_false_on_partial_identity() {
+        assert!(
+            !App::build_identity_mismatch(&(Some("0.0.1".to_string()), None)),
+            "partial daemon identity (version only) must not be a mismatch"
+        );
+        assert!(
+            !App::build_identity_mismatch(&(None, Some("1700000000".to_string()))),
+            "partial daemon identity (build_id only) must not be a mismatch"
+        );
+    }
+
+    /// D27: durable cockpit line is emitted on the FIRST observed
+    /// mismatch — the transition from "matched" to "mismatched"
+    /// is the signal worth a scrollback line.
+    #[test]
+    fn durable_mismatch_message_fires_on_first_mismatch() {
+        let (cv, cb) = own_id();
+        let matched = stamped(&cv, &cb);
+        let mismatched = stamped(&cv, "9999999999");
+        let msg = App::durable_mismatch_message(&matched, &mismatched)
+            .expect("transition matched -> mismatched must emit a line");
+        assert!(
+            msg.contains(&cv),
+            "durable line must carry the cockpit version, got: {msg}"
+        );
+        assert!(
+            msg.contains("restart cockpit"),
+            "durable line must name the action, got: {msg}"
+        );
+    }
+
+    /// D27: no durable line on the transition `unknown -> matched`
+    /// (daemon was rebuilt to the same identity — the most common
+    /// case in dev where both crates get rebuilt together).
+    #[test]
+    fn durable_mismatch_message_silent_on_unknown_to_match() {
+        let (cv, cb) = own_id();
+        let matched = stamped(&cv, &cb);
+        assert!(
+            App::durable_mismatch_message(&(None, None), &matched).is_none(),
+            "unknown -> matched must not emit a line"
+        );
+    }
+
+    /// D27: no durable line on the matched -> matched transition
+    /// (steady-state). The snapshot may re-land dozens of times
+    /// per second; we only want a line on the first drift.
+    #[test]
+    fn durable_mismatch_message_silent_on_match_to_match() {
+        let (cv, cb) = own_id();
+        let matched = stamped(&cv, &cb);
+        assert!(
+            App::durable_mismatch_message(&matched, &matched).is_none(),
+            "matched -> matched must not emit a line"
+        );
+    }
+
+    /// D27: no durable line on a continuing mismatch (mismatched
+    /// -> mismatched). The line was already emitted on the prior
+    /// transition; subsequent snapshots with the same mismatching
+    /// stamp must not spam scrollback.
+    #[test]
+    fn durable_mismatch_message_silent_on_continuing_mismatch() {
+        let (cv, _cb) = own_id();
+        let mismatched_a = stamped(&cv, "1111111111");
+        let mismatched_b = stamped(&cv, "2222222222");
+        assert!(
+            App::durable_mismatch_message(&mismatched_a, &mismatched_b).is_none(),
+            "continuing mismatch must not emit a duplicate line"
+        );
+    }
+
+    /// D27: no durable line on `unknown -> mismatched` when the
+    /// mismatch is inferred from partial fields. The predicate
+    /// is already false on partial identity, so this is more of
+    /// a guard against future drift in the predicate.
+    #[test]
+    fn durable_mismatch_message_silent_when_predicate_says_no() {
+        assert!(
+            App::durable_mismatch_message(&(None, None), &(Some("0.0.1".into()), None)).is_none(),
+            "transition into partial identity must not emit a line"
+        );
+    }
+

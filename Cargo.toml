@@ -36,6 +36,7 @@ members = [
 name = "blackbox"
 version = "0.0.1"
 edition = "2024"
+build = "build.rs"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

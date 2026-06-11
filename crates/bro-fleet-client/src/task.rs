@@ -66,6 +66,16 @@ impl Task {
 /// The cockpit's in-memory roster projection.
 pub struct TaskStore {
     tasks: HashMap<String, Arc<Task>>,
+    /// D27: latest daemon build identity reported by the most recent
+    /// `/control/roster` snapshot. The cockpit compares these against
+    /// its own compile-time `env!("CARGO_PKG_VERSION")` and
+    /// `env!("BRO_CLI_BUILD_ID")` to surface a "restart cockpit"
+    /// banner when the daemon was rebuilt but the cockpit binary
+    /// wasn't (D27, unit-N4 thread-c3f7c7e3). `None` when the daemon
+    /// pre-dates the build-identity fields OR no snapshot has been
+    /// ingested yet.
+    last_daemon_version: Option<String>,
+    last_daemon_build_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +88,8 @@ impl TaskStore {
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
+            last_daemon_version: None,
+            last_daemon_build_id: None,
         }
     }
 
@@ -87,6 +99,18 @@ impl TaskStore {
 
     pub fn all_tasks(&self) -> Vec<Arc<Task>> {
         self.tasks.values().cloned().collect()
+    }
+
+    /// D27: daemon build identity carried on the most recent
+    /// `/control/roster` snapshot. The cockpit reads this to detect
+    /// long-lived cockpits still rendering against a freshly
+    /// rebuilt daemon. `None` when no snapshot has been ingested
+    /// yet or the daemon pre-dates the build-identity fields.
+    pub fn last_daemon_build(&self) -> (Option<String>, Option<String>) {
+        (
+            self.last_daemon_version.clone(),
+            self.last_daemon_build_id.clone(),
+        )
     }
 
     /// Drop entries failing the predicate (e.g. a forgotten task). Returns the
@@ -114,6 +138,8 @@ impl TaskStore {
             self.upsert_roster_task(task);
         }
         self.tasks.retain(|id, _| seen.contains(id));
+        self.last_daemon_version = snapshot.daemon_version;
+        self.last_daemon_build_id = snapshot.daemon_build_id;
         snapshot.version
     }
 
@@ -305,8 +331,66 @@ mod tests {
         let snapshot = RosterSnapshotV1 {
             version: 1,
             tasks: vec![summary("task-1", TaskStatus::Running)],
+            daemon_version: None,
+            daemon_build_id: None,
         };
         store.replace_from_snapshot(snapshot);
         assert!(!root.join("tasks.json").exists());
+    }
+
+    /// D27: a snapshot that carries build identity must surface those
+    /// fields on `last_daemon_build()` so the cockpit can compare
+    /// against its own compile-time values.
+    #[test]
+    fn replace_from_snapshot_records_daemon_build_identity() {
+        let mut store = TaskStore::new();
+        // Initial state: no snapshot yet, no build identity.
+        assert_eq!(
+            store.last_daemon_build(),
+            (None, None),
+            "fresh store has no daemon build identity"
+        );
+
+        store.replace_from_snapshot(RosterSnapshotV1 {
+            version: 1,
+            tasks: vec![],
+            daemon_version: Some("0.0.1".to_string()),
+            daemon_build_id: Some("1700000000".to_string()),
+        });
+        assert_eq!(
+            store.last_daemon_build(),
+            (Some("0.0.1".to_string()), Some("1700000000".to_string())),
+            "snapshot build identity must be recorded"
+        );
+
+        // A second snapshot overwrites the prior build identity
+        // (the daemon may have been hot-restarted with a new build).
+        store.replace_from_snapshot(RosterSnapshotV1 {
+            version: 2,
+            tasks: vec![],
+            daemon_version: Some("0.0.1".to_string()),
+            daemon_build_id: Some("1700000999".to_string()),
+        });
+        assert_eq!(
+            store.last_daemon_build(),
+            (Some("0.0.1".to_string()), Some("1700000999".to_string())),
+            "later snapshot replaces the prior build identity"
+        );
+    }
+
+    /// D27 backward compat: a snapshot from a pre-build-identity
+    /// daemon (both fields `None`) is still recorded as "unknown
+    /// identity" — the cockpit suppresses the mismatch banner in
+    /// that case (zero visual change on legacy daemons).
+    #[test]
+    fn replace_from_snapshot_preserves_legacy_unknown_identity() {
+        let mut store = TaskStore::new();
+        store.replace_from_snapshot(RosterSnapshotV1 {
+            version: 1,
+            tasks: vec![],
+            daemon_version: None,
+            daemon_build_id: None,
+        });
+        assert_eq!(store.last_daemon_build(), (None, None));
     }
 }

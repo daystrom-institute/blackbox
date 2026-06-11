@@ -1212,7 +1212,21 @@ pub(crate) async fn control_roster_handler(
     let tasks = state.roster_view.snapshot();
     let version = state.roster_events().current_version();
 
-    let snapshot = RosterSnapshotV1 { version, tasks };
+    // D27: stamp the daemon's build identity on the snapshot so the
+    // fleet cockpit can detect long-lived cockpits still running
+    // stale binaries across upgrades. Both fields are additive
+    // `Option<String>` — older daemons that pre-date the build.rs
+    // and the protocol field simply emit `None` and the cockpit
+    // treats the snapshot as identity-unknown (zero visual change).
+    let daemon_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    let daemon_build_id = Some(env!("BLACKBOX_BUILD_ID").to_string());
+
+    let snapshot = RosterSnapshotV1 {
+        version,
+        tasks,
+        daemon_version,
+        daemon_build_id,
+    };
     axum::Json(snapshot).into_response()
 }
 
@@ -3273,16 +3287,27 @@ mod tests {
             }
         }
 
-        // Envelope shape: { version, tasks }. Version is the roster
-        // generation; this test asserts only presence, while the Slice 2
-        // delta test owns generation semantics.
+        // Envelope shape: { version, tasks, daemon_version?,
+        // daemon_build_id? }. Version is the roster generation; this
+        // test asserts only presence, while the Slice 2 delta test
+        // owns generation semantics. The two `daemon_*` build-identity
+        // fields were added in D27 (unit-N4 thread-c3f7c7e3) as
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`
+        // additivities — when populated, they ride along on the
+        // envelope; when `None`, the wire shape is unchanged.
         let obj = value.as_object().expect("envelope must be an object");
         assert!(obj.contains_key("version"), "envelope must carry `version`");
-        assert_eq!(
-            obj.len(),
-            2,
-            "envelope must carry exactly `version` and `tasks`"
-        );
+        assert!(obj.contains_key("tasks"), "envelope must carry `tasks`");
+        // The two additive identity fields, when present, must be
+        // stringly-typed (a regression of the additive DTO).
+        for key in ["daemon_version", "daemon_build_id"] {
+            if let Some(v) = obj.get(key) {
+                assert!(
+                    v.is_string(),
+                    "envelope.{key} must be a string when present, got: {v}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3349,6 +3374,49 @@ mod tests {
             .collect();
 
         assert_eq!(ids, vec!["running".to_string()]);
+    }
+
+    /// D27: the daemon's `/control/roster` snapshot now stamps
+    /// `daemon_version` and `daemon_build_id` so a long-lived
+    /// cockpit can detect when the daemon was rebuilt underneath
+    /// it. Both values are sourced from compile-time env!() at the
+    /// daemon's link step (root `build.rs`).
+    #[tokio::test]
+    async fn control_roster_handler_stamps_daemon_build_identity() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        let resp = control_roster_handler(AxumState(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let snapshot: bro_protocol::RosterSnapshotV1 = serde_json::from_slice(&body_bytes)
+            .expect("roster body must decode as RosterSnapshotV1");
+
+        // Both fields are present and equal the daemon's compile-time
+        // identity. A pure env!() comparison — no filesystem probing.
+        assert_eq!(
+            snapshot.daemon_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "daemon_version must reflect CARGO_PKG_VERSION at the daemon's link time"
+        );
+        assert_eq!(
+            snapshot.daemon_build_id.as_deref(),
+            Some(env!("BLACKBOX_BUILD_ID")),
+            "daemon_build_id must reflect BLACKBOX_BUILD_ID from the root build.rs"
+        );
+
+        // The two values must parse as a non-empty string each
+        // (we don't pin specific values — only the contract that
+        // the snapshot is identity-stamped, not identity-unknown).
+        assert!(
+            snapshot.daemon_build_id.as_deref().is_some_and(|s| !s.is_empty()),
+            "BLACKBOX_BUILD_ID must be a non-empty stamp"
+        );
     }
 
     #[tokio::test]
