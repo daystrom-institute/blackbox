@@ -11,9 +11,9 @@
   "impact": "medium",
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/roster-dispatch-shell-guard",
-  "notes": "D1 from thread-4719ad45. Code citation re-verified 2026-06-11 (drifted from :2558 at 9cb5228 to :3181-3183). OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing (repo convention + standing order 2026-06-11).",
+  "notes": "D1 from thread-4719ad45. LIVE-CONFIRMED 2026-06-11 via tmux MCP probe (isolated socket claude-fleet-probe, no other cockpit running): typed `ls -la` into the roster composer, Enter → dispatched as brodex agent 24cc2d4b (\"dispatched brodex agent\" in footer), agent ran the listing in a managed fleet worktree. Code citation re-verified same day at fleet_tui.rs:3181-3183 (drifted from :2558 at 9cb5228).",
   "resolution": "unresolved",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:10Z",
-  "updated_at": "2026-06-11T17:08:10Z"
+  "updated_at": "2026-06-11T17:14:14Z"
 }

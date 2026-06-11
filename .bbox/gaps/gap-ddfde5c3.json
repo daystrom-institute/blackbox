@@ -12,9 +12,9 @@
   "impact": "high",
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/single-instance-guard",
-  "notes": "D2 from thread-4719ad45. OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing — but note reproducing this one requires TWO cockpits over the same store, which is itself the hazard; coordinate with the operator before any live duel repro.",
+  "notes": "D2 from thread-4719ad45. Code-verified (no flock/pidfile/advisory-lock in fleet_tui.rs/main.rs/fleet.rs); live duel repro deliberately NOT performed 2026-06-11 — reproducing requires running two cockpits over the same store, which is the corruption hazard itself. Original dogfood incident (orphan cockpits dueling, corrupted display state) stands as the behavioral evidence. Coordinate with the operator before any live duel repro.",
   "resolution": "unresolved",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:15Z",
-  "updated_at": "2026-06-11T17:08:15Z"
+  "updated_at": "2026-06-11T17:14:31Z"
 }

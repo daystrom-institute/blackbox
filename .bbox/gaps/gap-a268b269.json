@@ -12,9 +12,9 @@
   "impact": "low",
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/closeout-forget-error-observability",
-  "notes": "D3+D4 from thread-4719ad45. D3 re-verified in code 2026-06-11 (~:1370, both force and merged-branch arms). OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing.",
+  "notes": "D3+D4 from thread-4719ad45. Static verification 2026-06-11: D3 confirmed in code at fleet_worktree.rs ~1370 (`let _ = git_run(..branch -D..)` in both force and merged-branch arms, deleted_branch reported unconditionally). These are error-path observability shapes — live validation would require inducing git/daemon failures, judged disproportionate for an observability nit; closeout was already verified to reap branches in the happy path during dogfood.",
   "resolution": "unresolved",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:22Z",
-  "updated_at": "2026-06-11T17:08:22Z"
+  "updated_at": "2026-06-11T17:14:33Z"
 }

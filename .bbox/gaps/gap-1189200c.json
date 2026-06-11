@@ -11,9 +11,9 @@
   "impact": "low",
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/roster-stream-optimistic-insert-and-backoff",
-  "notes": "D7+D6 from thread-4719ad45. D7 operator-observed 2026-06-09, not yet code-confirmed. OPERATOR GATE: validate against a live `bro fleet` instance via tmux MCP before fixing.",
+  "notes": "D7+D6 from thread-4719ad45. D7 LIVE-CONFIRMED 2026-06-11 via tmux MCP probe: immediately after dispatching agent 24cc2d4b the roster rendered TWO identical rows (\"Active (2)\", \"2 agents\", both `ls -la` 1s); ~4s later it reconciled to one row (\"Active (1)\") — exactly the optimistic-insert-vs-SSE-delta race described. D6 (fixed 750ms reconnect, no backoff) remains code-verified only (fleet.rs ~1667); inducing a live daemon outage to observe reconnect spray was judged disproportionate.",
   "resolution": "unresolved",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:44Z",
-  "updated_at": "2026-06-11T17:08:44Z"
+  "updated_at": "2026-06-11T17:14:17Z"
 }
