@@ -27,6 +27,7 @@ members = [
     "crates/bbox-code-nav",
     "crates/bbox-macros",
     "crates/bbox-packets",
+    "crates/bbox-system-memory",
 ]
 
 [package]
@@ -104,6 +105,7 @@ bbox-code-nav = { path = "crates/bbox-code-nav" }
 # Macro planning/model/backend layer, extracted from the root crate (stage 5).
 bbox-macros = { path = "crates/bbox-macros" }
 bbox-packets = { path = "crates/bbox-packets" }
+bbox-system-memory = { path = "crates/bbox-system-memory" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }

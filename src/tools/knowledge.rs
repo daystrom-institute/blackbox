@@ -462,7 +462,7 @@ mod tests {
     use super::*;
 
     fn init_system_memory() {
-        system_memory::init_for_tests();
+        crate::util::init_system_memory_for_tests();
     }
 
     #[test]

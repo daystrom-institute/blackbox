@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn registry_dispatches_every_entity_type() {
-        crate::system_memory::init_for_tests();
+        crate::util::init_system_memory_for_tests();
         let ctx = ProviderContext::empty_for_tests();
         for raw in sample_refs() {
             let parsed = EntityRef::parse(raw).unwrap();
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn compact_labels_fit_inline_budget() {
-        crate::system_memory::init_for_tests();
+        crate::util::init_system_memory_for_tests();
         let ctx = ProviderContext::empty_for_tests();
         for raw in sample_refs() {
             let parsed = EntityRef::parse(raw).unwrap();

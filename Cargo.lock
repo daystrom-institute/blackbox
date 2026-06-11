@@ -337,6 +337,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tera",
  "tracing",
 ]
 
@@ -428,6 +429,19 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "walkdir",
+]
+
+[[package]]
+name = "bbox-system-memory"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -543,6 +557,7 @@ dependencies = [
  "bbox-macros",
  "bbox-packets",
  "bbox-refactor",
+ "bbox-system-memory",
  "bbox-vectors",
  "bincode",
  "bro-capabilities",

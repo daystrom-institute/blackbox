@@ -83,14 +83,16 @@ mod pins;
 mod pollers;
 mod projects;
 mod providers;
-mod query;
+// `query`, `search` (rrf/rerank), and `template` extracted into
+// bbox-corpus-core; aliased back so existing call sites resolve unchanged.
+use bbox_corpus_core::query;
 // `refactor` extracted into bbox-refactor (stage 3); aliased back to
 // `crate::refactor` so existing call sites resolve unchanged.
 use bbox_refactor as refactor;
 pub mod render;
 mod roadmap;
 mod routing;
-mod search;
+use bbox_corpus_core::search;
 pub mod secrets;
 pub mod server;
 pub mod slack_channel_bindings;
@@ -101,8 +103,11 @@ mod snapshot;
 mod storage_health;
 mod store_persister;
 mod system_events;
-mod system_memory;
-mod template;
+// `system_memory` extracted into bbox-system-memory (root-crate split);
+// aliased back to `crate::system_memory` so existing call sites resolve
+// unchanged.
+use bbox_system_memory as system_memory;
+use bbox_corpus_core::template;
 mod threads;
 mod tool_docs;
 mod tools;

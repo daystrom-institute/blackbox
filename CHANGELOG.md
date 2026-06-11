@@ -10,6 +10,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Root-crate split (continued): runtime system memories moved to a new
+  `bbox-system-memory` leaf crate, and the dependency-free `query`,
+  `template`, and `search` (rrf/rerank) modules moved into `bbox-corpus-core`
+  — all re-exported under their original `crate::` paths. System-memory test
+  initialization is now `init_for_tests_from(&dir)` in the leaf with the
+  repo-root defaults path owned by the daemon's `util::init_system_memory_for_tests`.
 - Root-crate split: the rule-packet engine moved to a new `bbox-packets` leaf
   crate (compile/apply/audit AST, coercion, scanner, event log), re-exported as
   `crate::packets` so call sites are unchanged. Shared `json_store` and

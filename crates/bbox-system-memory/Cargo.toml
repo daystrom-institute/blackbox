@@ -1,0 +1,21 @@
+[package]
+name = "bbox-system-memory"
+version = "0.0.1"
+edition = "2024"
+
+# Runtime-loaded system memories (catalog, loader, signpost rendering),
+# extracted from the root `blackbox` crate for build parallelism (root-crate
+# split, thread-9938dffd). Leaf: sits on bbox-corpus-core (query parsing,
+# template rendering) + external crates only. Re-exported into the daemon as
+# `crate::system_memory` (see src/lib.rs).
+
+[dependencies]
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

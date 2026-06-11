@@ -1,6 +1,6 @@
 //! System memory catalog and in-memory search primitives.
 
-use crate::query::{QueryAtom, QueryNode, parse_query};
+use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -32,7 +32,7 @@ struct MemoryEntry {
 
 impl MemoryCatalog {
     pub fn load(defaults_dir: &Path, user_dir: Option<&Path>, ctx: &Value) -> Result<Self> {
-        let defaults = crate::system_memory::loader::load_dir(defaults_dir)
+        let defaults = crate::loader::load_dir(defaults_dir)
             .with_context(|| format!("failed to load defaults from {}", defaults_dir.display()))?;
 
         if defaults.is_empty() {
@@ -66,7 +66,7 @@ impl MemoryCatalog {
 
         if let Some(user_dir) = user_dir {
             let user_memories =
-                crate::system_memory::loader::load_dir(user_dir).with_context(|| {
+                crate::loader::load_dir(user_dir).with_context(|| {
                     format!("failed to load user memories from {}", user_dir.display())
                 })?;
             let mut seen_user = HashSet::new();
@@ -194,9 +194,9 @@ impl MemoryCatalog {
     }
 }
 
-fn render_body(raw: &crate::system_memory::loader::RawMemory, ctx: &Value) -> Result<String> {
+fn render_body(raw: &crate::loader::RawMemory, ctx: &Value) -> Result<String> {
     if raw.front_matter.template {
-        crate::template::render(&raw.body, ctx)
+        bbox_corpus_core::template::render(&raw.body, ctx)
             .with_context(|| format!("rendering system memory template {}", raw.slug))
     } else {
         Ok(raw.body.clone())
@@ -334,6 +334,7 @@ mod tests {
 
     fn fixture_default_catalog() -> MemoryCatalog {
         let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
             .join("system-defaults")
             .join("memories");
         MemoryCatalog::load(&defaults, None, &serde_json::json!({})).unwrap()
@@ -543,6 +544,7 @@ mod tests {
     #[test]
     fn load_all_shipped_files_parse() {
         let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
             .join("system-defaults")
             .join("memories");
         let dir_iter = fs::read_dir(&defaults).unwrap();
@@ -560,7 +562,7 @@ mod tests {
             }
             let body = fs::read_to_string(&path).unwrap();
             let slug = path.file_stem().unwrap().to_str().unwrap();
-            crate::system_memory::loader::parse_memory_file(slug, &body).unwrap();
+            crate::loader::parse_memory_file(slug, &body).unwrap();
         }
     }
 

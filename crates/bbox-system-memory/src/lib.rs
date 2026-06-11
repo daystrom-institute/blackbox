@@ -10,7 +10,7 @@ mod loader;
 use std::path::Path;
 use std::sync::OnceLock;
 
-pub use crate::system_memory::catalog::{MemoryCatalog, SystemMemory};
+pub use crate::catalog::{MemoryCatalog, SystemMemory};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -31,15 +31,24 @@ pub fn catalog() -> &'static MemoryCatalog {
         .expect("system memory catalog not initialized")
 }
 
-#[cfg(test)]
-pub fn init_for_tests() {
-    let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("system-defaults")
-        .join("memories");
+/// Idempotently initialize the process-wide catalog from `defaults_dir`.
+/// Test support for downstream crates (the daemon's tests must initialize
+/// the catalog and own the repo-root `system-defaults/memories` path); not
+/// `#[cfg(test)]`-gated because cfg(test) is false when this crate compiles
+/// as a dependency of the consumer's test build.
+pub fn init_for_tests_from(defaults_dir: &Path) {
     let _ = SYSTEM_MEMORY_CATALOG.get_or_init(|| {
-        MemoryCatalog::load(&defaults, None, &serde_json::json!({}))
+        MemoryCatalog::load(defaults_dir, None, &serde_json::json!({}))
             .expect("load system memory defaults for tests")
     });
+}
+
+#[cfg(test)]
+pub fn init_for_tests() {
+    // Repo-root fixtures, reached relative to this crate's manifest.
+    let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../system-defaults/memories");
+    init_for_tests_from(&defaults);
 }
 
 /// Lookup by exact ID. Accepts either canonical form (`sm-rule-packets`) or
