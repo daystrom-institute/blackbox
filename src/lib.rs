@@ -106,7 +106,7 @@ mod system_events;
 use bbox_system_memory as system_memory;
 use bbox_corpus_core::template;
 use bbox_threads::threads;
-mod tool_docs;
+use bbox_tool_docs::tool_docs;
 mod tools;
 use bbox_corpus_index::transcripts;
 pub use bbox_util::util;

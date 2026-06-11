@@ -15,7 +15,7 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 
-use crate::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
+use bbox_knowledge::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
 
 pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 
@@ -1832,7 +1832,7 @@ pub fn recursion_guard_tool_names_prefixed() -> Vec<String> {
 /// Defaults to `mcp__blackbox__`, but follows `BLACKBOX_MCP_NAME` at runtime
 /// so dev/prod daemons can coexist with distinct MCP entries.
 pub fn blackbox_mcp_prefix() -> String {
-    crate::util::blackbox_mcp_prefix()
+    bbox_util::util::blackbox_mcp_prefix()
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -1960,7 +1960,7 @@ pub struct SyncResult {
 
 /// Upsert the canonical tool reference as a fixed-ID global entry.
 /// Idempotent: no-op if the content hasn't changed.
-pub fn sync_into_knowledge(kb: &mut crate::knowledge::Knowledge) -> Result<SyncResult> {
+pub fn sync_into_knowledge(kb: &mut bbox_knowledge::knowledge::Knowledge) -> Result<SyncResult> {
     let content = render_markdown();
     let bytes = content.len();
 
@@ -1980,7 +1980,7 @@ pub fn sync_into_knowledge(kb: &mut crate::knowledge::Knowledge) -> Result<SyncR
         }
     }
 
-    let now = crate::util::now_iso();
+    let now = bbox_util::util::now_iso();
     let entry = KnowledgeEntry {
         id: TOOL_DOC_ENTRY_ID.to_string(),
         title: "Blackbox tool reference".to_string(),
@@ -2146,7 +2146,10 @@ mod tests {
     /// skipped — `every_registered_tool_has_a_doc` covers the missing-doc
     /// case separately.
     fn parse_registered_tools() -> Vec<(String, String)> {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // The #[tool] registrations live in the root crate's src/ (this
+        // crate holds only the doc stanzas) — re-root the scan two levels
+        // up from this crate's manifest.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src");
         let mut paths = Vec::new();
         collect_rust_files(&src_dir, &mut paths);
         paths.sort();

@@ -42,6 +42,7 @@ members = [
     "crates/bbox-inbox",
     "crates/bbox-slack",
     "crates/bbox-edge-index",
+    "crates/bbox-tool-docs",
 ]
 
 [package]
@@ -197,6 +198,7 @@ bbox-gaps = { path = "crates/bbox-gaps" }
 bbox-inbox = { path = "crates/bbox-inbox" }
 bbox-slack = { path = "crates/bbox-slack" }
 bbox-edge-index = { path = "crates/bbox-edge-index" }
+bbox-tool-docs = { path = "crates/bbox-tool-docs" }
 
 [dev-dependencies]
 filetime = "0.2"

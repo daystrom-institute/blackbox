@@ -615,6 +615,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-tool-docs"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-knowledge",
+ "bbox-util",
+]
+
+[[package]]
 name = "bbox-util"
 version = "0.0.1"
 dependencies = [
@@ -763,6 +772,7 @@ dependencies = [
  "bbox-stores",
  "bbox-system-memory",
  "bbox-threads",
+ "bbox-tool-docs",
  "bbox-util",
  "bbox-vectors",
  "bbox-whiteboards",

@@ -1,0 +1,12 @@
+[package]
+name = "bbox-tool-docs"
+version = "0.0.1"
+edition = "2024"
+
+# Extracted from the origin crate by extract_rust_crate; the origin aliases
+# the moved modules back under their original `crate::<module>` paths.
+
+[dependencies]
+anyhow = "1"
+bbox-util = { path = "../bbox-util" }
+bbox-knowledge = { path = "../bbox-knowledge" }
