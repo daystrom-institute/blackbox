@@ -1,0 +1,18 @@
+{
+  "id": "gap-fdacb6ed",
+  "title": "Per-turn MCP tool-call budget for agentic actor",
+  "gap_kind": "refactor_primitive",
+  "domain": "policy-primitive",
+  "wanted_capability": "`policy_packet` watches workflow steps, not LLM-internal tool calls. Need a primitive that constrains/budgets tool calls per turn (not per node).",
+  "evidence": [
+    "thread-3cfbf9e0",
+    "Codex round-5 design deliberation (2026-04)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "refactor_primitive/policy-primitive/tool-call-budget",
+  "notes": "Codex flagged runaway loop risk during agentic-corpus design round-5. Soft prompt budget is v1 workaround; structural fix deferred until eval shows the failure mode.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:04:38Z",
+  "updated_at": "2026-06-11T18:04:38Z"
+}

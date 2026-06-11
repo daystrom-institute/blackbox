@@ -1,0 +1,17 @@
+{
+  "id": "gap-9d84f24f",
+  "title": "Probe-team Q2-Q8 (WHO/WHEN, WHY, HOW, REPLACEMENT, HISTORICAL, IMPACT, WHAT)",
+  "gap_kind": "eval_coverage",
+  "domain": "probe-team",
+  "wanted_capability": "Dispatch probe-team Q2-Q8 (WHO/WHEN, WHY, HOW, REPLACEMENT, HISTORICAL, IMPACT, WHAT) with their designed checklists for cold-start grounding behavior evaluation.",
+  "evidence": [
+    "thread-3cfbf9e0 (Note 2 NEW)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "eval_coverage/probe-team/q2-q8",
+  "notes": "Only Q1 dispatched this session. Each question has a designed checklist for evaluating cold-start grounding behavior.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:32Z",
+  "updated_at": "2026-06-11T18:06:32Z"
+}

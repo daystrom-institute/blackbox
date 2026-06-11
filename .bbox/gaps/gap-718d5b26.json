@@ -1,0 +1,18 @@
+{
+  "id": "gap-718d5b26",
+  "title": "ARC_PRODUCED_COMMIT edge wiring",
+  "gap_kind": "tooling",
+  "domain": "provenance",
+  "wanted_capability": "Arc runner should write the producing commit SHA in `on_arc_exit` and emit an `ARC_PRODUCED_COMMIT` edge. Currently advertised in schema as a ghost edge (per design/commit-work-provenance.md Phase 0).",
+  "evidence": [
+    "thread-3cfbf9e0 (G2)",
+    "design/commit-work-provenance.md (Thread-3cfbf9e0 sibling)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/provenance/arc-commit-wiring",
+  "notes": "Design called for arcs to record their producing commit SHA in `on_arc_exit`; not yet wired. M2-M5 arcs could populate.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:04:48Z",
+  "updated_at": "2026-06-11T18:04:48Z"
+}

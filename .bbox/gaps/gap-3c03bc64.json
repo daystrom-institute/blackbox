@@ -1,0 +1,17 @@
+{
+  "id": "gap-3c03bc64",
+  "title": "chunk_kind expansion for IMG/AV",
+  "gap_kind": "refactor_primitive",
+  "domain": "chunk-kind",
+  "wanted_capability": "Add IMG/AV variants to chunk_kind enum; emit markers from chunker.",
+  "evidence": [
+    "thread-3cfbf9e0 (chunk_kind expansion)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "refactor_primitive/chunk-kind/img-av-expansion",
+  "notes": "Markers; chunk_kind enum already designed to accept these.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:07Z",
+  "updated_at": "2026-06-11T18:06:07Z"
+}

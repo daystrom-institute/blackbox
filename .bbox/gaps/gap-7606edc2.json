@@ -1,0 +1,17 @@
+{
+  "id": "gap-7606edc2",
+  "title": "Auto-edge ensemble vote parsing",
+  "gap_kind": "tooling",
+  "domain": "auto-edge",
+  "wanted_capability": "Ensemble node output should be parsed as a per-member array (or carry explicit boundaries) rather than concatenated blob, so `parse_json` can disambiguate members.",
+  "evidence": [
+    "thread-3cfbf9e0 (M5 review #2)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/auto-edge/ensemble-parse",
+  "notes": "3 ensemble outputs concatenate; `parse_json` on concatenation either needs ensemble-aware parser OR per-member output API.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:22Z",
+  "updated_at": "2026-06-11T18:05:22Z"
+}

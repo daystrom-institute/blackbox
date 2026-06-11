@@ -1,0 +1,17 @@
+{
+  "id": "gap-7994a0a3",
+  "title": "Eval workflow gate doesn't consume scoreboard",
+  "gap_kind": "tooling",
+  "domain": "eval-gate",
+  "wanted_capability": "`nightly-eval-arc` (and similar eval arcs) should be able to route on actual scoreboard drift — blocked on the same `op: shell` stdout capture primitive (gap tooling/workflow-engine/op-shell-stdout-capture).",
+  "evidence": [
+    "thread-3cfbf9e0 (H3 review #1)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/eval-gate/scoreboard-consumption",
+  "notes": "Same shape as the `op: shell` engine gap above. nightly-eval-arc records that the harness ran; can't route on actual drift.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:00Z",
+  "updated_at": "2026-06-11T18:06:00Z"
+}

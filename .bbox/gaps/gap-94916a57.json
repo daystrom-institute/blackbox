@@ -1,0 +1,17 @@
+{
+  "id": "gap-94916a57",
+  "title": "Y-* AST depth markers (5 remaining languages)",
+  "gap_kind": "refactor_primitive",
+  "domain": "ast-depth",
+  "wanted_capability": "Y-Python (pyright), Y-CSharp (omnisharp), Y-Go (gopls), Y-TS (tsserver), Y-CCpp (clangd) — wire each through the LspSessionManager substrate that shipped for rust-analyzer + jdtls.",
+  "evidence": [
+    "thread-3cfbf9e0 (Y-* markers)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "refactor_primitive/ast-depth/y-markers-remaining",
+  "notes": "Y-Rust (rust-analyzer) and Y-Java (jdtls) shipped via LspSessionManager. Remaining: Y-Python (pyright), Y-CSharp (omnisharp), Y-Go (gopls), Y-TS (tsserver), Y-CCpp (clangd).",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:17Z",
+  "updated_at": "2026-06-11T18:06:17Z"
+}

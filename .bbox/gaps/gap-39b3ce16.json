@@ -1,0 +1,17 @@
+{
+  "id": "gap-39b3ce16",
+  "title": "Combined rerank multiplier tuning",
+  "gap_kind": "eval_coverage",
+  "domain": "rerank",
+  "wanted_capability": "Empirically tune the combined rerank multiplier against the eval suite — current 1.5× cap is a guess.",
+  "evidence": [
+    "thread-3cfbf9e0 (H1 review #3)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "eval_coverage/rerank/empirical-tuning",
+  "notes": "Capped at 1.5× via H1 fix; empirical tuning against eval suite still open.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:35Z",
+  "updated_at": "2026-06-11T18:05:35Z"
+}

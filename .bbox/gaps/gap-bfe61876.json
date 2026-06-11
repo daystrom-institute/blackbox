@@ -1,0 +1,17 @@
+{
+  "id": "gap-bfe61876",
+  "title": "Multi-partition compaction per arc tick",
+  "gap_kind": "tooling",
+  "domain": "compaction",
+  "wanted_capability": "Compaction tick should iterate over all stale partitions (now expressible via foreach primitive) instead of picking worst-only per cron.",
+  "evidence": [
+    "thread-3cfbf9e0 (M2 review #3)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/compaction/multi-partition-per-tick",
+  "notes": "Picks worst partition only; others wait for next cron. Now unblocked by foreach primitive (0530ba27) but wiring deferred.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:30Z",
+  "updated_at": "2026-06-11T18:05:30Z"
+}

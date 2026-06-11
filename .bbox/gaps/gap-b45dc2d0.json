@@ -1,0 +1,17 @@
+{
+  "id": "gap-b45dc2d0",
+  "title": "Per-class checker logic refinement beyond Any/All/First",
+  "gap_kind": "refactor_primitive",
+  "domain": "checker-logic",
+  "wanted_capability": "Per-class checker semantics beyond Any/All/First (e.g. `at_least{n}`, `must_include_path_validation`, weighted contributions).",
+  "evidence": [
+    "thread-3cfbf9e0 (F2b review #1)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "refactor_primitive/checker-logic/per-class-refinement",
+  "notes": "pass_strictness covers v1 but per-query-class richness (e.g. \"≥2 of expected\", \"must include path validation\") is open.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:40Z",
+  "updated_at": "2026-06-11T18:05:40Z"
+}

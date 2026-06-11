@@ -1,0 +1,18 @@
+{
+  "id": "gap-d5bd0c66",
+  "title": "Multimodal X-* chunker markers (7 formats)",
+  "gap_kind": "refactor_primitive",
+  "domain": "multimodal",
+  "wanted_capability": "Chunker markers for the 7 deferred multimodal formats: X-PDF, X-IPYNB, X-XLSX, X-DOCX-PPTX, X-HTML, X-AV, X-IMG. Embedding model selection (per design/multimodal-embedding-routing.md) is the X-IMG blocker.",
+  "evidence": [
+    "thread-3cfbf9e0 (X-* markers)",
+    "design/multimodal-embedding-routing.md (8cade63b)"
+  ],
+  "impact": "high",
+  "blocking_level": "none",
+  "dedupe_key": "refactor_primitive/multimodal/x-markers",
+  "notes": "X-PDF (highest user priority per design A3), X-IPYNB, X-XLSX, X-DOCX-PPTX, X-HTML, X-AV (audio/video transcripts), X-IMG (standalone images, blocked on multimodal embed model selection per design §20.3). Embedding routing design now exists.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:14Z",
+  "updated_at": "2026-06-11T18:06:14Z"
+}

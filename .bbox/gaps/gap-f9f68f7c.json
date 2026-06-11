@@ -1,0 +1,17 @@
+{
+  "id": "gap-f9f68f7c",
+  "title": "Bidirectional git-notes sync hooks",
+  "gap_kind": "tooling",
+  "domain": "provenance",
+  "wanted_capability": "Git hooks (or daemon subscription) that auto-export bbox provenance notes on commit and auto-import on fetch.",
+  "evidence": [
+    "thread-3cfbf9e0 (G2 review #6)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/provenance/git-notes-sync-hooks",
+  "notes": "Push-notes-on-commit + pull-notes-on-fetch automation. Today: operator runs `bbox_provenance_export` / `bbox_provenance_import` manually + `git push refs/notes/bbox/*`.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:04:51Z",
+  "updated_at": "2026-06-11T18:04:51Z"
+}

@@ -1,0 +1,17 @@
+{
+  "id": "gap-99e7a909",
+  "title": "Markdown LINKS_TO_FILE / LINKS_TO_SECTION target resolution",
+  "gap_kind": "tooling",
+  "domain": "edge-projection",
+  "wanted_capability": "EdgeIndex lookup by (file, content_hash) to resolve markdown cross-references and section anchors into entity edges.",
+  "evidence": [
+    "thread-3cfbf9e0 (S2 review #1)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/edge-projection/markdown-links-resolution",
+  "notes": "Codex stopped emitting these self-loop edges; resolution needs EdgeIndex chunk-by-(file, hash) lookup. Defer to post-S4 EdgeIndex enhancement.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:04Z",
+  "updated_at": "2026-06-11T18:06:04Z"
+}

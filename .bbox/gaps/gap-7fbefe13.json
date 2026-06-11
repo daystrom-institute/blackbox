@@ -1,0 +1,17 @@
+{
+  "id": "gap-7fbefe13",
+  "title": "Engine-driven whiteboard auto-post",
+  "gap_kind": "tooling",
+  "domain": "workflow-engine",
+  "wanted_capability": "Engine should auto-post to a whiteboard from a specialist node's strict JSON output when the node is configured for `output_kind: whiteboard_post` — eliminates silent-failure from forgotten tool calls.",
+  "evidence": [
+    "thread-3cfbf9e0"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/workflow-engine/whiteboard-auto-post",
+  "notes": "Specialists are prompt-instructed to call `whiteboard_post`; silent failure if forgotten. Either completion-gate per node OR engine-driven auto-post from strict JSON output.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:04:43Z",
+  "updated_at": "2026-06-11T18:04:43Z"
+}

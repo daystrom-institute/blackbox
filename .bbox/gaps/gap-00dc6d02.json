@@ -1,0 +1,17 @@
+{
+  "id": "gap-00dc6d02",
+  "title": "Team install paths",
+  "gap_kind": "tooling",
+  "domain": "team-artifact-install",
+  "wanted_capability": "Teams referenced by ensemble actors (`contradiction-specialists`, `auto-edge-classifiers`) need a first-class install path — either add `team` to the F4 artifact catalog or ship an `install-teams.sh` bootstrap.",
+  "evidence": [
+    "thread-3cfbf9e0 (M4 review #1, M5 issue #3)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/team/artifact-install-paths",
+  "notes": "`contradiction-specialists` and `auto-edge-classifiers` teams referenced by ensemble actors but no automated install. Either F4 catalog grows team artifact kind OR install-teams.sh script.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:26Z",
+  "updated_at": "2026-06-11T18:05:26Z"
+}

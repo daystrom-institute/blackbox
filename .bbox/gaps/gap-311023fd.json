@@ -1,0 +1,17 @@
+{
+  "id": "gap-311023fd",
+  "title": "matching_anchors / prior_read_edges indexed by anchor",
+  "gap_kind": "tooling",
+  "domain": "provenance",
+  "wanted_capability": "Generalize the per-commit and per-session anchor indices into a generic anchor-indexed lookup so future provenance walks don't each reinvent the index.",
+  "evidence": [
+    "thread-3cfbf9e0 (P2 review #1, #2)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/provenance/anchor-indexed-lookups",
+  "notes": "Codex's P2 fixes added per-commit and per-session indices, but they only cover the specific anchor lookups in `bbox_blame`. Future provenance walks might need similar.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:09Z",
+  "updated_at": "2026-06-11T18:05:09Z"
+}

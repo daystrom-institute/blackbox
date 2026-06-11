@@ -1,0 +1,17 @@
+{
+  "id": "gap-e314921c",
+  "title": "Opencode SQLite session-DB lock under parallel runs",
+  "gap_kind": "tooling",
+  "domain": "opencode",
+  "wanted_capability": "Per-bro session DB (or some form of per-process SQLite isolation) so concurrent opencode bros don't lock-step on the same DB.",
+  "evidence": [
+    "thread-3cfbf9e0 (Note 2 NEW)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/opencode/sqlite-session-db-lock",
+  "notes": "Two opencode bros running concurrently get \"database is locked\" errors.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:26Z",
+  "updated_at": "2026-06-11T18:06:26Z"
+}

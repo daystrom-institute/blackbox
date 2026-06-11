@@ -1,0 +1,17 @@
+{
+  "id": "gap-a02e5c7d",
+  "title": "VectorStore singleton refactor",
+  "gap_kind": "refactor_primitive",
+  "domain": "vector-store",
+  "wanted_capability": "Replace `OnceLock<Arc<VectorStore>>` module-level singleton with explicit `&VectorStore` threading through call sites so tests can inject isolated stores.",
+  "evidence": [
+    "thread-3cfbf9e0 (E3 review #5)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "refactor_primitive/vector-store/explicit-passing",
+  "notes": "`OnceLock<Arc<VectorStore>>` for module-level free functions; testing harder. Pass &VectorStore explicitly.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:07Z",
+  "updated_at": "2026-06-11T18:05:07Z"
+}

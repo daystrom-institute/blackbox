@@ -1,0 +1,18 @@
+{
+  "id": "gap-f8246d09",
+  "title": "bbox_blame anchor-metadata file_path mismatch",
+  "gap_kind": "tooling",
+  "domain": "bbox-blame",
+  "wanted_capability": "Filter anchors by file_path match too, not just commit_sha, so `bbox_blame` returns the file actually being blamed.",
+  "evidence": [
+    "thread-3cfbf9e0 (Note 2 NEW)",
+    "feedback/probe-team-q1.md"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/bbox-blame/anchor-metadata-file-mismatch",
+  "notes": "When multiple Edit tool calls share a commit_sha, the matched anchor returns the FIRST anchor's metadata.file_path, not the file actually being blamed. Causes confusing surprise notes from agents (codex caught this on Q1 of probe-team validation).",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:20Z",
+  "updated_at": "2026-06-11T18:06:20Z"
+}

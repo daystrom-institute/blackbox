@@ -1,0 +1,17 @@
+{
+  "id": "gap-f293c181",
+  "title": "Opencode bros BLACKBOX.md @-imports loading",
+  "gap_kind": "tooling",
+  "domain": "opencode",
+  "wanted_capability": "Opencode bros honor the rendered BLACKBOX.md guidance. Investigate whether opencode chases `@/path/...` AGENTS.md @-imports; if not, render to opencode's expected location too.",
+  "evidence": [
+    "thread-3cfbf9e0 (Note 2 NEW)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/opencode/blackbox-md-imports",
+  "notes": "Opencode bros (glm, deepseek) have access to bbox MCP tools per `~/.config/opencode/opencode.json` but their behavioral default is `grep`/`read`. The rendered guidance in `~/.claude-shared/BLACKBOX.md` reaches them only if opencode honors AGENTS.md @-imports.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:24Z",
+  "updated_at": "2026-06-11T18:06:24Z"
+}

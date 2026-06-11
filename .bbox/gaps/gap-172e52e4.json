@@ -1,0 +1,17 @@
+{
+  "id": "gap-172e52e4",
+  "title": "Embed-on-search latency",
+  "gap_kind": "tooling",
+  "domain": "embed-on-search",
+  "wanted_capability": "Either cache query embeddings (LRU keyed by query string + route) or fall back to BM25-first rendering while vector embedding fills async.",
+  "evidence": [
+    "thread-3cfbf9e0 (H1 review #4)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/embed-on-search/latency",
+  "notes": "100-500ms per interactive query. Cache query embeddings or async-fill BM25-first.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:05:37Z",
+  "updated_at": "2026-06-11T18:05:37Z"
+}

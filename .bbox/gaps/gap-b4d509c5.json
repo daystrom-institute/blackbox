@@ -1,0 +1,18 @@
+{
+  "id": "gap-b4d509c5",
+  "title": "bro_exec task-completed signal emission",
+  "gap_kind": "tooling",
+  "domain": "workflow-engine",
+  "wanted_capability": "`bro_exec` must emit a `task-completed` signal (correlatable by task_id) on terminal state so routing packets with `route: signal_arc` can fire automatically.",
+  "evidence": [
+    "thread-3cfbf9e0",
+    "design/corpus/agentic-corpus/auto-digest-arc.json"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "tooling/workflow-engine/task-completed-signal",
+  "notes": "Auto-digest-arc's routing packet exists but never fires because `bro_exec` doesn't emit the signal. Operator triggers manually via `bbox_orchestrate_run`.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:04:41Z",
+  "updated_at": "2026-06-11T18:04:41Z"
+}

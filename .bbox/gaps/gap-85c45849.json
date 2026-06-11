@@ -1,0 +1,17 @@
+{
+  "id": "gap-85c45849",
+  "title": "Per-turn LLM scoring for ranker",
+  "gap_kind": "refactor_primitive",
+  "domain": "ranker",
+  "wanted_capability": "Replace fixed rerank multiplier with learned weights driven by per-turn LLM scoring. Aspirational — defer until the manual cap tuning plateaus.",
+  "evidence": [
+    "thread-3cfbf9e0 (Note 2 NEW)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "refactor_primitive/ranker/learned-weights",
+  "notes": "H1 #3 multiplier tuning could move to learned weights eventually. Aspirational — defer until manual cap tuning plateaus.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:35Z",
+  "updated_at": "2026-06-11T18:06:35Z"
+}

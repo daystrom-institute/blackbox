@@ -1,0 +1,17 @@
+{
+  "id": "gap-c123b7b4",
+  "title": "Codex over-explores on conceptual queries",
+  "gap_kind": "tooling",
+  "domain": "brofile",
+  "wanted_capability": "Tighten codex-gpt55 brofile lens with explicit \"stop when answered\" guidance to reduce 2× claude latency on conceptual probes.",
+  "evidence": [
+    "thread-3cfbf9e0 (Note 2 NEW)"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/brofile/codex-stop-when-answered",
+  "notes": "Quality high but 2× claude latency on the WHERE probe. Consider tightening codex-gpt55 brofile lens with explicit \"stop when answered.\"",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:06:30Z",
+  "updated_at": "2026-06-11T18:06:30Z"
+}

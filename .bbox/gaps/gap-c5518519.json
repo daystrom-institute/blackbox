@@ -1,0 +1,19 @@
+{
+  "id": "gap-c5518519",
+  "title": "op: shell stdout capture for gate consumption",
+  "gap_kind": "tooling",
+  "domain": "workflow-engine",
+  "wanted_capability": "Workflow gate predicates must be able to consume stdout/exit from `op: shell` steps (analogous to `capture` for command steps in refactor-run).",
+  "evidence": [
+    "thread-3cfbf9e0",
+    "design/corpus/agentic-corpus/agentic-corpus-followups.md H3",
+    "design/corpus/agentic-corpus/agentic-corpus-release-notes.md:42"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "tooling/workflow-engine/op-shell-stdout-capture",
+  "notes": "H3's nightly-eval-arc and several others ship as observable skeletons because gate predicates can only see workflow vars + node prompt output, not subprocess stdout. When this lands, gate routing on actual results becomes possible.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:04:36Z",
+  "updated_at": "2026-06-11T18:04:36Z"
+}
