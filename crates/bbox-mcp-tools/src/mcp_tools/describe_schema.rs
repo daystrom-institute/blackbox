@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::providers;
+use bbox_providers::providers;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSchemaEntry {

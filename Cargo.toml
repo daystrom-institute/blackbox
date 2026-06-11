@@ -47,6 +47,7 @@ members = [
     "crates/bbox-indexing",
     "crates/bbox-providers",
     "crates/bbox-embed",
+    "crates/bbox-mcp-tools",
 ]
 
 [package]
@@ -207,6 +208,7 @@ bbox-system-events = { path = "crates/bbox-system-events" }
 bbox-indexing = { path = "crates/bbox-indexing" }
 bbox-providers = { path = "crates/bbox-providers" }
 bbox-embed = { path = "crates/bbox-embed" }
+bbox-mcp-tools = { path = "crates/bbox-mcp-tools" }
 
 [dev-dependencies]
 filetime = "0.2"

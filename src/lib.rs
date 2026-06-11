@@ -65,7 +65,7 @@ use bbox_macros as macros;
 mod managed_worktrees;
 use bbox_edge_sidecar::manifest;
 mod mcp_client;
-mod mcp_tools;
+use bbox_mcp_tools::mcp_tools;
 use bbox_edge_index::migration;
 use bbox_threads::notes;
 mod orchestration;
@@ -76,7 +76,7 @@ use bbox_packets as packets;
 /// daemon's indexer and the `bro` cockpit both link it). Re-exported as
 /// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.
 pub use bro_transcript as parser;
-mod path_cache;
+use bbox_mcp_tools::path_cache;
 use bbox_stores::pins;
 mod pollers;
 use bbox_indexing::projects;

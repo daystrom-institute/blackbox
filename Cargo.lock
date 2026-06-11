@@ -569,6 +569,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-mcp-tools"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-chunker",
+ "bbox-corpus-core",
+ "bbox-edge-index",
+ "bbox-embed",
+ "bbox-indexing",
+ "bbox-knowledge",
+ "bbox-providers",
+ "bbox-system-memory",
+ "bbox-vectors",
+ "chrono",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-packets"
 version = "0.0.1"
 dependencies = [
@@ -868,6 +892,7 @@ dependencies = [
  "bbox-knowledge",
  "bbox-lsp",
  "bbox-macros",
+ "bbox-mcp-tools",
  "bbox-packets",
  "bbox-providers",
  "bbox-refactor",
