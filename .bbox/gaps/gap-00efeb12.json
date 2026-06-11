@@ -6,9 +6,12 @@
   "wanted_capability": "The dispatched prompt should be unmistakably demarcated as THE task, not appended unmarked after stacked directives. Observed (session 7476e678, vibebh/mistral-medium-3.5, openai-chat): first user turn = 2,845 chars of [scope]+[recall before acting]+[task shape]+[completion contract]+[milestone reporting] with the operator's one-line instruction as the bare last line; second user turn = 15,434 chars of rendered provider memory; the model answered \"the user hasn't actually provided a task yet\" and wandered. The same model follows the same instruction fine in its native CLI (clean prompt), so this is harness prompt assembly, not model capability. Candidate fixes (design decision): (a) explicit [task] demarcation or task-first ordering with directives after; (b) move standing directives to the system message on transports that support it (openai-chat allows a leading system message; the Mistral constraint only bans system-after-tool); (c) deliver rendered memory via the system/project-doc lane instead of a synthetic user turn. Compounding friction in the same trace: bbox_thread_list was deferred, so the task's one required tool cost an unknown-tool error + tool_search round-trip before work could start.",
   "fallback_used": "none — misattributed to model quality until the operator pushed back; events.jsonl forensics corrected it",
   "evidence": [
-    "~/.local/state/blackbox/bro/harness-sessions/7476e678-1774-43ec-8736-3c7df4e74653.events.jsonl",
+    "research/harness/codex/codex-context-management.md (enriched, high confidence — build_initial_context 12-section assembly, developer vs AGENTS.md-user slot split, delta-only updates)",
+    "research/harness/context-management.md (axis: system-prompt split, overlays, first-turn injection ordering)",
+    "~/.local/state/blackbox/bro/harness-sessions/7476e678-1774-43ec-8736-3c7df4e74653.events.jsonl (live failure trace)",
+    "codex-rs/core/src/session/mod.rs ~2860 PromptSlot routing; context/user_instructions.rs markers (confirms + extends the corpus cell)",
     "src/orchestration/mod.rs apply_ambient",
-    "crates/bro-harness/src/project_doc.rs"
+    "crates/bro-harness/src/agent_loop.rs:651 three-state --system-prompt"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
@@ -16,5 +19,5 @@
   "notes": "CORRECTION from reading actual Codex source (~/repos/codex, codex-rs/core/src/session/mod.rs ~2860, context/user_instructions.rs, context/contextual_user_message.rs): the prior provenance note overstated. Codex does NOT stuff policy into user turns — it has a typed PromptSlot system (DeveloperPolicy / DeveloperCapabilities / SeparateDeveloper / ContextualUser): its own standing policy+capability prose rides DEVELOPER-role messages (build_developer_update_item) plus base_instructions on the request. Only user-authored/situational content rides the contextual USER message — UserInstructions (AGENTS.md, semantically user-authored) and EnvironmentContext — each wrapped in typed markers (\"# AGENTS.md instructions for <dir>\" + <INSTRUCTIONS>...</INSTRUCTIONS>) with a fragment registry (is_contextual_user_fragment) that re-identifies injected fragments for the transcript lifecycle, assembled into ONE contextual message SEPARATE from the operator's prompt item. Our harness imported only \"instructions can be a user message\" with none of the discipline. Fix arc should mirror the slot model: [recall]/[task shape]/[completion contract]/[milestone] are DeveloperPolicy-class → system/developer slot on harness transports; rendered repo memory is user-authored → one marker-demarcated contextual user message with fragment identity; the operator prompt stands alone as its own item. Mistral system-after-tool constraint still binds mid-session injections only.",
   "resolution": "unresolved",
   "created_at": "2026-06-11T22:29:45Z",
-  "updated_at": "2026-06-11T22:47:13Z"
+  "updated_at": "2026-06-11T22:50:31Z"
 }
