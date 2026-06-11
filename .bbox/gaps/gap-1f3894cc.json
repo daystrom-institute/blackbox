@@ -1,0 +1,20 @@
+{
+  "id": "gap-1f3894cc",
+  "title": "Project gap persister deletes repo-owned .bbox/gaps files it didn't create",
+  "gap_kind": "tooling",
+  "domain": "gaps-store",
+  "wanted_capability": "The project-scope gap persister should merge unknown on-disk .bbox/gaps/*.json files into its store (or at minimum never delete files it didn't write) when persisting. Today it rewrites the directory from its in-memory project store: gap files that exist on disk but not in the store — e.g. records migrated from global scope whose authoritative copy is the committed repo file (gap-79a3edef, gap-98d35225, migrated 2026-06-11 with global twins resolved as \"authoritative record is the project-scoped file\") — are silently deleted on the next project-scoped bbox_gap call from any session. This clobbers committed repo-owned knowledge and shows up as confusing unstaged deletions in peer worktrees. A migration/import path (scope=global → project) that registers the project record in the daemon store atomically with writing the file would close the desync at the source.",
+  "fallback_used": "git restore the deleted files from HEAD after each clobber; the records survive only because they were committed",
+  "evidence": [
+    ".bbox/gaps/gap-79a3edef.json",
+    ".bbox/gaps/gap-98d35225.json",
+    "2c6bf1b"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/gaps-store/project-persist-clobbers-unknown-files",
+  "notes": "Reproduced live 2026-06-11: this session's project-scoped bbox_gap filings triggered the persist that deleted both files (restored via git restore). NOTE: the restored files remain clobber-prone until this is fixed — any project-scoped gap write from any session may delete them again. The daemon-side global twins are resolution=addressed, so re-filing under the same dedupe_key would mint new ids rather than dedupe.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T17:41:24Z",
+  "updated_at": "2026-06-11T17:41:24Z"
+}
