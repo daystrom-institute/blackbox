@@ -521,6 +521,46 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
+    /// Create a local-only handle with the given status for unit testing.
+    /// The handle has no daemon backing — `can_steer()` returns false and
+    /// `send_user_turn` / `interrupt` / `control_request` will fail.
+    /// `snapshot()` returns a synthetic snapshot with the requested status
+    /// and id, plus a Brodex provider for use in TUI test fixtures.
+    #[doc(hidden)]
+    pub fn for_test(status: TaskStatus, id: &str) -> Self {
+        use crate::task::now_ms;
+        let now = now_ms();
+        let inner = TaskInner {
+            id: id.to_string(),
+            provider: Provider::Brodex,
+            session_id: format!("session-{id}"),
+            events: Vec::new(),
+            last_assistant_message: None,
+            report_message: None,
+            cost_usd: Some(0.0),
+            num_turns: Some(1),
+            stderr: String::new(),
+            status,
+            started_at: now,
+            completed_at: status.is_terminal().then_some(now),
+            cwd: Some("/tmp/test-project".to_string()),
+            bro_label: Some(format!("agent-{id}")),
+            recoverable: false,
+            last_event_at_ms: Some(now),
+            model: None,
+            origin: bro_core::Origin::Unknown,
+            managed_worktree: None,
+            workflow_owned: false,
+        };
+        AgentHandle {
+            task: Arc::new(Task {
+                inner: parking_lot::Mutex::new(inner),
+                notify: Arc::new(tokio::sync::Notify::new()),
+            }),
+            daemon: None,
+        }
+    }
+
     pub fn id(&self) -> String {
         self.task.id()
     }

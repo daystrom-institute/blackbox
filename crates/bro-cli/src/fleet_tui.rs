@@ -85,6 +85,9 @@ const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
 const FINISHED_AFTER_IDLE_MS: u64 = 20 * 60 * 1000;
 /// Seconds the operator has to confirm a Ctrl+K prune after the first press.
 const PRUNE_ARM_SECS: u64 = 4;
+/// Seconds the operator has to confirm an Enter-after-terminal steer with a
+/// second Enter press.
+const STEER_ARM_SECS: u64 = 4;
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -566,6 +569,11 @@ struct App {
     /// executes. `None` = not armed.
     prune_armed_until: Option<Instant>,
     prune_armed_count: usize,
+    /// SingleAgent Enter-after-terminal arm-confirm state: first Enter arms
+    /// (shows a confirmation status line), second Enter within the TTL resumes
+    /// with the composer text. `None` = not armed.
+    steer_armed_until: Option<Instant>,
+    steer_armed_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -689,6 +697,8 @@ impl App {
             composer_history_path: history_path(&bro_home()),
             prune_armed_until: None,
             prune_armed_count: 0,
+            steer_armed_until: None,
+            steer_armed_agent_id: None,
         }
     }
 
@@ -2328,6 +2338,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if ctrl && key.code == KeyCode::Char('u') {
         app.clear_input();
         app.prune_armed_until = None;
+        app.steer_armed_until = None;
         return;
     }
     // Ctrl+X: stop a live agent (→ Interrupted), or delete an already-stopped
@@ -2336,6 +2347,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         stop_or_delete_selected(app);
         // Any non-Ctrl+K action disarms the prune confirmation.
         app.prune_armed_until = None;
+        app.steer_armed_until = None;
         return;
     }
     // Ctrl+K: prune all terminal rows from the roster in one action.
@@ -2347,6 +2359,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
     // Any key other than Ctrl+K disarms the prune confirmation.
     app.prune_armed_until = None;
+    // Any key other than Enter disarms the steer-after-terminal confirmation.
+    if key.code != KeyCode::Enter {
+        app.steer_armed_until = None;
+    }
     // Completion carveouts: slash commands and roster @project aliases own Tab
     // and ↑/↓ while their menus are up. Otherwise Tab cycles roster tabs from
     // home, or the current provider / model / effort sub-selector level.
@@ -2905,6 +2921,37 @@ fn submit(app: &mut App) {
             } else if app.mode.is_standalone() && app.agents.is_empty() {
                 launch_standalone_current_input(app);
             } else {
+                // Terminal-agent guard: if the focused agent is finished /
+                // interrupted, require a confirmation Enter before resuming.
+                // First Enter arms (shows a status line); second Enter within
+                // STEER_ARM_SECS submits. Running agents submit immediately.
+                if let Some(idx) = app.selected_agent() {
+                    let snap = app.agents[idx].task.snapshot();
+                    if snap.status.is_terminal() {
+                        let now = Instant::now();
+                        let agent_id = app.agents[idx].task.id();
+                        let armed = app
+                            .steer_armed_until
+                            .is_some_and(|until| now < until)
+                            && app
+                                .steer_armed_agent_id
+                                .as_deref()
+                                == Some(&agent_id);
+                        if !armed {
+                            app.steer_armed_until =
+                                Some(now + Duration::from_secs(STEER_ARM_SECS));
+                            app.steer_armed_agent_id = Some(agent_id);
+                            app.set_status(
+                                "agent finished — Enter again to resume this session with your message",
+                                Duration::from_secs(STEER_ARM_SECS),
+                            );
+                            return;
+                        }
+                        // Confirmed — disarm and proceed.
+                        app.steer_armed_until = None;
+                        app.steer_armed_agent_id = None;
+                    }
+                }
                 steer_selected(app);
             }
         }
