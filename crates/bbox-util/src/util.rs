@@ -59,13 +59,14 @@ pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// // ... assertions ...
 /// // original environment restored when `env` drops
 /// ```
-#[cfg(test)]
+// Like `TEST_ENV_LOCK` above, not `#[cfg(test)]` gated: consumer crates use
+// this from their own test modules, where this crate compiles as a normal
+// (non-test) dependency and `cfg(test)` is false.
 pub struct TestEnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     saved: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
 }
 
-#[cfg(test)]
 impl TestEnvGuard {
     pub fn new() -> Self {
         Self {
@@ -96,14 +97,12 @@ impl TestEnvGuard {
     }
 }
 
-#[cfg(test)]
 impl Default for TestEnvGuard {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
 impl Drop for TestEnvGuard {
     fn drop(&mut self) {
         for (key, prior) in self.saved.drain(..).rev() {
