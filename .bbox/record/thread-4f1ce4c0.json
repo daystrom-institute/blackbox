@@ -1,0 +1,11 @@
+{
+  "id": "thread-4f1ce4c0",
+  "topic": "Design the correct non-global instruction layer for workspace tools so workflow/atom agents that should use work_* tools see the guidance, while normal external agents and rendered global/provider memory do not. The previous hot render-layer reference was removed in commit e120a25 because it contaminated external agents. Follow-up should identify where workflow/atom ambient prompts or brofile/coerce_workspace appendices should carry these instructions, how the surface/tool availability gates interact, and what tests prove the instructions appear only for intended workflow agents.",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Context: workspace tools are now omitted from the global rendered tool reference, and work_bash now streams progress chunks. We still need SOME scoped layer for instructions that workflow/atom agents see when workspace-tools mode is explicitly enabled. Avoid reintroducing workspace tool guidance into global hot memory or external-agent rendered files."
+  ],
+  "created_at": "2026-05-14T02:28:36Z",
+  "resolved_at": "2026-06-11T16:31:57Z"
+}
