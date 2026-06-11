@@ -24,12 +24,10 @@
 //! usual. The request-side `reasoning_effort` knob is provider-specific and
 //! gated by [`ReasoningProfile`].
 //!
-//! Context reuse: the chat-completions wire shape used by vibebh/Mistral has no
-//! known explicit prompt-cache breakpoint or reusable context handle analogous
-//! to Anthropic `cache_control`, and the usage payload does not expose
-//! cache-read/cache-write counters. The transport still keeps stable system
-//! content prefix-friendly, but provider catalog metadata reports vibebh as
-//! `none_known` for explicit cache capability until Mistral exposes one.
+//! Context reuse: Mistral chat-completions supports `prompt_cache_key`, keyed
+//! here from the stable harness session id when the Mistral profile is active.
+//! Cache hits are reported as `usage.prompt_tokens_details.cached_tokens`; the
+//! final usage fold subtracts those cached tokens from fresh input usage.
 
 use super::{StopReason, Transport, TurnOpts, TurnOutput, Usage};
 use anyhow::{Context, Result};
@@ -94,6 +92,7 @@ pub struct OpenAiChatTransport {
     api_key: String,
     messages: Vec<Value>,
     reasoning: ReasoningProfile,
+    session_id: Option<String>,
 }
 
 impl OpenAiChatTransport {
@@ -112,6 +111,7 @@ impl OpenAiChatTransport {
             api_key,
             messages: Vec::new(),
             reasoning: ReasoningProfile::from_env(),
+            session_id: None,
         })
     }
 
@@ -202,6 +202,11 @@ impl OpenAiChatTransport {
         // profile Off.
         if let Some(effort) = self.reasoning.reasoning_effort(opts.effort.as_deref()) {
             body["reasoning_effort"] = json!(effort);
+        }
+        if self.reasoning == ReasoningProfile::Mistral
+            && let Some(session_id) = self.session_id.as_deref().filter(|id| !id.is_empty())
+        {
+            body["prompt_cache_key"] = json!(session_id);
         }
         body
     }
@@ -330,6 +335,10 @@ fn extract_thinking_text(thinking: &Value) -> String {
 impl Transport for OpenAiChatTransport {
     fn name(&self) -> &'static str {
         "openai-chat"
+    }
+
+    fn set_session_id(&mut self, id: String) {
+        self.session_id = Some(id);
     }
 
     fn push_user_text(&mut self, text: &str) {
@@ -738,6 +747,7 @@ mod tests {
             api_key: "k".into(),
             messages: vec![json!({"role": "user", "content": "hi"})],
             reasoning: ReasoningProfile::Off,
+            session_id: None,
         }
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
@@ -838,6 +848,7 @@ mod tests {
                 json!({"role": "tool", "tool_call_id": "c1", "content": "/tmp"}),
             ],
             reasoning: ReasoningProfile::Off,
+            session_id: None,
         }
     }
 
@@ -976,6 +987,28 @@ mod tests {
                 .get("reasoning_effort")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn mistral_profile_adds_prompt_cache_key_from_session_id() {
+        let mut tx = transport();
+        tx.reasoning = ReasoningProfile::Mistral;
+        tx.set_session_id("sess-1".into());
+
+        let body = tx.build_body(&[], &opts(SystemPrompt::default()));
+
+        assert_eq!(body["prompt_cache_key"], "sess-1");
+    }
+
+    #[test]
+    fn non_mistral_profile_omits_prompt_cache_key() {
+        let mut tx = transport();
+        tx.reasoning = ReasoningProfile::Off;
+        tx.set_session_id("sess-1".into());
+
+        let body = tx.build_body(&[], &opts(SystemPrompt::default()));
+
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     #[test]

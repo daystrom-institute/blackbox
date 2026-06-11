@@ -215,6 +215,10 @@ pub enum PromptCacheCapability {
     /// OpenAI Responses-style server-side prompt caching reports cached input in
     /// `input_tokens_details.cached_tokens`; no explicit breakpoint is sent.
     OpenAiPromptTokenDetails,
+    /// Chat Completions-style server-side prompt caching is enabled with a
+    /// stable `prompt_cache_key`; cached input is reported in
+    /// `prompt_tokens_details.cached_tokens`.
+    ChatCompletionsPromptCacheKey,
     /// No known explicit context-reuse or cache-reporting surface for this
     /// provider/transport.
     NoneKnown,
@@ -246,7 +250,8 @@ fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
             PromptCacheCapability::AnthropicCacheControl
         }
         Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
-        Provider::VibeBh | Provider::Workflow => PromptCacheCapability::NoneKnown,
+        Provider::VibeBh => PromptCacheCapability::ChatCompletionsPromptCacheKey,
+        Provider::Workflow => PromptCacheCapability::NoneKnown,
     }
 }
 
@@ -525,7 +530,7 @@ mod tests {
         );
         assert_eq!(
             Provider::VibeBh.prompt_cache(),
-            PromptCacheCapability::NoneKnown
+            PromptCacheCapability::ChatCompletionsPromptCacheKey
         );
     }
 }
