@@ -385,12 +385,12 @@ fn nonfields_of(body: &Value) -> Value {
 }
 
 /// rustls 0.23 needs a process-default crypto provider before a `ClientConfig`
-/// can be built; reqwest may not install one. Install aws-lc-rs once (no-op if a
-/// provider is already installed).
+/// can be built; reqwest may not install one. Install the ring provider once
+/// (no-op if a provider is already installed).
 fn ensure_crypto_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 

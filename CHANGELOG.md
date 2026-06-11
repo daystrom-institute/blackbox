@@ -32,6 +32,13 @@ out explicitly under `Changed` or `Removed`.
   `futures` (only `futures-util` is used); `bbox-code-nav` loses `tracing`;
   `bro-tools` loses `walkdir`; `bbox-refactor` loses `chrono`, `serde_yaml`,
   `strum`, `tokio`, and 9 tree-sitter grammars (accessed through `bbox-chunker`).
+- rustls crypto provider unified on `ring` across the workspace (609 → 604 lock
+  entries): `bro-harness` switched from `aws_lc_rs` to `ring` feature; rmcp's
+  `reqwest` feature replaced with `reqwest-tls-no-provider` in both the root and
+  `bro-harness` to prevent reqwest 0.13's default `rustls` feature from
+  re-activating aws-lc-rs. `aws-lc-sys` (43.6s build script) and `aws-lc-rs`
+  leave the build; `bindgen`/`clang-sys` remain via `v8` (bro-code-mode). The WS
+  Responses transport (`openai_responses_ws.rs`) now installs the ring provider.
 
 ### Added
 

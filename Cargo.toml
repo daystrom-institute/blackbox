@@ -129,7 +129,10 @@ rmcp = { version = "1.4", features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
-    "reqwest",
+    # Use no-provider variant so rmcp's reqwest dep doesn't activate
+    # aws-lc-rs via reqwest 0.13's default "rustls" feature; the ring
+    # provider is installed at startup via the workspace rustls dep.
+    "reqwest-tls-no-provider",
 ] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
