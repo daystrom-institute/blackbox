@@ -117,7 +117,7 @@ pub mod util;
 use bbox_vectors as vectors;
 mod watcher;
 mod webhooks;
-mod whiteboards;
+use bbox_whiteboards::whiteboards;
 mod workflow;
 use bbox_edge_sidecar::edge_sidecar;
 

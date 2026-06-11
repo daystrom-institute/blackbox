@@ -30,6 +30,7 @@ members = [
     "crates/bbox-macros",
     "crates/bbox-packets",
     "crates/bbox-system-memory",
+    "crates/bbox-whiteboards",
 ]
 
 [package]
@@ -181,6 +182,7 @@ jsonschema = { version = "0.17", default-features = false, features = ["draft202
 # write_atomic) and tests. Production usage requires this be a real
 # dependency, not dev-only.
 tempfile = "3"
+bbox-whiteboards = { path = "crates/bbox-whiteboards" }
 
 [dev-dependencies]
 filetime = "0.2"
