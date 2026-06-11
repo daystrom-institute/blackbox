@@ -1,0 +1,19 @@
+{
+  "id": "gap-1141590c",
+  "title": "extract_rust_crate validation gate misses test-target breakage (cargo check skips --all-targets)",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-rust",
+  "wanted_capability": "The extract_rust_crate compound run should validate with `cargo check --workspace --all-targets` (or run the test build) so cross-crate cfg(test) breakage is caught inside the transaction. Peeling util into bbox-util passed the run's `cargo check --workspace` gate but broke the root crate's test build: TestEnvGuard was #[cfg(test)]-gated, and cfg(test) is false when the new crate compiles as a dependency of the consumer's test build. The run reported success; the breakage only surfaced at the nextest gate after the transaction had committed its writes. A leftover-warning heuristic flagging #[cfg(test)] items in moved module files (same class as the existing env!(CARGO_MANIFEST_DIR) re-rooting warning) would also help.",
+  "missing_primitive": "extract_rust_crate expansion: --all-targets on its cargo check gate, or a cfg(test)-item leftover warning in extract_rust_crate_scaffold",
+  "fallback_used": "Ran cargo nextest run --workspace manually after the run completed; un-gated the cfg(test) items in the peeled crate (commit f0f9aac5) following the TEST_ENV_LOCK precedent.",
+  "evidence": [
+    "crates/bbox-util/src/util.rs (TestEnvGuard, commit f0f9aac5)",
+    "crates/bbox-refactor/src/rust_extract_crate.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-rust/extract-crate-all-targets-gate",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T18:16:07Z",
+  "updated_at": "2026-06-11T18:16:07Z"
+}
