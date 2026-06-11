@@ -414,6 +414,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-inbox"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-artifacts",
+ "bbox-gaps",
+ "bbox-knowledge",
+ "bbox-threads",
+ "bbox-whiteboards",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "bbox-knowledge"
 version = "0.0.1"
 dependencies = [
@@ -702,6 +719,7 @@ dependencies = [
  "bbox-corpus-index",
  "bbox-edge-sidecar",
  "bbox-gaps",
+ "bbox-inbox",
  "bbox-knowledge",
  "bbox-lsp",
  "bbox-macros",

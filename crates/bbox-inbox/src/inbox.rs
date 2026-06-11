@@ -2,12 +2,12 @@ use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts;
-use crate::gaps::{GapImpact, GapNote, GapResolution, GapStore};
-use crate::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
-use crate::notes::{Note, NoteKind, NoteResolution, Notes};
-use crate::threads::{Thread, ThreadStatus, Threads};
-use crate::whiteboards::{Phase, WhiteboardRegistry};
+use bbox_artifacts::artifacts;
+use bbox_gaps::gaps::{GapImpact, GapNote, GapResolution, GapStore};
+use bbox_knowledge::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
+use bbox_threads::notes::{Note, NoteKind, NoteResolution, Notes};
+use bbox_threads::threads::{Thread, ThreadStatus, Threads};
+use bbox_whiteboards::whiteboards::{Phase, WhiteboardRegistry};
 
 // ── MCP parameter struct ──────────────────────────────────────────
 
@@ -261,7 +261,7 @@ pub fn compute_inbox(
 
     if p.check_gap_closeouts.unwrap_or(false) {
         if let Some(project) = p.project.as_deref() {
-            match crate::gap_closeout::render_git_closeout_check(
+            match bbox_gaps::gap_closeout::render_git_closeout_check(
                 gaps,
                 std::path::Path::new(project),
                 p.gap_commit_range.as_deref(),
@@ -363,7 +363,7 @@ fn is_legacy_gap_body(body: &str) -> bool {
         .as_ref()
         .and_then(|v| v.get("type"))
         .and_then(|t| t.as_str())
-        == Some(crate::gaps::GAP_NOTE_TYPE)
+        == Some(bbox_gaps::gaps::GAP_NOTE_TYPE)
 }
 
 fn open_gaps<'a>(
@@ -739,10 +739,10 @@ fn iso_age_days(ts: &str, now_secs: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::LearnParams;
-    use crate::notes::{NoteParams, NoteStore};
-    use crate::threads::ThreadParams;
-    use crate::whiteboards::Role;
+    use bbox_knowledge::knowledge::LearnParams;
+    use bbox_threads::notes::{NoteParams, NoteStore};
+    use bbox_threads::threads::ThreadParams;
+    use bbox_whiteboards::whiteboards::Role;
     use tempfile::tempdir;
 
     fn empty_context(
@@ -786,7 +786,7 @@ mod tests {
         id: &str,
         title: &str,
         impact: GapImpact,
-        gap_kind: crate::gaps::GapKind,
+        gap_kind: bbox_gaps::gaps::GapKind,
         domain: &str,
         dedupe_key: &str,
         project: Option<&str>,
@@ -803,7 +803,7 @@ mod tests {
             fallback_used: None,
             evidence: Vec::new(),
             impact,
-            blocking_level: crate::gaps::BlockingLevel::WorkaroundAvailable,
+            blocking_level: bbox_gaps::gaps::BlockingLevel::WorkaroundAvailable,
             dedupe_key: dedupe_key.into(),
             suggested_owner: None,
             notes: None,
@@ -832,7 +832,7 @@ mod tests {
         let path = dir.path().join("gaps.json");
         std::fs::write(
             &path,
-            serde_json::to_string(&crate::gaps::GapStoreData {
+            serde_json::to_string(&bbox_gaps::gaps::GapStoreData {
                 version: 1,
                 gaps: stored,
             })
@@ -1075,7 +1075,7 @@ mod tests {
                 "gap-00000001",
                 "Packet AST cannot express rate predicates",
                 GapImpact::High,
-                crate::gaps::GapKind::PacketAst,
+                bbox_gaps::gaps::GapKind::PacketAst,
                 "review-policy",
                 "packet_ast/review-policy/rate-window-predicate",
                 Some("/repo/transcript-search"),
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn inbox_gap_notes_honor_resolution_project_filter_and_ordering() {
-        use crate::gaps::GapKind;
+        use bbox_gaps::gaps::GapKind;
         let dir = tempdir().unwrap();
         let (kb, threads, whiteboards) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn inbox_reports_stale_high_impact_gap_notes() {
-        use crate::gaps::GapKind;
+        use bbox_gaps::gaps::GapKind;
         let dir = tempdir().unwrap();
         let (kb, threads, whiteboards) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn inbox_can_render_gap_aggregates() {
-        use crate::gaps::GapKind;
+        use bbox_gaps::gaps::GapKind;
         let dir = tempdir().unwrap();
         let (kb, threads, whiteboards) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();

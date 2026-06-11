@@ -47,12 +47,11 @@ pub use bbox_corpus_core::entity_ref;
 #[cfg(test)]
 #[path = "../eval/check.rs"]
 mod eval_check;
-use bbox_gaps::gap_closeout;
 use bbox_gaps::gap_spool;
 use bbox_gaps::gaps;
 // `git` extracted into bbox-corpus-core (stage 0); aliased back to `crate::git`.
 use bbox_corpus_core::git;
-mod inbox;
+use bbox_inbox::inbox;
 mod index;
 // `json_store` extracted into bbox-corpus-core; aliased back to
 // `crate::json_store` so existing call sites resolve unchanged.
