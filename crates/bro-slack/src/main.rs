@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use blackbox::secrets;
+use bbox_config::secrets;
 
 // ── CLI ────────────────────────────────────────────────────────────
 
@@ -1312,15 +1312,15 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let cfg = blackbox::config::load()?;
+    let cfg = bbox_config::config::load()?;
     let identities_path = if let Some(p) = args.identities_file {
-        blackbox::util::resolve_tilde(&p)
+        bbox_util::util::resolve_tilde(&p)
     } else {
         let home = dirs::home_dir().context("home directory not found")?;
         let old = home.join(".bro").join("slack-identities.json");
         let new = cfg.paths.bro_home.join("slack-identities.json");
         if old.exists() && !new.exists() {
-            let _ = blackbox::util::migrate_legacy_file(&old, &new);
+            let _ = bbox_util::util::migrate_legacy_file(&old, &new);
         }
         new
     };
@@ -2007,7 +2007,7 @@ mod tests {
 
     #[test]
     fn test_hmac_no_secret_returns_none() {
-        let _env = blackbox::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         // Ensure the env var is unset
         unsafe {
             std::env::remove_var("BRO_TEST_NO_SECRET");
@@ -2018,7 +2018,7 @@ mod tests {
 
     #[test]
     fn test_hmac_secret_empty_returns_none() {
-        let _env = blackbox::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_EMPTY_SECRET", "");
         }
@@ -2028,7 +2028,7 @@ mod tests {
 
     #[test]
     fn test_hmac_produces_valid_hex() {
-        let _env = blackbox::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_HMAC_SECRET", "hunter2");
         }
@@ -2050,7 +2050,7 @@ mod tests {
 
     #[test]
     fn test_hmac_different_bodies_produce_different_sigs() {
-        let _env = blackbox::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_HMAC_DIFF", "secret");
         }
@@ -2137,13 +2137,13 @@ mod tests {
     #[test]
     fn test_resolve_tilde() {
         let home = dirs::home_dir().unwrap_or_default();
-        let result = blackbox::util::resolve_tilde("~/foo/bar.json");
+        let result = bbox_util::util::resolve_tilde("~/foo/bar.json");
         assert_eq!(result, home.join("foo/bar.json"));
-        let result2 = blackbox::util::resolve_tilde("~");
+        let result2 = bbox_util::util::resolve_tilde("~");
         assert_eq!(result2, home);
-        let result3 = blackbox::util::resolve_tilde("/absolute/path");
+        let result3 = bbox_util::util::resolve_tilde("/absolute/path");
         assert_eq!(result3, PathBuf::from("/absolute/path"));
-        let result4 = blackbox::util::resolve_tilde("relative/path");
+        let result4 = bbox_util::util::resolve_tilde("relative/path");
         assert_eq!(result4, PathBuf::from("relative/path"));
     }
 
@@ -2355,7 +2355,7 @@ mod tests {
 
     #[test]
     fn test_hmac_same_input_same_output() {
-        let _env = blackbox::util::test_env_lock();
+        let _env = bbox_util::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_DET", "secret");
         }
@@ -2509,14 +2509,15 @@ mod tests {
     fn test_example_workflow_json_valid() {
         // Validate each workflow JSON file against the blackbox
         // workflow schema.
-        let schema_json = include_str!("../schema/workflow.schema.json");
+        let schema_json = include_str!("../../../schema/workflow.schema.json");
         let schema_val: serde_json::Value =
             serde_json::from_str(schema_json).expect("schema JSON parse");
         let compiled = jsonschema::JSONSchema::options()
             .compile(&schema_val)
             .expect("schema compile");
 
-        let workflows_dir = std::path::Path::new("examples/slack/workflows");
+        let workflows_dir =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/slack/workflows"));
         if !workflows_dir.is_dir() {
             // ok if the dir doesn't exist (e.g. running from a different cwd)
             return;
@@ -2546,7 +2547,10 @@ mod tests {
     #[test]
     fn test_routing_packet_shape() {
         // Validate the routing-slack.json has the required structure.
-        let raw = std::fs::read_to_string("examples/slack/packets/routing-slack.json")
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/slack/packets/routing-slack.json"
+        ))
             .expect("routing-slack.json readable");
         let packet: Value = serde_json::from_str(&raw).expect("valid JSON");
 
@@ -2589,7 +2593,10 @@ mod tests {
 
     #[test]
     fn test_webhook_spec_shape() {
-        let raw = std::fs::read_to_string("examples/slack/webhooks/slack.json")
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/slack/webhooks/slack.json"
+        ))
             .expect("slack.json readable");
         let spec: Value = serde_json::from_str(&raw).expect("valid JSON");
 

@@ -14,6 +14,7 @@ members = [
     "crates/bro-transcript",
     "crates/bro-code-mode",
     "crates/bro-apply-patch",
+    "crates/bro-slack",
 
     # Daemon-internal corpus crates peeled out of the root `blackbox` crate for
     # build parallelism (NOT bro-harness crates). Pure leaves: they depend only
@@ -56,10 +57,6 @@ name = "blackboxd"
 path = "src/main.rs"
 
 # `bro` now lives in its own crate (crates/bro-cli) — §7 thin-client extraction.
-
-[[bin]]
-name = "bro-slack"
-path = "src/slack_bridge.rs"
 
 [dependencies]
 # Search index
@@ -155,14 +152,11 @@ uuid = { version = "1", features = ["v4"] }
 
 # CLI HTTP client
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
-futures-util = "0.3"
 futures = "0.3"
 
 # SSE stream construction
 async-stream = "0.3"
 
-# Slack Socket Mode WebSocket (bro-slack sidecar)
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Process management (SIGTERM)

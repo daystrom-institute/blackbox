@@ -759,7 +759,6 @@ dependencies = [
  "filetime",
  "fs2",
  "futures",
- "futures-util",
  "hex",
  "hmac",
  "http",
@@ -781,7 +780,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-metrics",
- "tokio-tungstenite",
  "tokio-util",
  "toml",
  "tower",
@@ -953,6 +951,33 @@ dependencies = [
  "bro-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bro-slack"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bbox-config",
+ "bbox-util",
+ "chrono",
+ "clap",
+ "dirs",
+ "futures-util",
+ "hex",
+ "hmac",
+ "jsonschema",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
