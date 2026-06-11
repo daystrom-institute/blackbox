@@ -114,6 +114,13 @@ pub struct KnowledgeListParams {
     /// Max rows to return.
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Internal, not part of the MCP schema: an additional project path the
+    /// project filter also matches. Set by the daemon adapter when `project`
+    /// was a managed-worktree path resolved to its registered base, so entries
+    /// written from inside the worktree (scoped to the worktree path) stay
+    /// visible alongside the base project's entries.
+    #[serde(skip)]
+    pub project_alias: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -125,7 +132,7 @@ pub struct ForgetParams {
     pub superseded_by: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RenderParams {
     /// Render for specific provider or all
     #[serde(default)]
@@ -148,6 +155,14 @@ pub struct RenderParams {
     /// Preview without writing (default: false)
     #[serde(default)]
     pub dry_run: Option<bool>,
+    /// Internal, not part of the MCP schema: the project path used to FILTER
+    /// project-scoped entries when it differs from `project` (the directory
+    /// the rendered files are written into). Set by the daemon adapter when
+    /// `project` is a managed worktree of a registered base: entries live
+    /// under the base path, but the rendered provider files belong in the
+    /// worktree checkout.
+    #[serde(skip)]
+    pub scope_project: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1639,6 +1654,7 @@ impl Knowledge {
         let category_filter = p.category.as_deref();
         let scope_filter = p.scope.as_deref();
         let project_filter = p.project.as_deref();
+        let project_alias_filter = p.project_alias.as_deref();
         let provider_filter = p.provider.as_deref();
         let status_filter = p.status.as_deref().unwrap_or("active");
         let approval_filter = p.approval.as_deref();
@@ -1687,7 +1703,9 @@ impl Knowledge {
                 if let Some(p) = project_filter {
                     match &e.project {
                         Some(ep) => {
-                            if !ep.contains(p) {
+                            let alias_hit = project_alias_filter
+                                .is_some_and(|alias| ep.contains(alias));
+                            if !ep.contains(p) && !alias_hit {
                                 return None;
                             }
                         }
@@ -1918,8 +1936,12 @@ impl Knowledge {
         // ── Project render: project-scope entries + PROJECT.md include only ──
         if do_project {
             let dir = project_dir.unwrap();
+            // Entries are filtered by `scope_project` when set (managed
+            // worktree rendering: entries live under the registered base
+            // path while the files land in the worktree checkout).
+            let scope_dir = p.scope_project.as_deref().unwrap_or(dir);
             for prov in &providers {
-                let body = self.render_project_body(prov, dir)?;
+                let body = self.render_project_body(prov, dir, scope_dir)?;
                 let path = Path::new(dir).join(target_file(prov, project_dir));
 
                 if body.trim().is_empty() {
@@ -2005,9 +2027,18 @@ impl Knowledge {
     /// Body for a project file: project-scope steerage + project-scope memory
     /// + a PROJECT.md include. No global content (that lives in the global
     /// render).
-    fn render_project_body(&self, provider: &str, project_dir: &str) -> Result<String> {
+    /// `project_dir` is the checkout the rendered files (and the PROJECT.md
+    /// include check) target; `scope_dir` is the project path entries are
+    /// filtered by. They differ when rendering into a managed worktree whose
+    /// entries live under the registered base path.
+    fn render_project_body(
+        &self,
+        provider: &str,
+        project_dir: &str,
+        scope_dir: &str,
+    ) -> Result<String> {
         let mut body = String::new();
-        let filter = ScopeFilter::Project(project_dir);
+        let filter = ScopeFilter::Project(scope_dir);
 
         self.render_steerage(provider, filter, &mut body);
 
@@ -2921,6 +2952,91 @@ mod tests {
             })
             .expect("substring query should succeed");
         assert_eq!(literal, "No entries found.");
+    }
+
+    #[test]
+    fn list_project_alias_also_matches_worktree_scoped_entries() {
+        let (_tmp, mut kb) = mk_kb();
+        let mut base_entry = entry("aaaa1111", "Base rule", "convention in base", Scope::Project);
+        base_entry.project = Some("/registry/base".into());
+        kb.store.entries.push(base_entry);
+        // Out-of-tree worktree path: does NOT contain the base path as a
+        // substring, so without the alias it is invisible to a base-scoped
+        // query (and vice versa).
+        let mut wt_entry = entry("bbbb2222", "Worktree rule", "written from a worktree", Scope::Project);
+        wt_entry.project = Some("/state/fleet/worktrees/wt-1".into());
+        kb.store.entries.push(wt_entry);
+
+        // Base filter alone: only the base entry.
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/registry/base".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .expect("list should succeed");
+        assert!(out.contains("Base rule"));
+        assert!(!out.contains("Worktree rule"));
+
+        // Base filter + worktree alias (the daemon adapter's rewrite for a
+        // managed-worktree caller): both visible.
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/registry/base".into()),
+                project_alias: Some("/state/fleet/worktrees/wt-1".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .expect("list should succeed");
+        assert!(out.contains("Base rule"));
+        assert!(out.contains("Worktree rule"));
+    }
+
+    #[test]
+    fn render_scope_project_filters_by_base_while_writing_into_worktree() {
+        let central = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let worktree_root = worktree.path().canonicalize().unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        let mut base_entry = entry(
+            "cccc3333",
+            "Base convention",
+            "WORKTREE_RENDER_MARKER from base scope",
+            Scope::Project,
+        );
+        base_entry.project = Some("/registry/base".into());
+        kb.store.entries.push(base_entry);
+
+        let report = kb
+            .render(&RenderParams {
+                provider: Some("claude".into()),
+                project: Some(worktree_root.to_string_lossy().into_owned()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+                scope_project: Some("/registry/base".into()),
+            })
+            .expect("render should succeed");
+        assert!(report.contains("Wrote project"), "report: {report}");
+
+        // The file lands in the WORKTREE checkout, filtered by the BASE scope.
+        let rendered = std::fs::read_to_string(worktree_root.join("CLAUDE.md")).unwrap();
+        assert!(rendered.contains("WORKTREE_RENDER_MARKER"), "{rendered}");
+
+        // Without scope_project the worktree path matches no entries.
+        let other = tempfile::tempdir().unwrap();
+        let other_root = other.path().canonicalize().unwrap();
+        let report = kb
+            .render(&RenderParams {
+                provider: Some("claude".into()),
+                project: Some(other_root.to_string_lossy().into_owned()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+                ..Default::default()
+            })
+            .expect("render should succeed");
+        assert!(report.contains("Skipped"), "report: {report}");
+        assert!(!other_root.join("CLAUDE.md").exists());
     }
 
     #[test]
@@ -3887,6 +4003,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 project: Some(repo_root.to_string_lossy().into_owned()),
                 scope: Some("project".into()),
                 dry_run: Some(true),
+                ..Default::default()
             })
             .unwrap();
 
@@ -4060,7 +4177,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         }
 
         let out = kb
-            .render_project_body("claude", project)
+            .render_project_body("claude", project, project)
             .expect("render should succeed");
 
         assert!(out.contains("## Conventions\n\n"));
@@ -4120,7 +4237,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         });
 
         let out = kb
-            .render_project_body("claude", project)
+            .render_project_body("claude", project, project)
             .expect("render should succeed");
 
         assert!(out.contains("**Local rule**"));
@@ -4168,7 +4285,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         });
 
         let out = kb
-            .render_project_body("gemini", project)
+            .render_project_body("gemini", project, project)
             .expect("render should succeed");
 
         let project_idx = out.find("@PROJECT.md").unwrap();
@@ -4306,6 +4423,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 project: Some(project.into()),
                 scope: Some("project".into()),
                 dry_run: Some(false),
+                ..Default::default()
             })
             .unwrap();
 

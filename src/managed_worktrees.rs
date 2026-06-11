@@ -1,15 +1,11 @@
 use std::path::PathBuf;
 
 /// Managed worktree parent roots recognized by the cockpit-facing daemon
-/// endpoints. Keep `/control/closeout` validation and task metadata projection
-/// on this one definition so the roster never advertises a different policy
-/// than the request-time guard enforces.
+/// endpoints. The single definition lives in `bbox_util` so the write-side
+/// worktree gate in `bbox-indexing` shares it; this delegate keeps the
+/// daemon-side call sites unchanged.
 pub(crate) fn cockpit_managed_worktree_roots() -> [PathBuf; 2] {
-    let bro_home = crate::util::bro_home_dir(&dirs::home_dir().unwrap_or_default());
-    [
-        bro_home.join("fleet").join("worktrees"),
-        bro_home.join("agent").join("worktrees"),
-    ]
+    bbox_util::util::cockpit_managed_worktree_roots()
 }
 
 pub(crate) fn managed_worktree_for_cwd(cwd: Option<&str>) -> Option<String> {

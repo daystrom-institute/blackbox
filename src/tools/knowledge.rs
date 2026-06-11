@@ -60,6 +60,32 @@ fn log_tool_err(tool: &'static str, start: std::time::Instant, err: &anyhow::Err
     tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %err, "err");
 }
 
+/// Rescope an absolute-path `project` filter through worktree→base project
+/// resolution. A managed/linked worktree (or a subdirectory) of a registered
+/// project hashes/keys differently from the base, so the literal path would
+/// silently match nothing; entries live under the registered base path.
+/// Rewrites `p.project` to the base canonical path and records the worktree
+/// checkout root in `p.project_alias` so entries written from inside the
+/// worktree (scoped to the worktree path) stay visible too. Non-path filters
+/// (substring matches like "transcript-search") and unregistered paths are
+/// left untouched.
+fn rescope_project_filter(
+    p: &mut KnowledgeListParams,
+    projects: &[crate::projects::ProjectRecord],
+) {
+    let Some(raw) = p.project.as_deref().filter(|raw| raw.starts_with('/')) else {
+        return;
+    };
+    let Some((scope, checkout)) = crate::projects::resolve_scope_and_checkout_dir(raw, projects)
+    else {
+        return;
+    };
+    if checkout != scope {
+        p.project_alias = Some(checkout);
+    }
+    p.project = Some(scope);
+}
+
 fn matches_system_memory_catalog(category: Option<&str>) -> bool {
     matches!(
         category,
@@ -272,6 +298,12 @@ impl BlackboxServer {
         Self::run_blocking("bbox_knowledge", move || {
             if let Some(out) = exact_system_memory_response(&p) {
                 return Ok(out);
+            }
+
+            let mut p = p;
+            if p.project.is_some() {
+                let projects = server.state.projects.read().list();
+                rescope_project_filter(&mut p, &projects);
             }
 
             let mut combined = server.state.kb.write().list(&p)?;
@@ -556,5 +588,128 @@ mod tests {
             ..Default::default()
         });
         assert!(out.is_none());
+    }
+
+    fn init_repo_with_worktree(
+        tmp: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::process::Command;
+        let base = tmp.join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Blackbox Test",
+                "-c",
+                "user.email=blackbox@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&base)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let worktree = tmp.join("wt");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "arc/scoped",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            base.canonicalize().unwrap(),
+            worktree.canonicalize().unwrap(),
+        )
+    }
+
+    fn record_for(path: &std::path::Path) -> crate::projects::ProjectRecord {
+        crate::projects::ProjectRecord {
+            project_id: "feedbeef".into(),
+            repo_id: None,
+            canonical_path: path.to_string_lossy().into_owned(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rescope_project_filter_resolves_worktree_to_base_with_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, worktree) = init_repo_with_worktree(&tmp_root);
+        let projects = vec![record_for(&base)];
+
+        let mut p = KnowledgeListParams {
+            project: Some(worktree.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        rescope_project_filter(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
+        assert_eq!(p.project_alias.as_deref(), Some(worktree.to_str().unwrap()));
+
+        // A plain descendant collapses to the base with no alias needed
+        // (descendant entry paths contain the base path already).
+        let subdir = base.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let mut p = KnowledgeListParams {
+            project: Some(subdir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        rescope_project_filter(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
+        assert_eq!(p.project_alias, None);
+    }
+
+    #[test]
+    fn rescope_project_filter_leaves_non_path_and_unregistered_filters_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let projects = vec![record_for(&base)];
+
+        // Substring filter (not an absolute path) is untouched.
+        let mut p = KnowledgeListParams {
+            project: Some("transcript-search".into()),
+            ..Default::default()
+        };
+        rescope_project_filter(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some("transcript-search"));
+        assert_eq!(p.project_alias, None);
+
+        // An absolute path no registered project owns is untouched.
+        let stranger = tmp_root.join("stranger");
+        std::fs::create_dir_all(&stranger).unwrap();
+        let mut p = KnowledgeListParams {
+            project: Some(stranger.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        rescope_project_filter(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(stranger.to_str().unwrap()));
+        assert_eq!(p.project_alias, None);
     }
 }

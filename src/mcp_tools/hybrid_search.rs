@@ -11,6 +11,7 @@ use crate::entity_loader;
 use crate::entity_ref::EntityRef;
 use crate::index::{HybridBm25Hit, TranscriptIndex};
 use crate::knowledge::Knowledge;
+use crate::projects::ProjectRecord;
 use crate::providers::ProviderContext;
 use crate::search::rerank::{self, RerankFeatures};
 use crate::search::rrf::{self, RankedHit, RankedList};
@@ -418,7 +419,11 @@ fn aggregate_bm25_by_file(chunks: &[crate::index::HybridBm25Hit]) -> Vec<RankedH
 /// Resolves the caller's `project` parameter to a canonical project_id
 /// (8-hex). Accepts:
 ///   - a bare 8-hex project_id (returned as-is)
-///   - an absolute path that's already in the registry (looked up)
+///   - an absolute path that a registered project owns — the registered root
+///     itself, any descendant (subdirectory or in-tree worktree), or any git
+///     worktree sharing the registered repo's common dir (fleet / agent /
+///     workflow worktrees) — resolved to the BASE project_id, since that is
+///     the id the indexed corpus lives under
 ///   - any other absolute path (computed via `entity_ref::project_id_for_path`)
 /// Returns `None` when no parameter was supplied or resolution failed (the
 /// caller treats `None` as "no scoping").
@@ -431,13 +436,21 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
     if raw.len() == 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
         return Some(raw.to_lowercase());
     }
-    // Try the registry first so symlink aliases collapse to the same id.
-    if let Some(stores) = ctx.stores() {
-        let projects = stores.projects.read().list();
-        let canonical = std::fs::canonicalize(raw).ok()?;
-        if let Some(record) = projects.iter().find(|r| r.canonical_path == canonical) {
-            return Some(record.project_id.clone());
-        }
+    let projects = ctx
+        .stores()
+        .map(|stores| stores.projects.read().list())
+        .unwrap_or_default();
+    resolve_project_filter_path(raw, &projects)
+}
+
+/// Path arm of [`resolve_project_filter`], parameterized over the registry
+/// list for testability. Registry-owned paths (root, descendant, or worktree
+/// of a registered repo) collapse to the registered base project_id — a
+/// worktree path must NOT fall through to the deterministic hash, which would
+/// derive a different id than the base and silently return empty results.
+fn resolve_project_filter_path(raw: &str, projects: &[ProjectRecord]) -> Option<String> {
+    if let Some(record) = crate::projects::resolve_base_project_for_scope(raw, projects) {
+        return Some(record.project_id.clone());
     }
     // Fall back to the deterministic path-derived id even when the project
     // hasn't been registered yet — useful for one-shot scoped searches.
@@ -1194,6 +1207,110 @@ mod tests {
         assert_eq!(
             label_for_entity(&ctx, "knowledge:abc12345", Some(&loaded), None),
             "Loaded Knowledge Title"
+        );
+    }
+
+    #[test]
+    fn project_filter_passes_bare_hex_id_through() {
+        let ctx = ProviderContext::empty_for_tests();
+        assert_eq!(
+            resolve_project_filter(Some("ABCD1234"), &ctx).as_deref(),
+            Some("abcd1234")
+        );
+        assert_eq!(resolve_project_filter(Some("  "), &ctx), None);
+        assert_eq!(resolve_project_filter(None, &ctx), None);
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        use std::process::Command;
+        for args in [
+            vec!["init"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Blackbox Test",
+                "-c",
+                "user.email=blackbox@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn project_filter_resolves_worktree_and_descendant_paths_to_base_project_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let registered = vec![crate::projects::ProjectRecord {
+            project_id: "feedbeef".into(),
+            repo_id: None,
+            canonical_path: base_canon.to_string_lossy().into_owned(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+        }];
+
+        // The registered root resolves to the registry id.
+        assert_eq!(
+            resolve_project_filter_path(base_canon.to_str().unwrap(), &registered).as_deref(),
+            Some("feedbeef")
+        );
+
+        // A descendant path resolves to the ROOT project's id, not a
+        // deterministic hash of the subdirectory.
+        let subdir = base_canon.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert_eq!(
+            resolve_project_filter_path(subdir.to_str().unwrap(), &registered).as_deref(),
+            Some("feedbeef")
+        );
+
+        // A linked worktree (any branch) resolves to the BASE project's id —
+        // the id the indexed corpus lives under — instead of hashing the
+        // worktree path to a foreign id with silently-empty results.
+        let worktree = tmp.path().join("wt");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args(["worktree", "add", "-b", "arc/x", worktree.to_str().unwrap(), "HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let worktree_canon = worktree.canonicalize().unwrap();
+        assert_eq!(
+            resolve_project_filter_path(worktree_canon.to_str().unwrap(), &registered).as_deref(),
+            Some("feedbeef")
+        );
+
+        // An unregistered plain directory keeps the deterministic
+        // path-derived id fallback.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let expected = crate::entity_ref::project_id_for_path(plain.to_str().unwrap()).unwrap();
+        assert_eq!(
+            resolve_project_filter_path(plain.to_str().unwrap(), &registered),
+            Some(expected)
         );
     }
 }

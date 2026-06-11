@@ -353,14 +353,14 @@ fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 
 /// If `project_dir` is a managed fleet worktree, synthesize a [`ProjectRecord`]
 /// aliasing it to its registered base project. A managed fleet worktree is one
-/// whose checked-out branch is `bro-fleet/*` and whose git common dir matches a
-/// registered project — fleet dispatch creates these outside the registered
-/// repo root (under the daemon state dir), so the literal worktree path is not a
-/// descendant of any registered root and project-scoped tools would otherwise
-/// reject it.
+/// whose git common dir matches a registered project and that carries a managed
+/// marker (a `bro-fleet/*` branch, or a path under a cockpit-managed worktree
+/// root) — dispatch creates these outside the registered repo root (under the
+/// daemon state dir), so the literal worktree path is not a descendant of any
+/// registered root and project-scoped tools would otherwise reject it.
 ///
 /// Returns `None` when the path is already a registered root or descendant (no
-/// aliasing needed), is not on a `bro-fleet/*` branch, or no registered project
+/// aliasing needed), carries no managed marker, or no registered project
 /// shares its git common dir. The synthesized record carries a `:fleet-worktree`
 /// project_id suffix and the worktree's own canonical path, so a registration
 /// check accepts the worktree while callers can still tell it apart from a
@@ -390,8 +390,8 @@ pub fn managed_fleet_worktree_project(
 /// durable scope (host-local thread keying, project-scoped queries) while the
 /// worktree is where repo-owned artifacts (e.g. committed thread records) should
 /// be written so they travel with the agent's branch. `None` when the path is
-/// not a managed fleet worktree (already registered/descendant, not `bro-fleet/*`,
-/// or no registered base shares its git common dir).
+/// not a managed fleet worktree (already registered/descendant, no managed
+/// marker, or no registered base shares its git common dir).
 pub fn fleet_worktree_scope_and_dir(
     project_dir: &str,
     projects: &[ProjectRecord],
@@ -404,14 +404,22 @@ pub fn fleet_worktree_scope_and_dir(
 }
 
 /// Shared core: resolve a path to `(base_record, canonical_worktree)` when it is
-/// a managed fleet worktree of a registered project. A managed fleet worktree is
-/// one whose checked-out branch is `bro-fleet/*` and whose git common dir matches
-/// a registered project — fleet dispatch creates these outside the registered
-/// repo root (under the daemon state dir), so the literal worktree path is not a
-/// descendant of any registered root. Returns `None` when the path is already a
-/// registered root/descendant (no resolution needed — early-returns before any
-/// git call), is not on a `bro-fleet/*` branch, or no registered project shares
-/// its git common dir.
+/// a managed worktree of a registered project. A managed worktree is one whose
+/// git common dir matches a registered project AND that carries a managed
+/// marker: either its checked-out branch is `bro-fleet/*` (fleet cockpit
+/// dispatch) or it lives under one of the cockpit-managed worktree parent roots
+/// (`$BRO_HOME/fleet/worktrees`, `$BRO_HOME/agent/worktrees` — agent dispatch
+/// uses arbitrary branch names, so the path is the signal there). Dispatch
+/// creates these outside the registered repo root (under the daemon state dir),
+/// so the literal worktree path is not a descendant of any registered root.
+/// Returns `None` when the path is already a registered root/descendant (no
+/// resolution needed — early-returns before any git call), carries no managed
+/// marker, or no registered project shares its git common dir.
+///
+/// Deliberately conservative: this gate guards WRITE-side aliasing (where gap
+/// files, threads, slice edits, and code-nav overlays land), so arbitrary user
+/// worktrees of a registered repo do not alias. Read-only scope resolution for
+/// retrieval uses the broader [`resolve_base_project_for_scope`].
 fn resolve_managed_fleet_worktree<'a>(
     project_dir: Option<&str>,
     projects: &'a [ProjectRecord],
@@ -424,8 +432,15 @@ fn resolve_managed_fleet_worktree<'a>(
     }) {
         return None;
     }
-    let branch = bbox_corpus_core::git::current_branch(&worktree)?;
-    if !branch.starts_with("bro-fleet/") {
+    let fleet_branch = bbox_corpus_core::git::current_branch(&worktree)
+        .is_some_and(|branch| branch.starts_with("bro-fleet/"));
+    let under_managed_root = util::cockpit_managed_worktree_roots()
+        .iter()
+        .any(|root| {
+            let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            worktree.starts_with(&root)
+        });
+    if !fleet_branch && !under_managed_root {
         return None;
     }
     let worktree_common = bbox_corpus_core::git::git_common_dir(&worktree)?;
@@ -434,6 +449,88 @@ fn resolve_managed_fleet_worktree<'a>(
             .is_some_and(|common| common == worktree_common)
     })?;
     Some((base, worktree))
+}
+
+/// Resolve a caller-supplied filesystem path to the registered project that
+/// owns it, for project-scoped RETRIEVAL (index / graph / knowledge scope
+/// resolution). Acceptance, in order:
+///
+/// 1. the path is a registered root or a descendant of one → that record.
+///    Covers plain subdirectories AND in-tree worktrees (e.g.
+///    `.claude/worktrees/<name>` under the repo) — both scope to the root
+///    project for retrieval purposes.
+/// 2. the path is inside any git worktree whose common dir matches a
+///    registered project's → that record. Covers out-of-tree worktrees —
+///    fleet (`bro-fleet/*`), agent dispatch, workflow arcs — regardless of
+///    branch name or parent directory.
+///
+/// This is intentionally broader than [`resolve_managed_fleet_worktree`]:
+/// scope resolution here is read-only (which corpus do I query?), so aliasing
+/// an arbitrary user worktree of a registered repo to its base project is
+/// harmless and exactly what a caller scoping a query wants. Write-side
+/// aliasing (gaps/threads/slices/code_nav) keeps the conservative managed
+/// gate. Returns `None` for paths no registered project owns; callers keep
+/// their existing fallback (deterministic path-hash id, raw filter, etc.).
+pub fn resolve_base_project_for_scope<'a>(
+    path: &str,
+    projects: &'a [ProjectRecord],
+) -> Option<&'a ProjectRecord> {
+    let canonical = fs::canonicalize(path).ok()?;
+    if let Some(record) = projects.iter().find(|project| {
+        let root = Path::new(&project.canonical_path);
+        canonical == root || canonical.starts_with(root)
+    }) {
+        return Some(record);
+    }
+    let common = bbox_corpus_core::git::git_common_dir(&canonical)?;
+    projects.iter().find(|project| {
+        bbox_corpus_core::git::git_common_dir(Path::new(&project.canonical_path))
+            .is_some_and(|base_common| base_common == common)
+    })
+}
+
+/// For surfaces that both READ project-scoped state and WRITE files into the
+/// project directory (e.g. `bbox_render` scope=project): resolve a path to
+/// `(base_scope_path, checkout_dir)`.
+///
+/// - `base_scope_path` is the registered base root's canonical path — the key
+///   under which project-scoped knowledge entries live.
+/// - `checkout_dir` is the top of the checkout that actually contains `path`:
+///   the worktree root for any worktree (in-tree or out-of-tree), or the base
+///   root itself for the root and plain subdirectories. Rendered provider
+///   files belong at the top of the checkout the caller is working in, so a
+///   worktree gets its own files while scope-filtering still hits the base.
+///
+/// Uses the broad retrieval resolution of [`resolve_base_project_for_scope`].
+/// `None` when no registered project owns the path.
+pub fn resolve_scope_and_checkout_dir(
+    path: &str,
+    projects: &[ProjectRecord],
+) -> Option<(String, String)> {
+    let base = resolve_base_project_for_scope(path, projects)?;
+    let canonical = fs::canonicalize(path).ok()?;
+    let base_root = Path::new(&base.canonical_path);
+    // Walk up from the requested path to the top of its checkout: the nearest
+    // ancestor carrying a `.git` marker (dir for a primary checkout, file for
+    // a linked worktree). Stop at the base root — a plain subdirectory of the
+    // base resolves to the base itself.
+    let mut cursor = canonical.clone();
+    let checkout_dir = loop {
+        if cursor == base_root {
+            break base_root.to_path_buf();
+        }
+        if cursor.join(".git").exists() {
+            break cursor;
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent.to_path_buf(),
+            None => break base_root.to_path_buf(),
+        }
+    };
+    Some((
+        base.canonical_path.clone(),
+        checkout_dir.to_string_lossy().into_owned(),
+    ))
 }
 
 /// Walk a project root (capped at depth 4) collecting language
@@ -845,6 +942,211 @@ mod tests {
                 .status
                 .success()
         );
+    }
+
+    fn add_worktree(base: &Path, branch: &str, path: &Path) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(base)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn record_for(path: &Path, project_id: &str) -> ProjectRecord {
+        ProjectRecord {
+            project_id: project_id.into(),
+            repo_id: None,
+            canonical_path: path.to_string_lossy().into_owned(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_base_project_for_scope_maps_descendants_and_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let registered = vec![record_for(&base_canon, "base-project")];
+
+        // The registered root itself.
+        let hit = resolve_base_project_for_scope(base_canon.to_str().unwrap(), &registered)
+            .expect("root should resolve");
+        assert_eq!(hit.project_id, "base-project");
+
+        // A plain subdirectory of the root.
+        let subdir = base_canon.join("src").join("deep");
+        fs::create_dir_all(&subdir).unwrap();
+        let hit = resolve_base_project_for_scope(subdir.to_str().unwrap(), &registered)
+            .expect("descendant should resolve to the root");
+        assert_eq!(hit.project_id, "base-project");
+
+        // An in-tree worktree (descendant of the registered root).
+        let in_tree = base_canon.join(".claude").join("worktrees").join("wt-in");
+        fs::create_dir_all(in_tree.parent().unwrap()).unwrap();
+        add_worktree(&base, "feature/in-tree", &in_tree);
+        let hit = resolve_base_project_for_scope(in_tree.to_str().unwrap(), &registered)
+            .expect("in-tree worktree should resolve to the root");
+        assert_eq!(hit.project_id, "base-project");
+
+        // An out-of-tree worktree on an ARBITRARY branch (no bro-fleet/
+        // prefix, not under a managed root): retrieval scope still resolves
+        // via the git common dir.
+        let out_tree = tmp.path().join("wt-out");
+        add_worktree(&base, "arc/anything", &out_tree);
+        let hit = resolve_base_project_for_scope(
+            out_tree.canonicalize().unwrap().to_str().unwrap(),
+            &registered,
+        )
+        .expect("out-of-tree worktree should resolve via common dir");
+        assert_eq!(hit.project_id, "base-project");
+
+        // A subdirectory INSIDE the out-of-tree worktree.
+        let wt_sub = out_tree.canonicalize().unwrap().join("nested");
+        fs::create_dir_all(&wt_sub).unwrap();
+        let hit = resolve_base_project_for_scope(wt_sub.to_str().unwrap(), &registered)
+            .expect("worktree subdirectory should resolve via common dir");
+        assert_eq!(hit.project_id, "base-project");
+
+        // An unrelated directory resolves to nothing.
+        let stranger = tmp.path().join("stranger");
+        fs::create_dir_all(&stranger).unwrap();
+        assert!(
+            resolve_base_project_for_scope(
+                stranger.canonicalize().unwrap().to_str().unwrap(),
+                &registered
+            )
+            .is_none()
+        );
+
+        // An unrelated git repo (different common dir) resolves to nothing.
+        let other_repo = tmp.path().join("other");
+        fs::create_dir_all(&other_repo).unwrap();
+        init_git_repo(&other_repo);
+        assert!(
+            resolve_base_project_for_scope(
+                other_repo.canonicalize().unwrap().to_str().unwrap(),
+                &registered
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_scope_and_checkout_dir_splits_scope_from_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let base_str = base_canon.to_string_lossy().into_owned();
+        let registered = vec![record_for(&base_canon, "base-project")];
+
+        // Plain subdirectory: scope AND checkout are the base root.
+        let subdir = base_canon.join("src");
+        fs::create_dir_all(&subdir).unwrap();
+        let (scope, checkout) =
+            resolve_scope_and_checkout_dir(subdir.to_str().unwrap(), &registered).unwrap();
+        assert_eq!(scope, base_str);
+        assert_eq!(checkout, base_str);
+
+        // Out-of-tree worktree: scope is the base, checkout is the worktree.
+        let out_tree = tmp.path().join("wt-out");
+        add_worktree(&base, "arc/out", &out_tree);
+        let out_canon = out_tree.canonicalize().unwrap();
+        let (scope, checkout) =
+            resolve_scope_and_checkout_dir(out_canon.to_str().unwrap(), &registered).unwrap();
+        assert_eq!(scope, base_str);
+        assert_eq!(checkout, out_canon.to_string_lossy());
+
+        // Subdirectory inside the worktree maps to the worktree top.
+        let wt_sub = out_canon.join("inner").join("dir");
+        fs::create_dir_all(&wt_sub).unwrap();
+        let (scope, checkout) =
+            resolve_scope_and_checkout_dir(wt_sub.to_str().unwrap(), &registered).unwrap();
+        assert_eq!(scope, base_str);
+        assert_eq!(checkout, out_canon.to_string_lossy());
+
+        // In-tree worktree: scope is the base, checkout is the worktree.
+        let in_tree = base_canon.join(".claude").join("worktrees").join("wt-in");
+        fs::create_dir_all(in_tree.parent().unwrap()).unwrap();
+        add_worktree(&base, "feature/in", &in_tree);
+        let (scope, checkout) =
+            resolve_scope_and_checkout_dir(in_tree.to_str().unwrap(), &registered).unwrap();
+        assert_eq!(scope, base_str);
+        assert_eq!(checkout, in_tree.to_string_lossy());
+
+        // Unregistered path resolves to nothing.
+        let stranger = tmp.path().join("stranger");
+        fs::create_dir_all(&stranger).unwrap();
+        assert!(
+            resolve_scope_and_checkout_dir(
+                stranger.canonicalize().unwrap().to_str().unwrap(),
+                &registered
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_gate_accepts_worktrees_under_cockpit_managed_roots() {
+        let _env = util::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let registered = vec![record_for(&base_canon, "base-project")];
+
+        let bro_home = tmp.path().join("bro-home");
+        let managed_parent = bro_home.join("agent").join("worktrees");
+        fs::create_dir_all(&managed_parent).unwrap();
+        // SAFETY: guarded by test_env_lock; restored below.
+        let prev = std::env::var_os("BRO_HOME");
+        unsafe { std::env::set_var("BRO_HOME", &bro_home) };
+
+        // Agent-dispatch worktree under the managed root on a NON-fleet
+        // branch: the path is the managed marker.
+        let wt = managed_parent.join("wt-agent");
+        add_worktree(&base, "arc/agent-task", &wt);
+        let wt_canon = wt.canonicalize().unwrap();
+        let resolved =
+            fleet_worktree_scope_and_dir(wt_canon.to_string_lossy().as_ref(), &registered);
+
+        // A worktree on a non-fleet branch OUTSIDE any managed root still
+        // does not alias on the write side.
+        let unmanaged = tmp.path().join("wt-unmanaged");
+        add_worktree(&base, "arc/unmanaged", &unmanaged);
+        let unmanaged_resolved = fleet_worktree_scope_and_dir(
+            unmanaged.canonicalize().unwrap().to_string_lossy().as_ref(),
+            &registered,
+        );
+
+        match prev {
+            Some(prev) => unsafe { std::env::set_var("BRO_HOME", prev) },
+            None => unsafe { std::env::remove_var("BRO_HOME") },
+        }
+
+        let (scope, dir) = resolved.expect("managed-root worktree should alias");
+        assert_eq!(scope, base_canon.to_string_lossy());
+        assert_eq!(dir, wt_canon.to_string_lossy());
+        assert!(unmanaged_resolved.is_none());
     }
 
     #[test]

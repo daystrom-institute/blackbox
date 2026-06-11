@@ -10,6 +10,35 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::render_tools()
 }
 
+/// Rescope a project render request through worktree→base project resolution.
+/// Project-scoped entries live under the registered base canonical path, so a
+/// managed/linked worktree path (or a subdirectory) would filter to nothing
+/// and render bare provider files. After this:
+///   - plain subdirectory of a registered root → render into the ROOT
+///     (provider files belong at the top of the checkout), filter by root;
+///   - worktree of a registered repo (in-tree or out-of-tree) → render into
+///     the WORKTREE checkout root, filter by the registered base path
+///     (`scope_project`);
+///   - unregistered paths and non-path values → untouched.
+fn rescope_render_project(
+    p: &mut RenderParams,
+    projects: &[crate::projects::ProjectRecord],
+) {
+    let Some(raw) = p.project.as_deref().filter(|raw| raw.starts_with('/')) else {
+        return;
+    };
+    let Some((scope, checkout)) = crate::projects::resolve_scope_and_checkout_dir(raw, projects)
+    else {
+        return;
+    };
+    if checkout != scope {
+        p.scope_project = Some(scope);
+        p.project = Some(checkout);
+    } else {
+        p.project = Some(scope);
+    }
+}
+
 #[tool_router(router = render_tools)]
 impl BlackboxServer {
     #[tool(
@@ -21,7 +50,15 @@ impl BlackboxServer {
         Parameters(p): Parameters<RenderParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_render", move || server.state.kb.read().render(&p)).await
+        Self::run_blocking("bbox_render", move || {
+            let mut p = p;
+            if p.project.is_some() {
+                let projects = server.state.projects.read().list();
+                rescope_render_project(&mut p, &projects);
+            }
+            server.state.kb.read().render(&p)
+        })
+        .await
     }
 
     #[tool(
@@ -84,5 +121,112 @@ impl BlackboxServer {
             server.state.kb.read().bootstrap(&p)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo_with_worktree(tmp: &Path) -> (PathBuf, PathBuf) {
+        let base = tmp.join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        git_ok(&base, &["init"]);
+        git_ok(
+            &base,
+            &[
+                "-c",
+                "user.name=Blackbox Test",
+                "-c",
+                "user.email=blackbox@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        let worktree = tmp.join("wt");
+        git_ok(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "arc/render",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        (
+            base.canonicalize().unwrap(),
+            worktree.canonicalize().unwrap(),
+        )
+    }
+
+    fn record_for(path: &Path) -> crate::projects::ProjectRecord {
+        crate::projects::ProjectRecord {
+            project_id: "feedbeef".into(),
+            repo_id: None,
+            canonical_path: path.to_string_lossy().into_owned(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rescope_render_project_splits_worktree_into_scope_and_write_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, worktree) = init_repo_with_worktree(&tmp_root);
+        let projects = vec![record_for(&base)];
+
+        // Worktree: write into the worktree, filter by the base scope.
+        let mut p = RenderParams {
+            project: Some(worktree.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        rescope_render_project(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(worktree.to_str().unwrap()));
+        assert_eq!(p.scope_project.as_deref(), Some(base.to_str().unwrap()));
+
+        // Plain subdirectory: collapse entirely to the registered root —
+        // provider files belong at the top of the checkout.
+        let subdir = base.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let mut p = RenderParams {
+            project: Some(subdir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        rescope_render_project(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
+        assert_eq!(p.scope_project, None);
+
+        // Unregistered path: untouched.
+        let stranger = tmp_root.join("stranger");
+        std::fs::create_dir_all(&stranger).unwrap();
+        let mut p = RenderParams {
+            project: Some(stranger.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        rescope_render_project(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(stranger.to_str().unwrap()));
+        assert_eq!(p.scope_project, None);
     }
 }

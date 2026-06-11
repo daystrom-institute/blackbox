@@ -205,6 +205,19 @@ pub fn bro_home_dir(home: &Path) -> PathBuf {
     env_path("BRO_HOME").unwrap_or_else(|| blackbox_state_dir(home).join("bro"))
 }
 
+/// Managed worktree parent roots recognized by the cockpit-facing daemon
+/// surfaces (`bro_home/{fleet,agent}/worktrees`). One definition shared by the
+/// daemon's `/control/closeout` validation, task-metadata projection, and the
+/// write-side worktree gate in `bbox-indexing` — the roster must never
+/// advertise a different policy than the request-time guards enforce.
+pub fn cockpit_managed_worktree_roots() -> [PathBuf; 2] {
+    let bro_home = bro_home_dir(&dirs::home_dir().unwrap_or_default());
+    [
+        bro_home.join("fleet").join("worktrees"),
+        bro_home.join("agent").join("worktrees"),
+    ]
+}
+
 pub fn blackbox_index_path(home: &Path) -> PathBuf {
     env_path("TRANSCRIPT_SEARCH_INDEX_PATH")
         .unwrap_or_else(|| xdg_data_dir(home).join("blackbox").join("index"))
