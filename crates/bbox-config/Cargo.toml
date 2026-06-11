@@ -1,0 +1,17 @@
+[package]
+name = "bbox-config"
+version = "0.0.1"
+edition = "2024"
+
+# Extracted from the origin crate by extract_rust_crate; the origin aliases
+# the moved modules back under their original `crate::<module>` paths.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+dirs = "6"
+anyhow = "1"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+regex = "1"
+figment = { version = "0.10", features = ["toml", "env"] }
+tempfile = "3"
+bbox-util = { path = "../bbox-util" }

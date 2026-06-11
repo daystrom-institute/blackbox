@@ -34,7 +34,7 @@ mod badgey_eval_check;
 // `crate::chunker` so existing call sites resolve unchanged.
 use bbox_chunker as chunker;
 pub mod code_nav;
-pub mod config;
+pub use bbox_config::config;
 mod crons;
 pub mod dispatch_mcp;
 mod edge_index;
@@ -92,7 +92,7 @@ pub mod render;
 use bbox_stores::roadmap;
 mod routing;
 use bbox_corpus_core::search;
-pub mod secrets;
+pub use bbox_config::secrets;
 pub mod server;
 pub mod slack_channel_bindings;
 pub mod slack_proposal_links;

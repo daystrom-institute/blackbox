@@ -33,6 +33,7 @@ members = [
     "crates/bbox-whiteboards",
     "crates/bbox-util",
     "crates/bbox-stores",
+    "crates/bbox-config",
 ]
 
 [package]
@@ -187,6 +188,7 @@ tempfile = "3"
 bbox-whiteboards = { path = "crates/bbox-whiteboards" }
 bbox-util = { path = "crates/bbox-util" }
 bbox-stores = { path = "crates/bbox-stores" }
+bbox-config = { path = "crates/bbox-config" }
 
 [dev-dependencies]
 filetime = "0.2"

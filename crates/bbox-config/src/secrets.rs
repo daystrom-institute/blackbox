@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn loadcredential_wins_over_file_and_env() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn file_secret_wins_over_env() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn env_secret_fallback() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn rejects_secret_name_with_slash() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn rejects_world_readable_secret_file() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn rejects_world_searchable_secret_dir() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn missing_secret_errors_with_name_not_value() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn write_file_secret_creates_0600_file_in_0700_dir() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
         let dir = tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
         let sources = SecretSources {
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn write_file_secret_overwrites_existing() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
         let dir = tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
         let sources = SecretSources {
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn write_file_secret_roundtrips_via_resolve() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
         unsafe {
             env::remove_var("CREDENTIALS_DIRECTORY");

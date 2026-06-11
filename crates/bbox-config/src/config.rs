@@ -12,7 +12,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::util;
+use bbox_util::util;
 
 /// Default configuration path: $XDG_CONFIG_HOME/blackbox/config.toml
 pub fn default_config_path() -> Option<PathBuf> {
@@ -383,7 +383,7 @@ pub struct Config {
 impl Config {
     /// Create raw defaults for the figment provider stack
     fn raw_defaults(home: &Path) -> RawConfig {
-        let _state_dir = crate::util::blackbox_state_dir(home);
+        let _state_dir = bbox_util::util::blackbox_state_dir(home);
         let _data_dir = dirs::data_dir().unwrap_or_else(|| home.join(".local").join("share"));
 
         RawConfig {
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn config_defaults_match_current_daemon_behavior() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Set a temp home
         let dir = tempdir().unwrap();
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn config_file_overrides_defaults() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save and clear env vars that might affect this test
         let orig_bbox_port = env::var("BBOX_PORT").ok();
@@ -1181,7 +1181,7 @@ bind = "0.0.0.0"
 
     #[test]
     fn env_overrides_config_file() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1224,7 +1224,7 @@ port = 7300
 
     #[test]
     fn flag_overrides_env() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1265,7 +1265,7 @@ port = 7300
 
     #[test]
     fn missing_config_file_is_ok() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         // Save and clear env vars that might affect this test
         let orig_bbox_port = env::var("BBOX_PORT").ok();
@@ -1324,7 +1324,7 @@ port = 7300
 
     #[test]
     fn malformed_config_file_errors() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1358,7 +1358,7 @@ port = 7300
 
     #[test]
     fn empty_path_env_is_ignored() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1405,7 +1405,7 @@ port = 7300
 
     #[test]
     fn blackbox_config_env_selects_file() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1452,7 +1452,7 @@ port = 8000
 
     #[test]
     fn mcp_session_keepalive_default_is_21600() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1481,7 +1481,7 @@ port = 8000
 
     #[test]
     fn lsp_idle_default_is_600() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1513,7 +1513,7 @@ port = 8000
 
     #[test]
     fn poller_min_default_is_5() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1545,7 +1545,7 @@ port = 8000
 
     #[test]
     fn shutdown_grace_default_is_15() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1577,7 +1577,7 @@ port = 8000
 
     #[test]
     fn jdtls_request_timeout_default_is_30() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1609,7 +1609,7 @@ port = 8000
 
     #[test]
     fn bro_port_no_longer_overrides_bbox_port() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1652,7 +1652,7 @@ port = 8000
 
     #[test]
     fn bro_store_no_longer_overrides_bro_home() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1695,7 +1695,7 @@ port = 8000
 
     #[test]
     fn defaults_memories_dir_from_env() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1720,7 +1720,7 @@ port = 8000
 
     #[test]
     fn defaults_memories_dir_dev_fallback() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1745,7 +1745,7 @@ port = 8000
 
     #[test]
     fn defaults_memories_dir_from_config_field_expands_tilde() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1777,7 +1777,7 @@ port = 8000
 
     #[test]
     fn user_memories_dir_derived_from_config_path() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1810,7 +1810,7 @@ port = 8000
 
     #[test]
     fn user_memories_dir_from_env_wins_over_config_path() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1842,7 +1842,7 @@ port = 8000
 
     #[test]
     fn user_memories_dir_from_config_field_expands_tilde() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1874,7 +1874,7 @@ port = 8000
 
     #[test]
     fn rust_analyzer_alias_no_longer_used() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -1917,7 +1917,7 @@ port = 8000
 
     #[test]
     fn tilde_only_does_not_panic() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = bbox_util::util::test_env_lock();
 
         let dir = tempdir().unwrap();
         let home = dir.path();
