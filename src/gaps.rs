@@ -192,6 +192,12 @@ pub struct GapNote {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub created_at: String,
+    /// Defaulted on deserialize (backfilled from `created_at` at repo-file
+    /// load) so a committed gap file written without it — by hand, by an
+    /// older producer, or by another machine — is not rejected. A rejected
+    /// file is invisible to the store and was historically DELETED by the
+    /// save-side purge (see `persist_repo_gap_entries`).
+    #[serde(default)]
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<String>,
@@ -580,6 +586,9 @@ fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
             }
         };
         entry.project = Some(project.clone());
+        if entry.updated_at.is_empty() {
+            entry.updated_at = entry.created_at.clone();
+        }
         out.push(entry);
     }
     if skipped > 0 {
@@ -595,9 +604,21 @@ fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
 
 /// Persist `entries` (all owned by `project_dir`) one file per gap under
 /// `<project>/.bbox/gaps/`, with the `project` field cleared. `purge` deletes
-/// committed files whose id is no longer present (generation semantics) — only
-/// safe when the in-memory set is authoritative for this project.
-fn persist_repo_gap_entries(project_dir: &Path, entries: &[&GapNote], purge: bool) -> Result<()> {
+/// committed files whose gap has been reassigned away from this dir
+/// (generation semantics for write_dir migrations / project moves).
+///
+/// `known_ids` is the full set of gap ids the store currently holds, across
+/// every scope. A file whose id the store does NOT hold is never deleted:
+/// it arrived out-of-band (git pull, peer commit, hand-authoring) or failed
+/// to deserialize at load — in both cases the in-memory set is not
+/// authoritative for it, and deleting it destroys committed repo-owned
+/// knowledge (this exact clobber shipped once; see gap-1f3894cc).
+fn persist_repo_gap_entries(
+    project_dir: &Path,
+    entries: &[&GapNote],
+    purge: bool,
+    known_ids: &BTreeSet<&str>,
+) -> Result<()> {
     let dir = repo_gaps_dir(project_dir);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
@@ -609,9 +630,18 @@ fn persist_repo_gap_entries(project_dir: &Path, entries: &[&GapNote], purge: boo
                 continue;
             }
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if !keep.contains(stem) {
-                    let _ = fs::remove_file(&path);
+                if keep.contains(stem) {
+                    continue;
                 }
+                if !known_ids.contains(stem) {
+                    tracing::warn!(
+                        "gaps save: keeping unknown on-disk gap file {} — id not in store \
+                         (out-of-band file or load-time parse failure); refusing to purge",
+                        path.display()
+                    );
+                    continue;
+                }
+                let _ = fs::remove_file(&path);
             }
         }
     }
@@ -725,9 +755,10 @@ impl GapStore {
         }
         crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
         let loaded: HashSet<&Path> = self.project_roots.iter().map(|p| p.as_path()).collect();
+        let known_ids: BTreeSet<&str> = self.data.gaps.iter().map(|g| g.id.as_str()).collect();
         for (dir, entries) in &by_project {
             let purge = loaded.contains(dir.as_path());
-            persist_repo_gap_entries(dir, entries, purge)?;
+            persist_repo_gap_entries(dir, entries, purge, &known_ids)?;
         }
         Ok(())
     }
@@ -1314,6 +1345,133 @@ mod tests {
         let (_id, created) = store.file(&p).unwrap();
         assert!(created);
         assert_eq!(store.all().len(), 2);
+    }
+
+    fn project_params(title: &str, dedupe: &str, root: &Path) -> GapFileParams {
+        let mut p = file_params(title, dedupe);
+        p.scope = Some("project".into());
+        p.project = Some(root.to_string_lossy().to_string());
+        p
+    }
+
+    /// Incident repro (gap-1f3894cc): a committed repo gap file written
+    /// without `updated_at` (hand-authored / older producer / other machine)
+    /// must load — backfilled from `created_at` — and must survive a
+    /// project-scoped save instead of being purged as unknown.
+    #[test]
+    fn repo_gap_file_without_updated_at_loads_and_survives_save() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let gaps_dir = root.join(".bbox/gaps");
+        fs::create_dir_all(&gaps_dir).unwrap();
+        let foreign = gaps_dir.join("gap-deadbeef.json");
+        fs::write(
+            &foreign,
+            r#"{
+  "id": "gap-deadbeef",
+  "title": "Peer-committed gap",
+  "gap_kind": "tooling",
+  "domain": "test-domain",
+  "wanted_capability": "survive the persister",
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/test-domain/peer-committed",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T16:33:52Z"
+}"#,
+        )
+        .unwrap();
+
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store.set_project_roots(vec![root.clone()]).unwrap();
+
+        let loaded = store
+            .all()
+            .iter()
+            .find(|g| g.id == "gap-deadbeef")
+            .expect("repo gap file missing updated_at should load");
+        assert_eq!(loaded.updated_at, "2026-06-11T16:33:52Z");
+
+        store
+            .file(&project_params(
+                "fresh gap",
+                "tooling/test-domain/fresh",
+                &root,
+            ))
+            .unwrap();
+        assert!(
+            foreign.exists(),
+            "project-scoped save must not purge the peer-committed gap file"
+        );
+    }
+
+    /// A repo gap file the store cannot parse must never be deleted by the
+    /// save-side purge: skipped-at-load means the in-memory set is not
+    /// authoritative for it.
+    #[test]
+    fn purge_keeps_files_unknown_to_store() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let gaps_dir = root.join(".bbox/gaps");
+        fs::create_dir_all(&gaps_dir).unwrap();
+        let broken = gaps_dir.join("gap-feedface.json");
+        fs::write(&broken, r#"{"id": "gap-feedface"}"#).unwrap();
+
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store.set_project_roots(vec![root.clone()]).unwrap();
+        assert!(
+            !store.all().iter().any(|g| g.id == "gap-feedface"),
+            "unparseable file should be skipped at load"
+        );
+
+        store
+            .file(&project_params("fresh", "tooling/test-domain/fresh2", &root))
+            .unwrap();
+        assert!(
+            broken.exists(),
+            "purge must keep files whose id the store does not hold"
+        );
+    }
+
+    /// Generation purge still reaps a file whose gap the store has
+    /// affirmatively reassigned to a different repo dir (write_dir
+    /// migration / project move).
+    #[test]
+    fn purge_removes_reassigned_files() {
+        let dir_a = tempdir().unwrap();
+        let root_a = dir_a.path().canonicalize().unwrap();
+        let dir_b = tempdir().unwrap();
+        let root_b = dir_b.path().canonicalize().unwrap();
+        fs::create_dir_all(root_b.join(".bbox/gaps")).unwrap();
+
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store
+            .set_project_roots(vec![root_a.clone(), root_b.clone()])
+            .unwrap();
+
+        let (id, _) = store
+            .file(&project_params("mover", "tooling/test-domain/mover", &root_a))
+            .unwrap();
+        // A second gap keeps root_a in the save's write set: purge only runs
+        // for dirs being written (a fully-vacated dir is left untouched).
+        store
+            .file(&project_params("stayer", "tooling/test-domain/stayer", &root_a))
+            .unwrap();
+        let file_a = root_a.join(".bbox/gaps").join(format!("{id}.json"));
+        assert!(file_a.exists());
+
+        let entry = store.data.gaps.iter_mut().find(|g| g.id == id).unwrap();
+        entry.project = Some(root_b.to_string_lossy().to_string());
+        store.save().unwrap();
+
+        assert!(
+            !file_a.exists(),
+            "reassigned gap's old file should be purged"
+        );
+        assert!(root_b.join(".bbox/gaps").join(format!("{id}.json")).exists());
     }
 
     #[test]
