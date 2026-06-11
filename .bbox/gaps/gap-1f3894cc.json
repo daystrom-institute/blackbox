@@ -14,7 +14,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/gaps-store/project-persist-clobbers-unknown-files",
   "notes": "Reproduced live 2026-06-11: this session's project-scoped bbox_gap filings triggered the persist that deleted both files (restored via git restore). NOTE: the restored files remain clobber-prone until this is fixed — any project-scoped gap write from any session may delete them again. The daemon-side global twins are resolution=addressed, so re-filing under the same dedupe_key would mint new ids rather than dedupe.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T17:41:24Z",
-  "updated_at": "2026-06-11T17:41:24Z"
+  "updated_at": "2026-06-11T17:58:33Z",
+  "resolved_at": "2026-06-11T17:58:33Z",
+  "resolution_note": "Fixed in a9b00cf: GapNote.updated_at is now serde-defaulted (backfilled from created_at at repo-file load) so peer/hand-authored files parse, and the save-side purge takes the store's full known-id set and refuses to delete any on-disk gap file whose id it does not hold. Regression tests cover the incident repro, unparseable-file protection, and the legitimate reassignment purge. NOTE: the running prod daemon predates the fix — it keeps clobbering gap-79a3edef/gap-98d35225 on every project gap write until rebuilt/restarted (operator-gated; next daily cleaning covers it)."
 }
