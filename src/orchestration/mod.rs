@@ -1883,6 +1883,34 @@ pub struct AmbientContext {
     pub coerce_workspace: bool,
 }
 
+/// Retrieval-read tools whose `project` param is a pure result *filter*
+/// (gap-ae22a6b2 item 2, operator-approved). Eliding it means "unscoped
+/// search"; defaulting it to the dispatch cwd scopes results to the project
+/// the agent is working in. The model keeps an explicit unscoped escape
+/// hatch: `resolve_project_filter` resolves an empty/whitespace `project`
+/// to None. Knowledge/note/learn `project` params must NEVER appear here —
+/// absence there means *global write scope*
+/// (design/bro-harness/tool-arg-defaulting.md §3.1).
+const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] =
+    &["bbox_hybrid_search", "bbox_discover_seed_entities"];
+
+/// Code-nav read tools whose `project_dir` param is the read root (file
+/// resolution / parse scan / LSP session root). All read-only; the mutating
+/// refactor tools are deliberately absent. These need `default:` entries on
+/// every dispatch shape because the `pin` flavor refuses mismatches but
+/// never fills an elided param.
+const CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS: &[&str] = &[
+    "bbox_code_query",
+    "bbox_code_symbols",
+    "bbox_code_node_describe",
+    "bbox_code_refs",
+    "bbox_code_usages",
+    "bbox_code_implementations",
+    "bbox_code_type_at",
+    "bbox_code_outline",
+    "bbox_workspace_symbols",
+];
+
 impl AmbientContext {
     /// Pending session IDs (non-Claude providers before the CLI emits
     /// one) carry no useful linkage — omit rather than leak the literal
@@ -1928,6 +1956,32 @@ impl AmbientContext {
                 session_id.to_string(),
             );
         }
+        // Coordination-id default (gap-ae22a6b2 item 2, operator-approved):
+        // `bro_report.task_id` is the dispatch's own task — eliding it today
+        // is a schema error, so filling the ambient id is pure recovery.
+        // bbox_thread ids are deliberately NOT defaulted: the table is
+        // per-(tool,param), not per-action, and `resolve_thread_id` prefers
+        // `id` over `name` — a filled `id` would shadow name-based
+        // continue/resolve and convert missing-id errors on resolve/promote/
+        // rename into silent mutations of the ambient thread.
+        if let Some(task_id) = self
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            defaults.insert(
+                "default:mcp.bro_report.task_id".to_string(),
+                task_id.to_string(),
+            );
+        }
+
+        let cwd = self
+            .project_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+
         // Worktree confinement pin (design/bro-harness/tool-arg-defaulting.md
         // §5): when the dispatch cwd is a daemon-managed worktree, pin every
         // tool's `project_dir` param to the canonical worktree root. A model
@@ -1937,11 +1991,49 @@ impl AmbientContext {
         // project-scoped coordination tools (notes/knowledge) take `project`,
         // not `project_dir` — see the schema-drift tripwire test. Plain repo
         // dispatches (`.git` directory) never pin.
-        if let Some(worktree) = self.project_dir.as_deref().and_then(worktree_pin_target) {
+        let worktree = cwd.and_then(worktree_pin_target);
+        if let Some(worktree) = &worktree {
             defaults.insert(
                 "pin:*.project_dir".to_string(),
                 worktree.to_string_lossy().into_owned(),
             );
+        }
+
+        // Retrieval-read + code-nav scope defaults (gap-ae22a6b2 item 2,
+        // operator-approved). Read-scoped params only: eliding `project` on
+        // a retrieval search merely means "unscoped", and the model can
+        // still request an unscoped search explicitly — `resolve_project_filter`
+        // treats an empty/whitespace `project` as None. The knowledge/note/
+        // learn `project` params stay excluded PERMANENTLY (§3.1: absence
+        // there means *global write scope*); see the exclusion test.
+        if let Some(cwd) = cwd {
+            // Raw dispatch cwd, canonicalized. Worktree paths are correct
+            // here because the server side resolves worktree/descendant
+            // paths to the registered base project via
+            // `resolve_base_project_for_scope`.
+            let canonical_cwd = std::path::Path::new(cwd)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| cwd.to_string());
+            for tool in RETRIEVAL_PROJECT_DEFAULT_TOOLS {
+                defaults.insert(
+                    format!("default:mcp.{tool}.project"),
+                    canonical_cwd.clone(),
+                );
+            }
+            // `project_dir`-named read params need explicit defaults on every
+            // dispatch shape: the `pin` flavor only refuses mismatches, it
+            // never fills an elided param. On worktree dispatches the value
+            // MUST equal the pin target exactly — defaults apply before pins,
+            // so a default of a worktree *subdir* would pin-conflict every
+            // elided call.
+            let dir_value = worktree
+                .as_ref()
+                .map(|w| w.to_string_lossy().into_owned())
+                .unwrap_or_else(|| canonical_cwd.clone());
+            for tool in CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS {
+                defaults.insert(format!("default:mcp.{tool}.project_dir"), dir_value.clone());
+            }
         }
         (!defaults.is_empty()).then_some(defaults)
     }
@@ -6148,11 +6240,10 @@ mod tests {
     }
 
     #[test]
-    fn ambient_tool_defaults_emit_only_session_id_for_bbox_note() {
+    fn ambient_tool_defaults_track_session_and_task_ids() {
+        // Session only: exactly the bbox_note.session_id default.
         let ctx = AmbientContext {
             session_id: Some("sess-abc".into()),
-            task_id: Some("task-abc".into()),
-            project_dir: Some("/repo/x".into()),
             bro_name: Some("executor".into()),
             ..Default::default()
         };
@@ -6165,11 +6256,157 @@ mod tests {
             Some("sess-abc")
         );
 
+        // Task id adds the bro_report coordination-id default.
+        let ctx = AmbientContext {
+            session_id: Some("sess-abc".into()),
+            task_id: Some("task-abc".into()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("session + task defaults");
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(
+            defaults
+                .get("default:mcp.bro_report.task_id")
+                .map(String::as_str),
+            Some("task-abc")
+        );
+
+        // Pending session, no task, no cwd: nothing to emit.
         let pending = AmbientContext {
             session_id: Some("pending".into()),
             ..Default::default()
         };
         assert!(pending.tool_arg_defaults().is_none());
+
+        // Blank ids are withheld, not emitted as empty defaults.
+        let blank = AmbientContext {
+            task_id: Some("  ".into()),
+            project_dir: Some("".into()),
+            ..Default::default()
+        };
+        assert!(blank.tool_arg_defaults().is_none());
+    }
+
+    #[test]
+    fn ambient_tool_defaults_scope_retrieval_reads_to_plain_repo_cwd() {
+        // Plain repo (.git directory): retrieval `project` filters and
+        // code-nav `project_dir` read roots default to the canonicalized
+        // dispatch cwd; no worktree pin.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let cwd = repo.join("src");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+
+        let ctx = AmbientContext {
+            project_dir: Some(cwd_str.clone()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("retrieval-read defaults");
+        assert!(!defaults.contains_key("pin:*.project_dir"));
+        for key in [
+            "default:mcp.bbox_hybrid_search.project",
+            "default:mcp.bbox_discover_seed_entities.project",
+        ] {
+            assert_eq!(defaults.get(key).map(String::as_str), Some(cwd_str.as_str()));
+        }
+        for tool in super::CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS {
+            assert_eq!(
+                defaults
+                    .get(&format!("default:mcp.{tool}.project_dir"))
+                    .map(String::as_str),
+                Some(cwd_str.as_str()),
+                "missing project_dir default for {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_tool_defaults_align_project_dir_defaults_with_worktree_pin() {
+        // Worktree dispatch from a subdir: the `project` filter defaults to
+        // the canonicalized cwd (server-side scope aliasing maps it to the
+        // base project), while `project_dir` defaults MUST equal the pin
+        // value (the canonical worktree root) — defaults fill before pins
+        // check, so any other value would pin-conflict every elided call.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (_base, wt) = fake_linked_worktree(&root);
+        let cwd = wt.join("src");
+
+        let ctx = AmbientContext {
+            project_dir: Some(cwd.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("worktree defaults");
+        let pin = defaults
+            .get("pin:*.project_dir")
+            .expect("worktree pin")
+            .clone();
+        assert_eq!(pin, wt.to_string_lossy());
+        assert_eq!(
+            defaults
+                .get("default:mcp.bbox_hybrid_search.project")
+                .map(String::as_str),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+        for tool in super::CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS {
+            assert_eq!(
+                defaults
+                    .get(&format!("default:mcp.{tool}.project_dir"))
+                    .map(String::as_str),
+                Some(pin.as_str()),
+                "project_dir default for {tool} must match the pin value"
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_tool_defaults_never_default_write_scope_params() {
+        // §3.1 permanent exclusion (gap-ae22a6b2): `project` on the
+        // knowledge/note/learn write tools means *global scope* when absent
+        // and must never be mechanically filled. bbox_thread ids are also
+        // excluded: the table is per-(tool,param), not per-action, and a
+        // filled `id` would shadow name-based lookups and silently mutate
+        // the ambient thread on resolve/promote/rename.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (_base, wt) = fake_linked_worktree(&root);
+        let ctx = AmbientContext {
+            session_id: Some("sess-max".into()),
+            task_id: Some("task-max".into()),
+            project_dir: Some(wt.to_string_lossy().into_owned()),
+            bro_name: Some("executor".into()),
+            thread_id: Some("thread-12345678".into()),
+            work_item_id: Some("thread-87654321".into()),
+            ..Default::default()
+        };
+        let defaults = ctx.tool_arg_defaults().expect("maximal ambient defaults");
+        for key in defaults.keys() {
+            for excluded in [
+                "bbox_note.project",
+                "bbox_knowledge",
+                "bbox_learn",
+                "bbox_remember",
+                "bbox_decide",
+                "bbox_gap",
+                "bbox_thread",
+            ] {
+                assert!(
+                    !key.contains(excluded),
+                    "write-scope/coordination param leaked into defaults: {key}"
+                );
+            }
+        }
+        // Every `.project` default targets a retrieval read tool, nothing else.
+        for key in defaults.keys().filter(|k| k.ends_with(".project")) {
+            assert!(
+                super::RETRIEVAL_PROJECT_DEFAULT_TOOLS
+                    .iter()
+                    .any(|tool| key == &format!("default:mcp.{tool}.project")),
+                "unexpected .project default: {key}"
+            );
+        }
     }
 
     /// Build a linked-worktree pair under `root`: a base repo whose
@@ -6201,7 +6438,6 @@ mod tests {
             ..Default::default()
         };
         let defaults = ctx.tool_arg_defaults().expect("session default + pin");
-        assert_eq!(defaults.len(), 2);
         assert_eq!(
             defaults
                 .get("default:mcp.bbox_note.session_id")
@@ -6213,14 +6449,14 @@ mod tests {
             Some(wt.to_string_lossy().as_ref())
         );
 
-        // A pending session still carries the worktree pin (pin only).
+        // A pending session still carries the worktree pin (no session entry).
         let pending = AmbientContext {
             session_id: Some("pending".into()),
             project_dir: Some(wt.to_string_lossy().into_owned()),
             ..Default::default()
         };
         let defaults = pending.tool_arg_defaults().expect("pin only");
-        assert_eq!(defaults.len(), 1);
+        assert!(!defaults.contains_key("default:mcp.bbox_note.session_id"));
         assert_eq!(
             defaults.get("pin:*.project_dir").map(String::as_str),
             Some(wt.to_string_lossy().as_ref())
@@ -6242,7 +6478,6 @@ mod tests {
             ..Default::default()
         };
         let defaults = ctx.tool_arg_defaults().expect("session default");
-        assert_eq!(defaults.len(), 1);
         assert!(!defaults.contains_key("pin:*.project_dir"));
     }
 
@@ -6282,10 +6517,12 @@ mod tests {
         // project-scoped coordination tools take `project`, not `project_dir`
         // — absence there means *global scope* and must stay free. Tripwire:
         // if these adapters ever grow a `project_dir` param, re-check the
-        // glob before shipping.
+        // glob (and the CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS defaults) before
+        // shipping.
         for (name, src) in [
             ("notes", include_str!("../tools/notes.rs")),
             ("knowledge", include_str!("../tools/knowledge.rs")),
+            ("threads", include_str!("../tools/threads.rs")),
         ] {
             assert!(
                 !src.contains("project_dir"),

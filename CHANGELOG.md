@@ -42,6 +42,24 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Worktree-scope cluster: dispatched agents working in daemon-managed
+  worktrees now get coherent project scoping end to end. Dispatch emits a
+  `pin:*.project_dir` worktree-confinement pin from one mechanical choke
+  point (`AmbientContext::tool_arg_defaults`) covering bro_exec/resume,
+  agent dispatch, workflow executor turns, and the fleet cockpit
+  (gap-8144b4b5); retrieval surfaces (`bbox_hybrid_search` project filter,
+  knowledge scoping, render) resolve worktree and descendant paths to the
+  registered base project via `resolve_base_project_for_scope`
+  (gap-72edd4f2); and the operator-approved ambient tool-arg default
+  expansion (gap-ae22a6b2 item 2) fills retrieval-read scope
+  (`bbox_hybrid_search.project`, `bbox_discover_seed_entities.project`, and
+  `project_dir` on the read-only `bbox_code_*` / `bbox_workspace_symbols`
+  family) plus coordination ids (`bro_report.task_id`) from the dispatch's
+  ambient context. Defaults fill only when the model elides the param;
+  passing `project=""` still requests an unscoped search; knowledge/note/
+  learn `project` params stay permanently excluded (absence means global
+  write scope), and `bbox_thread` ids are not defaulted because the
+  per-(tool,param) table cannot action-gate.
 - `extract_rust_crate` refactor compound (gap-fe4dd97f): peel leaf root
   modules of a monolithic crate into a new workspace-member crate via
   `bbox_refactor_run`. New primitives: `extract_rust_crate_scaffold` (atomic

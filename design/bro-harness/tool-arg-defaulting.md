@@ -156,7 +156,38 @@ The `pin:*.project_dir` glob is safe per §3.1: the project-scoped
 coordination tools (notes/knowledge) take `project`, not `project_dir`; a
 schema-drift tripwire test pins that assumption.
 
-Still pending from step 5: ambient-id *defaults* beyond
-`bbox_note.session_id` (e.g. `project` defaults for the coordination tools)
-remain decision-gated under gap-ae22a6b2 — absence of `project` means global
-scope (§3.1) and must not be mechanically filled without that decision.
+Step 5's ambient-default half (gap-ae22a6b2 item 2) is now operator-decided
+and live. The approved expansion, emitted from the same
+`AmbientContext::tool_arg_defaults()` choke point:
+
+- **Retrieval-read project defaults** — `default:mcp.bbox_hybrid_search.project`
+  and `default:mcp.bbox_discover_seed_entities.project` fill the canonicalized
+  dispatch cwd. Safe because `project` on these tools is a pure result
+  *filter*, and worktree/descendant cwds resolve server-side to the registered
+  base project (`resolve_base_project_for_scope`). The model keeps an explicit
+  **unscoped escape hatch**: `resolve_project_filter` resolves an
+  empty/whitespace `project` (e.g. `project=""`) to None — an agent can still
+  request a fully unscoped search even with the default in place.
+- **Code-nav read-root defaults** — `default:mcp.<tool>.project_dir` for the
+  read-only code-nav family (`bbox_code_query` / `bbox_code_symbols` /
+  `bbox_code_node_describe` / `bbox_code_refs` / `bbox_code_usages` /
+  `bbox_code_implementations` / `bbox_code_type_at` / `bbox_code_outline` /
+  `bbox_workspace_symbols`). Needed on every dispatch shape because the `pin`
+  flavor only *refuses mismatches*; it never fills an elided param. On
+  worktree dispatches the default value is the canonical worktree root —
+  identical to the `pin:*.project_dir` value, since defaults fill before pins
+  check and any other value would pin-conflict every elided call. Mutating
+  refactor tools are deliberately not defaulted.
+- **Coordination-id defaults** — `default:mcp.bro_report.task_id` fills the
+  ambient task id (eliding it was previously a hard schema error).
+  `bbox_thread` ids are deliberately **skipped**: the table is per-(tool,param),
+  not per-action; `resolve_thread_id` prefers `id` over `name`, so a filled
+  `id` would shadow name-based continue/resolve and convert missing-id errors
+  on resolve/promote/rename into silent mutations of the ambient thread.
+
+The knowledge/note/learn `project` exclusion is **permanent**, not pending:
+absence there means *global write scope* (§3.1) and is never mechanically
+filled. An exclusion test (`ambient_tool_defaults_never_default_write_scope_params`)
+plus the schema-drift tripwire pin both halves. Session-start schema
+validation remains warn-not-fail, so restricted brofiles whose sessions never
+load these tools see a startup warning, never a failure.
