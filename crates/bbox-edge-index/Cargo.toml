@@ -1,0 +1,26 @@
+[package]
+name = "bbox-edge-index"
+version = "0.0.1"
+edition = "2024"
+
+# Extracted from the origin crate by extract_rust_crate; the origin aliases
+# the moved modules back under their original `crate::<module>` paths.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-corpus-index = { path = "../bbox-corpus-index" }
+bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
+bbox-chunker = { path = "../bbox-chunker" }
+tracing = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+bbox-stores = { path = "../bbox-stores" }
+bbox-knowledge = { path = "../bbox-knowledge" }
+bbox-threads = { path = "../bbox-threads" }
+
+[dev-dependencies]
+filetime = "0.2"

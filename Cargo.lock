@@ -378,6 +378,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-edge-index"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-chunker",
+ "bbox-corpus-core",
+ "bbox-corpus-index",
+ "bbox-edge-sidecar",
+ "bbox-knowledge",
+ "bbox-stores",
+ "bbox-threads",
+ "filetime",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-edge-sidecar"
 version = "0.0.1"
 dependencies = [
@@ -729,6 +750,7 @@ dependencies = [
  "bbox-config",
  "bbox-corpus-core",
  "bbox-corpus-index",
+ "bbox-edge-index",
  "bbox-edge-sidecar",
  "bbox-gaps",
  "bbox-inbox",

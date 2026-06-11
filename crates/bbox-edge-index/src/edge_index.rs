@@ -294,7 +294,9 @@ impl EdgeIndex {
             .push(edge_id);
     }
 
-    #[cfg(test)]
+    // Not `#[cfg(test)]` gated: consumer crates (the root crate's
+    // mcp_tools tests) call this from their own test modules, where this
+    // crate compiles as a normal dependency and `cfg(test)` is false.
     pub fn from_edges_for_tests(edges: Vec<Edge>) -> Self {
         let mut index = Self::default();
         let mut seen = HashSet::new();
