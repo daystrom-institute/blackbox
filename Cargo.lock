@@ -256,6 +256,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bbox-artifacts"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-util",
+ "hex",
+ "notify",
+ "notify-debouncer-full",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
 name = "bbox-chunker"
 version = "0.0.1"
 dependencies = [
@@ -610,6 +630,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "bbox-artifacts",
  "bbox-chunker",
  "bbox-code-nav",
  "bbox-config",

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest as _;
 
-use crate::util;
+use bbox_util::util;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -222,7 +222,7 @@ impl ArtifactCatalog {
             })?;
         let meta_path = self.metadata_path_scoped(&scope, kind, &name)?;
 
-        crate::json_store::with_store_lock(&meta_path, || {
+        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
             self.install_value_locked_scoped(
                 scope,
                 kind,
@@ -464,7 +464,7 @@ impl ArtifactCatalog {
         superseded_by: &str,
     ) -> Result<ArtifactMetadata> {
         let meta_path = self.metadata_path(kind, name)?;
-        crate::json_store::with_store_lock(&meta_path, || {
+        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
             self.supersede_locked(kind, name, superseded_by)
         })
     }
@@ -495,7 +495,7 @@ impl ArtifactCatalog {
         }
 
         let meta_path = self.metadata_path(kind, name)?;
-        crate::json_store::with_store_lock(&meta_path, || {
+        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
             self.remove_hard_locked(kind, name, dry_run)
         })
     }
@@ -617,7 +617,7 @@ impl ArtifactCatalog {
         warnings: Vec<String>,
     ) -> Result<ArtifactMetadata> {
         let meta_path = self.metadata_path(kind, name)?;
-        crate::json_store::with_store_lock(&meta_path, || {
+        bbox_corpus_core::json_store::with_store_lock(&meta_path, || {
             let mut meta = self.load_metadata(kind, name)?;
             meta.install_warnings = warnings;
             self.save_metadata(&meta)?;
@@ -1182,7 +1182,7 @@ fn name_dir_path(name: &str) -> Result<PathBuf> {
 }
 
 fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    crate::json_store::atomic_write_json_locked(path, value)
+    bbox_corpus_core::json_store::atomic_write_json_locked(path, value)
 }
 
 fn default_active() -> bool {

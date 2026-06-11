@@ -26,7 +26,7 @@ extern crate self as blackbox;
 #[cfg(test)]
 #[path = "../eval/agents/check.rs"]
 mod agent_eval_check;
-mod artifacts;
+use bbox_artifacts::artifacts;
 #[cfg(test)]
 #[path = "../eval/badgey/check.rs"]
 mod badgey_eval_check;
@@ -115,7 +115,7 @@ pub use bbox_util::util;
 // decomposition). Aliased back to `crate::vectors` so existing `crate::vectors::*`
 // call sites resolve unchanged.
 use bbox_vectors as vectors;
-mod watcher;
+use bbox_artifacts::watcher;
 mod webhooks;
 use bbox_whiteboards::whiteboards;
 mod workflow;

@@ -110,7 +110,7 @@ impl BbxWatcher {
 }
 
 /// Route a single debounced notify event to the appropriate artifact action.
-pub(crate) fn handle_event(
+pub fn handle_event(
     event: &notify::Event,
     roots: &[(String, PathBuf)],
     catalog: &ArtifactCatalog,
