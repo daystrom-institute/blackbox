@@ -258,18 +258,16 @@ impl TranscriptIndex {
         })
     }
 
-    /// Spawn the daemon's single tantivy writer actor (concurrency-model
-    /// §4.3). All production index mutations and reindex passes flow
-    /// through the returned handle; the facade's synchronous `index_*` /
-    /// `delete_*` methods remain for tests.
-    pub(crate) fn spawn_writer_actor(&self) -> IndexWriterActor {
-        IndexWriterActor::spawn(
-            self.index.clone(),
-            self.fields,
-            self.config.clone(),
-            self.reader.clone(),
-            self.stats_cache.clone(),
-        )
+    /// Clone the shared `IndexReader` handle (writer-actor post-commit
+    /// reloads go through this).
+    pub(crate) fn reader_handle(&self) -> IndexReader {
+        self.reader.clone()
+    }
+
+    /// Clone the stats TTL-cache handle (writer-actor post-commit
+    /// invalidation goes through this).
+    pub(crate) fn stats_cache_handle(&self) -> StatsCache {
+        self.stats_cache.clone()
     }
 
     /// Get a clone of the Index handle for the background thread.
@@ -969,7 +967,7 @@ mod tests {
             None,
             index.field_handles(),
         );
-        let entity_id = crate::embed_queue::project_file_entity_id_for_snapshot(&chunk, None);
+        let entity_id = embed_hook::project_file_entity_id_for_snapshot(&chunk, None);
         let mut writer = index.index_handle().writer(50_000_000).unwrap();
         writer.add_document(doc).unwrap();
         writer.commit().unwrap();
@@ -1030,7 +1028,7 @@ mod tests {
             last_recalled: None,
         };
 
-        let actor = index.spawn_writer_actor();
+        let actor = super::writer_actor::IndexWriterActor::spawn_for(&index);
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(entry)));
         actor.flush_blocking().unwrap();
         let hits = index
@@ -1070,6 +1068,7 @@ mod tests {
 }
 
 mod code_tokenizer;
+pub(crate) mod embed_hook;
 mod git_history;
 mod helpers;
 mod knowledge_docs;

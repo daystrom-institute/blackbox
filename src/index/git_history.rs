@@ -11,7 +11,7 @@ use super::{FieldHandles, FileMeta};
 use crate::chunker::{Chunk, Edge, EdgeConfidence, EdgeProvenance};
 use crate::entity_ref::{self, EntityRef};
 use crate::git::GitCommit;
-use crate::projects::ProjectRecord;
+use bbox_corpus_core::project_record::ProjectRecord;
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const TRUNCATED_COMMIT_MESSAGE_SUFFIX: &str = "\n\n[... message truncated]";
@@ -110,7 +110,7 @@ pub(super) fn index_git_history_for_project(
             .delete_term(Term::from_field_text(ctx.f.entity_id, &entity_id));
         ctx.writer
             .add_document(build_commit_doc(&commit, repo_id, project, ctx.f))?;
-        crate::embed_queue::enqueue_git_message(
+        super::embed_hook::emit_git_message(
             &entity_id,
             &commit_message_hash(&commit.message),
             &commit.message,

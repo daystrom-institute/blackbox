@@ -11,7 +11,7 @@ use tantivy::{IndexWriter, TantivyDocument, Term};
 use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::chunker::{self, Chunk, Edge, EdgeConfidence, EdgeProvenance};
 use crate::entity_ref::{self, EntityRef};
-use crate::projects::{ProjectRecord, ProjectRegistry};
+use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "_build", ".worktrees"];
@@ -86,7 +86,7 @@ pub(super) fn scan_registered_project_files(
     config: &ReindexConfig,
 ) -> Result<Vec<(String, u64, u64)>> {
     let mut files = Vec::new();
-    for project in ProjectRegistry::load_records(&config.projects_path)? {
+    for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
         scan_project_files(&root, &mut files)?;
         if project.repo_id.is_some() {
@@ -112,7 +112,7 @@ pub(super) fn index_registered_projects_standalone(
     let mut stats = ProjectIndexStats::default();
     let edges_dir = crate::edge_index::edges_dir_from_projects_path(&config.projects_path);
     let git_meta_dir = super::git_history::git_meta_dir_from_projects_path(&config.projects_path);
-    for project in ProjectRegistry::load_records(&config.projects_path)? {
+    for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
         if !root.exists() {
             continue;
@@ -139,7 +139,7 @@ pub(crate) fn build_project_file_doc(
     snapshot_id: Option<&str>,
     f: FieldHandles,
 ) -> TantivyDocument {
-    let entity_id = crate::embed_queue::project_file_entity_id_for_snapshot(chunk, snapshot_id);
+    let entity_id = super::embed_hook::project_file_entity_id_for_snapshot(chunk, snapshot_id);
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "project_file");
     doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
@@ -394,11 +394,11 @@ fn index_project(
                 snapshot_id.as_deref(),
                 ctx.f,
             );
-            let entity_id = crate::embed_queue::project_file_entity_id_for_snapshot(
+            let entity_id = super::embed_hook::project_file_entity_id_for_snapshot(
                 &chunk,
                 snapshot_id.as_deref(),
             );
-            crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
+            super::embed_hook::emit_project_file(&chunk, &entity_id);
             ctx.writer.add_document(doc)?;
             ctx.stats.indexed_docs += 1;
         }

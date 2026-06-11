@@ -374,7 +374,7 @@ impl SharedState {
             store_dir.join("roadmap.json"),
         )
         .unwrap();
-        let index_writer = idx.spawn_writer_actor();
+        let index_writer = crate::index::IndexWriterActor::spawn_for(&idx);
         // Load committed `.bbox/knowledge/` for every registered project into
         // the knowledge query surface at startup (project durable knowledge is
         // repo-owned; the central store holds only global entries).

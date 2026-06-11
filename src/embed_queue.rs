@@ -152,6 +152,16 @@ pub(crate) fn tombstone_roadmap(entity_id: &str) {
     }
 }
 
+/// Register this module's enqueue functions as the index engine's embed
+/// hooks (`index::embed_hook`). Called from the daemon's writer-actor spawn
+/// path; idempotent.
+pub(crate) fn register_index_embed_hooks() {
+    crate::index::embed_hook::register_embed_hooks(crate::index::embed_hook::EmbedHooks {
+        project_file: enqueue_project_file,
+        git_message: enqueue_git_message,
+    });
+}
+
 pub(crate) fn enqueue_project_file(chunk: &Chunk, entity_id: &str) {
     let bucket = if chunk.language.is_some() || chunk.chunk_kind == "code_block" {
         Bucket::Code
@@ -395,32 +405,11 @@ pub(crate) fn enqueue_transcript(
     });
 }
 
-pub(crate) fn project_file_entity_id(chunk: &Chunk) -> String {
-    project_file_entity_id_for_snapshot(chunk, None)
-}
-
-pub(crate) fn project_file_entity_id_for_snapshot(
-    chunk: &Chunk,
-    snapshot_id: Option<&str>,
-) -> String {
-    if let Some(snapshot_id) = snapshot_id {
-        return EntityRef::ProjectFileV2 {
-            project_id: chunk.project_id.clone(),
-            snapshot_id: snapshot_id.to_string(),
-            rel_path_hash: chunk.rel_path_hash.clone(),
-            chunk_hash: chunk.chunk_hash.clone(),
-            occurrence_idx: chunk.occurrence_idx,
-        }
-        .to_string();
-    }
-    EntityRef::ProjectFile {
-        project_id: chunk.project_id.clone(),
-        rel_path_hash: chunk.rel_path_hash.clone(),
-        chunk_hash: chunk.chunk_hash.clone(),
-        occurrence_idx: chunk.occurrence_idx,
-    }
-    .to_string()
-}
+// Entity-id construction for project-file chunks lives with the index
+// engine (`index::embed_hook`); re-exported here for the embed-side callers.
+pub(crate) use crate::index::embed_hook::{
+    project_file_entity_id, project_file_entity_id_for_snapshot,
+};
 
 pub(crate) fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();

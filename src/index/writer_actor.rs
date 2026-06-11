@@ -33,7 +33,7 @@ use crate::roadmap::RoadmapItem;
 use crate::threads::Thread;
 
 use super::reindex::{conservative_log_merge_policy, execute_reindex_pass};
-use super::{FieldHandles, ReindexConfig, StatsCache};
+use super::{FieldHandles, ReindexConfig, StatsCache, TranscriptIndex};
 
 /// One queued index mutation.
 pub(crate) enum IndexWriteOp {
@@ -78,6 +78,25 @@ const WRITER_HEAP_SMALL_OPS: usize = 50_000_000;
 const WRITER_HEAP_REINDEX: usize = 100_000_000;
 
 impl IndexWriterActor {
+    /// Spawn the daemon's single tantivy writer actor for `idx`
+    /// (concurrency-model §4.3). All production index mutations and
+    /// reindex passes flow through the returned handle.
+    ///
+    /// Also registers the engine's daemon hooks (embed enqueue + the
+    /// manual-rebuild store-document pass): every spawn point is a daemon
+    /// boot path, so this is the single place store-side wiring attaches
+    /// to the engine.
+    pub(crate) fn spawn_for(idx: &TranscriptIndex) -> Self {
+        register_index_store_hooks();
+        Self::spawn(
+            idx.index_handle(),
+            idx.field_handles(),
+            idx.reindex_config(),
+            idx.reader_handle(),
+            idx.stats_cache_handle(),
+        )
+    }
+
     pub(crate) fn spawn(
         index: Index,
         fields: FieldHandles,
@@ -330,6 +349,31 @@ fn knowledge_path(config: &ReindexConfig) -> &Path {
     &config.knowledge_path
 }
 
+/// Wire the store side into the engine's daemon hooks: embed enqueue for
+/// project-file/git chunks, and the knowledge store-document pass for
+/// manual rebuilds (`TranscriptIndex::build_index`). Idempotent; called
+/// from every writer-actor spawn and directly by store-coupled tests that
+/// drive `build_index` without an actor.
+pub(crate) fn register_index_store_hooks() {
+    crate::embed_queue::register_index_embed_hooks();
+    super::embed_hook::register_manual_store_pass(manual_knowledge_store_pass);
+}
+
+fn manual_knowledge_store_pass(
+    config: &ReindexConfig,
+    fields: FieldHandles,
+    writer: &mut IndexWriter,
+    meta: &mut std::collections::HashMap<String, super::FileMeta>,
+) -> Result<u64> {
+    super::knowledge_docs::reindex_knowledge_store_standalone(
+        &config.knowledge_path,
+        &config.projects_path,
+        fields,
+        writer,
+        meta,
+    )
+}
+
 /// Make the committed segments visible to searches and invalidate the
 /// stats TTL cache — the same post-write publication the old inline
 /// facade methods performed under the `state.idx` write guard.
@@ -446,7 +490,7 @@ mod tests {
     fn batched_ops_commit_once_and_become_searchable_after_flush() {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
-        let actor = index.spawn_writer_actor();
+        let actor = IndexWriterActor::spawn_for(&index);
 
         // A burst of ops lands in one batch: upserts, a delete of one of
         // them, and a roadmap-style overwrite of the same entity id.
@@ -474,7 +518,7 @@ mod tests {
     fn ops_enqueued_around_a_reindex_pass_all_land() {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
-        let actor = index.spawn_writer_actor();
+        let actor = IndexWriterActor::spawn_for(&index);
 
         // Both entries are store-backed: a pass reconciles knowledge docs
         // from the kb store file, so index-only entries would be wiped by
@@ -509,7 +553,7 @@ mod tests {
     fn full_pass_rebuilds_and_keeps_store_docs() {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
-        let actor = index.spawn_writer_actor();
+        let actor = IndexWriterActor::spawn_for(&index);
 
         // Store-backed entry: write it to the kb store file so the pass's
         // store-doc phase re-adds it after delete_all_documents.

@@ -15,7 +15,6 @@ use tantivy::{IndexWriter, TantivyDocument, Term};
 use walkdir::WalkDir;
 
 use super::helpers::*;
-use super::knowledge_docs;
 use super::project_files;
 use super::reindex::*;
 use super::{FileMeta, TranscriptIndex};
@@ -1462,16 +1461,14 @@ impl TranscriptIndex {
         indexed_docs += project_stats.indexed_docs;
         skipped += project_stats.skipped;
 
-        let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
-            &self.config.knowledge_path,
-            &self.config.projects_path,
-            f,
-            &mut writer,
-            &mut meta,
-        )?;
-        if knowledge_docs > 0 {
+        // Store-backed documents (knowledge entries) reconcile into the same
+        // writer/commit via the daemon-registered pass; no-op when nothing
+        // is registered (engine-only use).
+        let store_docs =
+            super::embed_hook::run_manual_store_pass(&self.config, f, &mut writer, &mut meta)?;
+        if store_docs > 0 {
             indexed_files += 1;
-            indexed_docs += knowledge_docs;
+            indexed_docs += store_docs;
         }
 
         // Purge documents for deleted source files
@@ -1659,6 +1656,9 @@ mod agentic_project_file_tests {
 
     #[test]
     fn knowledge_entries_are_searchable_after_reindex() {
+        // build_index reconciles store docs through the daemon-registered
+        // pass; tests that drive it directly must wire the hooks first.
+        super::super::writer_actor::register_index_store_hooks();
         let dir = tempfile::tempdir().unwrap();
         let knowledge_path = dir.path().join("knowledge.json");
         let mut knowledge = crate::knowledge::Knowledge::open(&knowledge_path).unwrap();

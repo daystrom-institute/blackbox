@@ -87,7 +87,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // The daemon's single tantivy writer: every index mutation and reindex
     // pass flows through this actor (concurrency-model §4.3). Spawned AFTER
     // all ReindexConfig mutation — the actor clones the config at spawn.
-    let index_writer = idx.spawn_writer_actor();
+    let index_writer = crate::index::IndexWriterActor::spawn_for(&idx);
     let (projects_store, projects_needs_persist) =
         ProjectRegistry::open_with_backfill_status(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());

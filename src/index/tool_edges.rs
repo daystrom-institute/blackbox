@@ -10,7 +10,7 @@ use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::edge_index::Edge;
 use crate::entity_ref::EntityRef;
 use crate::parser::{self, ParsedEvent, ToolCallInfo, ToolCallKind};
-use crate::projects::{ProjectRecord, ProjectRegistry};
+use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
 
 pub(super) struct ToolEdgeContext {
     projects: Vec<ProjectRecord>,
@@ -21,7 +21,7 @@ pub(super) struct ToolEdgeContext {
 impl ToolEdgeContext {
     pub(super) fn from_config(config: &ReindexConfig, emit_sidecars: bool) -> Result<Self> {
         Ok(Self {
-            projects: ProjectRegistry::load_records(&config.projects_path)?,
+            projects: load_project_records(&config.projects_path)?,
             edges_dir: crate::edge_index::edges_dir_from_projects_path(&config.projects_path),
             emit_sidecars,
         })
@@ -306,7 +306,7 @@ fn anchor_metadata(
     }
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
-        event.timestamp.clone().unwrap_or_else(crate::util::now_iso),
+        event.timestamp.clone().unwrap_or_else(bbox_corpus_core::util::now_iso),
     );
     metadata.insert("tool.name".to_string(), tool_call.name.clone());
     if let Some(id) = &tool_call.tool_use_id {
@@ -325,7 +325,7 @@ fn bash_metadata(
     metadata.insert("anchor.project_id".to_string(), project.project_id.clone());
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
-        event.timestamp.clone().unwrap_or_else(crate::util::now_iso),
+        event.timestamp.clone().unwrap_or_else(bbox_corpus_core::util::now_iso),
     );
     metadata.insert("tool.name".to_string(), tool_call.name.clone());
     if let Some(id) = &tool_call.tool_use_id {
