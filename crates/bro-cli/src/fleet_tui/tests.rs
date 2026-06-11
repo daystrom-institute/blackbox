@@ -578,30 +578,49 @@ Trailing paragraph.";
     }
 
     #[test]
-    fn selector_right_drills_and_left_backs_out() {
+    fn selector_left_drills_and_right_backs_out() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
         let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        let orig_provider = app.next_provider;
+        let orig_model = app.next_model.clone();
+        let orig_effort = app.next_effort.clone();
 
+        // ← drills deeper from Roster
         zoom_left(&mut app);
         assert_eq!(app.zone, Zone::ProviderSelector);
+        assert!(app.selector_snapshot.is_some());
 
-        zoom_right(&mut app);
+        // ← drills to ModelSelector (no commit!)
+        zoom_left(&mut app);
         assert_eq!(app.zone, Zone::ModelSelector);
 
-        zoom_right(&mut app);
+        // ← drills to EffortSelector (no commit!)
+        zoom_left(&mut app);
         assert_eq!(app.zone, Zone::EffortSelector);
 
+        // At max depth, ← stays at EffortSelector
         zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::EffortSelector);
+
+        // → backs out to ModelSelector (no commit)
+        zoom_right(&mut app);
         assert_eq!(app.zone, Zone::ModelSelector);
 
-        zoom_left(&mut app);
+        // → backs out to ProviderSelector (no commit)
+        zoom_right(&mut app);
         assert_eq!(app.zone, Zone::ProviderSelector);
 
-        zoom_left(&mut app);
+        // → backs out to Roster (no commit)
+        zoom_right(&mut app);
         assert_eq!(app.zone, Zone::Roster);
+
+        // Since we never committed, next_provider/model/effort are unchanged
+        assert_eq!(app.next_provider, orig_provider);
+        assert_eq!(app.next_model, orig_model);
+        assert_eq!(app.next_effort, orig_effort);
     }
 
     #[test]
@@ -617,10 +636,12 @@ Trailing paragraph.";
             .expect("fleet provider with models");
         let provider = FLEET_PROVIDERS[provider_idx];
 
+        // Enter from ProviderSelector: commits provider, takes defaults for model+effort
         app.zone = Zone::ProviderSelector;
         app.provider_cursor = provider_idx;
         app.model_cursor = usize::MAX;
         app.effort_cursor = usize::MAX;
+        app.selector_snapshot = None;
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -630,12 +651,14 @@ Trailing paragraph.";
         assert_eq!(app.next_model.as_deref(), default_model_for(provider));
         assert_eq!(app.next_effort.as_deref(), default_effort_for(provider));
 
+        // Space from ModelSelector: commits provider + model, takes default effort
         let model_idx = (provider.models().len() > 1) as usize;
         let selected_model = provider.models()[model_idx].id;
         app.zone = Zone::ModelSelector;
         app.provider_cursor = provider_idx;
         app.model_cursor = model_idx;
         app.effort_cursor = usize::MAX;
+        app.selector_snapshot = None;
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -645,12 +668,14 @@ Trailing paragraph.";
         assert_eq!(app.next_model.as_deref(), Some(selected_model));
         assert_eq!(app.next_effort.as_deref(), default_effort_for(provider));
 
+        // Enter from EffortSelector: commits full provider + model + effort
         let effort_idx = provider.efforts().len().saturating_sub(1);
         let selected_effort = provider.efforts().get(effort_idx).map(|e| e.id);
         app.zone = Zone::EffortSelector;
         app.provider_cursor = provider_idx;
         app.model_cursor = model_idx;
         app.effort_cursor = effort_idx;
+        app.selector_snapshot = None;
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -659,6 +684,109 @@ Trailing paragraph.";
         assert_eq!(app.next_provider, provider);
         assert_eq!(app.next_model.as_deref(), Some(selected_model));
         assert_eq!(app.next_effort.as_deref(), selected_effort);
+    }
+
+    #[test]
+    fn selector_esc_restores_pre_entry_selection() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+        let orig_provider = app.next_provider;
+        let orig_model = app.next_model.clone();
+        let orig_effort = app.next_effort.clone();
+
+        // Enter selector via ← from Roster
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::ProviderSelector);
+
+        // Drill into model and effort
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::ModelSelector);
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::EffortSelector);
+
+        // Move cursors to something different
+        let provider_idx = FLEET_PROVIDERS
+            .iter()
+            .position(|p| *p != orig_provider)
+            .unwrap_or(0);
+        app.provider_cursor = provider_idx;
+
+        // Esc restores pre-entry selection
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert_eq!(app.zone, Zone::Roster);
+        assert_eq!(app.next_provider, orig_provider);
+        assert_eq!(app.next_model, orig_model);
+        assert_eq!(app.next_effort, orig_effort);
+        assert!(app.selector_snapshot.is_none());
+    }
+
+    #[test]
+    fn selector_cursors_persist_across_drill_and_back() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        // Enter selector and move provider cursor
+        zoom_left(&mut app); // Roster → ProviderSelector
+        let target_provider = FLEET_PROVIDERS.len().saturating_sub(1);
+        app.provider_cursor = target_provider;
+
+        // Drill into model and move model cursor
+        zoom_left(&mut app); // ProviderSelector → ModelSelector
+        let models = FLEET_PROVIDERS[target_provider].models();
+        let target_model = models.len().saturating_sub(1);
+        app.model_cursor = target_model;
+
+        // Drill into effort
+        zoom_left(&mut app); // ModelSelector → EffortSelector
+
+        // Back out to model — cursor should be where we left it
+        zoom_right(&mut app);
+        assert_eq!(app.zone, Zone::ModelSelector);
+        assert_eq!(app.model_cursor, target_model);
+
+        // Back out to provider — cursor should be where we left it
+        zoom_right(&mut app);
+        assert_eq!(app.zone, Zone::ProviderSelector);
+        assert_eq!(app.provider_cursor, target_provider);
+
+        // Drill back into model — cursor should still be where we left it
+        zoom_left(&mut app);
+        assert_eq!(app.zone, Zone::ModelSelector);
+        assert_eq!(app.model_cursor, target_model);
+    }
+
+    #[test]
+    fn selector_mind_change_drill_back_no_commit() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+        let orig_provider = app.next_provider;
+        let orig_model = app.next_model.clone();
+
+        // Enter selector and drill all the way to effort
+        zoom_left(&mut app); // → ProviderSelector
+        zoom_left(&mut app); // → ModelSelector
+        zoom_left(&mut app); // → EffortSelector
+
+        // Change mind: back all the way out to roster
+        zoom_right(&mut app); // EffortSelector → ModelSelector
+        zoom_right(&mut app); // ModelSelector → ProviderSelector
+        zoom_right(&mut app); // ProviderSelector → Roster
+
+        // Nothing was committed — selection unchanged
+        assert_eq!(app.next_provider, orig_provider);
+        assert_eq!(app.next_model, orig_model);
     }
 
     #[test]

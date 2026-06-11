@@ -191,20 +191,22 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
         Zone::ProviderSelector => vec![
             Line::from("  ↑/↓           cycle providers"),
             Line::from("  Enter/Space   quick-select shown defaults + home"),
-            Line::from("  →             drill into models"),
-            Line::from("  ←             back to roster"),
+            Line::from("  ←             drill into models"),
+            Line::from("  →             back to roster (no commit)"),
+            Line::from("  Esc           cancel selector, restore selection"),
         ],
         Zone::ModelSelector => vec![
             Line::from("  ↑/↓           cycle models"),
             Line::from("  Enter/Space   quick-select model + default effort"),
-            Line::from("  →             drill into efforts"),
-            Line::from("  ←             back to providers"),
+            Line::from("  ←             drill into efforts"),
+            Line::from("  →             back to providers (no commit)"),
+            Line::from("  Esc           cancel selector, restore selection"),
         ],
         Zone::EffortSelector => vec![
             Line::from("  ↑/↓           cycle efforts"),
             Line::from("  Enter/Space   confirm + home"),
-            Line::from("  →             confirm + home"),
-            Line::from("  ←             back to models"),
+            Line::from("  →             back to models (no commit)"),
+            Line::from("  Esc           cancel selector, restore selection"),
         ],
     };
     let h = (shortcut_lines.len() as u16 + 2).min(f.area().height);
@@ -566,7 +568,7 @@ pub(super) fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Enter quick   → models   ← roster",
+        " Enter quick   ← models   → roster  Esc cancel",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -612,7 +614,7 @@ pub(super) fn draw_model_selector(f: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Enter quick   → efforts  ← provider",
+        " Enter quick   ← efforts  → provider  Esc cancel",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -667,7 +669,7 @@ pub(super) fn draw_effort_selector(f: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Enter/→: confirm  ←: models",
+        " Enter/Space: confirm  →: models  Esc: cancel",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);

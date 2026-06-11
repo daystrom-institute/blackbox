@@ -282,13 +282,21 @@ const DEFAULT_FLEET_PROVIDER: Provider = Provider::Brodex;
 // ── Zoom axis (§5.1) ──────────────────────────────────────────────────────
 
 /// Left/right is a zoom axis; up/down selects within the current zone.
+///
+/// Selector navigation contract (Y1): ARROWS NEVER COMMIT.
+/// - `←` drills deeper: Roster → ProviderSelector → ModelSelector → EffortSelector
+/// - `→` backs out one level WITHOUT committing anything
+/// - Enter/Space commits the current cursor at whatever depth and returns to Roster;
+///   unvisited deeper levels take that provider's defaults
+/// - Esc exits the selector stack restoring the pre-entry selection
+/// - Per-level cursors persist across re-entry within one selector visit
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Zone {
-    /// Effort selector: ↑/↓ cycle efforts, `←` backs to models, `→` commits + home.
+    /// Effort selector: ↑/↓ cycle efforts, `←` is max depth, `→` backs to models.
     EffortSelector,
-    /// Model selector: ↑/↓ cycle models, `←` backs to providers, `→` drills into efforts.
+    /// Model selector: ↑/↓ cycle models, `←` drills into efforts, `→` backs to providers.
     ModelSelector,
-    /// Provider selector: ↑/↓ cycle providers, `←` backs home, `→` drills into models.
+    /// Provider selector: ↑/↓ cycle providers, `←` drills into models, `→` backs home.
     ProviderSelector,
     /// Home: ↑/↓ cycle agents, `←` provider selector, `→` enter agent.
     Roster,
@@ -379,6 +387,17 @@ enum FocusedTranscriptMsg {
     },
 }
 
+// ── Selector snapshot (Esc restore) ────────────────────────────────────────
+
+/// Saved when entering the provider-selector stack from Roster. Esc restores
+/// all three fields so the operator can bail out without committing anything.
+#[derive(Debug, Clone)]
+struct SelectorSnapshot {
+    provider: Provider,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 // ── App state ──────────────────────────────────────────────────────────────
 
 struct App {
@@ -417,6 +436,15 @@ struct App {
     model_cursor: usize,
     /// Index into the selected provider's effort catalog for the effort selector.
     effort_cursor: usize,
+    /// Snapshot saved when entering the selector stack (from Roster via `←`),
+    /// so Esc can restore the pre-entry provider/model/effort. `None` when
+    /// not inside any selector.
+    selector_snapshot: Option<SelectorSnapshot>,
+    /// Tracks whether each selector level has been visited in the current
+    /// selector session. Used to avoid re-syncing cursors when backing out
+    /// and drilling back in — cursors persist across re-entry.
+    selector_visited_model: bool,
+    selector_visited_effort: bool,
     /// Sticky-next provider — applies to the next dispatch only (§4).
     next_provider: Provider,
     /// Sticky-next model and effort, scoped to [`next_provider`].
@@ -610,6 +638,9 @@ impl App {
             provider_cursor,
             model_cursor,
             effort_cursor,
+            selector_snapshot: None,
+            selector_visited_model: false,
+            selector_visited_effort: false,
             next_provider: default_provider,
             next_model: default_model_for(default_provider).map(str::to_string),
             next_effort: default_effort_for(default_provider).map(str::to_string),
@@ -2384,6 +2415,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 Zone::ProviderSelector | Zone::ModelSelector | Zone::EffortSelector
             ) =>
         {
+            // Restore pre-entry selection and clear the snapshot
+            if let Some(snap) = app.selector_snapshot.take() {
+                app.next_provider = snap.provider;
+                app.next_model = snap.model;
+                app.next_effort = snap.effort;
+                sync_provider_cursor(app);
+                sync_model_cursor(app);
+                sync_effort_cursor(app);
+            }
             app.zone = Zone::Roster;
         }
         KeyCode::Esc => {
@@ -2450,6 +2490,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.cursor_pos = app.input.len();
         }
         // Enter/Space in sub-selectors: commit at the current depth and jump home.
+        // Unvisited deeper levels take the provider's defaults.
         KeyCode::Enter | KeyCode::Char(' ')
             if matches!(
                 app.zone,
@@ -2457,6 +2498,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             ) =>
         {
             commit_current_selector(app);
+            app.selector_snapshot = None;
             app.zone = Zone::Roster;
         }
         KeyCode::Enter => submit(app),
@@ -3791,13 +3833,34 @@ fn zoom_left(app: &mut App) {
     app.zone = match app.zone {
         Zone::SingleAgent => Zone::Roster,
         Zone::Roster => {
-            // Entering provider selector — sync cursor to current next_provider.
+            // Entering provider selector — save snapshot for Esc restore,
+            // clear visited flags, then sync cursor to current next_provider.
+            app.selector_snapshot = Some(SelectorSnapshot {
+                provider: app.next_provider,
+                model: app.next_model.clone(),
+                effort: app.next_effort.clone(),
+            });
+            app.selector_visited_model = false;
+            app.selector_visited_effort = false;
             sync_provider_cursor(app);
             Zone::ProviderSelector
         }
-        Zone::ProviderSelector => Zone::Roster,
-        Zone::ModelSelector => Zone::ProviderSelector,
-        Zone::EffortSelector => Zone::ModelSelector,
+        // ← drills deeper (no commit)
+        Zone::ProviderSelector => {
+            if !app.selector_visited_model {
+                sync_model_cursor(app);
+                app.selector_visited_model = true;
+            }
+            Zone::ModelSelector
+        }
+        Zone::ModelSelector => {
+            if !app.selector_visited_effort {
+                sync_effort_cursor(app);
+                app.selector_visited_effort = true;
+            }
+            Zone::EffortSelector
+        }
+        Zone::EffortSelector => Zone::EffortSelector,
         Zone::Config => Zone::Config,
     };
 }
@@ -3844,22 +3907,16 @@ fn zoom_right(app: &mut App) {
         return;
     }
     match app.zone {
+        // → backs out one level without committing anything
         Zone::EffortSelector => {
-            // Commit effort + model + provider and jump home.
-            commit_full_selection(app);
-            app.zone = Zone::Roster;
+            app.zone = Zone::ModelSelector;
         }
         Zone::ModelSelector => {
-            // Drill into effort selector for the selected model.
-            commit_model_without_flash(app);
-            sync_effort_cursor(app);
-            app.zone = Zone::EffortSelector;
+            app.zone = Zone::ProviderSelector;
         }
         Zone::ProviderSelector => {
-            // Drill into model selector for the selected provider.
-            set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
-            sync_model_cursor(app);
-            app.zone = Zone::ModelSelector;
+            app.selector_snapshot = None;
+            app.zone = Zone::Roster;
         }
         Zone::Roster => {
             if let Some(idx) = app.selected_agent() {
