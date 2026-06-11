@@ -13,8 +13,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/roster-stream-optimistic-insert-and-backoff",
   "notes": "D7+D6 from thread-4719ad45. D7 LIVE-CONFIRMED on POST-campaign HEAD build (2c68365) 2026-06-11 via tmux MCP: single dispatch rendered two identical Active rows, reconciling to one within ~5s — reproduced on both the pre-campaign binary and the HEAD build, so the optimistic-insert race survived the 2026-06-10 campaign. D6 still in code post-campaign: fixed 750ms reconnect sleep, no backoff, now at crates/bro-fleet-client/src/fleet.rs:1788 (roster_subscription_loop at :1731; file moved from bro-cli).",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:44Z",
-  "updated_at": "2026-06-11T17:22:10Z"
+  "updated_at": "2026-06-11T19:27:16Z",
+  "resolved_at": "2026-06-11T19:27:16Z",
+  "resolution_note": "Fixed in f06c957: (a) double-entry race fixed at both layers — TaskStore::insert_if_absent keeps the roster-delivered entry over the local stub, and install_dispatch merges dispatch-only fields into a roster-created row instead of pushing a duplicate (optimistic insert kept so dispatch still reads instant); (b) roster_subscription_loop reconnect backs off 750ms→×2→15s cap, reset on successful connect."
 }

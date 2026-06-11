@@ -13,8 +13,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/closeout-forget-error-observability",
   "notes": "D3+D4 from thread-4719ad45, both re-verified present on POST-campaign HEAD 2026-06-11: D3 at fleet_worktree.rs ~1370 (`let _ = git_run(..branch -D..)` in both arms, deleted_branch reported unconditionally); D4 at fleet_tui.rs:3616 (`let _ = app.orch.forget(&id)` in forget_standalone_agents). Error-path observability shapes — live validation would require inducing git/daemon failures, judged disproportionate; closeout was verified to reap branches in the happy path during dogfood.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:22Z",
-  "updated_at": "2026-06-11T17:22:22Z"
+  "updated_at": "2026-06-11T19:27:19Z",
+  "resolved_at": "2026-06-11T19:27:19Z",
+  "resolution_note": "Fixed in f06c957: closeout Remove phase captures git branch -D result — failure surfaces branch_kept_delete_failed + branch_delete_warning instead of a false deleted_branch claim (phase stays ok; warning not a leak). forget_standalone_agents logs each failed daemon DELETE and flashes a status summary, consistent with remove_agent_row."
 }
