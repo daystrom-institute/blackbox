@@ -12,8 +12,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/focused-transcript-zoom-fidelity",
   "notes": "D8+D9+D10+D11 (+D5) from thread-4719ad45. LIVE-VALIDATED 2026-06-11 via tmux MCP probe (agent 24cc2d4b, brodex, single short task; ground truth from bro_status): D8 CONFIRMED — first user turn `▌ ls -la` rendered twice at the top of the zoom view. D10 CONFIRMED, and worse than described — task completed at 18s but the zoomed view never rendered the final assistant message, AND a nav-out/nav-in refocus STILL showed the transcript ending at the tool result (refocus backfill also misses the final message + completion). D11 CONFIRMED again — throbber showed \"working 39s\" then \"working 1m14s\" climbing for the completed task, persisting across refocus. D9 NOT REPRODUCED on this probe — refocus restored full scrollback — but the 2-turn transcript fits one screen, so \"only last turn or two render\" is indistinguishable from full restore; needs a longer multi-turn session to discriminate before treating as refuted. D5 (started_at hydrated from last_event_at, task.rs:175) remains code-verified only. Fix as ONE tranche on the inline/zoomed render loop + start_focused_transcript + FocusedTranscriptBuffer.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:38Z",
-  "updated_at": "2026-06-11T17:14:28Z"
+  "updated_at": "2026-06-11T17:22:03Z",
+  "resolved_at": "2026-06-11T17:22:03Z",
+  "resolution_note": "Fixed by the 2026-06-10 21:25 fleet TUI campaign (another machine; e.g. e9103fa inline_stable_end watermark, 239ced2 cockpit truthfulness), already merged into beta/blackbox-v2. Re-validated live 2026-06-11 on a HEAD-build cockpit (2c68365) via tmux MCP, two probe dispatches: D8 first turn renders once; D10 new lines + final assistant message render live while zoomed; D11 footer flips to \"✓ took 31s\" (honest elapsed) on completion; D9 nav out/in restores full multi-screen scrollback. My earlier same-day \"live confirmations\" were against a pre-campaign binary (built Jun 10 16:29) and are void. Minor residual NOT worth its own gap: started_at hydration now prefers task.started_at (bro-fleet-client task.rs:201) but one path still falls back to last_event_at (task.rs:230)."
 }

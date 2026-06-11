@@ -12,9 +12,9 @@
   "impact": "high",
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/single-instance-guard",
-  "notes": "D2 from thread-4719ad45. Code-verified (no flock/pidfile/advisory-lock in fleet_tui.rs/main.rs/fleet.rs); live duel repro deliberately NOT performed 2026-06-11 — reproducing requires running two cockpits over the same store, which is the corruption hazard itself. Original dogfood incident (orphan cockpits dueling, corrupted display state) stands as the behavioral evidence. Coordinate with the operator before any live duel repro.",
+  "notes": "D2 from thread-4719ad45. Re-verified ABSENT on post-campaign HEAD 2026-06-11 (no flock/pidfile/advisory-lock/single-instance match in fleet_tui.rs, bro-cli main.rs, or bro-fleet-client fleet.rs) — the 2026-06-10 campaign did not add a guard. Live duel repro deliberately NOT performed: reproducing requires two cockpits over one store, which is the corruption hazard itself; the original dogfood incident stands as behavioral evidence. Coordinate with the operator before any live duel repro.",
   "resolution": "unresolved",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:15Z",
-  "updated_at": "2026-06-11T17:14:31Z"
+  "updated_at": "2026-06-11T17:22:19Z"
 }
