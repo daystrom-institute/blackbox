@@ -73,6 +73,8 @@ where
     result
 }
 
+// rare token-refresh read; offload tracked in thread-935b467d.
+#[allow(clippy::disallowed_methods)]
 async fn load_and_maybe_refresh(
     http: &reqwest::Client,
     auth_path: std::path::PathBuf,
@@ -223,6 +225,8 @@ fn merge_refresh(v: &mut Value, r: &Refreshed) {
 }
 
 /// Atomic write (temp + rename) with 0600 perms.
+// rare token-refresh write; offload tracked in thread-935b467d.
+#[allow(clippy::disallowed_methods)]
 fn write_back(auth_path: &std::path::Path, v: &Value) -> Result<()> {
     let body = serde_json::to_string_pretty(v).context("serialize auth.json")?;
     let tmp = auth_path.with_extension("json.tmp");

@@ -1193,6 +1193,8 @@ fn default_true() -> bool {
     true
 }
 
+// artifact mutations run via run_blocking handlers (wave 13).
+#[allow(clippy::disallowed_methods)]
 fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1201,6 +1203,8 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+// artifact mutations run via run_blocking handlers (wave 13).
+#[allow(clippy::disallowed_methods)]
 fn remove_dir_if_exists(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),

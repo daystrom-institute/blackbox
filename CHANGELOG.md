@@ -8,6 +8,19 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Added
+
+- Phase-4 concurrency enforcement (concurrency-model §5): a `clippy.toml`
+  disallowed-methods gate denies blocking fs/process/tantivy-writer calls in
+  MCP handler modules and the harness crates (sanctioned actor contexts carry
+  reasoned `#[allow]`s), `scripts/lint-concurrency.sh` blocks new sync
+  `#[tool]` handlers and thread spawns in tool modules, and a debug-build
+  `BlockingScope` marker panics if a sanctioned actor body ever runs on a
+  runtime thread. Landing the gate also converted the last two disk-writing
+  sync handlers (`bbox_packet_gap`, `bro_slack_bind`) to the blocking pool,
+  moved `/control/closeout`'s git phases off the runtime workers, and wrapped
+  `apply_patch`'s pre-image reads in the harness blocking helper.
+
 ### Fixed
 
 - Stream-delta ingest no longer does O(message) work per token chunk on the

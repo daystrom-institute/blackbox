@@ -170,6 +170,8 @@ pub type SharedRegistry = Arc<CronRegistry>;
 
 /// Load all persisted cron specs from a directory. Bad files are
 /// logged + skipped (mirrors webhook + poller restore semantics).
+// boot-time store load before the runtime serves traffic.
+#[allow(clippy::disallowed_methods)]
 pub fn load_all(dir: &std::path::Path) -> Vec<CronSpec> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {

@@ -245,6 +245,8 @@ fn writer_loop(rx: Receiver<LogMsg>, path: PathBuf, disabled: Arc<AtomicBool>) {
     }
 }
 
+// runs on the event-log writer thread (wave 14).
+#[allow(clippy::disallowed_methods)]
 fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

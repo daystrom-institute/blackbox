@@ -1,3 +1,10 @@
+// Phase 4 concurrency enforcement (concurrency-model §5): the clippy.toml
+// disallowed_methods list warns crate-wide by default. The store / index /
+// boot layers legitimately do blocking fs on actor threads and blocking-pool
+// contexts, so the crate root allows the lint and the enforcement surfaces
+// re-deny it: src/tools/mod.rs (MCP handlers) — plus scripts/
+// lint-concurrency.sh as the syntactic backstop for handler bodies.
+#![allow(clippy::disallowed_methods)]
 fn main() -> anyhow::Result<()> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
 

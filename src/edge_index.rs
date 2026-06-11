@@ -989,6 +989,8 @@ pub(crate) fn append_project_edges(
     Ok(())
 }
 
+// edge sidecar writes run on the reindex/writer-actor thread.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn replace_project_edges(
     edges_dir: &Path,
     namespace: &str,
@@ -1102,6 +1104,8 @@ pub(crate) struct EdgeSidecarCompactionStats {
     pub blank_lines_dropped: u64,
 }
 
+// invoked from bbox_edge_compact's run_blocking closure.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn compact_legacy_sidecar(
     edges_dir: &Path,
     project_id: &str,

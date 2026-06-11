@@ -788,6 +788,8 @@ impl BlackboxServer {
         .to_string())
     }
 
+    // migration debt: ROADMAP.md render write belongs on the blocking pool / a persister; tracked in thread-935b467d.
+    #[allow(clippy::disallowed_methods)]
     fn roadmap_render(&self, p: serde_json::Value) -> anyhow::Result<String> {
         let project = p.get("project").and_then(|v| v.as_str()).or_else(|| {
             p.get("project_dir")

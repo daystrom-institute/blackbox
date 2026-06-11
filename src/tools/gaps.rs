@@ -15,6 +15,8 @@ impl BlackboxServer {
     /// registered base but write repo-owned files into the worktree so the
     /// branch carries the gap. Other registered projects resolve through the
     /// registry; unregistered paths fall back to filesystem canonicalization.
+    // false positive: called from bbox_gap's run_blocking closure.
+    #[allow(clippy::disallowed_methods)]
     fn resolve_gap_project(&self, raw: &str) -> (String, Option<String>) {
         if let Some((base, worktree)) =
             crate::projects::fleet_worktree_scope_and_dir(raw, &self.state.projects.read().list())

@@ -177,6 +177,8 @@ fn git_status_summary(root: &Path, status_limit: usize) -> Value {
     })
 }
 
+// called from sandbox_status's call_blocking closure (wave 13).
+#[allow(clippy::disallowed_methods)]
 fn git_capture(root: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -445,6 +447,8 @@ fn hardened_walk(base: &Path) -> ignore::Walk {
 }
 
 /// Read a file as UTF-8, returning None for binary/oversized/unreadable.
+// called from content_search's call_blocking closure (wave 13).
+#[allow(clippy::disallowed_methods)]
 fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > max_bytes {
@@ -1473,93 +1477,102 @@ impl Tool for ApplyPatch {
             destructive: true,
         }
     }
+    // The fs reads below run inside the call_blocking closure; clippy's
+    // disallowed_methods is syntactic and cannot see the blocking context.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        // The custom_tool_call freeform channel maps raw text to `source`; also
-        // accept `patch`/`input` for the JSON-function fallback.
-        let patch_text = input
-            .get("source")
-            .or_else(|| input.get("patch"))
-            .or_else(|| input.get("input"))
-            .and_then(|v| v.as_str());
-        let patch_text = match patch_text {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => {
-                return ToolResult::Error(
-                    "apply_patch expects the patch envelope text (as `source`)".to_string(),
-                );
-            }
-        };
-
-        // Snapshot pre-images of every source path the patch touches, so applied
-        // changes feed the edit-diagnostics sink the same way file_edit does.
-        let parsed = match bro_apply_patch::parse_patch(patch_text) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::Error(format!("apply_patch parse error: {e}")),
-        };
-        let mut pre_images: std::collections::HashMap<PathBuf, Vec<u8>> =
-            std::collections::HashMap::new();
-        for hunk in &parsed.hunks {
-            let src = match hunk {
-                bro_apply_patch::Hunk::AddFile { path, .. } => path,
-                bro_apply_patch::Hunk::DeleteFile { path } => path,
-                bro_apply_patch::Hunk::UpdateFile { path, .. } => path,
+        // Sync multi-file pre-image reads + patch application — keep off the
+        // runtime workers (round-2 invariant audit, thread-935b467d).
+        let cx = cx.clone();
+        crate::tool::call_blocking(move || {
+            // The custom_tool_call freeform channel maps raw text to `source`; also
+            // accept `patch`/`input` for the JSON-function fallback.
+            let patch_text = input
+                .get("source")
+                .or_else(|| input.get("patch"))
+                .or_else(|| input.get("input"))
+                .and_then(|v| v.as_str());
+            let patch_text = match patch_text {
+                Some(s) if !s.trim().is_empty() => s,
+                _ => {
+                    return ToolResult::Error(
+                        "apply_patch expects the patch envelope text (as `source`)".to_string(),
+                    );
+                }
             };
-            let abs = cx.root.join(src);
-            pre_images.insert(src.clone(), std::fs::read(&abs).unwrap_or_default());
-        }
 
-        let outcome = match bro_apply_patch::apply_patch(patch_text, &cx.root) {
-            Ok(o) => o,
-            Err(e) => return ToolResult::Error(format!("apply_patch failed: {e}")),
-        };
+            // Snapshot pre-images of every source path the patch touches, so applied
+            // changes feed the edit-diagnostics sink the same way file_edit does.
+            let parsed = match bro_apply_patch::parse_patch(patch_text) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::Error(format!("apply_patch parse error: {e}")),
+            };
+            let mut pre_images: std::collections::HashMap<PathBuf, Vec<u8>> =
+                std::collections::HashMap::new();
+            for hunk in &parsed.hunks {
+                let src = match hunk {
+                    bro_apply_patch::Hunk::AddFile { path, .. } => path,
+                    bro_apply_patch::Hunk::DeleteFile { path } => path,
+                    bro_apply_patch::Hunk::UpdateFile { path, .. } => path,
+                };
+                let abs = cx.root.join(src);
+                pre_images.insert(src.clone(), std::fs::read(&abs).unwrap_or_default());
+            }
 
-        use bro_apply_patch::FileAction;
-        let mut summary = Vec::with_capacity(outcome.changes.len());
-        for ch in &outcome.changes {
-            let abs = cx.root.join(&ch.path);
-            match ch.action {
-                FileAction::Added | FileAction::Updated => {
-                    let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
-                    let post = std::fs::read(&abs).unwrap_or_default();
-                    record_edit(cx, &abs, &pre, &post);
-                }
-                FileAction::Deleted => {
-                    let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
-                    record_edit(cx, &abs, &pre, &[]);
-                }
-                FileAction::Moved => {
-                    // Old path removed, new path created.
-                    if let Some(from) = &ch.moved_from {
-                        let from_abs = cx.root.join(from);
-                        let pre = pre_images.get(from).cloned().unwrap_or_default();
-                        record_edit(cx, &from_abs, &pre, &[]);
+            let outcome = match bro_apply_patch::apply_patch(patch_text, &cx.root) {
+                Ok(o) => o,
+                Err(e) => return ToolResult::Error(format!("apply_patch failed: {e}")),
+            };
+
+            use bro_apply_patch::FileAction;
+            let mut summary = Vec::with_capacity(outcome.changes.len());
+            for ch in &outcome.changes {
+                let abs = cx.root.join(&ch.path);
+                match ch.action {
+                    FileAction::Added | FileAction::Updated => {
+                        let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
                         let post = std::fs::read(&abs).unwrap_or_default();
-                        record_edit(cx, &abs, &[], &post);
+                        record_edit(&cx, &abs, &pre, &post);
+                    }
+                    FileAction::Deleted => {
+                        let pre = pre_images.get(&ch.path).cloned().unwrap_or_default();
+                        record_edit(&cx, &abs, &pre, &[]);
+                    }
+                    FileAction::Moved => {
+                        // Old path removed, new path created.
+                        if let Some(from) = &ch.moved_from {
+                            let from_abs = cx.root.join(from);
+                            let pre = pre_images.get(from).cloned().unwrap_or_default();
+                            record_edit(&cx, &from_abs, &pre, &[]);
+                            let post = std::fs::read(&abs).unwrap_or_default();
+                            record_edit(&cx, &abs, &[], &post);
+                        }
                     }
                 }
+                let verb = match ch.action {
+                    FileAction::Added => "added",
+                    FileAction::Updated => "updated",
+                    FileAction::Deleted => "deleted",
+                    FileAction::Moved => "moved",
+                };
+                match (&ch.moved_from, ch.action) {
+                    (Some(from), FileAction::Moved) => summary.push(format!(
+                        "{verb} {} -> {}",
+                        from.display(),
+                        ch.path.display()
+                    )),
+                    _ => summary.push(format!("{verb} {}", ch.path.display())),
+                }
             }
-            let verb = match ch.action {
-                FileAction::Added => "added",
-                FileAction::Updated => "updated",
-                FileAction::Deleted => "deleted",
-                FileAction::Moved => "moved",
-            };
-            match (&ch.moved_from, ch.action) {
-                (Some(from), FileAction::Moved) => summary.push(format!(
-                    "{verb} {} -> {}",
-                    from.display(),
-                    ch.path.display()
-                )),
-                _ => summary.push(format!("{verb} {}", ch.path.display())),
-            }
-        }
 
-        ToolResult::Text(format!(
-            "Applied patch ({} change{}):\n{}",
-            summary.len(),
-            if summary.len() == 1 { "" } else { "s" },
-            summary.join("\n")
-        ))
+            ToolResult::Text(format!(
+                "Applied patch ({} change{}):\n{}",
+                summary.len(),
+                if summary.len() == 1 { "" } else { "s" },
+                summary.join("\n")
+            ))
+        })
+        .await
     }
 }
 

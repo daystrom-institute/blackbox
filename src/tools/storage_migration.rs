@@ -107,6 +107,8 @@ impl BlackboxServer {
     }
 }
 
+// false positive: called from bbox_storage_migrate_legacy_edges' run_blocking closure.
+#[allow(clippy::disallowed_methods)]
 fn resolve_dry_run_targets(
     registered: &std::collections::HashSet<String>,
     edges_dir: &Path,

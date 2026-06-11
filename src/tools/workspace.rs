@@ -218,6 +218,8 @@ fn resolve_repo(repo: Option<&str>) -> anyhow::Result<PathBuf> {
 
 // ── Helper: run git command in repo, return stdout ────────────────────
 
+// false positive: called from work_* handlers' run_blocking closures.
+#[allow(clippy::disallowed_methods)]
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -235,6 +237,8 @@ fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
 // ── Helper: run subprocess with timeout ──────────────────────────────
 // Returns (exit_code, stdout, stderr, was_truncated, timed_out)
 
+// false positive: called from work_* handlers' run_blocking closures.
+#[allow(clippy::disallowed_methods)]
 fn run_with_timeout(
     command: &str,
     cwd: &Path,
@@ -541,6 +545,8 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
     }))?)
 }
 
+// false positive: called from work_smart_read's run_blocking closure.
+#[allow(clippy::disallowed_methods)]
 fn impl_work_smart_read(state: &SharedState, p: &WorkSmartReadParams) -> anyhow::Result<String> {
     let path = Path::new(&p.file_path);
     if !path.exists() {
@@ -852,6 +858,8 @@ fn git_untracked_paths(repo_path: &Path, path_filter: Option<&str>) -> anyhow::R
         .collect())
 }
 
+// false positive: called from work_* handlers' run_blocking closures.
+#[allow(clippy::disallowed_methods)]
 fn git_diff_untracked_file(repo_path: &Path, path: &str) -> anyhow::Result<String> {
     let out = Command::new("git")
         .arg("-C")

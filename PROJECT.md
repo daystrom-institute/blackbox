@@ -68,6 +68,14 @@ cargo test --lib
 cargo clippy
 ```
 
+Concurrency enforcement (Phase 4, design/daemon-runtime/concurrency-model.md
+§5) rides the baseline: `cargo clippy` enforces the `clippy.toml`
+disallowed-methods gate (blocking fs/process calls deny in `src/tools/` and
+the harness crates; sanctioned actor contexts carry reasoned `#[allow]`s),
+and `scripts/lint-concurrency.sh` is the handler-shape backstop — no new
+sync `#[tool]` handlers, no thread spawns in tool modules. Run it alongside
+clippy when touching MCP handlers.
+
 Targeted recipes:
 
 - Tool docs or MCP adapters: run the relevant tool/module tests and ensure

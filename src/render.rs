@@ -304,6 +304,8 @@ fn managed_body_trimmed(block: &str) -> &str {
 
 /// Snapshot a file to `~/.local/state/blackbox/backups/<ISO-ts>/<filename>`.
 /// Returns the destination path. Creates parent dirs as needed.
+// render backup snapshots run inside the render handlers' run_blocking closures.
+#[allow(clippy::disallowed_methods)]
 pub fn snapshot_file(src: &Path) -> Result<PathBuf> {
     let backup_root = backup_root()?;
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -512,11 +514,7 @@ mod tests {
         }
 
         let p = root.join("CLAUDE.md");
-        std::fs::write(
-            &p,
-            format!("{MANAGED_START}\nold body\n{MANAGED_END}\n"),
-        )
-        .unwrap();
+        std::fs::write(&p, format!("{MANAGED_START}\nold body\n{MANAGED_END}\n")).unwrap();
 
         let plan = plan_managed_patch(&p, "").unwrap();
         // allow_empty=true bypasses the guard
@@ -544,11 +542,7 @@ mod tests {
         }
 
         let p = root.join("CLAUDE.md");
-        std::fs::write(
-            &p,
-            format!("{MANAGED_START}\nold\n{MANAGED_END}\n"),
-        )
-        .unwrap();
+        std::fs::write(&p, format!("{MANAGED_START}\nold\n{MANAGED_END}\n")).unwrap();
 
         // non-empty body → guard does not fire
         let plan = plan_managed_patch(&p, "new content").unwrap();

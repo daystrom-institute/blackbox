@@ -477,6 +477,8 @@ Constraints:\n\
         name = "bro_webhook_install",
         description = "Install a webhook endpoint reachable at POST /webhook/<name>. Signature verification, extractor projection, and routing-packet dispatch are mechanical at the daemon. Routing packets must already be operator-installed in the global packet store."
     )]
+    // migration debt: webhook/poller spec persists belong on a StorePersister; tracked in thread-935b467d.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) async fn bro_webhook_install(
         &self,
         Parameters(p): Parameters<WebhookInstallParams>,
@@ -523,6 +525,8 @@ Constraints:\n\
         name = "bro_poller_install",
         description = "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (>= BBOX_POLLER_MIN_INTERVAL_SECS, default 5), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. Persisted to disk + tick loop spawned immediately; reinstall replaces the running task."
     )]
+    // migration debt: webhook/poller spec persists belong on a StorePersister; tracked in thread-935b467d.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) async fn bro_poller_install(
         &self,
         Parameters(p): Parameters<PollerInstallParams>,
@@ -564,6 +568,8 @@ Constraints:\n\
         name = "bro_cron_install",
         description = "Install a calendar-driven cron inlet — sibling of webhook + poller. Same routing pipeline (extractor → routing packet → dispatch_routed_event), different trigger source: wall-clock schedule, no fetch. Spec: name, schedule (6-field cron expr `sec min hour dom mon dow`), optional payload (operator-supplied entity fields), optional concurrency cap (default 1, set 0 to disable), routing_packet, optional default_project_dir. Synthetic entity fields `cron_name` + `tick_at` are merged in at tick time so routing rules can discriminate."
     )]
+    // migration debt: webhook/poller spec persists belong on a StorePersister; tracked in thread-935b467d.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) async fn bro_cron_install(
         &self,
         Parameters(p): Parameters<CronInstallParams>,
@@ -626,6 +632,8 @@ Constraints:\n\
         name = "bro_workflow_install",
         description = "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced."
     )]
+    // migration debt: webhook/poller spec persists belong on a StorePersister; tracked in thread-935b467d.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) async fn bro_workflow_install(
         &self,
         Parameters(p): Parameters<WorkflowInstallParams>,

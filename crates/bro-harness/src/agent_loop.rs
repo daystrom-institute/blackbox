@@ -629,6 +629,8 @@ fn web_search_enabled() -> bool {
 }
 
 impl Session {
+    // one-time session construction; cwd canonicalize happens before the loop serves turns.
+    #[allow(clippy::disallowed_methods)]
     async fn build(
         cli: &Cli,
         callback: Option<EventCallback>,

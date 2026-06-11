@@ -244,6 +244,8 @@ impl ToolEdgeContext {
         Ok(1)
     }
 
+    // index-build path; runs on the IndexWriterActor / reindex thread.
+    #[allow(clippy::disallowed_methods)]
     fn resolve_project_path<'a>(
         &'a self,
         event: &ParsedEvent,

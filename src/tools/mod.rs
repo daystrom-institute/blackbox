@@ -1,3 +1,8 @@
+// Phase 4 enforcement surface (concurrency-model §5): MCP handler modules
+// must not call blocking fs/process APIs inline on tokio workers. Sanctioned
+// exceptions (run_blocking-closure helpers, tracked migration debt) carry
+// reasoned #[allow]s; everything else is a build error.
+#![deny(clippy::disallowed_methods)]
 pub mod agents;
 pub mod artifacts;
 pub mod atoms;

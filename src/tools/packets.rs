@@ -138,7 +138,20 @@ impl BlackboxServer {
         name = "bbox_packet_gap",
         description = "Log a packet-authoring gap: 'I wanted to compile a rule but the AST couldn't express it'. Use when you fall back to prose, ad-hoc code, or a different tool because a primitive you needed isn't available. The `description` names what you wanted; `ast_feature_requested` names the primitive you wished existed (e.g. `RateCmp`, `StringMatches`, `Within{temporal}`). These gaps are the highest-signal input for prioritizing new AST primitives — every gap logged is a vote for what the packet system can't yet say. Query via bbox_packet_events(op='gap')."
     )]
-    pub(crate) fn bbox_packet_gap(&self, Parameters(p): Parameters<GapParams>) -> CallToolResult {
+    pub(crate) async fn bbox_packet_gap(
+        &self,
+        Parameters(p): Parameters<GapParams>,
+    ) -> CallToolResult {
+        // log_gap appends a fsync'd packet event and the companion note
+        // writes the gap store — blocking pool, not a tokio worker.
+        let server = self.clone();
+        match tokio::task::spawn_blocking(move || server.bbox_packet_gap_sync(p)).await {
+            Ok(result) => result,
+            Err(e) => Self::err_text(&format!("packet gap task failed: {e}")),
+        }
+    }
+
+    fn bbox_packet_gap_sync(&self, p: GapParams) -> CallToolResult {
         let start = std::time::Instant::now();
         let tool = "bbox_packet_gap";
 

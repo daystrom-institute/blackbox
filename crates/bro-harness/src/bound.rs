@@ -41,6 +41,8 @@ pub fn dump_dir() -> PathBuf {
 /// If `content` exceeds `cap`, spill the full payload to a file under `dir` and
 /// return a head + rider; otherwise return `content` unchanged. `cap == 0`
 /// disables bounding. `id` (the tool_use id) makes the filename unique.
+// oversized-result spill is rare; offload tracked in thread-935b467d.
+#[allow(clippy::disallowed_methods)]
 pub fn bound_tool_result(tool: &str, content: String, cap: usize, dir: &Path, id: &str) -> String {
     if cap == 0 || content.len() <= cap {
         return content;

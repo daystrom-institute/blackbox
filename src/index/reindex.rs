@@ -167,7 +167,10 @@ pub(super) fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64
 fn scan_adapter_source_files(config: &ReindexConfig, files: &mut Vec<(String, u64, u64)>) {
     let registry = TranscriptAdapterRegistry::from_reindex_config(config);
     for adapter in registry.adapters() {
-        for target in [TranscriptScanTarget::Sessions, TranscriptScanTarget::History] {
+        for target in [
+            TranscriptScanTarget::Sessions,
+            TranscriptScanTarget::History,
+        ] {
             match adapter.scan_locations(target) {
                 Ok(locations) => {
                     for location in locations {
@@ -294,6 +297,8 @@ fn scheduled_reindex_tick(
 /// IndexWriterActor). `drain` is invoked at phase boundaries so small ops
 /// queued behind the pass land in the same commit instead of waiting for
 /// the next cycle. Returns the human-readable summary line.
+// the IndexWriterActor's own pass — the sanctioned single-writer site (concurrency-model §4.3).
+#[allow(clippy::disallowed_methods)]
 pub(super) fn execute_reindex_pass(
     index: &Index,
     config: &ReindexConfig,
@@ -795,9 +800,9 @@ pub(super) fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::orchestration::providers::Provider;
     use super::*;
     use crate::entity_ref;
+    use crate::orchestration::providers::Provider;
     use crate::parser::{MessageRole, ParsedEvent};
     use crate::transcripts::types::{
         NormalizedTranscriptEvent, RawTranscriptRef, TranscriptStorage,
@@ -826,12 +831,11 @@ mod tests {
             0,
             0,
         );
-        let normalized =
-            NormalizedTranscriptEvent::from_parsed_event(
-                crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
-                parsed,
-                raw,
-            );
+        let normalized = NormalizedTranscriptEvent::from_parsed_event(
+            crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
+            parsed,
+            raw,
+        );
         let doc = normalized_to_doc(
             &normalized,
             "codex",

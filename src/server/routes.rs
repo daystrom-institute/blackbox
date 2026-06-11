@@ -1036,7 +1036,23 @@ pub(crate) async fn control_closeout_handler(
     // local type; the driver fires them at phase boundaries. Skipped on dry_run.
     driver_req.closeout_hooks = req.closeout_hooks.as_ref().map(to_driver_hooks);
 
-    let outcome = run_closeout_phases(&driver_req);
+    // The closeout phases shell out to sync git (fetch/rebase/merge/push/
+    // worktree-remove — seconds to minutes) plus closeout hook scriptlets;
+    // run on the blocking pool, never inline on a runtime worker (I2,
+    // concurrency-model §5 Phase 4).
+    let outcome = tokio::task::spawn_blocking(move || run_closeout_phases(&driver_req))
+        .await
+        .unwrap_or_else(|join_err| {
+            ToolOutcome::Failed(bro_tools::fleet_worktree::PhaseResult {
+                phase: bro_tools::fleet_worktree::CloseoutPhase::Preflight,
+                repo_cwd: std::path::PathBuf::new(),
+                ok: false,
+                error_class: bro_tools::fleet_worktree::CloseoutErrorClass::None,
+                content: serde_json::json!({
+                    "error": format!("closeout driver task failed: {join_err}"),
+                }),
+            })
+        });
 
     // Translate bro_tools::CloseoutOutcome into the bro_protocol wire shape.
     // The two type families are intentionally distinct (bro_protocol is
@@ -1943,6 +1959,7 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
     std::thread::Builder::new()
         .name("blackbox-edge-rebuild".into())
         .spawn(move || {
+            let _scope = crate::util::BlockingScope::enter();
             // Nudge channel: async tool handlers whose store mutations change
             // projected edges wake this thread instead of rebuilding inline.
             let nudge_rx = state.edge_rebuild_nudge_rx.lock().unwrap().take();

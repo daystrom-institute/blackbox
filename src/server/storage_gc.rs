@@ -36,6 +36,7 @@ pub(crate) fn spawn_storage_gc_thread(state: Arc<SharedState>, interval: std::ti
     let _ = std::thread::Builder::new()
         .name("blackbox-storage-gc".into())
         .spawn(move || {
+            let _scope = crate::util::BlockingScope::enter();
             // Avoid competing with startup rebuilds, watcher initialization, and
             // client handshakes. Operators can still run bbox_storage_gc manually.
             std::thread::sleep(interval);
@@ -70,7 +71,8 @@ fn run_storage_gc_pass(state: &SharedState) -> anyhow::Result<()> {
     };
     let mut policy = storage_health::GcPolicy::default();
     policy.materialized_snapshots.max_age_days = Some(snapshot_max_age_days_from_env());
-    let candidates = storage_health::plan_gc_with_policy(&edges_dir, &registered, &params, &policy)?;
+    let candidates =
+        storage_health::plan_gc_with_policy(&edges_dir, &registered, &params, &policy)?;
     let deletable_bytes: u64 = candidates
         .iter()
         .filter(|candidate| candidate.deletable)

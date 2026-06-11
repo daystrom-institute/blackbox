@@ -109,6 +109,8 @@ fn project_agents_paths(cwd: &Path, names: &[String]) -> Vec<PathBuf> {
     chain
 }
 
+// one-time session-start project-doc read, before the loop serves turns.
+#[allow(clippy::disallowed_methods)]
 fn read_nonempty(path: &Path) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => Some(s),

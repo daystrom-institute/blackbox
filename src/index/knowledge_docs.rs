@@ -54,6 +54,8 @@ pub(crate) fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
     matches!(entry.status, Status::Active | Status::Superseded)
 }
 
+// executes inside the IndexWriterActor pass (sanctioned single-writer).
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn reindex_knowledge_store_standalone(
     knowledge_path: &Path,
     projects_path: &Path,

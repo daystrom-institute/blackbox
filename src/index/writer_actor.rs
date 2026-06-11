@@ -95,7 +95,10 @@ impl IndexWriterActor {
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
-            .spawn(move || run_actor(rx, ctx))
+            .spawn(move || {
+                let _scope = crate::util::BlockingScope::enter();
+                run_actor(rx, ctx)
+            })
         {
             tracing::error!(error = %err, "failed to spawn index writer actor thread");
         }
@@ -215,7 +218,12 @@ fn process_batch(ctx: &ActorCtx, batch: Vec<IndexWriteOp>) {
 /// ops into the same writer at phase boundaries so they land in the pass's
 /// commit. Concurrent pass requests are refused (callers retry); flushes
 /// drained mid-pass are acked after the commit.
-fn run_pass(ctx: &ActorCtx, rx: &mpsc::Receiver<IndexWriteOp>, full: bool, dirty: bool) -> Result<String> {
+fn run_pass(
+    ctx: &ActorCtx,
+    rx: &mpsc::Receiver<IndexWriteOp>,
+    full: bool,
+    dirty: bool,
+) -> Result<String> {
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     if !full {
         writer.set_merge_policy(Box::new(conservative_log_merge_policy()));

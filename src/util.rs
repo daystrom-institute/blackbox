@@ -603,3 +603,46 @@ mod tests {
         }
     }
 }
+
+/// Debug-build marker for sanctioned blocking contexts (Phase 4 of
+/// design/daemon-runtime/concurrency-model.md §5; invariants I1/I2).
+///
+/// Owner-actor threads (StorePersister, IndexWriterActor, storage GC, the
+/// edge-rebuild watcher, …) enter this scope at thread start. The
+/// constructor debug-asserts the thread is NOT a tokio runtime thread, so a
+/// refactor that accidentally moves an actor body into an async context
+/// panics in `cargo test --lib` / debug builds instead of silently blocking
+/// runtime workers in production.
+pub struct BlockingScope;
+
+impl BlockingScope {
+    pub fn enter() -> Self {
+        debug_assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "BlockingScope entered on a tokio runtime thread — sanctioned \
+             blocking actors must run on dedicated OS threads or the blocking \
+             pool (concurrency-model I2)"
+        );
+        BlockingScope
+    }
+}
+
+#[cfg(test)]
+mod blocking_scope_tests {
+    use super::BlockingScope;
+
+    #[test]
+    fn enter_on_plain_thread_is_fine() {
+        std::thread::spawn(|| {
+            let _scope = BlockingScope::enter();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "BlockingScope entered on a tokio runtime thread")]
+    async fn enter_on_runtime_thread_panics_in_debug() {
+        let _scope = BlockingScope::enter();
+    }
+}

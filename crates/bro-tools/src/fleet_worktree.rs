@@ -758,6 +758,8 @@ struct HookScriptOutcome {
 /// Run a single scriptlet via `bash -lc` with a wall-clock timeout. stdout/stderr
 /// are drained on dedicated threads (so a scriptlet that fills the pipe buffer
 /// cannot deadlock the poll loop) and truncated to keep the phase content small.
+// closeout hooks run on the blocking pool via /control/closeout (wave 16).
+#[allow(clippy::disallowed_methods)]
 fn run_hook_scriptlet(
     script: &str,
     cwd: &Path,
@@ -1373,6 +1375,8 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
     }
 }
 
+// fleet-client / blocking-pool contexts; the model-facing tool is unregistered.
+#[allow(clippy::disallowed_methods)]
 fn enter_worktree(cx_root: &Path, args: EnterWorktreeInput) -> anyhow::Result<Value> {
     let parent_worktree = git_toplevel(cx_root)?;
     let base_repo = fleet_base_repo(cx_root)?;
@@ -1793,6 +1797,8 @@ fn is_safe_pathspec(raw: &str) -> bool {
         })
 }
 
+// closeout/worktree git runs on the blocking pool via /control/closeout (wave 16).
+#[allow(clippy::disallowed_methods)]
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .arg("-C")
@@ -1802,6 +1808,8 @@ fn git_ok(cwd: &Path, args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+// closeout/worktree git runs on the blocking pool via /control/closeout (wave 16).
+#[allow(clippy::disallowed_methods)]
 fn git_capture(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
     if out.status.success() {
@@ -1811,6 +1819,8 @@ fn git_capture(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     }
 }
 
+// closeout/worktree git runs on the blocking pool via /control/closeout (wave 16).
+#[allow(clippy::disallowed_methods)]
 fn git_run(cwd: &Path, args: &[&str]) -> anyhow::Result<()> {
     let out = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
     if out.status.success() {

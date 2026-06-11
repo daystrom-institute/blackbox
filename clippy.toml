@@ -1,0 +1,32 @@
+# Phase 4 enforcement — design/daemon-runtime/concurrency-model.md §5.
+#
+# Invariant I2: blocking I/O must not run on tokio runtime workers. Allowed
+# only inside run_blocking / spawn_blocking closures, sanctioned actor /
+# persister / worker-thread modules (each carries a reasoned
+# #[allow(clippy::disallowed_methods)]), and test scopes.
+#
+# Deviation from the wave-13 lint design: tokio::fs::* entries were dropped —
+# tokio::fs offloads to the blocking pool internally, so denying it would
+# flag the correctly-async tool bodies.
+#
+# The companion backstop is scripts/lint-concurrency.sh, which catches what
+# clippy cannot scope: sync #[tool] handlers and fs/process calls inside
+# handler bodies that aren't wrapped in a blocking-pool closure.
+
+disallowed-methods = [
+    { path = "std::fs::read_to_string", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::read", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::read_dir", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::write", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::create_dir_all", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::create_dir", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::remove_file", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::remove_dir_all", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::rename", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::copy", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::metadata", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::fs::canonicalize", reason = "blocking I/O on tokio workers (I2); use run_blocking/spawn_blocking or a sanctioned actor (concurrency-model §5)" },
+    { path = "std::process::Command::new", reason = "child-process wait blocks tokio workers (I2); use tokio::process or run on the blocking pool (concurrency-model §5)" },
+    { path = "tantivy::IndexWriter::commit", reason = "single-writer tantivy mutation; route through IndexWriterActor (concurrency-model §4.3)" },
+    { path = "tantivy::IndexWriter::add_document", reason = "single-writer tantivy mutation; route through IndexWriterActor (concurrency-model §4.3)" },
+]

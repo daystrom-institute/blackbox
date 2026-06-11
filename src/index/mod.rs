@@ -684,6 +684,8 @@ pub(crate) fn register_code_tokenizer(index: &Index) {
     );
 }
 
+// one-time boot path before the runtime serves traffic.
+#[allow(clippy::disallowed_methods)]
 fn reset_index_on_schema_mismatch(index_path: &Path) -> Result<()> {
     if !index_path.exists() {
         return Ok(());
@@ -1085,12 +1087,12 @@ pub(crate) use knowledge_docs::{
 };
 pub(crate) use reindex::backfill_tool_edges_for_project;
 pub(crate) use reindex::spawn_reindex_thread;
-pub(crate) use writer_actor::{IndexWriteOp, IndexWriterActor};
 pub(crate) use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
 pub use search::{
     CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ReindexParams, SearchParams,
     SessionParams, SessionsListParams, TopicsParams,
 };
+pub(crate) use writer_actor::{IndexWriteOp, IndexWriterActor};
 
 pub(crate) fn resolve_current_project_chunk_entity(
     project: &crate::projects::ProjectRecord,

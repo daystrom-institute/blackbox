@@ -34,10 +34,20 @@ impl BlackboxServer {
         name = "bro_slack_bind",
         description = "Bind a Slack channel to a bbox project. The binding scopes inbound Slack→badgey activity to a single project and gives the daily-triage cron a per-channel home for proposal posts. Channel id (C-prefix) is the stable lookup key; rename-safe. Actions: bind, unbind, list, lookup. Project accepts absolute path or 8-hex project_id from the registry."
     )]
-    pub(crate) fn bro_slack_bind(
+    pub(crate) async fn bro_slack_bind(
         &self,
         Parameters(p): Parameters<BroSlackBindParams>,
     ) -> CallToolResult {
+        // bind/unbind persist the bindings store to disk — blocking pool,
+        // not a tokio worker.
+        let server = self.clone();
+        match tokio::task::spawn_blocking(move || server.bro_slack_bind_sync(p)).await {
+            Ok(result) => result,
+            Err(e) => Self::err_text(&format!("slack bind task failed: {e}")),
+        }
+    }
+
+    fn bro_slack_bind_sync(&self, p: BroSlackBindParams) -> CallToolResult {
         let store = &self.state.slack_channel_bindings;
         match p.action.as_str() {
             "bind" => {

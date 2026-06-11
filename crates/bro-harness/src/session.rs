@@ -85,6 +85,8 @@ static NONCE: AtomicU64 = AtomicU64::new(0);
 /// Atomically write `contents` to `path` using tmp+rename, matching the
 /// daemon's `json_store::atomic_write_json_locked` idiom. A crash mid-write
 /// leaves at most a stale `.tmp` file; the target is never partially written.
+// callers wrap session persists in spawn_blocking (wave 6b).
+#[allow(clippy::disallowed_methods)]
 pub fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
     let pid = std::process::id();
     let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
@@ -109,6 +111,8 @@ pub fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
 }
 
 impl SessionStore {
+    // one-time session open/resume, before the loop serves turns.
+    #[allow(clippy::disallowed_methods)]
     pub fn open(session_id: Option<&str>, resume: Option<&str>) -> Result<Self> {
         let dir = sessions_dir();
         std::fs::create_dir_all(&dir).context("create sessions dir")?;
@@ -134,18 +138,13 @@ impl SessionStore {
                     let legacy_path = legacy_sessions_dir().join(format!("{rid}.json"));
                     match std::fs::read_to_string(&legacy_path) {
                         Ok(s) => {
-                            let v: Value = serde_json::from_str(&s)
-                                .context("parse resumed legacy session")?;
+                            let v: Value =
+                                serde_json::from_str(&s).context("parse resumed legacy session")?;
                             Some(Restored {
-                                transport: v["transport"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
+                                transport: v["transport"].as_str().unwrap_or_default().to_string(),
                                 model: v["model"].as_str().map(str::to_string),
                                 code_mode: v["code_mode"].as_str().map(str::to_string),
-                                service_tier: v["service_tier"]
-                                    .as_str()
-                                    .map(str::to_string),
+                                service_tier: v["service_tier"].as_str().map(str::to_string),
                                 snapshot: v["snapshot"].clone(),
                                 side: v.get("side").cloned().unwrap_or(Value::Null),
                             })

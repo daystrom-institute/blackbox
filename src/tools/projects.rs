@@ -34,6 +34,8 @@ struct ProjectInitResult {
     skipped: Vec<String>,
 }
 
+// migration debt: project-init scaffolding writes inline; run_blocking conversion tracked in thread-935b467d.
+#[allow(clippy::disallowed_methods)]
 fn write_or_skip_file(
     path: &Path,
     contents: &str,
@@ -57,6 +59,8 @@ fn write_or_skip_file(
     Ok(())
 }
 
+// migration debt: project-init scaffolding writes inline; run_blocking conversion tracked in thread-935b467d.
+#[allow(clippy::disallowed_methods)]
 fn write_or_skip_mcp(
     path: &Path,
     force: bool,
@@ -77,6 +81,8 @@ fn write_or_skip_mcp(
     Ok(())
 }
 
+// migration debt: project-init scaffolding writes inline; run_blocking conversion tracked in thread-935b467d.
+#[allow(clippy::disallowed_methods)]
 fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectInitResult> {
     let project_dir = project_dir
         .canonicalize()
@@ -245,6 +251,7 @@ impl BlackboxServer {
             {
                 let reindex_cfg = server.state.idx.read().reindex_config();
                 let project_for_backfill = record.clone();
+                // lint-concurrency: allow(thread-spawn) — one-shot registration backfill; relocation to an owner module tracked in thread-935b467d
                 std::thread::spawn(move || {
                     match index::backfill_tool_edges_for_project(
                         &reindex_cfg,

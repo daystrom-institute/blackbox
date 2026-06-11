@@ -65,6 +65,8 @@ pub struct CompactionPolicy {
 }
 
 impl CompactionPolicy {
+    // once per session init.
+    #[allow(clippy::disallowed_methods)]
     pub fn from_env() -> Self {
         let enabled = std::env::var("BRO_HARNESS_COMPACTION")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("off") && !v.eq_ignore_ascii_case("false"))

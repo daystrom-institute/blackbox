@@ -1,3 +1,7 @@
+// Phase 4 (concurrency-model §5): sidecar binary owns its runtime; the
+// crate-wide clippy.toml disallowed_methods list is allowed here like the
+// daemon lib root (enforcement scopes to src/tools + the lint script).
+#![allow(clippy::disallowed_methods)]
 #![allow(
     clippy::collapsible_if,
     clippy::doc_overindented_list_items,

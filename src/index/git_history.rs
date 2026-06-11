@@ -47,6 +47,8 @@ pub(super) fn git_meta_dir_from_projects_path(projects_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("git_meta"))
 }
 
+// executes inside the IndexWriterActor pass (sanctioned single-writer).
+#[allow(clippy::disallowed_methods)]
 pub(super) fn index_git_history_for_project(
     project: &ProjectRecord,
     root: &Path,

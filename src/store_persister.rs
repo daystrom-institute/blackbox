@@ -67,7 +67,10 @@ impl<S: StoreSnapshot> StorePersister<S> {
         let thread_name = format!("{name}-persist");
         let spawned = std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run_actor(rx, store_w, path_w));
+            .spawn(move || {
+                let _scope = crate::util::BlockingScope::enter();
+                run_actor(rx, store_w, path_w)
+            });
         if let Err(err) = spawned {
             tracing::error!(error = %err, store = %name, "failed to spawn store persister thread");
         }

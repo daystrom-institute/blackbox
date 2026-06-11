@@ -63,6 +63,8 @@ impl CouncilRegistry {
     /// are NOT spawned here — call `respawn_workers_after_restart`
     /// after `SharedState` is fully constructed so the dispatch path
     /// has the full state graph.
+    // boot-time store load before the runtime serves traffic.
+    #[allow(clippy::disallowed_methods)]
     pub fn set_storage_dir(&self, dir: PathBuf) -> Result<()> {
         {
             let slot = self.storage_dir.read();
