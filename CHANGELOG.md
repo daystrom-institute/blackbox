@@ -28,6 +28,17 @@ out explicitly under `Changed` or `Removed`.
   turn. Previously every protocol event paid a full-envelope serialize +
   sync write inline in the agent loop (40–65 events/sec while a bro
   streams, events up to ~100KB).
+- `bro agent` now renders its agent's transcript. The standalone cockpit read
+  the task handle's local event buffer, which daemon-backed dispatch never
+  fills — the prompt appeared sent but no response, thinking, or result ever
+  rendered, and the activity throbber counted forever. Standalone now rides
+  the same focused-transcript SSE stream as the fleet zoom view, swaps in the
+  daemon roster handle so lifecycle updates flow, and both cockpits refetch
+  the focused snapshot when the focused task reaches a terminal status so the
+  closing assistant turn always appears. Terminal agents now render
+  "✓ took Ns" instead of a perpetual "working" spinner (the state previously
+  derived from a stream heuristic that defaults to turn-active on an empty
+  event buffer).
 - In-process harness tool execution no longer blocks the daemon's async
   runtime: the sync-bodied builtins (`content_search`, `glob`,
   `sandbox_status`, `sandbox_grounding` — tree walks, capped reads, sync git
