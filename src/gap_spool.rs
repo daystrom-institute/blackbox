@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::gaps::{GapNote, GapStore};
-use crate::projects::ProjectRegistry;
 
 const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
 
@@ -88,18 +87,20 @@ struct ImportedFingerprint {
     imported_at: String,
 }
 
+/// `project_roots` are canonical project paths (the caller maps them from
+/// its project registry); each contributes a `.bbox/gaps/inbox` spool dir.
 pub fn import_gap_spool(
     gaps: &mut GapStore,
-    registry: &ProjectRegistry,
+    project_roots: &[String],
     state_dir: &Path,
 ) -> Result<GapSpoolImportReport> {
     let host_inbox = host_gap_inbox_dir();
-    import_gap_spool_from_dirs(gaps, registry, state_dir, Some(host_inbox))
+    import_gap_spool_from_dirs(gaps, project_roots, state_dir, Some(host_inbox))
 }
 
 pub fn import_gap_spool_from_dirs(
     gaps: &mut GapStore,
-    registry: &ProjectRegistry,
+    project_roots: &[String],
     state_dir: &Path,
     host_inbox: Option<PathBuf>,
 ) -> Result<GapSpoolImportReport> {
@@ -107,7 +108,7 @@ pub fn import_gap_spool_from_dirs(
     let mut state = load_state(&state_path)?;
     let mut report = GapSpoolImportReport::default();
 
-    for source in spool_sources(registry, host_inbox) {
+    for source in spool_sources(project_roots, host_inbox) {
         let entries = match fs::read_dir(&source.inbox_dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -260,13 +261,13 @@ fn move_file(path: &Path, target_dir: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
-fn spool_sources(registry: &ProjectRegistry, host_inbox: Option<PathBuf>) -> Vec<SpoolSource> {
+fn spool_sources(project_roots: &[String], host_inbox: Option<PathBuf>) -> Vec<SpoolSource> {
     let mut out = Vec::new();
-    for record in registry.list() {
-        let root = PathBuf::from(&record.canonical_path);
+    for canonical_path in project_roots {
+        let root = PathBuf::from(canonical_path);
         out.push(SpoolSource {
             inbox_dir: root.join(".bbox").join("gaps").join("inbox"),
-            project: Some(record.canonical_path),
+            project: Some(canonical_path.clone()),
         });
     }
     if let Some(inbox_dir) = host_inbox {
@@ -342,12 +343,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
-        let record = registry.register_path(&project).unwrap();
+        let canonical = project.canonicalize().unwrap().to_string_lossy().to_string();
+        let roots = vec![canonical.clone()];
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let report =
-            import_gap_spool_from_dirs(&mut gaps, &registry, &dir.path().join("state"), None)
+            import_gap_spool_from_dirs(&mut gaps, &roots, &dir.path().join("state"), None)
                 .unwrap();
 
         assert_eq!(report.imported.len(), 1);
@@ -355,7 +356,7 @@ mod tests {
         assert_eq!(gaps.all().len(), 1);
         assert_eq!(
             gaps.all()[0].project.as_deref(),
-            Some(record.canonical_path.as_str())
+            Some(canonical.as_str())
         );
     }
 
@@ -369,12 +370,11 @@ mod tests {
             gap_body("Need host hook", "host-hook"),
         )
         .unwrap();
-        let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let report = import_gap_spool_from_dirs(
             &mut gaps,
-            &registry,
+            &[],
             &dir.path().join("state"),
             Some(host.clone()),
         )
@@ -391,12 +391,11 @@ mod tests {
         let host = dir.path().join("host/inbox");
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("bad.json"), "{not json").unwrap();
-        let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let report = import_gap_spool_from_dirs(
             &mut gaps,
-            &registry,
+            &[],
             &dir.path().join("state"),
             Some(host.clone()),
         )
@@ -414,12 +413,11 @@ mod tests {
         let host = dir.path().join("host/inbox");
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("first.json"), gap_body("Need hook", "hook")).unwrap();
-        let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let first = import_gap_spool_from_dirs(
             &mut gaps,
-            &registry,
+            &[],
             &dir.path().join("state"),
             Some(host.clone()),
         )
@@ -433,7 +431,7 @@ mod tests {
         .unwrap();
         let second = import_gap_spool_from_dirs(
             &mut gaps,
-            &registry,
+            &[],
             &dir.path().join("state"),
             Some(host.clone()),
         )

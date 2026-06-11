@@ -5433,6 +5433,39 @@ mod tests {
     }
 
     #[test]
+    fn workload_retro_prompt_names_only_valid_gap_kinds() {
+        // The retro probe instructs bros to file gaps with a specific
+        // gap_kind. Those tokens must stay parseable as `gaps::GapKind` —
+        // a mismatch makes every retro `bbox_gap` call fail. (Lives here,
+        // not in the gaps store, because this is the side that owns the
+        // prompt and depends on the store crate.)
+        use std::str::FromStr;
+
+        use crate::gaps::GapKind;
+
+        let prompt = WORKLOAD_RETRO_PROMPT;
+        for kind in [
+            "mcp_surface",
+            "tooling",
+            "workflow",
+            "agent",
+            "docs_runbook",
+            "refactor_primitive",
+            "ontology",
+            "eval_coverage",
+        ] {
+            assert!(
+                prompt.contains(kind),
+                "retro prompt no longer names gap_kind {kind:?}"
+            );
+            assert!(
+                GapKind::from_str(kind).is_ok(),
+                "retro prompt names gap_kind {kind:?} that GapKind cannot parse"
+            );
+        }
+    }
+
+    #[test]
     fn workload_retro_prompt_emits_scope_block() {
         let with_project = workload_retro_prompt("sess-123", Some("/repo/x"));
         assert!(with_project.starts_with("[scope] session:sess-123 · project:/repo/x\n\n"));

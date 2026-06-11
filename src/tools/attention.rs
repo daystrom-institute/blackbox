@@ -60,9 +60,12 @@ impl BlackboxServer {
                 let projects = server.state.projects.read();
                 let mut gaps = server.state.gaps.write();
                 let state_dir = server.state.config.read().paths.state_dir.clone();
-                Some(gap_spool::import_gap_spool(
-                    &mut gaps, &projects, &state_dir,
-                )?)
+                let roots: Vec<String> = projects
+                    .list()
+                    .into_iter()
+                    .map(|record| record.canonical_path)
+                    .collect();
+                Some(gap_spool::import_gap_spool(&mut gaps, &roots, &state_dir)?)
             } else {
                 None
             };
@@ -72,12 +75,13 @@ impl BlackboxServer {
             let notes = server.state.notes.read();
             let gaps = server.state.gaps.read();
             let task_store = server.state.task_store.read();
+            let failed_rows = collect_failed_tasks(&task_store);
             let inbox = inbox::compute_inbox(
                 &kb,
                 &threads,
                 &notes,
                 &gaps,
-                &task_store,
+                &failed_rows,
                 &server.state.whiteboards,
                 &p,
             )?;
@@ -94,4 +98,29 @@ impl BlackboxServer {
         })
         .await
     }
+}
+
+/// Extract (task_id, provider, started_at) rows for every failed task.
+/// Caller-side adapter for `inbox::compute_inbox` — the inbox store sits
+/// below orchestration in the crate DAG and takes plain rows instead of
+/// a `TaskStore`.
+fn collect_failed_tasks(
+    task_store: &crate::orchestration::TaskStore,
+) -> Vec<(String, String, u64)> {
+    task_store
+        .all_tasks()
+        .iter()
+        .filter_map(|t| {
+            let inner = t.inner.lock();
+            if inner.status == crate::orchestration::TaskStatus::Failed {
+                Some((
+                    inner.id.clone(),
+                    format!("{:?}", inner.provider),
+                    inner.started_at,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }

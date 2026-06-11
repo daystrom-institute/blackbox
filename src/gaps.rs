@@ -1599,33 +1599,6 @@ mod tests {
     }
 
     #[test]
-    fn workload_retro_prompt_names_only_valid_gap_kinds() {
-        // The retro probe (orchestration::WORKLOAD_RETRO_PROMPT) instructs bros
-        // to file gaps with a specific gap_kind. Those tokens must stay parseable
-        // as `GapKind` — a mismatch makes every retro `bbox_gap` call fail.
-        let prompt = crate::orchestration::WORKLOAD_RETRO_PROMPT;
-        for kind in [
-            "mcp_surface",
-            "tooling",
-            "workflow",
-            "agent",
-            "docs_runbook",
-            "refactor_primitive",
-            "ontology",
-            "eval_coverage",
-        ] {
-            assert!(
-                prompt.contains(kind),
-                "retro prompt no longer names gap_kind {kind:?}"
-            );
-            assert!(
-                GapKind::from_str(kind).is_ok(),
-                "retro prompt names gap_kind {kind:?} that GapKind cannot parse"
-            );
-        }
-    }
-
-    #[test]
     fn loader_ignores_spool_inbox_subdir() {
         let dir = tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();

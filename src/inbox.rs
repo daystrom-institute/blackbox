@@ -6,7 +6,6 @@ use crate::artifacts;
 use crate::gaps::{GapImpact, GapNote, GapResolution, GapStore};
 use crate::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
 use crate::notes::{Note, NoteKind, NoteResolution, Notes};
-use crate::orchestration::{TaskStatus, TaskStore};
 use crate::threads::{Thread, ThreadStatus, Threads};
 use crate::whiteboards::{Phase, WhiteboardRegistry};
 
@@ -47,7 +46,7 @@ pub fn compute_inbox(
     threads: &Threads,
     notes: &Notes,
     gaps: &GapStore,
-    task_store: &TaskStore,
+    failed_task_rows: &[(String, String, u64)],
     whiteboards: &WhiteboardRegistry,
     p: &InboxParams,
 ) -> Result<String> {
@@ -240,7 +239,7 @@ pub fn compute_inbox(
 
     // 6. Failed bro tasks (optional)
     if include_tasks {
-        let failed = failed_tasks(task_store, limit);
+        let failed = failed_tasks(failed_task_rows, limit);
         if !failed.is_empty() {
             out.push_str(&format!("## Failed tasks ({})\n", failed.len()));
             for (id, provider, started_at) in &failed {
@@ -667,24 +666,11 @@ fn unverified_knowledge<'a>(
     rows
 }
 
-fn failed_tasks(task_store: &TaskStore, limit: usize) -> Vec<(String, String, u64)> {
-    let mut rows: Vec<(String, String, u64)> = task_store
-        .all_tasks()
-        .iter()
-        .filter_map(|t| {
-            let inner = t.inner.lock();
-            if inner.status == TaskStatus::Failed {
-                Some((
-                    inner.id.clone(),
-                    format!("{:?}", inner.provider),
-                    inner.started_at,
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
-
+/// `rows` are (task_id, provider, started_at) tuples extracted by the
+/// caller from its task store (dependency inversion: this module sits
+/// below orchestration in the crate DAG).
+fn failed_tasks(rows: &[(String, String, u64)], limit: usize) -> Vec<(String, String, u64)> {
+    let mut rows = rows.to_vec();
     rows.sort_by_key(|b| std::cmp::Reverse(b.2));
     rows.truncate(limit);
     rows
@@ -761,11 +747,10 @@ mod tests {
 
     fn empty_context(
         dir: &tempfile::TempDir,
-    ) -> (Knowledge, Threads, TaskStore, WhiteboardRegistry) {
+    ) -> (Knowledge, Threads, WhiteboardRegistry) {
         (
             Knowledge::open(&dir.path().join("kb.json")).unwrap(),
             Threads::open(&dir.path().join("th.json")).unwrap(),
-            TaskStore::new(),
             WhiteboardRegistry::new(),
         )
     }
@@ -878,7 +863,6 @@ mod tests {
         let threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = empty_gaps(&dir);
-        let task_store = TaskStore::new();
         let whiteboards = WhiteboardRegistry::new();
 
         let out = compute_inbox(
@@ -886,7 +870,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
-            &task_store,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -910,7 +894,6 @@ mod tests {
         let mut threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = empty_gaps(&dir);
-        let task_store = TaskStore::new();
         let whiteboards = WhiteboardRegistry::new();
 
         // Agent-inferred knowledge → should appear in "Unverified"
@@ -1043,7 +1026,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
-            &task_store,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -1074,7 +1057,7 @@ mod tests {
     #[test]
     fn inbox_surfaces_gap_notes_before_followups() {
         let dir = tempdir().unwrap();
-        let (kb, threads, task_store, whiteboards) = empty_context(&dir);
+        let (kb, threads, whiteboards) = empty_context(&dir);
         let notes = open_notes_with(
             &dir,
             vec![note(
@@ -1106,7 +1089,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
-            &task_store,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("transcript-search".into()),
@@ -1133,7 +1116,7 @@ mod tests {
     fn inbox_gap_notes_honor_resolution_project_filter_and_ordering() {
         use crate::gaps::GapKind;
         let dir = tempdir().unwrap();
-        let (kb, threads, task_store, whiteboards) = empty_context(&dir);
+        let (kb, threads, whiteboards) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = open_gaps_with(
             &dir,
@@ -1201,7 +1184,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
-            &task_store,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
@@ -1229,7 +1212,7 @@ mod tests {
     fn inbox_reports_stale_high_impact_gap_notes() {
         use crate::gaps::GapKind;
         let dir = tempdir().unwrap();
-        let (kb, threads, task_store, whiteboards) = empty_context(&dir);
+        let (kb, threads, whiteboards) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = open_gaps_with(
             &dir,
@@ -1264,7 +1247,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
-            &task_store,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
@@ -1288,7 +1271,7 @@ mod tests {
     fn inbox_can_render_gap_aggregates() {
         use crate::gaps::GapKind;
         let dir = tempdir().unwrap();
-        let (kb, threads, task_store, whiteboards) = empty_context(&dir);
+        let (kb, threads, whiteboards) = empty_context(&dir);
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = open_gaps_with(
             &dir,
@@ -1334,7 +1317,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
-            &task_store,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
