@@ -1964,8 +1964,8 @@ impl FleetOrchestrator {
     }
 
     /// Subscribe to client-local roster-change/terminal signals. Each call
-    /// returns an independent receiver; the cockpit forwards these into its sync
-    /// TUI loop the same way `council_tui` forwards SSE signals.
+    /// returns an independent receiver; the cockpit forwards these into its
+    /// sync TUI loop.
     pub fn subscribe(&self) -> broadcast::Receiver<TailEvent> {
         self.tail_tx.subscribe()
     }

@@ -706,7 +706,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Convert a `ratatui_core` Line from tui-markdown output into a `'static`
-/// ratatui Line that the council and fleet widgets consume.
+/// ratatui Line that the fleet widgets consume.
 pub(crate) fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
     let mut line_style = convert_core_style(line.style);
     let mut iter = line.spans.into_iter().peekable();
