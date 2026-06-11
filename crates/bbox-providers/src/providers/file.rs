@@ -9,7 +9,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, schema, truncate_label,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
-use crate::projects::ProjectRecord;
+use bbox_indexing::projects::ProjectRecord;
 
 pub struct FileProvider;
 

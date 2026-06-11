@@ -40,7 +40,7 @@ pub mod dispatch_mcp;
 use bbox_edge_index::edge_index;
 mod embed;
 mod embed_queue;
-mod entity_loader;
+use bbox_providers::entity_loader;
 // `entity_ref` extracted into the bbox-corpus-core foundation crate (stage 0).
 // Aliased back so existing `crate::entity_ref::*` paths resolve unchanged.
 pub use bbox_corpus_core::entity_ref;
@@ -80,7 +80,7 @@ mod path_cache;
 use bbox_stores::pins;
 mod pollers;
 use bbox_indexing::projects;
-mod providers;
+use bbox_providers::providers;
 mod providers_ext;
 // `search` (rrf/rerank) and `template` extracted into bbox-corpus-core;
 // aliased back so existing call sites resolve unchanged. (`query` callers

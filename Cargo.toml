@@ -45,6 +45,7 @@ members = [
     "crates/bbox-tool-docs",
     "crates/bbox-system-events",
     "crates/bbox-indexing",
+    "crates/bbox-providers",
 ]
 
 [package]
@@ -203,6 +204,7 @@ bbox-edge-index = { path = "crates/bbox-edge-index" }
 bbox-tool-docs = { path = "crates/bbox-tool-docs" }
 bbox-system-events = { path = "crates/bbox-system-events" }
 bbox-indexing = { path = "crates/bbox-indexing" }
+bbox-providers = { path = "crates/bbox-providers" }
 
 [dev-dependencies]
 filetime = "0.2"

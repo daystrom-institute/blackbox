@@ -555,6 +555,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-providers"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-artifacts",
+ "bbox-corpus-core",
+ "bbox-corpus-index",
+ "bbox-edge-index",
+ "bbox-indexing",
+ "bbox-knowledge",
+ "bbox-packets",
+ "bbox-stores",
+ "bbox-system-memory",
+ "bbox-threads",
+ "bbox-whiteboards",
+ "parking_lot",
+]
+
+[[package]]
 name = "bbox-refactor"
 version = "0.0.1"
 dependencies = [
@@ -819,6 +838,7 @@ dependencies = [
  "bbox-lsp",
  "bbox-macros",
  "bbox-packets",
+ "bbox-providers",
  "bbox-refactor",
  "bbox-slack",
  "bbox-stores",

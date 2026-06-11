@@ -7,7 +7,7 @@ use super::{
     NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
     truncate_label,
 };
-use crate::artifacts::ArtifactKind;
+use bbox_artifacts::artifacts::ArtifactKind;
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 
 pub struct ArtifactProvider;

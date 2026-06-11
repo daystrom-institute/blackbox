@@ -24,7 +24,7 @@ impl InspectableEntityProvider for SystemMemoryProvider {
         let EntityRef::SystemMemory { id } = r else {
             unreachable!();
         };
-        let memory = crate::system_memory::get(id)
+        let memory = bbox_system_memory::get(id)
             .ok_or_else(|| anyhow::anyhow!("system memory {id} not found"))?;
         let mut properties = BTreeMap::new();
         properties.insert("id".into(), memory.id.clone());
@@ -59,7 +59,7 @@ impl InspectableEntityProvider for SystemMemoryProvider {
         let EntityRef::SystemMemory { id } = r else {
             return None;
         };
-        crate::system_memory::get(id)
+        bbox_system_memory::get(id)
             .map(|memory| truncate_label(&memory.title))
             .or_else(|| Some(truncate_label(id)))
     }

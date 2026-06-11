@@ -32,7 +32,7 @@ impl InspectableEntityProvider for AgentProvider {
             let catalog = stores.artifacts.read();
             // TODO(phase-4-shadowing): plumb project_id when caller has it to enable local shadowing.
             if let Some(v) = catalog
-                .load_artifact_value(crate::artifacts::ArtifactKind::Agent, name)
+                .load_artifact_value(bbox_artifacts::artifacts::ArtifactKind::Agent, name)
                 .ok()
                 .flatten()
             {
