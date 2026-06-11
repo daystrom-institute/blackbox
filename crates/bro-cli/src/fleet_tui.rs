@@ -515,6 +515,11 @@ struct App {
     closeout_tx: mpsc::Sender<CloseoutMsg>,
     /// Drained each tick: surfaces a closeout result as a status flash.
     closeout_rx: mpsc::Receiver<CloseoutMsg>,
+    /// Cockpit-generated messages (closeout outcomes, slash-command errors,
+    /// etc.) queued for insertion into the terminal's native scrollback
+    /// during the next inline-view frame — durable, so they survive
+    /// terminal resize / reflow and can be scrolled back with tmux/mouse.
+    pending_cockpit_lines: Vec<String>,
     /// Worktree-local rebase conflict currently delegated back to the owning
     /// agent. When the agent turn settles, closeout resumes as adopt/merge
     /// from the structured driver path, never as a second publish.
@@ -642,6 +647,7 @@ impl App {
             standalone_rx,
             closeout_tx,
             closeout_rx,
+            pending_cockpit_lines: Vec::new(),
             pending_closeout_recovery: None,
             activity_clocks: HashMap::new(),
             activity_frame: 0,
@@ -681,6 +687,17 @@ impl App {
             self.status = None;
             self.status_until = None;
         }
+    }
+
+    /// Push a cockpit-generated message (closeout outcome, slash-command
+    /// error, etc.) to both the current status flash AND a durable
+    /// scrollback line. The scrollback half is drained during the next
+    /// inline-view frame via `insert_history_lines`, so the message
+    /// survives terminal resize/reflow and scrollback.
+    fn push_cockpit_line(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.set_status(msg.clone(), Duration::from_secs(30));
+        self.pending_cockpit_lines.push(msg);
     }
 
     /// Agent indices in roster display order: bucket (attention) then stable
@@ -1868,6 +1885,19 @@ where
         }
         commit_size = Some((screen_w, screen_h));
 
+        // Drain cockpit-generated messages (closeout outcomes, slash-command
+        // errors, etc.) into the terminal's native scrollback so they survive
+        // resize/reflow and are scrollable — not just a transient footer
+        // status flash.
+        if !app.pending_cockpit_lines.is_empty() {
+            let lines: Vec<Line<'static>> = app
+                .pending_cockpit_lines
+                .drain(..)
+                .map(|msg| Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray))))
+                .collect();
+            let _ = insert_history::insert_history_lines(terminal, lines);
+        }
+
         let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
 
         let focus = inline_focus_idx(app);
@@ -2836,7 +2866,24 @@ fn run_local_slash(app: &mut App) -> bool {
             stop_all_running_agents(app);
             true
         }
-        _ => false,
+        _ => {
+            // Unmatched slash command: surface the error with available
+            // commands for the zone. Do NOT fall through to `submit`'s
+            // zone-specific routing — that would dispatch the text as a
+            // new task (roster) or steer it to an agent (single-agent).
+            if input.starts_with('/') {
+                let cmds = zone_slash_commands(app);
+                let names: Vec<&str> = cmds.iter().map(|c| c.name).collect();
+                app.push_cockpit_line(format!(
+                    "unknown command: {cmd} (available: {})",
+                    names.join(", ")
+                ));
+                app.clear_input();
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 

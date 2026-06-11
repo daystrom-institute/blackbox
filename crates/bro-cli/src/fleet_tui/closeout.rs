@@ -306,7 +306,7 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
     let parsed = match parse_closeout(arg) {
         Ok(p) => p,
         Err(msg) => {
-            app.set_status(msg, Duration::from_secs(6));
+            app.push_cockpit_line(msg);
             app.clear_input();
             return;
         }
@@ -314,9 +314,8 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
     let context = match focused_closeout_context(app) {
         Some(c) => c,
         None => {
-            app.set_status(
-                "/closeout: no focused fleet agent (select or open a fleet agent first)".to_string(),
-                Duration::from_secs(6),
+            app.push_cockpit_line(
+                "/closeout: no focused fleet agent (select or open a fleet agent first)",
             );
             app.clear_input();
             return;
@@ -334,25 +333,19 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
         )
     {
         if context.managed_worktree.is_none() {
-            app.set_status(
-                format!(
-                    "/closeout {} disabled: no managed worktree (add --dry-run to preview daemon preflight)",
-                    parsed.disposition
-                ),
-                Duration::from_secs(8),
-            );
+            app.push_cockpit_line(format!(
+                "/closeout {} disabled: no managed worktree (add --dry-run to preview daemon preflight)",
+                parsed.disposition
+            ));
             app.clear_input();
             return;
         }
         let expected = context.owner_origin.as_str();
         if parsed.ack_owner.as_deref() != Some(expected) {
-            app.set_status(
-                format!(
-                    "/closeout {} disabled: workflow-owned by {expected}; rerun with --ack-owner {expected} to confirm",
-                    parsed.disposition
-                ),
-                Duration::from_secs(10),
-            );
+            app.push_cockpit_line(format!(
+                "/closeout {} disabled: workflow-owned by {expected}; rerun with --ack-owner {expected} to confirm",
+                parsed.disposition
+            ));
             app.clear_input();
             return;
         }
@@ -360,9 +353,8 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
     let worktree = match context.managed_worktree.or(context.fallback_worktree) {
         Some(w) => w,
         None => {
-            app.set_status(
-                "/closeout: no focused fleet agent worktree to preflight".to_string(),
-                Duration::from_secs(6),
+            app.push_cockpit_line(
+                "/closeout: no focused fleet agent worktree to preflight",
             );
             app.clear_input();
             return;
@@ -374,10 +366,7 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
     let project = match resolve_project_closeout(&worktree) {
         Ok(p) => p,
         Err(e) => {
-            app.set_status(
-                format!("/closeout: fleet.json error — {e}"),
-                Duration::from_secs(8),
-            );
+            app.push_cockpit_line(format!("/closeout: fleet.json error — {e}"));
             app.clear_input();
             return;
         }
@@ -429,10 +418,7 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
             error,
         } => {
             let prefix = if dry_run { "preflight" } else { &disposition };
-            app.set_status(
-                format!("/closeout {prefix} failed: {error}"),
-                Duration::from_secs(8),
-            );
+            app.push_cockpit_line(format!("/closeout {prefix} failed: {error}"));
         }
         CloseoutMsg::Outcome {
             sent_disposition,
@@ -445,7 +431,7 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
                 return;
             }
             let line = render_outcome(&sent_disposition, dry_run, &outcome);
-            app.set_status(line, Duration::from_secs(6));
+            app.push_cockpit_line(line);
             // A SUCCESSFUL mutating fold removed the worktree, so the agent's row
             // is now a dead end (re-running /closeout would fail "no worktree").
             // Drop it from the roster so a folded agent doesn't linger looking
@@ -467,7 +453,7 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
                             app.zone = Zone::Roster;
                         }
                     }
-                    Err(e) => app.set_status(format!("closeout cleanup: {e:#}"), Duration::from_secs(5)),
+                    Err(e) => app.push_cockpit_line(format!("closeout cleanup: {e:#}")),
                 }
             }
         }
@@ -490,20 +476,16 @@ fn maybe_resume_rebase_recovery(
         return false;
     }
     let Some(idx) = agent_index_for_worktree(app, worktree) else {
-        app.set_status(
-            format!(
-                "/closeout rebase conflict in {worktree}; no owning fleet agent is focused/known"
-            ),
-            Duration::from_secs(8),
-        );
+        app.push_cockpit_line(format!(
+            "/closeout rebase conflict in {worktree}; no owning fleet agent is focused/known"
+        ));
         return true;
     };
     let provider = app.agents[idx].provider;
     if !provider_supports_bidi(provider) {
-        app.set_status(
-            format!("/closeout rebase conflict in {worktree}; {provider} cannot be resumed automatically"),
-            Duration::from_secs(8),
-        );
+        app.push_cockpit_line(format!(
+            "/closeout rebase conflict in {worktree}; {provider} cannot be resumed automatically"
+        ));
         return true;
     }
 
@@ -532,9 +514,8 @@ pub(super) fn poll_pending_closeout_recovery(app: &mut App) {
         .position(|agent| agent.task.id() == pending.agent_id)
     else {
         app.pending_closeout_recovery = None;
-        app.set_status(
-            "/closeout recovery stopped: owning agent is no longer in the roster".to_string(),
-            Duration::from_secs(8),
+        app.push_cockpit_line(
+            "/closeout recovery stopped: owning agent is no longer in the roster",
         );
         return;
     };
@@ -616,6 +597,334 @@ fn same_path(left: &Path, right: &str) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(arg: &str) -> ParsedCloseout {
+        parse_closeout(arg).expect("parse_closeout should succeed")
+    }
+
+    #[test]
+    fn closeout_mutation_enabled_requires_managed_unowned_worktree() {
+        assert!(closeout_mutation_enabled(Some("/tmp/wt"), false));
+        assert!(!closeout_mutation_enabled(None, false));
+        assert!(!closeout_mutation_enabled(Some("/tmp/wt"), true));
+        assert!(!closeout_mutation_enabled(None, true));
+    }
+
+    #[test]
+    fn parse_closeout_minimal_publish() {
+        let p = parsed("publish");
+        assert_eq!(p.disposition, "publish");
+        assert!(!p.dry_run);
+        assert!(p.target.is_none());
+        assert!(p.confirm, "publish is mutating");
+    }
+
+    #[test]
+    fn parse_closeout_dry_run_preserves_disposition_and_stamps_dry_run() {
+        let p = parsed("publish --dry-run");
+        assert_eq!(p.disposition, "publish", "typed disposition is preserved");
+        assert!(p.dry_run);
+        assert!(p.confirm, "publish is mutating; confirm stays true");
+    }
+
+    #[test]
+    fn parse_closeout_dry_run_adopt_preserves_adopt() {
+        let p = parsed("adopt --dry-run");
+        assert_eq!(p.disposition, "adopt");
+        assert!(p.dry_run);
+        assert!(p.confirm);
+    }
+
+    #[test]
+    fn parse_closeout_dry_run_discard_preserves_discard() {
+        let p = parsed("discard --dry-run");
+        assert_eq!(p.disposition, "discard");
+        assert!(p.dry_run);
+        assert!(p.confirm);
+    }
+
+    #[test]
+    fn parse_closeout_rejects_legacy_keep_and_preflight() {
+        for legacy in ["keep", "preflight"] {
+            let err = parse_closeout(legacy).unwrap_err();
+            assert!(err.contains("unknown disposition"), "{legacy}: {err}");
+            assert!(err.contains("--dry-run"), "{legacy}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_closeout_adopt_with_target() {
+        let p = parsed("adopt --target beta/blackbox-v2");
+        assert_eq!(p.disposition, "adopt");
+        assert!(p.confirm, "adopt is mutating");
+        assert_eq!(p.target.as_deref(), Some("beta/blackbox-v2"));
+    }
+
+    #[test]
+    fn parse_closeout_target_without_value_errors() {
+        let err = parse_closeout("publish --target").unwrap_err();
+        assert!(err.contains("--target requires"), "{err}");
+    }
+
+    #[test]
+    fn parse_closeout_rejects_unknown_disposition() {
+        let err = parse_closeout("yeet").unwrap_err();
+        assert!(err.contains("unknown disposition"), "{err}");
+    }
+
+    #[test]
+    fn parse_closeout_rejects_extra_positional() {
+        let err = parse_closeout("publish --dry-run extra").unwrap_err();
+        assert!(err.contains("unexpected extra argument"), "{err}");
+    }
+
+    #[test]
+    fn parse_closeout_empty_arg_errors_with_usage() {
+        let err = parse_closeout("").unwrap_err();
+        assert!(err.contains("usage:"), "{err}");
+        let err = parse_closeout("   ").unwrap_err();
+        assert!(err.contains("usage:"), "{err}");
+    }
+
+    #[test]
+    fn build_request_stamps_confirm_for_mutating_dispositions() {
+        for (disp, expected_confirm) in [
+            ("discard", true),
+            ("publish", true),
+            ("merge", true),
+            ("adopt", true),
+        ] {
+            let parsed = ParsedCloseout {
+                disposition: disp.to_string(),
+                dry_run: false,
+                target: None,
+                confirm: expected_confirm,
+                ack_owner: None,
+            };
+            let req = build_request(&parsed, "/tmp/wt", None);
+            assert_eq!(req.disposition, disp, "disposition roundtrip for {disp}");
+            assert_eq!(req.confirm, expected_confirm, "confirm for {disp}");
+            assert_eq!(req.worktree, "/tmp/wt");
+            assert!(req.target.is_none());
+            assert!(req.commit_message.is_none());
+            assert!(req.paths.is_empty());
+            assert!(req.allow_branch_prefixes.is_none());
+            assert!(!req.dry_run, "dry_run defaults to false on the non-dry-run path");
+        }
+    }
+
+    #[test]
+    fn build_request_stamps_dry_run_for_publish_adopt_discard() {
+        for disp in ["publish", "merge", "adopt", "discard"] {
+            let parsed = ParsedCloseout {
+                disposition: disp.to_string(),
+                dry_run: true,
+                target: None,
+                confirm: true,
+                ack_owner: None,
+            };
+            let req = build_request(&parsed, "/tmp/wt", None);
+            assert_eq!(req.disposition, disp, "disposition roundtrips for {disp} --dry-run");
+            assert!(req.dry_run, "dry_run is stamped for {disp} --dry-run");
+            assert!(req.confirm, "confirm stays true on dry-run for mutating {disp}");
+        }
+    }
+
+    #[test]
+    fn render_outcome_success_uses_content_head() {
+        let outcome = CloseoutOutcome::Success {
+            phases: vec![bro_fleet_client::PhaseResult {
+                phase: bro_fleet_client::CloseoutPhase::Push,
+                repo_cwd: "/tmp/base".into(),
+                ok: true,
+                error_class: bro_fleet_client::CloseoutErrorClass::None,
+                content: serde_json::json!({ "head": "abc1234" }),
+            }],
+        };
+        let line = render_outcome("publish", false, &outcome);
+        assert!(line.contains("publish: done"), "{line}");
+        assert!(line.contains("abc1234"), "{line}");
+    }
+
+    #[test]
+    fn render_outcome_dry_run_says_preflight_of_typed_disposition() {
+        let outcome = CloseoutOutcome::Success { phases: vec![] };
+        let line = render_outcome("publish", true, &outcome);
+        assert!(line.contains("preflight of publish: ready"), "{line}");
+    }
+
+    #[test]
+    fn render_outcome_failed_includes_phase_and_class() {
+        let outcome = CloseoutOutcome::Failed(bro_fleet_client::PhaseResult {
+            phase: bro_fleet_client::CloseoutPhase::Rebase,
+            repo_cwd: "/tmp/wt".into(),
+            ok: false,
+            error_class: bro_fleet_client::CloseoutErrorClass::RebaseConflict,
+            content: serde_json::json!({ "message": "conflict on Cargo.toml" }),
+        });
+        let line = render_outcome("publish", false, &outcome);
+        assert!(line.contains("rebase"), "{line}");
+        assert!(line.contains("rebase_conflict"), "{line}");
+        assert!(line.contains("conflict on Cargo.toml"), "{line}");
+    }
+
+    #[test]
+    fn render_outcome_failed_uses_error_fallback() {
+        let outcome = CloseoutOutcome::Failed(bro_fleet_client::PhaseResult {
+            phase: bro_fleet_client::CloseoutPhase::FfBase,
+            repo_cwd: "/tmp/base".into(),
+            ok: false,
+            error_class: bro_fleet_client::CloseoutErrorClass::FfBaseFailed,
+            content: serde_json::json!({ "error": "target is not fast-forwardable" }),
+        });
+        let line = render_outcome("adopt", false, &outcome);
+        assert!(line.contains("ff_base"), "{line}");
+        assert!(line.contains("ff_base_failed"), "{line}");
+        assert!(line.contains("target is not fast-forwardable"), "{line}");
+    }
+
+    #[test]
+    fn rebase_recovery_prompt_keeps_closeout_owned_by_cockpit() {
+        let result = bro_fleet_client::PhaseResult {
+            phase: bro_fleet_client::CloseoutPhase::Rebase,
+            repo_cwd: "/tmp/wt".into(),
+            ok: false,
+            error_class: bro_fleet_client::CloseoutErrorClass::RebaseConflict,
+            content: serde_json::json!({ "error": "CONFLICT (content): README.md" }),
+        };
+
+        let prompt = rebase_recovery_prompt("/tmp/wt", &result);
+        assert!(prompt.contains("/tmp/wt"), "{prompt}");
+        assert!(prompt.contains("stage and commit"), "{prompt}");
+        assert!(prompt.contains("Do not run closeout"), "{prompt}");
+        assert!(
+            prompt.contains("the cockpit will rerun closeout as adopt"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("CONFLICT (content): README.md"), "{prompt}");
+    }
+
+    // -- New tests for push_cockpit_line + slash-command routing --
+
+    #[test]
+    fn push_cockpit_line_sets_status_and_queues_scrollback() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        app.push_cockpit_line("usage: /closeout <discard|publish|merge|adopt> [--dry-run]");
+
+        // Status was set with a 30s TTL.
+        assert!(app.status.is_some(), "status should be set");
+        assert!(
+            app.status.as_deref().unwrap().contains("usage:"),
+            "status should contain usage: got {:?}",
+            app.status
+        );
+        // Pending cockpit line was queued for scrollback insertion.
+        assert_eq!(app.pending_cockpit_lines.len(), 1);
+        assert!(
+            app.pending_cockpit_lines[0].contains("usage:"),
+            "pending line should contain usage: got {:?}",
+            app.pending_cockpit_lines[0]
+        );
+    }
+
+    #[test]
+    fn run_local_slash_unknown_command_sets_cockpit_line() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        // Simulate typing an unknown slash command.
+        app.input = "/bogus".to_string();
+        app.cursor_pos = 6;
+
+        let handled = run_local_slash(&mut app);
+        assert!(handled, "/bogus should be handled (not fall through to dispatch/steer)");
+        assert!(
+            app.input.is_empty(),
+            "input should be cleared after unknown command; got {:?}",
+            app.input
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("unknown command:") && s.contains("/bogus")),
+            "status should show unknown command: got {:?}",
+            app.status
+        );
+        assert_eq!(
+            app.pending_cockpit_lines.len(),
+            1,
+            "unknown command should queue a cockpit line"
+        );
+        assert!(
+            app.pending_cockpit_lines[0].contains("unknown command:"),
+            "pending line should show unknown: got {:?}",
+            app.pending_cockpit_lines[0]
+        );
+    }
+
+    #[test]
+    fn run_local_slash_known_command_does_not_set_cockpit_line() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        // `/help` is a known command.
+        app.input = "/help".to_string();
+        app.cursor_pos = 5;
+
+        let handled = run_local_slash(&mut app);
+        assert!(handled, "/help should be handled");
+        assert!(app.help_visible, "/help should show the help overlay");
+        // `/help` shouldn't queue a cockpit line or status.
+        assert!(
+            app.pending_cockpit_lines.is_empty(),
+            "known command should not queue cockpit line"
+        );
+    }
+
+    #[test]
+    fn run_local_slash_closeout_empty_arg_shows_usage() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+
+        // Bare `/closeout` with no args — parse failure path in `run_closeout`.
+        app.input = "/closeout".to_string();
+        app.cursor_pos = 9;
+
+        let handled = run_local_slash(&mut app);
+        assert!(handled, "/closeout should be handled");
+        // `run_closeout` calls `push_cockpit_line` on parse failure (bare arg).
+        assert!(
+            !app.pending_cockpit_lines.is_empty(),
+            "bare /closeout should queue a cockpit line with usage"
+        );
+        let msg = &app.pending_cockpit_lines[0];
+        assert!(msg.contains("usage:"), "usage line: got {msg:?}");
+        assert!(msg.contains("discard"), "should list dispositions: got {msg:?}");
+        assert!(msg.contains("publish"), "should list dispositions: got {msg:?}");
+        assert!(msg.contains("merge"), "should list dispositions: got {msg:?}");
+        assert!(msg.contains("adopt"), "should list dispositions: got {msg:?}");
+        // Input should be cleared.
+        assert!(app.input.is_empty(), "input cleared: got {:?}", app.input);
     }
 }
 
@@ -719,232 +1028,3 @@ fn error_class_label(class: CloseoutErrorClass) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parsed(arg: &str) -> ParsedCloseout {
-        parse_closeout(arg).expect("parse_closeout should succeed")
-    }
-
-    #[test]
-    fn closeout_mutation_enabled_requires_managed_unowned_worktree() {
-        assert!(closeout_mutation_enabled(Some("/tmp/wt"), false));
-        assert!(!closeout_mutation_enabled(None, false));
-        assert!(!closeout_mutation_enabled(Some("/tmp/wt"), true));
-        assert!(!closeout_mutation_enabled(None, true));
-    }
-
-    #[test]
-    fn parse_closeout_minimal_publish() {
-        let p = parsed("publish");
-        assert_eq!(p.disposition, "publish");
-        assert!(!p.dry_run);
-        assert!(p.target.is_none());
-        assert!(p.confirm, "publish is mutating");
-    }
-
-    #[test]
-    fn parse_closeout_dry_run_preserves_disposition_and_stamps_dry_run() {
-        // The phased driver recognizes the REAL disposition (publish/merge/
-        // adopt/discard); we stamp dry_run=true on the wire DTO and let the
-        // daemon short-circuit to preflight. Replacing the older override-
-        // to-"preflight" pattern, which `phase_preflight` did not recognize
-        // (the Phase 1 decomposition dropped the `preflight` arm).
-        let p = parsed("publish --dry-run");
-        assert_eq!(p.disposition, "publish", "typed disposition is preserved");
-        assert!(p.dry_run);
-        // confirm is based on the typed disposition, not on dry_run. The
-        // daemon's confirm gate (`publish requires confirm=true`) still
-        // needs to pass even on a dry-run; the dry-run flag is what stops
-        // mutation, not the confirm flag.
-        assert!(p.confirm, "publish is mutating; confirm stays true");
-    }
-
-    #[test]
-    fn parse_closeout_dry_run_adopt_preserves_adopt() {
-        let p = parsed("adopt --dry-run");
-        assert_eq!(p.disposition, "adopt");
-        assert!(p.dry_run);
-        assert!(p.confirm);
-    }
-
-    #[test]
-    fn parse_closeout_dry_run_discard_preserves_discard() {
-        let p = parsed("discard --dry-run");
-        assert_eq!(p.disposition, "discard");
-        assert!(p.dry_run);
-        assert!(p.confirm);
-    }
-
-    #[test]
-    fn parse_closeout_rejects_legacy_keep_and_preflight() {
-        // The phased /control/closeout driver implements only the four folding
-        // dispositions; `keep`/`preflight` are legacy `exit_worktree` verbs the
-        // daemon rejects. The cockpit guards them client-side so the operator
-        // gets a friendly "add --dry-run to preview" instead of a daemon 400.
-        for legacy in ["keep", "preflight"] {
-            let err = parse_closeout(legacy).unwrap_err();
-            assert!(err.contains("unknown disposition"), "{legacy}: {err}");
-            assert!(err.contains("--dry-run"), "{legacy}: {err}");
-        }
-    }
-
-    #[test]
-    fn parse_closeout_adopt_with_target() {
-        let p = parsed("adopt --target beta/blackbox-v2");
-        assert_eq!(p.disposition, "adopt");
-        assert!(p.confirm, "adopt is mutating");
-        assert_eq!(p.target.as_deref(), Some("beta/blackbox-v2"));
-    }
-
-    #[test]
-    fn parse_closeout_target_without_value_errors() {
-        let err = parse_closeout("publish --target").unwrap_err();
-        assert!(err.contains("--target requires"), "{err}");
-    }
-
-    #[test]
-    fn parse_closeout_rejects_unknown_disposition() {
-        let err = parse_closeout("yeet").unwrap_err();
-        assert!(err.contains("unknown disposition"), "{err}");
-    }
-
-    #[test]
-    fn parse_closeout_rejects_extra_positional() {
-        let err = parse_closeout("publish --dry-run extra").unwrap_err();
-        assert!(err.contains("unexpected extra argument"), "{err}");
-    }
-
-    #[test]
-    fn parse_closeout_empty_arg_errors_with_usage() {
-        let err = parse_closeout("").unwrap_err();
-        assert!(err.contains("usage:"), "{err}");
-        let err = parse_closeout("   ").unwrap_err();
-        assert!(err.contains("usage:"), "{err}");
-    }
-
-    #[test]
-    fn build_request_stamps_confirm_for_mutating_dispositions() {
-        for (disp, expected_confirm) in [
-            ("discard", true),
-            ("publish", true),
-            ("merge", true),
-            ("adopt", true),
-        ] {
-            let parsed = ParsedCloseout {
-                disposition: disp.to_string(),
-                dry_run: false,
-                target: None,
-                confirm: expected_confirm,
-                ack_owner: None,
-            };
-            let req = build_request(&parsed, "/tmp/wt", None);
-            assert_eq!(req.disposition, disp, "disposition roundtrip for {disp}");
-            assert_eq!(req.confirm, expected_confirm, "confirm for {disp}");
-            assert_eq!(req.worktree, "/tmp/wt");
-            assert!(req.target.is_none());
-            assert!(req.commit_message.is_none());
-            assert!(req.paths.is_empty());
-            assert!(req.allow_branch_prefixes.is_none());
-            assert!(!req.dry_run, "dry_run defaults to false on the non-dry-run path");
-        }
-    }
-
-    #[test]
-    fn build_request_stamps_dry_run_for_publish_adopt_discard() {
-        // `--dry-run` no longer overrides disposition — the typed disposition
-        // roundtrips, and the wire DTO carries `dry_run: true` to tell the
-        // daemon's phased driver to short-circuit to preflight-only.
-        for disp in ["publish", "merge", "adopt", "discard"] {
-            let parsed = ParsedCloseout {
-                disposition: disp.to_string(),
-                dry_run: true,
-                target: None,
-                confirm: true,
-                ack_owner: None,
-            };
-            let req = build_request(&parsed, "/tmp/wt", None);
-            assert_eq!(req.disposition, disp, "disposition roundtrips for {disp} --dry-run");
-            assert!(req.dry_run, "dry_run is stamped for {disp} --dry-run");
-            assert!(req.confirm, "confirm stays true on dry-run for mutating {disp}");
-        }
-    }
-
-    #[test]
-    fn render_outcome_success_uses_content_head() {
-        let outcome = CloseoutOutcome::Success {
-            phases: vec![bro_fleet_client::PhaseResult {
-                phase: bro_fleet_client::CloseoutPhase::Push,
-                repo_cwd: "/tmp/base".into(),
-                ok: true,
-                error_class: bro_fleet_client::CloseoutErrorClass::None,
-                content: serde_json::json!({ "head": "abc1234" }),
-            }],
-        };
-        let line = render_outcome("publish", false, &outcome);
-        assert!(line.contains("publish: done"), "{line}");
-        assert!(line.contains("abc1234"), "{line}");
-    }
-
-    #[test]
-    fn render_outcome_dry_run_says_preflight_of_typed_disposition() {
-        // The wire DTO now sends the typed disposition (e.g. "publish") with
-        // `dry_run: true`; the renderer prefixes the message so the operator
-        // sees what they asked for. No more "preflight of preflight".
-        let outcome = CloseoutOutcome::Success { phases: vec![] };
-        let line = render_outcome("publish", true, &outcome);
-        assert!(line.contains("preflight of publish: ready"), "{line}");
-    }
-
-    #[test]
-    fn render_outcome_failed_includes_phase_and_class() {
-        let outcome = CloseoutOutcome::Failed(bro_fleet_client::PhaseResult {
-            phase: bro_fleet_client::CloseoutPhase::Rebase,
-            repo_cwd: "/tmp/wt".into(),
-            ok: false,
-            error_class: bro_fleet_client::CloseoutErrorClass::RebaseConflict,
-            content: serde_json::json!({ "message": "conflict on Cargo.toml" }),
-        });
-        let line = render_outcome("publish", false, &outcome);
-        assert!(line.contains("rebase"), "{line}");
-        assert!(line.contains("rebase_conflict"), "{line}");
-        assert!(line.contains("conflict on Cargo.toml"), "{line}");
-    }
-
-    #[test]
-    fn render_outcome_failed_uses_error_fallback() {
-        let outcome = CloseoutOutcome::Failed(bro_fleet_client::PhaseResult {
-            phase: bro_fleet_client::CloseoutPhase::FfBase,
-            repo_cwd: "/tmp/base".into(),
-            ok: false,
-            error_class: bro_fleet_client::CloseoutErrorClass::FfBaseFailed,
-            content: serde_json::json!({ "error": "target is not fast-forwardable" }),
-        });
-        let line = render_outcome("adopt", false, &outcome);
-        assert!(line.contains("ff_base"), "{line}");
-        assert!(line.contains("ff_base_failed"), "{line}");
-        assert!(line.contains("target is not fast-forwardable"), "{line}");
-    }
-
-    #[test]
-    fn rebase_recovery_prompt_keeps_closeout_owned_by_cockpit() {
-        let result = bro_fleet_client::PhaseResult {
-            phase: bro_fleet_client::CloseoutPhase::Rebase,
-            repo_cwd: "/tmp/wt".into(),
-            ok: false,
-            error_class: bro_fleet_client::CloseoutErrorClass::RebaseConflict,
-            content: serde_json::json!({ "error": "CONFLICT (content): README.md" }),
-        };
-
-        let prompt = rebase_recovery_prompt("/tmp/wt", &result);
-        assert!(prompt.contains("/tmp/wt"), "{prompt}");
-        assert!(prompt.contains("stage and commit"), "{prompt}");
-        assert!(prompt.contains("Do not run closeout"), "{prompt}");
-        assert!(
-            prompt.contains("the cockpit will rerun closeout as adopt"),
-            "{prompt}"
-        );
-        assert!(prompt.contains("CONFLICT (content): README.md"), "{prompt}");
-    }
-}
