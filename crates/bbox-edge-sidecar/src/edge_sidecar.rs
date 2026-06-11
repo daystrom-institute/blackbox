@@ -14,8 +14,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunker::{EdgeConfidence, EdgeProvenance};
-use crate::entity_ref::EntityRef;
+use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+use bbox_corpus_core::entity_ref::EntityRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Edge {
@@ -174,11 +174,13 @@ pub fn sidecar_project_is_registered(
 }
 
 
-#[cfg(test)]
+/// Test-fixture helper: append raw chunker edges to a project's JSONL lane.
+/// Deliberately un-gated (no `#[cfg(test)]`) so consumer-crate tests can use
+/// it — `cfg(test)` does not cross crate boundaries.
 pub fn append_project_edges(
     edges_dir: &Path,
     project_id: &str,
-    edges: &[crate::chunker::Edge],
+    edges: &[bbox_chunker::Edge],
 ) -> Result<()> {
     if edges.is_empty() {
         return Ok(());
@@ -210,7 +212,7 @@ pub fn replace_project_edges(
     edges_dir: &Path,
     namespace: &str,
     project_id: &str,
-    edges: &[crate::chunker::Edge],
+    edges: &[bbox_chunker::Edge],
 ) -> Result<()> {
     let dir = managed_derived_edges_dir(edges_dir).join(namespace);
     fs::create_dir_all(&dir)?;
@@ -577,7 +579,7 @@ pub fn replace_materialized_edges(
     edges_dir: &Path,
     namespace: &str,
     project_id: &str,
-    edges: &[crate::chunker::Edge],
+    edges: &[bbox_chunker::Edge],
 ) -> Result<()> {
     for e in edges {
         debug_assert!(
@@ -620,7 +622,7 @@ pub fn read_managed_derived_edges(
 }
 
 
-pub fn rel_path_hashes_of(edges: &[crate::chunker::Edge]) -> HashSet<String> {
+pub fn rel_path_hashes_of(edges: &[bbox_chunker::Edge]) -> HashSet<String> {
     let mut hashes = HashSet::new();
     for e in edges {
         if let EntityRef::ProjectFile { rel_path_hash, .. }
@@ -653,7 +655,7 @@ pub fn replace_materialized_edges_incremental(
     edges_dir: &Path,
     namespace: &str,
     project_id: &str,
-    new_edges: &[crate::chunker::Edge],
+    new_edges: &[bbox_chunker::Edge],
 ) -> Result<()> {
     for e in new_edges {
         debug_assert!(
@@ -668,10 +670,10 @@ pub fn replace_materialized_edges_incremental(
     }
     let stale_hashes = rel_path_hashes_of(new_edges);
     let existing = read_managed_derived_edges(edges_dir, namespace, project_id)?;
-    let preserved: Vec<crate::chunker::Edge> = existing
+    let preserved: Vec<bbox_chunker::Edge> = existing
         .into_iter()
         .filter(|e| !edge_touches_any_path_hash(e, &stale_hashes))
-        .map(|e| crate::chunker::Edge {
+        .map(|e| bbox_chunker::Edge {
             source: e.source,
             kind: e.kind,
             target: e.target,
@@ -702,10 +704,10 @@ pub fn purge_managed_edges_for_path_hashes(
     }
     let existing = read_managed_derived_edges(edges_dir, namespace, project_id)?;
     let before = existing.len();
-    let retained: Vec<crate::chunker::Edge> = existing
+    let retained: Vec<bbox_chunker::Edge> = existing
         .into_iter()
         .filter(|e| !edge_touches_any_path_hash(e, stale_hashes))
-        .map(|e| crate::chunker::Edge {
+        .map(|e| bbox_chunker::Edge {
             source: e.source,
             kind: e.kind,
             target: e.target,
@@ -725,7 +727,7 @@ pub fn merge_materialized_edges(
     edges_dir: &Path,
     namespace: &str,
     project_id: &str,
-    new_edges: &[crate::chunker::Edge],
+    new_edges: &[bbox_chunker::Edge],
 ) -> Result<()> {
     for e in new_edges {
         debug_assert!(
@@ -740,9 +742,9 @@ pub fn merge_materialized_edges(
     }
     let existing = read_managed_derived_edges(edges_dir, namespace, project_id)?;
     let mut seen: HashSet<String> = existing.iter().map(edge_import_key).collect();
-    let mut merged: Vec<crate::chunker::Edge> = existing
+    let mut merged: Vec<bbox_chunker::Edge> = existing
         .into_iter()
-        .map(|e| crate::chunker::Edge {
+        .map(|e| bbox_chunker::Edge {
             source: e.source,
             kind: e.kind,
             target: e.target,

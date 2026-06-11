@@ -1,0 +1,26 @@
+[package]
+name = "bbox-edge-sidecar"
+version = "0.0.1"
+edition = "2024"
+
+# Daemon-internal corpus crate, peeled out of the root `blackbox` crate
+# (build-time decomposition; root-crate-peels arc). Holds the edge sidecar
+# persistence floor: the workspace/materialization manifest, snapshot dir
+# layout + clean/dirty switching, and the JSONL edge-lane primitives
+# (observed / explicit / managed-derived append/replace/merge/purge/compact).
+# Store-agnostic by invariant: the store->edge emitters (EdgeIndex,
+# EdgeStoreRefs) stay in the root crate; this crate never sees store types.
+
+[dependencies]
+anyhow = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tracing = "0.1"
+
+bbox-chunker = { path = "../bbox-chunker" }
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+
+[dev-dependencies]
+tempfile = "3"
