@@ -44,9 +44,16 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > run_blocking; snapshot growth root-caused (one ~0.5GB generation per HEAD
 > commit, 14d age floor retained a 23.7GB week — maintenance GC default
 > tightened to 2d via `BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS`, emptied
-> snapshot dirs now pruned). REMAINING: status-snapshot publication
-> (evidence-gated), Phase 4 enforcement, the §4.6 runtime-split decision
-> (needs a compile-free streaming load test).
+> snapshot dirs now pruned). Waves 13–15 (2026-06-10/11) closed the
+> dispatch-plane streaming residual — in-process tool bodies to the blocking
+> pool, sidecar event-log writes to a writer thread, O(chunk) stream-delta
+> ingest (no per-delta journal/ring/clone work) — and the §4.6 runtime-split
+> question is RESOLVED: not adopted, fixed by invariants (see §4.6 for the
+> measured before/after and the revisit trigger). Status-snapshot publication
+> is dropped (roster/status stayed ~1ms under every load test). REMAINING:
+> Phase 4 enforcement (lint design delivered, unimplemented) and the audit's
+> next-tier I2 instances (apply_patch, enter/exit_worktree, whiteboards,
+> bro_mcp, gaps persister).
 > File:line citations are point-in-time from the original survey at commit
 > 9cb5228; verify against code.
 
@@ -281,6 +288,23 @@ without removing any remaining contention. Decision trigger to revisit:
 sustained worker poll-latency degradation under fleet load **after** Phases
 1–3 land, measured via `tokio-metrics` (Phase 0 adds the instrumentation so
 this is a data decision, not a vibe decision).
+
+**RESOLVED 2026-06-11 (waves 13–15, thread-935b467d): split NOT adopted —
+fixed by invariants.** The trigger DID fire on clean compile-free data:
+streaming bros produced ~3 slow polls/sec (means 7–33ms, worst worker 92ms)
+after Phases 1–3, falsifying the "ingest is microseconds" assumption at real
+event sizes/rates. Three successive fixes attributed and removed the cost:
+in-process tool bodies to the blocking pool (wave 13), sidecar event-log
+writes to a dedicated writer thread (wave 14), and O(chunk) stream-delta
+ingest — take-don't-clone message accumulation, O(tail) snippet, store-by-
+move, no delta ring storage, no per-delta `task.progress` journal append,
+roster throttle (wave 15). Post-wave-15 under identical 2-bro load: means
+1.3–6.9ms heavy-phase, worst worker ≤17ms, ~1.2 slow polls/sec, idle
+108–141µs with zero >900µs tail. Residual accepted: SSE bursts still
+process many chunks per future poll (tokio coop bounds the batch); at
+O(chunk) per-event cost this is ≤~17ms worst-case and does not move
+control-plane latency (roster stayed ~1ms throughout). Revisit trigger:
+worst-worker mean poll sustained >50ms under compile-free fleet load.
 
 ## 5. Migration phases (each independently shippable)
 
