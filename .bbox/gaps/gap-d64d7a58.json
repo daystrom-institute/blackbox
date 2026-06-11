@@ -15,7 +15,9 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/prompt-caching-minimax-vibebh-transports",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T03:37:52Z",
-  "updated_at": "2026-06-11T03:37:52Z"
+  "updated_at": "2026-06-11T07:11:56Z",
+  "resolved_at": "2026-06-11T07:11:56Z",
+  "resolution_note": "Addressed by unit N1 (commit 448b5560, beta/blackbox-v2): investigation found the harness ALREADY sends cache_control breakpoints to minimax (same Anthropic transport path as glm/deepseek; MiniMax-shaped regression test added proving stable-system-block + rolling-last-message breakpoints) — the zero cached tokens are endpoint-side: MiniMax ignores the breakpoints. vibebh's chat-completions transport has no explicit context-reuse handle (documented in transport module docs; OpenAI cached-token wire fields corrected: Responses input_tokens_details.cached_tokens vs chat-completions prompt_tokens_details.cached_tokens). Shipped the surfacing half of the wanted capability: PromptCacheCapability metadata in the bro-core provider catalog (glm/deepseek/minimax=anthropic_cache_control, brodex=open_ai_prompt_token_details, vibebh=none_known) exposed via bro_providers as promptCache, so allocator/cost-aware tiering can read it. Allocator behavior changes deliberately out of scope (operator-gated). Residual economics are endpoint-limited, not harness-limited; operator mitigation (vibebh excluded from dispatch waves) stands."
 }
