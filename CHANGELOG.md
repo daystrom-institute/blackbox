@@ -22,6 +22,16 @@ out explicitly under `Changed` or `Removed`.
   `/control/*` HTTP control plane is unaffected. Dependency tree shed 4
   unique nodes (626 → 622); the remaining 49 irc subtree crates were
   shared with other workspace dependencies.
+- Unused direct dependencies dropped from 5 workspace crates (cargo-machete
+  cleanup, 623 → 609 lock entries): `blackbox` root loses `bincode`, `crossterm`,
+  `ignore`, `lsp-types`, `ordered-float`, `ratatui`, `ratatui-core`, `rusqlite`,
+  `serde_yaml`, `tera`, `toml_edit`, `tree-sitter` + 10 grammars, `tui-markdown`,
+  `unicode-width`, `url`, `wide` (TUI surface lives in `crates/bro-cli`; grammars
+  compile via `bbox-chunker`; `rusqlite`/`libsqlite3-sys` leaves the build
+  entirely); `bro-cli` loses `bro-transcript` (local module, not the crate) and
+  `futures` (only `futures-util` is used); `bbox-code-nav` loses `tracing`;
+  `bro-tools` loses `walkdir`; `bbox-refactor` loses `chrono`, `serde_yaml`,
+  `strum`, `tokio`, and 9 tree-sitter grammars (accessed through `bbox-chunker`).
 
 ### Added
 

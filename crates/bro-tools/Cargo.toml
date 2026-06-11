@@ -17,7 +17,6 @@ tokio = { version = "1", features = ["process", "fs", "io-util", "rt", "macros",
 regex = "1"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 ignore = "0.4"
-walkdir = "2"
 globset = "0.4"
 tracing = "0.1"
 libc = "0.2"
