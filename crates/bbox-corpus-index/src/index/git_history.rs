@@ -8,21 +8,21 @@ use sha2::{Digest, Sha256};
 use tantivy::{IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta};
-use crate::chunker::{Chunk, Edge, EdgeConfidence, EdgeProvenance};
-use crate::entity_ref::{self, EntityRef};
-use crate::git::GitCommit;
+use bbox_chunker::{Chunk, Edge, EdgeConfidence, EdgeProvenance};
+use bbox_corpus_core::entity_ref::{self, EntityRef};
+use bbox_corpus_core::git::GitCommit;
 use bbox_corpus_core::project_record::ProjectRecord;
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const TRUNCATED_COMMIT_MESSAGE_SUFFIX: &str = "\n\n[... message truncated]";
 
 #[derive(Debug, Default)]
-pub(super) struct GitIndexStats {
+pub struct GitIndexStats {
     pub indexed_commits: u64,
     pub emitted_edges: u64,
 }
 
-pub(super) struct GitIndexContext<'a> {
+pub struct GitIndexContext<'a> {
     pub f: FieldHandles,
     pub writer: &'a mut IndexWriter,
     pub meta: &'a mut HashMap<String, FileMeta>,
@@ -36,11 +36,11 @@ struct GitIngestMeta {
     last_ingested_sha: Option<String>,
 }
 
-pub(super) fn git_source_key(project_id: &str) -> String {
+pub fn git_source_key(project_id: &str) -> String {
     format!("git:{project_id}")
 }
 
-pub(super) fn git_meta_dir_from_projects_path(projects_path: &Path) -> PathBuf {
+pub fn git_meta_dir_from_projects_path(projects_path: &Path) -> PathBuf {
     projects_path
         .parent()
         .map(|parent| parent.join("git_meta"))
@@ -49,7 +49,7 @@ pub(super) fn git_meta_dir_from_projects_path(projects_path: &Path) -> PathBuf {
 
 // executes inside the IndexWriterActor pass (sanctioned single-writer).
 #[allow(clippy::disallowed_methods)]
-pub(super) fn index_git_history_for_project(
+pub fn index_git_history_for_project(
     project: &ProjectRecord,
     root: &Path,
     project_chunks: &HashMap<String, EntityRef>,
@@ -58,7 +58,7 @@ pub(super) fn index_git_history_for_project(
     let Some(repo_id) = project.repo_id.as_deref() else {
         return Ok(GitIndexStats::default());
     };
-    let Some(head) = crate::git::current_head(root) else {
+    let Some(head) = bbox_corpus_core::git::current_head(root) else {
         return Ok(GitIndexStats::default());
     };
     let source_key = git_source_key(&project.project_id);
@@ -75,7 +75,7 @@ pub(super) fn index_git_history_for_project(
             source_key,
             FileMeta {
                 mtime: 0,
-                size: crate::git::head_fingerprint(root).unwrap_or_default(),
+                size: bbox_corpus_core::git::head_fingerprint(root).unwrap_or_default(),
                 mat_version: None,
             },
         );
@@ -87,7 +87,7 @@ pub(super) fn index_git_history_for_project(
     } else {
         git_meta.last_ingested_sha.as_deref()
     };
-    let commits = crate::git::commit_log(root, since)?;
+    let commits = bbox_corpus_core::git::commit_log(root, since)?;
     if commits.is_empty() {
         git_meta.last_ingested_sha = Some(head);
         save_git_meta(&git_meta_path, &git_meta)?;
@@ -95,7 +95,7 @@ pub(super) fn index_git_history_for_project(
             source_key,
             FileMeta {
                 mtime: 0,
-                size: crate::git::head_fingerprint(root).unwrap_or_default(),
+                size: bbox_corpus_core::git::head_fingerprint(root).unwrap_or_default(),
                 mat_version: None,
             },
         );
@@ -124,14 +124,14 @@ pub(super) fn index_git_history_for_project(
     // incremental ingest. Deferred: repo-scoped content-addressed lane keyed
     // by commit SHA.
     if ctx.force_full {
-        crate::edge_index::replace_materialized_edges(
+        bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
             ctx.edges_dir,
             "git",
             &project.project_id,
             &edges,
         )?;
     } else {
-        crate::edge_index::merge_materialized_edges(
+        bbox_edge_sidecar::edge_sidecar::merge_materialized_edges(
             ctx.edges_dir,
             "git",
             &project.project_id,
@@ -144,14 +144,14 @@ pub(super) fn index_git_history_for_project(
         source_key,
         FileMeta {
             mtime: 0,
-            size: crate::git::head_fingerprint(root).unwrap_or_default(),
+            size: bbox_corpus_core::git::head_fingerprint(root).unwrap_or_default(),
             mat_version: None,
         },
     );
     Ok(stats)
 }
 
-pub(crate) fn build_commit_doc(
+pub fn build_commit_doc(
     commit: &GitCommit,
     repo_id: &str,
     project: &ProjectRecord,
@@ -210,7 +210,7 @@ fn commit_edges(
             EdgeConfidence::Exact,
         ));
     }
-    for file in crate::git::changed_files_for_commit(root, &commit.sha)? {
+    for file in bbox_corpus_core::git::changed_files_for_commit(root, &commit.sha)? {
         if let Some(target) = project_chunks.get(&file) {
             edges.push(edge(
                 source.clone(),
@@ -299,7 +299,7 @@ fn chunk_ref(chunk: &Chunk, snapshot_id: Option<&str>) -> EntityRef {
     }
 }
 
-pub(super) fn current_chunk_targets(
+pub fn current_chunk_targets(
     chunks: &[Chunk],
     snapshot_id: Option<&str>,
 ) -> HashMap<String, EntityRef> {
@@ -423,7 +423,7 @@ mod tests {
         let mut writer = index.writer(50_000_000).unwrap();
         let project = ProjectRecord {
             project_id: "proj1234".into(),
-            repo_id: crate::entity_ref::repo_id_for_path(repo.path()).ok(),
+            repo_id: bbox_corpus_core::entity_ref::repo_id_for_path(repo.path()).ok(),
             canonical_path: repo.path().to_string_lossy().to_string(),
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,

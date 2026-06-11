@@ -7,12 +7,12 @@ use super::types::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptScanTarget {
+pub enum TranscriptScanTarget {
     Sessions,
     History,
 }
 
-pub(crate) trait TranscriptReadAdapter: Send + Sync {
+pub trait TranscriptReadAdapter: Send + Sync {
     fn source(&self) -> TranscriptSource;
 
     fn locate(&self, session_id: &str) -> Result<Option<TranscriptLocation>, TranscriptReadError>;
@@ -41,12 +41,12 @@ pub(crate) trait TranscriptReadAdapter: Send + Sync {
     ) -> Result<TranscriptBatch, TranscriptReadError>;
 }
 
-pub(crate) struct TranscriptAdapterRegistry {
+pub struct TranscriptAdapterRegistry {
     adapters: Vec<Box<dyn TranscriptReadAdapter>>,
 }
 
 impl TranscriptAdapterRegistry {
-    pub(crate) fn new(adapters: Vec<Box<dyn TranscriptReadAdapter>>) -> Self {
+    pub fn new(adapters: Vec<Box<dyn TranscriptReadAdapter>>) -> Self {
         Self { adapters }
     }
 
@@ -54,7 +54,7 @@ impl TranscriptAdapterRegistry {
     /// the config — harness sessions dir, interactive claude roots, codex
     /// root, gemini tmp root are all `None`/empty in hermetic test indexes —
     /// so reindex never silently scans the operator's real state.
-    pub(crate) fn from_reindex_config(config: &ReindexConfig) -> Self {
+    pub fn from_reindex_config(config: &ReindexConfig) -> Self {
         let mut adapters: Vec<Box<dyn TranscriptReadAdapter>> = Vec::new();
         if let Some(dir) = &config.harness_sessions_dir {
             adapters.extend(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(dir));
@@ -82,16 +82,16 @@ impl TranscriptAdapterRegistry {
     /// daemon exports `BRO_HOME` during startup, matching where in-process
     /// harness sessions write. Interactive sources are index-time only:
     /// tasks are never dispatched to them, so they have no runtime handles.
-    pub(crate) fn from_runtime_config() -> Self {
+    pub fn from_runtime_config() -> Self {
         let dir = super::harness_sessions::env_sessions_dir();
         Self::new(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(&dir))
     }
 
-    pub(crate) fn adapters(&self) -> impl Iterator<Item = &dyn TranscriptReadAdapter> {
+    pub fn adapters(&self) -> impl Iterator<Item = &dyn TranscriptReadAdapter> {
         self.adapters.iter().map(|adapter| adapter.as_ref())
     }
 
-    pub(crate) fn adapter_for(
+    pub fn adapter_for(
         &self,
         source: TranscriptSource,
     ) -> Option<&dyn TranscriptReadAdapter> {
@@ -100,11 +100,11 @@ impl TranscriptAdapterRegistry {
 
     /// Lookup by dispatch provider — the shape runtime callers (task
     /// transcript handles) think in.
-    pub(crate) fn adapter(&self, provider: Provider) -> Option<&dyn TranscriptReadAdapter> {
+    pub fn adapter(&self, provider: Provider) -> Option<&dyn TranscriptReadAdapter> {
         self.adapter_for(TranscriptSource::Harness(provider))
     }
 
-    pub(crate) fn locate(
+    pub fn locate(
         &self,
         provider: Provider,
         session_id: &str,

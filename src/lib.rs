@@ -99,7 +99,6 @@ pub mod slack_channel_bindings;
 pub mod slack_proposal_links;
 mod slack_thread_store;
 mod slices;
-use bbox_edge_sidecar::snapshot;
 mod storage_health;
 mod store_persister;
 mod system_events;
@@ -111,7 +110,7 @@ use bbox_corpus_core::template;
 mod threads;
 mod tool_docs;
 mod tools;
-mod transcripts;
+use bbox_corpus_index::transcripts;
 pub mod util;
 // `vectors` was extracted into the `bbox-vectors` workspace crate (build-time
 // decomposition). Aliased back to `crate::vectors` so existing `crate::vectors::*`

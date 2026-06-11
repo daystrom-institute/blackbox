@@ -1,0 +1,37 @@
+[package]
+name = "bbox-corpus-index"
+version = "0.0.1"
+edition = "2024"
+
+# Daemon-internal corpus crate, peeled out of the root `blackbox` crate
+# (root-crate-peels arc). The transcript/code index ENGINE: tantivy schema +
+# TranscriptIndex, search, transcript adapters and projection, project-file /
+# git-history / tool-edge index passes, scan/meta utilities, and the
+# daemon-hook seams (embed enqueue, manual store-doc pass). Store-agnostic by
+# invariant: the store->doc builders, writer actor, and reindex orchestration
+# stay daemon-side and call down into this crate; daemon-side wiring attaches
+# only through the startup-injected hooks in `index::embed_hook`.
+
+[dependencies]
+anyhow = "1"
+parking_lot = "0.12"
+dirs = "6"
+hex = "0.4"
+ignore = "0.4"
+regex = "1"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tantivy = "0.22"
+tracing = "0.1"
+walkdir = "2"
+
+bbox-chunker = { path = "../bbox-chunker" }
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
+bro-core = { path = "../bro-core" }
+bro-transcript = { path = "../bro-transcript" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -34,7 +34,7 @@ use std::str::FromStr;
 use serde_json::Value;
 
 use bro_core::Provider;
-use crate::parser::parse_transcript_line_rich;
+use bro_transcript::parse_transcript_line_rich;
 
 use super::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
 use super::types::{
@@ -43,7 +43,7 @@ use super::types::{
 };
 
 /// File suffix of the harness sidecar event log.
-pub(crate) const EVENT_LOG_SUFFIX: &str = ".events.jsonl";
+pub const EVENT_LOG_SUFFIX: &str = ".events.jsonl";
 
 /// Owner of logs whose provider cannot be determined (no `session_start`
 /// milestone, no inferable transport/model).
@@ -63,7 +63,7 @@ const HARNESS_PROVIDERS: &[Provider] = &[
 /// harness-sessions`, else `~/.bro-harness/sessions`. The daemon exports
 /// `BRO_HOME` during single-threaded startup (`server/open.rs`), so runtime
 /// callers agree with in-process harness sessions on the dir.
-pub(crate) fn env_sessions_dir() -> PathBuf {
+pub fn env_sessions_dir() -> PathBuf {
     if let Ok(home) = std::env::var("BRO_HOME") {
         PathBuf::from(home).join("harness-sessions")
     } else {
@@ -74,18 +74,18 @@ pub(crate) fn env_sessions_dir() -> PathBuf {
     }
 }
 
-pub(crate) struct HarnessSessionsAdapter {
+pub struct HarnessSessionsAdapter {
     provider: Provider,
     dir: PathBuf,
 }
 
 impl HarnessSessionsAdapter {
-    pub(crate) fn new(provider: Provider, dir: PathBuf) -> Self {
+    pub fn new(provider: Provider, dir: PathBuf) -> Self {
         Self { provider, dir }
     }
 
     /// One adapter instance per harness provider, all over the same dir.
-    pub(crate) fn all_for_dir(dir: &Path) -> Vec<Box<dyn TranscriptReadAdapter>> {
+    pub fn all_for_dir(dir: &Path) -> Vec<Box<dyn TranscriptReadAdapter>> {
         HARNESS_PROVIDERS
             .iter()
             .map(|provider| {

@@ -2472,7 +2472,7 @@ mod tests {
     mod cross_phase {
         use super::*;
         use crate::manifest::ManifestIndex;
-        use crate::snapshot::{
+        use bbox_edge_sidecar::snapshot::{
             clean_snapshot_id, snapshot_dir, switch_to_clean_snapshot, switch_to_dirty_overlay,
         };
         use crate::storage_health::{
@@ -3146,7 +3146,7 @@ mod tests {
     #[test]
     fn per_file_overlay_suppresses_covered_snapshot_edges() {
         use crate::manifest::{ManifestIndex, OverlayManifest, WorkspaceIndexEntry};
-        use crate::snapshot::{dirty_overlay_dir, snapshot_dir};
+        use bbox_edge_sidecar::snapshot::{dirty_overlay_dir, snapshot_dir};
         use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();

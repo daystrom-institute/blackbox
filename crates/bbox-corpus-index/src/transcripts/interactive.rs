@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::parser;
+use bro_transcript as parser;
 
 use super::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
 use super::types::{
@@ -29,12 +29,12 @@ use super::types::{
 // ── Claude ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub(crate) struct ClaudeTranscriptAdapter {
+pub struct ClaudeTranscriptAdapter {
     roots: Vec<(String, PathBuf)>,
 }
 
 impl ClaudeTranscriptAdapter {
-    pub(crate) fn new(roots: Vec<(String, PathBuf)>) -> Self {
+    pub fn new(roots: Vec<(String, PathBuf)>) -> Self {
         Self { roots }
     }
 }
@@ -176,12 +176,12 @@ impl TranscriptReadAdapter for ClaudeTranscriptAdapter {
 // ── Codex ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub(crate) struct CodexTranscriptAdapter {
+pub struct CodexTranscriptAdapter {
     codex_root: PathBuf,
 }
 
 impl CodexTranscriptAdapter {
-    pub(crate) fn new(codex_root: PathBuf) -> Self {
+    pub fn new(codex_root: PathBuf) -> Self {
         Self { codex_root }
     }
 }
@@ -291,12 +291,12 @@ impl TranscriptReadAdapter for CodexTranscriptAdapter {
 // ── Gemini ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub(crate) struct GeminiTranscriptAdapter {
+pub struct GeminiTranscriptAdapter {
     tmp_root: PathBuf,
 }
 
 impl GeminiTranscriptAdapter {
-    pub(crate) fn new(tmp_root: PathBuf) -> Self {
+    pub fn new(tmp_root: PathBuf) -> Self {
         Self { tmp_root }
     }
 }
@@ -667,7 +667,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use crate::parser::{self, MessageRole};
+    use bro_transcript::{self, MessageRole};
 
     use super::*;
 

@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use bro_core::Provider;
-use crate::parser::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind, TranscriptEvent};
+use bro_transcript::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind, TranscriptEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TranscriptStorage {
+pub enum TranscriptStorage {
     JsonlFile,
     HistoryJsonl,
     JsonFile,
@@ -26,7 +26,7 @@ pub(crate) enum TranscriptStorage {
 /// source, not a dispatch target, so they get their own identity here instead
 /// of resurrecting dispatch variants (gap-5af6d773).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TranscriptSource {
+pub enum TranscriptSource {
     Harness(Provider),
     Claude,
     Codex,
@@ -36,7 +36,7 @@ pub(crate) enum TranscriptSource {
 impl TranscriptSource {
     /// Stable lowercase label: indexed `account` fallback, entity-id prefix,
     /// and serialized form.
-    pub(crate) fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Harness(Provider::Brodex) => "brodex",
             Self::Harness(Provider::VibeBh) => "vibebh",
@@ -84,7 +84,7 @@ impl<'de> Deserialize<'de> for TranscriptSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TranscriptLocation {
+pub struct TranscriptLocation {
     /// Field keeps its historical wire name; see [`TranscriptSource`] serde.
     #[serde(rename = "provider")]
     pub source: TranscriptSource,
@@ -99,7 +99,7 @@ pub(crate) struct TranscriptLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum TranscriptCursor {
+pub enum TranscriptCursor {
     ByteOffset {
         offset: u64,
     },
@@ -117,20 +117,20 @@ pub(crate) enum TranscriptCursor {
 }
 
 impl TranscriptCursor {
-    pub(crate) fn byte_offset(offset: u64) -> Self {
+    pub fn byte_offset(offset: u64) -> Self {
         Self::ByteOffset { offset }
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TranscriptSnapshot {
+pub struct TranscriptSnapshot {
     pub location: TranscriptLocation,
     pub events: Vec<NormalizedTranscriptEvent>,
     pub cursor: Option<TranscriptCursor>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TranscriptBatch {
+pub struct TranscriptBatch {
     pub location: TranscriptLocation,
     pub events: Vec<NormalizedTranscriptEvent>,
     pub cursor: Option<TranscriptCursor>,
@@ -138,7 +138,7 @@ pub(crate) struct TranscriptBatch {
 }
 
 #[derive(Clone)]
-pub(crate) enum TranscriptReadError {
+pub enum TranscriptReadError {
     Io {
         op: &'static str,
         path: PathBuf,
@@ -169,7 +169,7 @@ pub(crate) enum TranscriptReadError {
 }
 
 impl TranscriptReadError {
-    pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, err: io::Error) -> Self {
+    pub fn io(op: &'static str, path: impl Into<PathBuf>, err: io::Error) -> Self {
         Self::Io {
             op,
             path: path.into(),
@@ -294,7 +294,7 @@ impl fmt::Display for TranscriptReadError {
 impl std::error::Error for TranscriptReadError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TranscriptRole {
+pub enum TranscriptRole {
     User,
     Assistant,
     Thinking,
@@ -330,7 +330,7 @@ impl From<TranscriptRole> for MessageRole {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TranscriptEventKind {
+pub enum TranscriptEventKind {
     Message,
     Thinking,
     ToolUse,
@@ -339,7 +339,7 @@ pub(crate) enum TranscriptEventKind {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NormalizedToolCall {
+pub struct NormalizedToolCall {
     pub kind: ToolCallKind,
     pub name: String,
     pub tool_use_id: Option<String>,
@@ -369,7 +369,7 @@ impl From<NormalizedToolCall> for ToolCallInfo {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RawTranscriptRef {
+pub struct RawTranscriptRef {
     pub source: TranscriptSource,
     pub storage: TranscriptStorage,
     pub path: PathBuf,
@@ -381,7 +381,7 @@ pub(crate) struct RawTranscriptRef {
 }
 
 impl RawTranscriptRef {
-    pub(crate) fn jsonl(
+    pub fn jsonl(
         source: TranscriptSource,
         storage: TranscriptStorage,
         path: impl Into<PathBuf>,
@@ -401,7 +401,7 @@ impl RawTranscriptRef {
         }
     }
 
-    pub(crate) fn provider_event(
+    pub fn provider_event(
         source: TranscriptSource,
         storage: TranscriptStorage,
         path: impl Into<PathBuf>,
@@ -422,7 +422,7 @@ impl RawTranscriptRef {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NormalizedTranscriptEvent {
+pub struct NormalizedTranscriptEvent {
     pub source: TranscriptSource,
     pub role: TranscriptRole,
     pub kind: TranscriptEventKind,
@@ -438,7 +438,7 @@ pub(crate) struct NormalizedTranscriptEvent {
 }
 
 impl NormalizedTranscriptEvent {
-    pub(crate) fn from_parsed_event(
+    pub fn from_parsed_event(
         source: TranscriptSource,
         event: ParsedEvent,
         raw: RawTranscriptRef,
@@ -460,7 +460,7 @@ impl NormalizedTranscriptEvent {
         }
     }
 
-    pub(crate) fn from_transcript_event(
+    pub fn from_transcript_event(
         source: TranscriptSource,
         event: &TranscriptEvent,
         raw: RawTranscriptRef,
@@ -470,7 +470,7 @@ impl NormalizedTranscriptEvent {
             .map(|parsed| Self::from_parsed_event(source, parsed, raw))
     }
 
-    pub(crate) fn jsonl_entity_id(&self) -> Option<String> {
+    pub fn jsonl_entity_id(&self) -> Option<String> {
         let byte_offset = self.raw.byte_offset?;
         let event_idx = self.raw.event_idx?;
         Some(format!(

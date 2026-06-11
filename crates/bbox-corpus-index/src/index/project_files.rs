@@ -9,15 +9,15 @@ use sha2::{Digest, Sha256};
 use tantivy::{IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta, ReindexConfig};
-use crate::chunker::{self, Chunk, Edge, EdgeConfidence, EdgeProvenance};
-use crate::entity_ref::{self, EntityRef};
+use bbox_chunker::{self as chunker, Chunk, Edge, EdgeConfidence, EdgeProvenance};
+use bbox_corpus_core::entity_ref::{self, EntityRef};
 use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "_build", ".worktrees"];
 
 #[derive(Debug, Default)]
-pub(super) struct ProjectIndexStats {
+pub struct ProjectIndexStats {
     pub indexed_files: u64,
     pub indexed_docs: u64,
     pub skipped: u64,
@@ -61,7 +61,7 @@ fn ref_snapshot_id(
         return None;
     }
     if let (Some(repo_id), Some(head_sha)) = (project.repo_id.as_deref(), commit_sha) {
-        return Some(crate::snapshot::clean_snapshot_id(
+        return Some(bbox_edge_sidecar::snapshot::clean_snapshot_id(
             repo_id,
             &project.project_id,
             head_sha,
@@ -76,13 +76,13 @@ fn ref_snapshot_id(
         hasher.update(size.to_le_bytes());
     }
     let fingerprint = hex::encode(hasher.finalize());
-    Some(crate::snapshot::nongit_snapshot_id(
+    Some(bbox_edge_sidecar::snapshot::nongit_snapshot_id(
         &project.project_id,
         &fingerprint,
     ))
 }
 
-pub(super) fn scan_registered_project_files(
+pub fn scan_registered_project_files(
     config: &ReindexConfig,
 ) -> Result<Vec<(String, u64, u64)>> {
     let mut files = Vec::new();
@@ -90,7 +90,7 @@ pub(super) fn scan_registered_project_files(
         let root = PathBuf::from(&project.canonical_path);
         scan_project_files(&root, &mut files)?;
         if project.repo_id.is_some() {
-            if let Some(head) = crate::git::head_fingerprint(&root) {
+            if let Some(head) = bbox_corpus_core::git::head_fingerprint(&root) {
                 files.push((
                     super::git_history::git_source_key(&project.project_id),
                     0,
@@ -102,7 +102,7 @@ pub(super) fn scan_registered_project_files(
     Ok(files)
 }
 
-pub(super) fn index_registered_projects_standalone(
+pub fn index_registered_projects_standalone(
     config: &ReindexConfig,
     f: FieldHandles,
     writer: &mut IndexWriter,
@@ -110,7 +110,7 @@ pub(super) fn index_registered_projects_standalone(
     force_git_full: bool,
 ) -> Result<ProjectIndexStats> {
     let mut stats = ProjectIndexStats::default();
-    let edges_dir = crate::edge_index::edges_dir_from_projects_path(&config.projects_path);
+    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
     let git_meta_dir = super::git_history::git_meta_dir_from_projects_path(&config.projects_path);
     for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
@@ -131,7 +131,7 @@ pub(super) fn index_registered_projects_standalone(
     Ok(stats)
 }
 
-pub(crate) fn build_project_file_doc(
+pub fn build_project_file_doc(
     chunk: &Chunk,
     project: &ProjectRecord,
     absolute_path: &Path,
@@ -199,7 +199,7 @@ pub(crate) fn build_project_file_doc(
     doc
 }
 
-pub(crate) fn resolve_current_chunk_entity(
+pub fn resolve_current_chunk_entity(
     project: &ProjectRecord,
     root: &Path,
     absolute_path: &Path,
@@ -281,13 +281,13 @@ fn index_project(
     ctx: &mut ProjectIndexContext<'_>,
 ) -> Result<()> {
     let registry = chunker::default_registry();
-    let commit_sha = crate::git::current_head(root);
+    let commit_sha = bbox_corpus_core::git::current_head(root);
     let mut files = Vec::new();
     let mut pending = Vec::new();
     let mut project_edges = Vec::new();
     scan_project_files(root, &mut files)?;
     let snapshot_id = ref_snapshot_id(project, root, &files, commit_sha.as_deref());
-    let mat_version = crate::snapshot::current_materialization_version();
+    let mat_version = bbox_edge_sidecar::snapshot::current_materialization_version();
     // On-disk text-file set for this project, captured before `files` is moved.
     // Used to detect tracked-file deletions (in meta, absent on disk) so their
     // derived edges are purged rather than lingering in the materialized graph.
@@ -412,7 +412,7 @@ fn index_project(
         );
         ctx.stats.indexed_files += 1;
     }
-    crate::edge_index::replace_materialized_edges_incremental(
+    bbox_edge_sidecar::edge_sidecar::replace_materialized_edges_incremental(
         ctx.edges_dir,
         "project",
         &project.project_id,
@@ -439,7 +439,7 @@ fn index_project(
     }
     ctx.stats.emitted_edges += git_stats.emitted_edges;
     if ctx.force_git_full {
-        match crate::edge_index::compact_legacy_sidecar(ctx.edges_dir, &project.project_id, true) {
+        match bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(ctx.edges_dir, &project.project_id, true) {
             Ok(stats) if stats.applied => {
                 tracing::info!(
                     project_id = %project.project_id,
@@ -480,7 +480,7 @@ fn index_project(
     let deletions_purged = if deleted_rel_hashes.is_empty() {
         0
     } else {
-        crate::edge_index::purge_managed_edges_for_path_hashes(
+        bbox_edge_sidecar::edge_sidecar::purge_managed_edges_for_path_hashes(
             ctx.edges_dir,
             "project",
             &project.project_id,
@@ -544,7 +544,7 @@ fn is_supported_text_path(path: &Path) -> bool {
         Some(
             "md" | "markdown" | "mdown" | "json" | "toml" | "yaml" | "yml" | "txt" | "text" | "log"
         )
-    ) || crate::chunker::code::language_for_path(path).is_some()
+    ) || bbox_chunker::code::language_for_path(path).is_some()
 }
 
 fn finalize_chunks(project: &ProjectRecord, rel_path: &Path, chunks: Vec<Chunk>) -> Vec<Chunk> {
@@ -925,7 +925,7 @@ fn materialization_is_current(
     head_sha: &str,
     worktree_dirty: bool,
 ) -> bool {
-    let Ok(idx) = crate::manifest::ManifestIndex::load(edges_dir) else {
+    let Ok(idx) = bbox_edge_sidecar::manifest::ManifestIndex::load(edges_dir) else {
         // No manifest-index yet (cold start / never materialized) ⇒ materialize.
         return false;
     };
@@ -936,8 +936,8 @@ fn materialization_is_current(
     // Version-aware expected snapshot for the current HEAD. `clean_snapshot_id`
     // folds INDEXER_VERSION/CHUNKER_VERSION, so a version bump with unchanged
     // mtimes yields a different id ⇒ mismatch ⇒ not skipped.
-    let expected_snap = crate::snapshot::clean_snapshot_id(repo_id, project_id, head_sha);
-    let expected_snap_rel = crate::snapshot::active_snapshot_rel(project_id, &expected_snap);
+    let expected_snap = bbox_edge_sidecar::snapshot::clean_snapshot_id(repo_id, project_id, head_sha);
+    let expected_snap_rel = bbox_edge_sidecar::snapshot::active_snapshot_rel(project_id, &expected_snap);
     if entry.active_snapshot.as_deref() != Some(expected_snap_rel.as_str()) {
         return false;
     }
@@ -946,9 +946,9 @@ fn materialization_is_current(
     // ManifestIndex overlay pointer, and the overlay dir on disk. Any
     // disagreement forces re-materialization (e.g. a clean checkout that left a
     // stale overlay, which `switch_to_clean_snapshot` must clear).
-    let overlay_rel = crate::snapshot::dirty_overlay_rel(project_id);
+    let overlay_rel = bbox_edge_sidecar::snapshot::dirty_overlay_rel(project_id);
     let overlay_in_manifest = entry.dirty_overlay.as_deref() == Some(overlay_rel.as_str());
-    let overlay_on_disk = crate::snapshot::dirty_overlay_dir(edges_dir, project_id).is_dir();
+    let overlay_on_disk = bbox_edge_sidecar::snapshot::dirty_overlay_dir(edges_dir, project_id).is_dir();
     if worktree_dirty {
         if !overlay_in_manifest || !overlay_on_disk {
             return false;
@@ -960,7 +960,7 @@ fn materialization_is_current(
         // Clean ⇒ the active snapshot dir is what the loader reads; it must
         // exist. `active_materialized_paths` silently drops missing dirs, so a
         // GC between passes would lose this project from the graph if we skipped.
-        if !crate::snapshot::snapshot_dir(edges_dir, project_id, &expected_snap).is_dir() {
+        if !bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, project_id, &expected_snap).is_dir() {
             return false;
         }
     }
@@ -977,11 +977,11 @@ fn snapshot_after_reindex(
     let Some(repo_id) = project.repo_id.as_deref() else {
         return Ok(());
     };
-    let Some(head_sha) = crate::git::current_head(root) else {
+    let Some(head_sha) = bbox_corpus_core::git::current_head(root) else {
         return Ok(());
     };
-    let branch = crate::git::current_branch(root);
-    let worktree_dirty = crate::git::is_worktree_dirty(root);
+    let branch = bbox_corpus_core::git::current_branch(root);
+    let worktree_dirty = bbox_corpus_core::git::is_worktree_dirty(root);
 
     // Writer-side materialization idempotency. Re-running `switch_to_*` rewrites
     // the dirty overlay via temp-dir + atomic rename, which stamps fresh mtimes
@@ -1005,13 +1005,13 @@ fn snapshot_after_reindex(
     }
 
     let project_edges =
-        crate::edge_index::read_managed_derived_edges(edges_dir, "project", &project.project_id)?;
+        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(edges_dir, "project", &project.project_id)?;
     let git_edges =
-        crate::edge_index::read_managed_derived_edges(edges_dir, "git", &project.project_id)?;
+        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(edges_dir, "git", &project.project_id)?;
 
-    let snapshot_edges: Vec<crate::edge_index::Edge> = project_edges
+    let snapshot_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = project_edges
         .iter()
-        .map(|e| crate::edge_index::Edge {
+        .map(|e| bbox_edge_sidecar::edge_sidecar::Edge {
             source: e.source.clone(),
             kind: e.kind.clone(),
             target: e.target.clone(),
@@ -1020,9 +1020,9 @@ fn snapshot_after_reindex(
             metadata: Default::default(),
         })
         .collect();
-    let git_snapshot_edges: Vec<crate::edge_index::Edge> = git_edges
+    let git_snapshot_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = git_edges
         .iter()
-        .map(|e| crate::edge_index::Edge {
+        .map(|e| bbox_edge_sidecar::edge_sidecar::Edge {
             source: e.source.clone(),
             kind: e.kind.clone(),
             target: e.target.clone(),
@@ -1033,8 +1033,8 @@ fn snapshot_after_reindex(
         .collect();
 
     if worktree_dirty {
-        let fp = crate::git::dirty_fingerprint(root).unwrap_or_default();
-        crate::snapshot::switch_to_dirty_overlay(
+        let fp = bbox_corpus_core::git::dirty_fingerprint(root).unwrap_or_default();
+        bbox_edge_sidecar::snapshot::switch_to_dirty_overlay(
             edges_dir,
             &project.project_id,
             repo_id,
@@ -1046,7 +1046,7 @@ fn snapshot_after_reindex(
             git_snapshot_edges,
         )?;
     } else {
-        crate::snapshot::switch_to_clean_snapshot(
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
             edges_dir,
             &project.project_id,
             repo_id,
@@ -1063,7 +1063,7 @@ fn snapshot_after_reindex(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::SourceFormatChunker;
+    use bbox_chunker::SourceFormatChunker;
     use crate::index::build_schema;
     use tantivy::schema::Field;
 
@@ -1180,7 +1180,7 @@ mod tests {
             &project,
             Path::new("src/lib.rs"),
             vec![
-                crate::chunker::placeholder_chunk(
+                bbox_chunker::placeholder_chunk(
                     Path::new("src/lib.rs"),
                     "code_block",
                     Some("rust"),
@@ -1189,7 +1189,7 @@ mod tests {
                     14,
                     0,
                 ),
-                crate::chunker::placeholder_chunk(
+                bbox_chunker::placeholder_chunk(
                     Path::new("src/lib.rs"),
                     "code_block",
                     Some("rust"),
@@ -1242,7 +1242,7 @@ mod tests {
             &project,
             Path::new("src/lib.rs"),
             vec![
-                crate::chunker::placeholder_chunk(
+                bbox_chunker::placeholder_chunk(
                     Path::new("src/lib.rs"),
                     "code_block",
                     Some("rust"),
@@ -1251,7 +1251,7 @@ mod tests {
                     19,
                     0,
                 ),
-                crate::chunker::placeholder_chunk(
+                bbox_chunker::placeholder_chunk(
                     Path::new("src/lib.rs"),
                     "code_block",
                     Some("rust"),
@@ -1316,11 +1316,11 @@ mod tests {
         "#;
         let right = br#"{"a":{"z":true},"b":2}"#;
 
-        let left_chunks = crate::chunker::config::JsonChunker
+        let left_chunks = bbox_chunker::config::JsonChunker
             .chunk(Path::new("config.json"), left)
             .unwrap()
             .0;
-        let right_chunks = crate::chunker::config::JsonChunker
+        let right_chunks = bbox_chunker::config::JsonChunker
             .chunk(Path::new("config.json"), right)
             .unwrap()
             .0;
@@ -1360,8 +1360,8 @@ mod tests {
     const MAT_PROJ: &str = "proj-mat";
     const MAT_HEAD: &str = "abc123def456";
 
-    fn mat_edge(id: &str, target: &str) -> crate::edge_index::Edge {
-        crate::edge_index::Edge {
+    fn mat_edge(id: &str, target: &str) -> bbox_edge_sidecar::edge_sidecar::Edge {
+        bbox_edge_sidecar::edge_sidecar::Edge {
             source: EntityRef::Knowledge { id: id.into() },
             kind: "DESCRIBES".into(),
             target: EntityRef::Knowledge { id: target.into() },
@@ -1372,7 +1372,7 @@ mod tests {
     }
 
     fn seed_clean(edges_dir: &Path) {
-        crate::snapshot::switch_to_clean_snapshot(
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
             edges_dir,
             MAT_PROJ,
             MAT_REPO,
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     fn seed_dirty(edges_dir: &Path) {
-        crate::snapshot::switch_to_dirty_overlay(
+        bbox_edge_sidecar::snapshot::switch_to_dirty_overlay(
             edges_dir,
             MAT_PROJ,
             MAT_REPO,
@@ -1402,7 +1402,7 @@ mod tests {
 
     #[test]
     fn classify_project_file_covers_skip_adopt_reindex() {
-        let v = crate::snapshot::current_materialization_version();
+        let v = bbox_edge_sidecar::snapshot::current_materialization_version();
         let current = FileMeta {
             mtime: 100,
             size: 200,
@@ -1516,7 +1516,7 @@ mod tests {
         // switch must run to clear it, so skipping would leave the stale overlay.
         let dir = tempfile::tempdir().unwrap();
         seed_dirty(dir.path());
-        assert!(crate::snapshot::dirty_overlay_dir(dir.path(), MAT_PROJ).is_dir());
+        assert!(bbox_edge_sidecar::snapshot::dirty_overlay_dir(dir.path(), MAT_PROJ).is_dir());
         assert!(!materialization_is_current(
             dir.path(),
             MAT_PROJ,
@@ -1546,8 +1546,8 @@ mod tests {
         // active_materialized_paths drops missing dirs silently, so re-materialize.
         let dir = tempfile::tempdir().unwrap();
         seed_clean(dir.path());
-        let snap_id = crate::snapshot::clean_snapshot_id(MAT_REPO, MAT_PROJ, MAT_HEAD);
-        let snap = crate::snapshot::snapshot_dir(dir.path(), MAT_PROJ, &snap_id);
+        let snap_id = bbox_edge_sidecar::snapshot::clean_snapshot_id(MAT_REPO, MAT_PROJ, MAT_HEAD);
+        let snap = bbox_edge_sidecar::snapshot::snapshot_dir(dir.path(), MAT_PROJ, &snap_id);
         std::fs::remove_dir_all(&snap).unwrap();
         assert!(!materialization_is_current(
             dir.path(),

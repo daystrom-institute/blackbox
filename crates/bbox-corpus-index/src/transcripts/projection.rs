@@ -1,12 +1,12 @@
 use tantivy::TantivyDocument;
 
 use crate::index::FieldHandles;
-use crate::parser::{ParsedEvent, ToolCallKind};
+use bro_transcript::{ParsedEvent, ToolCallKind};
 
 use super::types::{NormalizedTranscriptEvent, TranscriptEventKind};
 
 impl NormalizedTranscriptEvent {
-    pub(crate) fn to_parsed_event(&self) -> Option<ParsedEvent> {
+    pub fn to_parsed_event(&self) -> Option<ParsedEvent> {
         let role = self.role.into();
         Some(ParsedEvent {
             role,
@@ -21,7 +21,7 @@ impl NormalizedTranscriptEvent {
         })
     }
 
-    pub(crate) fn is_indexable(&self) -> bool {
+    pub fn is_indexable(&self) -> bool {
         matches!(
             self.kind,
             TranscriptEventKind::Message
@@ -33,7 +33,7 @@ impl NormalizedTranscriptEvent {
     }
 }
 
-pub(crate) fn normalized_to_doc(
+pub fn normalized_to_doc(
     event: &NormalizedTranscriptEvent,
     account: &str,
     file_path: &str,
@@ -45,7 +45,7 @@ pub(crate) fn normalized_to_doc(
     let byte_offset = event.raw.byte_offset.unwrap_or_default();
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "transcript");
-    doc.add_text(f.parser_version, crate::entity_ref::PARSER_VERSION);
+    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
     doc.add_text(f.content, &parsed.content);
     doc.add_text(f.session_id, &parsed.session_id);
     doc.add_text(f.account, account);
@@ -81,7 +81,7 @@ pub(crate) fn normalized_to_doc(
     Some(doc)
 }
 
-pub(crate) fn normalized_to_tool_call_doc(
+pub fn normalized_to_tool_call_doc(
     event: &NormalizedTranscriptEvent,
     account: &str,
     file_path: &str,
@@ -104,7 +104,7 @@ pub(crate) fn normalized_to_tool_call_doc(
 
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "tool_call");
-    doc.add_text(f.parser_version, crate::entity_ref::PARSER_VERSION);
+    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
     doc.add_text(f.content, &parsed.content);
     doc.add_text(f.session_id, &parsed.session_id);
     doc.add_text(f.account, account);
@@ -215,7 +215,7 @@ mod tests {
     use serde_json::json;
 
     use bro_core::Provider;
-    use crate::parser::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind};
+    use bro_transcript::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind};
 
     use super::super::types::RawTranscriptRef;
     use super::*;

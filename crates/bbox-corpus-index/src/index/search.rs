@@ -4,7 +4,6 @@ use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tantivy::collector::TopDocs;
@@ -16,10 +15,10 @@ use walkdir::WalkDir;
 
 use super::helpers::*;
 use super::project_files;
-use super::reindex::*;
+use super::passes::*;
 use super::{FileMeta, TranscriptIndex};
-use crate::parser;
-use crate::query::smart_query_to_tantivy;
+use bro_transcript as parser;
+use bbox_corpus_core::query::smart_query_to_tantivy;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -345,7 +344,7 @@ impl TranscriptIndex {
         Ok(out)
     }
 
-    pub(crate) fn hybrid_bm25_hits(
+    pub fn hybrid_bm25_hits(
         &self,
         query: &str,
         limit: usize,
@@ -446,7 +445,7 @@ impl TranscriptIndex {
                     _ => None,
                 })
                 .unwrap_or_default();
-            return crate::entity_ref::EntityRef::Transcript {
+            return bbox_corpus_core::entity_ref::EntityRef::Transcript {
                 provider,
                 session_id,
                 line_offset,
@@ -1049,7 +1048,7 @@ impl TranscriptIndex {
                         }
                     }
                     // Skip tool_result — too noisy for topic extraction
-                    if ev.role == crate::parser::MessageRole::ToolResult {
+                    if ev.role == bro_transcript::MessageRole::ToolResult {
                         continue;
                     }
                     all_content.push(' ');
@@ -1376,7 +1375,7 @@ impl TranscriptIndex {
         let index_size = dir_size(self.config.meta_path.parent().unwrap_or(Path::new(".")));
         let segments = segment_count(&self.index);
         let tool_call_edges = count_tool_call_edges(
-            &crate::edge_index::edges_dir_from_projects_path(&self.config.projects_path),
+            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&self.config.projects_path),
         );
 
         format!(
@@ -1560,7 +1559,7 @@ fn count_tool_call_edges(edges_dir: &Path) -> u64 {
         .filter_map(|path| fs::File::open(path).ok())
         .flat_map(|file| std::io::BufReader::new(file).lines().map_while(Result::ok))
         .filter(|line| {
-            serde_json::from_str::<crate::edge_index::Edge>(line)
+            serde_json::from_str::<bbox_edge_sidecar::edge_sidecar::Edge>(line)
                 .ok()
                 .is_some_and(|edge| {
                     matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH")
@@ -1600,7 +1599,13 @@ mod agentic_project_file_tests {
     fn registered_project_markdown_and_rust_source_are_searchable() {
         let dir = tempfile::tempdir().unwrap();
         let projects_path = dir.path().join("projects.json");
-        register_test_project(&projects_path, std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        // This test indexes the live repo (design/ + src/). The engine crate
+        // lives at <repo>/crates/bbox-corpus-index, so re-root two levels up.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap();
+        register_test_project(&projects_path, repo_root);
 
         let mut index = TranscriptIndex::open_or_create(
             &dir.path().join("index"),

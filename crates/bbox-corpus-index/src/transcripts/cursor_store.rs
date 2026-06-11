@@ -31,24 +31,24 @@ impl Default for CursorStoreFile {
 }
 
 #[derive(Debug)]
-pub(crate) struct TranscriptCursorStore {
+pub struct TranscriptCursorStore {
     path: PathBuf,
     data: CursorStoreFile,
 }
 
 impl TranscriptCursorStore {
-    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             data: CursorStoreFile::default(),
         }
     }
 
-    pub(crate) fn default_for_provider(provider: &str) -> Self {
+    pub fn default_for_provider(provider: &str) -> Self {
         Self::new(Self::default_path_for_provider(provider))
     }
 
-    pub(crate) fn default_path_for_provider(provider: &str) -> PathBuf {
+    pub fn default_path_for_provider(provider: &str) -> PathBuf {
         let base = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".local")
@@ -58,7 +58,7 @@ impl TranscriptCursorStore {
         base.join(format!("{provider}.json"))
     }
 
-    pub(crate) fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
         if !path.exists() {
             return Ok(Self::new(path));
@@ -77,7 +77,7 @@ impl TranscriptCursorStore {
         Ok(Self { path, data })
     }
 
-    pub(crate) fn get(
+    pub fn get(
         &self,
         session_id: &str,
         location: &TranscriptLocation,
@@ -86,7 +86,7 @@ impl TranscriptCursorStore {
         (record.location_fingerprint == location_fingerprint(location)).then_some(&record.cursor)
     }
 
-    pub(crate) fn set(
+    pub fn set(
         &mut self,
         session_id: impl Into<String>,
         location: &TranscriptLocation,
@@ -102,7 +102,7 @@ impl TranscriptCursorStore {
         );
     }
 
-    pub(crate) fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cursor store mkdir {}: {e}", parent.display()))?;
@@ -117,7 +117,7 @@ impl TranscriptCursorStore {
     }
 }
 
-pub(crate) fn location_fingerprint(location: &TranscriptLocation) -> String {
+pub fn location_fingerprint(location: &TranscriptLocation) -> String {
     let mut h = DefaultHasher::new();
     location.source.hash(&mut h);
     location.storage.hash(&mut h);

@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use bbox_corpus_core::entity_ref::EntityRef;
 use tantivy::IndexWriter;
 
-use crate::chunker::Chunk;
+use bbox_chunker::Chunk;
 
 use super::{FieldHandles, FileMeta, ReindexConfig};
 
@@ -36,13 +36,13 @@ pub fn register_embed_hooks(hooks: EmbedHooks) {
     let _ = EMBED_HOOKS.set(hooks);
 }
 
-pub(crate) fn emit_project_file(chunk: &Chunk, entity_id: &str) {
+pub fn emit_project_file(chunk: &Chunk, entity_id: &str) {
     if let Some(hooks) = EMBED_HOOKS.get() {
         (hooks.project_file)(chunk, entity_id);
     }
 }
 
-pub(crate) fn emit_git_message(entity_id: &str, chunk_hash: &str, message: &str) {
+pub fn emit_git_message(entity_id: &str, chunk_hash: &str, message: &str) {
     if let Some(hooks) = EMBED_HOOKS.get() {
         (hooks.git_message)(entity_id, chunk_hash, message);
     }
@@ -53,7 +53,7 @@ pub(crate) fn emit_git_message(entity_id: &str, chunk_hash: &str, message: &str)
 /// reconciles store-backed documents (knowledge entries) into the same
 /// writer/commit as the transcript and project passes. Returns the number
 /// of documents indexed.
-pub(crate) type ManualStorePass = fn(
+pub type ManualStorePass = fn(
     &ReindexConfig,
     FieldHandles,
     &mut IndexWriter,
@@ -64,13 +64,13 @@ static MANUAL_STORE_PASS: OnceLock<ManualStorePass> = OnceLock::new();
 
 /// Register the daemon's store-document pass for manual rebuilds.
 /// Idempotent: first registration wins.
-pub(crate) fn register_manual_store_pass(pass: ManualStorePass) {
+pub fn register_manual_store_pass(pass: ManualStorePass) {
     let _ = MANUAL_STORE_PASS.set(pass);
 }
 
 /// Run the registered store-document pass, or no-op (0 docs) when nothing
 /// is registered (engine-only tests, standalone use).
-pub(crate) fn run_manual_store_pass(
+pub fn run_manual_store_pass(
     config: &ReindexConfig,
     fields: FieldHandles,
     writer: &mut IndexWriter,

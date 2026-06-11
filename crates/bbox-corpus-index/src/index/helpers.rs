@@ -7,13 +7,13 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::ReindexConfig;
-use crate::parser;
+use bro_transcript as parser;
 use crate::transcripts::types::TranscriptStorage;
 
 /// Extract a human-readable project name from the file path.
 /// Claude Code encodes project paths as directory names: `/home/user/repos/foo` → `-home-user-repos-foo`
 #[cfg(test)]
-pub(super) fn extract_project_from_path(file_path: &Path, projects_root: &Path) -> String {
+pub fn extract_project_from_path(file_path: &Path, projects_root: &Path) -> String {
     let relative = file_path.strip_prefix(projects_root).unwrap_or(file_path);
 
     // First path component is the encoded project dir
@@ -126,7 +126,7 @@ pub fn find_session_file(
 }
 
 /// Extract session ID from Codex filename: rollout-YYYY-MM-DDTHH-MM-SS-UUID.jsonl
-pub(super) fn extract_codex_session_id(path: &Path) -> String {
+pub fn extract_codex_session_id(path: &Path) -> String {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -145,7 +145,7 @@ pub(super) fn extract_codex_session_id(path: &Path) -> String {
 }
 
 /// Extract cwd from the session_meta line in a Codex JSONL file (first line).
-pub(super) fn extract_codex_cwd(path: &Path) -> Option<String> {
+pub fn extract_codex_cwd(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines().take(5) {
@@ -158,20 +158,20 @@ pub(super) fn extract_codex_cwd(path: &Path) -> Option<String> {
     None
 }
 
-pub(super) struct SessionEntry {
-    pub(super) session_id: String,
-    pub(super) account: String,
-    pub(super) project: String,
-    pub(super) start_time: String,
-    pub(super) duration_minutes: u64,
+pub struct SessionEntry {
+    pub session_id: String,
+    pub account: String,
+    pub project: String,
+    pub start_time: String,
+    pub duration_minutes: u64,
     #[allow(dead_code)]
-    pub(super) user_messages: u64,
-    pub(super) first_prompt: String,
-    pub(super) name: String,
+    pub user_messages: u64,
+    pub first_prompt: String,
+    pub name: String,
 }
 
 /// Extract the first user prompt from a Codex session file (reads first ~30 lines).
-pub(super) fn extract_codex_first_prompt(path: &Path) -> String {
+pub fn extract_codex_first_prompt(path: &Path) -> String {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return String::new(),
@@ -218,7 +218,7 @@ pub(super) fn extract_codex_first_prompt(path: &Path) -> String {
 
 /// Detect the caller's session by finding the most recently modified transcript
 /// whose tail contains the search query in a user message. Provider-agnostic.
-pub(super) fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<String> {
+pub fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<String> {
     let query_lower = query.to_lowercase();
     let now = std::time::SystemTime::now();
     let max_age_secs = 300; // 5-minute window
@@ -326,7 +326,7 @@ pub(super) fn detect_caller_session(config: &ReindexConfig, query: &str) -> Opti
 
 /// Build a map of session UUID -> friendly name from Claude session files.
 /// Claude stores sessions in ~/.claude/sessions/{pid}.json with { sessionId, name? }.
-pub(super) fn load_claude_session_names(roots: &[(String, PathBuf)]) -> HashMap<String, String> {
+pub fn load_claude_session_names(roots: &[(String, PathBuf)]) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for (_account, root) in roots {
         let sessions_dir = root.join("sessions");
@@ -363,7 +363,7 @@ pub(super) fn load_claude_session_names(roots: &[(String, PathBuf)]) -> HashMap<
 /// Build a map of session UUID -> friendly name from Codex session_index.jsonl.
 /// Format: one JSON object per line: { "id": "UUID", "thread_name": "friendly-name" }
 /// Append-only — last entry per ID wins (supports renames).
-pub(super) fn load_codex_session_names(codex_root: Option<&PathBuf>) -> HashMap<String, String> {
+pub fn load_codex_session_names(codex_root: Option<&PathBuf>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let root = match codex_root {
         Some(r) => r,
@@ -391,7 +391,7 @@ pub(super) fn load_codex_session_names(codex_root: Option<&PathBuf>) -> HashMap<
 
 /// Resolve a friendly session name to a UUID. Checks both Claude and Codex sources.
 /// Returns None if the input already looks like a UUID or no match is found.
-pub(super) fn resolve_session_name(
+pub fn resolve_session_name(
     name: &str,
     roots: &[(String, PathBuf)],
     codex_root: Option<&PathBuf>,
@@ -422,7 +422,7 @@ pub(super) fn resolve_session_name(
 }
 
 /// Quick check: does this string look like a UUID (8-4-4-4-12 hex)?
-pub(super) fn looks_like_uuid(s: &str) -> bool {
+pub fn looks_like_uuid(s: &str) -> bool {
     if s.len() != 36 {
         return false;
     }
@@ -436,7 +436,7 @@ pub(super) fn looks_like_uuid(s: &str) -> bool {
 }
 
 /// Shorten a project path for display: /home/user/repos/foo -> foo
-pub(super) fn shorten_project(path: &str) -> String {
+pub fn shorten_project(path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
@@ -446,7 +446,7 @@ pub(super) fn shorten_project(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-pub(super) fn is_stop_word(w: &str) -> bool {
+pub fn is_stop_word(w: &str) -> bool {
     matches!(
         w,
         // Determiners, pronouns, prepositions, conjunctions

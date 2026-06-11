@@ -6,10 +6,10 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 use super::{ReindexConfig, project_files};
-use crate::chunker::{EdgeConfidence, EdgeProvenance};
-use crate::edge_index::Edge;
-use crate::entity_ref::EntityRef;
-use crate::parser::{self, ParsedEvent, ToolCallInfo, ToolCallKind};
+use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+use bbox_edge_sidecar::edge_sidecar::Edge;
+use bbox_corpus_core::entity_ref::EntityRef;
+use bro_transcript::{self as parser, ParsedEvent, ToolCallInfo, ToolCallKind};
 use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
 
 pub struct ToolEdgeContext {
@@ -19,17 +19,17 @@ pub struct ToolEdgeContext {
 }
 
 impl ToolEdgeContext {
-    pub(super) fn from_config(config: &ReindexConfig, emit_sidecars: bool) -> Result<Self> {
+    pub fn from_config(config: &ReindexConfig, emit_sidecars: bool) -> Result<Self> {
         Ok(Self {
             projects: load_project_records(&config.projects_path)?,
-            edges_dir: crate::edge_index::edges_dir_from_projects_path(&config.projects_path),
+            edges_dir: bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path),
             emit_sidecars,
         })
     }
 
     /// Single-project context for backfill use — restricts edge resolution
     /// to the given project so unrelated transcript paths are cheap to skip.
-    pub(super) fn for_project(project: ProjectRecord, edges_dir: PathBuf) -> Self {
+    pub fn for_project(project: ProjectRecord, edges_dir: PathBuf) -> Self {
         Self {
             projects: vec![project],
             edges_dir,
@@ -37,7 +37,7 @@ impl ToolEdgeContext {
         }
     }
 
-    pub(super) fn emit_event_edges(
+    pub fn emit_event_edges(
         &self,
         event: &ParsedEvent,
         provider: &str,
@@ -62,7 +62,7 @@ impl ToolEdgeContext {
 
     /// Build edges for a transcript event without writing them. Used by
     /// backfill paths that collect all edges first and then write with dedup.
-    pub(super) fn build_event_edges(
+    pub fn build_event_edges(
         &self,
         event: &ParsedEvent,
         provider: &str,
@@ -200,11 +200,11 @@ impl ToolEdgeContext {
             return Ok(0);
         };
         let project_id = match &edge.target {
-            crate::entity_ref::EntityRef::ProjectFile { project_id, .. }
-            | crate::entity_ref::EntityRef::ProjectFileV2 { project_id, .. } => project_id.clone(),
+            bbox_corpus_core::entity_ref::EntityRef::ProjectFile { project_id, .. }
+            | bbox_corpus_core::entity_ref::EntityRef::ProjectFileV2 { project_id, .. } => project_id.clone(),
             _ => return Ok(0),
         };
-        crate::edge_index::append_observed_edges(&self.edges_dir, &project_id, &[edge])?;
+        bbox_edge_sidecar::edge_sidecar::append_observed_edges(&self.edges_dir, &project_id, &[edge])?;
         Ok(1)
     }
 
@@ -240,7 +240,7 @@ impl ToolEdgeContext {
             confidence: EdgeConfidence::Exact,
             metadata: bash_metadata(event, tool_call, project, line_offset),
         };
-        crate::edge_index::append_observed_edges(&self.edges_dir, &project.project_id, &[edge])?;
+        bbox_edge_sidecar::edge_sidecar::append_observed_edges(&self.edges_dir, &project.project_id, &[edge])?;
         Ok(1)
     }
 
@@ -301,7 +301,7 @@ fn anchor_metadata(
         metadata.insert("anchor.byte_end".to_string(), end.to_string());
     }
     metadata.insert("anchor.content_hash_at_edit".to_string(), sha256_hex(bytes));
-    if let Some(commit_sha) = crate::git::current_head(root) {
+    if let Some(commit_sha) = bbox_corpus_core::git::current_head(root) {
         metadata.insert("anchor.commit_sha_at_edit".to_string(), commit_sha);
     }
     metadata.insert(
@@ -392,7 +392,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind};
+    use bro_transcript::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind};
     use serde_json::json;
 
     #[test]
