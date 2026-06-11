@@ -74,6 +74,11 @@ struct FleetArgs {
     /// via BLACKBOX_FLEET_DAEMON_URL.
     #[arg(long, value_name = "URL")]
     daemon_url: Option<String>,
+    /// Bypass the single-cockpit instance lock and start even if another
+    /// `bro fleet` already drives this fleet store. The two cockpits will
+    /// fight over the roster stream — recovery use only.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -685,7 +690,7 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
-            rt.block_on(fleet_tui::run(args.cwd, args.daemon_url))
+            rt.block_on(fleet_tui::run(args.cwd, args.daemon_url, args.force))
         }
         BroCommand::Agent(args) => {
             default_fleet_harness_tee();

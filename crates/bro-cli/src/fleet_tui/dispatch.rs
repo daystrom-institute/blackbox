@@ -160,20 +160,33 @@ pub(super) fn install_dispatch(app: &mut App, outcome: DispatchOutcome) {
             app.classifier_tx.clone(),
         )
     });
-    app.agents.push(Agent {
-        task: d.task,
-        classifier,
-        provider: d.provider,
-        selected_model: d.model,
-        selected_effort: d.effort,
-        selected_service_tier: d.service_tier,
-        selected_cwd: Some(d.project_cwd),
-        name: d.name,
-        name_overridden: false,
-        initial_prompt: Some(d.prompt.clone()),
-        pending_inputs: VecDeque::new(),
-        seen_user_steers: 0,
-    });
+    // The roster stream's Added delta can land (and refresh_agents_from_roster
+    // create the row) before this install runs; merge the dispatch-only fields
+    // into that row instead of pushing a duplicate (gap-1189200c).
+    if let Some(existing) = app.agents.iter_mut().find(|a| a.task.id() == id) {
+        existing.classifier = classifier;
+        existing.provider = d.provider;
+        existing.selected_model = d.model;
+        existing.selected_effort = d.effort;
+        existing.selected_service_tier = d.service_tier;
+        existing.selected_cwd = Some(d.project_cwd);
+        existing.initial_prompt = Some(d.prompt.clone());
+    } else {
+        app.agents.push(Agent {
+            task: d.task,
+            classifier,
+            provider: d.provider,
+            selected_model: d.model,
+            selected_effort: d.effort,
+            selected_service_tier: d.service_tier,
+            selected_cwd: Some(d.project_cwd),
+            name: d.name,
+            name_overridden: false,
+            initial_prompt: Some(d.prompt.clone()),
+            pending_inputs: VecDeque::new(),
+            seen_user_steers: 0,
+        });
+    }
     // Append the dispatch prompt to the shared composer histfile.
     let _ = composer_history::append_history(&app.composer_history_path, &d.prompt);
     // Pin the roster cursor to the freshly dispatched agent so it stays selected

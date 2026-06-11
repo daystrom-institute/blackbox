@@ -1681,8 +1681,23 @@ fn complete_project(app: &mut App) {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
-pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Result<()> {
+pub async fn run(
+    cwd: Option<String>,
+    daemon_url: Option<String>,
+    force: bool,
+) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_config_with_daemon_url(daemon_url)?);
+    // Single-cockpit instance guard (gap-ddfde5c3): refuse to duel another
+    // live cockpit over the same fleet store. Acquired before taking the
+    // terminal so the refusal prints as a normal CLI error; held until run()
+    // returns (drop = release).
+    let _instance_lock = if force {
+        None
+    } else {
+        Some(instance_lock::CockpitInstanceLock::acquire(
+            orch.store_dir(),
+        )?)
+    };
     // File-only logging + terminal-restoring panic hook before we take the
     // terminal. Hold the guard for the whole cockpit lifetime (drop = flush +
     // stop worker).
@@ -3608,12 +3623,24 @@ fn remove_agent_row(app: &mut App, idx: usize) -> anyhow::Result<()> {
 }
 
 fn forget_standalone_agents(app: &mut App, stop_running: bool) {
+    let mut failed = 0usize;
     for agent in &app.agents {
         let id = agent.task.id();
         if stop_running && agent.task.snapshot().status == TaskStatus::Running {
             let _ = app.orch.stop(&agent.task);
         }
-        let _ = app.orch.forget(&id);
+        // Surface daemon DELETE failures like remove_agent_row does instead of
+        // silently leaving the roster record behind (gap-a268b269).
+        if let Err(e) = app.orch.forget(&id) {
+            failed += 1;
+            tracing::warn!("standalone forget failed for {id}: {e:#}");
+        }
+    }
+    if failed > 0 {
+        app.set_status(
+            format!("forget: {failed} roster record(s) not deleted (see cockpit log)"),
+            Duration::from_secs(5),
+        );
     }
 }
 
@@ -5405,3 +5432,4 @@ mod custom_terminal;
 mod insert_history;
 mod closeout;
 mod composer_history;
+mod instance_lock;

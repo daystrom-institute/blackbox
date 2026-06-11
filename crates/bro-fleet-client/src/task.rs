@@ -93,8 +93,13 @@ impl TaskStore {
         }
     }
 
-    pub fn insert(&mut self, id: String, task: Arc<Task>) {
-        self.tasks.insert(id, task);
+    /// Insert a locally constructed task only if the roster stream hasn't
+    /// already delivered the same task_id. The optimistic insert after
+    /// `/control/exec` races the `/control/roster/stream` Added delta for the
+    /// same task; when the delta wins, the daemon-fed entry is fresher than
+    /// the local stub and must not be clobbered (gap-1189200c).
+    pub fn insert_if_absent(&mut self, id: String, task: Arc<Task>) {
+        self.tasks.entry(id).or_insert(task);
     }
 
     pub fn all_tasks(&self) -> Vec<Arc<Task>> {
@@ -304,6 +309,33 @@ mod tests {
         };
         assert_eq!(store.apply_delta(2, removed), RosterApply::Applied { seq: 3 });
         assert!(store.all_tasks().is_empty());
+    }
+
+    /// gap-1189200c: the optimistic post-`/control/exec` insert races the
+    /// roster stream's Added delta for the same task_id. When the delta wins,
+    /// `insert_if_absent` must keep the daemon-fed entry instead of clobbering
+    /// it with the local stub (which would briefly show stale state).
+    #[test]
+    fn insert_if_absent_keeps_roster_delivered_task() {
+        let mut store = TaskStore::new();
+        let added = RosterDelta::Added {
+            seq: 1,
+            task: summary("task-1", TaskStatus::Completed),
+        };
+        assert_eq!(store.apply_delta(0, added), RosterApply::Applied { seq: 1 });
+
+        // A local stub (status Running, no daemon state) loses the race.
+        let stub = task_from_roster(summary("task-1", TaskStatus::Running));
+        store.insert_if_absent("task-1".to_string(), stub);
+
+        let tasks = store.all_tasks();
+        assert_eq!(tasks.len(), 1, "same task_id must not duplicate");
+        assert_eq!(tasks[0].inner.lock().status, TaskStatus::Completed);
+
+        // A genuinely new id still inserts.
+        let fresh = task_from_roster(summary("task-2", TaskStatus::Running));
+        store.insert_if_absent("task-2".to_string(), fresh);
+        assert_eq!(store.all_tasks().len(), 2);
     }
 
     #[test]

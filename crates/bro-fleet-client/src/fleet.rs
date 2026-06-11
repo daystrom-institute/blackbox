@@ -1728,6 +1728,19 @@ async fn handle_roster_sse_item<T: RosterTransport + ?Sized>(
     }
 }
 
+/// Reconnect pacing for `roster_subscription_loop`: start at 750ms and double
+/// up to a 15s cap so a downed daemon isn't hammered at a fixed cadence. The
+/// loop resets to the floor on every successful connect.
+const ROSTER_RECONNECT_BACKOFF_FLOOR: std::time::Duration =
+    std::time::Duration::from_millis(750);
+const ROSTER_RECONNECT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn next_roster_reconnect_backoff(current: std::time::Duration) -> std::time::Duration {
+    current
+        .saturating_mul(2)
+        .min(ROSTER_RECONNECT_BACKOFF_CAP)
+}
+
 async fn roster_subscription_loop(
     client: DaemonFleetClient,
     task_store: Arc<RwLock<TaskStore>>,
@@ -1736,9 +1749,11 @@ async fn roster_subscription_loop(
 ) {
     let mut state = RosterSubscriptionState { last_seq: initial_seq };
     let mut buffer = String::new();
+    let mut backoff = ROSTER_RECONNECT_BACKOFF_FLOOR;
     loop {
         match client.open_roster_stream().await {
             Ok(mut response) => {
+                backoff = ROSTER_RECONNECT_BACKOFF_FLOOR;
                 buffer.clear();
                 loop {
                     match response.chunk().await {
@@ -1785,7 +1800,8 @@ async fn roster_subscription_loop(
             Ok(seq) => state.last_seq = seq,
             Err(err) => tracing::warn!("fleet roster snapshot resync failed: {err:#}"),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = next_roster_reconnect_backoff(backoff);
     }
 }
 
@@ -1825,6 +1841,30 @@ impl FleetOrchestrator {
             store_dir,
             TaskStore::new(),
             DaemonFleetClient::new(default_daemon_url()),
+        )
+    }
+
+    /// Construct over an explicit `store_dir`, pointed at a daemon URL whose
+    /// scheme reqwest rejects at request-build time. Test fixtures must use
+    /// this instead of [`FleetOrchestrator::new`] for two reasons:
+    ///
+    /// 1. `new`'s default URL is the live local blackboxd on 7264, so a test
+    ///    that steers/resumes fires real `/control/*` calls at the prod
+    ///    daemon (test-isolation violation).
+    /// 2. The URL must fail without any socket IO. `block_on_fleet_http`
+    ///    drives its future via `block_in_place` + `Handle::block_on`; when
+    ///    the test fn returns and drops its `Runtime` while such a call is in
+    ///    flight, runtime shutdown kills the IO driver before the socket
+    ///    event (even an instant connection-refusal) is delivered, the waker
+    ///    never fires, and `block_on` parks the thread forever — a 120s
+    ///    nextest timeout. A rejected-scheme URL errors on first poll with no
+    ///    driver involvement, so it cannot lose that race.
+    #[doc(hidden)]
+    pub fn for_test(store_dir: PathBuf) -> Self {
+        Self::with_store(
+            store_dir,
+            TaskStore::new(),
+            DaemonFleetClient::new("dead-scheme://cockpit-test-fixture"),
         )
     }
 
@@ -2011,7 +2051,7 @@ impl FleetOrchestrator {
         let handle = self.daemon.dispatch(spec);
         self.task_store
             .write()
-            .insert(handle.id(), handle.task.clone());
+            .insert_if_absent(handle.id(), handle.task.clone());
         handle
     }
 
@@ -2024,7 +2064,7 @@ impl FleetOrchestrator {
         let handle = self.daemon.dispatch_async(spec).await;
         self.task_store
             .write()
-            .insert(handle.id(), handle.task.clone());
+            .insert_if_absent(handle.id(), handle.task.clone());
         handle
     }
 
@@ -2035,7 +2075,7 @@ impl FleetOrchestrator {
         let handle = self.daemon.resume(spec);
         self.task_store
             .write()
-            .insert(handle.id(), handle.task.clone());
+            .insert_if_absent(handle.id(), handle.task.clone());
         handle
     }
 
@@ -2044,7 +2084,7 @@ impl FleetOrchestrator {
         let handle = self.daemon.resume_async(spec).await;
         self.task_store
             .write()
-            .insert(handle.id(), handle.task.clone());
+            .insert_if_absent(handle.id(), handle.task.clone());
         handle
     }
 
@@ -2130,6 +2170,29 @@ mod tests {
         assert!(orch.tasks().is_empty());
         // subscribe must yield a live receiver without a prior dispatch.
         let _rx = orch.subscribe();
+    }
+
+    /// gap-1189200c: roster reconnects back off exponentially from the 750ms
+    /// floor to the 15s cap instead of hammering a downed daemon at a fixed
+    /// cadence. (The loop resets to the floor on every successful connect.)
+    #[test]
+    fn roster_reconnect_backoff_doubles_to_cap() {
+        let mut backoff = ROSTER_RECONNECT_BACKOFF_FLOOR;
+        assert_eq!(backoff, Duration::from_millis(750));
+        let mut seen = vec![backoff];
+        for _ in 0..8 {
+            backoff = next_roster_reconnect_backoff(backoff);
+            seen.push(backoff);
+        }
+        assert_eq!(seen[1], Duration::from_millis(1500));
+        assert_eq!(seen[2], Duration::from_millis(3000));
+        assert!(seen.iter().all(|d| *d <= ROSTER_RECONNECT_BACKOFF_CAP));
+        assert_eq!(*seen.last().unwrap(), ROSTER_RECONNECT_BACKOFF_CAP);
+        // The cap is a fixpoint.
+        assert_eq!(
+            next_roster_reconnect_backoff(ROSTER_RECONNECT_BACKOFF_CAP),
+            ROSTER_RECONNECT_BACKOFF_CAP
+        );
     }
 
     #[test]

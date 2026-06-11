@@ -817,8 +817,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         app.push_cockpit_line("usage: /closeout <discard|publish|merge|adopt> [--dry-run]");
 
@@ -843,8 +844,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         // Simulate typing an unknown slash command.
         app.input = "/bogus".to_string();
@@ -881,8 +883,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         // `/help` is a known command.
         app.input = "/help".to_string();
@@ -903,8 +906,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         // Bare `/closeout` with no args — parse failure path in `run_closeout`.
         app.input = "/closeout".to_string();

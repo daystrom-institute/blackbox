@@ -1367,13 +1367,11 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
     }
     let mut content = json!({"removed_worktree": worktree});
     if force {
-        let _ = git_run(base_repo, &["branch", "-D", branch]);
-        content["deleted_branch"] = json!(branch);
+        delete_branch_into_content(base_repo, branch, &mut content);
     } else {
         match branch_tip_merged_into_base_head(base_repo, branch) {
             Ok(true) => {
-                let _ = git_run(base_repo, &["branch", "-D", branch]);
-                content["deleted_branch"] = json!(branch);
+                delete_branch_into_content(base_repo, branch, &mut content);
             }
             Ok(false) => {
                 content["branch_kept_unmerged"] = json!(branch);
@@ -1390,6 +1388,22 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
         ok: true,
         error_class: CloseoutErrorClass::None,
         content,
+    }
+}
+
+/// Delete the worktree branch and record the outcome on the Remove phase
+/// content. A failed `git branch -D` is a warning, not a closeout failure —
+/// the worktree is already gone, so the phase stays ok but must not claim
+/// `deleted_branch` it didn't deliver (gap-a268b269).
+fn delete_branch_into_content(base_repo: &Path, branch: &str, content: &mut Value) {
+    match git_run(base_repo, &["branch", "-D", branch]) {
+        Ok(()) => {
+            content["deleted_branch"] = json!(branch);
+        }
+        Err(e) => {
+            content["branch_kept_delete_failed"] = json!(branch);
+            content["branch_delete_warning"] = json!(format!("git branch -D {branch}: {e:#}"));
+        }
     }
 }
 
@@ -2747,6 +2761,63 @@ mod tests {
         assert!(
             !branch_exists(repo.path(), "bro-fleet/test-branch"),
             "discard keeps operator-authorized branch deletion"
+        );
+    }
+
+    /// gap-a268b269: a failed `git branch -D` must not be reported as
+    /// `deleted_branch`. The phase stays ok (the worktree is gone — branch
+    /// delete failure is a warning, not a leak) but the content surfaces the
+    /// failure instead of claiming a delete that never happened.
+    #[test]
+    fn phase_remove_surfaces_branch_delete_failure_as_warning() {
+        let repo = seed_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let cwd = worktrees.path().join("wt-test");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                cwd.to_str().unwrap(),
+                "-b",
+                "bro-fleet/test-branch",
+            ],
+        );
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            // A branch that doesn't exist makes `git branch -D` fail after the
+            // worktree remove succeeded.
+            branch: "bro-fleet/does-not-exist".to_string(),
+            target: "main".to_string(),
+            disposition: "discard".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+
+        let result = phase_remove(&req);
+
+        assert!(result.ok, "branch delete failure stays a warning: {:?}", result.content);
+        assert!(!cwd.exists(), "worktree should be removed");
+        assert!(
+            result.content.get("deleted_branch").is_none(),
+            "must not claim a delete that failed: {:?}",
+            result.content
+        );
+        assert_eq!(
+            result.content["branch_kept_delete_failed"],
+            json!("bro-fleet/does-not-exist")
+        );
+        assert!(
+            result.content["branch_delete_warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("bro-fleet/does-not-exist")),
+            "warning must carry the git error: {:?}",
+            result.content
         );
     }
 

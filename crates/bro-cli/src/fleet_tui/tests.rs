@@ -566,8 +566,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
-        let app = App::new(orch, None, rt.handle().clone());
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         let titles = roster_composer_top_titles(&app);
 
@@ -582,8 +583,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
         let orig_provider = app.next_provider;
         let orig_model = app.next_model.clone();
         let orig_effort = app.next_effort.clone();
@@ -628,8 +630,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
         let provider_idx = FLEET_PROVIDERS
             .iter()
             .position(|p| !p.models().is_empty())
@@ -691,8 +694,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
         let orig_provider = app.next_provider;
         let orig_model = app.next_model.clone();
         let orig_effort = app.next_effort.clone();
@@ -731,8 +735,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         // Enter selector and move provider cursor
         zoom_left(&mut app); // Roster → ProviderSelector
@@ -769,8 +774,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
         let orig_provider = app.next_provider;
         let orig_model = app.next_model.clone();
 
@@ -1251,7 +1257,7 @@ Trailing paragraph.";
         run_git(repo.path(), &["commit", "-m", "init"]);
 
         let store = tempfile::tempdir().unwrap();
-        let orch = FleetOrchestrator::new(store.path().join("fleet"));
+        let orch = FleetOrchestrator::for_test(store.path().join("fleet"));
         let worktree = prepare_dispatch_worktree(
             &orch,
             Some(repo.path().to_str().unwrap()),
@@ -1852,8 +1858,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         // Simulate the armed state (first Ctrl+K was pressed).
         app.prune_armed_until = Some(Instant::now() + Duration::from_secs(PRUNE_ARM_SECS));
@@ -1890,8 +1897,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         // Simulate armed state.
         app.prune_armed_until = Some(Instant::now() + Duration::from_secs(PRUNE_ARM_SECS));
@@ -1917,8 +1925,9 @@ Trailing paragraph.";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
         let mut app = App::new(orch, None, rt.handle().clone());
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
 
         // Simulate armed state.
         app.prune_armed_until = Some(Instant::now() + Duration::from_secs(PRUNE_ARM_SECS));
@@ -2019,8 +2028,107 @@ Trailing paragraph.";
 
     fn make_test_app(rt: &tokio::runtime::Handle) -> App {
         let dir = tempfile::tempdir().unwrap();
-        let orch = std::sync::Arc::new(FleetOrchestrator::new(dir.path().join("fleet")));
-        App::new(orch, None, rt.clone())
+        let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
+        let mut app = App::new(orch, None, rt.clone());
+        // App::new points the composer histfile at the real bro_home; any test
+        // that submits/steers would append junk turns to the operator's actual
+        // history (and contend on its flock). Keep it under the per-test
+        // tempdir — append_history recreates the parent dir on demand.
+        app.composer_history_path = dir.path().join("composer_history.jsonl");
+        app
+    }
+
+    /// gap-1189200c: when the roster stream's Added delta creates the agent
+    /// row before the off-thread dispatch outcome installs, install_dispatch
+    /// must merge into that row instead of pushing a duplicate.
+    #[test]
+    fn install_dispatch_merges_into_roster_created_row() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        // install_dispatch appends to the composer histfile; keep it in a
+        // per-test tempdir, never the real bro_home.
+        let hist_dir = tempfile::tempdir().unwrap();
+        app.composer_history_path = hist_dir.path().join("history");
+
+        // Row already created by refresh_agents_from_roster from the delta.
+        let handle = AgentHandle::for_test(TaskStatus::Running, "task-1");
+        app.agents.push(Agent {
+            task: handle.clone(),
+            classifier: None,
+            provider: Provider::Brodex,
+            selected_model: None,
+            selected_effort: None,
+            selected_service_tier: None,
+            selected_cwd: None,
+            name: "agent-task-1".to_string(),
+            name_overridden: false,
+            initial_prompt: None,
+            pending_inputs: VecDeque::new(),
+            seen_user_steers: 0,
+        });
+
+        app.pending_dispatches = 1;
+        install_dispatch(
+            &mut app,
+            DispatchOutcome::Ready(Box::new(DispatchedAgent {
+                task: handle,
+                provider: Provider::Brodex,
+                model: Some("gpt-test".to_string()),
+                effort: None,
+                service_tier: None,
+                project_cwd: "/tmp/test-project".to_string(),
+                name: "agent-task-1".to_string(),
+                prompt: "do the thing".to_string(),
+                classifier_cfg: None,
+                alias: None,
+                worktree_tail: "wt-test".to_string(),
+            })),
+        );
+
+        assert_eq!(
+            app.agents.len(),
+            1,
+            "dispatch install must not duplicate the roster-created row"
+        );
+        assert_eq!(app.agents[0].selected_model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            app.agents[0].initial_prompt.as_deref(),
+            Some("do the thing"),
+            "dispatch-only fields must merge into the existing row"
+        );
+        assert_eq!(app.roster_anchor_id.as_deref(), Some("task-1"));
+        assert_eq!(app.pending_dispatches, 0);
+    }
+
+    /// And the unraced path still appends a fresh row.
+    #[test]
+    fn install_dispatch_appends_when_row_absent() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        let hist_dir = tempfile::tempdir().unwrap();
+        app.composer_history_path = hist_dir.path().join("history");
+
+        install_dispatch(
+            &mut app,
+            DispatchOutcome::Ready(Box::new(DispatchedAgent {
+                task: AgentHandle::for_test(TaskStatus::Running, "task-2"),
+                provider: Provider::Brodex,
+                model: None,
+                effort: None,
+                service_tier: None,
+                project_cwd: "/tmp/test-project".to_string(),
+                name: "agent-task-2".to_string(),
+                prompt: "fresh dispatch".to_string(),
+                classifier_cfg: None,
+                alias: None,
+                worktree_tail: "wt-test".to_string(),
+            })),
+        );
+
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.agents[0].task.id(), "task-2");
     }
 
     /// Set up a terminal (Completed) Brodex agent with the given id and make
