@@ -14,7 +14,9 @@
   "impact": "low",
   "blocking_level": "workaround_available",
   "dedupe_key": "docs_runbook/bro-harness/live-provider-wire-probe",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-02T07:46:44Z",
-  "updated_at": "2026-06-02T07:46:44Z"
+  "updated_at": "2026-06-11T19:04:11Z",
+  "resolved_at": "2026-06-11T19:04:11Z",
+  "resolution_note": "Shipped sm-live-provider-wire-probe (system-defaults/memories/live-provider-wire-probe.md, catalog-mapped) on feat/minimax-cache-mechanics → beta/blackbox-v2. Covers credential locations (~/.claude-{zai,ds,mm}/settings.json env block for GLM/DeepSeek/MiniMax; MISTRAL_API_KEY env or ~/.vibe/.env for vibebh), Anthropic-shape and chat-completions probe bodies mirroring the harness build_body, cache-validation recipe (512+-token stable prefix, send-twice, read cache_read_input_tokens / prompt_tokens_details.cached_tokens), SSE capture guidance, token hygiene (read keys at runtime, redact on print, max_tokens<=16), and report shape (date the evidence — endpoint conclusions decay, per the gap-d64d7a58 cautionary tale). Scope broadened beyond GLM/DeepSeek to MiniMax + Mistral since those probes were performed and verified live 2026-06-11."
 }

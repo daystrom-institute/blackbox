@@ -76,6 +76,12 @@ Files in `system-defaults/memories/` use bare slugs such as
 - [sm-refactor-c-cpp](refactor-c-cpp.md) - C/C++ inventory and clang
   validation workflow.
 
+## Harness And Provider Validation
+
+- [sm-live-provider-wire-probe](live-provider-wire-probe.md) - narrow live
+  HTTP probes of harness provider endpoints (GLM/DeepSeek/MiniMax/Mistral):
+  credential locations, wire shapes, cache validation, and token hygiene.
+
 ## How To Use
 
 Open this file in Obsidian and follow regular Markdown links to the target
