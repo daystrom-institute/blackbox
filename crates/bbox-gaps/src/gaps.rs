@@ -497,7 +497,7 @@ pub struct GapResolveParams {
     /// `project`. Not accepted from clients and omitted from the tool schema.
     #[serde(skip)]
     #[schemars(skip)]
-    pub(crate) write_dir: Option<String>,
+    pub write_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -537,7 +537,7 @@ pub struct GapUpdateParams {
     /// `project`. Not accepted from clients and omitted from the tool schema.
     #[serde(skip)]
     #[schemars(skip)]
-    pub(crate) write_dir: Option<String>,
+    pub write_dir: Option<String>,
 }
 
 // ── Persistence ────────────────────────────────────────────────────

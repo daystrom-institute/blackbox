@@ -483,7 +483,7 @@ fn in_tree_linked_worktree_top(path: &Path, root: &Path) -> Option<PathBuf> {
             return None;
         }
         if dot_git.is_file() {
-            let base = crate::git::linked_worktree_base(cursor)?;
+            let base = bbox_corpus_core::git::linked_worktree_base(cursor)?;
             let base = fs::canonicalize(&base).unwrap_or(base);
             return (base == root).then(|| cursor.to_path_buf());
         }
