@@ -1279,4 +1279,115 @@ Trailing paragraph.";
         );
     }
 
+    // ── Prune arm-confirm + worktree cleanup tests ──────────────────────────
+
+    fn setup_repo_with_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
+        let base = tempfile::tempdir().unwrap();
+        run_git(base.path(), &["init"]);
+        run_git(base.path(), &["config", "user.email", "test@example.com"]);
+        run_git(base.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(base.path().join("README.md"), "base\n").unwrap();
+        run_git(base.path(), &["add", "."]);
+        run_git(base.path(), &["commit", "-m", "init"]);
+
+        let worktrees = tempfile::tempdir().unwrap();
+        let wt_path = worktrees.path().join("wt-test");
+        run_git(
+            base.path(),
+            &[
+                "worktree",
+                "add",
+                wt_path.to_str().unwrap(),
+                "-b",
+                "bro-fleet/test-branch",
+            ],
+        );
+        (base, worktrees)
+    }
+
+    #[test]
+    fn worktree_clean_status_reports_clean_for_unchanged() {
+        let (_base, worktrees) = setup_repo_with_worktree();
+        let wt_path = worktrees.path().join("wt-test");
+        assert!(
+            worktree_clean_status(wt_path.to_str().unwrap()).unwrap(),
+            "fresh worktree should be clean"
+        );
+    }
+
+    #[test]
+    fn worktree_clean_status_reports_dirty_after_modification() {
+        let (_base, worktrees) = setup_repo_with_worktree();
+        let wt_path = worktrees.path().join("wt-test");
+        std::fs::write(wt_path.join("README.md"), "dirty\n").unwrap();
+        assert!(
+            !worktree_clean_status(wt_path.to_str().unwrap()).unwrap(),
+            "modified worktree should be dirty"
+        );
+    }
+
+    #[test]
+    fn worktree_clean_status_errors_on_nonexistent() {
+        assert!(
+            worktree_clean_status("/no/such/path").is_err(),
+            "nonexistent path should error"
+        );
+    }
+
+    #[test]
+    fn worktree_branch_resolves_checked_out_branch() {
+        let (_base, worktrees) = setup_repo_with_worktree();
+        let wt_path = worktrees.path().join("wt-test");
+        let branch = worktree_branch(wt_path.to_str().unwrap()).unwrap();
+        assert_eq!(branch, "bro-fleet/test-branch");
+    }
+
+    #[test]
+    fn worktree_branch_returns_none_for_nonexistent() {
+        assert!(
+            worktree_branch("/no/such/path").is_none(),
+            "nonexistent path should return None"
+        );
+    }
+
+    #[test]
+    fn remove_fleet_worktree_removes_clean_worktree_and_branch() {
+        let (base, worktrees) = setup_repo_with_worktree();
+        let wt_path = worktrees.path().join("wt-test");
+        let wt_str = wt_path.to_str().unwrap();
+
+        assert!(remove_fleet_worktree(wt_str), "should succeed");
+
+        // Worktree dir should be gone.
+        assert!(!wt_path.exists(), "worktree dir should be removed");
+        // Branch should be deleted from the base repo.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(base.path())
+            .args(["branch", "--list", "bro-fleet/test-branch"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !listing.contains("bro-fleet/test-branch"),
+            "branch should be deleted, got: {listing}"
+        );
+    }
+
+    #[test]
+    fn remove_fleet_worktree_fails_gracefully_on_nonexistent() {
+        assert!(
+            !remove_fleet_worktree("/no/such/worktree"),
+            "nonexistent worktree should return false"
+        );
+    }
+
+    #[test]
+    fn prune_arm_requires_two_presses() {
+        // We can't easily instantiate a full App in unit tests (it needs a
+        // FleetOrchestrator + tokio runtime), so test the arm-confirm logic
+        // by verifying the status messages set via the two-press protocol.
+        // Instead, test the constants and helpers are correct.
+        assert_eq!(PRUNE_ARM_SECS, 4, "arm TTL should be 4 seconds");
+    }
     

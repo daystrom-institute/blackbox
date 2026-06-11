@@ -83,6 +83,8 @@ const TOOL_CALL_GLYPH: &str = "▸";
 const ROSTER_SELECTED_MARKER: &str = "› ";
 const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
 const FINISHED_AFTER_IDLE_MS: u64 = 20 * 60 * 1000;
+/// Seconds the operator has to confirm a Ctrl+K prune after the first press.
+const PRUNE_ARM_SECS: u64 = 4;
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -523,6 +525,10 @@ struct App {
     /// Path to the shared composer histfile (`$BRO_HOME/composer_history.jsonl`).
     /// Shared across all fleet instances and standalone sessions.
     composer_history_path: PathBuf,
+    /// Ctrl+K arm-confirm state: first press arms, second press within the TTL
+    /// executes. `None` = not armed.
+    prune_armed_until: Option<Instant>,
+    prune_armed_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -640,6 +646,8 @@ impl App {
             activity_clocks: HashMap::new(),
             activity_frame: 0,
             composer_history_path: history_path(&bro_home()),
+            prune_armed_until: None,
+            prune_armed_count: 0,
         }
     }
 
@@ -2233,13 +2241,19 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // one from the roster (Claude-agents idiom, §5).
     if ctrl && key.code == KeyCode::Char('x') {
         stop_or_delete_selected(app);
+        // Any non-Ctrl+K action disarms the prune confirmation.
+        app.prune_armed_until = None;
         return;
     }
     // Ctrl+K: prune all terminal rows from the roster in one action.
+    // First press arms (shows "Ctrl+K again to prune N"), second press within
+    // PRUNE_ARM_SECS executes. Any other key disarms.
     if ctrl && key.code == KeyCode::Char('k') {
         prune_terminal_agents(app);
         return;
     }
+    // Any key other than Ctrl+K disarms the prune confirmation.
+    app.prune_armed_until = None;
     // Completion carveouts: slash commands and roster @project aliases own Tab
     // and ↑/↓ while their menus are up. Otherwise Tab cycles roster tabs from
     // home, or the current provider / model / effort sub-selector level.
@@ -2514,10 +2528,43 @@ fn prune_terminal_agents(app: &mut App) {
         .enumerate()
         .filter_map(|(idx, agent)| agent.task.snapshot().status.is_terminal().then_some(idx))
         .collect();
-    if terminal.is_empty() {
+    let count = terminal.len();
+    if count == 0 {
+        app.prune_armed_until = None;
+        app.prune_armed_count = 0;
         app.clear_input();
         app.set_status("no terminal agents to prune", Duration::from_secs(3));
         return;
+    }
+
+    // Arm-confirm pattern: first press arms, second press within TTL executes.
+    let now = Instant::now();
+    let armed = app
+        .prune_armed_until
+        .is_some_and(|until| now < until && app.prune_armed_count == count);
+
+    if !armed {
+        app.prune_armed_count = count;
+        app.prune_armed_until = Some(now + Duration::from_secs(PRUNE_ARM_SECS));
+        app.set_status(
+            format!("Ctrl+K again to prune {count} terminal agents"),
+            Duration::from_secs(PRUNE_ARM_SECS),
+        );
+        return;
+    }
+
+    // Confirmed — execute the prune.
+    app.prune_armed_until = None;
+    app.prune_armed_count = 0;
+
+    // Collect managed worktree paths before removing agents (we need the
+    // snapshot data to decide whether each worktree is clean).
+    let mut worktrees_to_check: Vec<(String, String)> = Vec::new(); // (worktree_path, task_id)
+    for &idx in &terminal {
+        let snap = app.agents[idx].task.snapshot();
+        if let Some(wt) = snap.managed_worktree.as_deref() {
+            worktrees_to_check.push((wt.to_string(), app.agents[idx].task.id()));
+        }
     }
 
     let mut focused_removed = false;
@@ -2548,17 +2595,135 @@ fn prune_terminal_agents(app: &mut App) {
     }
     app.reconcile_roster_selection();
     app.clear_input();
-    if failed > 0 {
-        app.set_status(
-            format!("pruned {pruned} terminal agents ({failed} failed)"),
-            Duration::from_secs(5),
-        );
-    } else {
-        app.set_status(
-            format!("pruned {pruned} terminal agents"),
-            Duration::from_secs(3),
-        );
+
+    // Clean up managed worktrees that are git-clean.
+    let mut worktrees_removed = 0usize;
+    let mut worktrees_dirty = 0usize;
+    let mut worktrees_failed = 0usize;
+    let mut dirty_names: Vec<String> = Vec::new();
+    for (wt_path, _task_id) in &worktrees_to_check {
+        match worktree_clean_status(wt_path) {
+            Ok(true) => {
+                if remove_fleet_worktree(wt_path) {
+                    worktrees_removed += 1;
+                } else {
+                    worktrees_failed += 1;
+                }
+            }
+            Ok(false) => {
+                worktrees_dirty += 1;
+                dirty_names.push(path_tail(wt_path));
+            }
+            Err(_) => {
+                // Couldn't check — leave it, don't remove.
+                worktrees_failed += 1;
+            }
+        }
     }
+
+    let mut msg = format!("pruned {pruned} terminal agents");
+    if failed > 0 {
+        msg = format!("{msg} ({failed} failed)");
+    }
+    if worktrees_removed > 0 {
+        msg = format!("{msg}, removed {worktrees_removed} clean worktrees");
+    }
+    if worktrees_dirty > 0 {
+        msg = format!("{msg}, {worktrees_dirty} dirty worktrees kept");
+    }
+    if worktrees_failed > 0 {
+        msg = format!("{msg}, {worktrees_failed} worktree removals failed");
+    }
+    let ttl = if worktrees_dirty > 0 { 8 } else { 5 };
+    app.set_status(msg, Duration::from_secs(ttl));
+}
+
+/// Check whether a worktree directory has a clean working tree (no uncommitted
+/// changes). Returns `Ok(true)` if `git status --porcelain` is empty.
+fn worktree_clean_status(worktree: &str) -> Result<bool, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| format!("{e:#}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout.trim().is_empty())
+}
+
+/// Remove a managed fleet worktree and its branch via `git worktree remove`
+/// and `git branch -D`. Returns `true` on success. Best-effort: logs failures
+/// rather than crashing the prune flow.
+fn remove_fleet_worktree(worktree: &str) -> bool {
+    // Resolve the base repo so we can run `git worktree remove` from it.
+    let base_repo = match closeout::base_repo_of_worktree(worktree) {
+        Some(p) => p,
+        None => {
+            tracing::warn!("prune: could not resolve base repo for {worktree}");
+            return false;
+        }
+    };
+
+    // Extract the branch name from the worktree HEAD.
+    let branch = match worktree_branch(worktree) {
+        Some(b) => b,
+        None => {
+            tracing::warn!("prune: could not resolve branch for {worktree}");
+            return false;
+        }
+    };
+
+    // `git worktree remove` from the base repo.
+    let remove_out = Command::new("git")
+        .arg("-C")
+        .arg(&base_repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree)
+        .output();
+    match remove_out {
+        Ok(o) if o.status.success() => {}
+        other => {
+            let stderr = other
+                .as_ref()
+                .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                .unwrap_or_else(|e| format!("{e:#}"));
+            tracing::warn!("prune: git worktree remove failed for {worktree}: {stderr}");
+            return false;
+        }
+    }
+
+    // `git branch -D <branch>` from the base repo.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&base_repo)
+        .args(["branch", "-D", &branch])
+        .output();
+
+    true
+}
+
+/// Resolve the current branch name of a worktree checkout.
+fn worktree_branch(worktree: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some(branch)
 }
 
 /// Begin renaming the selected roster agent with a blank composer; Enter

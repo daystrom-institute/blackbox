@@ -282,7 +282,7 @@ fn resolve_project_closeout(worktree: &str) -> Result<Option<ProjectCloseout>, S
 /// Resolve the base repo backing a managed worktree via
 /// `git --git-common-dir` (`<base>/.git` → `<base>`). Used to key
 /// `project_closeout`/`project_dispatch` by canonical repo path.
-fn base_repo_of_worktree(worktree: &str) -> Option<PathBuf> {
+pub(super) fn base_repo_of_worktree(worktree: &str) -> Option<PathBuf> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree)
