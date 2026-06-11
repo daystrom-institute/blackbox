@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 use tantivy::{IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta};
-use crate::entity_ref::EntityRef;
+use bbox_corpus_core::entity_ref::EntityRef;
 use crate::projects::ProjectRegistry;
-use crate::threads::{Thread, ThreadRecord, Threads};
+use bbox_threads::threads::{Thread, ThreadRecord, Threads};
 
 fn thread_entity_id(thread_id: &str) -> String {
     EntityRef::Thread {
@@ -81,7 +81,7 @@ fn build_thread_doc(thread: &Thread, threads_path: &Path, f: FieldHandles) -> Ta
     let content = thread_content(thread);
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "thread");
-    doc.add_text(f.parser_version, crate::entity_ref::PARSER_VERSION);
+    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
     doc.add_text(f.content, &content);
     doc.add_text(f.entity_id, thread_entity_id(&thread.id));
     doc.add_text(f.account, "blackbox");
@@ -140,7 +140,7 @@ fn build_record_doc(
     // Indexed as a `thread` so a committed record is found exactly like the
     // live thread it snapshots (same entity_id); on a clone it is the only copy.
     doc.add_text(f.doc_type, "thread");
-    doc.add_text(f.parser_version, crate::entity_ref::PARSER_VERSION);
+    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
     doc.add_text(f.content, &content);
     doc.add_text(f.entity_id, thread_entity_id(&record.id));
     doc.add_text(f.account, "blackbox");
@@ -168,7 +168,7 @@ fn build_record_doc(
 /// investigations are searchable on a clone where the live thread store doesn't
 /// carry them. Deduped against the live thread store by id — on the origin
 /// machine the live thread is already indexed, so its record is skipped.
-pub(crate) fn reindex_project_records_standalone(
+pub fn reindex_project_records_standalone(
     projects_path: &Path,
     threads_path: &Path,
     f: FieldHandles,
@@ -190,7 +190,7 @@ pub(crate) fn reindex_project_records_standalone(
         .collect();
     let mut docs = 0u64;
     for root in &roots {
-        for record in crate::threads::load_repo_records(root) {
+        for record in bbox_threads::threads::load_repo_records(root) {
             if live_ids.contains(&record.id) {
                 continue;
             }
@@ -210,7 +210,7 @@ pub(crate) fn reindex_project_records_standalone(
     Ok(docs)
 }
 
-pub(crate) fn reindex_threads_store_standalone(
+pub fn reindex_threads_store_standalone(
     threads_path: &Path,
     f: FieldHandles,
     writer: &mut IndexWriter,
@@ -245,7 +245,7 @@ pub(crate) fn reindex_threads_store_standalone(
 
 /// Apply a full thread-store replacement to an already-held writer (no
 /// commit). `threads` is a point-in-time snapshot of every thread.
-pub(crate) fn apply_threads_store_upsert(
+pub fn apply_threads_store_upsert(
     writer: &mut IndexWriter,
     f: FieldHandles,
     threads_path: &Path,
@@ -260,7 +260,7 @@ pub(crate) fn apply_threads_store_upsert(
 }
 
 /// Apply a single-thread upsert to an already-held writer (no commit).
-pub(crate) fn apply_thread_upsert(
+pub fn apply_thread_upsert(
     writer: &mut IndexWriter,
     f: FieldHandles,
     threads_path: &Path,
@@ -278,7 +278,7 @@ pub(crate) fn apply_thread_upsert(
 mod tests {
     use super::*;
     use crate::index::build_schema;
-    use crate::threads::{ThreadKind, ThreadStatus};
+    use bbox_threads::threads::{ThreadKind, ThreadStatus};
 
     fn first_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
         doc.get_first(field)
@@ -304,10 +304,10 @@ mod tests {
             sessions: Vec::new(),
             handoff_doc: Some("handoff marker".into()),
             notes: vec!["inline note marker".into()],
-            edges: vec![crate::threads::ThreadEdge {
-                kind: crate::threads::EdgeKind::RelatesTo,
+            edges: vec![bbox_threads::threads::ThreadEdge {
+                kind: bbox_threads::threads::EdgeKind::RelatesTo,
                 target: "thread-def67890".into(),
-                target_type: crate::threads::EdgeTarget::Thread,
+                target_type: bbox_threads::threads::EdgeTarget::Thread,
                 note: Some("edge note marker".into()),
                 created_at: "2026-05-06T00:00:00Z".into(),
             }],
@@ -354,9 +354,9 @@ mod tests {
         // register_path is memory-only post-persister-conversion; the
         // standalone reindex reads projects.json from disk, so flush the
         // snapshot explicitly (the production path persists via the actor).
-        crate::json_store::atomic_write_json_locked(
+        bbox_corpus_core::json_store::atomic_write_json_locked(
             projects_path,
-            &<ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&reg).unwrap(),
+            &<ProjectRegistry as bbox_stores::store_persister::StoreSnapshot>::snapshot(&reg).unwrap(),
         )
         .unwrap();
     }
@@ -418,7 +418,7 @@ mod tests {
         };
         std::fs::write(
             &threads_path,
-            serde_json::to_string(&crate::threads::ThreadStore {
+            serde_json::to_string(&bbox_threads::threads::ThreadStore {
                 version: 1,
                 threads: vec![live],
             })

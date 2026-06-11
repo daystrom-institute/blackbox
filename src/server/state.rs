@@ -390,6 +390,9 @@ impl SharedState {
         gaps.set_project_roots(kb_project_roots).unwrap();
         crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread);
         crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note);
+        crate::index::writer_actor::register_embed_bootstrap(
+            crate::embed_queue::register_index_embed_hooks,
+        );
         let notes_path = store_dir.join("notes.json");
         let notes_store = Arc::new(RwLock::new(Notes::open(&notes_path).unwrap()));
         let notes_persister = StorePersister::spawn("notes-test", notes_store.clone(), notes_path);

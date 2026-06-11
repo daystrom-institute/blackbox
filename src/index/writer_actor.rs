@@ -28,15 +28,15 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tantivy::{Index, IndexReader, IndexWriter};
 
-use crate::knowledge::KnowledgeEntry;
-use crate::roadmap::RoadmapItem;
-use crate::threads::Thread;
+use bbox_knowledge::knowledge::KnowledgeEntry;
+use bbox_stores::roadmap::RoadmapItem;
+use bbox_threads::threads::Thread;
 
 use super::reindex::{conservative_log_merge_policy, execute_reindex_pass};
 use super::{FieldHandles, ReindexConfig, StatsCache, TranscriptIndex};
 
 /// One queued index mutation.
-pub(crate) enum IndexWriteOp {
+pub enum IndexWriteOp {
     UpsertKnowledge(Box<KnowledgeEntry>),
     DeleteKnowledge(String),
     UpsertRoadmap(Box<RoadmapItem>),
@@ -57,7 +57,7 @@ pub(crate) enum IndexWriteOp {
 
 /// Cloneable handle to the writer actor. Lives in `SharedState`.
 #[derive(Clone)]
-pub(crate) struct IndexWriterActor {
+pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
 }
 
@@ -86,7 +86,7 @@ impl IndexWriterActor {
     /// manual-rebuild store-document pass): every spawn point is a daemon
     /// boot path, so this is the single place store-side wiring attaches
     /// to the engine.
-    pub(crate) fn spawn_for(idx: &TranscriptIndex) -> Self {
+    pub fn spawn_for(idx: &TranscriptIndex) -> Self {
         register_index_store_hooks();
         Self::spawn(
             idx.index_handle(),
@@ -97,7 +97,7 @@ impl IndexWriterActor {
         )
     }
 
-    pub(crate) fn spawn(
+    pub fn spawn(
         index: Index,
         fields: FieldHandles,
         config: ReindexConfig,
@@ -115,7 +115,7 @@ impl IndexWriterActor {
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
             .spawn(move || {
-                let _scope = crate::util::BlockingScope::enter();
+                let _scope = bbox_util::util::BlockingScope::enter();
                 run_actor(rx, ctx)
             })
         {
@@ -127,7 +127,7 @@ impl IndexWriterActor {
     /// Queue a mutation, fire-and-forget. A send failure (actor thread dead)
     /// is logged; the periodic reindex pass reconciles the index from the
     /// durable stores, so a dropped op degrades freshness, not correctness.
-    pub(crate) fn enqueue(&self, op: IndexWriteOp) {
+    pub fn enqueue(&self, op: IndexWriteOp) {
         if self.tx.send(op).is_err() {
             tracing::error!("index writer actor unavailable; dropping index write op");
         }
@@ -135,7 +135,7 @@ impl IndexWriterActor {
 
     /// Run a reindex pass on the actor thread and wait for its outcome.
     /// Returns the human-readable summary line on commit/no-op.
-    pub(crate) fn run_reindex_pass(&self, full: bool, dirty: bool) -> Result<String> {
+    pub fn run_reindex_pass(&self, full: bool, dirty: bool) -> Result<String> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         self.tx
             .send(IndexWriteOp::ReindexPass { full, dirty, ack })
@@ -147,7 +147,7 @@ impl IndexWriterActor {
 
     /// Block until every op enqueued before this call has been applied and
     /// committed. Test/shutdown determinism helper.
-    pub(crate) fn flush_blocking(&self) -> Result<()> {
+    pub fn flush_blocking(&self) -> Result<()> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         self.tx
             .send(IndexWriteOp::Flush(ack))
@@ -349,13 +349,29 @@ fn knowledge_path(config: &ReindexConfig) -> &Path {
     &config.knowledge_path
 }
 
+/// Embed-bootstrap trampoline: the daemon registers
+/// `embed_queue::register_index_embed_hooks` here at SharedState
+/// construction (same inversion as the threads/notes embed hooks), and
+/// every writer-actor spawn fires it. Keeps this module below the embed
+/// pipeline in the crate DAG; unregistered means embed enqueue stays a
+/// no-op, matching the uninstalled-queue behavior.
+static EMBED_BOOTSTRAP: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the embed-hook bootstrap. Idempotent; first registration wins.
+pub fn register_embed_bootstrap(hook: fn()) {
+    let _ = EMBED_BOOTSTRAP.set(hook);
+}
+
 /// Wire the store side into the engine's daemon hooks: embed enqueue for
-/// project-file/git chunks, and the knowledge store-document pass for
-/// manual rebuilds (`TranscriptIndex::build_index`). Idempotent; called
-/// from every writer-actor spawn and directly by store-coupled tests that
-/// drive `build_index` without an actor.
-pub(crate) fn register_index_store_hooks() {
-    crate::embed_queue::register_index_embed_hooks();
+/// project-file/git chunks (via the registered bootstrap), and the
+/// knowledge store-document pass for manual rebuilds
+/// (`TranscriptIndex::build_index`). Idempotent; called from every
+/// writer-actor spawn and directly by store-coupled tests that drive
+/// `build_index` without an actor.
+pub fn register_index_store_hooks() {
+    if let Some(bootstrap) = EMBED_BOOTSTRAP.get() {
+        bootstrap();
+    }
     super::embed_hook::register_manual_store_pass(manual_knowledge_store_pass);
 }
 
@@ -422,14 +438,14 @@ mod tests {
             content: content.into(),
             cluster: None,
             variants: Default::default(),
-            category: crate::knowledge::Category::Memory,
-            scope: crate::knowledge::Scope::Global,
+            category: bbox_knowledge::knowledge::Category::Memory,
+            scope: bbox_knowledge::knowledge::Scope::Global,
             project: None,
             providers: Vec::new(),
-            priority: crate::knowledge::Priority::Standard,
+            priority: bbox_knowledge::knowledge::Priority::Standard,
             weight: 100,
-            status: crate::knowledge::Status::Active,
-            approval: crate::knowledge::Approval::UserConfirmed,
+            status: bbox_knowledge::knowledge::Status::Active,
+            approval: bbox_knowledge::knowledge::Approval::UserConfirmed,
             render: true,
             decay: true,
             review_at: None,
@@ -462,13 +478,13 @@ mod tests {
     /// reconcile knowledge docs from this file, so test entries that must
     /// survive a pass need to live here, not just in the index.
     fn persist_kb_entries(kb_path: &std::path::Path, entries: &[KnowledgeEntry]) {
-        use crate::store_persister::StoreSnapshot;
-        let mut kb = crate::knowledge::Knowledge::open(kb_path).unwrap();
+        use bbox_stores::store_persister::StoreSnapshot;
+        let mut kb = bbox_knowledge::knowledge::Knowledge::open(kb_path).unwrap();
         for entry in entries {
             kb.upsert_generated(entry.clone()).unwrap();
         }
         let snapshot = kb.snapshot().unwrap();
-        crate::json_store::atomic_write_json_locked(kb_path, &snapshot).unwrap();
+        bbox_corpus_core::json_store::atomic_write_json_locked(kb_path, &snapshot).unwrap();
     }
 
     fn search(index: &TranscriptIndex, q: &str) -> String {

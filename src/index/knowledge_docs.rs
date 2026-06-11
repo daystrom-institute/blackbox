@@ -9,17 +9,17 @@ use tantivy::schema::Term;
 use tantivy::{IndexWriter, TantivyDocument};
 
 use super::{FieldHandles, FileMeta};
-use crate::entity_ref::{EntityRef, PARSER_VERSION};
-use crate::knowledge::{Knowledge, KnowledgeEntry, Status};
+use bbox_corpus_core::entity_ref::{EntityRef, PARSER_VERSION};
+use bbox_knowledge::knowledge::{Knowledge, KnowledgeEntry, Status};
 
-pub(crate) fn knowledge_entity_id(entry_id: &str) -> String {
+pub fn knowledge_entity_id(entry_id: &str) -> String {
     EntityRef::Knowledge {
         id: entry_id.to_string(),
     }
     .to_string()
 }
 
-pub(crate) fn knowledge_chunk_hash(entry: &KnowledgeEntry) -> String {
+pub fn knowledge_chunk_hash(entry: &KnowledgeEntry) -> String {
     let mut hasher = Sha256::new();
     hasher.update(entry.content.as_bytes());
     hex::encode(hasher.finalize())
@@ -28,7 +28,7 @@ pub(crate) fn knowledge_chunk_hash(entry: &KnowledgeEntry) -> String {
 /// Build a tantivy document for a knowledge entry. `account` and `role` fields
 /// are transcript-only; queries scoped by account/role return only transcript
 /// hits, not knowledge entries.
-pub(crate) fn build_knowledge_doc(
+pub fn build_knowledge_doc(
     entry: &KnowledgeEntry,
     knowledge_path: &Path,
     f: FieldHandles,
@@ -48,7 +48,7 @@ pub(crate) fn build_knowledge_doc(
     doc
 }
 
-pub(crate) fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
+pub fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
     // Superseded entries remain searchable so history queries can find the
     // original decision; H1 rerank should downweight them by status.
     matches!(entry.status, Status::Active | Status::Superseded)
@@ -56,7 +56,7 @@ pub(crate) fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
 
 // executes inside the IndexWriterActor pass (sanctioned single-writer).
 #[allow(clippy::disallowed_methods)]
-pub(crate) fn reindex_knowledge_store_standalone(
+pub fn reindex_knowledge_store_standalone(
     knowledge_path: &Path,
     projects_path: &Path,
     fields: FieldHandles,
@@ -107,7 +107,7 @@ pub(crate) fn reindex_knowledge_store_standalone(
 
 /// Apply a knowledge upsert to an already-held writer (no commit). The
 /// IndexWriterActor is the production caller; it batches ops and commits once.
-pub(crate) fn apply_knowledge_upsert(
+pub fn apply_knowledge_upsert(
     writer: &mut IndexWriter,
     fields: FieldHandles,
     knowledge_path: &Path,
@@ -122,7 +122,7 @@ pub(crate) fn apply_knowledge_upsert(
 }
 
 /// Apply a knowledge delete to an already-held writer (no commit).
-pub(crate) fn apply_knowledge_delete(
+pub fn apply_knowledge_delete(
     writer: &mut IndexWriter,
     fields: FieldHandles,
     entry_id: &str,
@@ -152,7 +152,7 @@ fn file_meta(path: &Path) -> Option<FileMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::{Approval, Category, Priority, Scope};
+    use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope};
 
     #[test]
     fn knowledge_doc_carries_entity_id_and_content() {
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn reindex_includes_committed_project_bbox_entries() {
-        use crate::knowledge::KnowledgeStore;
+        use bbox_knowledge::knowledge::KnowledgeStore;
         use tantivy::Index;
 
         let central = tempfile::tempdir().unwrap();
@@ -288,9 +288,9 @@ mod tests {
         {
             let mut reg = crate::projects::ProjectRegistry::open(&projects_path).unwrap();
             reg.register_path(&repo_root).unwrap();
-            crate::json_store::atomic_write_json_locked(
+            bbox_corpus_core::json_store::atomic_write_json_locked(
                 &projects_path,
-                &<crate::projects::ProjectRegistry as crate::store_persister::StoreSnapshot>::snapshot(&reg)
+                &<crate::projects::ProjectRegistry as bbox_stores::store_persister::StoreSnapshot>::snapshot(&reg)
                     .unwrap(),
             )
             .unwrap();

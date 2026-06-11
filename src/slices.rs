@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::projects::ProjectRecord;
-use crate::refactor::{
+use bbox_refactor as refactor;
+use bbox_refactor::{
     self, FileEdit, PlanStatus, RefactorApplyParams, RefactorPlan, RefactorStatusParams,
     SemanticStatus, TextEdit, parse_validation_step_for_path, path_string, sha256_hex,
     validate_plan_shape,

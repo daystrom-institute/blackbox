@@ -17,12 +17,12 @@ mod roadmap_docs;
 #[cfg(test)]
 mod store_integration_tests;
 mod thread_docs;
-pub(crate) mod writer_actor;
+pub mod writer_actor;
 
-pub(crate) use knowledge_docs::{
+pub use knowledge_docs::{
     indexable_knowledge_entry, knowledge_chunk_hash, knowledge_entity_id,
 };
-pub(crate) use reindex::backfill_tool_edges_for_project;
-pub(crate) use reindex::spawn_reindex_thread;
-pub(crate) use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
-pub(crate) use writer_actor::{IndexWriteOp, IndexWriterActor};
+pub use reindex::backfill_tool_edges_for_project;
+pub use reindex::spawn_reindex_thread;
+pub use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
+pub use writer_actor::{IndexWriteOp, IndexWriterActor};

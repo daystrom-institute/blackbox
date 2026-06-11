@@ -13,8 +13,8 @@ use super::tool_edges::ToolEdgeContext;
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, ReindexConfig};
 use crate::projects::ProjectRecord;
-use crate::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
-pub(crate) use super::passes::*;
+use bbox_corpus_index::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
+pub use super::passes::*;
 
 // At the default 120s interval this is one full refresh per day. Full
 // project refreshes rewrite managed derived sidecars and trigger legacy
@@ -315,7 +315,7 @@ pub(super) fn execute_reindex_pass(
 /// `reindex_dirty` is a shared out-of-band trigger: the `.bbox/knowledge`
 /// watcher (and daemon startup) set it so repo-owned knowledge changes that
 /// `needs_reindex` cannot see still drive one incremental pass.
-pub(crate) fn spawn_reindex_thread(
+pub fn spawn_reindex_thread(
     actor: super::writer_actor::IndexWriterActor,
     config: ReindexConfig,
     interval: Duration,
@@ -365,14 +365,14 @@ pub(crate) fn spawn_reindex_thread(
 ///
 /// Idempotent: uses `append_edges_dedup` so re-running produces no duplicates.
 /// Returns the number of new edges written.
-pub(crate) fn backfill_tool_edges_for_project(
+pub fn backfill_tool_edges_for_project(
     config: &ReindexConfig,
     project: &ProjectRecord,
 ) -> Result<usize> {
-    let edges_dir = crate::edge_index::edges_dir_from_projects_path(&config.projects_path);
+    let edges_dir = bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
     let ctx = ToolEdgeContext::for_project(project.clone(), edges_dir.clone());
     let registry = TranscriptAdapterRegistry::from_reindex_config(config);
-    let mut collected: Vec<crate::edge_index::Edge> = Vec::new();
+    let mut collected: Vec<bbox_edge_index::edge_index::Edge> = Vec::new();
 
     for adapter in registry.adapters() {
         for target in [
@@ -422,7 +422,7 @@ pub(crate) fn backfill_tool_edges_for_project(
     }
 
     let observed_dir = edges_dir.join("observed");
-    crate::edge_index::append_edges_dedup(&observed_dir, &project.project_id, &collected)
+    bbox_edge_index::edge_index::append_edges_dedup(&observed_dir, &project.project_id, &collected)
 }
 
 #[cfg(test)]
@@ -430,11 +430,11 @@ mod tests {
     use tantivy::schema::Field;
 
     use super::*;
-    use crate::transcripts::projection::normalized_to_doc;
-    use crate::entity_ref;
+    use bbox_corpus_index::transcripts::projection::normalized_to_doc;
+    use bbox_corpus_core::entity_ref;
     use bro_core::Provider;
-    use crate::parser::{MessageRole, ParsedEvent};
-    use crate::transcripts::types::{
+    use bro_transcript::{MessageRole, ParsedEvent};
+    use bbox_corpus_index::transcripts::types::{
         NormalizedTranscriptEvent, RawTranscriptRef, TranscriptStorage,
     };
     use tantivy::TantivyDocument;
@@ -454,7 +454,7 @@ mod tests {
             tool_call: None,
         };
         let raw = RawTranscriptRef::jsonl(
-            crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
+            bbox_corpus_index::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
             TranscriptStorage::JsonlFile,
             "/tmp/session.jsonl",
             0,
@@ -462,7 +462,7 @@ mod tests {
             0,
         );
         let normalized = NormalizedTranscriptEvent::from_parsed_event(
-            crate::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
+            bbox_corpus_index::transcripts::types::TranscriptSource::Harness(Provider::Brodex),
             parsed,
             raw,
         );

@@ -22,20 +22,20 @@ use super::{SearchParams, TranscriptIndex};
             dir.path().join("roadmap.json"),
         )
         .unwrap();
-        let entry = crate::knowledge::KnowledgeEntry {
+        let entry = bbox_knowledge::knowledge::KnowledgeEntry {
             id: "abc12345".into(),
             title: "Delete fixture".into(),
             content: "tombstone searchable knowledge phrase".into(),
             cluster: None,
             variants: Default::default(),
-            category: crate::knowledge::Category::Memory,
-            scope: crate::knowledge::Scope::Global,
+            category: bbox_knowledge::knowledge::Category::Memory,
+            scope: bbox_knowledge::knowledge::Scope::Global,
             project: None,
             providers: Vec::new(),
-            priority: crate::knowledge::Priority::Standard,
+            priority: bbox_knowledge::knowledge::Priority::Standard,
             weight: 100,
-            status: crate::knowledge::Status::Active,
-            approval: crate::knowledge::Approval::UserConfirmed,
+            status: bbox_knowledge::knowledge::Status::Active,
+            approval: bbox_knowledge::knowledge::Approval::UserConfirmed,
             render: true,
             decay: true,
             review_at: None,
@@ -95,10 +95,10 @@ use super::{SearchParams, TranscriptIndex};
         super::writer_actor::register_index_store_hooks();
         let dir = tempfile::tempdir().unwrap();
         let knowledge_path = dir.path().join("knowledge.json");
-        let mut knowledge = crate::knowledge::Knowledge::open(&knowledge_path).unwrap();
+        let mut knowledge = bbox_knowledge::knowledge::Knowledge::open(&knowledge_path).unwrap();
         knowledge
             .remember(
-                &crate::knowledge::RememberParams {
+                &bbox_knowledge::knowledge::RememberParams {
                     content: "durable zebra phrase for knowledge indexing".into(),
                     category: None,
                     title: Some("Knowledge indexing fixture".into()),
@@ -111,9 +111,9 @@ use super::{SearchParams, TranscriptIndex};
                 false,
             )
             .unwrap();
-        crate::json_store::atomic_write_json_locked(
+        bbox_corpus_core::json_store::atomic_write_json_locked(
             &knowledge_path,
-            &<crate::knowledge::Knowledge as crate::store_persister::StoreSnapshot>::snapshot(
+            &<bbox_knowledge::knowledge::Knowledge as bbox_stores::store_persister::StoreSnapshot>::snapshot(
                 &knowledge,
             )
             .unwrap(),

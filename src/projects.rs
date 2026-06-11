@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 pub use bbox_corpus_core::language::Language;
 pub use bbox_corpus_core::project_record::ProjectRecord;
 
-use crate::entity_ref;
-use crate::store_persister::StoreSnapshot;
-use crate::util;
+use bbox_corpus_core::entity_ref;
+use bbox_stores::store_persister::StoreSnapshot;
+use bbox_util::util;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProjectRegisterParams {
@@ -75,7 +75,7 @@ pub struct ProjectRenameResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub(crate) struct ProjectInitParams {
+pub struct ProjectInitParams {
     pub path: String,
     #[serde(default)]
     pub force: bool,
@@ -370,7 +370,7 @@ fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 /// ([`crate::code_nav`]) so a fleet-dispatched agent working inside an isolated
 /// worktree can use project-scoped tools without registering each ephemeral
 /// worktree.
-pub(crate) fn managed_fleet_worktree_project(
+pub fn managed_fleet_worktree_project(
     project_dir: Option<&str>,
     projects: &[ProjectRecord],
 ) -> Option<ProjectRecord> {
@@ -392,7 +392,7 @@ pub(crate) fn managed_fleet_worktree_project(
 /// be written so they travel with the agent's branch. `None` when the path is
 /// not a managed fleet worktree (already registered/descendant, not `bro-fleet/*`,
 /// or no registered base shares its git common dir).
-pub(crate) fn fleet_worktree_scope_and_dir(
+pub fn fleet_worktree_scope_and_dir(
     project_dir: &str,
     projects: &[ProjectRecord],
 ) -> Option<(String, String)> {
@@ -424,13 +424,13 @@ fn resolve_managed_fleet_worktree<'a>(
     }) {
         return None;
     }
-    let branch = crate::git::current_branch(&worktree)?;
+    let branch = bbox_corpus_core::git::current_branch(&worktree)?;
     if !branch.starts_with("bro-fleet/") {
         return None;
     }
-    let worktree_common = crate::git::git_common_dir(&worktree)?;
+    let worktree_common = bbox_corpus_core::git::git_common_dir(&worktree)?;
     let base = projects.iter().find(|project| {
-        crate::git::git_common_dir(Path::new(&project.canonical_path))
+        bbox_corpus_core::git::git_common_dir(Path::new(&project.canonical_path))
             .is_some_and(|common| common == worktree_common)
     })?;
     Some((base, worktree))
@@ -519,7 +519,7 @@ fn canonical_nonexistent_absolute_path(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_persister::StorePersister;
+    use bbox_stores::store_persister::StorePersister;
     use parking_lot::RwLock;
     use std::process::Command;
     use std::sync::Arc;

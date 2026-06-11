@@ -9,20 +9,20 @@ use tantivy::schema::Term;
 use tantivy::{IndexWriter, TantivyDocument};
 
 use super::{FieldHandles, FileMeta};
-use crate::entity_ref::{EntityRef, PARSER_VERSION};
-use crate::roadmap::{Roadmap, RoadmapItem};
+use bbox_corpus_core::entity_ref::{EntityRef, PARSER_VERSION};
+use bbox_stores::roadmap::{Roadmap, RoadmapItem};
 
-pub(crate) fn roadmap_entity_id(id: &str) -> String {
+pub fn roadmap_entity_id(id: &str) -> String {
     EntityRef::RoadmapItem { id: id.to_string() }.to_string()
 }
 
-pub(crate) fn roadmap_chunk_hash(item: &RoadmapItem) -> String {
+pub fn roadmap_chunk_hash(item: &RoadmapItem) -> String {
     let mut hasher = Sha256::new();
     hasher.update(item.body.as_bytes());
     hex::encode(hasher.finalize())
 }
 
-pub(crate) fn build_roadmap_doc(
+pub fn build_roadmap_doc(
     item: &RoadmapItem,
     roadmap_path: &Path,
     f: FieldHandles,
@@ -43,11 +43,11 @@ pub(crate) fn build_roadmap_doc(
 }
 
 /// All non-rejected roadmap items are indexable.
-pub(crate) fn indexable_roadmap_item(item: &RoadmapItem) -> bool {
-    !matches!(item.status, crate::roadmap::RoadmapStatus::Rejected)
+pub fn indexable_roadmap_item(item: &RoadmapItem) -> bool {
+    !matches!(item.status, bbox_stores::roadmap::RoadmapStatus::Rejected)
 }
 
-pub(crate) fn reindex_roadmap_store_standalone(
+pub fn reindex_roadmap_store_standalone(
     roadmap_path: &Path,
     fields: FieldHandles,
     writer: &mut IndexWriter,
@@ -75,7 +75,7 @@ pub(crate) fn reindex_roadmap_store_standalone(
 }
 
 /// Apply a roadmap upsert to an already-held writer (no commit).
-pub(crate) fn apply_roadmap_upsert(
+pub fn apply_roadmap_upsert(
     writer: &mut IndexWriter,
     fields: FieldHandles,
     roadmap_path: &Path,
@@ -90,7 +90,7 @@ pub(crate) fn apply_roadmap_upsert(
 }
 
 /// Apply a roadmap delete to an already-held writer (no commit).
-pub(crate) fn apply_roadmap_delete(
+pub fn apply_roadmap_delete(
     writer: &mut IndexWriter,
     fields: FieldHandles,
     item_id: &str,
@@ -128,9 +128,9 @@ mod tests {
             id: "roadmap-a1b2c3d4".into(),
             title: "Add roadmap tracker".into(),
             body: "Build bbox_roadmap tool for prospective work tracking".into(),
-            status: crate::roadmap::RoadmapStatus::Accepted,
-            category: crate::roadmap::RoadmapCategory::Feature,
-            priority: crate::roadmap::RoadmapPriority::High,
+            status: bbox_stores::roadmap::RoadmapStatus::Accepted,
+            category: bbox_stores::roadmap::RoadmapCategory::Feature,
+            priority: bbox_stores::roadmap::RoadmapPriority::High,
             scope: "project".into(),
             project: Some("/tmp/test-project".into()),
             created_at: "2026-05-08T12:00:00Z".into(),
@@ -154,9 +154,9 @@ mod tests {
             id: "roadmap-x1".into(),
             title: "Bad idea".into(),
             body: "nope".into(),
-            status: crate::roadmap::RoadmapStatus::Rejected,
-            category: crate::roadmap::RoadmapCategory::Feature,
-            priority: crate::roadmap::RoadmapPriority::Low,
+            status: bbox_stores::roadmap::RoadmapStatus::Rejected,
+            category: bbox_stores::roadmap::RoadmapCategory::Feature,
+            priority: bbox_stores::roadmap::RoadmapPriority::Low,
             scope: "project".into(),
             project: None,
             created_at: "2026-05-08T12:00:00Z".into(),
@@ -164,7 +164,7 @@ mod tests {
             transitions: Vec::new(),
         };
         assert!(!indexable_roadmap_item(&item));
-        item.status = crate::roadmap::RoadmapStatus::Accepted;
+        item.status = bbox_stores::roadmap::RoadmapStatus::Accepted;
         assert!(indexable_roadmap_item(&item));
     }
 

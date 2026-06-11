@@ -65,7 +65,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
         languages: BTreeSet::new(),
     };
 
-    let method_chunk = crate::chunker::Chunk {
+    let method_chunk = bbox_chunker::Chunk {
         project_id: "proj-impl-test".into(),
         file_path: std::path::PathBuf::from("src/lib.rs"),
         rel_path_hash: "h1".into(),
@@ -83,7 +83,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
         byte_start: 19,
         byte_end: 35,
     };
-    let toplevel_chunk = crate::chunker::Chunk {
+    let toplevel_chunk = bbox_chunker::Chunk {
         project_id: "proj-impl-test".into(),
         file_path: std::path::PathBuf::from("src/lib.rs"),
         rel_path_hash: "h1".into(),
