@@ -450,7 +450,7 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
 /// worktree path must NOT fall through to the deterministic hash, which would
 /// derive a different id than the base and silently return empty results.
 fn resolve_project_filter_path(raw: &str, projects: &[ProjectRecord]) -> Option<String> {
-    if let Some(record) = crate::projects::resolve_base_project_for_scope(raw, projects) {
+    if let Some(record) = bbox_indexing::projects::resolve_base_project_for_scope(raw, projects) {
         return Some(record.project_id.clone());
     }
     // Fall back to the deterministic path-derived id even when the project
@@ -1277,7 +1277,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         init_git_repo(&base);
         let base_canon = base.canonicalize().unwrap();
-        let registered = vec![crate::projects::ProjectRecord {
+        let registered = vec![bbox_indexing::projects::ProjectRecord {
             project_id: "feedbeef".into(),
             repo_id: None,
             canonical_path: base_canon.to_string_lossy().into_owned(),
@@ -1326,7 +1326,7 @@ mod tests {
         // path-derived id fallback.
         let plain = tmp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        let expected = crate::entity_ref::project_id_for_path(plain.to_str().unwrap()).unwrap();
+        let expected = bbox_corpus_core::entity_ref::project_id_for_path(plain.to_str().unwrap()).unwrap();
         assert_eq!(
             resolve_project_filter_path(plain.to_str().unwrap(), &registered),
             Some(expected)
