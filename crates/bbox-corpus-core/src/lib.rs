@@ -14,6 +14,8 @@
 pub mod edit;
 pub mod entity_ref;
 pub mod git;
+pub mod json_store;
 pub mod language;
 pub mod lsp_config;
 pub mod project_record;
+pub mod util;

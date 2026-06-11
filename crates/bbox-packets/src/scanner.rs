@@ -275,7 +275,7 @@ pub fn find_repair_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packets::test_support::tmp_packets;
+    use crate::test_support::tmp_packets;
 
     #[test]
     fn self_heal_scanner_flags_and_dedups() {

@@ -55,7 +55,9 @@ mod gaps;
 use bbox_corpus_core::git;
 mod inbox;
 mod index;
-pub mod json_store;
+// `json_store` extracted into bbox-corpus-core; aliased back to
+// `crate::json_store` so existing call sites resolve unchanged.
+pub use bbox_corpus_core::json_store;
 mod knowledge;
 // `lsp` extracted into bbox-lsp (stage 2); aliased back to `crate::lsp`.
 use bbox_lsp as lsp;
@@ -69,7 +71,9 @@ mod mcp_tools;
 mod migration;
 mod notes;
 mod orchestration;
-mod packets;
+// `packets` extracted into bbox-packets (root-crate split); aliased back to
+// `crate::packets` so existing call sites resolve unchanged.
+use bbox_packets as packets;
 /// The transcript parser lives in the shared `bro-transcript` crate (the
 /// daemon's indexer and the `bro` cockpit both link it). Re-exported as
 /// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.

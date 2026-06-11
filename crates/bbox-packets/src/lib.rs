@@ -415,44 +415,10 @@ impl Packets {
         body.to_string()
     }
 
-    /// Emit the companion gap note for a packet-authoring gap into the
-    /// first-class gap store. Global-scoped (substrate gaps aren't repo-owned);
-    /// `GapStore::ingest` handles open-duplicate dedupe by `dedupe_key`.
-    pub fn emit_companion_gap_note(
-        gaps_lock: &parking_lot::RwLock<crate::gaps::GapStore>,
-        ev: &PacketEvent,
-        params: &GapParams,
-    ) -> Option<String> {
-        let dedupe_key = Self::gap_dedupe_key(
-            ev.domain.as_deref(),
-            params.ast_feature_requested.as_deref(),
-            &params.description,
-        );
-
-        let body = Self::build_gap_note_body(ev, params, &dedupe_key);
-        let value: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(e) => return Some(format!("companion gap note build failed: {e:#}")),
-        };
-        let gap = match crate::gaps::GapNote::from_envelope(
-            &value,
-            String::new(),
-            crate::util::now_iso(),
-        ) {
-            Ok(g) => g,
-            Err(e) => return Some(format!("companion gap note build failed: {e:#}")),
-        };
-
-        match gaps_lock.write().ingest(gap) {
-            Ok(_) => None,
-            Err(e) => Some(format!("companion gap note failed: {e:#}")),
-        }
-    }
-
     fn save_packet(&self, packet: &Packet) -> Result<()> {
         let path = packet_path(&self.packets_dir, &packet.scope, &packet.id);
-        let result = crate::json_store::with_store_lock(&path, || {
-            crate::json_store::atomic_write_json_locked(&path, packet)
+        let result = bbox_corpus_core::json_store::with_store_lock(&path, || {
+            bbox_corpus_core::json_store::atomic_write_json_locked(&path, packet)
         });
         if result.is_ok() {
             self.bump_generation();
@@ -1101,7 +1067,7 @@ impl Packets {
     /// `PACKET_SELF_HEAL_ENABLED=true`. Also exposed for direct
     /// invocation from tests / operators.
     pub fn scanner_step(&self, config: &ScannerConfig) -> Result<Vec<RepairCandidate>> {
-        let now = crate::util::now_iso();
+        let now = bbox_corpus_core::util::now_iso();
         self.scanner_step_at(config, &now)
     }
 

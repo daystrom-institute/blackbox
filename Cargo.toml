@@ -26,6 +26,7 @@ members = [
     "crates/bbox-refactor",
     "crates/bbox-code-nav",
     "crates/bbox-macros",
+    "crates/bbox-packets",
 ]
 
 [package]
@@ -102,6 +103,7 @@ bbox-refactor = { path = "crates/bbox-refactor" }
 bbox-code-nav = { path = "crates/bbox-code-nav" }
 # Macro planning/model/backend layer, extracted from the root crate (stage 5).
 bbox-macros = { path = "crates/bbox-macros" }
+bbox-packets = { path = "crates/bbox-packets" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }

@@ -10,6 +10,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Root-crate split: the rule-packet engine moved to a new `bbox-packets` leaf
+  crate (compile/apply/audit AST, coercion, scanner, event log), re-exported as
+  `crate::packets` so call sites are unchanged. Shared `json_store` and
+  `now_iso` moved into `bbox-corpus-core`; companion gap-note ingestion
+  inverted root-side (`gaps::emit_companion_packet_gap_note`) so the leaf has
+  no gap-store coupling.
 - cargo-nextest test gates (`.config/nextest.toml`): the unit suite now runs
   process-per-test under nextest — `cargo nextest run --lib` is the mid-cycle
   gate (~16s execution; the two >45s tests are quarantined), and

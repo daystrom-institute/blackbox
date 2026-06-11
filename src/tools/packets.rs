@@ -1,6 +1,6 @@
 use crate::packets::{
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
-    PacketListParams, Packets, packet_matches_query, packet_summary,
+    PacketListParams, packet_matches_query, packet_summary,
 };
 use crate::server::BlackboxServer;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -173,7 +173,7 @@ impl BlackboxServer {
             }
         };
 
-        let warning = Packets::emit_companion_gap_note(&self.state.gaps, &ev, &p);
+        let warning = crate::gaps::emit_companion_packet_gap_note(&self.state.gaps, &ev, &p);
 
         let mut response = serde_json::json!({
             "logged": true,

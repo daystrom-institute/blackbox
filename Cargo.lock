@@ -330,9 +330,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "fs2",
  "hex",
  "schemars 1.2.1",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
@@ -368,6 +370,22 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "bbox-packets"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "chrono",
+ "regex",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "strum 0.26.3",
  "tempfile",
  "tracing",
 ]
@@ -523,6 +541,7 @@ dependencies = [
  "bbox-corpus-core",
  "bbox-lsp",
  "bbox-macros",
+ "bbox-packets",
  "bbox-refactor",
  "bbox-vectors",
  "bincode",

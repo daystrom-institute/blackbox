@@ -1,0 +1,27 @@
+[package]
+name = "bbox-packets"
+version = "0.0.1"
+edition = "2024"
+
+# Rule-packet engine (compile/apply/audit AST, coercion, scanner, event log),
+# extracted from the root `blackbox` crate for build parallelism (root-crate
+# split, thread-9938dffd). True leaf at extraction time: sits on
+# bbox-corpus-core (json_store, now_iso) + external crates only. The one
+# upward reach (companion gap notes -> blackbox::gaps) was inverted: gap-store
+# ingestion lives root-side in `blackbox::gaps::emit_companion_packet_gap_note`;
+# this crate only composes the gap-note body. Re-exported into the daemon as
+# `crate::packets` (see src/lib.rs).
+
+[dependencies]
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+anyhow = "1"
+chrono = "0.4"
+regex = "1"
+rmcp = { version = "1.4", features = ["macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strum = { version = "0.26", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

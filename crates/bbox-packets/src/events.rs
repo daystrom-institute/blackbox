@@ -67,7 +67,7 @@ pub struct PacketEvent {
 impl PacketEvent {
     pub(super) fn now(op: &str, outcome: &str) -> Self {
         Self {
-            timestamp: crate::util::now_iso(),
+            timestamp: bbox_corpus_core::util::now_iso(),
             op: op.to_string(),
             outcome: outcome.to_string(),
             packet_id: None,
