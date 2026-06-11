@@ -411,7 +411,9 @@ impl BlackboxServer {
             if let Some(obj) = task_status.as_object_mut() {
                 obj.insert(
                     "supervision".to_string(),
-                    inner.supervision.snapshot(now_ms),
+                    inner
+                        .supervision
+                        .snapshot(&orchestration::supervision::config(), now_ms),
                 );
             }
 
@@ -447,7 +449,9 @@ impl BlackboxServer {
                 .unwrap_or_default();
             (
                 task_status,
-                inner.supervision.snapshot(now_ms),
+                inner
+                    .supervision
+                    .snapshot(&orchestration::supervision::config(), now_ms),
                 assistant_tail,
                 latest_report,
                 helper_events,
@@ -462,7 +466,7 @@ impl BlackboxServer {
                 "supervision": serde_json::json!({"ok": false, "event_count": 0}),
             });
             let snapshot = orchestration::supervision::SupervisionState::default()
-                .snapshot(orchestration::now_ms());
+                .snapshot(&orchestration::supervision::config(), orchestration::now_ms());
             (
                 attached_task,
                 snapshot,

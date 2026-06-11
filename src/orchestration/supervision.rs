@@ -166,7 +166,13 @@ impl Default for SupervisionConfig {
 }
 
 impl SupervisionState {
-    pub fn observe_event(&mut self, event: &Value, sink: &EventSink, now_ms: u64) {
+    pub fn observe_event(
+        &mut self,
+        event: &Value,
+        sink: &EventSink,
+        cfg: &SupervisionConfig,
+        now_ms: u64,
+    ) {
         if !self.enabled {
             return;
         }
@@ -196,7 +202,7 @@ impl SupervisionState {
                 loop_candidate,
             });
 
-            while self.recent_hashes.len() > config().max_recent_hashes {
+            while self.recent_hashes.len() > cfg.max_recent_hashes {
                 self.recent_hashes.pop_front();
             }
 
@@ -206,7 +212,7 @@ impl SupervisionState {
 
             let count = self.trailing_loop_count(&hashed);
 
-            if count == config().loop_amber_count {
+            if count == cfg.loop_amber_count {
                 self.push_alert(
                     AlertKind::Loop,
                     AlertSeverity::Amber,
@@ -214,11 +220,12 @@ impl SupervisionState {
                     Some(count as f64),
                     Some(hashed.clone()),
                     Some(tool_name.clone()),
+                    cfg,
                     now_ms,
                 );
             }
 
-            if count == config().loop_red_count {
+            if count == cfg.loop_red_count {
                 self.push_alert(
                     AlertKind::Loop,
                     AlertSeverity::Red,
@@ -226,6 +233,7 @@ impl SupervisionState {
                     Some(count as f64),
                     Some(hashed),
                     Some(tool_name),
+                    cfg,
                     now_ms,
                 );
             }
@@ -236,7 +244,7 @@ impl SupervisionState {
         if has_compaction_marker(event) {
             self.compaction_times_ms.push_back(now_ms);
             while let Some(front) = self.compaction_times_ms.front().copied() {
-                if now_ms.saturating_sub(front) > config().compaction_window_ms {
+                if now_ms.saturating_sub(front) > cfg.compaction_window_ms {
                     self.compaction_times_ms.pop_front();
                 } else {
                     break;
@@ -244,41 +252,43 @@ impl SupervisionState {
             }
 
             let compactions = self.compaction_times_ms.len() as u64;
-            if compactions == config().compaction_amber_count {
+            if compactions == cfg.compaction_amber_count {
                 self.push_alert(
                     AlertKind::Compaction,
                     AlertSeverity::Amber,
                     format!(
                         "compaction markers observed {compactions} times in {}s window",
-                        config().compaction_window_ms / 1000
+                        cfg.compaction_window_ms / 1000
                     ),
                     Some(compactions as f64),
                     None,
                     None,
+                    cfg,
                     now_ms,
                 );
             }
 
-            if compactions == config().compaction_red_count {
+            if compactions == cfg.compaction_red_count {
                 self.push_alert(
                     AlertKind::Compaction,
                     AlertSeverity::Red,
                     format!(
                         "compaction markers observed {compactions} times in {}s window",
-                        config().compaction_window_ms / 1000
+                        cfg.compaction_window_ms / 1000
                     ),
                     Some(compactions as f64),
                     None,
                     None,
+                    cfg,
                     now_ms,
                 );
             }
         }
 
-        self.emit_token_burn_alert(now_ms);
+        self.emit_token_burn_alert(cfg, now_ms);
     }
 
-    pub fn observe_bulk_sink(&mut self, sink: &EventSink, now_ms: u64) {
+    pub fn observe_bulk_sink(&mut self, sink: &EventSink, cfg: &SupervisionConfig, now_ms: u64) {
         if !self.enabled {
             return;
         }
@@ -287,7 +297,7 @@ impl SupervisionState {
         self.last_event_at_ms = Some(now_ms);
 
         self.observe_usage(sink);
-        self.emit_token_burn_alert(now_ms);
+        self.emit_token_burn_alert(cfg, now_ms);
     }
 
     /// Seconds of inactivity since the last observed event, but only once the
@@ -296,16 +306,16 @@ impl SupervisionState {
     /// neutral replacement for the old amber/red stall alert: it reports a fact
     /// ("no activity for N seconds") and asserts nothing about whether the agent
     /// is wedged or simply blocked on a long-running child process.
-    fn idle_seconds(&self, now_ms: u64) -> Option<u64> {
+    fn idle_seconds(&self, cfg: &SupervisionConfig, now_ms: u64) -> Option<u64> {
         let last_ms = self.last_event_at_ms?;
         let elapsed = now_ms.saturating_sub(last_ms);
-        if elapsed < config().stall_notice_ms {
+        if elapsed < cfg.stall_notice_ms {
             return None;
         }
         Some(elapsed / 1000)
     }
 
-    pub fn snapshot(&self, now_ms: u64) -> Value {
+    pub fn snapshot(&self, cfg: &SupervisionConfig, now_ms: u64) -> Value {
         let mut obj = serde_json::json!({
             "enabled": self.enabled,
             "event_count": self.event_count,
@@ -341,12 +351,12 @@ impl SupervisionState {
         // treat it as the agent being wrong. The notice is labelled with the
         // tool-running state so "idle" reads as "blocked on a tool" vs "model
         // is quiet" vs "unknown" without any classification.
-        if let Some(idle) = self.idle_seconds(now_ms) {
+        if let Some(idle) = self.idle_seconds(cfg, now_ms) {
             obj["idle_seconds"] = Value::from(idle);
             obj["idle_notice"] = Value::from(idle_notice(idle, self.tool_running));
         }
 
-        let compactions_in_window = self.compactions_within_window(now_ms);
+        let compactions_in_window = self.compactions_within_window(cfg, now_ms);
         obj["compactions_in_window"] = Value::from(compactions_in_window);
 
         if let Some(ratio) = token_burn_ratio(
@@ -357,7 +367,7 @@ impl SupervisionState {
         }
 
         obj["alerts"] = Value::Array(
-            self.recent_alerts()
+            self.recent_alerts(cfg)
                 .into_iter()
                 .map(|alert| serde_json::to_value(alert).unwrap_or(Value::Null))
                 .collect(),
@@ -369,12 +379,12 @@ impl SupervisionState {
     /// when all supervision metrics are green, otherwise delegates to `snapshot()`.
     /// Use for bro response rendering (task_result_json, timeout_snapshot_json).
     /// Machine consumers that need the full shape should call `snapshot()` directly.
-    pub fn snapshot_for_response(&self, now_ms: u64) -> Value {
+    pub fn snapshot_for_response(&self, cfg: &SupervisionConfig, now_ms: u64) -> Value {
         if !self.enabled {
-            return self.snapshot(now_ms);
+            return self.snapshot(cfg, now_ms);
         }
 
-        if self.is_green(now_ms) {
+        if self.is_green(cfg, now_ms) {
             let mut obj = serde_json::json!({
                 "ok": true,
                 "event_count": self.event_count,
@@ -383,25 +393,24 @@ impl SupervisionState {
             // that wants to threshold on it can, without the daemon asserting
             // anything is wrong. `tool_running` rides along so the orchestrator
             // can tell "blocked on a tool" from "model is quiet" itself.
-            if let Some(idle) = self.idle_seconds(now_ms) {
+            if let Some(idle) = self.idle_seconds(cfg, now_ms) {
                 obj["idle_seconds"] = Value::from(idle);
                 obj["tool_running"] = serde_json::to_value(self.tool_running).unwrap();
             }
             return obj;
         }
 
-        self.snapshot(now_ms)
+        self.snapshot(cfg, now_ms)
     }
 
     /// True when every supervision metric sits within its green threshold.
     /// Only meaningful while `enabled`; a disabled supervisor has no opinion,
     /// so it reports as not-green and callers gating on greenness keep emitting
     /// its (disabled) snapshot rather than silently dropping it.
-    fn is_green(&self, now_ms: u64) -> bool {
+    fn is_green(&self, cfg: &SupervisionConfig, now_ms: u64) -> bool {
         if !self.enabled {
             return false;
         }
-        let cfg = config();
         // Idle is deliberately absent from this check: long inactivity is a
         // neutral fact, not a problem, so it must not flip a task out of green.
         let burn_is_green = token_burn_ratio(
@@ -409,9 +418,9 @@ impl SupervisionState {
             self.token_baseline,
         )
         .is_none_or(|r| r < cfg.token_burn_amber_ratio);
-        self.recent_alerts().is_empty()
+        self.recent_alerts(cfg).is_empty()
             && self.max_loop_count() < cfg.loop_amber_count
-            && self.compactions_within_window(now_ms) < cfg.compaction_amber_count
+            && self.compactions_within_window(cfg, now_ms) < cfg.compaction_amber_count
             && burn_is_green
     }
 
@@ -421,11 +430,16 @@ impl SupervisionState {
     /// `ok: true` — so the whole field is dropped from terminal status
     /// responses. Live tasks (idle / tool_running thresholds still useful) and
     /// any non-green state always yield `Some`.
-    pub fn snapshot_for_response_gated(&self, now_ms: u64, terminal: bool) -> Option<Value> {
-        if terminal && self.is_green(now_ms) {
+    pub fn snapshot_for_response_gated(
+        &self,
+        cfg: &SupervisionConfig,
+        now_ms: u64,
+        terminal: bool,
+    ) -> Option<Value> {
+        if terminal && self.is_green(cfg, now_ms) {
             return None;
         }
-        Some(self.snapshot_for_response(now_ms))
+        Some(self.snapshot_for_response(cfg, now_ms))
     }
 
     fn observe_usage(&mut self, sink: &EventSink) {
@@ -448,7 +462,7 @@ impl SupervisionState {
         }
     }
 
-    fn emit_token_burn_alert(&mut self, now_ms: u64) {
+    fn emit_token_burn_alert(&mut self, cfg: &SupervisionConfig, now_ms: u64) {
         let Some(ratio) = token_burn_ratio(
             self.total_input_tokens + self.total_output_tokens,
             self.token_baseline,
@@ -456,7 +470,7 @@ impl SupervisionState {
             return;
         };
 
-        if ratio >= config().token_burn_red_ratio {
+        if ratio >= cfg.token_burn_red_ratio {
             self.push_alert(
                 AlertKind::TokenBurn,
                 AlertSeverity::Red,
@@ -468,9 +482,10 @@ impl SupervisionState {
                 Some(ratio),
                 None,
                 None,
+                cfg,
                 now_ms,
             );
-        } else if ratio >= config().token_burn_amber_ratio {
+        } else if ratio >= cfg.token_burn_amber_ratio {
             self.push_alert(
                 AlertKind::TokenBurn,
                 AlertSeverity::Amber,
@@ -482,6 +497,7 @@ impl SupervisionState {
                 Some(ratio),
                 None,
                 None,
+                cfg,
                 now_ms,
             );
         }
@@ -550,11 +566,11 @@ impl SupervisionState {
             .count() as u64
     }
 
-    fn compactions_within_window(&self, now_ms: u64) -> u64 {
+    fn compactions_within_window(&self, cfg: &SupervisionConfig, now_ms: u64) -> u64 {
         self.compaction_times_ms
             .iter()
             .copied()
-            .filter(|time| now_ms.saturating_sub(*time) <= config().compaction_window_ms)
+            .filter(|time| now_ms.saturating_sub(*time) <= cfg.compaction_window_ms)
             .count() as u64
     }
 
@@ -566,11 +582,12 @@ impl SupervisionState {
         measurement: Option<f64>,
         related_hash: Option<String>,
         related_tool: Option<String>,
+        cfg: &SupervisionConfig,
         now_ms: u64,
     ) {
         let key = format!("{kind:?}:{severity:?}");
         if let Some(last_at) = self.last_alert_at_ms.get(&key) {
-            if now_ms.saturating_sub(*last_at) < config().alert_cooldown_ms {
+            if now_ms.saturating_sub(*last_at) < cfg.alert_cooldown_ms {
                 return;
             }
         }
@@ -592,8 +609,8 @@ impl SupervisionState {
         }
     }
 
-    fn recent_alerts(&self) -> Vec<SupervisionAlert> {
-        let max = config().max_snapshot_alerts;
+    fn recent_alerts(&self, cfg: &SupervisionConfig) -> Vec<SupervisionAlert> {
+        let max = cfg.max_snapshot_alerts;
         self.alerts.iter().rev().take(max).cloned().rev().collect()
     }
 }
@@ -670,7 +687,7 @@ fn default_token_burn_red_ratio() -> f64 {
     3.0
 }
 
-fn config() -> SupervisionConfig {
+pub(crate) fn config() -> SupervisionConfig {
     SupervisionConfig::default()
 }
 
@@ -836,6 +853,13 @@ mod tests {
     use super::*;
     use crate::orchestration::providers::{EventSink, Usage};
 
+    // Tests pass `SupervisionConfig::default()` everywhere a cfg is required.
+    // The new regression test at the bottom of the mod is the only caller that
+    // exercises a non-default cfg.
+    fn cfg() -> SupervisionConfig {
+        SupervisionConfig::default()
+    }
+
     fn sink_with_tokens(input: u64, output: u64) -> EventSink {
         EventSink {
             last_assistant_message: None,
@@ -892,7 +916,7 @@ mod tests {
         let event = tool_call_event();
 
         for idx in 0..6 {
-            state.observe_event(&event, &sink_without_usage(), 1_000 + idx * 10);
+            state.observe_event(&event, &sink_without_usage(), &cfg(), 1_000 + idx * 10);
         }
 
         let amber = state
@@ -931,8 +955,8 @@ mod tests {
         });
 
         for idx in 0..6 {
-            state.observe_event(&edit, &sink_without_usage(), 1_000 + idx * 20);
-            state.observe_event(&read, &sink_without_usage(), 1_010 + idx * 20);
+            state.observe_event(&edit, &sink_without_usage(), &cfg(), 1_000 + idx * 20);
+            state.observe_event(&read, &sink_without_usage(), &cfg(), 1_010 + idx * 20);
         }
 
         assert!(
@@ -960,7 +984,7 @@ mod tests {
         });
 
         for idx in 0..8 {
-            state.observe_event(&poll, &sink_without_usage(), 1_000 + idx * 1_000);
+            state.observe_event(&poll, &sink_without_usage(), &cfg(), 1_000 + idx * 1_000);
         }
 
         assert_eq!(state.recent_hashes.len(), 8);
@@ -979,7 +1003,7 @@ mod tests {
             "shell_poll cadence is expected progress polling, not struggle: {:?}",
             state.alerts
         );
-        assert_eq!(state.snapshot_for_response(10_000)["ok"], true);
+        assert_eq!(state.snapshot_for_response(&cfg(), 10_000)["ok"], true);
     }
 
     #[test]
@@ -999,7 +1023,7 @@ mod tests {
             }
         });
 
-        state.observe_event(&event, &sink_without_usage(), 1_000);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 1_000);
 
         assert_eq!(state.recent_hashes.len(), 1);
         assert_eq!(state.max_loop_count(), 1);
@@ -1011,7 +1035,7 @@ mod tests {
         let event = tool_call_event();
 
         for idx in 0..3 {
-            state.observe_event(&event, &sink_without_usage(), 10_000 + idx);
+            state.observe_event(&event, &sink_without_usage(), &cfg(), 10_000 + idx);
         }
 
         let first_amber = state
@@ -1026,7 +1050,7 @@ mod tests {
         let state_len = state.alerts.len();
 
         // Still in cooldown, and loop state remains in the amber bucket.
-        state.observe_event(&event, &sink_without_usage(), 30_000);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 30_000);
 
         assert_eq!(state.alerts.len(), state_len);
         assert_eq!(first_amber, 1);
@@ -1042,7 +1066,7 @@ mod tests {
         // Past the notice threshold: snapshot reports the idle fact, but never
         // as a severity-bearing alert.
         let now = 200_000;
-        let snap = state.snapshot(now);
+        let snap = state.snapshot(&cfg(), now);
         assert_eq!(snap["seconds_since_last_event"], 181);
         assert_eq!(snap["idle_seconds"], 181);
         // No events were observed (last_event_at_ms set directly), so the
@@ -1061,7 +1085,7 @@ mod tests {
         );
 
         // Long idle is still just a larger number, not a red escalation.
-        let far = state.snapshot(420_000);
+        let far = state.snapshot(&cfg(), 420_000);
         assert_eq!(far["idle_seconds"], 401);
         assert!(far["alerts"].as_array().unwrap().is_empty());
     }
@@ -1073,7 +1097,7 @@ mod tests {
             ..Default::default()
         };
         // stall_notice_ms is 180_000, so 170s elapsed is below threshold.
-        let snap = state.snapshot(170_000);
+        let snap = state.snapshot(&cfg(), 170_000);
         assert_eq!(snap["seconds_since_last_event"], 170);
         assert!(snap.get("idle_seconds").is_none());
         assert!(snap.get("idle_notice").is_none());
@@ -1087,19 +1111,19 @@ mod tests {
         assert_eq!(state.tool_running, None);
 
         // A tool_use event: a dispatch is now in flight.
-        state.observe_event(&tool_call_event(), &sink_without_usage(), 1_000);
+        state.observe_event(&tool_call_event(), &sink_without_usage(), &cfg(), 1_000);
         assert_eq!(state.tool_running, Some(true));
 
         // Idle while the tool runs: the notice says so, and it never alerts.
-        let snap = state.snapshot(1_000 + STALL_NOTICE_MS + 5_000);
+        let snap = state.snapshot(&cfg(), 1_000 + STALL_NOTICE_MS + 5_000);
         assert_eq!(snap["tool_running"], true);
         assert_eq!(snap["idle_notice"], "no activity for 185s (tool running)");
         assert!(snap["alerts"].as_array().unwrap().is_empty());
 
         // The tool returns (a non-dispatch event): tool no longer running.
-        state.observe_event(&text_event(), &sink_without_usage(), 200_000);
+        state.observe_event(&text_event(), &sink_without_usage(), &cfg(), 200_000);
         assert_eq!(state.tool_running, Some(false));
-        let snap = state.snapshot(200_000 + STALL_NOTICE_MS + 10_000);
+        let snap = state.snapshot(&cfg(), 200_000 + STALL_NOTICE_MS + 10_000);
         assert_eq!(snap["tool_running"], false);
         assert_eq!(
             snap["idle_notice"], "no activity for 190s (no tool running)",
@@ -1112,10 +1136,10 @@ mod tests {
         let mut state = SupervisionState::default();
         // Bulk-output providers only ever feed observe_bulk_sink — no mid-run
         // visibility, so tool_running stays unknown rather than faking false.
-        state.observe_bulk_sink(&sink_without_usage(), 1_000);
+        state.observe_bulk_sink(&sink_without_usage(), &cfg(), 1_000);
         assert_eq!(state.tool_running, None);
 
-        let snap = state.snapshot(1_000 + STALL_NOTICE_MS + 1_000);
+        let snap = state.snapshot(&cfg(), 1_000 + STALL_NOTICE_MS + 1_000);
         assert!(snap["tool_running"].is_null());
         assert_eq!(
             snap["idle_notice"],
@@ -1126,11 +1150,11 @@ mod tests {
     #[test]
     fn green_response_carries_tool_running_when_idle() {
         let mut state = SupervisionState::default();
-        state.observe_event(&tool_call_event(), &sink_without_usage(), 0);
+        state.observe_event(&tool_call_event(), &sink_without_usage(), &cfg(), 0);
         // One tool_use is below the loop threshold → still green; long idle does
         // not change that, but tool_running rides along so the orchestrator can
         // tell "blocked on a tool" from "model is quiet".
-        let snap = state.snapshot_for_response(400_000);
+        let snap = state.snapshot_for_response(&cfg(), 400_000);
         assert_eq!(snap["ok"], true);
         assert_eq!(snap["idle_seconds"], 400);
         assert_eq!(snap["tool_running"], true);
@@ -1143,15 +1167,17 @@ mod tests {
         state.observe_event(
             &serde_json::json!({"note": "bootstrap"}),
             &sink_with_tokens(100, 25),
+            &cfg(),
             1_000,
         );
         state.observe_event(
             &serde_json::json!({"note": "follow"}),
             &sink_with_tokens(375, 125),
+            &cfg(),
             2_000,
         );
 
-        let snapshot = state.snapshot(2_100);
+        let snapshot = state.snapshot(&cfg(), 2_100);
         assert!(snapshot.get("token_burn_ratio").is_none());
         assert!(
             state
@@ -1171,10 +1197,11 @@ mod tests {
         state.observe_event(
             &serde_json::json!({"note": "follow"}),
             &sink_with_tokens(375, 125),
+            &cfg(),
             2_000,
         );
 
-        let snapshot = state.snapshot(2_100);
+        let snapshot = state.snapshot(&cfg(), 2_100);
         assert_eq!(snapshot["token_burn_ratio"], 4.0);
 
         let red_burn = state.alerts.iter().any(|alert| {
@@ -1200,9 +1227,9 @@ mod tests {
             session_id: None,
             interrupted: false,
         };
-        state.observe_event(&serde_json::json!({"note": "n"}), &sink, 1_000);
+        state.observe_event(&serde_json::json!({"note": "n"}), &sink, &cfg(), 1_000);
 
-        let snap = state.snapshot(1_100);
+        let snap = state.snapshot(&cfg(), 1_100);
         assert_eq!(
             snap["total_input_tokens"], 1200,
             "fresh input is the headline"
@@ -1256,7 +1283,7 @@ mod tests {
     #[test]
     fn snapshot_includes_supervision_block() {
         let state = SupervisionState::default();
-        let snapshot = state.snapshot(1_234);
+        let snapshot = state.snapshot(&cfg(), 1_234);
         assert!(snapshot.is_object());
         assert!(snapshot.get("event_count").is_some());
         assert!(snapshot.get("alerts").is_some());
@@ -1277,7 +1304,7 @@ mod tests {
             }
         });
 
-        state.observe_event(&event, &sink_without_usage(), 1_000);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 1_000);
 
         assert_eq!(state.recent_hashes.len(), 1);
         assert_eq!(state.recent_hashes[0].tool_name.as_deref(), Some("read"));
@@ -1305,7 +1332,7 @@ mod tests {
         });
 
         for idx in 0..4 {
-            state.observe_event(&event, &sink_without_usage(), 1_000 + idx * 10);
+            state.observe_event(&event, &sink_without_usage(), &cfg(), 1_000 + idx * 10);
         }
 
         assert!(
@@ -1329,7 +1356,7 @@ mod tests {
     #[test]
     fn green_state_returns_ok_sentinel() {
         let state = SupervisionState::default();
-        let snap = state.snapshot_for_response(1_000);
+        let snap = state.snapshot_for_response(&cfg(), 1_000);
         assert_eq!(snap["ok"], true);
         assert_eq!(snap["event_count"], 0);
         assert!(
@@ -1344,7 +1371,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let snap = state.snapshot_for_response(1_000);
+        let snap = state.snapshot_for_response(&cfg(), 1_000);
         assert_eq!(snap["enabled"], false);
         assert!(
             snap.get("ok").is_none(),
@@ -1363,9 +1390,10 @@ mod tests {
             Some(200.0),
             None,
             None,
+            &cfg(),
             1_000,
         );
-        let snap = state.snapshot_for_response(2_000);
+        let snap = state.snapshot_for_response(&cfg(), 2_000);
         assert!(
             snap.get("ok").is_none(),
             "alerts should force full snapshot"
@@ -1379,10 +1407,10 @@ mod tests {
         let mut state = SupervisionState::default();
         let event = tool_call_event();
         // loop_amber_count is 3, so 2 consecutive is below threshold → green
-        state.observe_event(&event, &sink_without_usage(), 1_000);
-        state.observe_event(&event, &sink_without_usage(), 1_010);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 1_000);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 1_010);
         assert_eq!(state.max_loop_count(), 2);
-        let snap = state.snapshot_for_response(1_020);
+        let snap = state.snapshot_for_response(&cfg(), 1_020);
         assert_eq!(
             snap["ok"], true,
             "loop_max=2 (below amber=3) should be green"
@@ -1394,11 +1422,11 @@ mod tests {
         let mut state = SupervisionState::default();
         let event = tool_call_event();
         // loop_amber_count is 3, so 3 consecutive hits the threshold → full
-        state.observe_event(&event, &sink_without_usage(), 1_000);
-        state.observe_event(&event, &sink_without_usage(), 1_010);
-        state.observe_event(&event, &sink_without_usage(), 1_020);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 1_000);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 1_010);
+        state.observe_event(&event, &sink_without_usage(), &cfg(), 1_020);
         assert_eq!(state.max_loop_count(), 3);
-        let snap = state.snapshot_for_response(1_030);
+        let snap = state.snapshot_for_response(&cfg(), 1_030);
         assert!(
             snap.get("ok").is_none(),
             "loop_max=3 (at amber threshold) should force full snapshot"
@@ -1412,13 +1440,13 @@ mod tests {
             ..Default::default()
         };
         // Below the notice threshold: green, no idle field.
-        let snap = state.snapshot_for_response(170_000);
+        let snap = state.snapshot_for_response(&cfg(), 170_000);
         assert_eq!(snap["ok"], true, "170s elapsed should be green");
         assert!(snap.get("idle_seconds").is_none());
 
         // Past the threshold: still green (idle is neutral), but the idle fact
         // is surfaced alongside ok=true for orchestrators that want it.
-        let snap = state.snapshot_for_response(400_000);
+        let snap = state.snapshot_for_response(&cfg(), 400_000);
         assert_eq!(
             snap["ok"], true,
             "long idle must not flip a task out of green"
@@ -1429,10 +1457,45 @@ mod tests {
     #[test]
     fn snapshot_full_remains_unchanged() {
         let state = SupervisionState::default();
-        let full = state.snapshot(1_000);
+        let full = state.snapshot(&cfg(), 1_000);
         assert!(full.get("enabled").is_some());
         assert!(full.get("event_count").is_some());
         assert!(full.get("alerts").is_some());
         assert!(full.get("loop_hash_max").is_some());
+    }
+
+    // --- C3 regression: caller-supplied cfg is honored, not silently dropped
+    // to default. Pre-fix, observe_event called a hardcoded
+    // SupervisionConfig::default() internally; passing a tighter amber count
+    // would never lower the threshold. This test confirms the wired parameter
+    // actually flows through. ---
+
+    #[test]
+    fn observe_event_with_custom_cfg_honors_threshold() {
+        let mut state = SupervisionState::default();
+        let event = tool_call_event();
+
+        // Tighter than the default (3): with loop_amber_count=2, two identical
+        // consecutive calls already trip the amber alert. The default cfg
+        // would not fire until the third.
+        let mut tight = SupervisionConfig::default();
+        tight.loop_amber_count = 2;
+
+        for idx in 0..2 {
+            state.observe_event(&event, &sink_without_usage(), &tight, 1_000 + idx * 10);
+        }
+
+        let amber = state
+            .alerts
+            .iter()
+            .filter(|alert| {
+                matches!(alert.kind, AlertKind::Loop)
+                    && matches!(alert.severity, AlertSeverity::Amber)
+            })
+            .count();
+        assert_eq!(
+            amber, 1,
+            "caller-supplied cfg with loop_amber_count=2 should trip amber on the second event"
+        );
     }
 }

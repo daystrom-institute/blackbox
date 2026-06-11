@@ -2845,7 +2845,7 @@ fn ingest_harness_event(
             };
             provider.parse_event(&evt, &mut sink);
             apply_cwd_updates_from_event(&mut inner, &evt);
-            inner.supervision.observe_event(&evt, &sink, now_ms());
+            inner.supervision.observe_event(&evt, &sink, &supervision::config(), now_ms());
             apply_sink_updates(&mut inner, sink);
             // A terminal `result` event with `is_error: true` fails the task and
             // preserves the message in stderr. The subprocess path derives this
@@ -3585,7 +3585,12 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                         }
                         if accepted {
                             apply_cwd_updates_from_event(&mut inner, &evt);
-                            inner.supervision.observe_event(&evt, &sink, now_ms());
+                            inner.supervision.observe_event(
+                                &evt,
+                                &sink,
+                                &supervision::config(),
+                                now_ms(),
+                            );
                             apply_sink_updates(&mut inner, sink);
                         }
                         let snippet_to_emit = accepted
@@ -3676,16 +3681,22 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     if inner.session_id == "pending" {
                         inner.session_id = sid;
                         session_id_observed = true;
-                        inner.supervision.observe_bulk_sink(&sink, now_ms());
+                        inner
+                            .supervision
+                            .observe_bulk_sink(&sink, &supervision::config(), now_ms());
                         apply_sink_updates(&mut inner, sink);
                     } else if inner.session_id != sid {
                         reject_forked_session(&mut inner, &sid);
                     } else {
-                        inner.supervision.observe_bulk_sink(&sink, now_ms());
+                        inner
+                            .supervision
+                            .observe_bulk_sink(&sink, &supervision::config(), now_ms());
                         apply_sink_updates(&mut inner, sink);
                     }
                 } else {
-                    inner.supervision.observe_bulk_sink(&sink, now_ms());
+                    inner
+                        .supervision
+                        .observe_bulk_sink(&sink, &supervision::config(), now_ms());
                     apply_sink_updates(&mut inner, sink);
                 }
                 drop(inner);
@@ -4186,7 +4197,11 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     // (idle / tool_running / alerts still carry signal).
     if let Some(supervision) = inner
         .supervision
-        .snapshot_for_response_gated(supervision_now, inner.status.is_terminal())
+        .snapshot_for_response_gated(
+            &supervision::config(),
+            supervision_now,
+            inner.status.is_terminal(),
+        )
     {
         obj["supervision"] = supervision;
     }
@@ -4535,7 +4550,9 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
         "keep_going": keep_going,
         "lastAssistantSnippet": last_activity,
         "interrupted": inner.interrupted,
-        "supervision": inner.supervision.snapshot_for_response(now_ms()),
+        "supervision": inner
+            .supervision
+            .snapshot_for_response(&supervision::config(), now_ms()),
     })
 }
 
