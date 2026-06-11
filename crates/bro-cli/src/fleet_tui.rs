@@ -2882,14 +2882,22 @@ fn prune_terminal_agents(app: &mut App) {
     let mut worktrees_removed = 0usize;
     let mut worktrees_dirty = 0usize;
     let mut worktrees_failed = 0usize;
+    let mut worktree_branches_kept: Vec<String> = Vec::new();
     let mut dirty_names: Vec<String> = Vec::new();
     for (wt_path, _task_id) in &worktrees_to_check {
         match worktree_clean_status(wt_path) {
             Ok(true) => {
-                if remove_fleet_worktree(wt_path) {
-                    worktrees_removed += 1;
-                } else {
-                    worktrees_failed += 1;
+                match remove_fleet_worktree(wt_path) {
+                    Some(FleetWorktreeRemoval::BranchDeleted { .. }) => {
+                        worktrees_removed += 1;
+                    }
+                    Some(FleetWorktreeRemoval::BranchKeptUnmerged { branch }) => {
+                        worktrees_removed += 1;
+                        worktree_branches_kept.push(branch);
+                    }
+                    None => {
+                        worktrees_failed += 1;
+                    }
                 }
             }
             Ok(false) => {
@@ -2903,6 +2911,35 @@ fn prune_terminal_agents(app: &mut App) {
         }
     }
 
+    let msg = prune_status_message(
+        pruned,
+        failed,
+        worktrees_removed,
+        worktrees_dirty,
+        worktrees_failed,
+        &worktree_branches_kept,
+    );
+    let ttl = if worktrees_dirty > 0 || !worktree_branches_kept.is_empty() { 8 } else { 5 };
+    tracing::debug!(
+        prune_action = "executed",
+        pruned,
+        failed,
+        worktrees_removed,
+        worktrees_dirty,
+        worktrees_failed,
+        worktree_branches_kept = ?worktree_branches_kept,
+    );
+    app.set_status(msg, Duration::from_secs(ttl));
+}
+
+fn prune_status_message(
+    pruned: usize,
+    failed: usize,
+    worktrees_removed: usize,
+    worktrees_dirty: usize,
+    worktrees_failed: usize,
+    worktree_branches_kept: &[String],
+) -> String {
     let mut msg = format!("pruned {pruned} terminal agents");
     if failed > 0 {
         msg = format!("{msg} ({failed} failed)");
@@ -2916,16 +2953,11 @@ fn prune_terminal_agents(app: &mut App) {
     if worktrees_failed > 0 {
         msg = format!("{msg}, {worktrees_failed} worktree removals failed");
     }
-    let ttl = if worktrees_dirty > 0 { 8 } else { 5 };
-    tracing::debug!(
-        prune_action = "executed",
-        pruned,
-        failed,
-        worktrees_removed,
-        worktrees_dirty,
-        worktrees_failed,
-    );
-    app.set_status(msg, Duration::from_secs(ttl));
+    if !worktree_branches_kept.is_empty() {
+        let branches = worktree_branches_kept.join(", ");
+        msg = format!("{msg}, branch kept (unmerged): {branches}");
+    }
+    msg
 }
 
 /// Check whether a worktree directory has a clean working tree (no uncommitted
@@ -2947,16 +2979,22 @@ fn worktree_clean_status(worktree: &str) -> Result<bool, String> {
     Ok(stdout.trim().is_empty())
 }
 
-/// Remove a managed fleet worktree and its branch via `git worktree remove`
-/// and `git branch -D`. Returns `true` on success. Best-effort: logs failures
-/// rather than crashing the prune flow.
-fn remove_fleet_worktree(worktree: &str) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FleetWorktreeRemoval {
+    BranchDeleted { branch: String },
+    BranchKeptUnmerged { branch: String },
+}
+
+/// Remove a managed fleet worktree, then delete its branch only when the branch
+/// tip is already merged into the base repo's current branch. Best-effort: logs
+/// failures rather than crashing the prune flow.
+fn remove_fleet_worktree(worktree: &str) -> Option<FleetWorktreeRemoval> {
     // Resolve the base repo so we can run `git worktree remove` from it.
     let base_repo = match closeout::base_repo_of_worktree(worktree) {
         Some(p) => p,
         None => {
             tracing::warn!("prune: could not resolve base repo for {worktree}");
-            return false;
+            return None;
         }
     };
 
@@ -2965,7 +3003,15 @@ fn remove_fleet_worktree(worktree: &str) -> bool {
         Some(b) => b,
         None => {
             tracing::warn!("prune: could not resolve branch for {worktree}");
-            return false;
+            return None;
+        }
+    };
+
+    let branch_merged = match branch_tip_merged_into_base_head(&base_repo, &branch) {
+        Ok(merged) => merged,
+        Err(e) => {
+            tracing::warn!("prune: could not check merge status for {branch}: {e}");
+            false
         }
     };
 
@@ -2984,18 +3030,47 @@ fn remove_fleet_worktree(worktree: &str) -> bool {
                 .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
                 .unwrap_or_else(|e| format!("{e:#}"));
             tracing::warn!("prune: git worktree remove failed for {worktree}: {stderr}");
-            return false;
+            return None;
         }
     }
 
-    // `git branch -D <branch>` from the base repo.
-    let _ = Command::new("git")
+    if !branch_merged {
+        return Some(FleetWorktreeRemoval::BranchKeptUnmerged { branch });
+    }
+
+    let delete_out = Command::new("git")
         .arg("-C")
         .arg(&base_repo)
         .args(["branch", "-D", &branch])
         .output();
+    match delete_out {
+        Ok(o) if o.status.success() => Some(FleetWorktreeRemoval::BranchDeleted { branch }),
+        other => {
+            let stderr = other
+                .as_ref()
+                .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                .unwrap_or_else(|e| format!("{e:#}"));
+            tracing::warn!("prune: git branch -D failed for {branch}: {stderr}");
+            None
+        }
+    }
+}
 
-    true
+fn branch_tip_merged_into_base_head(base_repo: &Path, branch: &str) -> Result<bool, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(base_repo)
+        .args(["merge-base", "--is-ancestor", branch, "HEAD"])
+        .output()
+        .map_err(|e| format!("{e:#}"))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )),
+    }
 }
 
 /// Resolve the current branch name of a worktree checkout.

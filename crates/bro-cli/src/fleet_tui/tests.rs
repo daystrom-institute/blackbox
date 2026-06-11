@@ -1312,6 +1312,21 @@ Trailing paragraph.";
         );
     }
 
+    fn branch_exists(cwd: &Path, branch: &str) -> bool {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["branch", "--list", branch])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git branch --list {branch} failed:\nstderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).contains(branch)
+    }
+
     #[test]
     fn shell_result_renderer_unpacks_json_envelope() {
         let lines = shell_result_block(
@@ -1758,34 +1773,68 @@ Trailing paragraph.";
     }
 
     #[test]
-    fn remove_fleet_worktree_removes_clean_worktree_and_branch() {
+    fn remove_fleet_worktree_removes_clean_worktree_and_merged_branch() {
         let (base, worktrees) = setup_repo_with_worktree();
         let wt_path = worktrees.path().join("wt-test");
         let wt_str = wt_path.to_str().unwrap();
 
-        assert!(remove_fleet_worktree(wt_str), "should succeed");
+        assert_eq!(
+            remove_fleet_worktree(wt_str),
+            Some(FleetWorktreeRemoval::BranchDeleted {
+                branch: "bro-fleet/test-branch".to_string()
+            }),
+            "should remove the worktree and delete an already-merged branch"
+        );
 
         // Worktree dir should be gone.
         assert!(!wt_path.exists(), "worktree dir should be removed");
-        // Branch should be deleted from the base repo.
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(base.path())
-            .args(["branch", "--list", "bro-fleet/test-branch"])
-            .output()
-            .unwrap();
-        let listing = String::from_utf8_lossy(&out.stdout);
         assert!(
-            !listing.contains("bro-fleet/test-branch"),
-            "branch should be deleted, got: {listing}"
+            !branch_exists(base.path(), "bro-fleet/test-branch"),
+            "merged branch should be deleted"
+        );
+    }
+
+    #[test]
+    fn remove_fleet_worktree_keeps_clean_unmerged_branch() {
+        let (base, worktrees) = setup_repo_with_worktree();
+        let wt_path = worktrees.path().join("wt-test");
+        std::fs::write(wt_path.join("README.md"), "base\nunmerged\n").unwrap();
+        run_git(&wt_path, &["add", "README.md"]);
+        run_git(&wt_path, &["commit", "-m", "unmerged work"]);
+
+        assert_eq!(
+            remove_fleet_worktree(wt_path.to_str().unwrap()),
+            Some(FleetWorktreeRemoval::BranchKeptUnmerged {
+                branch: "bro-fleet/test-branch".to_string()
+            }),
+            "worktree should be removed while preserving an unmerged branch"
+        );
+
+        assert!(!wt_path.exists(), "worktree dir should be removed");
+        assert!(
+            branch_exists(base.path(), "bro-fleet/test-branch"),
+            "unmerged branch must remain referenced"
         );
     }
 
     #[test]
     fn remove_fleet_worktree_fails_gracefully_on_nonexistent() {
+        assert_eq!(remove_fleet_worktree("/no/such/worktree"), None);
+    }
+
+    #[test]
+    fn prune_status_reports_unmerged_branch_kept() {
+        let msg = prune_status_message(
+            2,
+            0,
+            1,
+            0,
+            0,
+            &["bro-fleet/test-branch".to_string()],
+        );
         assert!(
-            !remove_fleet_worktree("/no/such/worktree"),
-            "nonexistent worktree should return false"
+            msg.contains("branch kept (unmerged): bro-fleet/test-branch"),
+            "flash should report preserved branch: {msg}"
         );
     }
 
@@ -2364,4 +2413,3 @@ Trailing paragraph.";
             "build-mismatch banner must be visible when no status flash, got: {text}"
         );
     }
-

@@ -1365,13 +1365,49 @@ fn phase_remove(req: &CloseoutRequest) -> PhaseResult {
             content: json!({"error": format!("{e:#}"), "worktree": worktree_str}),
         };
     }
-    let _ = git_run(base_repo, &["branch", "-D", branch]);
+    let mut content = json!({"removed_worktree": worktree});
+    if force {
+        let _ = git_run(base_repo, &["branch", "-D", branch]);
+        content["deleted_branch"] = json!(branch);
+    } else {
+        match branch_tip_merged_into_base_head(base_repo, branch) {
+            Ok(true) => {
+                let _ = git_run(base_repo, &["branch", "-D", branch]);
+                content["deleted_branch"] = json!(branch);
+            }
+            Ok(false) => {
+                content["branch_kept_unmerged"] = json!(branch);
+            }
+            Err(e) => {
+                content["branch_kept_unmerged"] = json!(branch);
+                content["branch_merge_check_error"] = json!(format!("{e:#}"));
+            }
+        }
+    }
     PhaseResult {
         phase: CloseoutPhase::Remove,
         repo_cwd: base_repo.clone(),
         ok: true,
         error_class: CloseoutErrorClass::None,
-        content: json!({"removed_worktree": worktree, "deleted_branch": branch}),
+        content,
+    }
+}
+
+// closeout/worktree git runs on the blocking pool via /control/closeout (wave 16).
+#[allow(clippy::disallowed_methods)]
+fn branch_tip_merged_into_base_head(base_repo: &Path, branch: &str) -> anyhow::Result<bool> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(base_repo)
+        .args(["merge-base", "--is-ancestor", branch, "HEAD"])
+        .output()?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "git merge-base failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
     }
 }
 
@@ -1970,6 +2006,21 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn branch_exists(cwd: &Path, branch: &str) -> bool {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["branch", "--list", branch])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git branch --list {branch} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).contains(branch)
     }
 
     fn seed_repo() -> tempfile::TempDir {
@@ -2608,6 +2659,95 @@ mod tests {
         );
 
         std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[test]
+    fn phase_remove_keeps_unmerged_branch_for_non_discard_closeout() {
+        let repo = seed_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let cwd = worktrees.path().join("wt-test");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                cwd.to_str().unwrap(),
+                "-b",
+                "bro-fleet/test-branch",
+            ],
+        );
+        std::fs::write(cwd.join("README.md"), "base\nunmerged\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "unmerged work"]);
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: "bro-fleet/test-branch".to_string(),
+            target: "main".to_string(),
+            disposition: "merge".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+
+        let result = phase_remove(&req);
+
+        assert!(result.ok, "remove should succeed: {:?}", result.content);
+        assert!(!cwd.exists(), "worktree should be removed");
+        assert_eq!(
+            result.content["branch_kept_unmerged"],
+            json!("bro-fleet/test-branch")
+        );
+        assert!(
+            branch_exists(repo.path(), "bro-fleet/test-branch"),
+            "non-discard closeout must keep unmerged branch"
+        );
+    }
+
+    #[test]
+    fn phase_remove_deletes_unmerged_branch_for_discard_closeout() {
+        let repo = seed_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let cwd = worktrees.path().join("wt-test");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                cwd.to_str().unwrap(),
+                "-b",
+                "bro-fleet/test-branch",
+            ],
+        );
+        std::fs::write(cwd.join("README.md"), "base\nunmerged\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "unmerged work"]);
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch: "bro-fleet/test-branch".to_string(),
+            target: "main".to_string(),
+            disposition: "discard".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+
+        let result = phase_remove(&req);
+
+        assert!(result.ok, "discard remove should succeed: {:?}", result.content);
+        assert!(!cwd.exists(), "worktree should be removed");
+        assert_eq!(result.content["deleted_branch"], json!("bro-fleet/test-branch"));
+        assert!(
+            !branch_exists(repo.path(), "bro-fleet/test-branch"),
+            "discard keeps operator-authorized branch deletion"
+        );
     }
 
     #[tokio::test]
