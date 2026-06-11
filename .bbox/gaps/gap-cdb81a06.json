@@ -1,0 +1,14 @@
+{
+  "id": "gap-cdb81a06",
+  "title": "Surface verdict instructions field never exposed to callers",
+  "gap_kind": "mcp_surface",
+  "domain": "mcp-surfaces",
+  "wanted_capability": "Per-surface instructions (human-readable guidance) surfaced through MCP ServerInfo or similar so callers see the surface's declared intent",
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/mcp-surfaces/instructions-not-surfaced",
+  "notes": "ToolSurfaceVerdict::ToolSurface carries an `instructions: Option<String>` field. The routing packet supports it, the evaluator preserves it, and the system-defaults packet defines instructions for each surface (e.g. readonly: \"Read-only surface for reviewers...\"). But the field is never read by any code path — the handler's initialize/surface_entry don't inject it into ServerInfo.instructions, and no consumer can access it. The open question from design/surfaces/mcp/mcp-surfaces.md (\"Should surface decisions include instructions, and if so where can RMCP expose per-surface instructions cleanly?\") was never resolved.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T16:39:04Z",
+  "updated_at": "2026-06-11T16:39:04Z"
+}

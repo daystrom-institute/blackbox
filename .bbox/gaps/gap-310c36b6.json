@@ -1,0 +1,14 @@
+{
+  "id": "gap-310c36b6",
+  "title": "MCP wire head doesn't plumb project context to surface evaluation",
+  "gap_kind": "mcp_surface",
+  "domain": "mcp-surfaces",
+  "wanted_capability": "Project-scoped surface routing packets reachable through the wire MCP head (?surface=...), not only through the dispatch path",
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/mcp-surfaces/wire-head-project-scoping",
+  "notes": "surface_entry() and surface_entry_sync() in src/server/handler.rs hardcode None for project on every call into cached_surface_entry / evaluate_tool_surface. The evaluator and cache already support project-scoped packet resolution (load_latest_by_domain with project), and dispatch_surface_filters() already plumbs project through — so the dispatch path works correctly. But an MCP client connecting to /mcp?surface=readonly can never hit a project-scoped surface packet, because the initialize handler doesn't know which project the session belongs to. Fix would require: (1) a way for MCP session init to carry project identity (header? separate URL path? mcp_name registration metadata?), and (2) threading that into surface_entry/surface_entry_sync.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T16:38:59Z",
+  "updated_at": "2026-06-11T16:38:59Z"
+}
