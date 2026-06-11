@@ -214,7 +214,7 @@ mod tests {
     use super::super::types::TranscriptSource;
     use serde_json::json;
 
-    use crate::orchestration::providers::Provider;
+    use bro_core::Provider;
     use crate::parser::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind};
 
     use super::super::types::RawTranscriptRef;

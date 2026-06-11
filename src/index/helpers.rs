@@ -59,11 +59,11 @@ pub fn find_session_file(
         &registry_config,
     );
     for provider in [
-        crate::orchestration::providers::Provider::Glm,
-        crate::orchestration::providers::Provider::Deepseek,
-        crate::orchestration::providers::Provider::Minimax,
-        crate::orchestration::providers::Provider::Brodex,
-        crate::orchestration::providers::Provider::VibeBh,
+        bro_core::Provider::Glm,
+        bro_core::Provider::Deepseek,
+        bro_core::Provider::Minimax,
+        bro_core::Provider::Brodex,
+        bro_core::Provider::VibeBh,
     ] {
         if let Ok(Some(location)) = registry.locate(provider, session_id)
             && matches!(

@@ -143,7 +143,7 @@ mod tests {
     use super::super::types::TranscriptSource;
     use tempfile::tempdir;
 
-    use crate::orchestration::providers::Provider;
+    use bro_core::Provider;
 
     use super::*;
     use crate::transcripts::types::TranscriptStorage;

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::orchestration::providers::Provider;
+use bro_core::Provider;
 use crate::parser::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind, TranscriptEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

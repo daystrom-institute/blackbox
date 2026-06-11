@@ -1,5 +1,5 @@
 use crate::index::ReindexConfig;
-use crate::orchestration::providers::Provider;
+use bro_core::Provider;
 
 use super::types::{
     TranscriptBatch, TranscriptCursor, TranscriptLocation, TranscriptReadError, TranscriptSnapshot,

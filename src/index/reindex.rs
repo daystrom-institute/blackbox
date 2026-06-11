@@ -802,7 +802,7 @@ pub(super) fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::entity_ref;
-    use crate::orchestration::providers::Provider;
+    use bro_core::Provider;
     use crate::parser::{MessageRole, ParsedEvent};
     use crate::transcripts::types::{
         NormalizedTranscriptEvent, RawTranscriptRef, TranscriptStorage,

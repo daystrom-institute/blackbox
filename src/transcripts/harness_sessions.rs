@@ -33,7 +33,7 @@ use std::str::FromStr;
 
 use serde_json::Value;
 
-use crate::orchestration::providers::Provider;
+use bro_core::Provider;
 use crate::parser::parse_transcript_line_rich;
 
 use super::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
