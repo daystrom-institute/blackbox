@@ -9,12 +9,87 @@ pub(super) fn render_markdown_with_width(text: &str, width: usize) -> Vec<Line<'
     render_markdown_with_limit(text, Some(width.max(1)))
 }
 
+/// Render markdown while preserving every author-supplied newline as a hard
+/// line break. CommonMark collapses a single `\n` inside a paragraph into a
+/// soft break (rendered as a space) — fine for prose, wrong for the fleet
+/// cockpit transcript, where line structure is part of the message (e.g. one
+/// number per line, stack traces, ASCII diagrams, list output).
+///
+/// The transformation prefixes each newline (outside fenced code blocks) with
+/// two spaces, which CommonMark reads as a hard line break. Fenced blocks
+/// (```` ``` ```` / `~~~`) and lines that look like one are passed through
+/// untouched so a code block's content doesn't end up visibly padded with
+/// trailing whitespace.
+pub(super) fn render_markdown_preserving_breaks_with_width(
+    text: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    render_markdown_with_limit(&harden_line_breaks(text), Some(width.max(1)))
+}
+
 pub(super) fn render_markdown_with_limit(text: &str, max_width: Option<usize>) -> Vec<Line<'static>> {
     let text = unwrap_markdown_table_fences(text);
     markdown_blocks_preserving_terminal_shapes(&text)
         .into_iter()
         .flat_map(|block| render_markdown_block(block, max_width))
         .collect()
+}
+
+/// Rewrite single newlines in `text` as markdown hard breaks (`  \n`),
+/// skipping lines that are inside a fenced code block (```` ``` ```` /
+/// `~~~`). Fence detection is intentionally minimal — we only need to
+/// recognize "this line opens a fence" and "this line closes the current
+/// fence" so we don't pad a code block's content. Anything more elaborate
+/// (info strings, indented fences, nested fences) is left to the downstream
+/// markdown parser.
+fn harden_line_breaks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fence_marker: Option<&'static str> = None;
+    for segment in text.split_inclusive('\n') {
+        let (body, had_nl) = match segment.strip_suffix('\n') {
+            Some(b) => (b, true),
+            None => (segment, false),
+        };
+        let trimmed = body.trim_start();
+        match fence_marker {
+            Some(marker) => {
+                let is_close = trimmed.starts_with(marker)
+                    && trimmed[marker.len()..].trim().is_empty();
+                out.push_str(body);
+                if had_nl {
+                    out.push('\n');
+                }
+                if is_close {
+                    fence_marker = None;
+                }
+            }
+            None => {
+                if let Some(marker) = opening_fence_marker(trimmed) {
+                    fence_marker = Some(marker);
+                    out.push_str(body);
+                    if had_nl {
+                        out.push('\n');
+                    }
+                } else {
+                    out.push_str(body);
+                    if had_nl {
+                        out.push_str("  \n");
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn opening_fence_marker(line: &str) -> Option<&'static str> {
+    if line.starts_with("```") {
+        Some("```")
+    } else if line.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
+    }
 }
 
 /// Strip ` ```md `/` ```markdown ` fences whose body contains a markdown table,

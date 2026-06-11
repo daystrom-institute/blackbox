@@ -89,6 +89,15 @@ out explicitly under `Changed` or `Removed`.
   3/workspace + 10/repo is unchanged). Previously the 14-day default let
   per-commit snapshot churn accumulate ~24GB in one heavy week. GC also
   removes snapshot directories once all their files are pruned.
+- Fleet cockpit assistant-text rendering preserves the author's line
+  structure. A `TranscriptItem::AssistantText` whose raw text is one number
+  per line (`1\n2\n3\n…`) used to be rendered space-separated and
+  soft-wrapped, because the markdown path collapsed single newlines into
+  soft breaks per CommonMark. The new
+  `render_markdown_preserving_breaks_with_width` rewrites every newline
+  (outside fenced code blocks) into a markdown hard break (`  \n`), so
+  the source layout survives while inline markdown (bold, code, links,
+  …) still renders.
 
 ### Added
 

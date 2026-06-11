@@ -1254,4 +1254,29 @@ Trailing paragraph.";
         assert_eq!(start - 0, committed);
     }
 
+    #[test]
+    fn assistant_text_lays_out_one_line_per_source_line() {
+        // Repro of the fleet-cockpit newline-collapse bug: an assistant
+        // message with one number per line was rendered as `1 2 3 4 5`
+        // (space-separated, soft-wrapped) because the markdown path
+        // collapsed single newlines into soft breaks per CommonMark.
+        // After the fix, each source line should land on its own rendered
+        // line, in order.
+        let items = vec![TranscriptItem::AssistantText("1\n2\n3\n4\n5".into())];
+        let rendered: Vec<String> = render_committed_items(&items, 80)
+            .iter()
+            .map(line_text)
+            .collect();
+        let body: Vec<&str> = rendered
+            .iter()
+            .map(String::as_str)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            body,
+            vec!["1", "2", "3", "4", "5"],
+            "each source line should land on its own rendered line: {rendered:?}"
+        );
+    }
+
     

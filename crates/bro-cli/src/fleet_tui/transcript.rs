@@ -78,7 +78,16 @@ pub(super) fn render_item(
     let mut lines = Vec::new();
     match item {
         TranscriptItem::UserSteer(t) => lines.extend(render_steer_with_status(t, width, status)),
-        TranscriptItem::AssistantText(t) => lines.extend(render_markdown_with_width(t, width)),
+        TranscriptItem::AssistantText(t) => {
+            // Plain assistant text must keep the author's line structure.
+            // The default markdown path collapses single `\n` into a soft
+            // break (a space) per CommonMark, which mangles messages like
+            // `1\n2\n3\n…` into `1 2 3 …`. `preserving_breaks` rewrites
+            // each newline into a markdown hard break (`  \n`) outside
+            // fenced code blocks, so the source layout survives while
+            // inline markdown (bold, code, links, …) still renders.
+            lines.extend(render_markdown_preserving_breaks_with_width(t, width))
+        }
         TranscriptItem::Thinking(t) => {
             for l in t.lines() {
                 lines.push(Line::from(Span::styled(
