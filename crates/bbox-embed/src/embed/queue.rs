@@ -95,7 +95,7 @@ struct EmbedQueueInner {
     senders: RwLock<BTreeMap<String, mpsc::UnboundedSender<WorkerCommand>>>,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
     router: Option<EmbeddingRouter>,
-    vector_store: Option<Arc<crate::vectors::VectorStore>>,
+    vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     debounce: Duration,
     retry_backoff: Duration,
 }
@@ -118,16 +118,16 @@ struct WorkerSpec {
     debounce: Duration,
     retry_backoff: Duration,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
-    vector_store: Option<Arc<crate::vectors::VectorStore>>,
+    vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     persist_vectors: bool,
 }
 
 impl EmbedQueueHandle {
     pub fn start_default() -> Self {
-        Self::start_default_with_store(crate::vectors::global())
+        Self::start_default_with_store(bbox_vectors::global())
     }
 
-    pub fn start_default_with_store(vector_store: Arc<crate::vectors::VectorStore>) -> Self {
+    pub fn start_default_with_store(vector_store: Arc<bbox_vectors::VectorStore>) -> Self {
         Self::start_default_with_optional_store(Some(vector_store))
     }
 
@@ -136,7 +136,7 @@ impl EmbedQueueHandle {
     }
 
     fn start_default_with_optional_store(
-        vector_store: Option<Arc<crate::vectors::VectorStore>>,
+        vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     ) -> Self {
         match EmbeddingRouter::load_default() {
             Ok(router) => Self::from_router(
@@ -156,7 +156,7 @@ impl EmbedQueueHandle {
         router: EmbeddingRouter,
         debounce: Duration,
         retry_backoff: Duration,
-        vector_store: Option<Arc<crate::vectors::VectorStore>>,
+        vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     ) -> Self {
         let mut providers: Vec<ProviderSpec> = Vec::new();
         for bucket in Bucket::ALL {
@@ -447,7 +447,7 @@ impl EmbedQueueHandle {
         debounce: Duration,
         retry_backoff: Duration,
         router: Option<EmbeddingRouter>,
-        vector_store: Option<Arc<crate::vectors::VectorStore>>,
+        vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     ) -> Self {
         let statuses = Arc::new(RwLock::new(BTreeMap::new()));
         let mut senders = BTreeMap::new();
@@ -811,7 +811,7 @@ fn persist_vectors(
             if request.bucket == Bucket::Knowledge {
                 contradiction_checks.push((request.clone(), vector.clone()));
             }
-            crate::vectors::VectorUpsert {
+            bbox_vectors::VectorUpsert {
                 entity_id: request.entity_id.clone(),
                 content_hash: request.chunk_hash.clone(),
                 vector,
@@ -975,7 +975,7 @@ fn mark_error(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, mes
     status.last_error = Some(message.to_string());
 }
 
-pub(crate) fn normalize_route_statuses(response: &mut EmbedStatusResponse) {
+pub fn normalize_route_statuses(response: &mut EmbedStatusResponse) {
     for status in response.routes.values_mut() {
         normalize_route_status(status);
     }

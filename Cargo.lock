@@ -415,6 +415,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-embed"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bbox-chunker",
+ "bbox-corpus-core",
+ "bbox-indexing",
+ "bbox-knowledge",
+ "bbox-stores",
+ "bbox-threads",
+ "bbox-vectors",
+ "chrono",
+ "dirs",
+ "futures",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-gaps"
 version = "0.0.1"
 dependencies = [
@@ -831,6 +861,7 @@ dependencies = [
  "bbox-corpus-index",
  "bbox-edge-index",
  "bbox-edge-sidecar",
+ "bbox-embed",
  "bbox-gaps",
  "bbox-inbox",
  "bbox-indexing",

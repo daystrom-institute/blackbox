@@ -38,8 +38,8 @@ pub use bbox_config::config;
 mod crons;
 pub mod dispatch_mcp;
 use bbox_edge_index::edge_index;
-mod embed;
-mod embed_queue;
+use bbox_embed::embed;
+use bbox_embed::embed_queue;
 mod embed_runtime;
 use bbox_providers::entity_loader;
 // `entity_ref` extracted into the bbox-corpus-core foundation crate (stage 0).

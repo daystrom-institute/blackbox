@@ -3,13 +3,13 @@ use std::sync::OnceLock;
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
-use crate::chunker::Chunk;
+use bbox_chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
 use crate::embed::{Bucket, queue};
-use crate::entity_ref::EntityRef;
-use crate::knowledge::KnowledgeEntry;
-use crate::notes::Note;
-use crate::threads::Thread;
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_knowledge::knowledge::KnowledgeEntry;
+use bbox_threads::notes::Note;
+use bbox_threads::threads::Thread;
 
 static GLOBAL_QUEUE: OnceLock<RwLock<Option<EmbedQueueHandle>>> = OnceLock::new();
 const THREAD_EMBED_TEXT_MAX_BYTES: usize = 24 * 1024;
@@ -18,17 +18,17 @@ fn queue_slot() -> &'static RwLock<Option<EmbedQueueHandle>> {
     GLOBAL_QUEUE.get_or_init(|| RwLock::new(None))
 }
 
-pub(crate) fn install(handle: EmbedQueueHandle) {
+pub fn install(handle: EmbedQueueHandle) {
     *queue_slot().write() = Some(handle);
 }
 
-pub(crate) fn shutdown() {
+pub fn shutdown() {
     if let Some(handle) = queue_slot().read().clone() {
         handle.shutdown();
     }
 }
 
-pub(crate) fn status_response() -> EmbedStatusResponse {
+pub fn status_response() -> EmbedStatusResponse {
     queue_slot()
         .read()
         .as_ref()
@@ -38,7 +38,7 @@ pub(crate) fn status_response() -> EmbedStatusResponse {
         })
 }
 
-pub(crate) fn enqueue_knowledge(entry: &KnowledgeEntry, entity_id: &str, chunk_hash: &str) {
+pub fn enqueue_knowledge(entry: &KnowledgeEntry, entity_id: &str, chunk_hash: &str) {
     enqueue(EmbedRequest {
         bucket: Bucket::Knowledge,
         project_id: None,
@@ -48,7 +48,7 @@ pub(crate) fn enqueue_knowledge(entry: &KnowledgeEntry, entity_id: &str, chunk_h
     });
 }
 
-pub(crate) fn tombstone_knowledge(entity_id: &str) {
+pub fn tombstone_knowledge(entity_id: &str) {
     if let Some(queue) = queue_slot().read().as_ref() {
         queue.tombstone(entity_id);
     } else {
@@ -60,8 +60,8 @@ pub(crate) fn tombstone_knowledge(entity_id: &str) {
     }
 }
 
-pub(crate) fn enqueue_roadmap(
-    item: &crate::roadmap::RoadmapItem,
+pub fn enqueue_roadmap(
+    item: &bbox_stores::roadmap::RoadmapItem,
     entity_id: &str,
     chunk_hash: &str,
 ) {
@@ -74,7 +74,7 @@ pub(crate) fn enqueue_roadmap(
     });
 }
 
-pub(crate) fn tombstone_roadmap(entity_id: &str) {
+pub fn tombstone_roadmap(entity_id: &str) {
     if let Some(queue) = queue_slot().read().as_ref() {
         queue.tombstone(entity_id);
     } else {
@@ -88,14 +88,14 @@ pub(crate) fn tombstone_roadmap(entity_id: &str) {
 /// Register this module's enqueue functions as the index engine's embed
 /// hooks (`index::embed_hook`). Called from the daemon's writer-actor spawn
 /// path; idempotent.
-pub(crate) fn register_index_embed_hooks() {
-    crate::index::embed_hook::register_embed_hooks(crate::index::embed_hook::EmbedHooks {
+pub fn register_index_embed_hooks() {
+    bbox_indexing::index::embed_hook::register_embed_hooks(bbox_indexing::index::embed_hook::EmbedHooks {
         project_file: enqueue_project_file,
         git_message: enqueue_git_message,
     });
 }
 
-pub(crate) fn enqueue_project_file(chunk: &Chunk, entity_id: &str) {
+pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) {
     let bucket = if chunk.language.is_some() || chunk.chunk_kind == "code_block" {
         Bucket::Code
     } else {
@@ -110,7 +110,7 @@ pub(crate) fn enqueue_project_file(chunk: &Chunk, entity_id: &str) {
     });
 }
 
-pub(crate) fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &str) {
+pub fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &str) {
     enqueue(EmbedRequest {
         bucket: Bucket::GitMessage,
         project_id: None,
@@ -120,7 +120,7 @@ pub(crate) fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &s
     });
 }
 
-pub(crate) fn enqueue_note(note: &Note) {
+pub fn enqueue_note(note: &Note) {
     let entity_id = EntityRef::Note {
         note_id: note.id.clone(),
     }
@@ -134,7 +134,7 @@ pub(crate) fn enqueue_note(note: &Note) {
     });
 }
 
-pub(crate) fn enqueue_thread(thread: &Thread) {
+pub fn enqueue_thread(thread: &Thread) {
     let entity_id = EntityRef::Thread {
         thread_id: thread.id.clone(),
     }
@@ -148,7 +148,7 @@ pub(crate) fn enqueue_thread(thread: &Thread) {
     });
 }
 
-pub(crate) fn enqueue_transcript(
+pub fn enqueue_transcript(
     provider: &str,
     session_id: &str,
     byte_offset: u64,
@@ -173,12 +173,12 @@ pub(crate) fn enqueue_transcript(
 
 // Entity-id construction for project-file chunks lives with the index
 // engine (`index::embed_hook`); re-exported here for the embed-side callers.
-pub(crate) use crate::index::embed_hook::project_file_entity_id;
+pub use bbox_indexing::index::embed_hook::project_file_entity_id;
 
 /// Parse an `agent_embed:<name>:v<version>:<component>` vector entity id
 /// into its plain parts. The agent-typed wrapper lives in the daemon's
 /// embed runtime; this layer stays free of orchestration types.
-pub(crate) fn parse_agent_component_entity_id_parts(
+pub fn parse_agent_component_entity_id_parts(
     entity_id: &str,
 ) -> Option<(String, u32, String)> {
     let rest = entity_id.strip_prefix("agent_embed:")?;
@@ -188,13 +188,13 @@ pub(crate) fn parse_agent_component_entity_id_parts(
     Some((name.to_string(), version, component_part.to_string()))
 }
 
-pub(crate) fn content_hash(content: &str) -> String {
+pub fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-pub(crate) fn note_chunk_hash(note: &Note) -> String {
+pub fn note_chunk_hash(note: &Note) -> String {
     let mut hasher = Sha256::new();
     hasher.update(note.id.as_bytes());
     hasher.update([0]);
@@ -223,7 +223,7 @@ fn note_text(note: &Note) -> String {
     fields.join("\n")
 }
 
-pub(crate) fn thread_chunk_hash(thread: &Thread) -> String {
+pub fn thread_chunk_hash(thread: &Thread) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, "thread-v1");
     hash_field(&mut hasher, &thread.id);
@@ -348,7 +348,7 @@ fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
     idx
 }
 
-pub(crate) fn enqueue(request: queue::EmbedRequest) {
+pub fn enqueue(request: queue::EmbedRequest) {
     let route = request.bucket.as_str();
     let entity_id = request.entity_id.clone();
     let chunk_hash = request.chunk_hash.clone();
@@ -379,7 +379,7 @@ mod tests {
     
     
     
-    use crate::threads::{
+    use bbox_threads::threads::{
         EdgeKind, EdgeTarget, SessionLink, Thread, ThreadEdge, ThreadKind,
         ThreadStatus,
     };

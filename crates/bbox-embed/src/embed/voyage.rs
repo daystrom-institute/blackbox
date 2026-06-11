@@ -91,7 +91,7 @@ impl VoyageProvider {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(endpoint: String) -> Result<Self> {
+    pub fn for_test(endpoint: String) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))

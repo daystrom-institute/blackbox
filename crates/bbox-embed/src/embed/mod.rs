@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::entity_ref::EntityRef;
+use bbox_corpus_core::entity_ref::EntityRef;
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
@@ -270,7 +270,7 @@ impl EmbeddingRouter {
         }
     }
 
-    pub(crate) fn queue_and_vector_route(
+    pub fn queue_and_vector_route(
         &self,
         bucket: Bucket,
         project_id: Option<&str>,
@@ -295,18 +295,18 @@ pub fn route_for(bucket: Bucket, project_id: Option<&str>) -> Result<Box<dyn Emb
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ClusterId {
+pub struct ClusterId {
     pub id: String,
     pub members: Vec<EntityRef>,
 }
 
-pub(crate) fn embed_iterate_internal(
+pub fn embed_iterate_internal(
     bucket: &str,
     project_id: &str,
     since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<impl Iterator<Item = (EntityRef, Vec<f32>)>> {
     let route = internal_bucket_route(bucket, project_id)?;
-    let rows = crate::vectors::iter_active(&route, since)?
+    let rows = bbox_vectors::iter_active(&route, since)?
         .filter_map(|entry| {
             vector_entity_ref(&entry.entity_id).map(|entity| (entity, entry.vector))
         })
@@ -314,13 +314,13 @@ pub(crate) fn embed_iterate_internal(
     Ok(rows.into_iter())
 }
 
-pub(crate) fn cluster_neighbors_within(
+pub fn cluster_neighbors_within(
     bucket: &str,
     project_id: &str,
     similarity_threshold: f32,
 ) -> Result<Vec<ClusterId>> {
     let route = internal_bucket_route(bucket, project_id)?;
-    let clusters = crate::vectors::cluster_neighbors_within_route(&route, similarity_threshold)?
+    let clusters = bbox_vectors::cluster_neighbors_within_route(&route, similarity_threshold)?
         .into_iter()
         .filter_map(|cluster| {
             let members = cluster
@@ -460,8 +460,8 @@ threads = "ollama"
     #[test]
     fn embed_iterate_internal_respects_since_and_entity_refs() {
         let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(crate::vectors::VectorStore::open(dir.path()).unwrap());
-        let _guard = crate::vectors::install_test_global(store.clone());
+        let store = std::sync::Arc::new(bbox_vectors::VectorStore::open(dir.path()).unwrap());
+        let _guard = bbox_vectors::install_test_global(store.clone());
         let route = EmbeddingRouter::default()
             .route(Bucket::Transcripts, None)
             .unwrap()
@@ -503,8 +503,8 @@ threads = "ollama"
     #[test]
     fn cluster_neighbors_within_returns_bounded_entity_clusters() {
         let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(crate::vectors::VectorStore::open(dir.path()).unwrap());
-        let _guard = crate::vectors::install_test_global(store.clone());
+        let store = std::sync::Arc::new(bbox_vectors::VectorStore::open(dir.path()).unwrap());
+        let _guard = bbox_vectors::install_test_global(store.clone());
         let route = EmbeddingRouter::default()
             .route(Bucket::AgentManifest, None)
             .unwrap()
