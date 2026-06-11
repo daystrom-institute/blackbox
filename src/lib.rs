@@ -78,7 +78,7 @@ use bbox_packets as packets;
 /// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.
 pub use bro_transcript as parser;
 mod path_cache;
-mod pins;
+use bbox_stores::pins;
 mod pollers;
 mod projects;
 mod providers;
@@ -89,7 +89,7 @@ use bbox_corpus_core::query;
 // `crate::refactor` so existing call sites resolve unchanged.
 use bbox_refactor as refactor;
 pub mod render;
-mod roadmap;
+use bbox_stores::roadmap;
 mod routing;
 use bbox_corpus_core::search;
 pub mod secrets;
@@ -99,7 +99,7 @@ pub mod slack_proposal_links;
 mod slack_thread_store;
 mod slices;
 mod storage_health;
-mod store_persister;
+use bbox_stores::store_persister;
 mod system_events;
 // `system_memory` extracted into bbox-system-memory (root-crate split);
 // aliased back to `crate::system_memory` so existing call sites resolve

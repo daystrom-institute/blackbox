@@ -6,13 +6,13 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-pub(crate) trait StoreSnapshot: Send + Sync + 'static {
+pub trait StoreSnapshot: Send + Sync + 'static {
     type Snapshot: Serialize + Send + 'static;
 
     fn snapshot(&self) -> Result<Self::Snapshot>;
 }
 
-pub(crate) struct StorePersister<S: StoreSnapshot> {
+pub struct StorePersister<S: StoreSnapshot> {
     inner: Arc<StorePersisterInner<S>>,
 }
 
@@ -55,7 +55,7 @@ impl PersistAck {
 }
 
 impl<S: StoreSnapshot> StorePersister<S> {
-    pub(crate) fn spawn(
+    pub fn spawn(
         name: impl Into<String>,
         store: Arc<RwLock<S>>,
         store_path: PathBuf,
@@ -68,7 +68,7 @@ impl<S: StoreSnapshot> StorePersister<S> {
         let spawned = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let _scope = crate::util::BlockingScope::enter();
+                let _scope = bbox_util::util::BlockingScope::enter();
                 run_actor(rx, store_w, path_w)
             });
         if let Err(err) = spawned {
@@ -86,13 +86,13 @@ impl<S: StoreSnapshot> StorePersister<S> {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn request(&self) {
+    pub fn request(&self) {
         if self.inner.tx.send(PersistRequest { ack: None }).is_err() {
             self.write_now_on_fallback_thread();
         }
     }
 
-    pub(crate) async fn request_durable(&self) -> Result<()> {
+    pub async fn request_durable(&self) -> Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
         if self
             .inner
@@ -112,7 +112,7 @@ impl<S: StoreSnapshot> StorePersister<S> {
         }
     }
 
-    pub(crate) fn flush_blocking(&self) -> Result<()> {
+    pub fn flush_blocking(&self) -> Result<()> {
         let (ack_tx, ack_rx) = mpsc::channel();
         if self
             .inner
@@ -188,8 +188,8 @@ fn persist_once<S: StoreSnapshot>(store: &RwLock<S>, store_path: &Path) -> Resul
         let guard = store.read();
         guard.snapshot()?
     };
-    crate::json_store::with_store_lock(store_path, || {
-        crate::json_store::atomic_write_json_locked(store_path, &snapshot)
+    bbox_corpus_core::json_store::with_store_lock(store_path, || {
+        bbox_corpus_core::json_store::atomic_write_json_locked(store_path, &snapshot)
     })
 }
 

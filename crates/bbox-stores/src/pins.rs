@@ -7,7 +7,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::store_persister::StoreSnapshot;
-use crate::util;
+use bbox_util::util;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PinParams {

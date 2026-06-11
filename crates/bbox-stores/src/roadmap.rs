@@ -279,7 +279,7 @@ impl Roadmap {
     }
 
     fn now_iso() -> String {
-        crate::util::now_iso()
+        bbox_util::util::now_iso()
     }
 
     fn gen_id() -> String {
@@ -956,7 +956,7 @@ impl Roadmap {
 
         serde_json::json!({
             "project": project_name,
-            "now": crate::util::now_iso(),
+            "now": bbox_util::util::now_iso(),
             "sections": sections,
             "all_items": all_items,
         })
@@ -1040,7 +1040,7 @@ fn days_between(a: &str, b: &str) -> Result<f64> {
 mod tests {
     use super::*;
     use crate::store_persister::StorePersister;
-    use crate::template;
+    use bbox_corpus_core::template;
     use parking_lot::RwLock;
     use std::sync::Arc;
     use tempfile::tempdir;
