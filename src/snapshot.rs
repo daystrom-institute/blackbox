@@ -8,7 +8,7 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 use crate::chunker::EdgeProvenance;
-use crate::edge_index::Edge;
+use crate::edge_sidecar::Edge;
 use crate::entity_ref::EntityRef;
 use crate::manifest::{
     ManifestIndex, OverlayManifest, WorkspaceIndexEntry, WorkspaceManifest, materialized_dir,

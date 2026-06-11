@@ -121,6 +121,7 @@ mod watcher;
 mod webhooks;
 mod whiteboards;
 mod workflow;
+mod edge_sidecar;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
