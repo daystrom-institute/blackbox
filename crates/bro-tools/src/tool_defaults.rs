@@ -173,17 +173,23 @@ impl ToolArgDefaults {
         }
 
         for rule in self.selected_rules(tool_name, Flavor::Pin) {
+            // A pin only acts on a model-supplied value: mismatch refuses,
+            // match records the enforcement. An absent param is a no-op and
+            // MUST stay rider-silent — `pin:*` globs match every tool, so an
+            // unconditional rider would stamp the pinned paths onto every
+            // tool result in the session (observed: vibebh cockpit dispatch
+            // drowning one-line results under two worktree paths per call).
             let expected = Value::String(rule.value.clone());
-            if let Some(actual) = input_obj.get(&rule.param)
-                && actual != &expected
-            {
-                return Err(PinConflict {
-                    param: rule.param.clone(),
-                    expected,
-                    actual: actual.clone(),
-                });
+            if let Some(actual) = input_obj.get(&rule.param) {
+                if actual != &expected {
+                    return Err(PinConflict {
+                        param: rule.param.clone(),
+                        expected,
+                        actual: actual.clone(),
+                    });
+                }
+                rider.pin_enforced.insert(rule.param.clone(), expected);
             }
-            rider.pin_enforced.insert(rule.param.clone(), expected);
         }
 
         Ok((Value::Object(input_obj), rider))
@@ -418,6 +424,38 @@ mod tests {
         assert_eq!(err.param, "session_id");
         assert_eq!(err.expected, "host");
         assert_eq!(err.actual, "model");
+    }
+
+    #[test]
+    fn pin_rider_silent_when_param_absent() {
+        // `pin:*` globs match every tool, so a pin checked against an ABSENT
+        // param must be a complete no-op: no fill, no rider. Otherwise every
+        // tool result in a worktree dispatch carries the pinned paths as
+        // noise (regression observed live on a vibebh cockpit dispatch).
+        let defaults = table(&[
+            ("pin:*.cwd", "/repo/wt"),
+            ("pin:*.project_dir", "/repo/wt"),
+        ]);
+
+        let (out, rider) = defaults
+            .apply(
+                "mcp__blackbox__bbox_thread_list",
+                json!({"project": "/repo/base", "status": "open"}),
+            )
+            .unwrap();
+        assert!(rider.is_empty(), "absent pinned params must stay rider-silent");
+        assert_eq!(out.get("cwd"), None, "pins never fill");
+        assert_eq!(out.get("project_dir"), None, "pins never fill");
+
+        // A present, matching value IS an enforcement and is disclosed.
+        let (_, rider) = defaults
+            .apply(
+                "mcp__blackbox__bro_exec",
+                json!({"prompt": "x", "cwd": "/repo/wt"}),
+            )
+            .unwrap();
+        assert_eq!(rider.pin_enforced.get("cwd"), Some(&json!("/repo/wt")));
+        assert!(!rider.pin_enforced.contains_key("project_dir"));
     }
 
     #[test]
