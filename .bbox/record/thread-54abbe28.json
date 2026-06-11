@@ -1,0 +1,13 @@
+{
+  "id": "thread-54abbe28",
+  "topic": "Workflow language completeness design doc",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Committed and pushed docs-only design rewrite as ca95fb4592a22203599d0e1706bf31fae6f694b4 (`docs: frame workflow language completeness`). The cited doc is `design/turing-completeness.md`, reframed around mechanically complete LLM-authored workflows: packet indexed reads, hook indexed writes, dynamic addressing, stress-test fixtures, and roadmap. DeepSeek review converged in session ses_1faca4f72ffeTjajama7Olbo9U with final note note-6c23b191: no remaining blockers, CONVERGED.",
+    "Final pointer: commit ca95fb4592a22203599d0e1706bf31fae6f694b4 (`docs: frame workflow language completeness`) was pushed to `main`. Doc citation: `design/turing-completeness.md` (`Toward mechanically complete LLM-authored workflows`). Link attempts for commit/doc were not supported by bbox_thread target types; the thread uses `handoff_doc=design/turing-completeness.md` plus this note as the durable pointer.",
+    "Stale - taking a different direction entirely on the workflow language question. Closing without implementation."
+  ],
+  "created_at": "2026-05-08T01:36:48Z",
+  "resolved_at": "2026-06-11T17:59:56Z"
+}
