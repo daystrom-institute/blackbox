@@ -1,0 +1,18 @@
+{
+  "id": "gap-ae22a6b2",
+  "title": "Ambient tool-arg defaulting stops at bbox_note.session_id — expansion blocked on per-tool scope decisions",
+  "gap_kind": "tooling",
+  "domain": "dispatch",
+  "wanted_capability": "Broaden ambient defaults beyond the proven bbox_note.session_id: thread_id/work_item for bbox_thread continue, task_id for bro_report. DECISION-GATED per design/bro-harness/tool-arg-defaulting.md §3.1 scope semantics: the project/scope params are a deliberate exclusion — `project: None` means GLOBAL scope on knowledge/note tools, so defaulting it would silently convert intended-global writes into project-scoped ones. Each tool needs an explicit operator decision, not a sweep. The mechanism (ToolArgDefaults table, default/pin grammar, riders, schema validation) is live and proven in prod.",
+  "evidence": [
+    "design/bro-harness/tool-arg-defaulting.md",
+    "thread-55d51135"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/dispatch/ambient-default-expansion",
+  "notes": "Item 2 of thread-55d51135 (extracted at thread resolution). Pick up by presenting the operator a per-tool expansion list with the scope-semantics consequence of each, then implementing the approved subset. Item 4 of the same thread (BRO_HARNESS_COMPACTION_CONFIG provider-catalog wiring) was explicitly optional/unpursued — revisit only if a per-dispatch window override is ever needed; not filed.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T17:30:10Z",
+  "updated_at": "2026-06-11T17:30:10Z"
+}
