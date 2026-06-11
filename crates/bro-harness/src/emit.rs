@@ -134,15 +134,43 @@ impl Emitter {
     /// (`streaming_captured` guard); the tool_use blocks are what surface tool
     /// calls to supervision and the fleet transcript. When the turn did NOT
     /// stream (non-streaming transports), this is the authoritative text.
-    pub fn assistant_message(&self, content: Vec<Value>) {
+    ///
+    /// `stop` and `usage` are the model step's stop reason and token usage —
+    /// the same per-step `TurnOutput` fields the suspicious-turn-end
+    /// diagnostics read. They are persisted on `message` in the
+    /// Anthropic-native shape (`stop_reason: "max_tokens"`, `usage:
+    /// {input_tokens, ...}`) so events.jsonl forensics can tell an
+    /// output-token-cap cut from a natural `end_turn` per step, not only at
+    /// session termination. Both are additive/optional: `None` omits the
+    /// field entirely, keeping old logs and existing consumers parseable.
+    pub fn assistant_message(
+        &self,
+        content: Vec<Value>,
+        stop: Option<&crate::transport::StopReason>,
+        usage: Option<&Usage>,
+    ) {
+        let mut message = json!({
+            "role": "assistant",
+            "content": content,
+            "session_id": self.session_id,
+        });
+        if let Some(stop) = stop {
+            message["stop_reason"] = json!(stop.anthropic_wire_label());
+        }
+        if let Some(usage) = usage {
+            // Anthropic-native usage shape, matching the terminal `result`
+            // event: fresh `input_tokens` plus cache read/creation breakdown.
+            message["usage"] = json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_read_input_tokens": usage.cached_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            });
+        }
         self.write_line(json!({
             "type": "assistant",
             "session_id": self.session_id,
-            "message": {
-                "role": "assistant",
-                "content": content,
-                "session_id": self.session_id,
-            },
+            "message": message,
         }));
     }
 
@@ -331,6 +359,128 @@ mod tests {
         assert_eq!(events[0]["session_id"], "session-1");
         assert_eq!(events[1]["type"], "result");
         assert_eq!(events[1]["result"], "done");
+    }
+
+    #[test]
+    fn assistant_message_carries_step_stop_reason_and_usage() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-stop".into(), sink);
+
+        let usage = Usage {
+            input_tokens: 12,
+            output_tokens: 3000,
+            cached_input_tokens: 4500,
+            cache_creation_input_tokens: 78,
+        };
+        emitter.assistant_message(
+            vec![json!({"type": "thinking", "thinking": "cut mid-thought"})],
+            Some(&crate::transport::StopReason::Length),
+            Some(&usage),
+        );
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let message = &events[0]["message"];
+        // max_tokens cut is distinguishable from a natural end_turn.
+        assert_eq!(message["stop_reason"], "max_tokens");
+        assert_eq!(message["usage"]["input_tokens"], 12);
+        assert_eq!(message["usage"]["output_tokens"], 3000);
+        assert_eq!(message["usage"]["cache_read_input_tokens"], 4500);
+        assert_eq!(message["usage"]["cache_creation_input_tokens"], 78);
+    }
+
+    #[test]
+    fn assistant_message_stop_reason_maps_anthropic_vocabulary() {
+        use crate::transport::StopReason;
+        for (stop, expect) in [
+            (StopReason::ToolCalls, "tool_use"),
+            (StopReason::Done, "end_turn"),
+            (StopReason::Length, "max_tokens"),
+            (StopReason::Other("content_filter".into()), "content_filter"),
+        ] {
+            assert_eq!(stop.anthropic_wire_label(), expect);
+        }
+    }
+
+    #[test]
+    fn assistant_message_without_step_metadata_keeps_legacy_shape() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-legacy".into(), sink);
+
+        emitter.assistant_message(vec![json!({"type": "text", "text": "hi"})], None, None);
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let message = events[0]["message"].as_object().unwrap();
+        // None omits the fields entirely — the pre-gap-dab30623 wire shape.
+        assert!(!message.contains_key("stop_reason"));
+        assert!(!message.contains_key("usage"));
+        assert_eq!(message["role"], "assistant");
+    }
+
+    #[test]
+    fn persisted_assistant_event_round_trips_with_and_without_step_metadata() {
+        use crate::event_log::EventLog;
+
+        // Per-test tempdir; EventLog::at_path never touches the real
+        // sessions dir / $HOME.
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(EventLog::at_path(dir.path().join("s.events.jsonl")));
+
+        // Old-shape line, as an existing events.jsonl would carry it.
+        log.append_event(&json!({
+            "type": "assistant",
+            "session_id": "session-rt",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "old"}]},
+        }));
+
+        // New-shape line, persisted through the emitter tee. No-op callback so
+        // the protocol line goes nowhere but the log (not test stdout).
+        let emitter = Emitter::with_callback("session-rt".into(), Arc::new(|_| {}))
+            .with_event_log(log.clone());
+        emitter.assistant_message(
+            vec![json!({"type": "text", "text": "new"})],
+            Some(&crate::transport::StopReason::Done),
+            Some(&Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cached_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+            }),
+        );
+
+        log.flush_blocking();
+        let lines: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+
+        // Old log line still parses and simply lacks the new fields.
+        let old_msg = lines[0]["event"]["message"].as_object().unwrap();
+        assert!(!old_msg.contains_key("stop_reason"));
+        assert!(!old_msg.contains_key("usage"));
+
+        // New line round-trips the step metadata.
+        let new_msg = &lines[1]["event"]["message"];
+        assert_eq!(new_msg["stop_reason"], "end_turn");
+        assert_eq!(new_msg["usage"]["input_tokens"], 1);
+        assert_eq!(new_msg["usage"]["output_tokens"], 2);
+        assert_eq!(new_msg["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(new_msg["usage"]["cache_creation_input_tokens"], 4);
     }
 
     #[test]

@@ -1210,7 +1210,13 @@ impl Session {
                 }));
             }
             if !assistant_content.is_empty() {
-                self.emitter.assistant_message(assistant_content);
+                // Carry the step's stop_reason + usage on the persisted
+                // assistant event (gap-dab30623): same source of truth as the
+                // suspicious-turn-end diagnostics (`out.stop` / `out.usage`),
+                // but recorded per step so a max_tokens cut mid-session is
+                // visible in events.jsonl without waiting for termination.
+                self.emitter
+                    .assistant_message(assistant_content, Some(&out.stop), Some(&out.usage));
             }
 
             let has_tool_work = out.stop == StopReason::ToolCalls && !out.tool_calls.is_empty();

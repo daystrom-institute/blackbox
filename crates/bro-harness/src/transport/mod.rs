@@ -159,6 +159,23 @@ pub enum StopReason {
     Other(String),
 }
 
+impl StopReason {
+    /// Anthropic-native `stop_reason` label for the emitted Claude
+    /// `stream-json` envelope (the per-step `assistant` event carries this so
+    /// an output-cap cut is distinguishable from a natural stop after the
+    /// fact). Normalized variants map to the Anthropic vocabulary regardless
+    /// of which transport produced them; `Other` passes the transport-native
+    /// string through unchanged.
+    pub fn anthropic_wire_label(&self) -> &str {
+        match self {
+            StopReason::ToolCalls => "tool_use",
+            StopReason::Done => "end_turn",
+            StopReason::Length => "max_tokens",
+            StopReason::Other(other) => other,
+        }
+    }
+}
+
 /// Normalized result of one assistant turn.
 pub struct TurnOutput {
     pub text: String,
