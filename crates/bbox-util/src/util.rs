@@ -41,17 +41,6 @@ static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// (directly or via [`TestEnvGuard`]) MUST hold this lock for the whole mutation
 /// window. Poison-tolerant on purpose: a panicking env test must not cascade into
 /// every later env test failing with a poisoned-mutex panic.
-/// Initialize the process-wide system-memory catalog for tests. The
-/// repo-root `system-defaults/memories` path is owned here (the root crate),
-/// not by bbox-system-memory, whose manifest dir is the crate subdirectory.
-#[cfg(test)]
-pub fn init_system_memory_for_tests() {
-    let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("system-defaults")
-        .join("memories");
-    crate::system_memory::init_for_tests_from(&defaults);
-}
-
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_ENV_LOCK
         .lock()

@@ -449,6 +449,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-util"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "dirs",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-vectors"
 version = "0.0.1"
 dependencies = [
@@ -576,6 +588,7 @@ dependencies = [
  "bbox-packets",
  "bbox-refactor",
  "bbox-system-memory",
+ "bbox-util",
  "bbox-vectors",
  "bbox-whiteboards",
  "bro-capabilities",

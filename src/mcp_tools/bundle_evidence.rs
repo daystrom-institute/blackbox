@@ -450,7 +450,7 @@ mod tests {
         // A single resolvable ref, full property mode, no paths: nothing
         // degraded and no intra-bundle structure. The padding blocks should
         // be absent entirely.
-        crate::util::init_system_memory_for_tests();
+        crate::init_system_memory_for_tests();
         let params = BundleEvidenceParams {
             question: "what is the opening sequence?".into(),
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn system_memory_refs_are_bundleable() {
-        crate::util::init_system_memory_for_tests();
+        crate::init_system_memory_for_tests();
         let params = BundleEvidenceParams {
             question: "what is the opening sequence?".into(),
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],

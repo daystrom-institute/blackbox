@@ -110,7 +110,7 @@ mod threads;
 mod tool_docs;
 mod tools;
 use bbox_corpus_index::transcripts;
-pub mod util;
+pub use bbox_util::util;
 // `vectors` was extracted into the `bbox-vectors` workspace crate (build-time
 // decomposition). Aliased back to `crate::vectors` so existing `crate::vectors::*`
 // call sites resolve unchanged.
@@ -120,6 +120,17 @@ mod webhooks;
 use bbox_whiteboards::whiteboards;
 mod workflow;
 use bbox_edge_sidecar::edge_sidecar;
+
+/// Initialize the process-wide system-memory catalog for tests. The
+/// repo-root `system-defaults/memories` path is owned here (the root crate),
+/// not by bbox-system-memory, whose manifest dir is the crate subdirectory.
+#[cfg(test)]
+pub(crate) fn init_system_memory_for_tests() {
+    let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("system-defaults")
+        .join("memories");
+    system_memory::init_for_tests_from(&defaults);
+}
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

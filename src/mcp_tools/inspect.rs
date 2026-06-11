@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn inspect_system_memory_ref() {
-        crate::util::init_system_memory_for_tests();
+        crate::init_system_memory_for_tests();
         let params = InspectEntityParams {
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
             edge_types: None,
@@ -467,7 +467,7 @@ mod tests {
         // An entity with no edges in the index: every optional expected family
         // resolves to count 0. Those rows are padding and must not reach the
         // structured payload; only present (count > 0) or required families do.
-        crate::util::init_system_memory_for_tests();
+        crate::init_system_memory_for_tests();
         let params = InspectEntityParams {
             entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
             edge_types: None,
