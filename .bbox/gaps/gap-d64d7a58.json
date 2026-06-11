@@ -1,0 +1,21 @@
+{
+  "id": "gap-d64d7a58",
+  "title": "No prompt caching on minimax/vibebh harness transports — 1.6M-19.6M uncached input tokens per code task",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "Prompt caching (or equivalent context-reuse) on the bro-harness transports that currently resend the full conversation uncached every turn. Measured during the TUI friction campaign (thread-c3f7c7e3): a ~30min minimax code task consumed 19,602,803 uncached input tokens; a ~13min vibebh task 1,651,011 uncached (74k cached). On the same workload shapes, deepseek and brodex cache well (deepseek ~4-11M cached vs ~70-100k fresh; brodex ~7-25M cached vs ~100-280k fresh). If MiniMax's Anthropic-compatible endpoint supports cache_control breakpoints, the harness should send them; if Mistral's chat-completions endpoint has no caching, consider harness-side mitigation (aggressive compaction thresholds, trimming) or surface the economics in the allocator so cost-aware tiering avoids these providers for long agentic tasks.",
+  "missing_primitive": "cache_control / context-reuse support (or per-provider cache-capability metadata consumed by the allocator) in crates/bro-harness transports for minimax (Anthropic transport — verify whether the endpoint honors cache_control and whether the harness omits it) and vibebh (OpenAI chat-completions transport).",
+  "fallback_used": "Operator excluded vibebh from campaign dispatch rounds; minimax kept but burns ~20M input tokens per long task.",
+  "evidence": [
+    "minimax task 3811f596 (unit W3): usage input_tokens=19602803 output=39552, no cached fields",
+    "vibebh task 16f9c7b4 (unit U7): input_tokens=1651011 cached_input_tokens=74048",
+    "deepseek task 51bd33fc (unit W2): cached_input_tokens=11396480 input_tokens=97581",
+    "brodex task 7639a9e2 (unit U5): cached_input_tokens=24751360 input_tokens=276340"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/prompt-caching-minimax-vibebh-transports",
+  "resolution": "unresolved",
+  "created_at": "2026-06-11T03:37:52Z",
+  "updated_at": "2026-06-11T03:37:52Z"
+}
