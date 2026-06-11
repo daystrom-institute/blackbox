@@ -21,6 +21,7 @@ members = [
     # into the daemon under their original module path.
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
+    "crates/bbox-edge-sidecar",
     "crates/bbox-chunker",
     "crates/bbox-lsp",
     "crates/bbox-refactor",
@@ -94,6 +95,7 @@ anyhow = "1"
 bbox-vectors = { path = "crates/bbox-vectors" }
 # Foundation crate (entity_ref + git) extracted from the root crate (stage 0).
 bbox-corpus-core = { path = "crates/bbox-corpus-core" }
+bbox-edge-sidecar = { path = "crates/bbox-edge-sidecar" }
 # Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).
 bbox-chunker = { path = "crates/bbox-chunker" }
 # Shared LSP session/conversion helpers, extracted from the root crate (stage 2).

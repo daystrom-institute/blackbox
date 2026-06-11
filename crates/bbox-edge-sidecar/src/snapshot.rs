@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::chunker::EdgeProvenance;
+use bbox_chunker::EdgeProvenance;
 use crate::edge_sidecar::Edge;
-use crate::entity_ref::EntityRef;
+use bbox_corpus_core::entity_ref::EntityRef;
 use crate::manifest::{
     ManifestIndex, OverlayManifest, WorkspaceIndexEntry, WorkspaceManifest, materialized_dir,
 };
@@ -29,7 +29,7 @@ pub fn current_materialization_version() -> String {
         "{}+{}+{}",
         INDEXER_VERSION,
         CHUNKER_VERSION,
-        crate::entity_ref::PARSER_VERSION
+        bbox_corpus_core::entity_ref::PARSER_VERSION
     )
 }
 
@@ -420,7 +420,7 @@ fn update_manifest_for_snapshot(
 
 #[cfg(test)]
 fn worktree_identity(project_path: &Path) -> (String, Option<String>) {
-    let project_id = crate::entity_ref::project_id_for_path(project_path)
+    let project_id = bbox_corpus_core::entity_ref::project_id_for_path(project_path)
         .unwrap_or_else(|_| hash_path_fallback(project_path));
     let repo_id = discover_repo_id(project_path);
     (project_id, repo_id)
@@ -440,13 +440,13 @@ fn discover_repo_id(project_path: &Path) -> Option<String> {
     if !git_dir.exists() {
         return None;
     }
-    crate::entity_ref::repo_id_for_path(project_path).ok()
+    bbox_corpus_core::entity_ref::repo_id_for_path(project_path).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_ref::EntityRef;
+    use bbox_corpus_core::entity_ref::EntityRef;
 
     fn make_edge(id: &str, kind: &str, target: &str, prov: EdgeProvenance) -> Edge {
         Edge {
@@ -454,7 +454,7 @@ mod tests {
             kind: kind.into(),
             target: EntityRef::Knowledge { id: target.into() },
             provenance: prov,
-            confidence: crate::chunker::EdgeConfidence::Exact,
+            confidence: bbox_chunker::EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
         }
     }

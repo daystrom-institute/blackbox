@@ -65,7 +65,7 @@ use bbox_lsp as lsp;
 // `crate::macros` so existing call sites resolve unchanged.
 use bbox_macros as macros;
 mod managed_worktrees;
-mod manifest;
+use bbox_edge_sidecar::manifest;
 mod mcp_client;
 mod mcp_tools;
 mod migration;
@@ -99,7 +99,7 @@ pub mod slack_channel_bindings;
 pub mod slack_proposal_links;
 mod slack_thread_store;
 mod slices;
-mod snapshot;
+use bbox_edge_sidecar::snapshot;
 mod storage_health;
 mod store_persister;
 mod system_events;
@@ -121,7 +121,7 @@ mod watcher;
 mod webhooks;
 mod whiteboards;
 mod workflow;
-mod edge_sidecar;
+use bbox_edge_sidecar::edge_sidecar;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
