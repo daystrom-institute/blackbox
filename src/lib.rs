@@ -33,7 +33,7 @@ mod badgey_eval_check;
 // chunker extracted into the bbox-chunker crate (stage 1); aliased back to
 // `crate::chunker` so existing call sites resolve unchanged.
 use bbox_chunker as chunker;
-pub mod code_nav;
+pub use bbox_indexing::code_nav;
 pub use bbox_config::config;
 mod crons;
 pub mod dispatch_mcp;
@@ -52,7 +52,7 @@ use bbox_gaps::gaps;
 // `git` extracted into bbox-corpus-core (stage 0); aliased back to `crate::git`.
 use bbox_corpus_core::git;
 use bbox_inbox::inbox;
-mod index;
+use bbox_indexing::index;
 // `json_store` extracted into bbox-corpus-core; aliased back to
 // `crate::json_store` so existing call sites resolve unchanged.
 pub use bbox_corpus_core::json_store;
@@ -79,7 +79,7 @@ pub use bro_transcript as parser;
 mod path_cache;
 use bbox_stores::pins;
 mod pollers;
-mod projects;
+use bbox_indexing::projects;
 mod providers;
 // `search` (rrf/rerank) and `template` extracted into bbox-corpus-core;
 // aliased back so existing call sites resolve unchanged. (`query` callers
@@ -96,7 +96,7 @@ pub mod server;
 pub use bbox_slack::slack_channel_bindings;
 pub use bbox_slack::slack_proposal_links;
 use bbox_slack::slack_thread_store;
-mod slices;
+use bbox_indexing::slices;
 use bbox_edge_index::storage_health;
 use bbox_stores::store_persister;
 use bbox_system_events::system_events;

@@ -453,6 +453,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-indexing"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-chunker",
+ "bbox-code-nav",
+ "bbox-corpus-core",
+ "bbox-corpus-index",
+ "bbox-edge-index",
+ "bbox-knowledge",
+ "bbox-refactor",
+ "bbox-stores",
+ "bbox-threads",
+ "bbox-util",
+ "bro-core",
+ "bro-transcript",
+ "hex",
+ "parking_lot",
+ "rmcp",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tantivy",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-knowledge"
 version = "0.0.1"
 dependencies = [
@@ -784,6 +814,7 @@ dependencies = [
  "bbox-edge-sidecar",
  "bbox-gaps",
  "bbox-inbox",
+ "bbox-indexing",
  "bbox-knowledge",
  "bbox-lsp",
  "bbox-macros",

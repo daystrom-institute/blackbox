@@ -1,0 +1,48 @@
+[package]
+name = "bbox-indexing"
+version = "0.0.1"
+edition = "2024"
+
+# Extracted from the origin crate by extract_rust_crate; the origin aliases
+# the moved modules back under their original `crate::<module>` paths.
+
+[dependencies]
+tantivy = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+anyhow = "1"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-corpus-index = { path = "../bbox-corpus-index" }
+bbox-chunker = { path = "../bbox-chunker" }
+bbox-refactor = { path = "../bbox-refactor" }
+bbox-code-nav = { path = "../bbox-code-nav" }
+bro-core = { path = "../bro-core" }
+bro-transcript = { path = "../bro-transcript" }
+parking_lot = "0.12"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+rmcp = { version = "1.4", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    # Client-side: needed by the workflow `mcp_call` op which dials
+    # remote MCP servers (biofilter via stdio child-process; blackbox-
+    # self via streamable HTTP) to inject deterministic tool results
+    # into the arc context.
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    # Use no-provider variant so rmcp's reqwest dep doesn't activate
+    # aws-lc-rs via reqwest 0.13's default "rustls" feature; the ring
+    # provider is installed at startup via the workspace rustls dep.
+    "reqwest-tls-no-provider",
+] }
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+bbox-util = { path = "../bbox-util" }
+bbox-stores = { path = "../bbox-stores" }
+bbox-knowledge = { path = "../bbox-knowledge" }
+bbox-threads = { path = "../bbox-threads" }
+bbox-edge-index = { path = "../bbox-edge-index" }
