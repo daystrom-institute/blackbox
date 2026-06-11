@@ -452,11 +452,17 @@ pub(super) fn draw_roster(
             let v = &views[i];
             let a = &app.agents[i];
             let (glyph, gcolor) = v.state.glyph();
-            let model = a
-                .selected_model
-                .clone()
-                .or_else(|| v.model.clone())
-                .unwrap_or_else(|| "—".into());
+            // The model column carries the operator's intent first
+            // (`selected_model`, set on a per-agent basis from the cockpit),
+            // then the live snapshot (`v.model`, the daemon's truth for
+            // daemon-origin tasks once the first event arrives), then the
+            // provider's default catalog model. The previous chain skipped
+            // the default-model fallback, so a Dispatched-tab row whose
+            // snapshot had not yet reported a model rendered "—" instead of
+            // the provider's default — visually indistinguishable from "we
+            // don't know what this is". `provider_tuple` (zoom footer)
+            // already uses this richer chain; share one helper for parity.
+            let model = roster_model_label_for(a, v).into_owned();
             let report = v
                 .report_message
                 .as_deref()

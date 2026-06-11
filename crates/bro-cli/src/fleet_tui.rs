@@ -4077,7 +4077,20 @@ fn selected_activity_spans(
     let v = &views[idx];
     let turn_active = v.turn_active || pending_turn;
     let agent_key = activity_key("agent", &agent_id);
-    let agent_clock = sync_activity_clock(&mut app.activity_clocks, agent_key, turn_active, now);
+    // The activity clock's first reading of an already-running turn must
+    // reflect the agent's elapsed time, not the operator's view-time: when
+    // zooming into a 35s-old running agent, the "working 5s" footgun is
+    // `now_ms - now_ms` instead of `now_ms - turn_started_at`. Use the
+    // most recent event timestamp (turn activity since last event), or the
+    // task start as a fallback when no events have arrived yet.
+    let turn_started_at = v.last_activity_ms.or(Some(v.started_at));
+    let agent_clock = sync_activity_clock(
+        &mut app.activity_clocks,
+        agent_key,
+        turn_active,
+        now,
+        turn_started_at,
+    );
 
     let mut spans = vec![Span::raw("  ")];
     spans.extend(activity_segment(
@@ -4108,11 +4121,16 @@ fn selected_activity_spans(
             snap.last_event_at_ms,
         );
         let classifier_key = activity_key("classifier", &classifier_id);
+        // `started_at` is the task's wall-clock session start, so it is always
+        // present; `last_event_at_ms` is more precise (last in-turn activity)
+        // but optional. Prefer the more precise timestamp when available.
+        let classifier_started_at = snap.last_event_at_ms.or(Some(snap.started_at));
         let classifier_clock = sync_activity_clock(
             &mut app.activity_clocks,
             classifier_key,
             snap.turn_active,
             now,
+            classifier_started_at,
         );
         spans.extend(activity_segment(
             "Classifier activity",
@@ -4270,7 +4288,13 @@ fn single_agent_status_spans(
             .or(views[idx].cwd.as_deref())
             .map(path_name)
             .unwrap_or_else(|| "project".to_string());
-        let prompt = truncate(initial_prompt(a), 44);
+        // The initial prompt is a cockpit-local field (the operator's own
+        // -p / composer text), so for daemon-origin tasks (bro_exec, agent
+        // dispatch, workflows) it is always None and the footer would
+        // render an empty `""`. Fall back to the agent's display name —
+        // which the daemon populates via `snap.name` for origin-tracked
+        // tasks — so the footer always carries something meaningful.
+        let prompt = truncate(agent_zoom_label(a), 44);
         spans.push(Span::styled(format!(" {project} "), byline));
         spans.push(Span::styled("──", dim));
         spans.push(Span::styled(format!(" \"{prompt}\" "), byline));
@@ -4288,12 +4312,7 @@ fn single_agent_status_spans(
 }
 
 fn provider_tuple(a: &Agent, v: &AgentView) -> String {
-    let model = a
-        .selected_model
-        .as_deref()
-        .or(v.model.as_deref())
-        .or_else(|| default_model_for(a.provider))
-        .unwrap_or("—");
+    let model = roster_model_label_for(a, v);
     let mut tuple = match a
         .selected_effort
         .as_deref()
@@ -4306,6 +4325,39 @@ fn provider_tuple(a: &Agent, v: &AgentView) -> String {
         tuple.push_str(" fast");
     }
     tuple
+}
+
+/// Resolve the model label shown in the roster row and the zoom-footer's
+/// provider tuple. Order:
+///   1. Cockpit-local `selected_model` (the operator's per-agent intent,
+///      e.g. the result of `/model`).
+///   2. The live task snapshot's model (`v.model`, which is `snap.model`
+///      re-read every draw — the daemon's truth for `bro_exec`-origin
+///      tasks once the first event lands).
+///   3. The provider's catalog default (`default_model_for`).
+///   4. The em-dash placeholder, so a row never renders empty.
+///
+/// Returning a `Cow` keeps the fast path zero-copy when the operator's
+/// intent or the snapshot's value is present, and only allocates when
+/// the placeholder is reached.
+fn roster_model_label<'a>(
+    selected_model: Option<&'a str>,
+    snapshot_model: Option<&'a str>,
+    provider: Provider,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(m) = selected_model.or(snapshot_model) {
+        std::borrow::Cow::Borrowed(m)
+    } else if let Some(m) = default_model_for(provider) {
+        std::borrow::Cow::Borrowed(m)
+    } else {
+        std::borrow::Cow::Borrowed("—")
+    }
+}
+
+/// Convenience wrapper that pulls the three fields off the (Agent,
+/// AgentView) pair the roster and zoom paths always carry together.
+fn roster_model_label_for<'a>(a: &'a Agent, v: &'a AgentView) -> std::borrow::Cow<'a, str> {
+    roster_model_label(a.selected_model.as_deref(), v.model.as_deref(), a.provider)
 }
 
 fn next_tuple(app: &App) -> String {
@@ -4345,10 +4397,23 @@ fn sync_activity_clock(
     key: String,
     active: bool,
     now_ms: u64,
+    turn_started_at: Option<u64>,
 ) -> ActivityClock {
     let clock = clocks.entry(key).or_default();
     match (active, clock.active_since_ms) {
-        (true, None) => clock.active_since_ms = Some(now_ms),
+        (true, None) => {
+            // Seed the clock from the turn-start evidence rather than `now_ms`
+            // so the zoom-view "Agent activity working Ns" reflects how long
+            // the turn has actually been in flight — not how long the operator
+            // has been viewing it. Prefer the live event timestamp (the most
+            // recent in-turn activity), then the task start, then `now_ms` as
+            // a last resort when no prior evidence exists. Clamp forward
+            // timestamps (clock skew, future-dated events) to `now_ms`.
+            let seeded = turn_started_at
+                .map(|t| t.min(now_ms))
+                .unwrap_or(now_ms);
+            clock.active_since_ms = Some(seeded);
+        }
         (false, Some(started)) => {
             clock.last_duration_ms = Some(now_ms.saturating_sub(started));
             clock.active_since_ms = None;
@@ -4423,6 +4488,30 @@ fn since_compact(start_ms: Option<u64>, now_ms: u64) -> Option<String> {
 /// (only stdin steers are replayed), so the renderer prepends it.
 fn initial_prompt(a: &Agent) -> &str {
     a.initial_prompt.as_deref().unwrap_or("")
+}
+
+/// Resolve the zoomed single-agent footer label. Cockpit-origin dispatches
+/// carry the operator's own prompt in `initial_prompt`; daemon-origin tasks
+/// (bro_exec, workflows, agent dispatch) don't, so fall back to the agent's
+/// display name — which the daemon populates via `snap.name` for
+/// origin-tracked tasks — so the footer always carries something
+/// meaningful instead of an empty `""`.
+///
+/// Pure helper split out from [`agent_zoom_label`] so it is unit-testable
+/// without needing to construct an [`Agent`] (which requires a live
+/// `AgentHandle`).
+fn pick_zoom_label<'a>(initial_prompt: &'a str, name: &'a str) -> &'a str {
+    if initial_prompt.is_empty() {
+        name
+    } else {
+        initial_prompt
+    }
+}
+
+/// The footer label for the zoomed single-agent view. See
+/// [`pick_zoom_label`] for the resolution rule.
+fn agent_zoom_label(a: &Agent) -> &str {
+    pick_zoom_label(initial_prompt(a), a.name.as_str())
 }
 
 /// Returns true when the transcript's first item is a `UserSteer` whose text

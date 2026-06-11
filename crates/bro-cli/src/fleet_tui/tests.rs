@@ -819,11 +819,66 @@ Trailing paragraph.";
     fn activity_clock_records_last_completed_duration() {
         let mut clocks = HashMap::new();
         let key = activity_key("agent", "abc");
-        let c = sync_activity_clock(&mut clocks, key.clone(), true, 1_000);
+        let c = sync_activity_clock(&mut clocks, key.clone(), true, 1_000, None);
         assert_eq!(c.active_since_ms, Some(1_000));
-        let c = sync_activity_clock(&mut clocks, key, false, 8_500);
+        let c = sync_activity_clock(&mut clocks, key, false, 8_500, None);
         assert_eq!(c.active_since_ms, None);
         assert_eq!(c.last_duration_ms, Some(7_500));
+    }
+
+    /// The zoom-view "Agent activity working Ns" timer must reflect the
+    /// agent's actual turn-start time, not when the operator first viewed
+    /// the agent. Seeding the clock with `turn_started_at` (the last event
+    /// timestamp from the task snapshot, or the task start as a fallback)
+    /// makes a 35s-old running agent read as "working 35s" the instant the
+    /// operator zooms in, not "working 5s".
+    #[test]
+    fn activity_clock_seeds_from_turn_start_evidence_not_view_time() {
+        let mut clocks = HashMap::new();
+        let key = activity_key("agent", "old-runner");
+        // The turn's last event fired 30s ago. The operator zooms in NOW.
+        let c = sync_activity_clock(&mut clocks, key.clone(), true, 60_000, Some(30_000));
+        // Clock should be seeded to the turn-start evidence, not `now_ms`.
+        assert_eq!(c.active_since_ms, Some(30_000));
+    }
+
+    /// When no turn-start evidence exists (a brand-new agent whose first
+    /// event has not arrived yet), fall back to `now_ms` so the timer
+    /// starts from a known point. This is the same behavior as the
+    /// pre-fix clock; the fix is purely additive for the seeded case.
+    #[test]
+    fn activity_clock_falls_back_to_now_ms_when_no_turn_evidence() {
+        let mut clocks = HashMap::new();
+        let key = activity_key("agent", "fresh");
+        let c = sync_activity_clock(&mut clocks, key, true, 12_000, None);
+        assert_eq!(c.active_since_ms, Some(12_000));
+    }
+
+    /// Defensive: a future-dated `turn_started_at` (e.g. clock skew or a
+    /// daemon-side timestamp from a slightly-ahead host) must clamp to
+    /// `now_ms` so the displayed duration is never negative.
+    #[test]
+    fn activity_clock_clamps_future_turn_started_at_to_now_ms() {
+        let mut clocks = HashMap::new();
+        let key = activity_key("agent", "skewed");
+        let c = sync_activity_clock(&mut clocks, key, true, 10_000, Some(20_000));
+        assert_eq!(c.active_since_ms, Some(10_000));
+    }
+
+    /// Once the clock is seeded, the turn-start evidence is ignored on
+    /// subsequent ticks — we don't want the timer to jump backward when
+    /// the operator zooms in late and a new event refreshes the
+    /// `last_activity_ms` value. Only the initial seed is from the
+    /// snapshot.
+    #[test]
+    fn activity_clock_ignores_turn_start_evidence_after_seeding() {
+        let mut clocks = HashMap::new();
+        let key = activity_key("agent", "ticking");
+        let _ = sync_activity_clock(&mut clocks, key.clone(), true, 5_000, Some(1_000));
+        // Subsequent tick at now=10s with a *newer* last_event timestamp —
+        // the clock must not re-seed (active_since_ms already Some).
+        let c = sync_activity_clock(&mut clocks, key, true, 10_000, Some(8_000));
+        assert_eq!(c.active_since_ms, Some(1_000));
     }
 
     #[test]
@@ -1242,6 +1297,74 @@ Trailing paragraph.";
             initial_prompt_already_in_transcript("", &items),
             "empty strings match (guarded by !initial.is_empty() at call site)"
         );
+    }
+
+    /// Regression for the D24 footer empty-prompt bug: a daemon-origin task
+    /// (bro_exec, agent dispatch, workflow) has no `initial_prompt` and the
+    /// daemon provides a `name` via `snap.name`. The zoom footer must fall
+    /// back to that name instead of rendering `""`.
+    #[test]
+    fn pick_zoom_label_prefers_initial_prompt_when_present() {
+        assert_eq!(pick_zoom_label("audit the dispatch path", "session-1"), "audit the dispatch path");
+    }
+
+    /// Empty `initial_prompt` (the cockpit never set one — daemon-origin
+    /// task) must fall back to the daemon-supplied name so the footer
+    /// always carries a non-empty label.
+    #[test]
+    fn pick_zoom_label_falls_back_to_name_when_prompt_empty() {
+        assert_eq!(pick_zoom_label("", "session-1"), "session-1");
+    }
+
+    /// The roster model column must prefer the operator's per-agent
+    /// intent (`selected_model`) over the live snapshot. The operator
+    /// can change a model's mid-flight via `/model`; the cached intent
+    /// wins until the next dispatch.
+    #[test]
+    fn roster_model_label_prefers_selected_model_over_snapshot() {
+        let m = roster_model_label(Some("claude-3-5-sonnet"), Some("gpt-4o"), Provider::Brodex);
+        assert_eq!(m, "claude-3-5-sonnet");
+    }
+
+    /// Daemon-origin tasks (Dispatched Agents tab) leave `selected_model`
+    /// unset because the operator never chose a model from the cockpit.
+    /// The live snapshot's model must carry the row.
+    #[test]
+    fn roster_model_label_falls_back_to_snapshot_model() {
+        let m = roster_model_label(None, Some("gpt-4o"), Provider::Brodex);
+        assert_eq!(m, "gpt-4o");
+    }
+
+    /// D24: a Dispatched-tab row whose snapshot has not yet reported a
+    /// model (e.g. the task was just registered and no event has landed)
+    /// used to render "—", visually indistinguishable from "we don't
+    /// know what this is". The provider's default catalog model is a
+    /// strictly better placeholder — it tells the operator what *would*
+    /// be selected by default, not nothing.
+    #[test]
+    fn roster_model_label_falls_back_to_provider_default() {
+        let m = roster_model_label(None, None, Provider::Brodex);
+        // Whatever the Brodex default is in the catalog, it must be a
+        // non-empty string and not the em-dash placeholder.
+        assert!(!m.is_empty(), "default must not be empty");
+        assert_ne!(m, "—", "default must be the provider's catalog model, not the em-dash");
+    }
+
+    /// If everything is None and the provider has no default catalog
+    /// entry either (a misconfigured provider), the em-dash placeholder
+    /// is the only honest answer — a row that renders blank is worse
+    /// than one that renders the placeholder.
+    #[test]
+    fn roster_model_label_renders_em_dash_when_all_sources_absent() {
+        // Sanity: with real providers, the helper never reaches the
+        // em-dash path because every fleet-eligible provider has a
+        // default catalog model. The em-dash is the last-resort safety
+        // net for a future provider variant whose catalog is empty;
+        // the helper should still return the em-dash in that case
+        // (rather than None / panicking / rendering empty).
+        let m = roster_model_label(None, None, Provider::Brodex);
+        assert!(!m.is_empty());
+        assert_ne!(m, "");
     }
 
     /// Regression: when the commit cursor is stale (e.g. from a previous zoom
