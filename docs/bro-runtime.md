@@ -15,7 +15,7 @@ Start a fresh task:
 bro_exec(
   bro="executor",
   prompt="audit the tail module for stale assumptions",
-  project_dir="/repo/x"
+  cwd="/repo/x"
 )
 ```
 
@@ -55,7 +55,7 @@ Use non-blocking reads when you are supervising:
 
 ```text
 bro_status(task_id="<task-id>", tail=20)
-bro_dashboard(project_dir="/repo/x")
+bro_dashboard(team="bbox-red")
 ```
 
 Dispatched agents and workflow hooks should report milestones:

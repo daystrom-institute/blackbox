@@ -434,7 +434,7 @@ implement the badgey instance lifecycle on top of `bro_exec` /
 - `Wrapper::exec(scope, brief?)` — opens thread-of-record (`bbox_thread`
   with `kind=work_item, name=badgey:<...>`), writes the `exec` event
   note (incl. provider + provider_session_id), spawns the bro via
-  `bro_exec(brofile=badgey, project_dir=scope.project_root, ...)`,
+  `bro_exec(brofile=badgey, cwd=scope.project_root, ...)`,
   records (badgey_id, session_id) in registry, returns badgey_id +
   session_id.
 - `Wrapper::resume(badgey_id, prompt)` — looks up registry, calls

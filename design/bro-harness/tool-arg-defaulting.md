@@ -97,6 +97,19 @@ breaking:
   failure that wrote into `$HOME`).
 - Tool docs and prompts migrate to `cwd` opportunistically.
 
+**Status (2026-06-11, gap-6366c92d / thread-55d51135 item 3): done.** The
+schema-advertised name on the dispatch tools — `bro_exec`, `bro_resume`,
+`bro_broadcast`, `bro_agent_dispatch` — is now `cwd`, with `project_dir`
+retained as a deprecated serde alias (the inverse of the interim 830c2c0
+state, which advertised `project_dir` and aliased `cwd`). Tool docs, prompts,
+example skills, and design-doc dispatch examples migrated in the same pass.
+Project-dir-*semantic* params (code-nav/refactor/slice `project_dir` read
+roots, `bro_team`/`bro_brofile`/badgey/allocator project scopes) keep their
+names — the canonical `cwd` applies to the dispatch working directory only.
+Because the table applies in the harness *before* the daemon's serde alias
+normalization, the worktree pin is emitted under BOTH spellings
+(`pin:*.cwd` + `pin:*.project_dir`) — see §7.
+
 ## 5. Non-goals / relationship to native bindings
 
 - This is not a second tool surface; there is no catalog cost and no
@@ -136,8 +149,14 @@ dropped the table), fleet cockpit via the control plane — now emits, from
 `AmbientContext::tool_arg_defaults()` (src/orchestration/mod.rs):
 
 - `default:mcp.bbox_note.session_id=<session>` (pre-existing), and
-- `pin:*.project_dir=<canonical worktree root>` when the dispatch cwd is a
-  daemon-managed worktree.
+- `pin:*.cwd=<canonical worktree root>` **and**
+  `pin:*.project_dir=<canonical worktree root>` when the dispatch cwd is a
+  daemon-managed worktree. Both spellings are pinned (gap-6366c92d): the pin
+  guards by the literal param key present in the tool input, and the table
+  applies at the harness choke point *before* the daemon's serde alias
+  normalization — dispatch tools advertise `cwd` but still accept
+  `project_dir` as a deprecated alias, so a single-name pin would let the
+  other spelling land in the wrong tree.
 
 Detection is **one mechanical choke point** (`worktree_pin_target`), not
 per-site emission at each worktree-creation surface, so fleet, agent, and
@@ -152,9 +171,14 @@ daemon-created worktree is structurally a linked worktree. A plain repo
 checkout (`.git` *directory*) never pins. Operator-created linked worktrees
 also match; accepted deliberately — a dispatch confined to a worktree wants
 the same confinement semantics regardless of who ran `git worktree add`.
-The `pin:*.project_dir` glob is safe per §3.1: the project-scoped
-coordination tools (notes/knowledge) take `project`, not `project_dir`; a
-schema-drift tripwire test pins that assumption.
+The `pin:*.cwd` / `pin:*.project_dir` globs are safe per §3.1: the
+project-scoped coordination tools (notes/knowledge) take `project`, not
+`cwd`/`project_dir`; a schema-drift tripwire test pins that assumption.
+Session-start schema validation treats glob rules as "wherever the param
+exists" — a glob matching tools without the param is the expected steady
+state (e.g. `pin:*.cwd` on a recursion-guarded profile that loads no
+dispatch tools) and emits no warning; only exact-name rules warn on a
+missing param, and any rule matching no loaded tool at all still warns.
 
 Step 5's ambient-default half (gap-ae22a6b2 item 2) is now operator-decided
 and live. The approved expansion, emitted from the same

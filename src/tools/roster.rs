@@ -2221,7 +2221,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "dash-agent".into(),
             args: serde_json::Value::Null,
-            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            cwd: Some(tmp.path().to_str().unwrap().to_string()),
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2288,7 +2288,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "report-agent".into(),
             args: serde_json::Value::Null,
-            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            cwd: Some(tmp.path().to_str().unwrap().to_string()),
             bro: None,
             ambient: None,
             caller_provider: None,

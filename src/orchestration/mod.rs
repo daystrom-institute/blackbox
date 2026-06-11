@@ -1984,19 +1984,24 @@ impl AmbientContext {
 
         // Worktree confinement pin (design/bro-harness/tool-arg-defaulting.md
         // §5): when the dispatch cwd is a daemon-managed worktree, pin every
-        // tool's `project_dir` param to the canonical worktree root. A model
-        // passing a different tree (usually the primary checkout) is confused;
-        // the pin refuses with an explanatory error instead of letting the
-        // call land in the wrong tree. Safe as a glob because the
-        // project-scoped coordination tools (notes/knowledge) take `project`,
-        // not `project_dir` — see the schema-drift tripwire test. Plain repo
-        // dispatches (`.git` directory) never pin.
+        // tool's `cwd` and `project_dir` params to the canonical worktree
+        // root. A model passing a different tree (usually the primary
+        // checkout) is confused; the pin refuses with an explanatory error
+        // instead of letting the call land in the wrong tree. BOTH names are
+        // pinned because the pin guards by the literal param key present in
+        // the tool input, and the table applies in the harness BEFORE the
+        // daemon's serde alias normalization: dispatch tools advertise `cwd`
+        // (canonical, gap-6366c92d) but still accept `project_dir` as a
+        // deprecated alias, so a single-name pin would let the other
+        // spelling sail past. Safe as globs because the project-scoped
+        // coordination tools (notes/knowledge) take `project`, not
+        // `cwd`/`project_dir` — see the schema-drift tripwire test. Plain
+        // repo dispatches (`.git` directory) never pin.
         let worktree = cwd.and_then(worktree_pin_target);
         if let Some(worktree) = &worktree {
-            defaults.insert(
-                "pin:*.project_dir".to_string(),
-                worktree.to_string_lossy().into_owned(),
-            );
+            for key in ["pin:*.cwd", "pin:*.project_dir"] {
+                defaults.insert(key.to_string(), worktree.to_string_lossy().into_owned());
+            }
         }
 
         // Retrieval-read + code-nav scope defaults (gap-ae22a6b2 item 2,
@@ -6305,6 +6310,7 @@ mod tests {
         };
         let defaults = ctx.tool_arg_defaults().expect("retrieval-read defaults");
         assert!(!defaults.contains_key("pin:*.project_dir"));
+        assert!(!defaults.contains_key("pin:*.cwd"));
         for key in [
             "default:mcp.bbox_hybrid_search.project",
             "default:mcp.bbox_discover_seed_entities.project",
@@ -6344,6 +6350,13 @@ mod tests {
             .expect("worktree pin")
             .clone();
         assert_eq!(pin, wt.to_string_lossy());
+        // The canonical dispatch-param name is pinned alongside the alias:
+        // the pin guards by literal key, and the table applies before the
+        // daemon's serde alias normalization (gap-6366c92d).
+        assert_eq!(
+            defaults.get("pin:*.cwd").map(String::as_str),
+            Some(pin.as_str())
+        );
         assert_eq!(
             defaults
                 .get("default:mcp.bbox_hybrid_search.project")
@@ -6444,10 +6457,13 @@ mod tests {
                 .map(String::as_str),
             Some("sess-wt")
         );
-        assert_eq!(
-            defaults.get("pin:*.project_dir").map(String::as_str),
-            Some(wt.to_string_lossy().as_ref())
-        );
+        for key in ["pin:*.project_dir", "pin:*.cwd"] {
+            assert_eq!(
+                defaults.get(key).map(String::as_str),
+                Some(wt.to_string_lossy().as_ref()),
+                "missing worktree pin {key}"
+            );
+        }
 
         // A pending session still carries the worktree pin (no session entry).
         let pending = AmbientContext {
@@ -6457,10 +6473,13 @@ mod tests {
         };
         let defaults = pending.tool_arg_defaults().expect("pin only");
         assert!(!defaults.contains_key("default:mcp.bbox_note.session_id"));
-        assert_eq!(
-            defaults.get("pin:*.project_dir").map(String::as_str),
-            Some(wt.to_string_lossy().as_ref())
-        );
+        for key in ["pin:*.project_dir", "pin:*.cwd"] {
+            assert_eq!(
+                defaults.get(key).map(String::as_str),
+                Some(wt.to_string_lossy().as_ref()),
+                "missing worktree pin {key}"
+            );
+        }
     }
 
     #[test]
@@ -6479,6 +6498,7 @@ mod tests {
         };
         let defaults = ctx.tool_arg_defaults().expect("session default");
         assert!(!defaults.contains_key("pin:*.project_dir"));
+        assert!(!defaults.contains_key("pin:*.cwd"));
     }
 
     #[test]
@@ -6512,13 +6532,14 @@ mod tests {
 
     #[test]
     fn project_dir_pin_glob_is_safe_for_project_scoped_tools() {
-        // `pin:*.project_dir` globs every tool's `project_dir` param. That is
-        // safe (design/bro-harness/tool-arg-defaulting.md §3.1) because the
-        // project-scoped coordination tools take `project`, not `project_dir`
-        // — absence there means *global scope* and must stay free. Tripwire:
-        // if these adapters ever grow a `project_dir` param, re-check the
-        // glob (and the CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS defaults) before
-        // shipping.
+        // `pin:*.cwd` / `pin:*.project_dir` glob every tool's `cwd` /
+        // `project_dir` params. That is safe
+        // (design/bro-harness/tool-arg-defaulting.md §3.1) because the
+        // project-scoped coordination tools take `project`, not
+        // `cwd`/`project_dir` — absence there means *global scope* and must
+        // stay free. Tripwire: if these adapters ever grow a `cwd` or
+        // `project_dir` param, re-check the globs (and the
+        // CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS defaults) before shipping.
         for (name, src) in [
             ("notes", include_str!("../tools/notes.rs")),
             ("knowledge", include_str!("../tools/knowledge.rs")),
@@ -6527,6 +6548,10 @@ mod tests {
             assert!(
                 !src.contains("project_dir"),
                 "src/tools/{name}.rs now mentions project_dir; re-check pin:*.project_dir glob safety"
+            );
+            assert!(
+                !src.contains("\"cwd\"") && !src.contains("cwd: Option<String>"),
+                "src/tools/{name}.rs now carries a cwd param; re-check pin:*.cwd glob safety"
             );
         }
     }

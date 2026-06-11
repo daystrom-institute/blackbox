@@ -640,7 +640,7 @@ turn, the wrapper:
    recognized shape)
 2. checks the per-scout sub-bro budget (3 parallel, 8 sequential)
 3. dispatches `bro_exec(brofile="badgey-scout", allow_recursion=false,
-   prompt=charter, project_dir=...)`
+   prompt=charter, cwd=...)`
 4. records the spawned task id in the scout thread, links the sub-bro
    thread back to the scout thread
 
@@ -682,7 +682,7 @@ Wrapper apply path:
      `bbox_artifact_install` at new scope, then
      `bbox_artifact_supersede` on prior
    - `kind=re-dispatch` → `bro_exec(prompt=refined_charter,
-     project_dir=..., allow_recursion=false)` using the proposal's
+     cwd=..., allow_recursion=false)` using the proposal's
      pre-recorded `idempotency_key` so a duplicate fires no second
      bro
 4. on success: transition `applying → applied`, record

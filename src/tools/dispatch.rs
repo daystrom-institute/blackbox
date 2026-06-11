@@ -222,7 +222,7 @@ fn allocator_status_runtime_request(
         prompt: String::new(),
         bro: None,
         provider: None,
-        project_dir: p.project_dir.clone(),
+        cwd: p.project_dir.clone(),
         allow_recursion: None,
         allow_tools: None,
         disallow_tools: None,
@@ -475,7 +475,7 @@ impl BlackboxServer {
             match self.resolve_exec_target(
                 p.bro.as_deref(),
                 p.provider.as_deref(),
-                p.project_dir.as_deref(),
+                p.cwd.as_deref(),
             ) {
                 Ok(r) => r,
                 Err(e) => return Self::err_text(&e),
@@ -486,7 +486,7 @@ impl BlackboxServer {
                 None,
                 None,
                 None,
-                p.project_dir.clone(),
+                p.cwd.clone(),
                 None,
                 false,
                 None,
@@ -500,7 +500,7 @@ impl BlackboxServer {
             .bro
             .as_deref()
             .and_then(|name| {
-                self.resolve_exec_brofile_for_allocator(name, p.project_dir.as_deref())
+                self.resolve_exec_brofile_for_allocator(name, p.cwd.as_deref())
             })
             .and_then(|bf| bf.runtime);
         let mut allocation_request = match exec_params_runtime_request(&p, brofile_runtime) {
@@ -545,7 +545,7 @@ impl BlackboxServer {
             disallow_tools: p.disallow_tools.clone(),
             tool_placement: p.tool_placement.clone(),
             allocation_request,
-            project_dir_for_lease: p.project_dir.clone(),
+            project_dir_for_lease: p.cwd.clone(),
             ambient_bro_name: p.bro.clone(),
             spawn_bro_label: None,
             spawn_agent_label: None,
@@ -591,7 +591,7 @@ impl BlackboxServer {
                     task_id,
                     session_id.clone(),
                     allocation,
-                    p.project_dir.clone(),
+                    p.cwd.clone(),
                     cwd,
                     lease_brofile_context,
                 ),
@@ -649,7 +649,7 @@ impl BlackboxServer {
             p.bro.as_deref(),
             p.session_id.as_deref(),
             p.provider.as_deref(),
-            p.project_dir.as_deref(),
+            p.cwd.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => return Self::err_text(&e),
@@ -661,7 +661,7 @@ impl BlackboxServer {
 
         // Auto-resolve cwd from the session's own recorded origin so
         // agents can resurrect each other across repo boundaries without
-        // the caller threading project_dir. Gemini gets a hard refuse on
+        // the caller threading cwd. Gemini gets a hard refuse on
         // miss because its CLI silently forks a fresh session when the
         // UUID isn't in the cwd's project hash folder (aliasing the
         // resumed session). Claude/Codex error loudly on miss — fall
@@ -1213,7 +1213,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_broadcast",
-        description = "Send the same prompt to every team member."
+        description = "Send the same prompt to every team member. `cwd` (canonical; `project_dir` deprecated alias) overrides the working directory for every member dispatch."
     )]
     pub(crate) async fn bro_broadcast(
         &self,
@@ -1225,7 +1225,7 @@ impl BlackboxServer {
             None => return Self::err_text(&format!("Unknown team: {}", p.team)),
         };
         let allow_recursion = p.allow_recursion.unwrap_or(false);
-        let cwd = p.project_dir.or(team.project_dir.clone());
+        let cwd = p.cwd.or(team.project_dir.clone());
         let store_dir = self.state.store_dir.clone();
         let mut launched = Vec::new();
         let mut updated_team = team.clone();
@@ -2598,7 +2598,7 @@ mod tests {
             prompt: "test".into(),
             bro: None,
             provider: None,
-            project_dir: None,
+            cwd: None,
             allow_recursion: None,
             allow_tools: None,
             disallow_tools: None,

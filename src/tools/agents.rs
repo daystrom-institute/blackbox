@@ -646,7 +646,7 @@ impl BlackboxServer {
                 }
             };
             let ctx = DispatchContext {
-                project_dir: p.project_dir.clone(),
+                project_dir: p.cwd.clone(),
                 ambient: p
                     .ambient
                     .as_ref()
@@ -686,7 +686,7 @@ impl BlackboxServer {
             let bf = match orchestration::brofile::resolve_brofile(
                 br,
                 &self.state.store_dir,
-                p.project_dir.as_deref(),
+                p.cwd.as_deref(),
             ) {
                 Some(b) => b,
                 None => {
@@ -888,7 +888,7 @@ impl BlackboxServer {
             }
         };
 
-        let cwd = p.project_dir.clone();
+        let cwd = p.cwd.clone();
         let brofile_filters = orchestration::mcp::McpFilters {
             allow: merged.allow.clone(),
             disallow: merged.disallow.clone(),
@@ -940,7 +940,7 @@ impl BlackboxServer {
                 disallow_tools: None,
                 tool_placement: None,
                 allocation_request: runtime,
-                project_dir_for_lease: p.project_dir.clone(),
+                project_dir_for_lease: p.cwd.clone(),
                 ambient_bro_name: p.bro.clone(),
                 spawn_bro_label: Some(bro_label.clone()),
                 spawn_agent_label: Some(bro_label.clone()),
@@ -967,7 +967,7 @@ impl BlackboxServer {
         let agent_session = AgentSession {
             session_id: session_id.clone(),
             provider: selected_provider.as_str().to_string(),
-            project_dir: p.project_dir.clone(),
+            project_dir: p.cwd.clone(),
             agent: agent_ref,
             task_id: Some(task_id.clone()),
         };
@@ -2210,7 +2210,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "nonexistent".into(),
             args: serde_json::Value::Null,
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2266,7 +2266,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "inactive-dispatch@v1".into(),
             args: serde_json::Value::Null,
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2309,7 +2309,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "badgey-agent".into(),
             args: serde_json::Value::Null,
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2403,7 +2403,7 @@ mod tests {
             .bro_agent_dispatch(Parameters(AgentDispatchParams {
                 agent: "noop-agent".into(),
                 args: serde_json::json!({"prompt": "hello"}),
-                project_dir: None,
+                cwd: None,
                 bro: None,
                 ambient: None,
                 caller_provider: Some("claude".into()),
@@ -2493,7 +2493,7 @@ mod tests {
             .bro_agent_dispatch(Parameters(AgentDispatchParams {
                 agent: "diff-narrator".into(),
                 args: serde_json::json!({"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new"}),
-                project_dir: Some("/tmp/test".into()),
+                cwd: Some("/tmp/test".into()),
                 bro: None,
                 ambient: None,
                 caller_provider: None,
@@ -2596,7 +2596,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "broken-dispatch".into(),
             args: serde_json::Value::Null,
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2634,7 +2634,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "no-brofile-agent".into(),
             args: serde_json::Value::Null,
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2696,7 +2696,7 @@ mod tests {
                 "project_dir": "/tmp/x",
                 "acknowledge_repr": true
             }),
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2749,7 +2749,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "ack-constant-agent".into(),
             args: serde_json::json!({"project_dir": "/tmp/x"}),
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2802,7 +2802,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "ack-compact-constant-agent".into(),
             args: serde_json::json!({"project_dir": "/tmp/x"}),
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2859,7 +2859,7 @@ mod tests {
                 "project_dir": "/tmp/x",
                 "acknowledge_repr": true
             }),
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2902,7 +2902,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "bad-provider-agent".into(),
             args: serde_json::Value::Null,
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -2951,7 +2951,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "schema-agent".into(),
             args: serde_json::json!({"diff": "abc123"}),
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -3003,7 +3003,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "typed-agent".into(),
             args: serde_json::json!({"diff": 123}),
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -3061,7 +3061,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "tuple-agent".into(),
             args: serde_json::json!({"coords": ["not-a-number", 2]}),
-            project_dir: None,
+            cwd: None,
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -3102,7 +3102,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "labeled-agent".into(),
             args: serde_json::Value::Null,
-            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            cwd: Some(tmp.path().to_str().unwrap().to_string()),
             bro: None,
             ambient: None,
             caller_provider: None,
@@ -3159,7 +3159,7 @@ mod tests {
         let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
             agent: "bro-dispatch-agent".into(),
             args: serde_json::Value::Null,
-            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            cwd: Some(tmp.path().to_str().unwrap().to_string()),
             bro: Some("some-bro".into()),
             ambient: None,
             caller_provider: None,

@@ -249,7 +249,7 @@ impl BlackboxServer {
             None,
             None,
             // Resume turns must re-carry the tool-arg default/pin table
-            // (session default + managed-worktree project_dir pin) — the
+            // (session default + managed-worktree cwd/project_dir pins) — the
             // fresh branch gets it via dispatch_fresh_bro_task; the legacy
             // spawn_task wrapper silently dropped it here.
             ambient_ctx.tool_arg_defaults(),

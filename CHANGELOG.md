@@ -59,7 +59,19 @@ out explicitly under `Changed` or `Removed`.
   passing `project=""` still requests an unscoped search; knowledge/note/
   learn `project` params stay permanently excluded (absence means global
   write scope), and `bbox_thread` ids are not defaulted because the
-  per-(tool,param) table cannot action-gate.
+  per-(tool,param) table cannot action-gate. The dispatch tools (`bro_exec`,
+  `bro_resume`, `bro_broadcast`, `bro_agent_dispatch`) now advertise `cwd`
+  as the schema name for the dispatch working directory — the contract-bottom
+  canonical name — with `project_dir` retained as a deprecated serde alias
+  (gap-6366c92d; inverts the interim 830c2c0 aliasing). Because the
+  default/pin table applies in the harness before the daemon's alias
+  normalization, the worktree-confinement pin is emitted under both
+  spellings (`pin:*.cwd` + `pin:*.project_dir`), and session-start schema
+  validation no longer warns when a glob rule matches tools that simply
+  lack the param (glob rules are "wherever the param exists" by design;
+  exact-name rules still warn on unknown params). Project-dir-semantic
+  params on code-nav/refactor/team/brofile/badgey/allocator tools keep
+  their names.
 - `extract_rust_crate` refactor compound (gap-fe4dd97f): peel leaf root
   modules of a monolithic crate into a new workspace-member crate via
   `bbox_refactor_run`. New primitives: `extract_rust_crate_scaffold` (atomic

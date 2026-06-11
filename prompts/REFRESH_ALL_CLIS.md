@@ -55,7 +55,7 @@ tweak `MINE_CLI.md`, every future refresh inherits it.
   (observed: "I don't have shell"). The recursion guard + bro-harness's lack of a
   built-in Edit/Write already bound the surface. Add `disallow_tools` only if you
   have a specific reason.
-- `project_dir` = the **source repo** (source mine) or `/home/invidious`
+- `cwd` = the **source repo** (source mine) or `/home/invidious`
   (binary mine that needs `~/.local` + `~/.gemini` + `~/repos/<docs>`).
 - `pin_model`, `pin_effort: high`.
 - **Split a large CLI into 2–3 bros** by axis cluster (wire+loop / tool surfaces /

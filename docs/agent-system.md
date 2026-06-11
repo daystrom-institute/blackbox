@@ -73,7 +73,7 @@ public contract.
 ```json
 bro_agent_dispatch(
   agent = "pr-reviewer",
-  project_dir = "/path/to/repo",
+  cwd = "/path/to/repo",
   args = {
     "pr_number": "142",
     "base_branch": "main",

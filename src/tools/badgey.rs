@@ -705,7 +705,7 @@ mod tests {
             .bro_agent_dispatch(Parameters(AgentDispatchParams {
                 agent: "badgey".into(),
                 args: serde_json::json!({"prompt": "advise"}),
-                project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+                cwd: Some(tmp.path().to_string_lossy().into_owned()),
                 bro: None,
                 ambient: None,
                 caller_provider: None,

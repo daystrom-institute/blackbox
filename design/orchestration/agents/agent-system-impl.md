@@ -525,7 +525,7 @@ agent.
 **Components.**
 - `#[tool] async fn bro_agent_dispatch(&self, params: BroAgentDispatchParams)`.
 - `BroAgentDispatchParams { agent: String, args: serde_json::Value,
-  project_dir?, bro?, ambient? }`.
+  cwd? (alias project_dir), bro?, ambient? }`.
 - Routing:
   ```rust
   let manifest = registry.get(&params.agent)?;

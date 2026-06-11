@@ -281,7 +281,7 @@ Do not treat this as a routine pause — it's the emergency brake.
 bro_exec(
   bro="overmind-orchestrator",
   prompt=<ORCHESTRATOR BRIEF>,
-  project_dir=<cwd>,
+  cwd=<cwd>,
   allow_recursion=true     // MANDATORY — orchestrator needs bro_* for its own ensemble + implementer
 )
 ```
@@ -447,7 +447,7 @@ Then dispatch:
 bro_exec(
   bro="overmind-orchestrator",
   prompt=<RECOVERY BRIEF>,
-  project_dir=<cwd>,
+  cwd=<cwd>,
   allow_recursion=true
 )
 ```

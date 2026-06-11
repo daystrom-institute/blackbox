@@ -108,7 +108,7 @@ bro_team(action="list")
 bro_broadcast(
   team="<topic>-review",
   prompt=<FIRST-ROUND PROMPT>,
-  project_dir=<cwd>,
+  cwd=<cwd>,
   allow_recursion=false
 )
 ```
@@ -295,7 +295,7 @@ incomplete.
 bro_exec(
   bro="crucible-implementer",
   prompt=<WORK PACKET>,
-  project_dir=<cwd>,
+  cwd=<cwd>,
   allow_recursion=false
 )
 ```
@@ -369,7 +369,7 @@ git diff <rollback_ref>...HEAD -- <relevant paths>
 bro_broadcast(
   team="<topic>-review",
   prompt=<AUDIT PROMPT>,
-  project_dir=<cwd>,
+  cwd=<cwd>,
   allow_recursion=false
 )
 ```

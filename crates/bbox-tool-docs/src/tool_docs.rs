@@ -831,16 +831,16 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_exec",
         category: ToolCategory::Orchestration,
         summary: "Launch a fresh agent task/session and return {taskId, sessionId}. Required selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`.",
-        when_to_use: "Use to start a fresh agent session only. A dispatch selector is required: pass exactly one selector family — `bro` for a named bro, `provider` for a raw ad-hoc provider, or allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `selection_policy`, `pin_provider`, `pin_account`, `pin_model`, `pin_effort`, `prefer_provider`) for pool-backed runtime allocation. Fresh-session overrides such as `service_tier` apply after selector resolution. Prefer `bro:` over raw `provider:` so routing stays stable when a named bro exists. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
+        when_to_use: "Use to start a fresh agent session only. A dispatch selector is required: pass exactly one selector family — `bro` for a named bro, `provider` for a raw ad-hoc provider, or allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `selection_policy`, `pin_provider`, `pin_account`, `pin_model`, `pin_effort`, `prefer_provider`) for pool-backed runtime allocation. Set the session's working directory with `cwd` (canonical name; `project_dir` is accepted as a deprecated alias). Fresh-session overrides such as `service_tier` apply after selector resolution. Prefer `bro:` over raw `provider:` so routing stays stable when a named bro exists. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
         example: Some(
-            r#"bro_exec(prompt="review this patch", project_dir="/repo/x", tier="standard", pool_name="coding", durable=true)"#,
+            r#"bro_exec(prompt="review this patch", cwd="/repo/x", tier="standard", pool_name="coding", durable=true)"#,
         ),
     },
     ToolDoc {
         name: "bro_resume",
         category: ToolCategory::Orchestration,
         summary: "Continue an existing session with a follow-up; single-flight per provider session and the continuity path after bro_exec.",
-        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Pass explicit `session_id` / `provider` when possible; named bro targeting is only safe when the session is unambiguous. For Brodex, pass `service_tier=\"priority\"` to force fast routing for the continuation or `service_tier=\"default\"` to persist standard routing. Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Pass explicit `session_id` / `provider` when possible; named bro targeting is only safe when the session is unambiguous. The working-directory override is `cwd` (canonical; `project_dir` accepted as a deprecated alias) — usually unnecessary because resume auto-resolves the session's recorded cwd. For Brodex, pass `service_tier=\"priority\"` to force fast routing for the continuation or `service_tier=\"default\"` to persist standard routing. Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),
@@ -974,7 +974,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_broadcast",
         category: ToolCategory::Orchestration,
-        summary: "Send the same prompt to every team member.",
+        summary: "Send the same prompt to every team member. `cwd` (canonical; `project_dir` deprecated alias) overrides the working directory for every member dispatch.",
         when_to_use: "Ensemble work. Follow with `bro_when_all` (deliberation) or `bro_when_any` (race). Resumed members are single-flight like `bro_resume`; wait or cancel a member's current task before broadcasting another turn to that same session. Interleave with individual `bro_resume` for cross-pollination between rounds.",
         example: None,
     },
@@ -1307,8 +1307,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_agent_dispatch",
         category: ToolCategory::Orchestration,
         summary: "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path. Returns task_id, session, and agent attribution (agentLabel on the spawned task, preserved even when bro= routes to a named team member).",
-        when_to_use: "Dispatching an agent after discovery via bro_agent_search. Returns (task_id, session) — resume with bro_resume, status with bro_status. Prefer over hand-rolling a brofile + bro_exec when the task matches an agent's description and when_to_use. Pass runtime={...} to overlay tier/pool/pin allocation on the standard bro dispatch path. Anti-pattern: do not dispatch when the agent's manifest declares one of your task's properties as an anti_pattern.",
-        example: Some(r#"bro_agent_dispatch(agent="code-reviewer", args={"diff": "..."})"#),
+        when_to_use: "Dispatching an agent after discovery via bro_agent_search. Returns (task_id, session) — resume with bro_resume, status with bro_status. Prefer over hand-rolling a brofile + bro_exec when the task matches an agent's description and when_to_use. Set the session's working directory with `cwd` (canonical; `project_dir` accepted as a deprecated alias). Pass runtime={...} to overlay tier/pool/pin allocation on the standard bro dispatch path. Anti-pattern: do not dispatch when the agent's manifest declares one of your task's properties as an anti_pattern.",
+        example: Some(r#"bro_agent_dispatch(agent="code-reviewer", cwd="/repo/x", args={"diff": "..."})"#),
     },
     // ── Atoms ───────────────────────────────────────────────────
     ToolDoc {

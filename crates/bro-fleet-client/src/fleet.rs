@@ -1414,7 +1414,7 @@ fn dispatch_body(spec: &DispatchSpec) -> Value {
         "allow_recursion": true,
     });
     if let Some(cwd) = &spec.cwd {
-        body["project_dir"] = Value::String(cwd.clone());
+        body["cwd"] = Value::String(cwd.clone());
     }
     if let Some(model) = &spec.model {
         body["pin_model"] = Value::String(model.clone());
@@ -1445,7 +1445,7 @@ fn resume_body(spec: &ResumeSpec) -> Value {
         "allow_recursion": true,
     });
     if let Some(cwd) = &spec.cwd {
-        body["project_dir"] = Value::String(cwd.clone());
+        body["cwd"] = Value::String(cwd.clone());
     }
     if let Some(model) = &spec.model {
         body["pin_model"] = Value::String(model.clone());

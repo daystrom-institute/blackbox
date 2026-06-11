@@ -24,10 +24,12 @@ pub(crate) struct ExecParams {
     /// Dispatch selector option 2: raw provider for ad-hoc tasks.
     #[serde(default)]
     pub(crate) provider: Option<String>,
-    /// Working directory (absolute path). `cwd` is the canonical name at
-    /// the protocol layer and is accepted as an alias here.
-    #[serde(default, alias = "cwd")]
-    pub(crate) project_dir: Option<String>,
+    /// Working directory for the dispatched session (absolute path). `cwd`
+    /// is the canonical name (the contract-bottom dispatch name,
+    /// design/bro-harness/tool-arg-defaulting.md §4); `project_dir` is
+    /// accepted as a deprecated alias for older callers and recordings.
+    #[serde(default, alias = "project_dir")]
+    pub(crate) cwd: Option<String>,
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
     pub(crate) allow_recursion: Option<bool>,
@@ -147,9 +149,10 @@ pub(crate) struct ResumeParams {
     /// Provider (required with session_id)
     #[serde(default)]
     pub(crate) provider: Option<String>,
-    /// Working directory. `cwd` accepted as an alias.
-    #[serde(default, alias = "cwd")]
-    pub(crate) project_dir: Option<String>,
+    /// Working directory. `cwd` is canonical; `project_dir` accepted as a
+    /// deprecated alias.
+    #[serde(default, alias = "project_dir")]
+    pub(crate) cwd: Option<String>,
     /// Per-resume service tier override. For Brodex, `priority` is fast mode
     /// and `default` is the standard-routing sentinel persisted by the harness.
     /// When absent, resume defers to the brofile/session/harness default.
@@ -327,9 +330,10 @@ pub(crate) struct BroadcastParams {
     pub(crate) team: String,
     /// Prompt sent to every member
     pub(crate) prompt: String,
-    /// Working directory override
-    #[serde(default)]
-    pub(crate) project_dir: Option<String>,
+    /// Working directory override for every member dispatch. `cwd` is
+    /// canonical; `project_dir` accepted as a deprecated alias.
+    #[serde(default, alias = "project_dir")]
+    pub(crate) cwd: Option<String>,
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
     pub(crate) allow_recursion: Option<bool>,
@@ -589,8 +593,10 @@ pub(crate) struct AgentDispatchParams {
     pub(crate) agent: String,
     #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
     pub(crate) args: serde_json::Value,
-    #[serde(default)]
-    pub(crate) project_dir: Option<String>,
+    /// Working directory for the dispatched agent session. `cwd` is
+    /// canonical; `project_dir` accepted as a deprecated alias.
+    #[serde(default, alias = "project_dir")]
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
     pub(crate) bro: Option<String>,
     #[serde(default)]
@@ -1032,6 +1038,87 @@ pub(crate) struct AtomDelegateParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Dispatch params advertise `cwd` (the contract-bottom canonical name,
+    // design/bro-harness/tool-arg-defaulting.md §4) and accept `project_dir`
+    // as a deprecated alias so existing callers, atom templates, and
+    // recorded workflows keep working (gap-6366c92d).
+    #[test]
+    fn dispatch_param_schemas_advertise_cwd_not_project_dir() {
+        for (name, schema) in [
+            (
+                "ExecParams",
+                serde_json::to_value(rmcp::schemars::schema_for!(ExecParams)).unwrap(),
+            ),
+            (
+                "ResumeParams",
+                serde_json::to_value(rmcp::schemars::schema_for!(ResumeParams)).unwrap(),
+            ),
+            (
+                "BroadcastParams",
+                serde_json::to_value(rmcp::schemars::schema_for!(BroadcastParams)).unwrap(),
+            ),
+            (
+                "AgentDispatchParams",
+                serde_json::to_value(rmcp::schemars::schema_for!(AgentDispatchParams)).unwrap(),
+            ),
+        ] {
+            let props = schema["properties"].as_object().unwrap();
+            assert!(props.contains_key("cwd"), "{name} schema must advertise cwd");
+            assert!(
+                !props.contains_key("project_dir"),
+                "{name} schema must not advertise project_dir (alias only)"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_params_accept_cwd_and_project_dir_alias() {
+        let canonical: ExecParams =
+            serde_json::from_value(serde_json::json!({"prompt": "x", "cwd": "/repo/a"})).unwrap();
+        assert_eq!(canonical.cwd.as_deref(), Some("/repo/a"));
+
+        let alias: ExecParams =
+            serde_json::from_value(serde_json::json!({"prompt": "x", "project_dir": "/repo/b"}))
+                .unwrap();
+        assert_eq!(alias.cwd.as_deref(), Some("/repo/b"));
+
+        // deny_unknown_fields stays loud for misspellings (gap-16d79781).
+        assert!(
+            serde_json::from_value::<ExecParams>(
+                serde_json::json!({"prompt": "x", "cwdd": "/repo/c"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resume_broadcast_and_agent_dispatch_accept_project_dir_alias() {
+        let resume: ResumeParams =
+            serde_json::from_value(serde_json::json!({"prompt": "x", "project_dir": "/repo/r"}))
+                .unwrap();
+        assert_eq!(resume.cwd.as_deref(), Some("/repo/r"));
+        let resume: ResumeParams =
+            serde_json::from_value(serde_json::json!({"prompt": "x", "cwd": "/repo/r2"})).unwrap();
+        assert_eq!(resume.cwd.as_deref(), Some("/repo/r2"));
+
+        let bcast: BroadcastParams = serde_json::from_value(
+            serde_json::json!({"team": "t", "prompt": "x", "project_dir": "/repo/t"}),
+        )
+        .unwrap();
+        assert_eq!(bcast.cwd.as_deref(), Some("/repo/t"));
+
+        let agent: AgentDispatchParams = serde_json::from_value(
+            serde_json::json!({"agent": "a", "args": {}, "project_dir": "/repo/g"}),
+        )
+        .unwrap();
+        assert_eq!(agent.cwd.as_deref(), Some("/repo/g"));
+        let agent: AgentDispatchParams = serde_json::from_value(
+            serde_json::json!({"agent": "a", "args": {}, "cwd": "/repo/g2"}),
+        )
+        .unwrap();
+        assert_eq!(agent.cwd.as_deref(), Some("/repo/g2"));
+    }
 
     #[test]
     fn atom_invoke_args_schema_is_object() {

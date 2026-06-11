@@ -76,7 +76,7 @@ Overmind's orchestrator is itself a dispatcher — it runs crucible, which fans 
 bro_exec(
   bro="overmind-orchestrator",
   prompt=<brief>,
-  project_dir=<cwd>,
+  cwd=<cwd>,
   allow_recursion=true     // legitimate meta-orchestration exception
 )
 ```

@@ -204,7 +204,12 @@ impl ToolArgDefaults {
                     continue;
                 }
                 matched_any_tool = true;
-                if !schema_has_param(schema, &rule.param) {
+                // Glob rules are "wherever the param exists" by design
+                // (§3.1: the host writes them deliberately): a `pin:*.cwd`
+                // worktree pin matching tools without a `cwd` param is the
+                // expected steady state, not rot — only exact-name rules
+                // warn on a missing param.
+                if !rule.pattern.is_glob() && !schema_has_param(schema, &rule.param) {
                     let msg = format!(
                         "tool arg default key '{}' references unknown param '{}' on tool '{}'",
                         rule.key, rule.param, tool_name
@@ -429,6 +434,95 @@ mod tests {
         };
         assert_eq!(v["defaults_applied"]["session_id"], "host");
         assert_eq!(v["pin_enforced"]["cwd"], "/repo/wt");
+    }
+
+    #[test]
+    fn worktree_pin_covers_both_cwd_and_project_dir_spellings() {
+        // The pin guards by the literal param key in the tool input, and the
+        // table applies BEFORE the daemon's serde alias normalization
+        // (dispatch tools advertise `cwd`, accept `project_dir` as a
+        // deprecated alias — gap-6366c92d). The daemon therefore emits pins
+        // for BOTH names; either spelling of a wrong tree must refuse.
+        let defaults = table(&[
+            ("pin:*.cwd", "/repo/wt"),
+            ("pin:*.project_dir", "/repo/wt"),
+        ]);
+
+        // New canonical name, wrong tree: refused.
+        let err = defaults
+            .apply(
+                "mcp__blackbox__bro_exec",
+                json!({"prompt": "x", "cwd": "/repo/primary"}),
+            )
+            .unwrap_err();
+        assert_eq!(err.param, "cwd");
+        assert_eq!(err.expected, "/repo/wt");
+        assert_eq!(err.actual, "/repo/primary");
+
+        // Old alias name, wrong tree: still refused.
+        let err = defaults
+            .apply(
+                "mcp__blackbox__bro_exec",
+                json!({"prompt": "x", "project_dir": "/repo/primary"}),
+            )
+            .unwrap_err();
+        assert_eq!(err.param, "project_dir");
+        assert_eq!(err.actual, "/repo/primary");
+
+        // Correct tree passes under either spelling.
+        for key in ["cwd", "project_dir"] {
+            let (_, rider) = defaults
+                .apply(
+                    "mcp__blackbox__bro_exec",
+                    json!({"prompt": "x", (key): "/repo/wt"}),
+                )
+                .unwrap();
+            assert_eq!(rider.pin_enforced[key], "/repo/wt");
+            assert!(rider.pin_conflict.is_empty());
+        }
+    }
+
+    #[test]
+    fn glob_rules_do_not_warn_on_tools_missing_the_param() {
+        // Daemon-shaped table on a standard dispatch profile: glob pins for
+        // both dispatch-cwd spellings plus an exact code-nav default. Tools
+        // without the pinned params are the expected steady state for glob
+        // rules — session-start validation must stay quiet.
+        let defaults = table(&[
+            ("pin:*.cwd", "/repo/wt"),
+            ("pin:*.project_dir", "/repo/wt"),
+            ("default:mcp.bbox_code_outline.project_dir", "/repo/wt"),
+        ]);
+        let dispatch_schema = json!({
+            "type": "object",
+            "properties": {"prompt": {"type": "string"}, "cwd": {"type": "string"}}
+        });
+        let code_nav_schema = json!({
+            "type": "object",
+            "properties": {"file": {"type": "string"}, "project_dir": {"type": "string"}}
+        });
+        let note_schema = json!({
+            "type": "object",
+            "properties": {"kind": {"type": "string"}, "session_id": {"type": "string"}}
+        });
+        let warnings = defaults.validation_warnings([
+            ("mcp__blackbox__bro_exec", &dispatch_schema),
+            ("mcp__blackbox__bbox_code_outline", &code_nav_schema),
+            ("mcp__blackbox__bbox_note", &note_schema),
+        ]);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        // Exact rules still warn on a missing param (rot detection).
+        let stale = table(&[("default:mcp.bbox_note.nope", "x")]);
+        let warnings = stale.validation_warnings([("mcp__blackbox__bbox_note", &note_schema)]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("unknown param 'nope'"));
+
+        // Glob rules that match no loaded tool at all still warn.
+        let dead = table(&[("pin:mcp.bbox_zzz_*.cwd", "/repo/wt")]);
+        let warnings = dead.validation_warnings([("mcp__blackbox__bbox_note", &note_schema)]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("matched no loaded tool"));
     }
 
     #[test]

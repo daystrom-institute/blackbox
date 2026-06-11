@@ -626,7 +626,8 @@ Ranking:
 bro_agent_dispatch(
   agent: String,                   // name; resolves to latest version
   args: Object,                    // validated against manifest.inputs.schema
-  project_dir: Option<String>,
+  cwd: Option<String>,             // canonical; project_dir accepted as deprecated alias
+
   bro: Option<String>,             // named bro instance
   ambient: Option<Object>,         // forwarded to scope-bind
 )
@@ -645,7 +646,7 @@ Validation:
 - Filter merging: brofile filters ∪ manifest overlay; conflicts
   resolved by deny-wins. (Existing filter chain supports per-dispatch
   overlays; no substrate change required.)
-- Calls `bro_exec(prompt=expand_template(args), project_dir, ...)`
+- Calls `bro_exec(prompt=expand_template(args), cwd, ...)`
   with the merged filter chain.
 
 Provider selection is determined by the brofile's declared provider
@@ -1169,7 +1170,7 @@ When `dispatch_adapter == null`:
 2. expands `manifest.inputs.prompt_template` with args
 3. resolves brofile_ref (or uses brofile_inline)
 4. merges filters (brofile + manifest overlay; deny-wins)
-5. calls `bro_exec(prompt, project_dir, brofile, filters, ...)`
+5. calls `bro_exec(prompt, cwd, brofile, filters, ...)`
 6. wraps result in `AgentSession` and returns
 
 The direct path is the agent-system layer's reference implementation;

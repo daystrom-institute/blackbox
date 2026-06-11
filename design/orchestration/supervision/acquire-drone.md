@@ -30,7 +30,7 @@ must be set.
 Today the closest primitive is `bro_exec` in ad hoc provider mode:
 
 ```text
-bro_exec(provider="codex", prompt="...", project_dir="/repo/x")
+bro_exec(provider="codex", prompt="...", cwd="/repo/x")
 ```
 
 That is too thin for external callers. It only chooses a provider named by the
