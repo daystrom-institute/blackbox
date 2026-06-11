@@ -205,7 +205,11 @@ impl Agent {
         };
         AgentView {
             state,
-            turn_active: snap.turn_active,
+            // Gate on the derived state, not the raw stream heuristic: daemon
+            // -backed handles carry an empty event buffer, whose stream state
+            // defaults to turn-active. A terminal task must never read as
+            // "working" — state is Active iff the task is live AND mid-turn.
+            turn_active: matches!(state, FleetState::Active),
             needs_input: snap.needs_input,
             model: snap.model,
             cwd: snap.cwd,
@@ -398,6 +402,9 @@ struct App {
     focused_transcript_rx: mpsc::Receiver<FocusedTranscriptMsg>,
     focused_history_inflight: bool,
     focused_reflow_requested: bool,
+    /// Set once the focused task has been seen in a terminal status, so the
+    /// terminal-transition resnapshot (see `handle_tail`) fires exactly once.
+    focused_seen_terminal: bool,
     /// Index into [`FLEET_PROVIDERS`] for the provider selector.
     provider_cursor: usize,
     /// Index into the selected provider's model catalog for the model selector.
@@ -584,6 +591,7 @@ impl App {
             focused_transcript_rx,
             focused_history_inflight: false,
             focused_reflow_requested: false,
+            focused_seen_terminal: false,
             provider_cursor,
             model_cursor,
             effort_cursor,
@@ -817,6 +825,20 @@ fn refresh_agents_from_roster(app: &mut App) {
     app.reconcile_roster_selection();
 }
 
+/// Standalone mode owns exactly one agent; swap its task handle for the
+/// daemon-roster handle of the same id so status/lifecycle updates flow.
+/// The handle installed at dispatch time is a static stub (`daemon_task`)
+/// whose status would otherwise stay Running forever.
+fn refresh_standalone_agent_from_roster(app: &mut App) {
+    let Some(agent) = app.agents.first_mut() else {
+        return;
+    };
+    let id = agent.task.id();
+    if let Some(handle) = app.orch.tasks().into_iter().find(|h| h.id() == id) {
+        agent.task = handle;
+    }
+}
+
 fn start_focused_transcript(app: &mut App, task_id: String) {
     if app.focused_transcript_task_id.as_deref() == Some(task_id.as_str()) {
         return;
@@ -826,6 +848,7 @@ fn start_focused_transcript(app: &mut App, task_id: String) {
     app.focused_transcript = Some(FocusedTranscriptBuffer::default());
     app.focused_history_inflight = false;
     app.focused_reflow_requested = true;
+    app.focused_seen_terminal = false;
     let ui_tx = app.focused_transcript_tx.clone();
     let (stream_tx, stream_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -863,20 +886,21 @@ fn stop_focused_transcript(app: &mut App) {
 }
 
 fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
-    if app.mode.is_standalone() {
-        return app.agents[idx].task.transcript();
-    }
+    // Both modes prefer the focused-transcript SSE buffer: daemon-backed task
+    // handles never fill their local event buffer, so `task.transcript()` is
+    // empty for them. The handle buffer remains as a fallback for tasks whose
+    // events are delivered in-process.
     let id = app.agents[idx].task.id();
     if app.focused_transcript_task_id.as_deref() == Some(id.as_str())
         && let Some(buffer) = &app.focused_transcript
     {
         return parse_transcript(&buffer.events());
     }
-    Vec::new()
+    app.agents[idx].task.transcript()
 }
 
 fn request_focused_history(app: &mut App) {
-    if app.zone != Zone::SingleAgent || app.mode.is_standalone() || app.focused_history_inflight {
+    if app.zone != Zone::SingleAgent || app.focused_history_inflight {
         return;
     }
     let Some(task_id) = app.focused_agent_id.clone() else {
@@ -2125,8 +2149,27 @@ fn page_scroll_step(app: &App) -> usize {
 }
 
 fn handle_tail(app: &mut App, ev: TailEvent) {
-    if !app.mode.is_standalone() {
+    if app.mode.is_standalone() {
+        refresh_standalone_agent_from_roster(app);
+    } else {
         refresh_agents_from_roster(app);
+    }
+    // The daemon's tail broadcast carries lifecycle markers only — per-task
+    // envelope events never flow on the focused stream's live lane, and the
+    // daemon-backed client emits only payload-free RosterChanged signals. So
+    // watch the focused task's status across roster refreshes: on its first
+    // transition to a terminal status the snapshot we hold is stale (it
+    // predates the final assistant turn) — refetch it so the closing response
+    // renders instead of leaving the transcript frozen mid-turn.
+    if let Some(task_id) = app.focused_agent_id.clone()
+        && !app.focused_seen_terminal
+        && let Some(agent) = app.agents.iter().find(|a| a.task.id() == task_id)
+        && agent.task.snapshot().status.is_terminal()
+    {
+        stop_focused_transcript(app);
+        start_focused_transcript(app, task_id);
+        app.focused_seen_terminal = true;
+        app.set_status("agent finished", Duration::from_secs(4));
     }
     match ev {
         TailEvent::TaskCompleted { cost, .. } => {
