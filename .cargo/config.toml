@@ -2,7 +2,7 @@
 TSLP_LANGUAGES = { value = "rust,python,csharp,java,go,typescript,javascript,c,cpp", force = true }
 
 # Use lld for linking — the default bfd linker serially links the ~156MB
-# blackboxd binary (×3 binaries: blackboxd/bro-irc/bro-slack). lld is already
+# blackboxd binary (×2 binaries: blackboxd/bro-slack). lld is already
 # installed at /usr/bin/ld.lld; this cuts the final link stage substantially.
 # mold would be faster still but is not installed on this host.
 [target.x86_64-unknown-linux-gnu]

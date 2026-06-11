@@ -113,11 +113,11 @@ pub(crate) struct ExecParams {
     pub(crate) service_tier: Option<String>,
     /// **Internal.** Spawn-time origin override (Slice 1b). The MCP
     /// `bro_exec` tool ignores this and dispatches as
-    /// `Origin::AgentDispatch`; the daemon's HTTP control handlers
-    /// (`/control/exec`, `/irc/exec`) set it to `Origin::Cockpit` so
-    /// the roster can tab cockpit/IRC-launched tasks separately
-    /// from peer-bros-launched ones. Not part of the public MCP
-    /// schema — clients should not set it.
+    /// `Origin::AgentDispatch`; the daemon's HTTP control handler
+    /// (`/control/exec`) sets it to `Origin::Cockpit` so the roster
+    /// can tab cockpit-launched tasks separately from peer-bros-launched
+    /// ones. Not part of the public MCP schema — clients should not set
+    /// it.
     #[serde(default)]
     #[schemars(skip)]
     pub(crate) origin_override: Option<bro_core::Origin>,

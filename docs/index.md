@@ -47,7 +47,6 @@ The crate is `blackbox`. It produces four binaries:
 | [Ingress Paths](ingress-paths.md) | Webhooks, pollers, and crons. One routing pipeline. |
 | [System Events](system-events.md) | Durable event model used by workflows and external inlets |
 | [Slack Bridge](slack-bridge.md) | Sidecar architecture, channel binding, triage workflow, proposal lifecycle |
-| [IRC Bridge](irc-bridge.md) | LAN couch steering, ngircd setup, commands |
 | [Whiteboards](whiteboards.md) | Structured multi-agent deliberation (phased boards) |
 
 ## Quick links

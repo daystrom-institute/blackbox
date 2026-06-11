@@ -864,7 +864,7 @@ pub(crate) async fn orchestrate_by_id_handler(
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct IrcStatusQuery {
+pub(crate) struct ControlStatusQuery {
     #[serde(default)]
     tail: Option<usize>,
 }
@@ -873,11 +873,11 @@ pub(crate) async fn control_exec_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(mut req): axum::Json<ExecParams>,
 ) -> axum::Json<CallToolResult> {
-    // The HTTP control handlers (`/control/exec`, `/irc/exec`) bypass
-    // the MCP bro_exec tool surface but route through the same spawn
-    // funnel. Force the origin to Cockpit so the roster tab groups
-    // cockpit/IRC-launched tasks separately from peer-bros-launched
-    // ones (which carry AgentDispatch). The MCP bro_exec path itself
+    // The HTTP control handler (`/control/exec`) bypasses the MCP
+    // bro_exec tool surface but routes through the same spawn funnel.
+    // Force the origin to Cockpit so the roster tab groups
+    // cockpit-launched tasks separately from peer-bros-launched ones
+    // (which carry AgentDispatch). The MCP bro_exec path itself
     // defaults to AgentDispatch and ignores this override slot.
     req.origin_override = Some(bro_core::Origin::Cockpit);
     axum::Json(BlackboxServer::new(state).bro_exec(Parameters(req)).await)
@@ -1162,7 +1162,7 @@ pub(crate) async fn control_broadcast_handler(
 pub(crate) async fn control_status_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
-    Query(query): Query<IrcStatusQuery>,
+    Query(query): Query<ControlStatusQuery>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(
         BlackboxServer::new(state).bro_status(Parameters(StatusParams {

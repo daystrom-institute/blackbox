@@ -738,7 +738,6 @@ mod tests {
         let hidden = [
             "mcp__blackbox__badgey_exec",
             "mcp__blackbox__bro_slack_bind",
-            "mcp__blackbox__bro_irc_join",
             "mcp__blackbox__bro_allocator_status",
             "mcp__blackbox__bro_agent_list",
             "mcp__blackbox__atom_list",

@@ -15,6 +15,13 @@ out explicitly under `Changed` or `Removed`.
   `CouncilPosted` / `CouncilMention` system event kinds; `src/council/` store
   and drain machinery). Orphaned state at `$STORE_DIR/councils/` is left on
   disk and can be deleted manually.
+- `bro-irc` sidecar binary (`src/irc_bridge.rs`) removed along with the
+  `/irc/*` legacy HTTP route aliases, the `irc 1.1.0` crate dependency, and
+  the `deploy/irc/` ngircd stack (`deploy/bro-irc.service`,
+  `deploy/irc/docker-compose.yml`, `deploy/irc/config/ngircd.conf`). The
+  `/control/*` HTTP control plane is unaffected. Dependency tree shed 4
+  unique nodes (626 → 622); the remaining 49 irc subtree crates were
+  shared with other workspace dependencies.
 
 ### Added
 

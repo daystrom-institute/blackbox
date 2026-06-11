@@ -48,10 +48,6 @@ path = "src/main.rs"
 # `bro` now lives in its own crate (crates/bro-cli) — §7 thin-client extraction.
 
 [[bin]]
-name = "bro-irc"
-path = "src/irc_bridge.rs"
-
-[[bin]]
 name = "bro-slack"
 path = "src/slack_bridge.rs"
 
@@ -168,7 +164,6 @@ uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 futures-util = "0.3"
 futures = "0.3"
-irc = { version = "1.1.0", default-features = false }
 
 # Terminal
 crossterm = "0.28"

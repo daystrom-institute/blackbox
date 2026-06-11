@@ -20,10 +20,10 @@ pub use provider::{Capability, EffortInfo, ModelInfo, Provider};
 // HUD and the fleet TUI both need this distinction:
 //   - `AgentDispatch` covers the bro_* MCP tools invoked by another bro / by
 //     the operator from the cockpit chat. The bulk of fleet traffic.
-//   - `Cockpit` covers the cockpit/IRC bridge dispatches that bypass the
-//     bro_exec MCP tool but still go through the same spawn funnel. Same
-//     intent as AgentDispatch but with a separate UI tab so cockpit-launched
-//     tasks are visually distinguishable from peer-bros-launched ones.
+//   - `Cockpit` covers cockpit dispatches that bypass the bro_exec MCP
+//     tool but still go through the same spawn funnel. Same intent as
+//     AgentDispatch but with a separate UI tab so cockpit-launched tasks
+//     are visually distinguishable from peer-bros-launched ones.
 //   - `Workflow` covers team / workflow / advisor runtime
 //     dispatches (orchestrate.rs, workflow_runtime.rs, roster.rs team advisor).
 //   - `Atom` covers catalog atom invocations and resumes.
