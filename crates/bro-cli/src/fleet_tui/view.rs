@@ -59,6 +59,15 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
 
 /// Popup list of slash completions, anchored above the composer.
 pub(super) fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
+    render_slash_menu(f.buffer_mut(), composer, app);
+}
+
+/// Buffer-level core shared by the alt-screen `draw()` path and the inline
+/// zoom view (whose `custom_terminal::Frame` is a distinct type from
+/// `ratatui::Frame` — same buffer rendering underneath).
+pub(super) fn render_slash_menu(buf: &mut ratatui::buffer::Buffer, composer: Rect, app: &App) {
+    use ratatui::widgets::{StatefulWidget, Widget};
+
     let cmds = filtered_slash(app);
     if cmds.is_empty() {
         return;
@@ -96,11 +105,11 @@ pub(super) fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
             " /commands — ↑/↓ · Tab completes ",
             Style::default().fg(Color::Yellow),
         ));
-    f.render_widget(Clear, area);
+    Widget::render(Clear, area, buf);
     let inner = block.inner(area);
-    f.render_widget(block, area);
+    Widget::render(block, area, buf);
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    f.render_stateful_widget(list, inner, &mut state);
+    StatefulWidget::render(list, inner, buf, &mut state);
 }
 
 /// Popup list of roster @project completions, anchored above the composer.
@@ -151,6 +160,15 @@ pub(super) fn draw_project_menu(f: &mut Frame, composer: Rect, app: &App) {
 
 /// Centered popup overlay showing context-aware keyboard shortcuts.
 pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
+    let frame_area = f.area();
+    render_help_overlay(f.buffer_mut(), frame_area, app);
+}
+
+/// Buffer-level core shared by the alt-screen and inline-zoom render paths
+/// (see [`render_slash_menu`]). `frame_area` is the area the popup centers in.
+pub(super) fn render_help_overlay(buf: &mut ratatui::buffer::Buffer, frame_area: Rect, app: &App) {
+    use ratatui::widgets::Widget;
+
     let shortcut_lines: Vec<Line<'static>> = match app.zone {
         Zone::Roster => vec![
             Line::from("  ↑/↓           navigate agents"),
@@ -209,7 +227,7 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
             Line::from("  Esc           cancel selector, restore selection"),
         ],
     };
-    let h = (shortcut_lines.len() as u16 + 2).min(f.area().height);
+    let h = (shortcut_lines.len() as u16 + 2).min(frame_area.height);
     // Auto-fit width to the longest shortcut line (and the title), so no row is
     // truncated regardless of zone. +4 = borders + trailing breathing room.
     let title = " shortcuts — Esc to dismiss ";
@@ -219,8 +237,8 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
         .max()
         .unwrap_or(40)
         .max(title.chars().count());
-    let w = (content_w as u16 + 4).min(f.area().width);
-    let area = centered_rect(w, h, f.area());
+    let w = (content_w as u16 + 4).min(frame_area.width);
+    let area = centered_rect(w, h, frame_area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -228,11 +246,11 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
             " shortcuts — Esc to dismiss ",
             Style::default().fg(Color::Cyan),
         ));
-    f.render_widget(Clear, area);
+    Widget::render(Clear, area, buf);
     let inner = block.inner(area);
-    f.render_widget(block, area);
+    Widget::render(&block, area, buf);
     let para = Paragraph::new(shortcut_lines).style(Style::default().fg(Color::White));
-    f.render_widget(para, inner);
+    Widget::render(para, inner, buf);
 }
 
 pub(super) fn draw_roster_body(

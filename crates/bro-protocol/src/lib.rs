@@ -162,6 +162,16 @@ pub struct RosterSummaryV1 {
     /// querying `bro_status`. Additive+optional — absent for live/healthy tasks.
     #[serde(default)]
     pub error_teaser: Option<String>,
+    /// Absolute path of the session's append-only transcript event log
+    /// (`<sessions>/<session_id>.events.jsonl` for harness providers). The
+    /// fleet cockpit attaches to this file directly for the zoom transcript
+    /// — same-host by design — instead of streaming events over HTTP: the
+    /// file is the single transcript coordinate space, so a resumed session
+    /// (same session id → same file) keeps full history with no cursor
+    /// reconciliation. The file may not exist yet for a freshly dispatched
+    /// task; readers treat absence as an empty transcript. Additive+optional.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
 }
 
 /// Structured form of a `bro_report` payload, projected into the
@@ -245,61 +255,6 @@ impl RosterDelta {
     }
 }
 
-/// One raw provider event from the task's current in-memory event buffer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FocusedTranscriptMemoryEventV1 {
-    /// Zero-based cursor within the daemon's current in-memory event window.
-    pub cursor: u64,
-    pub event: Value,
-}
-
-/// Initial SSE payload for `GET /control/transcript/{task_id}/stream`.
-///
-/// `live_cursor` is the daemon tail cursor through which the snapshot is
-/// current. The stream sends only live events with `cursor > live_cursor`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FocusedTranscriptSnapshotV1 {
-    pub task_id: TaskId,
-    pub session_id: Option<SessionId>,
-    pub provider: Provider,
-    pub status: TaskStatus,
-    pub live_cursor: u64,
-    pub memory_start_cursor: u64,
-    pub next_memory_cursor: u64,
-    pub events: Vec<FocusedTranscriptMemoryEventV1>,
-    pub history_jsonl_path: Option<String>,
-}
-
-/// One live tail event for a focused transcript subscription.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FocusedTranscriptLiveEventV1 {
-    pub task_id: TaskId,
-    pub cursor: u64,
-    pub event: Value,
-}
-
-/// One provider transcript-file JSONL record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TranscriptHistoryEventV1 {
-    /// Zero-based JSONL record index in the provider transcript file.
-    pub cursor: u64,
-    pub byte_offset: u64,
-    pub event: Value,
-}
-
-/// Bounded page from the provider transcript file source.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TranscriptHistoryPageV1 {
-    pub task_id: TaskId,
-    pub session_id: SessionId,
-    pub history_jsonl_path: String,
-    pub from_cursor: u64,
-    pub limit: usize,
-    pub next_cursor: u64,
-    pub reached_end: bool,
-    pub events: Vec<TranscriptHistoryEventV1>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +288,7 @@ mod tests {
             report_full: None,
             interrupted: false,
             error_teaser: None,
+            transcript_path: None,
         };
         let value = serde_json::to_value(&summary).unwrap();
         let obj = value.as_object().expect("summary must serialize as object");

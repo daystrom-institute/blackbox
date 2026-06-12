@@ -290,10 +290,11 @@ pub(super) fn install_standalone(app: &mut App, o: StandaloneOutcome) {
     // Append the prompt to the shared composer histfile.
     let _ = composer_history::append_history(&app.composer_history_path, &o.prompt);
     app.focused_agent_id = Some(id.clone());
-    // Daemon-backed handles never fill their local event buffer, so the
-    // standalone view must ride the same focused-transcript SSE stream the
-    // fleet zoom view uses — without this the transcript stays blank forever.
-    super::start_focused_transcript(app, id.clone());
+    // Daemon-backed handles never fill their local event buffer; the
+    // standalone view rides the same file-attached transcript tail the fleet
+    // zoom view uses. Attach as soon as the roster resolves the session's
+    // transcript_path (the per-tick sync also covers it).
+    super::sync_focused_tail(app);
     app.zone = Zone::SingleAgent;
     let verb = if o.is_resume { "resumed" } else { "started" };
     app.set_status(

@@ -760,6 +760,7 @@ mod roster_view_tests {
             report_full: None,
             interrupted: false,
             error_teaser: None,
+            transcript_path: None,
         };
         view.upsert("t1".into(), summary.clone());
         let snap = view.snapshot();
@@ -794,6 +795,7 @@ mod roster_view_tests {
                 report_full: None,
                 interrupted: false,
                 error_teaser: None,
+            transcript_path: None,
             },
         );
         assert_eq!(view.snapshot().len(), 1);
@@ -916,6 +918,7 @@ mod roster_view_tests {
                 report_full: None,
                 interrupted: false,
                 error_teaser: None,
+            transcript_path: None,
             },
         );
         let mut store = TaskStore::new();
@@ -1039,7 +1042,29 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         } else {
             None
         },
+        // Where the session's append-only event log lives. Deterministic for
+        // harness providers (every fleet provider) — same resolution the
+        // harness itself uses when it opens the log, so the cockpit attaches
+        // to the exact file the running agent appends to. The file may not
+        // exist yet for a fresh dispatch; readers treat absence as empty.
+        transcript_path: harness_session_transcript_path(&inner.session_id),
     }
+}
+
+/// Absolute path of a harness session's `<session_id>.events.jsonl`, when the
+/// session id is resolved. Pure path math (no IO) via the harness's own
+/// resolver, so the daemon and the in-process harness can never disagree on
+/// where a session's transcript lives.
+fn harness_session_transcript_path(session_id: &str) -> Option<String> {
+    if session_id.is_empty() || session_id == "pending" {
+        return None;
+    }
+    Some(
+        bro_harness::event_log::EventLog::for_session(session_id)
+            .path()
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Project an in-memory `BroReport` to the wire-shaped

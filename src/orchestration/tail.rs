@@ -68,17 +68,6 @@ impl TailEvent {
             | TailEvent::TaskCancelled { task_id, .. } => task_id,
         }
     }
-
-    pub fn cursor(&self) -> u64 {
-        match self {
-            TailEvent::TaskStarted { cursor, .. }
-            | TailEvent::TaskProgress { cursor, .. }
-            | TailEvent::TaskEvent { cursor, .. }
-            | TailEvent::TaskCompleted { cursor, .. }
-            | TailEvent::TaskFailed { cursor, .. }
-            | TailEvent::TaskCancelled { cursor, .. } => *cursor,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -93,7 +82,6 @@ mod tests {
             activity: "working".into(),
         };
         assert_eq!(evt.task_id(), "my-task");
-        assert_eq!(evt.cursor(), 1);
     }
 
     #[test]

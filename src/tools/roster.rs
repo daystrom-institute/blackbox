@@ -1523,6 +1523,7 @@ mod tests {
                 }),
                 interrupted: false,
                 error_teaser: None,
+            transcript_path: None,
             }
         }
 
@@ -1554,6 +1555,7 @@ mod tests {
                 report_full: None,
                 interrupted: false,
                 error_teaser: None,
+            transcript_path: None,
             }
         }
 

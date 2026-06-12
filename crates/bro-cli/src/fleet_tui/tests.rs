@@ -2157,46 +2157,32 @@ Trailing paragraph.";
         app.cursor_pos = text.len();
     }
 
+    /// Chat-flow contract: ONE Enter submits, for terminal and running
+    /// agents alike. A terminal focused agent resumes its session with the
+    /// composer text; a running one is steered. (The old arm-confirm
+    /// double-Enter pattern is deliberately gone — typing a message is
+    /// already a deliberate act.)
     #[test]
-    fn terminal_agent_first_enter_arms_not_submits() {
+    fn terminal_agent_single_enter_submits() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let mut app = make_test_app(rt.handle());
         setup_terminal_agent(&mut app, "test-1", "resume this");
 
-        assert!(app.steer_armed_until.is_none());
         submit(&mut app);
 
-        // First Enter on a terminal agent arms the confirmation guard.
-        assert!(app.steer_armed_until.is_some(), "should arm after first Enter");
-        // Input must NOT be cleared (the guard returns before steer_selected).
-        assert_eq!(app.input, "resume this", "input must stay in composer");
+        assert!(app.input.is_empty(), "first Enter must submit (resume path takes the input)");
+        assert!(
+            app.resuming.contains("test-1"),
+            "terminal agent + composer text → resume in flight"
+        );
     }
 
     #[test]
-    fn terminal_agent_second_enter_submits() {
+    fn running_agent_single_enter_submits() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let mut app = make_test_app(rt.handle());
-        setup_terminal_agent(&mut app, "test-2", "go again");
-
-        // Manually arm the confirmation (simulating a first Enter).
-        app.steer_armed_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(STEER_ARM_SECS));
-        app.steer_armed_agent_id = Some(app.agents[0].task.id());
-
-        submit(&mut app);
-
-        // Second Enter disarms and proceeds — steer_selected takes the input.
-        assert!(app.steer_armed_until.is_none(), "should disarm before submitting");
-        assert!(app.input.is_empty(), "steer_selected should take the input");
-    }
-
-    #[test]
-    fn running_agent_submits_immediately() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let mut app = make_test_app(rt.handle());
-        // Running agent (not terminal) — the guard must NOT engage.
         let handle = AgentHandle::for_test(TaskStatus::Running, "test-3");
         let agent = Agent {
             task: handle.clone(),
@@ -2218,72 +2204,11 @@ Trailing paragraph.";
         app.input = "steer me".to_string();
         app.cursor_pos = 8;
 
-        assert!(app.steer_armed_until.is_none());
         submit(&mut app);
 
-        // Running agent bypasses the guard entirely.
-        assert!(app.steer_armed_until.is_none(), "guard must not arm for running agents");
         assert!(app.input.is_empty(), "steer_selected should take the input");
     }
 
-    #[test]
-    fn steer_armed_disarmed_by_non_enter_key() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let mut app = make_test_app(rt.handle());
-        setup_terminal_agent(&mut app, "test-4", "armed");
-
-        // Arm the confirmation.
-        app.steer_armed_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(STEER_ARM_SECS));
-        app.steer_armed_agent_id = Some(app.agents[0].task.id());
-
-        // Press 'a' — should disarm.
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(app.steer_armed_until.is_none(), "non-Enter key should disarm");
-    }
-
-    #[test]
-    fn enter_key_preserves_armed_steer_for_submit() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let mut app = make_test_app(rt.handle());
-
-        // Terminal agent, armed steer — Enter should submit, not just disarm.
-        setup_terminal_agent(&mut app, "test-5", "confirm");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(STEER_ARM_SECS);
-        app.steer_armed_until = Some(deadline);
-        app.steer_armed_agent_id = Some(app.agents[0].task.id());
-
-        // Press Enter via handle_key — this should reach submit() which
-        // sees the armed confirmation and proceeds (disarming + submitting).
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        // After submit, steer is disarmed AND input is consumed.
-        assert!(app.steer_armed_until.is_none(), "submit should disarm on confirm");
-        assert!(app.input.is_empty(), "submit should consume input");
-    }
-
-    #[test]
-    fn steer_armed_expired_rearms_on_enter() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let mut app = make_test_app(rt.handle());
-        setup_terminal_agent(&mut app, "test-6", "stale");
-
-        // Arm with an already-expired deadline.
-        app.steer_armed_until = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
-        app.steer_armed_agent_id = Some(app.agents[0].task.id());
-
-        submit(&mut app);
-
-        // Expired arm → re-arms (not submitted).
-        assert!(app.steer_armed_until.is_some(), "expired arm should re-arm");
-        assert_eq!(app.input, "stale", "input must stay in composer");
-    }
-    
     // ---- D27: long-lived cockpits running stale binaries (unit-N4) -------
     //
     // The fleet cockpit now stamps the daemon's build identity from

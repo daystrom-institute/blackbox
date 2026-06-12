@@ -884,8 +884,13 @@ pub(crate) async fn control_exec_handler(
 
 pub(crate) async fn control_resume_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<ResumeParams>,
+    axum::Json(mut req): axum::Json<ResumeParams>,
 ) -> axum::Json<CallToolResult> {
+    // Same origin pinning as `/control/exec`: a cockpit-driven resume is a
+    // cockpit task. Without this the resumed follow-up turn spawns as
+    // AgentDispatch and the roster row jumps from the fleet tab to the
+    // dispatched-agents tab mid-conversation.
+    req.origin_override = Some(bro_core::Origin::Cockpit);
     axum::Json(BlackboxServer::new(state).bro_resume(Parameters(req)).await)
 }
 

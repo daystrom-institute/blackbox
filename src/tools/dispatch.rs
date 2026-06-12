@@ -766,9 +766,11 @@ impl BlackboxServer {
             None,
             ambient_ctx.tool_arg_defaults(),
             Some(self.state.system_events.clone()),
-            // bro_resume is the user-facing MCP tool for resuming
-            // an existing session — same source class as bro_exec.
-            bro_core::Origin::AgentDispatch,
+            // bro_resume is the user-facing MCP tool for resuming an existing
+            // session — same source class as bro_exec. The HTTP control plane
+            // (`/control/resume`) overrides this to Cockpit, exactly like
+            // `/control/exec`, so cockpit follow-up turns don't jump tabs.
+            p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
         );
         if let Some(lease) = &runtime_lease {
             let inner = task.inner.lock();

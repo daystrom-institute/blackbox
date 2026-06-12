@@ -182,6 +182,15 @@ pub(crate) struct ResumeParams {
     /// prefix. When false or absent, defers to the brofile setting.
     #[serde(default)]
     pub(crate) coerce_workspace: Option<bool>,
+    /// **Internal.** Spawn-time origin override, mirroring the slot on
+    /// `ExecParams`: the MCP `bro_resume` tool ignores it and resumes as
+    /// `Origin::AgentDispatch`; the daemon's `/control/resume` handler sets
+    /// it to `Origin::Cockpit` so a cockpit-driven follow-up turn stays in
+    /// the fleet roster tab instead of jumping to the dispatched-agents tab.
+    /// Not part of the public MCP schema — clients should not set it.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub(crate) origin_override: Option<bro_core::Origin>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

@@ -56,10 +56,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use bro_fleet_client::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DispatchSpec, FleetConfig,
-    FleetOrchestrator, FocusedTranscriptBuffer, FocusedTranscriptStreamEvent, Provider,
-    ResumeSpec, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY, TailEvent, TaskStatus,
-    TodoItemStatus, TodoState, TranscriptHistoryPageV1, TranscriptItem, bro_home, intern_rider,
-    parse_transcript, provider_supports_bidi,
+    FleetOrchestrator, Provider, ResumeSpec, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY,
+    TailEvent, TaskStatus, TodoItemStatus, TodoState, TranscriptItem, bro_home, intern_rider,
+    provider_supports_bidi,
 };
 
 use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
@@ -85,9 +84,6 @@ const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
 const FINISHED_AFTER_IDLE_MS: u64 = 20 * 60 * 1000;
 /// Seconds the operator has to confirm a Ctrl+K prune after the first press.
 const PRUNE_ARM_SECS: u64 = 4;
-/// Seconds the operator has to confirm an Enter-after-terminal steer with a
-/// second Enter press.
-const STEER_ARM_SECS: u64 = 4;
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -375,21 +371,6 @@ pub struct AgentLaunch {
     pub prompt: Option<String>,
 }
 
-const FOCUSED_HISTORY_PAGE: usize = 200;
-
-#[derive(Debug)]
-enum FocusedTranscriptMsg {
-    Stream(FocusedTranscriptStreamEvent),
-    HistoryPage {
-        task_id: String,
-        result: Result<TranscriptHistoryPageV1, String>,
-    },
-    Error {
-        task_id: String,
-        message: String,
-    },
-}
-
 // ── Selector snapshot (Esc restore) ────────────────────────────────────────
 
 /// Saved when entering the provider-selector stack from Roster. Esc restores
@@ -421,18 +402,12 @@ struct App {
     /// Stable task id for the currently open single-agent view. Roster order is
     /// live-sorted, so a row index is not a stable identity while agents update.
     focused_agent_id: Option<String>,
-    /// Raw focused transcript events for the zoomed agent, hydrated from the
-    /// daemon's snapshot+cursor stream and optional JSONL history pages.
-    focused_transcript: Option<FocusedTranscriptBuffer>,
-    focused_transcript_task_id: Option<String>,
-    focused_transcript_task: Option<tokio::task::JoinHandle<()>>,
-    focused_transcript_tx: mpsc::Sender<FocusedTranscriptMsg>,
-    focused_transcript_rx: mpsc::Receiver<FocusedTranscriptMsg>,
-    focused_history_inflight: bool,
+    /// File-attached transcript source for the zoomed agent: an incremental
+    /// reader over the session's append-only event log, at the daemon-provided
+    /// `transcript_path`. Same file across resumes of the session, so the
+    /// zoom transcript carries across task swaps with no reconciliation.
+    focused_tail: Option<transcript_tail::TranscriptFileTail>,
     focused_reflow_requested: bool,
-    /// Set once the focused task has been seen in a terminal status, so the
-    /// terminal-transition resnapshot (see `handle_tail`) fires exactly once.
-    focused_seen_terminal: bool,
     /// Index into [`FLEET_PROVIDERS`] for the provider selector.
     provider_cursor: usize,
     /// Index into the selected provider's model catalog for the model selector.
@@ -572,8 +547,6 @@ struct App {
     /// SingleAgent Enter-after-terminal arm-confirm state: first Enter arms
     /// (shows a confirmation status line), second Enter within the TTL resumes
     /// with the composer text. `None` = not armed.
-    steer_armed_until: Option<Instant>,
-    steer_armed_agent_id: Option<String>,
     /// D27: latest daemon build identity stamped on the most recent
     /// `/control/roster` snapshot. `None` when the daemon pre-dates
     /// the build-identity fields or no snapshot has been ingested
@@ -619,7 +592,6 @@ impl App {
         let (ctrl_tx, ctrl_rx) = mpsc::channel();
         let (standalone_tx, standalone_rx) = mpsc::channel();
         let (closeout_tx, closeout_rx) = mpsc::channel();
-        let (focused_transcript_tx, focused_transcript_rx) = mpsc::channel();
         let default_provider = DEFAULT_FLEET_PROVIDER;
         let provider_cursor = default_fleet_provider_cursor();
         let model_cursor = default_provider
@@ -642,14 +614,8 @@ impl App {
             roster_selected: 0,
             roster_anchor_id: None,
             focused_agent_id: None,
-            focused_transcript: None,
-            focused_transcript_task_id: None,
-            focused_transcript_task: None,
-            focused_transcript_tx,
-            focused_transcript_rx,
-            focused_history_inflight: false,
+            focused_tail: None,
             focused_reflow_requested: false,
-            focused_seen_terminal: false,
             provider_cursor,
             model_cursor,
             effort_cursor,
@@ -704,8 +670,6 @@ impl App {
             composer_history_path: history_path(&bro_home()),
             prune_armed_until: None,
             prune_armed_count: 0,
-            steer_armed_until: None,
-            steer_armed_agent_id: None,
             last_daemon_build: (None, None),
         }
     }
@@ -1009,7 +973,7 @@ fn refresh_agents_from_roster(app: &mut App) {
     if let Some(id) = app.focused_agent_id.clone()
         && !app.agents.iter().any(|agent| agent.task.id() == id)
     {
-        stop_focused_transcript(app);
+        app.focused_tail = None;
         app.focused_agent_id = None;
         if app.zone == Zone::SingleAgent && !app.mode.is_standalone() {
             app.zone = Zone::Roster;
@@ -1032,195 +996,55 @@ fn refresh_standalone_agent_from_roster(app: &mut App) {
     }
 }
 
-fn start_focused_transcript(app: &mut App, task_id: String) {
-    if app.focused_transcript_task_id.as_deref() == Some(task_id.as_str()) {
+/// Keep the focused agent's file-attached transcript tail in sync: attach to
+/// the daemon-provided `transcript_path` when it appears or changes, drop it
+/// when nothing is focused, and consume newly appended events otherwise.
+///
+/// Resume continuity falls out of the keying: a resumed task carries the SAME
+/// session (same file), so the tail — and the inline commit cursor, which is
+/// keyed by the same path — just keeps going. Only a genuinely different file
+/// (different session focused) re-attaches and re-flows.
+fn sync_focused_tail(app: &mut App) {
+    let Some(idx) = inline_focus_idx(app) else {
+        app.focused_tail = None;
+        return;
+    };
+    let path = app.agents[idx].task.snapshot().transcript_path;
+    let Some(path) = path else {
+        // No resolved session yet (pending dispatch) — nothing to attach.
+        app.focused_tail = None;
+        return;
+    };
+    let attached = app
+        .focused_tail
+        .as_ref()
+        .is_some_and(|tail| tail.path() == std::path::Path::new(&path));
+    if !attached {
+        app.focused_tail = Some(transcript_tail::TranscriptFileTail::attach(&path));
         return;
     }
-    stop_focused_transcript(app);
-    app.focused_transcript_task_id = Some(task_id.clone());
-    app.focused_transcript = Some(FocusedTranscriptBuffer::default());
-    app.focused_history_inflight = false;
-    app.focused_reflow_requested = true;
-    app.focused_seen_terminal = false;
-    let ui_tx = app.focused_transcript_tx.clone();
-    let (stream_tx, stream_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        while let Ok(event) = stream_rx.recv() {
-            if ui_tx.send(FocusedTranscriptMsg::Stream(event)).is_err() {
-                break;
-            }
-        }
-    });
-    let err_tx = app.focused_transcript_tx.clone();
-    let orch = app.orch.clone();
-    let stream_task_id = task_id.clone();
-    let handle = app.rt.spawn(async move {
-        let result = orch
-            .stream_focused_transcript(stream_task_id.clone(), stream_tx)
-            .await;
-        if let Err(err) = result {
-            let _ = err_tx.send(FocusedTranscriptMsg::Error {
-                task_id: stream_task_id,
-                message: err.to_string(),
-            });
-        }
-    });
-    app.focused_transcript_task = Some(handle);
-}
-
-fn stop_focused_transcript(app: &mut App) {
-    if let Some(handle) = app.focused_transcript_task.take() {
-        handle.abort();
+    if let Some(tail) = &mut app.focused_tail
+        && tail.poll_reset()
+    {
+        // The file shrank underneath us (rotated/replaced): committed
+        // scrollback no longer matches — re-flow from the top.
+        app.inline_commits.remove(&path);
+        app.focused_reflow_requested = true;
     }
-    app.focused_transcript_task_id = None;
-    app.focused_transcript = None;
-    app.focused_history_inflight = false;
-    app.focused_reflow_requested = false;
 }
 
 fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
-    // Both modes prefer the focused-transcript SSE buffer: daemon-backed task
-    // handles never fill their local event buffer, so `task.transcript()` is
-    // empty for them. The handle buffer remains as a fallback for tasks whose
-    // events are delivered in-process.
-    let id = app.agents[idx].task.id();
-    if app.focused_transcript_task_id.as_deref() == Some(id.as_str())
-        && let Some(buffer) = &app.focused_transcript
+    // Prefer the file-attached session event log (daemon-backed task handles
+    // never fill their local event buffer, so `task.transcript()` is empty
+    // for them). The handle buffer remains as a fallback for tasks whose
+    // events are delivered in-process or whose session isn't resolved yet.
+    let path = app.agents[idx].task.snapshot().transcript_path;
+    if let (Some(tail), Some(path)) = (&app.focused_tail, path)
+        && tail.path() == std::path::Path::new(&path)
     {
-        return parse_transcript(&buffer.events());
+        return tail.items().to_vec();
     }
     app.agents[idx].task.transcript()
-}
-
-fn request_focused_history(app: &mut App) {
-    if app.zone != Zone::SingleAgent || app.focused_history_inflight {
-        return;
-    }
-    let Some(task_id) = app.focused_agent_id.clone() else {
-        return;
-    };
-    if app.focused_transcript_task_id.as_deref() != Some(task_id.as_str()) {
-        return;
-    }
-    let Some(buffer) = &app.focused_transcript else {
-        return;
-    };
-    if buffer.history_jsonl_path().is_none() {
-        return;
-    }
-    let Some(earliest) = buffer.earliest_cursor() else {
-        return;
-    };
-    if earliest == 0 {
-        return;
-    }
-    let limit = FOCUSED_HISTORY_PAGE.min(earliest as usize).max(1);
-    let from_cursor = earliest.saturating_sub(limit as u64);
-    app.focused_history_inflight = true;
-    let orch = app.orch.clone();
-    let tx = app.focused_transcript_tx.clone();
-    app.rt.spawn(async move {
-        let result = orch
-            .transcript_history_page(&task_id, from_cursor, limit)
-            .await
-            .map_err(|err| err.to_string());
-        let _ = tx.send(FocusedTranscriptMsg::HistoryPage { task_id, result });
-    });
-}
-
-fn handle_focused_transcript_msg(app: &mut App, msg: FocusedTranscriptMsg) {
-    match msg {
-        FocusedTranscriptMsg::Stream(FocusedTranscriptStreamEvent::Snapshot(snapshot)) => {
-            let task_id = snapshot.task_id.as_str().to_string();
-            if app.focused_agent_id.as_deref() != Some(task_id.as_str()) {
-                return;
-            }
-            let had_events = app
-                .focused_transcript
-                .as_ref()
-                .is_some_and(|buffer| buffer.earliest_cursor().is_some());
-            let buffer = app
-                .focused_transcript
-                .get_or_insert_with(FocusedTranscriptBuffer::default);
-            buffer.apply_snapshot(snapshot);
-            app.focused_transcript_task_id = Some(task_id.clone());
-            // The zoom-in entry code (run_inline_view) already clears the
-            // commit cursor for fresh starts. Terminal-transition and resync
-            // restarts must preserve it so already-committed scrollback lines
-            // aren't re-emitted (which would render the initial prompt three
-            // times). commit_inline_history bounds-checks the committed count
-            // against the transcript length so a stale cursor from a resync
-            // that genuinely changed history is still safe.
-            app.focused_reflow_requested |= had_events;
-        }
-        FocusedTranscriptMsg::Stream(FocusedTranscriptStreamEvent::Event(event)) => {
-            let task_id = event.task_id.as_str().to_string();
-            if app.focused_agent_id.as_deref() != Some(task_id.as_str())
-                || app.focused_transcript_task_id.as_deref() != Some(task_id.as_str())
-            {
-                return;
-            }
-            let buffer = app
-                .focused_transcript
-                .get_or_insert_with(FocusedTranscriptBuffer::default);
-            let _ = buffer.apply_live_event(event);
-        }
-        FocusedTranscriptMsg::Stream(FocusedTranscriptStreamEvent::Resync { reason, skipped }) => {
-            if let Some(buffer) = &mut app.focused_transcript {
-                buffer.mark_resync_required();
-            }
-            let detail = reason.unwrap_or_else(|| "lag".to_string());
-            let skipped = skipped.map(|n| format!(" ({n} skipped)")).unwrap_or_default();
-            app.set_status(
-                format!("transcript stream resync: {detail}{skipped}"),
-                Duration::from_secs(4),
-            );
-            if let Some(task_id) = app.focused_agent_id.clone() {
-                start_focused_transcript(app, task_id);
-            }
-        }
-        FocusedTranscriptMsg::HistoryPage { task_id, result } => {
-            if app.focused_agent_id.as_deref() != Some(task_id.as_str()) {
-                return;
-            }
-            app.focused_history_inflight = false;
-            match result {
-                Ok(page) => {
-                    let buffer = app
-                        .focused_transcript
-                        .get_or_insert_with(FocusedTranscriptBuffer::default);
-                    if buffer.apply_history_page(page) {
-                        app.inline_commits.remove(&task_id);
-                        app.focused_reflow_requested = true;
-                    }
-                }
-                Err(message) => {
-                    app.set_status(
-                        format!("transcript history failed: {}", first_line(&message)),
-                        Duration::from_secs(5),
-                    );
-                }
-            }
-        }
-        FocusedTranscriptMsg::Error { task_id, message } => {
-            if app.focused_agent_id.as_deref() == Some(task_id.as_str()) {
-                app.set_status(
-                    format!("transcript stream failed: {}", first_line(&message)),
-                    Duration::from_secs(5),
-                );
-            }
-        }
-    }
-}
-
-fn drain_focused_transcript(app: &mut App) {
-    let mut messages = Vec::new();
-    while let Ok(msg) = app.focused_transcript_rx.try_recv() {
-        messages.push(msg);
-    }
-    for msg in messages {
-        handle_focused_transcript_msg(app, msg);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2020,7 +1844,7 @@ where
     // so seed a full-screen viewport first; the loop sets the real one below.
     if exit_on_zoom_out {
         if let Some(idx) = inline_focus_idx(app) {
-            app.inline_commits.remove(&app.agents[idx].task.id());
+            app.inline_commits.remove(&inline_commit_key(app, idx));
         }
         terminal.autoresize()?;
         let s = terminal.last_known_screen_size;
@@ -2068,7 +1892,7 @@ where
             && prev != (screen_w, screen_h)
         {
             if let Some(idx) = inline_focus_idx(app) {
-                app.inline_commits.remove(&app.agents[idx].task.id());
+                app.inline_commits.remove(&inline_commit_key(app, idx));
             } else {
                 app.inline_commits.clear();
             }
@@ -2079,7 +1903,7 @@ where
         }
         if exit_on_zoom_out && app.focused_reflow_requested {
             if let Some(idx) = inline_focus_idx(app) {
-                app.inline_commits.remove(&app.agents[idx].task.id());
+                app.inline_commits.remove(&inline_commit_key(app, idx));
             }
             let seed = inline_seed_viewport(app, screen_w, screen_h);
             terminal.set_viewport_area(seed);
@@ -2143,7 +1967,23 @@ where
                 .line_count(screen_w)
                 .min(u16::MAX as usize) as u16
         };
-        let live_h = active_h.saturating_add(composer_h).min(screen_h).max(composer_h);
+        // Overlays need viewport rows to exist in: the slash menu anchors
+        // above the composer (reserve its height so it isn't clipped at the
+        // viewport edge), and the /help overlay centers on the whole screen.
+        let slash_menu_h = if slash_active(app) && !app.help_visible {
+            (filtered_slash(app).len() as u16 + 2).min(8)
+        } else {
+            0
+        };
+        let live_h = if app.help_visible {
+            screen_h
+        } else {
+            active_h
+                .saturating_add(composer_h)
+                .saturating_add(slash_menu_h)
+                .min(screen_h)
+                .max(composer_h)
+        };
         let viewport = Rect::new(0, screen_h.saturating_sub(live_h), screen_w, live_h);
         let vp_changed = prev_vp.is_some_and(|p| p != viewport);
         let prev_top = prev_vp.map(|p| p.y);
@@ -2189,6 +2029,16 @@ where
                 .then(|| single_agent_composer_top_titles(app, &views, &order));
             let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
             draw_composer_inline(f, composer_area, app, top_titles, bottom_title);
+            // Overlays — the inline view must render these itself (the
+            // alt-screen `draw()` path is not in play while zoomed): the
+            // slash-completion menu anchored above the composer, and the
+            // /help overlay over the whole (expanded) viewport.
+            if slash_active(app) && !app.help_visible {
+                render_slash_menu(f.buffer, composer_area, app);
+            }
+            if app.help_visible {
+                render_help_overlay(f.buffer, area, app);
+            }
         })?;
 
         if poll_tui_input(app)? {
@@ -2249,7 +2099,7 @@ fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
     while let Ok(ev) = signals.try_recv() {
         handle_tail(app, ev);
     }
-    drain_focused_transcript(app);
+    sync_focused_tail(app);
     let mut notes = Vec::new();
     while let Ok(note) = app.classifier_rx.try_recv() {
         notes.push(note);
@@ -2321,6 +2171,18 @@ fn reset_inline_commit_state(app: &mut App) {
     app.inline_commits.clear();
 }
 
+/// Key for [`App::inline_commits`]: the session transcript path when the
+/// daemon has resolved one, else the task id. Path-keyed cursors survive a
+/// resume (new task id, same session file), so committed scrollback is not
+/// re-emitted — the old wipe/duplicate seam.
+fn inline_commit_key(app: &App, idx: usize) -> String {
+    app.agents[idx]
+        .task
+        .snapshot()
+        .transcript_path
+        .unwrap_or_else(|| app.agents[idx].task.id())
+}
+
 fn commit_inline_history<B>(
     app: &mut App,
     terminal: &mut custom_terminal::Terminal<B>,
@@ -2332,7 +2194,7 @@ fn commit_inline_history<B>(
 where
     B: ratatui::backend::Backend + Write,
 {
-    let id = app.agents[idx].task.id();
+    let id = inline_commit_key(app, idx);
     let cursor = app.inline_commits.get(&id).copied().unwrap_or_default();
 
     let mut lines = Vec::new();
@@ -2428,23 +2290,6 @@ fn handle_tail(app: &mut App, ev: TailEvent) {
     // identity and (on first observed mismatch) surface a
     // one-time durable cockpit line — see App::refresh_daemon_build_health.
     app.refresh_daemon_build_health();
-    // The daemon's tail broadcast carries lifecycle markers only — per-task
-    // envelope events never flow on the focused stream's live lane, and the
-    // daemon-backed client emits only payload-free RosterChanged signals. So
-    // watch the focused task's status across roster refreshes: on its first
-    // transition to a terminal status the snapshot we hold is stale (it
-    // predates the final assistant turn) — refetch it so the closing response
-    // renders instead of leaving the transcript frozen mid-turn.
-    if let Some(task_id) = app.focused_agent_id.clone()
-        && !app.focused_seen_terminal
-        && let Some(agent) = app.agents.iter().find(|a| a.task.id() == task_id)
-        && agent.task.snapshot().status.is_terminal()
-    {
-        stop_focused_transcript(app);
-        start_focused_transcript(app, task_id);
-        app.focused_seen_terminal = true;
-        app.set_status("agent finished", Duration::from_secs(4));
-    }
     match ev {
         TailEvent::TaskCompleted { cost, .. } => {
             let c = cost.map(|c| format!(" (${c:.4})")).unwrap_or_default();
@@ -2492,7 +2337,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if ctrl && key.code == KeyCode::Char('u') {
         app.clear_input();
         app.prune_armed_until = None;
-        app.steer_armed_until = None;
         return;
     }
     // Ctrl+X: stop a live agent (→ Interrupted), or delete an already-stopped
@@ -2501,7 +2345,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         stop_or_delete_selected(app);
         // Any non-Ctrl+K action disarms the prune confirmation.
         app.prune_armed_until = None;
-        app.steer_armed_until = None;
         return;
     }
     // Ctrl+K: prune all terminal rows from the roster in one action.
@@ -2513,10 +2356,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
     // Any key other than Ctrl+K disarms the prune confirmation.
     app.prune_armed_until = None;
-    // Any key other than Enter disarms the steer-after-terminal confirmation.
-    if key.code != KeyCode::Enter {
-        app.steer_armed_until = None;
-    }
     // Completion carveouts: slash commands and roster @project aliases own Tab
     // and ↑/↓ while their menus are up. Otherwise Tab cycles roster tabs from
     // home, or the current provider / model / effort sub-selector level.
@@ -2620,7 +2459,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // (arrows are claimed by editing, so scroll rides Ctrl).
         KeyCode::Up if ctrl && app.zone == Zone::SingleAgent => {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(1);
-            request_focused_history(app);
         }
         KeyCode::Down if ctrl && app.zone == Zone::SingleAgent => {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1);
@@ -2634,14 +2472,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         KeyCode::PageUp if app.zone == Zone::SingleAgent => {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(page_scroll_step(app));
-            request_focused_history(app);
         }
         KeyCode::PageDown if app.zone == Zone::SingleAgent => {
             app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(page_scroll_step(app));
         }
         KeyCode::Home if app.zone == Zone::SingleAgent => {
             app.scroll_from_bottom = usize::MAX / 2;
-            request_focused_history(app);
         }
         KeyCode::End if app.zone == Zone::SingleAgent => app.scroll_from_bottom = 0,
 
@@ -3151,37 +2987,9 @@ fn submit(app: &mut App) {
             if app.mode.is_standalone() && app.agents.is_empty() {
                 launch_standalone_current_input(app);
             } else {
-                // Terminal-agent guard: if the focused agent is finished /
-                // interrupted, require a confirmation Enter before resuming.
-                // First Enter arms (shows a status line); second Enter within
-                // STEER_ARM_SECS submits. Running agents submit immediately.
-                if let Some(idx) = app.selected_agent() {
-                    let snap = app.agents[idx].task.snapshot();
-                    if snap.status.is_terminal() {
-                        let now = Instant::now();
-                        let agent_id = app.agents[idx].task.id();
-                        let armed = app
-                            .steer_armed_until
-                            .is_some_and(|until| now < until)
-                            && app
-                                .steer_armed_agent_id
-                                .as_deref()
-                                == Some(&agent_id);
-                        if !armed {
-                            app.steer_armed_until =
-                                Some(now + Duration::from_secs(STEER_ARM_SECS));
-                            app.steer_armed_agent_id = Some(agent_id);
-                            app.set_status(
-                                "agent finished — Enter again to resume this session with your message",
-                                Duration::from_secs(STEER_ARM_SECS),
-                            );
-                            return;
-                        }
-                        // Confirmed — disarm and proceed.
-                        app.steer_armed_until = None;
-                        app.steer_armed_agent_id = None;
-                    }
-                }
+                // Running agents are steered; terminal agents are resumed.
+                // Either way one Enter submits — typing a message is already
+                // a deliberate act, so no arm-confirm in the chat flow.
                 steer_selected(app);
             }
         }
@@ -3943,8 +3751,10 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
     // Repoint the stable identities at the resumed task's fresh id, or the
     // single-agent view and roster cursor would lose this agent.
     if app.focused_agent_id.as_deref() == Some(outcome.agent_id.as_str()) {
+        // Same session → same transcript file; the per-tick sync_focused_tail
+        // keeps the attachment (and the path-keyed commit cursor) untouched,
+        // so the zoom transcript carries straight across the task swap.
         app.focused_agent_id = Some(new_id.clone());
-        start_focused_transcript(app, new_id.clone());
     }
     if app.roster_anchor_id.as_deref() == Some(outcome.agent_id.as_str()) {
         app.roster_anchor_id = Some(new_id.clone());
@@ -4159,7 +3969,7 @@ fn zoom_left(app: &mut App) {
             app.anchor_roster_selection();
         }
         app.focused_agent_id = None;
-        stop_focused_transcript(app);
+        app.focused_tail = None;
     }
     app.zone = match app.zone {
         Zone::SingleAgent => Zone::Roster,
@@ -4253,8 +4063,8 @@ fn zoom_right(app: &mut App) {
             if let Some(idx) = app.selected_agent() {
                 let task_id = app.agents[idx].task.id();
                 app.focused_agent_id = Some(task_id.clone());
-                start_focused_transcript(app, task_id);
                 app.zone = Zone::SingleAgent;
+                sync_focused_tail(app);
                 app.scroll_from_bottom = 0;
                 app.history_cursor = None;
             }
@@ -5466,6 +5276,7 @@ mod highlight;
 #[allow(dead_code)]
 mod custom_terminal;
 mod insert_history;
+mod transcript_tail;
 mod closeout;
 mod composer_history;
 mod instance_lock;

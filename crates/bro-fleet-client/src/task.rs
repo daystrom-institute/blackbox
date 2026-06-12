@@ -50,6 +50,11 @@ pub struct TaskInner {
     pub origin: Origin,
     pub managed_worktree: Option<String>,
     pub workflow_owned: bool,
+    /// Daemon-resolved path of the session's append-only transcript event
+    /// log. The zoom view attaches to this file directly (same-host by
+    /// design); resume keeps the same session file, so the transcript view
+    /// carries across task swaps with no cursor reconciliation.
+    pub transcript_path: Option<String>,
 }
 
 pub struct Task {
@@ -213,6 +218,7 @@ fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
             origin: task.origin,
             managed_worktree: task.managed_worktree,
             workflow_owned: task.workflow_owned,
+            transcript_path: task.transcript_path,
         }),
         notify: Arc::new(Notify::new()),
     })
@@ -243,6 +249,9 @@ fn update_task_from_roster(existing: &Task, task: RosterSummaryV1) {
     inner.origin = task.origin;
     inner.managed_worktree = task.managed_worktree;
     inner.workflow_owned = task.workflow_owned;
+    if task.transcript_path.is_some() {
+        inner.transcript_path = task.transcript_path;
+    }
     // Propagate daemon-reported error teaser into stderr so the
     // fleet TUI can render it in the zoom view. Only overwrite when
     // the daemon provides a teaser; a local synthetic error (from
@@ -282,6 +291,7 @@ mod tests {
             report_full: None,
             interrupted: false,
             error_teaser: None,
+            transcript_path: None,
         }
     }
 

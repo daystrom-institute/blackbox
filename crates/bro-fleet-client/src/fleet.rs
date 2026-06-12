@@ -12,7 +12,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
@@ -30,10 +29,8 @@ use crate::task::{RosterApply, Task, TaskInner, TaskStore, now_ms};
 // enum on the client side.
 pub use bro_core::Provider;
 pub use bro_protocol::{
-    CloseoutOutcome, CloseoutRequest, DispatchSpec, FocusedTranscriptLiveEventV1,
-    FocusedTranscriptMemoryEventV1, FocusedTranscriptSnapshotV1, ResumeSpec, RosterDelta,
-    RosterSnapshotV1, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptHistoryPageV1,
-    TranscriptItem,
+    CloseoutOutcome, CloseoutRequest, DispatchSpec, ResumeSpec, RosterDelta, RosterSnapshotV1,
+    TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptItem,
 };
 
 /// TUI-local fleet config — `fleet.json` beside the selected blackbox
@@ -551,6 +548,7 @@ impl AgentHandle {
             origin: bro_core::Origin::Unknown,
             managed_worktree: None,
             workflow_owned: false,
+            transcript_path: None,
         };
         AgentHandle {
             task: Arc::new(Task {
@@ -679,6 +677,7 @@ impl AgentHandle {
             origin: inner.origin,
             managed_worktree: inner.managed_worktree.clone(),
             workflow_owned: inner.workflow_owned,
+            transcript_path: inner.transcript_path.clone(),
         }
     }
 
@@ -979,6 +978,10 @@ pub struct TaskSnapshot {
     pub managed_worktree: Option<String>,
     /// True when a workflow or atom owns this task's lifecycle.
     pub workflow_owned: bool,
+    /// Daemon-resolved path of the session's append-only transcript event
+    /// log (`<sid>.events.jsonl`). The zoom view attaches to this file
+    /// directly; same file across resumes of the session.
+    pub transcript_path: Option<String>,
 }
 
 /// Harness-envelope state derived from the raw stream-json buffer.
@@ -1240,57 +1243,6 @@ impl DaemonFleetClient {
             .error_for_status()?)
     }
 
-    async fn open_focused_transcript_stream(
-        &self,
-        task_id: &str,
-    ) -> anyhow::Result<reqwest::Response> {
-        Ok(self
-            .stream_http
-            .get(self.endpoint(&format!("/control/transcript/{task_id}/stream")))
-            .send()
-            .await?
-            .error_for_status()?)
-    }
-
-    async fn get_focused_transcript_history(
-        &self,
-        task_id: &str,
-        from_cursor: u64,
-        limit: usize,
-    ) -> anyhow::Result<TranscriptHistoryPageV1> {
-        let resp = self
-            .http
-            .get(self.endpoint(&format!("/control/transcript/{task_id}")))
-            .query(&[("from_cursor", from_cursor.to_string()), ("limit", limit.to_string())])
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
-    }
-
-    async fn stream_focused_transcript(
-        &self,
-        task_id: String,
-        tx: Sender<FocusedTranscriptStreamEvent>,
-    ) -> anyhow::Result<()> {
-        let mut response = self.open_focused_transcript_stream(&task_id).await?;
-        let mut buffer = String::new();
-        while let Some(chunk) = response.chunk().await? {
-            let text = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
-            buffer.push_str(&text);
-            while let Some(idx) = buffer.find("\n\n") {
-                let frame: String = buffer.drain(..idx + 2).collect();
-                if let Some(item) = parse_focused_transcript_sse_frame(&frame) {
-                    if tx.send(item).is_err() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn dispatch(&self, spec: DispatchSpec) -> AgentHandle {
         let body = dispatch_body(&spec);
         let value = block_on_fleet_http(self.post_json("/control/exec", body))
@@ -1504,6 +1456,7 @@ fn daemon_task(
             origin: bro_core::Origin::Cockpit,
             managed_worktree: None,
             workflow_owned: false,
+            transcript_path: None,
         }),
         notify: Arc::new(Notify::new()),
     })
@@ -1524,81 +1477,6 @@ impl RosterTransport for DaemonFleetClient {
 #[derive(Debug, Clone, Copy)]
 struct RosterSubscriptionState {
     last_seq: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum FocusedTranscriptStreamEvent {
-    Snapshot(FocusedTranscriptSnapshotV1),
-    Event(FocusedTranscriptLiveEventV1),
-    Resync {
-        reason: Option<String>,
-        skipped: Option<u64>,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct FocusedTranscriptBuffer {
-    events: BTreeMap<u64, Value>,
-    live_cursor: Option<u64>,
-    memory_start_cursor: u64,
-    next_memory_cursor: u64,
-    history_jsonl_path: Option<String>,
-    resync_required: bool,
-}
-
-impl FocusedTranscriptBuffer {
-    pub fn apply_snapshot(&mut self, snapshot: FocusedTranscriptSnapshotV1) {
-        self.events.clear();
-        self.live_cursor = Some(snapshot.live_cursor);
-        self.memory_start_cursor = snapshot.memory_start_cursor;
-        self.next_memory_cursor = snapshot.next_memory_cursor;
-        self.history_jsonl_path = snapshot.history_jsonl_path;
-        self.resync_required = false;
-        for item in snapshot.events {
-            self.events.insert(item.cursor, item.event);
-        }
-    }
-
-    pub fn apply_live_event(&mut self, event: FocusedTranscriptLiveEventV1) -> bool {
-        if self.live_cursor.is_some_and(|cursor| event.cursor <= cursor) {
-            return false;
-        }
-        self.live_cursor = Some(event.cursor);
-        self.next_memory_cursor = self.next_memory_cursor.max(event.cursor.saturating_add(1));
-        self.events.insert(event.cursor, event.event);
-        true
-    }
-
-    pub fn apply_history_page(&mut self, page: TranscriptHistoryPageV1) -> bool {
-        let mut changed = false;
-        for item in page.events {
-            changed |= self.events.insert(item.cursor, item.event).is_none();
-        }
-        if changed {
-            self.memory_start_cursor = self.events.keys().next().copied().unwrap_or(0);
-        }
-        changed
-    }
-
-    pub fn mark_resync_required(&mut self) {
-        self.resync_required = true;
-    }
-
-    pub fn resync_required(&self) -> bool {
-        self.resync_required
-    }
-
-    pub fn history_jsonl_path(&self) -> Option<&str> {
-        self.history_jsonl_path.as_deref()
-    }
-
-    pub fn earliest_cursor(&self) -> Option<u64> {
-        self.events.keys().next().copied()
-    }
-
-    pub fn events(&self) -> Vec<Value> {
-        self.events.values().cloned().collect()
-    }
 }
 
 async fn resync_roster_from<T: RosterTransport + ?Sized>(
@@ -1685,29 +1563,6 @@ fn parse_roster_sse_frame(frame: &str) -> Option<RosterSseItem> {
     serde_json::from_str::<RosterDelta>(&data)
         .ok()
         .map(RosterSseItem::Delta)
-}
-
-fn parse_focused_transcript_sse_frame(frame: &str) -> Option<FocusedTranscriptStreamEvent> {
-    let (event_name, data) = parse_sse_frame(frame);
-    match event_name.as_deref() {
-        Some("snapshot") => serde_json::from_str::<FocusedTranscriptSnapshotV1>(&data)
-            .ok()
-            .map(FocusedTranscriptStreamEvent::Snapshot),
-        Some("event") => serde_json::from_str::<FocusedTranscriptLiveEventV1>(&data)
-            .ok()
-            .map(FocusedTranscriptStreamEvent::Event),
-        Some("resync") => {
-            let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
-            Some(FocusedTranscriptStreamEvent::Resync {
-                reason: parsed
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                skipped: parsed.get("skipped").and_then(|v| v.as_u64()),
-            })
-        }
-        _ => None,
-    }
 }
 
 fn emit_roster_changed(tail_tx: &broadcast::Sender<TailEvent>) {
@@ -1993,28 +1848,6 @@ impl FleetOrchestrator {
         Ok(())
     }
 
-    /// Open the focused transcript SSE stream for one zoomed task. The first item
-    /// should be a snapshot; later items are live cursor events or resync signals.
-    pub async fn stream_focused_transcript(
-        &self,
-        task_id: String,
-        tx: Sender<FocusedTranscriptStreamEvent>,
-    ) -> anyhow::Result<()> {
-        self.daemon.stream_focused_transcript(task_id, tx).await
-    }
-
-    /// Fetch a cursor-bounded page from the provider transcript JSONL history.
-    pub async fn transcript_history_page(
-        &self,
-        task_id: &str,
-        from_cursor: u64,
-        limit: usize,
-    ) -> anyhow::Result<TranscriptHistoryPageV1> {
-        self.daemon
-            .get_focused_transcript_history(task_id, from_cursor, limit)
-            .await
-    }
-
     /// Subscribe to client-local roster-change/terminal signals. Each call
     /// returns an independent receiver; the cockpit forwards these into its
     /// sync TUI loop.
@@ -2221,52 +2054,6 @@ mod tests {
         assert_eq!(STREAM_HTTP_TIMEOUTS.connect, Duration::from_secs(10));
         assert_eq!(STREAM_HTTP_TIMEOUTS.total, None);
         assert_eq!(UNARY_HTTP_TIMEOUTS.total, Some(Duration::from_secs(180)));
-    }
-
-    #[test]
-    fn focused_transcript_snapshot_then_cursor_apply() {
-        let mut buffer = FocusedTranscriptBuffer::default();
-        buffer.apply_snapshot(FocusedTranscriptSnapshotV1 {
-            task_id: bro_core::TaskId::new("task-1"),
-            session_id: Some(bro_core::SessionId::new("session-1")),
-            provider: Provider::Brodex,
-            status: TaskStatus::Running,
-            live_cursor: 2,
-            memory_start_cursor: 0,
-            next_memory_cursor: 3,
-            events: vec![
-                bro_protocol::FocusedTranscriptMemoryEventV1 {
-                    cursor: 0,
-                    event: json!({ "type": "user", "message": { "content": "hi" } }),
-                },
-                bro_protocol::FocusedTranscriptMemoryEventV1 {
-                    cursor: 1,
-                    event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "one" }] } }),
-                },
-                bro_protocol::FocusedTranscriptMemoryEventV1 {
-                    cursor: 2,
-                    event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "two" }] } }),
-                },
-            ],
-            history_jsonl_path: Some("/tmp/task.jsonl".to_string()),
-        });
-
-        assert_eq!(buffer.events().len(), 3);
-        assert!(!buffer.apply_live_event(FocusedTranscriptLiveEventV1 {
-            task_id: bro_core::TaskId::new("task-1"),
-            cursor: 2,
-            event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "stale" }] } }),
-        }));
-        assert_eq!(buffer.events().len(), 3);
-        assert!(buffer.apply_live_event(FocusedTranscriptLiveEventV1 {
-            task_id: bro_core::TaskId::new("task-1"),
-            cursor: 3,
-            event: json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "three" }] } }),
-        }));
-
-        let events = buffer.events();
-        assert_eq!(events.len(), 4);
-        assert_eq!(events[3]["message"]["content"][0]["text"], "three");
     }
 
     #[test]
@@ -2706,6 +2493,7 @@ mod tests {
             report_full: None,
             interrupted: false,
             error_teaser: None,
+            transcript_path: None,
         }
     }
 
@@ -2990,102 +2778,5 @@ mod tests {
         assert_eq!(policy.on_fail, HookOnFail::Warn);
         assert_eq!(policy.timeout_secs, 600);
         assert!(policy.cwd.is_none());
-    }
-
-    /// Two-revision regression for the partial-duplicate tool-call bug
-    /// (thread-c3f7c7e3).  When a live event adds content blocks to the
-    /// active turn, `parse_transcript` sees a longer item list on the second
-    /// call.  The committed-scrollback watermark must keep ALL in-progress
-    /// items in the live region — committing them mid-turn produces a
-    /// truncated tool_use fragment in scrollback alongside the complete
-    /// version in the live area.
-    #[test]
-    fn parse_transcript_two_revision_live_event_sequence() {
-        use bro_core::TaskId;
-
-        let mut buffer = FocusedTranscriptBuffer::default();
-
-        // ── Revision 1: one completed turn + start of a second turn ──
-        buffer.apply_snapshot(FocusedTranscriptSnapshotV1 {
-            task_id: TaskId::new("task-revseq"),
-            session_id: None,
-            provider: Provider::Glm,
-            status: TaskStatus::Running,
-            live_cursor: 4,
-            memory_start_cursor: 0,
-            next_memory_cursor: 5,
-            events: vec![
-                FocusedTranscriptMemoryEventV1 {
-                    cursor: 0,
-                    event: json!({"type":"user","message":{"role":"user","content":"go"}}),
-                },
-                FocusedTranscriptMemoryEventV1 {
-                    cursor: 1,
-                    event: json!({"type":"assistant","message":{"content":[
-                        {"type":"text","text":"on it"},
-                        {"type":"tool_use","id":"t1","name":"shell_run","input":{"command":"ls"}}
-                    ]}}),
-                },
-                FocusedTranscriptMemoryEventV1 {
-                    cursor: 2,
-                    event: json!({"type":"user","message":{"role":"user","content":[
-                        {"type":"tool_result","tool_use_id":"t1","content":"file.txt","is_error":false}
-                    ]}}),
-                },
-                FocusedTranscriptMemoryEventV1 {
-                    cursor: 3,
-                    event: json!({"type":"result","subtype":"success","num_turns":1}),
-                },
-                FocusedTranscriptMemoryEventV1 {
-                    cursor: 4,
-                    event: json!({"type":"user","message":{"role":"user","content":"more"}}),
-                },
-            ],
-            history_jsonl_path: None,
-        });
-
-        let rev1 = parse_transcript(&buffer.events());
-        // Turn 1: UserSteer, AssistantText, ToolCall, ToolResult, TurnFooter
-        // Turn 2 (active): UserSteer ("more") — no assistant yet.
-        assert_eq!(rev1.len(), 6);
-        assert!(matches!(&rev1[0], TranscriptItem::UserSteer(s) if s == "go"));
-        assert!(matches!(&rev1[1], TranscriptItem::AssistantText(..)));
-        assert!(matches!(&rev1[2], TranscriptItem::ToolCall { name, .. } if name == "shell_run"));
-        assert!(matches!(&rev1[3], TranscriptItem::ToolResult { .. }));
-        assert!(matches!(&rev1[4], TranscriptItem::TurnFooter { .. }));
-        assert!(matches!(&rev1[5], TranscriptItem::UserSteer(s) if s == "more"));
-
-        // At this point, a conservative watermark finds the last TurnFooter at
-        // index 4 and draws the stable/live boundary at index 5 — the "more"
-        // UserSteer stays live (it has no response yet).
-
-        // ── Revision 2: the assistant turn arrives ──
-        buffer.apply_live_event(FocusedTranscriptLiveEventV1 {
-            task_id: TaskId::new("task-revseq"),
-            cursor: 5,
-            event: json!({"type":"assistant","message":{"content":[
-                {"type":"text","text":"doing more"},
-                {"type":"tool_use","id":"t2","name":"shell_run","input":{"command":"pwd"}}
-            ]}}),
-        });
-
-        let rev2 = parse_transcript(&buffer.events());
-        // Now 8 items: original 6 + AssistantText + ToolCall.
-        assert_eq!(rev2.len(), 8);
-        assert!(matches!(&rev2[5], TranscriptItem::UserSteer(s) if s == "more"));
-        assert!(matches!(&rev2[6], TranscriptItem::AssistantText(..)));
-        assert!(matches!(&rev2[7], TranscriptItem::ToolCall { name, .. } if name == "shell_run"));
-
-        // The last TurnFooter is STILL at index 4 — the new assistant turn has
-        // no result yet.  A correct watermark keeps items [5..8] in the live
-        // region; the bug's old `total_items - 1` watermark would have
-        // committed items [5..7] (UserSteer("more") and AssistantText("doing
-        // more")) into scrollback, then re-rendered the last ToolCall at index
-        // 7 in the live area — partial duplicate.
-
-        // Verify the events themselves haven't changed identity:
-        let rev2_again = parse_transcript(&buffer.events());
-        assert_eq!(rev2, rev2_again,
-            "re-parsing the same buffer should be idempotent — items are stable once emitted");
     }
 }
