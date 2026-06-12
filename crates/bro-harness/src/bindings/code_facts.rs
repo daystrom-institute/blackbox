@@ -69,12 +69,71 @@ pub(super) fn read_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+/// One-of `file` / `files` target selection, shared by the multi-file fact
+/// bindings (gap-3ec052ea: per-crate fan-out is the host's job, not a cell
+/// for-loop).
+#[derive(Deserialize)]
+struct FactTargets {
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+}
+
+impl FactTargets {
+    /// `(targets, multi)` — `multi` preserves the single-file return shape
+    /// for `file:` callers while `files:` callers get the batched shape.
+    fn resolve(self, tool: &str) -> Result<(Vec<String>, bool), ToolResult> {
+        match (self.file, self.files) {
+            (Some(f), None) => Ok((vec![f], false)),
+            (None, Some(fs)) if !fs.is_empty() => Ok((fs, true)),
+            (None, Some(_)) => Err(err(format!("{tool}: `files` must be non-empty"))),
+            (Some(_), Some(_)) => Err(err(format!(
+                "{tool}: pass `file` (single) OR `files` (batch), not both"
+            ))),
+            (None, None) => Err(err(format!("{tool}: `file` or `files` is required"))),
+        }
+    }
+}
+
 /// `code.items` — top-level syntax-item inventory with Spans.
 pub struct CodeItems;
 
-#[derive(Deserialize)]
-struct CodeItemsParams {
-    file: String,
+fn items_payload(file: &str, found: &facts::FileItemsFacts) -> Value {
+    let items: Vec<Value> = found
+        .items
+        .iter()
+        .map(|fact| {
+            let item = &fact.item;
+            json!({
+                "name": item.name,
+                "kind": item.kind,
+                "visibility": fact.visibility,
+                "span": Span {
+                    file: file.to_string(),
+                    byte_start: item.byte_start,
+                    byte_end: item.byte_end,
+                    content_sha256: found.content_sha256.clone(),
+                },
+                "trivia_span": Span {
+                    file: file.to_string(),
+                    byte_start: item.leading_trivia_start,
+                    byte_end: item.trailing_trivia_end,
+                    content_sha256: found.content_sha256.clone(),
+                },
+                "line_start": item.line_start,
+                "line_end": item.line_end,
+                "attributes": item.attributes,
+            })
+        })
+        .collect();
+    json!({
+        "file": file,
+        "language": found.language,
+        "content_sha256": found.content_sha256,
+        "source_len": found.source_len,
+        "items": items,
+    })
 }
 
 #[async_trait]
@@ -83,15 +142,15 @@ impl Tool for CodeItems {
         "code.items"
     }
     fn description(&self) -> &str {
-        "Inventory the top-level syntax items of one source file (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans for every item."
+        "Inventory the top-level syntax items of source files (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans for every item. Pass `file` for one file (flat result) or `files` for a host-side batch (per-file results; a bad file becomes an `error` entry, not a failed call)."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative source file path." }
-            },
-            "required": ["file"]
+                "file": { "type": "string", "description": "Workspace-relative source file path (single-file shape)." },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of workspace-relative paths; the host fans out (use instead of a cell for-loop)." }
+            }
         })
     }
     fn annotations(&self) -> ToolAnnotations {
@@ -104,53 +163,108 @@ impl Tool for CodeItems {
         Some(("code".to_string(), "items".to_string()))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let params: CodeItemsParams = match serde_json::from_value(input) {
+        let params: FactTargets = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return err(format!("code.items: {e}")),
         };
-        let path = match resolve(&cx.root, &params.file) {
-            Ok(p) => p,
-            Err(e) => return err(format!("code.items: {e}")),
+        let (targets, multi) = match params.resolve("code.items") {
+            Ok(t) => t,
+            Err(e) => return e,
         };
-        let file = params.file.clone();
-        bro_tools::tool::call_blocking(move || match facts::file_items(&path) {
-            Ok(found) => {
-                let items: Vec<Value> = found
-                    .items
-                    .iter()
-                    .map(|fact| {
-                        let item = &fact.item;
-                        json!({
-                            "name": item.name,
-                            "kind": item.kind,
-                            "visibility": fact.visibility,
-                            "span": Span {
-                                file: file.clone(),
-                                byte_start: item.byte_start,
-                                byte_end: item.byte_end,
-                                content_sha256: found.content_sha256.clone(),
-                            },
-                            "trivia_span": Span {
-                                file: file.clone(),
-                                byte_start: item.leading_trivia_start,
-                                byte_end: item.trailing_trivia_end,
-                                content_sha256: found.content_sha256.clone(),
-                            },
-                            "line_start": item.line_start,
-                            "line_end": item.line_end,
-                            "attributes": item.attributes,
-                        })
-                    })
-                    .collect();
-                ToolResult::Json(json!({
-                    "file": file,
-                    "language": found.language,
-                    "content_sha256": found.content_sha256,
-                    "source_len": found.source_len,
-                    "items": items,
-                }))
+        let mut resolved = Vec::with_capacity(targets.len());
+        for file in targets {
+            match resolve(&cx.root, &file) {
+                Ok(p) => resolved.push((file, p)),
+                Err(e) => return err(format!("code.items: {file}: {e}")),
             }
-            Err(e) => err(format!("code.items: {e:#}")),
+        }
+        bro_tools::tool::call_blocking(move || {
+            if !multi {
+                let (file, path) = &resolved[0];
+                return match facts::file_items(path) {
+                    Ok(found) => ToolResult::Json(items_payload(file, &found)),
+                    Err(e) => err(format!("code.items: {e:#}")),
+                };
+            }
+            let files: Vec<Value> = resolved
+                .iter()
+                .map(|(file, path)| match facts::file_items(path) {
+                    Ok(found) => items_payload(file, &found),
+                    Err(e) => json!({ "file": file, "error": format!("{e:#}") }),
+                })
+                .collect();
+            ToolResult::Json(json!({ "files": files }))
+        })
+        .await
+    }
+}
+
+/// `code.files` — enumerate the tree-sitter-supported source files of the
+/// working set (gap-3ec052ea's original ask: fact pipelines self-contained,
+/// no tools.glob bootstrap).
+pub struct CodeFiles;
+
+#[derive(Deserialize)]
+struct CodeFilesParams {
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[async_trait]
+impl Tool for CodeFiles {
+    fn name(&self) -> &str {
+        "code.files"
+    }
+    fn description(&self) -> &str {
+        "Enumerate the source files the code.* facts can parse (pure walk; skips dot-dirs and target/node_modules/build/dist/vendor). Optional `dir` narrows to a subdirectory, `language` to one language (e.g. \"rust\", \"java\"). Feed the result straight into code.items({files}) / code.query({files})."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "dir": { "type": "string", "description": "Workspace-relative subdirectory to enumerate (default: the whole workspace)." },
+                "language": { "type": "string", "description": "Restrict to one language name, as reported by code.items (e.g. \"rust\")." }
+            }
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("code".to_string(), "files".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: CodeFilesParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.files: {e}")),
+        };
+        // Confine `dir` exactly like file targets.
+        if let Some(dir) = &params.dir
+            && let Err(e) = resolve(&cx.root, dir)
+        {
+            return err(format!("code.files: {dir}: {e}"));
+        }
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            match facts::source_files(&root, params.dir.as_deref(), params.language.as_deref()) {
+                Ok((files, truncated)) => {
+                    let entries: Vec<Value> = files
+                        .iter()
+                        .map(|f| json!({ "file": f.file, "language": f.language }))
+                        .collect();
+                    ToolResult::Json(json!({
+                        "files": entries,
+                        "count": entries.len(),
+                        "truncated": truncated,
+                    }))
+                }
+                Err(e) => err(format!("code.files: {e:#}")),
+            }
         })
         .await
     }
@@ -161,7 +275,8 @@ pub struct CodeQuery;
 
 #[derive(Deserialize)]
 struct CodeQueryParams {
-    file: String,
+    #[serde(flatten)]
+    targets: FactTargets,
     query: String,
     #[serde(default)]
     within: Option<WithinRange>,
@@ -179,17 +294,18 @@ impl Tool for CodeQuery {
         "code.query"
     }
     fn description(&self) -> &str {
-        "Run a tree-sitter query over one source file (pure; syntax_only tier). Captures carry hash-anchored Spans. Optionally restrict to matches intersecting a `within` byte range."
+        "Run a tree-sitter query over source files (pure; syntax_only tier). Captures carry hash-anchored Spans. Pass `file` for one file, or `files` for a host-side batch — cross-file symbol search is ONE call (captures from every file in a flat array; each span names its file). `within` restricts to a byte range (single-file only)."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative source file path." },
+                "file": { "type": "string", "description": "Workspace-relative source file path (single-file shape)." },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of workspace-relative paths; the host fans out and returns a flat captures array." },
                 "query": { "type": "string", "description": "Tree-sitter query source, e.g. \"(function_item name: (identifier) @fn_name)\"." },
                 "within": {
                     "type": "object",
-                    "description": "Optional byte range; only matches intersecting it are returned.",
+                    "description": "Optional byte range; only matches intersecting it are returned (single-file only).",
                     "properties": {
                         "byte_start": { "type": "integer", "minimum": 0 },
                         "byte_end": { "type": "integer", "minimum": 0 }
@@ -197,7 +313,7 @@ impl Tool for CodeQuery {
                     "required": ["byte_start", "byte_end"]
                 }
             },
-            "required": ["file", "query"]
+            "required": ["query"]
         })
     }
     fn annotations(&self) -> ToolAnnotations {
@@ -214,44 +330,95 @@ impl Tool for CodeQuery {
             Ok(p) => p,
             Err(e) => return err(format!("code.query: {e}")),
         };
-        let path = match resolve(&cx.root, &params.file) {
-            Ok(p) => p,
-            Err(e) => return err(format!("code.query: {e}")),
+        let (targets, multi) = match params.targets.resolve("code.query") {
+            Ok(t) => t,
+            Err(e) => return e,
         };
-        let file = params.file.clone();
+        if multi && params.within.is_some() {
+            return err("code.query: `within` is single-file only — pass `file`, not `files`");
+        }
+        let mut resolved = Vec::with_capacity(targets.len());
+        for file in targets {
+            match resolve(&cx.root, &file) {
+                Ok(p) => resolved.push((file, p)),
+                Err(e) => return err(format!("code.query: {file}: {e}")),
+            }
+        }
         let query = params.query.clone();
         let within = params.within.map(|w| (w.byte_start, w.byte_end));
         bro_tools::tool::call_blocking(move || {
-            match facts::file_query(&path, &query, within) {
-                Ok(found) => {
-                    let truncated = found.captures.len() >= facts::MAX_QUERY_CAPTURES;
-                    let captures: Vec<Value> = found
-                        .captures
-                        .iter()
-                        .map(|capture| {
-                            json!({
-                                "capture": capture.capture,
-                                "kind": capture.kind,
-                                "text": capture.text,
-                                "span": Span {
-                                    file: file.clone(),
-                                    byte_start: capture.byte_start,
-                                    byte_end: capture.byte_end,
-                                    content_sha256: found.content_sha256.clone(),
-                                },
-                            })
+            let captures_of = |file: &str, found: &facts::FileQueryFacts| -> Vec<Value> {
+                found
+                    .captures
+                    .iter()
+                    .map(|capture| {
+                        json!({
+                            "capture": capture.capture,
+                            "kind": capture.kind,
+                            "text": capture.text,
+                            "span": Span {
+                                file: file.to_string(),
+                                byte_start: capture.byte_start,
+                                byte_end: capture.byte_end,
+                                content_sha256: found.content_sha256.clone(),
+                            },
                         })
-                        .collect();
-                    ToolResult::Json(json!({
-                        "file": file,
-                        "language": found.language,
-                        "content_sha256": found.content_sha256,
-                        "captures": captures,
-                        "truncated": truncated,
-                    }))
-                }
-                Err(e) => err(format!("code.query: {e:#}")),
+                    })
+                    .collect()
+            };
+            if !multi {
+                let (file, path) = &resolved[0];
+                return match facts::file_query(path, &query, within) {
+                    Ok(found) => {
+                        let truncated = found.captures.len() >= facts::MAX_QUERY_CAPTURES;
+                        ToolResult::Json(json!({
+                            "file": file,
+                            "language": found.language,
+                            "content_sha256": found.content_sha256,
+                            "captures": captures_of(file, &found),
+                            "truncated": truncated,
+                        }))
+                    }
+                    Err(e) => err(format!("code.query: {e:#}")),
+                };
             }
+            // Batch: flat captures (spans name their file), per-file roll-up.
+            let mut all_captures: Vec<Value> = Vec::new();
+            let mut file_summaries: Vec<Value> = Vec::new();
+            let mut truncated = false;
+            for (file, path) in &resolved {
+                match facts::file_query(path, &query, None) {
+                    Ok(found) => {
+                        truncated |= found.captures.len() >= facts::MAX_QUERY_CAPTURES;
+                        let captures = captures_of(file, &found);
+                        file_summaries.push(json!({
+                            "file": file,
+                            "language": found.language,
+                            "content_sha256": found.content_sha256,
+                            "captures": captures.len(),
+                        }));
+                        all_captures.extend(captures);
+                    }
+                    Err(e) => {
+                        file_summaries.push(json!({ "file": file, "error": format!("{e:#}") }));
+                    }
+                }
+            }
+            // Every file erroring is one upstream mistake (usually a
+            // malformed query) — fail the call so the cell sees it once,
+            // instead of an empty-but-plausible captures array.
+            if file_summaries.iter().all(|f| f.get("error").is_some()) {
+                let first = file_summaries[0]["error"].as_str().unwrap_or("unknown");
+                return err(format!(
+                    "code.query: all {} file(s) failed; first error: {first}",
+                    file_summaries.len()
+                ));
+            }
+            ToolResult::Json(json!({
+                "captures": all_captures,
+                "files": file_summaries,
+                "truncated": truncated,
+            }))
         })
         .await
     }
@@ -473,6 +640,7 @@ impl Tool for CodeSpanUnion {
 /// The `code.*` binding set.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
+        Arc::new(CodeFiles) as Arc<dyn Tool>,
         Arc::new(CodeItems) as Arc<dyn Tool>,
         Arc::new(CodeQuery) as Arc<dyn Tool>,
         Arc::new(CodeRead) as Arc<dyn Tool>,
@@ -487,15 +655,19 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The five methods below are the complete `code` surface. Independent calls are safe to batch: `const invs = await Promise.all(files.map(f => code.items({ file: f })))`. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public fns returning Result\"): `code.items` → filter `kind === \"function_item\"` (the `visibility` field tells you pub/private already) → `Promise.all(fns.map(f => code.signature({ span: f.span })))` → filter on `return_type`. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
+        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The six methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public fns returning Result\"): `code.items` → filter `kind === \"function_item\"` (the `visibility` field tells you pub/private already) → `Promise.all(fns.map(f => code.signature({ span: f.span })))` → filter on `return_type`. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type SyntaxItemFact = { name?: string; kind: string; visibility?: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
+type QueryCapture = { capture: string; kind: string; text: string; span: Span };
+type FileItems = { file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] };
 declare const code: {
-  /** Inventory the top-level syntax items of one source file. visibility is "pub"/"public"/... or undefined = private. source_len enables whole-file Spans. */
-  items(args: { file: string }): Promise<{ file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] }>;
-  /** Run a tree-sitter query; captures carry hash-anchored Spans. */
-  query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } }): Promise<{ file: string; language: string; content_sha256: string; captures: { capture: string; kind: string; text: string; span: Span }[]; truncated: boolean }>;
+  /** Enumerate parseable source files (skips dot-dirs, target, node_modules, build, dist, vendor). Feed straight into items({files})/query({files}). */
+  files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
+  /** Inventory top-level syntax items. visibility is "pub"/"public"/... or undefined = private. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
+  items(args: { file: string } | { files: string[] }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
+  /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. */
+  query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean }>;
   /** Read the exact text of a Span; errors with stale_span on content drift. */
   read(args: { span: Span }): Promise<{ text: string; span: Span }>;
   /** Signature of the function item at/enclosing a Span (Rust only for now): name, visibility (null = private), params, return_type (null = unit), generics, is_async. Returned span covers the whole function item. Errors with stale_span on drift. */
@@ -681,6 +853,106 @@ mod tests {
             .call(json!({ "spans": [a, cross] }), &cx_in(&root))
             .await;
         assert!(matches!(result, ToolResult::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn files_enumerates_and_filters_by_language_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/B.java"), "class B {}\n").unwrap();
+        std::fs::write(root.join("src/notes.txt"), "not source\n").unwrap();
+        std::fs::write(root.join("target/debug/gen.rs"), "fn skipped() {}\n").unwrap();
+        std::fs::write(root.join(".hidden/h.rs"), "fn hidden() {}\n").unwrap();
+
+        let all = json_of(CodeFiles.call(json!({}), &cx_in(&root)).await);
+        let files: Vec<&str> = all["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["file"].as_str().unwrap())
+            .collect();
+        assert_eq!(files, vec!["src/B.java", "src/a.rs"], "{all}");
+        assert_eq!(all["truncated"], false);
+
+        let rust_only = json_of(
+            CodeFiles
+                .call(json!({ "language": "rust", "dir": "src" }), &cx_in(&root))
+                .await,
+        );
+        assert_eq!(rust_only["count"], 1, "{rust_only}");
+        assert_eq!(rust_only["files"][0]["file"], "src/a.rs");
+    }
+
+    #[tokio::test]
+    async fn items_batches_files_with_per_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub fn b() {}\n").unwrap();
+
+        let out = json_of(
+            CodeItems
+                .call(json!({ "files": ["a.rs", "b.rs", "missing.rs"] }), &cx_in(&root))
+                .await,
+        );
+        let files = out["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3, "{out}");
+        assert_eq!(files[0]["items"][0]["name"], "a");
+        assert_eq!(files[1]["items"][0]["name"], "b");
+        assert!(files[2]["error"].as_str().is_some(), "{out}");
+        // Single-file shape unchanged.
+        let single = json_of(CodeItems.call(json!({ "file": "a.rs" }), &cx_in(&root)).await);
+        assert_eq!(single["file"], "a.rs");
+        assert!(single["items"].is_array());
+    }
+
+    #[tokio::test]
+    async fn query_batch_returns_flat_cross_file_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub fn beta() {}\nfn alpha_caller() { alpha(); }\n").unwrap();
+
+        let out = json_of(
+            CodeQuery
+                .call(
+                    json!({ "files": ["a.rs", "b.rs"], "query": "(function_item name: (identifier) @fn)" }),
+                    &cx_in(&root),
+                )
+                .await,
+        );
+        let captures = out["captures"].as_array().unwrap();
+        let names: Vec<&str> = captures.iter().map(|c| c["text"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "alpha_caller"], "{out}");
+        // Spans name their files and carry per-file hashes.
+        assert_eq!(captures[0]["span"]["file"], "a.rs");
+        assert_eq!(captures[1]["span"]["file"], "b.rs");
+        assert_ne!(
+            captures[0]["span"]["content_sha256"],
+            captures[1]["span"]["content_sha256"]
+        );
+
+        // within + files is an explicit error.
+        let bad = CodeQuery
+            .call(
+                json!({ "files": ["a.rs"], "query": "(function_item) @f", "within": { "byte_start": 0, "byte_end": 5 } }),
+                &cx_in(&root),
+            )
+            .await;
+        assert!(matches!(bad, ToolResult::Error(ref e) if e.contains("single-file")), "{bad:?}");
+
+        // A query failing on every file fails the call once.
+        let broken = CodeQuery
+            .call(
+                json!({ "files": ["a.rs", "b.rs"], "query": "(nonexistent_node) @x" }),
+                &cx_in(&root),
+            )
+            .await;
+        assert!(matches!(broken, ToolResult::Error(ref e) if e.contains("all 2 file(s) failed")), "{broken:?}");
     }
 
     #[tokio::test]

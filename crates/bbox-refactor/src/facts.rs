@@ -213,6 +213,87 @@ pub fn name_span(path: &Path, byte_start: usize, byte_end: usize) -> Result<Opti
     }
 }
 
+/// One enumerated source file.
+#[derive(Debug, Clone)]
+pub struct SourceFileFact {
+    /// Path relative to the enumeration root.
+    pub file: String,
+    pub language: &'static str,
+}
+
+/// Cap on enumerated files, mirroring [`MAX_QUERY_CAPTURES`]'s shape: callers
+/// surface a `truncated` flag instead of unbounded payloads.
+pub const MAX_SOURCE_FILES: usize = 5_000;
+
+/// Enumerate the tree-sitter-supported source files under `root` (optionally
+/// narrowed to `dir`, a root-relative subdirectory, and/or one `language`
+/// name as returned by the other facts). Pure walk of the working set:
+/// skips dot-directories and the conventional build/vendor dirs (`target`,
+/// `node_modules`, `build`, `dist`, `vendor`). Results are sorted, capped at
+/// [`MAX_SOURCE_FILES`] (the bool is `truncated`).
+// Blocking walk by design, like every facts function: callers (the code.files
+// binding) run it on the blocking pool via call_blocking.
+#[allow(clippy::disallowed_methods)]
+pub fn source_files(
+    root: &Path,
+    dir: Option<&str>,
+    language: Option<&str>,
+) -> Result<(Vec<SourceFileFact>, bool)> {
+    const SKIP_DIRS: &[&str] = &["target", "node_modules", "build", "dist", "vendor"];
+    let base = match dir {
+        Some(d) => root.join(d),
+        None => root.to_path_buf(),
+    };
+    if !base.is_dir() {
+        return Err(anyhow!(
+            "`{}` is not a directory under the workspace root",
+            dir.unwrap_or(".")
+        ));
+    }
+    let mut found = Vec::new();
+    let mut stack = vec![base];
+    let mut truncated = false;
+    'walk: while let Some(current) = stack.pop() {
+        let entries = std::fs::read_dir(&current)
+            .map_err(|e| anyhow!("reading {}: {e}", current.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| anyhow!("reading {}: {e}", current.display()))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            let Some(lang) = chunker::code::language_for_path(&path) else {
+                continue;
+            };
+            if let Some(filter) = language
+                && lang != filter
+            {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .map(|r| r.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+            found.push(SourceFileFact {
+                file: rel,
+                language: lang,
+            });
+            if found.len() >= MAX_SOURCE_FILES {
+                truncated = true;
+                break 'walk;
+            }
+        }
+    }
+    found.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok((found, truncated))
+}
+
 /// Parse health of one source file.
 #[derive(Debug, Clone)]
 pub struct ParseCheckFacts {
