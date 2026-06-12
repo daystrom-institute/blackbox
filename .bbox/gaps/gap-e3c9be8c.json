@@ -1,0 +1,19 @@
+{
+  "id": "gap-e3c9be8c",
+  "title": "No spacing-aware item removal: deleting an item with blank-line collapse is byte arithmetic",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools/edit-algebra",
+  "wanted_capability": "A spacing-aware removal primitive — e.g. edits.deleteItem({es, span, collapse: \"before\"|\"after\"|\"both\"}) or a code.leadingTrivia(span) fact — that deletes an item and collapses surrounding blank lines per the one-blank-line-between-items idiom. Tree-sitter emits no blank-line nodes, so cells fall back to trivia_span text inspection and manual byte arithmetic; both mutation probes spent cells on whitespace bookkeeping around the deleted item.",
+  "missing_primitive": "edits.deleteItem with whitespace collapse / code.leadingTrivia",
+  "fallback_used": "Used trivia_span (which merges leading+trailing trivia) plus code.read inspection and hand-computed zero-width spans.",
+  "evidence": [
+    "sessions probe-edits-1/probe-edits-2",
+    "prompts/RETRO_ISOLATE_REFACTOR.md retro findings: spans (point-before), missing-algebra (delete with spacing)"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/spacing-aware-item-removal",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T20:13:16Z",
+  "updated_at": "2026-06-12T20:13:16Z"
+}

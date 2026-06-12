@@ -143,8 +143,45 @@ impl Tool for EditsBegin {
         Some(("edits".to_string(), "begin".to_string()))
     }
     async fn call(&self, _input: Value, _cx: &ToolCx) -> ToolResult {
-        ToolResult::Json(json!({ "es": self.0.begin() }))
+        // A bare string, deliberately: `const es = await edits.begin()` is the
+        // natural cell idiom (probe-edits-1 burned ~6 turns passing a wrapper
+        // object's `{es}` into later calls when this returned an object).
+        ToolResult::Json(Value::String(self.0.begin()))
     }
+}
+
+/// Lenient input normalization for the algebra's two recurring cell
+/// mistakes (probe-edits-1): `es` passed as the begin() result object, and
+/// `span` passed as a JSON-encoded string. Canonical shapes stay documented;
+/// these just absorb the obvious slips instead of bouncing the cell on a
+/// field-nameless serde error.
+fn normalize_algebra_input(mut input: Value) -> Value {
+    if let Some(es) = input.get("es") {
+        if let Some(inner) = es.get("es").and_then(Value::as_str) {
+            let inner = inner.to_string();
+            input["es"] = Value::String(inner);
+        }
+    }
+    if let Some(span) = input.get("span")
+        && let Some(raw) = span.as_str()
+        && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+        && parsed.is_object()
+    {
+        input["span"] = parsed;
+    }
+    input
+}
+
+/// Decode tool params with an error that names the expected shape — serde's
+/// bare "invalid type: map, expected a string" cost probe-edits-1 several
+/// diagnostic cells because it names neither field nor fix.
+fn decode<T: serde::de::DeserializeOwned>(
+    tool: &str,
+    shape: &str,
+    input: Value,
+) -> Result<T, ToolResult> {
+    serde_json::from_value(normalize_algebra_input(input))
+        .map_err(|e| err(format!("{tool}: bad input — expected {shape}; {e}")))
 }
 
 #[derive(Deserialize)]
@@ -187,9 +224,9 @@ macro_rules! span_edit_tool {
                 Some(("edits".to_string(), $method.to_string()))
             }
             async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-                let params: SpanEditParams = match serde_json::from_value(input) {
+                let params: SpanEditParams = match decode($name, "{ es: string, span: Span, text?: string }", input) {
                     Ok(p) => p,
-                    Err(e) => return err(format!("{}: {e}", $name)),
+                    Err(e) => return e,
                 };
                 if $needs_text && params.text.is_none() {
                     return err(format!("{}: `text` is required", $name));
@@ -231,6 +268,19 @@ span_edit_tool!(
     |span: &Span, text: String| TextEdit {
         byte_start: span.byte_end,
         byte_end: span.byte_end,
+        replacement: text,
+    }
+);
+
+span_edit_tool!(
+    EditsInsertBefore,
+    "edits.insertBefore",
+    "insertBefore",
+    "Queue insertion of text immediately before a Span's start (pure; builds, never writes). Use an item's span to place text directly above it — no byte arithmetic.",
+    true,
+    |span: &Span, text: String| TextEdit {
+        byte_start: span.byte_start,
+        byte_end: span.byte_start,
         replacement: text,
     }
 );
@@ -281,9 +331,9 @@ impl Tool for EditsCreateFile {
         Some(("edits".to_string(), "createFile".to_string()))
     }
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let params: CreateFileParams = match serde_json::from_value(input) {
+        let params: CreateFileParams = match decode("edits.createFile", "{ es: string, path: string, content: string }", input) {
             Ok(p) => p,
-            Err(e) => return err(format!("edits.createFile: {e}")),
+            Err(e) => return e,
         };
         let result = self.0.with_set(&params.es, |set| {
             if set.creates.iter().any(|c| c.path == params.path)
@@ -355,9 +405,9 @@ impl Tool for EditsApply {
         Some(("edits".to_string(), "apply".to_string()))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let params: ApplyParams = match serde_json::from_value(input) {
+        let params: ApplyParams = match decode("edits.apply", "{ es: string, validations?: string[] }", input) {
             Ok(p) => p,
-            Err(e) => return err(format!("edits.apply: {e}")),
+            Err(e) => return e,
         };
         let validations = params
             .validations
@@ -545,39 +595,59 @@ impl Tool for EditsApply {
             }
 
             // ---- Success: edit-sink events, consume, summarize ----
-            if let Ok(mut sink) = edit_sink.lock() {
-                for (_file, path, pre_image, _) in &written {
+            // Post-state hashes computed once, used for both the edit sink
+            // and the summary: the Applied result carries the NEW generation's
+            // content_sha256 per file, so follow-up cells can mint fresh Spans
+            // without re-calling code.items (probe-edits-2 retro ask).
+            let written_posts: Vec<(String, PathBuf, Vec<u8>, usize, String)> = written
+                .iter()
+                .map(|(file, path, pre_image, new_len)| {
                     let post = read_file_bytes(path).unwrap_or_default();
+                    let post_sha = sha256_hex(&post);
+                    (file.clone(), path.clone(), pre_image.clone(), *new_len, post_sha)
+                })
+                .collect();
+            let created_posts: Vec<(String, PathBuf, String)> = created
+                .iter()
+                .map(|(file, path)| {
+                    let post = read_file_bytes(path).unwrap_or_default();
+                    (file.clone(), path.clone(), sha256_hex(&post))
+                })
+                .collect();
+            if let Ok(mut sink) = edit_sink.lock() {
+                for (_file, path, pre_image, _, post_sha) in &written_posts {
                     sink.push(bro_tools::edits::EditEvent {
                         path: path.clone(),
                         pre_image: pre_image.clone(),
                         pre_sha256: sha256_hex(pre_image),
-                        post_sha256: sha256_hex(&post),
+                        post_sha256: post_sha.clone(),
                     });
                 }
-                for (_file, path) in &created {
-                    let post = read_file_bytes(path).unwrap_or_default();
+                for (_file, path, post_sha) in &created_posts {
                     sink.push(bro_tools::edits::EditEvent {
                         path: path.clone(),
                         pre_image: Vec::new(),
                         pre_sha256: sha256_hex(&[]),
-                        post_sha256: sha256_hex(&post),
+                        post_sha256: post_sha.clone(),
                     });
                 }
             }
             store.consume(&es_id);
 
-            let summary: Vec<Value> = written
+            let summary: Vec<Value> = written_posts
                 .iter()
-                .map(|(file, _path, pre_image, new_len)| {
+                .map(|(file, _path, pre_image, new_len, post_sha)| {
                     json!({
                         "file": file,
                         "edits": set.files.get(file).map(|a| a.edits.len()).unwrap_or(0),
                         "bytes_before": pre_image.len(),
                         "bytes_after": new_len,
+                        "content_sha256": post_sha,
                     })
                 })
-                .chain(created.iter().map(|(file, _)| json!({ "file": file, "created": true })))
+                .chain(created_posts.iter().map(|(file, _, post_sha)| {
+                    json!({ "file": file, "created": true, "content_sha256": post_sha })
+                }))
                 .collect();
             ToolResult::Json(json!({
                 "applied": true,
@@ -607,6 +677,7 @@ pub fn tools(store: Arc<EditStore>) -> Vec<Arc<dyn Tool>> {
         Arc::new(EditsBegin(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsReplace(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsInsertAfter(Arc::clone(&store))) as Arc<dyn Tool>,
+        Arc::new(EditsInsertBefore(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsDelete(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsCreateFile(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsApply(store)) as Arc<dyn Tool>,
@@ -672,7 +743,7 @@ mod tests {
         let (store, cx) = set_up(&root);
         let (_, beta) = beta_span(&root, &cx).await;
 
-        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)["es"]
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
             .as_str()
             .unwrap()
             .to_string();
@@ -701,13 +772,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_before_places_text_above_item_and_reports_new_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (_, beta) = beta_span(&root, &cx).await;
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        json_of(
+            EditsInsertBefore(store.clone())
+                .call(
+                    json!({ "es": es, "span": beta["span"], "text": "/// The answer precursor.\n" }),
+                    &cx,
+                )
+                .await,
+        );
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        let on_disk = std::fs::read(root.join("probe.rs")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&on_disk).contains("/// The answer precursor.\npub fn beta"),
+            "{}",
+            String::from_utf8_lossy(&on_disk)
+        );
+        // Applied summary carries the NEW generation hash.
+        assert_eq!(
+            result["summary"][0]["content_sha256"],
+            bbox_refactor::sha256_hex(&on_disk),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lenient_inputs_absorb_wrapper_es_and_stringified_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (_, beta) = beta_span(&root, &cx).await;
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The two probe-edits-1 slips: es as the begin() wrapper object shape,
+        // span as a JSON-encoded string.
+        let span_str = serde_json::to_string(&beta["span"]).unwrap();
+        let result = EditsDelete(store)
+            .call(
+                json!({ "es": { "es": es }, "span": span_str }),
+                &cx,
+            )
+            .await;
+        let out = json_of(result);
+        assert_eq!(out["edit_count"], 1, "{out}");
+    }
+
+    #[tokio::test]
     async fn stale_span_bounces_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let (store, cx) = set_up(&root);
         let (_, beta) = beta_span(&root, &cx).await;
 
-        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)["es"]
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
             .as_str()
             .unwrap()
             .to_string();
@@ -740,7 +870,7 @@ mod tests {
         let (store, cx) = set_up(&root);
         let (_, beta) = beta_span(&root, &cx).await;
 
-        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)["es"]
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
             .as_str()
             .unwrap()
             .to_string();
@@ -769,7 +899,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let (store, cx) = set_up(&root);
 
-        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)["es"]
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
             .as_str()
             .unwrap()
             .to_string();
@@ -782,7 +912,7 @@ mod tests {
         assert_eq!(result["applied"], true, "{result}");
         assert!(root.join("newmod.rs").exists());
 
-        let es2 = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)["es"]
+        let es2 = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
             .as_str()
             .unwrap()
             .to_string();
@@ -803,7 +933,7 @@ mod tests {
         let (store, cx) = set_up(&root);
         let (_, beta) = beta_span(&root, &cx).await;
 
-        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)["es"]
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
             .as_str()
             .unwrap()
             .to_string();
@@ -828,18 +958,20 @@ mod tests {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "edits".to_string(),
-        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, invalid_edits, create_exists, parse_error_after_apply, write_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is syntax_only for cell-authored edits."
+        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, invalid_edits, create_exists, parse_error_after_apply, write_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is syntax_only for cell-authored edits."
             .to_string(),
         declarations: r#"type Finding = { kind: "stale_span" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed"; file: string; detail: string; resolution_hint: string };
-type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean }[]; semantic_status: "syntax_only"; validations: { validation: string; status: string; files_checked: number }[] };
+type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; content_sha256: string }[]; semantic_status: "syntax_only"; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation — mint fresh Spans from it without re-calling code.items
 type Bounced = { applied: false; es: string; findings: Finding[]; rolled_back?: boolean; semantic_status: "syntax_only" };
 declare const edits: {
   /** Open a fresh EditSet (host-side, session-scoped; survives across cells by id). */
-  begin(args?: {}): Promise<{ es: string }>;
+  begin(args?: {}): Promise<string>;  // returns the EditSet id directly
   /** Queue replacement of a Span's exact bytes (pure; never writes). */
   replace(args: { es: string; span: Span; text: string }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue insertion immediately after a Span's end (pure; never writes). */
   insertAfter(args: { es: string; span: Span; text: string }): Promise<{ es: string; file: string; edit_count: number }>;
+  /** Queue insertion immediately before a Span's start — place text directly above an item without byte arithmetic (pure; never writes). */
+  insertBefore(args: { es: string; span: Span; text: string }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue deletion of a Span's exact bytes (pure; never writes). */
   delete(args: { es: string; span: Span }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue creation of a new file (pure; never writes; bounces if it exists at apply). */

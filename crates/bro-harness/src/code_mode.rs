@@ -802,7 +802,7 @@ text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
         let source = r#"
 const inv = await code.items({ file: "probe.rs" });
 const fn41 = inv.items.find(i => i.name === "answer");
-const { es } = await edits.begin();
+const es = await edits.begin();
 await edits.replace({ es, span: fn41.span, text: "pub fn answer() -> u8 {\n    42\n}" });
 const r = await edits.apply({ es });
 text(`${r.applied}:${r.semantic_status}:${r.validations[0].status}`);

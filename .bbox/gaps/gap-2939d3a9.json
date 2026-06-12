@@ -1,0 +1,19 @@
+{
+  "id": "gap-2939d3a9",
+  "title": "edits.apply needs a formatter validation mode (rustfmt --check) for cosmetic correctness",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools/edit-algebra",
+  "wanted_capability": "An optional validations entry like \"rustfmt_check\" on edits.apply that runs the language formatter in check mode after the write (alongside tree_sitter_no_errors). Probe-edits-1's first apply was syntactically valid but cosmetically wrong (doc comment separated from its item by a leftover blank line); tree-sitter cannot see whitespace adjacency, so the agent needed a human-eye re-read of the file to catch it. The probe-edits-2 retro explicitly proposed rustfmt integration as the right shape (a niche no_blank_before_doc_comment check was considered and rejected).",
+  "missing_primitive": "edits.apply validations: [\"rustfmt_check\"]",
+  "fallback_used": "Re-read the file after apply and fixed spacing with a second EditSet round.",
+  "evidence": [
+    "sessions probe-edits-1/probe-edits-2 (BRO_HOME=/tmp/refactor-v2-probe/brohome)",
+    "prompts/RETRO_ISOLATE_REFACTOR.md retro finding: edits-apply (cosmetic blank line)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/refactor-tools/apply-formatter-validation",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T20:13:10Z",
+  "updated_at": "2026-06-12T20:13:10Z"
+}

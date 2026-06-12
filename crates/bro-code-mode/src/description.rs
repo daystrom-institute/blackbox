@@ -20,7 +20,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call in flight never triggers a yield; the window restarts when the call returns.
 - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
-- When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
+- When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded. Each `exec` cell is a FRESH scope: locals from earlier cells are gone — redeclare them, or pass values across cells via `store()`/`load()`.
 
 - Global helpers:
 - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
