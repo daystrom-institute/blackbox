@@ -132,6 +132,141 @@ pub fn file_query(
     })
 }
 
+/// One parameter of a function signature.
+#[derive(Debug, Clone)]
+pub struct FnParamFact {
+    /// Binding pattern text (`raw`, `mut workers`, `&self`, …).
+    pub pattern: String,
+    /// Declared type text; `None` for `self` parameters.
+    pub type_text: Option<String>,
+}
+
+/// Signature facts for one function item, extracted from the AST.
+#[derive(Debug, Clone)]
+pub struct FnSignatureFacts {
+    pub name: Option<String>,
+    /// Visibility modifier text (`pub`, `pub(crate)`, …); `None` = private.
+    pub visibility: Option<String>,
+    pub is_async: bool,
+    pub params: Vec<FnParamFact>,
+    /// Return type text without the `->`; `None` = unit.
+    pub return_type: Option<String>,
+    /// Generic parameter list text (`<T: Clone>`); `None` when absent.
+    pub generics: Option<String>,
+    /// Byte range of the resolved function item (may widen a narrower input
+    /// span, e.g. a name identifier, to the whole item).
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub content_sha256: String,
+}
+
+/// Extract the signature of the function item at (or enclosing) the given
+/// byte range. Rust only for now — other languages fail closed with a clear
+/// error rather than guessing at grammar shapes.
+///
+/// When `expected_content_sha256` is set, the file hash is verified BEFORE
+/// the byte range is interpreted — a drifted file must fail as `stale_span`,
+/// never as a confusing "no function_item at range" against the new tree.
+pub fn fn_signature(
+    path: &Path,
+    byte_start: usize,
+    byte_end: usize,
+    expected_content_sha256: Option<&str>,
+) -> Result<FnSignatureFacts> {
+    let parsed = super::parse_source_file(path)?;
+    if let Some(expected) = expected_content_sha256 {
+        let current = sha256_hex(parsed.source.as_bytes());
+        if current != expected {
+            return Err(anyhow!(
+                "stale_span: {} changed since the span was minted (span hash {expected}, current {current}); re-derive the span from fresh facts",
+                path.display()
+            ));
+        }
+    }
+    if parsed.language != "rust" {
+        return Err(anyhow!(
+            "fn_signature supports rust only for now (got {})",
+            parsed.language
+        ));
+    }
+    let len = parsed.source.len();
+    let (start, end) = (byte_start.min(len), byte_end.min(len).max(byte_start.min(len)));
+    let root = parsed.tree.root_node();
+    let mut node = root
+        .named_descendant_for_byte_range(start, end)
+        .ok_or_else(|| anyhow!("no syntax node at byte range {start}..{end}"))?;
+    while node.kind() != "function_item" {
+        let Some(parent) = node.parent() else {
+            return Err(anyhow!(
+                "no function_item at or enclosing byte range {start}..{end} (innermost node kind: {})",
+                parsed
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(start, end)
+                    .map(|n| n.kind())
+                    .unwrap_or("?")
+            ));
+        };
+        node = parent;
+    }
+
+    let text_of = |n: tree_sitter::Node<'_>| -> String {
+        parsed
+            .source
+            .get(n.start_byte()..n.end_byte())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let mut visibility = None;
+    let mut is_async = false;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "visibility_modifier" => visibility = Some(text_of(child)),
+            "function_modifiers" => is_async = text_of(child).contains("async"),
+            _ => {}
+        }
+    }
+
+    let mut params = Vec::new();
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            match parameter.kind() {
+                "parameter" => params.push(FnParamFact {
+                    pattern: parameter
+                        .child_by_field_name("pattern")
+                        .map(text_of)
+                        .unwrap_or_else(|| text_of(parameter)),
+                    type_text: parameter.child_by_field_name("type").map(text_of),
+                }),
+                "self_parameter" => params.push(FnParamFact {
+                    pattern: text_of(parameter),
+                    type_text: None,
+                }),
+                "attribute_item" | "line_comment" | "block_comment" => {}
+                _ => params.push(FnParamFact {
+                    pattern: text_of(parameter),
+                    type_text: None,
+                }),
+            }
+        }
+    }
+
+    Ok(FnSignatureFacts {
+        name: node.child_by_field_name("name").map(text_of),
+        visibility,
+        is_async,
+        params,
+        return_type: node.child_by_field_name("return_type").map(text_of),
+        generics: node.child_by_field_name("type_parameters").map(text_of),
+        byte_start: node.start_byte(),
+        byte_end: node.end_byte(),
+        content_sha256: sha256_hex(parsed.source.as_bytes()),
+    })
+}
+
 #[cfg(test)]
 mod facts_tests {
     use super::*;
@@ -195,6 +330,56 @@ mod facts_tests {
         .unwrap();
         let names: Vec<_> = facts.captures.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(names, vec!["gamma"]);
+    }
+
+    #[test]
+    fn fn_signature_extracts_pub_fn_with_result_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("sig.rs");
+        fs::write(
+            &path,
+            "pub async fn fetch<T: Clone>(id: u32, name: &str) -> Result<T, String> {\n    todo!()\n}\n\nfn private_unit(x: u8) {}\n\npub struct S;\nimpl S {\n    pub fn method(&self, n: usize) -> usize { n }\n}\n",
+        )
+        .unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+
+        let at = source.find("fetch").unwrap();
+        let sig = fn_signature(&path, at, at + 5, None).unwrap();
+        assert_eq!(sig.name.as_deref(), Some("fetch"));
+        assert_eq!(sig.visibility.as_deref(), Some("pub"));
+        assert!(sig.is_async);
+        assert_eq!(sig.generics.as_deref(), Some("<T: Clone>"));
+        assert_eq!(sig.return_type.as_deref(), Some("Result<T, String>"));
+        assert_eq!(sig.params.len(), 2);
+        assert_eq!(sig.params[0].pattern, "id");
+        assert_eq!(sig.params[0].type_text.as_deref(), Some("u32"));
+        assert_eq!(sig.params[1].type_text.as_deref(), Some("&str"));
+        assert_eq!(&source[sig.byte_start..sig.byte_end].split('(').next().unwrap(), &"pub async fn fetch<T: Clone>");
+
+        let at = source.find("private_unit").unwrap();
+        let sig = fn_signature(&path, at, at, None).unwrap();
+        assert_eq!(sig.visibility, None);
+        assert_eq!(sig.return_type, None);
+        assert!(!sig.is_async);
+
+        let at = source.find("method").unwrap();
+        let sig = fn_signature(&path, at, at + 6, None).unwrap();
+        assert_eq!(sig.name.as_deref(), Some("method"));
+        assert_eq!(sig.params[0].pattern, "&self");
+        assert_eq!(sig.params[0].type_text, None);
+        assert_eq!(sig.return_type.as_deref(), Some("usize"));
+    }
+
+    #[test]
+    fn fn_signature_rejects_non_function_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = fixture(&root);
+        let source = fs::read_to_string(&path).unwrap();
+        let at = source.find("struct Alpha").unwrap();
+        let err = fn_signature(&path, at, at + 5, None).unwrap_err();
+        assert!(err.to_string().contains("no function_item"), "got: {err}");
     }
 
     #[test]

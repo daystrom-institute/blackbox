@@ -317,6 +317,83 @@ impl Tool for CodeRead {
     }
 }
 
+/// `code.signature` — extract a function signature from the AST at a Span.
+pub struct CodeSignature;
+
+#[derive(Deserialize)]
+struct CodeSignatureParams {
+    span: Span,
+}
+
+#[async_trait]
+impl Tool for CodeSignature {
+    fn name(&self) -> &str {
+        "code.signature"
+    }
+    fn description(&self) -> &str {
+        "Extract the signature of the function item at (or enclosing) a hash-anchored Span: name, visibility, params, return type, generics, async (pure; syntax_only tier; Rust only for now). Errors with `stale_span` on content drift."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "span": span_schema() },
+            "required": ["span"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("code".to_string(), "signature".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: CodeSignatureParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.signature: {e}")),
+        };
+        let path = match resolve(&cx.root, &params.span.file) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.signature: {e}")),
+        };
+        let span = params.span;
+        bro_tools::tool::call_blocking(move || {
+            match facts::fn_signature(
+                &path,
+                span.byte_start,
+                span.byte_end,
+                Some(&span.content_sha256),
+            ) {
+                Ok(sig) => {
+                    let params_json: Vec<Value> = sig
+                        .params
+                        .iter()
+                        .map(|p| json!({ "pattern": p.pattern, "type": p.type_text }))
+                        .collect();
+                    ToolResult::Json(json!({
+                        "name": sig.name,
+                        "visibility": sig.visibility,
+                        "is_async": sig.is_async,
+                        "params": params_json,
+                        "return_type": sig.return_type,
+                        "generics": sig.generics,
+                        "span": Span {
+                            file: span.file.clone(),
+                            byte_start: sig.byte_start,
+                            byte_end: sig.byte_end,
+                            content_sha256: sig.content_sha256,
+                        },
+                    }))
+                }
+                Err(e) => err(format!("code.signature: {e:#}")),
+            }
+        })
+        .await
+    }
+}
+
 /// `code.spanUnion` — union same-file Spans into one covering Span (pure).
 pub struct CodeSpanUnion;
 
@@ -389,6 +466,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(CodeItems) as Arc<dyn Tool>,
         Arc::new(CodeQuery) as Arc<dyn Tool>,
         Arc::new(CodeRead) as Arc<dyn Tool>,
+        Arc::new(CodeSignature) as Arc<dyn Tool>,
         Arc::new(CodeSpanUnion) as Arc<dyn Tool>,
     ]
 }
@@ -399,7 +477,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The four methods below are the complete `code` surface. Independent calls are safe to batch with `Promise.all`. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that language's grammar."
+        description: "Pure syntax facts over the working set (tree-sitter). Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The five methods below are the complete `code` surface. Independent calls are safe to batch with `Promise.all`. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. Signature predicates (\"public fns returning Result\") compose as: `code.items` → filter `kind === \"function_item\"` → `Promise.all(fns.map(f => code.signature({ span: f.span })))` → filter on `visibility`/`return_type` — prefer that over hand-writing queries. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that language's grammar."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type SyntaxItemFact = { name?: string; kind: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
@@ -410,6 +488,8 @@ declare const code: {
   query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } }): Promise<{ file: string; language: string; content_sha256: string; captures: { capture: string; kind: string; text: string; span: Span }[]; truncated: boolean }>;
   /** Read the exact text of a Span; errors with stale_span on content drift. */
   read(args: { span: Span }): Promise<{ text: string; span: Span }>;
+  /** Signature of the function item at/enclosing a Span (Rust only for now): name, visibility (null = private), params, return_type (null = unit), generics, is_async. Returned span covers the whole function item. Errors with stale_span on drift. */
+  signature(args: { span: Span }): Promise<{ name?: string; visibility?: string; is_async: boolean; params: { pattern: string; type?: string }[]; return_type?: string; generics?: string; span: Span }>;
   /** Union same-file Spans into one covering Span (pure; no I/O). */
   spanUnion(args: { spans: Span[] }): Promise<{ span: Span }>;
 };"#
@@ -490,6 +570,56 @@ mod tests {
         let span = captures[0]["span"].clone();
         let read = json_of(CodeRead.call(json!({ "span": span }), &cx_in(&root)).await);
         assert_eq!(read["text"], "beta");
+    }
+
+    #[tokio::test]
+    async fn signature_extracts_visibility_and_return_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = fixture(&root);
+        let items = json_of(
+            CodeItems
+                .call(json!({ "file": file }), &cx_in(&root))
+                .await,
+        );
+        let beta_span = items["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "beta")
+            .unwrap()["span"]
+            .clone();
+        let sig = json_of(
+            CodeSignature
+                .call(json!({ "span": beta_span }), &cx_in(&root))
+                .await,
+        );
+        assert_eq!(sig["name"], "beta");
+        assert_eq!(sig["visibility"], "pub");
+        assert_eq!(sig["return_type"], "u8");
+        assert_eq!(sig["is_async"], false);
+        assert_eq!(sig["span"]["content_sha256"], items["content_sha256"]);
+    }
+
+    #[tokio::test]
+    async fn signature_fails_closed_on_stale_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = fixture(&root);
+        let items = json_of(
+            CodeItems
+                .call(json!({ "file": file }), &cx_in(&root))
+                .await,
+        );
+        let span = items["items"][1]["span"].clone();
+        std::fs::write(root.join(file), "pub fn mutated() -> u8 { 1 }\n").unwrap();
+        let result = CodeSignature
+            .call(json!({ "span": span }), &cx_in(&root))
+            .await;
+        match result {
+            ToolResult::Error(e) => assert!(e.contains("stale_span"), "got: {e}"),
+            other => panic!("expected stale_span error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
