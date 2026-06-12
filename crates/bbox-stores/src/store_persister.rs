@@ -269,7 +269,16 @@ mod tests {
         store.write().value = 99;
         persister.flush_blocking().unwrap();
 
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // Exact snapshot counts are scheduling-dependent: the burst races the
+        // actor's drain window (run_actor's try_recv loop runs between the
+        // initial persist's file write and the next park), so under load an
+        // extra wakeup can land mid-burst. The invariant is coalescing — far
+        // fewer persists than the 21 requests — not an exact count.
+        let snapshots = count.load(Ordering::SeqCst);
+        assert!(
+            (2..=4).contains(&snapshots),
+            "expected 21 requests to coalesce into 2-4 snapshots, got {snapshots}"
+        );
         let raw = std::fs::read_to_string(&path).unwrap();
         let saved: TestSnapshot = serde_json::from_str(&raw).unwrap();
         assert_eq!(saved.value, 99);
