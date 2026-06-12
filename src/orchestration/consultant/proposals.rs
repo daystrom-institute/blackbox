@@ -8,7 +8,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::types::{
-    BadgeyId, BadgeyProposal, ProposalEvent, ProposalKind, ProposalState, now_rfc3339,
+    ConsultantId, ConsultantProposal, ProposalEvent, ProposalKind, ProposalState, now_rfc3339,
 };
 
 #[derive(Debug)]
@@ -18,7 +18,7 @@ pub enum ProposalStoreError {
     InvalidInstance(String),
     InvalidProposalId(String),
     NotFound {
-        instance_id: BadgeyId,
+        instance_id: ConsultantId,
         proposal_id: String,
     },
     Conflict {
@@ -37,6 +37,8 @@ pub enum ProposalStoreError {
     },
 }
 
+// Error text intentionally keeps the legacy "badgey" wording until the
+// consumer-descriptor phase parameterizes per-consumer wording.
 impl std::fmt::Display for ProposalStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -93,8 +95,10 @@ pub struct ProposalStore {
 }
 
 impl ProposalStore {
-    pub fn new(state_dir: PathBuf) -> Result<Self> {
-        let root = state_dir.join("badgey").join("proposals");
+    /// Open a proposal store rooted at `root`. The caller owns path layout;
+    /// the daemon passes the legacy `state_dir/badgey/proposals` for the
+    /// Badgey consumer so on-disk state is unchanged by the extraction.
+    pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
         Ok(Self { root })
     }
@@ -105,11 +109,11 @@ impl ProposalStore {
 
     pub fn create(
         &self,
-        instance_id: &BadgeyId,
+        instance_id: &ConsultantId,
         kind: ProposalKind,
         draft: serde_json::Value,
         idempotency_key: Option<String>,
-    ) -> Result<BadgeyProposal> {
+    ) -> Result<ConsultantProposal> {
         let dir = self.instance_dir(instance_id)?;
         fs::create_dir_all(&dir)?;
         let _lock = lock_path(&dir.join(".create.lock"))?;
@@ -131,7 +135,7 @@ impl ProposalStore {
         }
 
         let id = next_proposal_id(&dir)?;
-        let proposal = BadgeyProposal::new(
+        let proposal = ConsultantProposal::new(
             id.clone(),
             instance_id.clone(),
             kind,
@@ -142,7 +146,7 @@ impl ProposalStore {
         Ok(proposal)
     }
 
-    pub fn get(&self, instance_id: &BadgeyId, proposal_id: &str) -> Result<Option<BadgeyProposal>> {
+    pub fn get(&self, instance_id: &ConsultantId, proposal_id: &str) -> Result<Option<ConsultantProposal>> {
         let path = self.proposal_path(instance_id, proposal_id)?;
         if !path.exists() {
             return Ok(None);
@@ -152,12 +156,12 @@ impl ProposalStore {
 
     pub fn transition(
         &self,
-        instance_id: &BadgeyId,
+        instance_id: &ConsultantId,
         proposal_id: &str,
         from: ProposalState,
         to: ProposalState,
         note: Option<String>,
-    ) -> Result<BadgeyProposal> {
+    ) -> Result<ConsultantProposal> {
         let path = self.proposal_path(instance_id, proposal_id)?;
         if !path.exists() {
             return Err(ProposalStoreError::NotFound {
@@ -166,7 +170,7 @@ impl ProposalStore {
             });
         }
         let _lock = lock_path(&path.with_extension("lock"))?;
-        let mut proposal: BadgeyProposal = read_json(&path)?;
+        let mut proposal: ConsultantProposal = read_json(&path)?;
         if proposal.state != from {
             return Err(ProposalStoreError::Conflict {
                 proposal_id: proposal_id.to_string(),
@@ -196,10 +200,10 @@ impl ProposalStore {
 
     pub fn set_applied_task_id(
         &self,
-        instance_id: &BadgeyId,
+        instance_id: &ConsultantId,
         proposal_id: &str,
         task_id: String,
-    ) -> Result<BadgeyProposal> {
+    ) -> Result<ConsultantProposal> {
         let path = self.proposal_path(instance_id, proposal_id)?;
         if !path.exists() {
             return Err(ProposalStoreError::NotFound {
@@ -208,7 +212,7 @@ impl ProposalStore {
             });
         }
         let _lock = lock_path(&path.with_extension("lock"))?;
-        let mut proposal: BadgeyProposal = read_json(&path)?;
+        let mut proposal: ConsultantProposal = read_json(&path)?;
         if proposal.state != ProposalState::Applying {
             return Err(ProposalStoreError::Conflict {
                 proposal_id: proposal_id.to_string(),
@@ -222,7 +226,7 @@ impl ProposalStore {
         Ok(proposal)
     }
 
-    pub fn list_by_instance(&self, instance_id: &BadgeyId) -> Result<Vec<BadgeyProposal>> {
+    pub fn list_by_instance(&self, instance_id: &ConsultantId) -> Result<Vec<ConsultantProposal>> {
         let dir = self.instance_dir(instance_id)?;
         if !dir.exists() {
             return Ok(Vec::new());
@@ -234,13 +238,13 @@ impl ProposalStore {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            proposals.push(read_json::<BadgeyProposal>(&path)?);
+            proposals.push(read_json::<ConsultantProposal>(&path)?);
         }
         proposals.sort_by_key(|p| proposal_number(&p.id).unwrap_or(usize::MAX));
         Ok(proposals)
     }
 
-    pub fn list_non_terminal(&self) -> Result<Vec<BadgeyProposal>> {
+    pub fn list_non_terminal(&self) -> Result<Vec<ConsultantProposal>> {
         if !self.root.exists() {
             return Ok(Vec::new());
         }
@@ -250,7 +254,7 @@ impl ProposalStore {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let instance_id = match BadgeyId::from_str(&entry.file_name().to_string_lossy()) {
+            let instance_id = match ConsultantId::from_str(&entry.file_name().to_string_lossy()) {
                 Ok(id) => id,
                 Err(_) => continue,
             };
@@ -263,14 +267,14 @@ impl ProposalStore {
         Ok(proposals)
     }
 
-    fn instance_dir(&self, instance_id: &BadgeyId) -> Result<PathBuf> {
-        if BadgeyId::from_str(instance_id.as_str()).is_err() {
+    fn instance_dir(&self, instance_id: &ConsultantId) -> Result<PathBuf> {
+        if ConsultantId::from_str(instance_id.as_str()).is_err() {
             return Err(ProposalStoreError::InvalidInstance(instance_id.to_string()));
         }
         Ok(self.root.join(instance_id.as_str()))
     }
 
-    fn proposal_path(&self, instance_id: &BadgeyId, proposal_id: &str) -> Result<PathBuf> {
+    fn proposal_path(&self, instance_id: &ConsultantId, proposal_id: &str) -> Result<PathBuf> {
         proposal_path(&self.instance_dir(instance_id)?, proposal_id)
     }
 }
@@ -354,8 +358,8 @@ mod tests {
 
     use super::*;
 
-    fn instance() -> BadgeyId {
-        BadgeyId::from_str("bg-3f7a91c4-91ff04cc").unwrap()
+    fn instance() -> ConsultantId {
+        ConsultantId::from_str("bg-3f7a91c4-91ff04cc").unwrap()
     }
 
     #[test]
@@ -363,7 +367,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ProposalStore::new(tmp.path().to_path_buf()).unwrap();
         let a = instance();
-        let b = BadgeyId::from_str("bg-11111111-22222222").unwrap();
+        let b = ConsultantId::from_str("bg-11111111-22222222").unwrap();
         let pa = store
             .create(&a, ProposalKind::Packet, serde_json::json!({"a": 1}), None)
             .unwrap();

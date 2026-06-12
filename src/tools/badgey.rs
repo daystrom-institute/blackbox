@@ -128,7 +128,7 @@ impl BlackboxServer {
             Ok(id) => id,
             Err(err) => return Self::err_text(&err),
         };
-        let instance = match self.state.badgey_registry.get(&id) {
+        let instance = match self.state.consultant_registry.get(&id) {
             Ok(instance) => instance,
             Err(err) => return Self::err_text(&err.to_string()),
         };
@@ -215,7 +215,7 @@ impl BlackboxServer {
             Ok(parsed) => parsed,
             Err(e) => return Self::err_text(&e),
         };
-        let proposals = match self.state.badgey_proposals.list_by_instance(&id) {
+        let proposals = match self.state.consultant_proposals.list_by_instance(&id) {
             Ok(v) => v,
             Err(e) => return Self::err_text(&format!("listing proposals: {e}")),
         };
@@ -271,7 +271,7 @@ impl BlackboxServer {
         // Resume existing instance when present + still active.
         if let Some(ref bid) = binding.badgey_id {
             if let Ok(parsed) = bid.parse::<orchestration::badgey::types::BadgeyId>() {
-                match self.state.badgey_registry.get(&parsed) {
+                match self.state.consultant_registry.get(&parsed) {
                     Ok(instance) => {
                         return Self::ok_json(&json!({
                             "badgey_id": bid,
@@ -739,7 +739,7 @@ mod tests {
                 .any(|p| p.as_str() == Some("mcp__blackbox__bro_report")),
             "bro_report should remain available for telemetry: {disallow:?}"
         );
-        assert_eq!(server.state.badgey_registry.list().len(), 1);
+        assert_eq!(server.state.consultant_registry.list().len(), 1);
 
         match prior_bin {
             Some(value) => unsafe { std::env::set_var("CODEX_BIN", value) },
@@ -764,7 +764,7 @@ mod tests {
         );
         server
             .state
-            .badgey_registry
+            .consultant_registry
             .register(instance.clone())
             .unwrap();
         let action_id = uuid::Uuid::new_v4().to_string();
@@ -796,7 +796,7 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["proposal_id"], "P-1");
-        let proposals = server.state.badgey_proposals.list_by_instance(&id).unwrap();
+        let proposals = server.state.consultant_proposals.list_by_instance(&id).unwrap();
         assert_eq!(proposals.len(), 1);
         assert_eq!(
             proposals[0].kind,
@@ -805,7 +805,7 @@ mod tests {
         assert!(matches!(
             server
                 .state
-                .badgey_journal
+                .consultant_journal
                 .list_non_terminal()
                 .unwrap()
                 .as_slice(),
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(
             server
                 .state
-                .badgey_proposals
+                .consultant_proposals
                 .list_by_instance(&id)
                 .unwrap()
                 .len(),
@@ -845,7 +845,7 @@ mod tests {
         );
         server
             .state
-            .badgey_registry
+            .consultant_registry
             .register(instance.clone())
             .unwrap();
         let action_id = uuid::Uuid::new_v4().to_string();
@@ -902,7 +902,7 @@ mod tests {
             "codex-session-5".to_string(),
             "thread-00000001".to_string(),
         );
-        server.state.badgey_registry.register(instance).unwrap();
+        server.state.consultant_registry.register(instance).unwrap();
         let draft_path = tmp.path().join("new-bro.json");
         std::fs::write(
             &draft_path,
@@ -916,7 +916,7 @@ mod tests {
         .unwrap();
         let apply_proposal = server
             .state
-            .badgey_proposals
+            .consultant_proposals
             .create(
                 &id,
                 orchestration::badgey::types::ProposalKind::Brofile,
@@ -926,7 +926,7 @@ mod tests {
             .unwrap();
         let reject_proposal = server
             .state
-            .badgey_proposals
+            .consultant_proposals
             .create(
                 &id,
                 orchestration::badgey::types::ProposalKind::Agent,
@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(
             server
                 .state
-                .badgey_proposals
+                .consultant_proposals
                 .get(&id, &apply_proposal.id)
                 .unwrap()
                 .unwrap()
@@ -969,7 +969,7 @@ mod tests {
         assert_eq!(
             server
                 .state
-                .badgey_proposals
+                .consultant_proposals
                 .get(&id, &reject_proposal.id)
                 .unwrap()
                 .unwrap()
@@ -1039,7 +1039,7 @@ mod tests {
             .unwrap();
 
         restore_badgey_registry_from_notes(&server.state);
-        let restored = server.state.badgey_registry.get(&id).unwrap();
+        let restored = server.state.consultant_registry.get(&id).unwrap();
         assert_eq!(restored.thread_of_record_id, thread_id);
         assert_eq!(restored.provider_session_id, "codex-session-6");
     }
@@ -1107,7 +1107,7 @@ mod tests {
         server.state.threads_persister.request();
 
         restore_badgey_registry_from_notes(&server.state);
-        assert!(server.state.badgey_registry.get(&id).is_err());
+        assert!(server.state.consultant_registry.get(&id).is_err());
         assert!(server.state.notes.read().all().iter().any(|note| {
             note.kind == notes::NoteKind::Surprise
                 && note
@@ -1133,7 +1133,7 @@ mod tests {
         );
         server
             .state
-            .badgey_registry
+            .consultant_registry
             .register(instance.clone())
             .unwrap();
         server
@@ -1230,7 +1230,7 @@ mod tests {
             "codex-session-8".to_string(),
             "thread-00000001".to_string(),
         );
-        server.state.badgey_registry.register(instance).unwrap();
+        server.state.consultant_registry.register(instance).unwrap();
         let thread_result = server
             .state
             .threads
@@ -1266,7 +1266,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(triage["proposal_sheet"]["proposals"][0]["stored"], true);
-        let proposals = server.state.badgey_proposals.list_by_instance(&id).unwrap();
+        let proposals = server.state.consultant_proposals.list_by_instance(&id).unwrap();
         assert_eq!(proposals.len(), 1);
         assert_eq!(
             proposals[0].kind,
@@ -1285,7 +1285,7 @@ mod tests {
         let action_id = orchestration::badgey::types::ActionId::new_v4();
         server
             .state
-            .badgey_journal
+            .consultant_journal
             .record_seen(
                 action_id.clone(),
                 "bg-action-spawn-subbro".to_string(),
@@ -1295,7 +1295,7 @@ mod tests {
         let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let proposal = server
             .state
-            .badgey_proposals
+            .consultant_proposals
             .create(
                 &id,
                 orchestration::badgey::types::ProposalKind::RedispatchTask,
@@ -1305,7 +1305,7 @@ mod tests {
             .unwrap();
         server
             .state
-            .badgey_proposals
+            .consultant_proposals
             .transition(
                 &id,
                 &proposal.id,
@@ -1319,7 +1319,7 @@ mod tests {
         assert!(matches!(
             server
                 .state
-                .badgey_journal
+                .consultant_journal
                 .get(&action_id)
                 .unwrap()
                 .unwrap()
@@ -1329,7 +1329,7 @@ mod tests {
         assert_eq!(
             server
                 .state
-                .badgey_proposals
+                .consultant_proposals
                 .get(&id, &proposal.id)
                 .unwrap()
                 .unwrap()

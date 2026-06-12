@@ -11,17 +11,17 @@ impl BlackboxServer {
             let id = self.badgey_parse_id(raw)?;
             let instance = self
                 .state
-                .badgey_registry
+                .consultant_registry
                 .get_including_dismissed(&id)
                 .map_err(|e| e.to_string())?;
             let queue = self
                 .state
-                .badgey_registry
+                .consultant_registry
                 .queue_status(&id)
                 .map_err(|e| e.to_string())?;
             let proposals = self
                 .state
-                .badgey_proposals
+                .consultant_proposals
                 .list_by_instance(&id)
                 .map_err(|e| format!("listing proposals: {e:#}"))?;
             return Ok(json!({
@@ -37,12 +37,12 @@ impl BlackboxServer {
     pub(crate) fn badgey_list_internal(&self, include_dismissed: bool) -> Result<Value, String> {
         let instances: Vec<_> = self
             .state
-            .badgey_registry
+            .consultant_registry
             .list()
             .into_iter()
             .filter(|instance| include_dismissed || !instance.is_dismissed())
             .map(|instance| {
-                let queue = self.state.badgey_registry.queue_status(&instance.id).ok();
+                let queue = self.state.consultant_registry.queue_status(&instance.id).ok();
                 json!({
                     "id": instance.id,
                     "scope": instance.scope,
@@ -66,7 +66,7 @@ impl BlackboxServer {
             let id = self.badgey_parse_id(raw)?;
             Some(
                 self.state
-                    .badgey_registry
+                    .consultant_registry
                     .get_including_dismissed(&id)
                     .map_err(|e| e.to_string())?,
             )
@@ -203,7 +203,7 @@ impl BlackboxServer {
                     .and_then(|raw| self.badgey_parse_id(raw).ok())
                     .and_then(|id| {
                         self.state
-                            .badgey_proposals
+                            .consultant_proposals
                             .create(
                                 &id,
                                 orchestration::badgey::types::ProposalKind::RedispatchTask,

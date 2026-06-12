@@ -206,11 +206,13 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     }
     let task_ttl = cfg.daemon.task_ttl_ms;
     let task_store = TaskStore::load(&store_dir, task_ttl);
-    let badgey_proposals = Arc::new(orchestration::badgey::ProposalStore::new(
-        store_dir.clone(),
+    // Legacy on-disk layout: the Badgey consumer keeps state under
+    // state_dir/badgey/ until the dissolution's migration phase.
+    let consultant_proposals = Arc::new(orchestration::consultant::ProposalStore::new(
+        store_dir.join("badgey").join("proposals"),
     )?);
-    let badgey_journal = Arc::new(orchestration::badgey::ActionJournal::new(
-        store_dir.clone(),
+    let consultant_journal = Arc::new(orchestration::consultant::ActionJournal::new(
+        store_dir.join("badgey").join("action_journal"),
     )?);
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
@@ -284,9 +286,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         arc_cancel_tokens: RwLock::new(HashMap::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         agent_adapter_registry,
-        badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
-        badgey_proposals,
-        badgey_journal,
+        consultant_registry: Arc::new(orchestration::consultant::ConsultantRegistry::new()),
+        consultant_proposals,
+        consultant_journal,
         slack_thread_store: Arc::new(
             slack_thread_store::SlackThreadStore::open(&store_dir)
                 .unwrap_or_else(|e| panic!("opening slack thread store at {store_dir:?}: {e}")),

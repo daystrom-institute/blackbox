@@ -152,7 +152,7 @@ impl BlackboxServer {
                             if let Ok(parsed) =
                                 bid.parse::<orchestration::badgey::types::BadgeyId>()
                             {
-                                match self.state.badgey_registry.dismiss(&parsed) {
+                                match self.state.consultant_registry.dismiss(&parsed) {
                                     Ok(_) => dismissed_badgey = Some(bid.clone()),
                                     Err(e) => tracing::warn!(
                                         badgey_id = %bid,

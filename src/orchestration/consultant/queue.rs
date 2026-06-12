@@ -26,6 +26,8 @@ pub enum QueueError {
     Closed,
 }
 
+// Error text intentionally keeps the legacy "badgey" wording until the
+// consumer-descriptor phase parameterizes per-consumer wording.
 impl std::fmt::Display for QueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

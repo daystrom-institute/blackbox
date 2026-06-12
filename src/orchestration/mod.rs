@@ -3,6 +3,7 @@ pub mod agents;
 pub mod allocator;
 pub mod atoms;
 pub mod badgey;
+pub mod consultant;
 pub mod brofile;
 pub mod capabilities;
 pub mod http_fetch;

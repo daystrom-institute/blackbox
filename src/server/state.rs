@@ -167,9 +167,9 @@ pub(crate) struct SharedState {
         Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
     /// Badgey wrapper state. W1 keeps the live badgey_id mapping in
     /// memory; proposals and action journal are durable in the state dir.
-    pub(crate) badgey_registry: Arc<orchestration::badgey::BadgeyRegistry>,
-    pub(crate) badgey_proposals: Arc<orchestration::badgey::ProposalStore>,
-    pub(crate) badgey_journal: Arc<orchestration::badgey::ActionJournal>,
+    pub(crate) consultant_registry: Arc<orchestration::consultant::ConsultantRegistry>,
+    pub(crate) consultant_proposals: Arc<orchestration::consultant::ProposalStore>,
+    pub(crate) consultant_journal: Arc<orchestration::consultant::ActionJournal>,
     /// Slack thread → claude session_id continuity map. Webhook
     /// `start_arc` looks up the prior session before starting an arc
     /// and seeds it into actor_sessions; the arc writes back when
@@ -487,12 +487,20 @@ impl SharedState {
             agent_adapter_registry: Arc::new(RwLock::new(
                 orchestration::agents::adapter::AgentAdapterRegistry::new(),
             )),
-            badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
-            badgey_proposals: Arc::new(
-                orchestration::badgey::ProposalStore::new(store_dir.to_path_buf()).unwrap(),
+            consultant_registry: Arc::new(orchestration::consultant::ConsultantRegistry::new()),
+            consultant_proposals: Arc::new(
+                // Legacy on-disk layout: the Badgey consumer keeps state under
+                // state_dir/badgey/ until the dissolution's migration phase.
+                orchestration::consultant::ProposalStore::new(
+                    store_dir.join("badgey").join("proposals"),
+                )
+                .unwrap(),
             ),
-            badgey_journal: Arc::new(
-                orchestration::badgey::ActionJournal::new(store_dir.to_path_buf()).unwrap(),
+            consultant_journal: Arc::new(
+                orchestration::consultant::ActionJournal::new(
+                    store_dir.join("badgey").join("action_journal"),
+                )
+                .unwrap(),
             ),
             slack_thread_store: Arc::new(
                 slack_thread_store::SlackThreadStore::open(store_dir).unwrap(),

@@ -7,15 +7,15 @@ use serde::{Deserialize, Serialize};
 use crate::orchestration::providers::Provider;
 
 use super::queue::{PendingTurn, QueueError, QueuePermit, QueueStatus, ResumeQueue};
-use super::types::{BadgeyId, BadgeyScope, now_rfc3339};
+use super::types::{ConsultantId, ConsultantScope, now_rfc3339};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BadgeyInstance {
-    pub id: BadgeyId,
-    pub scope: BadgeyScope,
+pub struct ConsultantInstance {
+    pub id: ConsultantId,
+    pub scope: ConsultantScope,
     pub provider: Provider,
     /// Provider-owned session id observed from the underlying exec
-    /// result. Badgey never generates this value.
+    /// result. The consultant runtime never generates this value.
     pub provider_session_id: String,
     pub thread_of_record_id: String,
     pub created_at: String,
@@ -24,10 +24,10 @@ pub struct BadgeyInstance {
     pub dismissed_at: Option<String>,
 }
 
-impl BadgeyInstance {
+impl ConsultantInstance {
     pub fn new(
-        id: BadgeyId,
-        scope: BadgeyScope,
+        id: ConsultantId,
+        scope: ConsultantScope,
         provider: Provider,
         provider_session_id: String,
         thread_of_record_id: String,
@@ -52,12 +52,14 @@ impl BadgeyInstance {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
-    NotFound { id: BadgeyId },
-    AlreadyExists { id: BadgeyId },
-    Dismissed { id: BadgeyId },
-    QueueRejected { id: BadgeyId, err: QueueError },
+    NotFound { id: ConsultantId },
+    AlreadyExists { id: ConsultantId },
+    Dismissed { id: ConsultantId },
+    QueueRejected { id: ConsultantId, err: QueueError },
 }
 
+// Error text intentionally keeps the legacy "badgey" wording until the
+// consumer-descriptor phase parameterizes per-consumer wording.
 impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -72,17 +74,17 @@ impl std::fmt::Display for RegistryError {
 impl std::error::Error for RegistryError {}
 
 #[derive(Default)]
-pub struct BadgeyRegistry {
-    instances: RwLock<HashMap<BadgeyId, BadgeyInstance>>,
-    queues: RwLock<HashMap<BadgeyId, Arc<ResumeQueue>>>,
+pub struct ConsultantRegistry {
+    instances: RwLock<HashMap<ConsultantId, ConsultantInstance>>,
+    queues: RwLock<HashMap<ConsultantId, Arc<ResumeQueue>>>,
 }
 
-impl BadgeyRegistry {
+impl ConsultantRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn register(&self, instance: BadgeyInstance) -> Result<(), RegistryError> {
+    pub fn register(&self, instance: ConsultantInstance) -> Result<(), RegistryError> {
         let mut instances = self.instances.write();
         if instances.contains_key(&instance.id) {
             return Err(RegistryError::AlreadyExists {
@@ -98,7 +100,7 @@ impl BadgeyRegistry {
         Ok(())
     }
 
-    pub fn get(&self, id: &BadgeyId) -> Result<BadgeyInstance, RegistryError> {
+    pub fn get(&self, id: &ConsultantId) -> Result<ConsultantInstance, RegistryError> {
         let instances = self.instances.read();
         let instance = instances
             .get(id)
@@ -110,7 +112,7 @@ impl BadgeyRegistry {
         Ok(instance)
     }
 
-    pub fn get_including_dismissed(&self, id: &BadgeyId) -> Result<BadgeyInstance, RegistryError> {
+    pub fn get_including_dismissed(&self, id: &ConsultantId) -> Result<ConsultantInstance, RegistryError> {
         self.instances
             .read()
             .get(id)
@@ -118,7 +120,7 @@ impl BadgeyRegistry {
             .ok_or_else(|| RegistryError::NotFound { id: id.clone() })
     }
 
-    pub fn dismiss(&self, id: &BadgeyId) -> Result<BadgeyInstance, RegistryError> {
+    pub fn dismiss(&self, id: &ConsultantId) -> Result<ConsultantInstance, RegistryError> {
         let mut instances = self.instances.write();
         let instance = instances
             .get_mut(id)
@@ -135,13 +137,13 @@ impl BadgeyRegistry {
         Ok(instance.clone())
     }
 
-    pub fn list(&self) -> Vec<BadgeyInstance> {
+    pub fn list(&self) -> Vec<ConsultantInstance> {
         let mut instances: Vec<_> = self.instances.read().values().cloned().collect();
         instances.sort_by(|a, b| a.id.cmp(&b.id));
         instances
     }
 
-    pub fn enqueue_resume(&self, id: &BadgeyId, turn: PendingTurn) -> Result<usize, RegistryError> {
+    pub fn enqueue_resume(&self, id: &ConsultantId, turn: PendingTurn) -> Result<usize, RegistryError> {
         let queue = self.queue_for_active_instance(id)?;
         queue
             .enqueue(turn)
@@ -153,7 +155,7 @@ impl BadgeyRegistry {
 
     pub fn enqueue_priority_resume(
         &self,
-        id: &BadgeyId,
+        id: &ConsultantId,
         turn: PendingTurn,
     ) -> Result<usize, RegistryError> {
         let queue = self.queue_for_active_instance(id)?;
@@ -165,13 +167,13 @@ impl BadgeyRegistry {
             })
     }
 
-    pub fn pop_next_resume(&self, id: &BadgeyId) -> Result<Option<PendingTurn>, RegistryError> {
+    pub fn pop_next_resume(&self, id: &ConsultantId) -> Result<Option<PendingTurn>, RegistryError> {
         Ok(self.queue_for_active_instance(id)?.pop_next())
     }
 
     pub async fn wait_for_resume_turn(
         &self,
-        id: &BadgeyId,
+        id: &ConsultantId,
         turn_id: &str,
     ) -> Result<QueuePermit, RegistryError> {
         let queue = self.queue_for_active_instance(id)?;
@@ -184,18 +186,18 @@ impl BadgeyRegistry {
             })
     }
 
-    pub fn queue_status(&self, id: &BadgeyId) -> Result<QueueStatus, RegistryError> {
+    pub fn queue_status(&self, id: &ConsultantId) -> Result<QueueStatus, RegistryError> {
         Ok(self.queue_for_existing_instance(id)?.status())
     }
 
-    fn queue_for_active_instance(&self, id: &BadgeyId) -> Result<Arc<ResumeQueue>, RegistryError> {
+    fn queue_for_active_instance(&self, id: &ConsultantId) -> Result<Arc<ResumeQueue>, RegistryError> {
         self.get(id)?;
         self.queue_for_existing_instance(id)
     }
 
     fn queue_for_existing_instance(
         &self,
-        id: &BadgeyId,
+        id: &ConsultantId,
     ) -> Result<Arc<ResumeQueue>, RegistryError> {
         self.queues
             .read()
@@ -213,11 +215,11 @@ mod tests {
 
     #[test]
     fn register_lookup_dismiss_marks_instance_unavailable() {
-        let registry = BadgeyRegistry::new();
-        let id = BadgeyId::from_str("bg-3f7a91c4-91ff04cc").unwrap();
-        let instance = BadgeyInstance::new(
+        let registry = ConsultantRegistry::new();
+        let id = ConsultantId::from_str("bg-3f7a91c4-91ff04cc").unwrap();
+        let instance = ConsultantInstance::new(
             id.clone(),
-            BadgeyScope {
+            ConsultantScope {
                 project_id: "proj".to_string(),
                 initial_brief: Some("brief".to_string()),
             },
@@ -245,12 +247,12 @@ mod tests {
 
     #[test]
     fn registry_queue_serializes_resumes_and_closes_on_dismiss() {
-        let registry = BadgeyRegistry::new();
-        let id = BadgeyId::from_str("bg-3f7a91c4-91ff04cc").unwrap();
+        let registry = ConsultantRegistry::new();
+        let id = ConsultantId::from_str("bg-3f7a91c4-91ff04cc").unwrap();
         registry
-            .register(BadgeyInstance::new(
+            .register(ConsultantInstance::new(
                 id.clone(),
-                BadgeyScope {
+                ConsultantScope {
                     project_id: "proj".to_string(),
                     initial_brief: None,
                 },

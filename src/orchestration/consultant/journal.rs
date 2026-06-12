@@ -79,8 +79,10 @@ pub struct ActionJournal {
 }
 
 impl ActionJournal {
-    pub fn new(state_dir: PathBuf) -> Result<Self> {
-        let root = state_dir.join("badgey").join("action_journal");
+    /// Open an action journal rooted at `root`. The caller owns path layout;
+    /// the daemon passes the legacy `state_dir/badgey/action_journal` for the
+    /// Badgey consumer so on-disk state is unchanged by the extraction.
+    pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
         Ok(Self { root })
     }

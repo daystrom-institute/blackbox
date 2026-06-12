@@ -109,12 +109,12 @@ pub(crate) fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
             provider_session_id,
             thread_id,
         );
-        let _ = state.badgey_registry.register(instance);
+        let _ = state.consultant_registry.register(instance);
         if latest_dismissed
             .get(&id)
             .is_some_and(|dismissed_at| *dismissed_at > exec_at)
         {
-            let _ = state.badgey_registry.dismiss(&id);
+            let _ = state.consultant_registry.dismiss(&id);
         }
     }
 }
@@ -122,11 +122,11 @@ pub(crate) fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
 pub(crate) fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
     use orchestration::badgey::types::{ActionJournalState, ProposalState};
 
-    if let Ok(entries) = state.badgey_journal.list_non_terminal() {
+    if let Ok(entries) = state.consultant_journal.list_non_terminal() {
         for entry in entries {
             match entry.state.clone() {
                 ActionJournalState::Seen => {
-                    let _ = state.badgey_journal.transition(
+                    let _ = state.consultant_journal.transition(
                         &entry.action_id,
                         ActionJournalState::Seen,
                         ActionJournalState::Failed {
@@ -156,7 +156,7 @@ pub(crate) fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
                         reason: format!("dispatched task {task_id} not found after restart"),
                     });
                     if !matches!(to, ActionJournalState::Dispatching { .. }) {
-                        let _ = state.badgey_journal.transition(
+                        let _ = state.consultant_journal.transition(
                             &entry.action_id,
                             entry.state,
                             to,
@@ -169,7 +169,7 @@ pub(crate) fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
         }
     }
 
-    if let Ok(proposals) = state.badgey_proposals.list_non_terminal() {
+    if let Ok(proposals) = state.consultant_proposals.list_non_terminal() {
         for proposal in proposals {
             if proposal.state != ProposalState::Applying {
                 continue;
@@ -196,7 +196,7 @@ pub(crate) fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
                 } else {
                     "startup recovery failed orphaned applying proposal"
                 };
-                let _ = state.badgey_proposals.transition(
+                let _ = state.consultant_proposals.transition(
                     &proposal.instance_id,
                     &proposal.id,
                     ProposalState::Applying,

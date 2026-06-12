@@ -112,12 +112,12 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         agent_adapter_registry: Arc::new(RwLock::new(
             orchestration::agents::adapter::AgentAdapterRegistry::new(),
         )),
-        badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
-        badgey_proposals: Arc::new(
-            orchestration::badgey::ProposalStore::new(tmp.path().join("bro")).unwrap(),
+        consultant_registry: Arc::new(orchestration::consultant::ConsultantRegistry::new()),
+        consultant_proposals: Arc::new(
+            orchestration::consultant::ProposalStore::new(tmp.path().join("bro")).unwrap(),
         ),
-        badgey_journal: Arc::new(
-            orchestration::badgey::ActionJournal::new(tmp.path().join("bro")).unwrap(),
+        consultant_journal: Arc::new(
+            orchestration::consultant::ActionJournal::new(tmp.path().join("bro")).unwrap(),
         ),
         slack_thread_store: Arc::new(
             slack_thread_store::SlackThreadStore::open(&tmp.path().join("bro")).unwrap(),

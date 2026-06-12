@@ -40,7 +40,7 @@ impl BlackboxServer {
             .unwrap_or("general consultation");
         let recent_proposals = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .list_by_instance(id)
             .map(|proposals| {
                 proposals
@@ -54,7 +54,7 @@ impl BlackboxServer {
             .unwrap_or_default();
         let queue_status = self
             .state
-            .badgey_registry
+            .consultant_registry
             .queue_status(id)
             .ok()
             .and_then(|status| serde_json::to_string(&status).ok())
@@ -321,7 +321,7 @@ impl BlackboxServer {
             thread_id.clone(),
         );
         self.state
-            .badgey_registry
+            .consultant_registry
             .register(instance.clone())
             .map_err(|e| e.to_string())?;
         let continue_result = self.state.threads.write().thread(&threads::ThreadParams {
@@ -399,7 +399,7 @@ impl BlackboxServer {
             Some(WrapperCommand::ExpandPath(path_id)) => {
                 let instance = self
                     .state
-                    .badgey_registry
+                    .consultant_registry
                     .get(&id)
                     .map_err(|e| e.to_string())?;
                 return match self.badgey_cached_path(&instance.thread_of_record_id, &path_id) {
@@ -426,7 +426,7 @@ impl BlackboxServer {
             Some(WrapperCommand::BudgetExtend) => {
                 let instance = self
                     .state
-                    .badgey_registry
+                    .consultant_registry
                     .get(&id)
                     .map_err(|e| e.to_string())?;
                 self.badgey_action_result_note(
@@ -444,12 +444,12 @@ impl BlackboxServer {
             Some(WrapperCommand::RevertBrofileTo(version)) => {
                 let instance = self
                     .state
-                    .badgey_registry
+                    .consultant_registry
                     .get(&id)
                     .map_err(|e| e.to_string())?;
                 let proposal = self
                     .state
-                    .badgey_proposals
+                    .consultant_proposals
                     .create(
                         &id,
                         orchestration::badgey::types::ProposalKind::Brofile,
@@ -482,7 +482,7 @@ impl BlackboxServer {
             Some(WrapperCommand::TrustSubBro(label)) => {
                 let instance = self
                     .state
-                    .badgey_registry
+                    .consultant_registry
                     .get(&id)
                     .map_err(|e| e.to_string())?;
                 self.badgey_action_result_note(
@@ -501,7 +501,7 @@ impl BlackboxServer {
         }
         let instance = self
             .state
-            .badgey_registry
+            .consultant_registry
             .get(&id)
             .map_err(|e| e.to_string())?;
         if !instance.provider.supports_resume() {
@@ -509,7 +509,7 @@ impl BlackboxServer {
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
         self.state
-            .badgey_registry
+            .consultant_registry
             .enqueue_resume(
                 &id,
                 orchestration::badgey::queue::PendingTurn {
@@ -520,7 +520,7 @@ impl BlackboxServer {
             .map_err(|e| e.to_string())?;
         let _permit = self
             .state
-            .badgey_registry
+            .consultant_registry
             .wait_for_resume_turn(&id, &turn_id)
             .await
             .map_err(|e| e.to_string())?;

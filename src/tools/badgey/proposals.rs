@@ -158,7 +158,7 @@ impl BlackboxServer {
         }
         let proposals = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .list_by_instance(&instance.id)
             .unwrap_or_default();
         let applied = proposals
@@ -336,11 +336,11 @@ impl BlackboxServer {
         })?;
         let entry = self
             .state
-            .badgey_journal
+            .consultant_journal
             .record_seen(action_id.clone(), event.clone(), body)
             .map_err(|e| format!("recording failed action journal: {e}"))?;
         if !entry.state.is_terminal() {
-            let _ = self.state.badgey_journal.transition(
+            let _ = self.state.consultant_journal.transition(
                 &action_id,
                 ActionJournalState::Seen,
                 ActionJournalState::Failed {
@@ -385,7 +385,7 @@ impl BlackboxServer {
             .map_err(|e| format!("invalid action_id {action_id_raw}: {e}"))?;
         let entry = self
             .state
-            .badgey_journal
+            .consultant_journal
             .record_seen(action_id.clone(), event.clone(), body.clone())
             .map_err(|e| format!("recording action journal: {e}"))?;
         if entry.state.is_terminal() {
@@ -409,7 +409,7 @@ impl BlackboxServer {
                             reason: format!("task {task_id} ended with {status:?}"),
                         }
                     };
-                    let _ = self.state.badgey_journal.transition(
+                    let _ = self.state.consultant_journal.transition(
                         &action_id,
                         entry.state.clone(),
                         terminal_state,
@@ -501,7 +501,7 @@ impl BlackboxServer {
                 }
                 let proposal = self
                     .state
-                    .badgey_proposals
+                    .consultant_proposals
                     .create(&instance.id, kind, draft.clone(), idempotency_key)
                     .map_err(|e| format!("creating badgey proposal: {e}"))?;
                 self.badgey_write_event(
@@ -535,7 +535,7 @@ impl BlackboxServer {
                     task_id: task_id.clone(),
                 };
                 self.state
-                    .badgey_journal
+                    .consultant_journal
                     .transition(
                         &action_id,
                         ActionJournalState::Seen,
@@ -553,7 +553,7 @@ impl BlackboxServer {
                     Some(instance.id.as_str()),
                     Some("badgey-scout".to_string()),
                 ) {
-                    let _ = self.state.badgey_journal.transition(
+                    let _ = self.state.consultant_journal.transition(
                         &action_id,
                         dispatching,
                         ActionJournalState::Failed {
@@ -599,7 +599,7 @@ impl BlackboxServer {
         };
 
         self.state
-            .badgey_journal
+            .consultant_journal
             .transition(
                 &action_id,
                 completion_from,
@@ -719,12 +719,12 @@ impl BlackboxServer {
 
         let instance = self
             .state
-            .badgey_registry
+            .consultant_registry
             .get(id)
             .map_err(|e| e.to_string())?;
         let proposal = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .get(id, proposal_id)
             .map_err(|e| format!("reading proposal: {e}"))?
             .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
@@ -750,7 +750,7 @@ impl BlackboxServer {
         let from = proposal.state;
         let applying = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .transition(
                 id,
                 proposal_id,
@@ -832,7 +832,7 @@ impl BlackboxServer {
                     })
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 self.state
-                    .badgey_proposals
+                    .consultant_proposals
                     .set_applied_task_id(id, proposal_id, task_id.clone())
                     .map_err(|e| format!("recording redispatch task id: {e}"))?;
                 self.badgey_spawn_privileged_task(
@@ -904,7 +904,7 @@ impl BlackboxServer {
             Ok(outcome) => {
                 let applied = self
                     .state
-                    .badgey_proposals
+                    .consultant_proposals
                     .transition(
                         id,
                         proposal_id,
@@ -976,7 +976,7 @@ impl BlackboxServer {
                 }))
             }
             Err(err) => {
-                let _ = self.state.badgey_proposals.transition(
+                let _ = self.state.consultant_proposals.transition(
                     id,
                     proposal_id,
                     ProposalState::Applying,
@@ -1021,12 +1021,12 @@ impl BlackboxServer {
 
         let instance = self
             .state
-            .badgey_registry
+            .consultant_registry
             .get(id)
             .map_err(|e| e.to_string())?;
         let proposal = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .get(id, proposal_id)
             .map_err(|e| format!("reading proposal: {e}"))?
             .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
@@ -1072,7 +1072,7 @@ impl BlackboxServer {
         let from = proposal.state;
         let applying = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .transition(
                 id,
                 proposal_id,
@@ -1111,7 +1111,7 @@ impl BlackboxServer {
                 })
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             self.state
-                .badgey_proposals
+                .consultant_proposals
                 .set_applied_task_id(id, proposal_id, task_id.clone())
                 .map_err(|e| format!("recording redispatch task id: {e}"))?;
             return Ok(json!({
@@ -1189,7 +1189,7 @@ impl BlackboxServer {
 
         let instance = self
             .state
-            .badgey_registry
+            .consultant_registry
             .get(id)
             .map_err(|e| e.to_string())?;
         let success = outcome == "completed";
@@ -1201,7 +1201,7 @@ impl BlackboxServer {
             };
             let applied = self
                 .state
-                .badgey_proposals
+                .consultant_proposals
                 .transition(
                     id,
                     proposal_id,
@@ -1273,7 +1273,7 @@ impl BlackboxServer {
                 "actor outcome={outcome}; {}",
                 summary.unwrap_or("no summary")
             );
-            let _ = self.state.badgey_proposals.transition(
+            let _ = self.state.consultant_proposals.transition(
                 id,
                 proposal_id,
                 ProposalState::Applying,
@@ -1300,12 +1300,12 @@ impl BlackboxServer {
 
         let instance = self
             .state
-            .badgey_registry
+            .consultant_registry
             .get(id)
             .map_err(|e| e.to_string())?;
         let current = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .get(id, proposal_id)
             .map_err(|e| format!("reading proposal: {e}"))?
             .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
@@ -1321,7 +1321,7 @@ impl BlackboxServer {
         }
         let rejected = self
             .state
-            .badgey_proposals
+            .consultant_proposals
             .transition(
                 id,
                 proposal_id,
@@ -1354,7 +1354,7 @@ impl BlackboxServer {
         let id = self.badgey_parse_id(badgey_id)?;
         let instance = self
             .state
-            .badgey_registry
+            .consultant_registry
             .dismiss(&id)
             .map_err(|e| e.to_string())?;
         let reason = reason.unwrap_or_else(|| "dismissed by caller".to_string());

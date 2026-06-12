@@ -1,16 +1,29 @@
 #![allow(dead_code)]
 
+//! Badgey: the first configured consumer of the generic consultant runtime
+//! (`orchestration::consultant`). This module keeps the Badgey-specific
+//! vocabulary (thread events, wrapper commands) plus aliased re-exports of the
+//! consultant core under the legacy `badgey::*` paths so consumer call sites
+//! keep compiling during the dissolution.
+//! See design/orchestration/agents/consultant-runtime.md.
+
 pub mod commands;
 pub mod events;
-pub mod journal;
-pub mod proposals;
-pub mod queue;
-pub mod registry;
-pub mod types;
 
-pub use journal::ActionJournal;
-pub use proposals::ProposalStore;
-pub use registry::BadgeyRegistry;
+pub mod types {
+    pub use crate::orchestration::consultant::types::*;
+    pub use crate::orchestration::consultant::types::{
+        ConsultantId as BadgeyId, ConsultantScope as BadgeyScope,
+    };
+}
+
+pub mod registry {
+    pub use crate::orchestration::consultant::registry::ConsultantInstance as BadgeyInstance;
+}
+
+pub mod queue {
+    pub use crate::orchestration::consultant::queue::*;
+}
 
 #[cfg(test)]
 mod artifact_tests {

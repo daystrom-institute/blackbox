@@ -11,9 +11,9 @@ pub fn now_rfc3339() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BadgeyId(String);
+pub struct ConsultantId(String);
 
-impl BadgeyId {
+impl ConsultantId {
     pub fn new() -> Self {
         let raw = Uuid::new_v4().simple().to_string();
         Self(format!("bg-{}-{}", &raw[..8], &raw[8..16]))
@@ -24,19 +24,22 @@ impl BadgeyId {
     }
 }
 
-impl Default for BadgeyId {
+impl Default for ConsultantId {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl fmt::Display for BadgeyId {
+// Error/display text below intentionally keeps the legacy "badgey" wording
+// until the consumer-descriptor phase parameterizes id prefix and wording
+// per consumer (see design/orchestration/agents/consultant-runtime.md §5).
+impl fmt::Display for ConsultantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl FromStr for BadgeyId {
+impl FromStr for ConsultantId {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -56,7 +59,7 @@ impl FromStr for BadgeyId {
     }
 }
 
-impl Serialize for BadgeyId {
+impl Serialize for ConsultantId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -65,7 +68,7 @@ impl Serialize for BadgeyId {
     }
 }
 
-impl<'de> Deserialize<'de> for BadgeyId {
+impl<'de> Deserialize<'de> for ConsultantId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -76,7 +79,7 @@ impl<'de> Deserialize<'de> for BadgeyId {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BadgeyScope {
+pub struct ConsultantScope {
     pub project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_brief: Option<String>,
@@ -130,9 +133,9 @@ pub struct ProposalEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BadgeyProposal {
+pub struct ConsultantProposal {
     pub id: String,
-    pub instance_id: BadgeyId,
+    pub instance_id: ConsultantId,
     pub kind: ProposalKind,
     pub state: ProposalState,
     pub draft: Value,
@@ -146,10 +149,10 @@ pub struct BadgeyProposal {
     pub events: Vec<ProposalEvent>,
 }
 
-impl BadgeyProposal {
+impl ConsultantProposal {
     pub fn new(
         id: String,
-        instance_id: BadgeyId,
+        instance_id: ConsultantId,
         kind: ProposalKind,
         draft: Value,
         idempotency_key: Option<String>,
@@ -307,12 +310,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn badgey_id_round_trips() {
-        let id = BadgeyId::from_str("bg-3f7a91c4-91ff04cc").unwrap();
+    fn consultant_id_round_trips() {
+        let id = ConsultantId::from_str("bg-3f7a91c4-91ff04cc").unwrap();
         assert_eq!(id.to_string(), "bg-3f7a91c4-91ff04cc");
         let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(serde_json::from_str::<BadgeyId>(&json).unwrap(), id);
-        assert!(BadgeyId::from_str("bg-nope").is_err());
+        assert_eq!(serde_json::from_str::<ConsultantId>(&json).unwrap(), id);
+        assert!(ConsultantId::from_str("bg-nope").is_err());
     }
 
     #[test]
@@ -324,16 +327,16 @@ mod tests {
 
     #[test]
     fn proposal_and_action_journal_serde_round_trip() {
-        let proposal = BadgeyProposal::new(
+        let proposal = ConsultantProposal::new(
             "P-1".to_string(),
-            BadgeyId::from_str("bg-3f7a91c4-91ff04cc").unwrap(),
+            ConsultantId::from_str("bg-3f7a91c4-91ff04cc").unwrap(),
             ProposalKind::Agent,
             serde_json::json!({"name": "badgey"}),
             Some("idem-1".to_string()),
         );
         let raw = serde_json::to_string(&proposal).unwrap();
         assert_eq!(
-            serde_json::from_str::<BadgeyProposal>(&raw).unwrap(),
+            serde_json::from_str::<ConsultantProposal>(&raw).unwrap(),
             proposal
         );
 
