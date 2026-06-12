@@ -330,6 +330,7 @@ mod tests {
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -428,6 +429,7 @@ mod tests {
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         };
         let mut meta: HashMap<String, FileMeta> = HashMap::new();
         let edges_dir = state.path().join("edges");

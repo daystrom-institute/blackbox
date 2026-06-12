@@ -31,6 +31,7 @@ fn registered_for(dir: &TempDir) -> Vec<ProjectRecord> {
         registered_at: "2026-01-01T00:00:00Z".to_string(),
         is_git_repo: false,
         languages: BTreeSet::new(),
+        aliases: Default::default(),
     }]
 }
 

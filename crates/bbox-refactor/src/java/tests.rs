@@ -9,6 +9,7 @@ fn project_record(path: &Path) -> ProjectRecord {
         registered_at: "2026-05-09T00:00:00Z".to_string(),
         is_git_repo: false,
         languages: Default::default(),
+        aliases: Default::default(),
     }
 }
 

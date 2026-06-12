@@ -276,6 +276,20 @@ pub struct ProjectConfig {
     pub mcp: ProjectMcpConfig,
     #[serde(default)]
     pub artifacts: ProjectArtifactConfig,
+    #[serde(default)]
+    pub project: ProjectIdentityConfig,
+}
+
+/// Repo-declared project identity (`[project]` table in `.bbox/config.toml`).
+/// `aliases` are convenience selectors over the stable project_id —
+/// repo-owned and reviewable, so two hosts registering the same repo
+/// converge on the same alias even though project_id is host-scoped. The
+/// registry materializes them at register time and daemon open; conflicting
+/// claims fail closed (design: project-taxonomy-standardization.md).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ProjectIdentityConfig {
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

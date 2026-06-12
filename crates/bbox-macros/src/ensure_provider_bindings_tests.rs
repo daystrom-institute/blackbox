@@ -529,6 +529,7 @@ fn make_probe_runner(project_dir: &str) -> crate::probe::CodeNavProbeRunner {
         registered_at: "2024-01-01T00:00:00Z".to_string(),
         is_git_repo: true,
         languages: std::collections::BTreeSet::new(),
+        aliases: Default::default(),
     };
     crate::probe::CodeNavProbeRunner::new(None, vec![project_record])
 }

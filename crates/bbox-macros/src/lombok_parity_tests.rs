@@ -71,6 +71,7 @@ fn run_macro_strategy(
         registered_at: "2024-01-01T00:00:00Z".into(),
         is_git_repo: false,
         languages: std::collections::BTreeSet::new(),
+        aliases: Default::default(),
     };
     let runner = CodeNavProbeRunner::new(None, vec![project_record]);
     let ctx = MacroPlannerContext::new(backend, None, Box::new(runner));

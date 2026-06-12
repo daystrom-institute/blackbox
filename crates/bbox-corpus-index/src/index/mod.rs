@@ -874,6 +874,7 @@ mod tests {
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         };
         let chunk = bbox_chunker::Chunk {
             project_id: "proj1234".into(),
@@ -946,6 +947,7 @@ mod tests {
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         };
         let chunk = bbox_chunker::Chunk {
             project_id: "proj-cn-d3".into(),
@@ -1029,6 +1031,7 @@ mod tests {
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         };
         let content = "pub fn measured() { println!(\"full content\"); }";
         let chunk = bbox_chunker::Chunk {

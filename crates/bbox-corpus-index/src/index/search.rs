@@ -1589,6 +1589,7 @@ mod agentic_project_file_tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: canonical.join(".git").exists(),
             languages: Default::default(),
+            aliases: Default::default(),
         };
         std::fs::write(
             projects_path,

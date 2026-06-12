@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -160,10 +161,23 @@ impl BlackboxServer {
         Parameters(p): Parameters<ProjectRegisterParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
-        // Phase 1: register + persist — light lock ops + async I/O on the runtime.
+        // Phase 1: register + alias materialization + persist — light lock
+        // ops + async I/O on the runtime. Declared aliases come from the
+        // repo's committed `.bbox/config.toml` and sync under the same write
+        // lock so the persisted record carries them; a conflicting alias
+        // claim fails the call (fail closed) while the registration itself
+        // stands — fix the config and re-register to converge.
+        let declared_aliases = config::load_project(Path::new(&p.path))
+            .map(|cfg| cfg.project.aliases.into_iter().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
         let res = {
             let mut projects = self.state.projects.write();
-            projects.register_path(&p.path)
+            projects.register_path(&p.path).and_then(|record| {
+                projects.sync_declared_aliases(&record.project_id, &declared_aliases)?;
+                projects
+                    .resolve(&record.project_id)?
+                    .with_context(|| format!("project vanished mid-register: {}", record.project_id))
+            })
         };
         let record = match res {
             Ok(record) => record,

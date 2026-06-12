@@ -176,6 +176,7 @@ impl ProjectRegistry {
             registered_at: util::now_iso(),
             is_git_repo,
             languages,
+            aliases: BTreeSet::new(),
         };
         self.store.projects.push(record.clone());
         self.store
@@ -322,6 +323,9 @@ impl ProjectRegistry {
         {
             return Ok(Some(idx));
         }
+        if let Some(idx) = unique_alias_index(raw, &self.store.projects) {
+            return Ok(Some(idx));
+        }
         let path = PathBuf::from(raw);
         if path.is_absolute() {
             if let Ok(canonical) = canonical_project_path(&path) {
@@ -335,6 +339,65 @@ impl ProjectRegistry {
         }
         Ok(None)
     }
+
+    /// Replace `selector`'s materialized alias set with the repo-declared
+    /// one. Fail-closed: every declared alias must be well-formed and not
+    /// claimed by another registered project, otherwise nothing mutates.
+    /// Returns whether the record changed (caller persists on `true`).
+    pub fn sync_declared_aliases(
+        &mut self,
+        selector: &str,
+        declared: &BTreeSet<String>,
+    ) -> Result<bool> {
+        let idx = self
+            .resolve_project_index(selector)?
+            .with_context(|| format!("project not registered: {selector}"))?;
+        for alias in declared {
+            if !valid_alias(alias) {
+                anyhow::bail!(
+                    "invalid project alias `{alias}`: aliases must be non-empty, \
+                     without `/` or whitespace"
+                );
+            }
+            if let Some(owner) = self
+                .store
+                .projects
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .find(|(_, project)| project.aliases.contains(alias))
+            {
+                anyhow::bail!(
+                    "project alias `{alias}` already claimed by {} ({}); \
+                     conflicting aliases fail closed",
+                    owner.1.project_id,
+                    owner.1.canonical_path
+                );
+            }
+        }
+        let record = &mut self.store.projects[idx];
+        if record.aliases == *declared {
+            return Ok(false);
+        }
+        record.aliases = declared.clone();
+        Ok(true)
+    }
+}
+
+/// An alias resolves only when exactly one registered project claims it —
+/// ambiguity fails closed (registry sync enforces uniqueness, but a
+/// hand-edited store must not resolve arbitrarily).
+fn unique_alias_index(raw: &str, projects: &[ProjectRecord]) -> Option<usize> {
+    let mut matches = projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| project.aliases.contains(raw));
+    let (idx, _) = matches.next()?;
+    matches.next().is_none().then_some(idx)
+}
+
+fn valid_alias(alias: &str) -> bool {
+    !alias.is_empty() && !alias.contains('/') && !alias.chars().any(char::is_whitespace)
 }
 
 fn load_store(path: &Path) -> Result<ProjectStore> {
@@ -382,6 +445,7 @@ pub fn managed_fleet_worktree_project(
         registered_at: "fleet-managed".to_string(),
         is_git_repo: true,
         languages: base.languages.clone(),
+        aliases: BTreeSet::new(),
     })
 }
 
@@ -594,7 +658,7 @@ pub enum ResolveIntent {
 /// §Resolution Order). Accepts, in order:
 ///
 /// 1. an exact `project_id` or registered canonical path;
-/// 2. (registered alias — taxonomy slice 2, not yet an input form;)
+/// 2. a registered alias (unique claim required — ambiguity fails closed);
 /// 3. an absolute path: a registered root, a descendant, or a worktree of a
 ///    registered repo, gated by `intent`.
 ///
@@ -622,6 +686,10 @@ pub fn resolve_project_context(
         .find(|project| project.project_id == raw || project.canonical_path == raw)
     {
         return Some(base_context(record));
+    }
+    // 2. Registered alias.
+    if let Some(idx) = unique_alias_index(raw, projects) {
+        return Some(base_context(&projects[idx]));
     }
     let path = Path::new(raw);
     if !path.is_absolute() {
@@ -666,7 +734,7 @@ fn base_context(record: &ProjectRecord) -> ProjectContext {
     ProjectContext {
         project_id: record.project_id.clone(),
         repo_id: record.repo_id.clone(),
-        aliases: Vec::new(),
+        aliases: record.aliases.clone(),
         host_root: record.canonical_path.clone(),
         checkout: None,
     }
@@ -1112,7 +1180,84 @@ mod tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: true,
             languages: BTreeSet::new(),
+            aliases: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn declared_aliases_sync_resolve_and_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_a = tmp.path().join("repo-a");
+        let repo_b = tmp.path().join("repo-b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        let store_path = tmp.path().join("projects.json");
+        let mut registry = ProjectRegistry::open(&store_path).unwrap();
+        let rec_a = registry.register_path(&repo_a).unwrap();
+        let rec_b = registry.register_path(&repo_b).unwrap();
+
+        // Sync materializes and reports dirty; identical re-sync is clean.
+        let declared: BTreeSet<String> = ["blackbox".to_string()].into();
+        assert!(
+            registry
+                .sync_declared_aliases(&rec_a.project_id, &declared)
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .sync_declared_aliases(&rec_a.project_id, &declared)
+                .unwrap()
+        );
+
+        // Alias resolves through the registry like an id or path.
+        let hit = registry.resolve("blackbox").unwrap().expect("alias resolves");
+        assert_eq!(hit.project_id, rec_a.project_id);
+
+        // A conflicting claim from another project fails closed, mutating
+        // nothing.
+        let err = registry
+            .sync_declared_aliases(&rec_b.project_id, &declared)
+            .unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "{err:#}");
+        assert!(
+            registry
+                .resolve(&rec_b.project_id)
+                .unwrap()
+                .unwrap()
+                .aliases
+                .is_empty()
+        );
+
+        // Malformed aliases fail closed.
+        let bad: BTreeSet<String> = ["has space".to_string()].into();
+        assert!(registry.sync_declared_aliases(&rec_b.project_id, &bad).is_err());
+
+        // Alias resolves through resolve_project_context (both intents).
+        let records = registry.list();
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let ctx = resolve_project_context("blackbox", &records, intent)
+                .expect("alias should resolve to context");
+            assert_eq!(ctx.project_id, rec_a.project_id);
+            assert!(ctx.aliases.contains("blackbox"));
+            assert!(ctx.checkout.is_none());
+        }
+
+        // An ambiguous alias (possible only via hand-edited store) fails
+        // closed at resolution.
+        let mut forged = registry.list();
+        forged[1].aliases = declared.clone();
+        assert!(unique_alias_index("blackbox", &forged).is_none());
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            assert!(resolve_project_context("blackbox", &forged, intent).is_none());
+        }
+
+        // Sync removal: an emptied declaration clears the materialized set.
+        assert!(
+            registry
+                .sync_declared_aliases(&rec_a.project_id, &BTreeSet::new())
+                .unwrap()
+        );
+        assert!(registry.resolve("blackbox").unwrap().is_none());
     }
 
     #[test]
@@ -1405,6 +1550,7 @@ mod tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: true,
             languages: BTreeSet::new(),
+            aliases: Default::default(),
         }];
 
         // Managed worktree → (base scope, worktree write-dir).

@@ -18,6 +18,12 @@ pub struct ProjectRecord {
     /// re-detects empty entries on load and persists the result.
     #[serde(default)]
     pub languages: BTreeSet<Language>,
+    /// Alias selectors resolving to this project (taxonomy slice 2).
+    /// Materialized from the repo's committed `.bbox/config.toml`
+    /// `[project] aliases` declaration at register time and daemon open;
+    /// unique across the registry — conflicting claims fail closed.
+    #[serde(default)]
+    pub aliases: BTreeSet<String>,
 }
 
 /// Resolved project identity plus the concrete checkout view that produced
@@ -38,10 +44,9 @@ pub struct ProjectContext {
     /// Cross-host repo identity (first-commit SHA hash) when known.
     #[serde(default)]
     pub repo_id: Option<String>,
-    /// Registered alias selectors. Empty until alias materialization lands
-    /// (taxonomy slice 2).
+    /// Registered alias selectors for this project.
     #[serde(default)]
-    pub aliases: Vec<String>,
+    pub aliases: BTreeSet<String>,
     /// Canonical path of the registered base checkout — the durable
     /// project-scope key on this host.
     pub host_root: String,
