@@ -1,0 +1,22 @@
+{
+  "id": "gap-2eabd96d",
+  "title": "HNSW add_reverse_edge pure-distance pruning orphans near-duplicate cluster members (recall loss)",
+  "gap_kind": "tooling",
+  "domain": "hnsw",
+  "wanted_capability": "Connectivity-preserving reverse-edge pruning in HnswIndex. add_reverse_edge (crates/bbox-vectors/src/hnsw.rs:404) prunes a saturated neighbor list purely by distance, so in a near-duplicate cluster larger than m0 (=64) later members evict earlier members from every inbound list — in-degree drops to 0 and the node becomes unreachable by search (search_layer/greedy_closest only follow forward edges from the entry point). Reproduced: 20 clusters x 1000 members (sigma 0.05), sequential push (prod's incremental arrival order) → 5,685/20,000 disconnected (28%), zero-in-degree 5,684 (exact match — orphaning IS the mechanism), self-recall misses 350/1000 (35% of indexed vectors not returned in their own top-10). Bulk build (level-sorted) still loses 913/20,000 (4.6%). Prod partition voyage-voyage-code-3-1024-0103683e currently reports 66,621/399,613 disconnected (~17%) — transcript corpora are near-duplicate-heavy, so this is live recall loss, not a metric artifact. Wanted fix: apply the select_neighbors diversity heuristic when shrinking the reverse-edge list (HNSW paper's shrink-connections), optionally with keep-pruned-connections, instead of distance-sort-truncate; plus a regression test asserting self-recall under large-cluster sequential push. After the fix, prod needs an HNSW rebuild (bbox_reembed or partition rebuild) to repair existing graphs.",
+  "missing_primitive": "Diversity-heuristic (connectivity-preserving) reverse-edge shrink in HnswIndex::add_reverse_edge",
+  "fallback_used": "None — the large ef_search floor (max(len/4, 2000)-capped) partially masks the loss for well-connected regions, but orphaned nodes are unreachable at any ef.",
+  "evidence": [
+    "crates/bbox-vectors/src/hnsw.rs:404 (add_reverse_edge distance-sort-truncate)",
+    "crates/bbox-vectors/src/hnsw.rs:351 (search skips inactive only; forward-edge traversal)",
+    "prod partition metrics 2026-06-12: disconnected_nodes=66621/399613",
+    "repro: 20x1000 clusters sigma=0.05 push-order -> disconnected 5685/20000, zero_in 5684, self-recall miss 350/1000, bulk-build 913/20000"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/hnsw/reverse-edge-prune-orphaning",
+  "supersedes": "gap-e2cb1ff8",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T21:23:53Z",
+  "updated_at": "2026-06-12T21:24:00Z"
+}

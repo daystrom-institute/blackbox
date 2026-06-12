@@ -5,14 +5,15 @@
   "domain": "hnsw",
   "wanted_capability": "Expose neighbor-degree distribution, layer-occupancy stats, and recall diagnostics for HNSW indices.",
   "evidence": [
-    "thread-3cfbf9e0 (E3 review #6)",
-    "feedback/e3-review.md"
+    "crates/bbox-vectors/src/hnsw.rs:151-182 (metrics: avg degree, layer distribution, disconnected BFS)",
+    "prod partition 2026-06-12: disconnected_nodes=66621/399613",
+    "gap-e2cb1ff8 (root-cause bug filed from these metrics)"
   ],
   "impact": "medium",
   "blocking_level": "none",
   "dedupe_key": "tooling/hnsw/health-metrics",
-  "notes": "Neighbor-degree distribution, layer-occupancy stats. Useful for diagnosing search quality regressions.",
+  "notes": "Partially shipped and proven useful: HnswMetrics now exposes avg_neighbor_degree, layer_distribution, and disconnected_nodes (BFS from entry point, semantics match search traversal) — these surfaced the prod 66,621/399,613 (~17%) disconnection that led to gap-e2cb1ff8 (add_reverse_edge orphaning, root cause confirmed by repro: zero in-degree accounts for disconnection exactly, 35% self-recall miss under large-cluster push order). Still missing from the original want: (a) in-degree distribution — the decisive diagnostic in the investigation (zero-in count pinpointed the mechanism); out-degree stats alone cannot see orphaning; (b) recall diagnostics — a sampled self-recall probe (search k=10 for indexed vectors, report miss rate) would have flagged this long before an operator eyeballed partition stats. Recommend closing this gap by adding those two to HnswMetrics alongside the gap-e2cb1ff8 fix, since the self-recall probe doubles as the fix's regression metric.",
   "resolution": "unresolved",
   "created_at": "2026-06-11T18:05:05Z",
-  "updated_at": "2026-06-11T18:05:05Z"
+  "updated_at": "2026-06-12T21:22:31Z"
 }
