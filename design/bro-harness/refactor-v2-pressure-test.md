@@ -283,6 +283,67 @@ dissolve rather than resolve).
    produces. Without this, `lsp_verified` is unreachable from any real
    program.
 
+## 6.5 The mechanical toolbox: transform bindings (the lsp.rename shape, generalized)
+
+The v1 Java catalog (~40 kinds, ~38 modules, ~800KB of Rust: the
+`extract_java_class` / jOOQ repository / Vaadin component families) is not
+algebra and not library-script material — each is a hard Rust analysis plus
+templated edit synthesis. v2 §5's rule decides their form: a transform whose
+honest JS port is "300 lines re-deriving capture analysis" is a **binding**.
+The probe-validated shape for that binding already exists: `lsp.rename` —
+**an authority that returns hash-anchored `{changes, findings}` for
+`edits.merge`, and never writes.**
+
+So the toolbox exposes as **transform bindings**:
+
+```ts
+const r = await java.extractClass({ file, classes: [...], wiring: "constructor" });
+// r: { changes: SpanChange[], findings: Finding[], fixme_count: number }
+await edits.merge({ es, changes: r.changes });
+await edits.apply({ es });   // same choke point, same detections, same bounce
+```
+
+The v1 planners already compute exactly this (FileEdits + capture/external-
+call findings) — porting strips the MCP envelope and the plan/apply
+orchestration, keeps the analysis and synthesis verbatim. Selection (which
+class, which fields) moves to the cell; `deep_analysis`-style flags die
+(detection is always-on at the choke point); operator-authority flags stay
+dispatch-supplied (RX-V1 relocated, v2 §3.3).
+
+**Surface economics — the part that must not recreate the catalog problem.**
+Forty hand-authored TS signatures would bloat the exec description (cell-dsl
+§9; render-hygiene rule: deep docs belong in system memories). Mechanism:
+
+1. The `java.*` (and `jooq.*`/`vaadin.*`) namespace descriptions stay a
+   compact index — one line per transform, name + purpose.
+2. Depth on demand: `java.describe({ transform })` returns the full contract
+   (params, findings vocabulary, an example) at runtime — gap-374fba64's
+   per-kind-describe ask, legitimately re-emerging for a wide toolbox, but
+   as one namespace method with values staying in the isolate (no MCP
+   response cap), backed by the same per-language system memory the
+   sm-tree-sitter direction prescribes for query grammar.
+
+**Triage before porting (v2 §7, used-kind parity).** Mine transcripts/atom
+invocations for which kinds were actually called, then bucket: (a)
+expressible today as a short cell program over `code.*`/`edits.*` → library
+script; (b) hard analysis/synthesis → transform binding (the extract-class
+and jOOQ-repository families are certain members); (c) campaign-bound,
+nobody-will-miss-it → not ported (plausibly several Vaadin/jOOQ audits).
+"Lombokifier"-style recipes are compositions over (b) plus selection —
+library scripts or atoms, not new bindings.
+
+**Gates.** Tree-sitter-backed transforms port now (the java modules are
+daemon-independent; grammar via bbox-chunker). `rename_java_symbol` /
+`java_lsp_organize_imports` wait on `bro-lsp` growing jdtls (v2 §7's named
+gate). Atoms remain the external interface for MCP-only consumers — a
+canned atom whose implementation dispatches the cell path, never a vestigial
+MCP projection.
+
+**Pilot.** One real, used transform first — `java_jooq_extract_repository`
+or `extract_java_class` — ported as a transform binding with the compact
+index + describe, probed on a Java fixture with the standard loop, before
+committing to the sweep.
+
 ## 7. Validation: live probes + tailored retro
 
 Patterns earn their place by probe, not by this doc:
