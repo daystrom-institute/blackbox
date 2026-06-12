@@ -2,9 +2,68 @@ use crate::server::BlackboxServer;
 
 use rmcp::model::{CallToolResult, IntoContents};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 impl BlackboxServer {
     const JSON_RESPONSE_PREVIEW_BYTES: usize = 1024;
+    /// Spilled response dumps older than this are pruned on the next spill.
+    const DUMP_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+    /// Directory oversized MCP responses are spilled to.
+    fn response_dump_dir() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+        crate::util::blackbox_state_dir(&home).join("response-dumps")
+    }
+
+    /// Write an over-cap payload to a dump file so the inline cap never
+    /// destroys data: the cap is context hygiene, not data policy, and every
+    /// client of this localhost daemon has file-read tools to recover the
+    /// full payload. Best-effort: `None` means the write failed and the
+    /// caller falls back to inline truncation.
+    // Spill is rare (>80KB responses only); blocking IO here mirrors the
+    // harness-side spill in bro-harness bound.rs.
+    #[allow(clippy::disallowed_methods)]
+    fn spill_oversized_response(text: &str) -> Option<PathBuf> {
+        let dir = Self::response_dump_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        Self::prune_old_dumps(&dir);
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(text, &mut hasher);
+        let digest = std::hash::Hasher::finish(&hasher);
+        let trimmed = text.trim_start();
+        let ext = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            "json"
+        } else {
+            "txt"
+        };
+        let path = dir.join(format!("resp-{millis}-{digest:016x}.{ext}"));
+        std::fs::write(&path, text).ok()?;
+        Some(path)
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn prune_old_dumps(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > Self::DUMP_RETENTION);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 
     pub(crate) fn ok_text(text: &str) -> CallToolResult {
         CallToolResult::success(Self::cap_response_text(text).into_contents())
@@ -48,20 +107,37 @@ impl BlackboxServer {
         if text.len() <= Self::MCP_RESPONSE_CAP_BYTES {
             return text.to_string();
         }
+        let spilled = Self::spill_oversized_response(text);
         let trimmed = text.trim_start();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             // Transport invariant: never emit invalid JSON; size JSON at the producer.
             let preview = Self::prefix_at_char_boundary(text, Self::JSON_RESPONSE_PREVIEW_BYTES);
-            return serde_json::json!({
+            let mut envelope = serde_json::json!({
                 "error": "response_too_large",
                 "bytes": text.len(),
                 "cap_bytes": Self::MCP_RESPONSE_CAP_BYTES,
                 "hint": "response exceeded the MCP cap; narrow the query (filters, limit, tail) or use a paginated variant",
                 "preview": preview,
-            })
-            .to_string();
+            });
+            if let Some(path) = &spilled {
+                envelope["spilled_to"] = Value::String(path.display().to_string());
+                envelope["hint"] = Value::String(
+                    "response exceeded the MCP cap; the full payload is at spilled_to (read it \
+                     with file tools), or narrow the query (filters, limit, tail)"
+                        .to_string(),
+                );
+            }
+            return envelope.to_string();
         }
-        let suffix = "\n\n[... response truncated to 80KB by bbox response cap]";
+        let suffix = match &spilled {
+            Some(path) => format!(
+                "\n\n[... inline view truncated to 80KB by bbox response cap; full {} kB \
+                 response written to {}]",
+                text.len().div_ceil(1024),
+                path.display()
+            ),
+            None => "\n\n[... response truncated to 80KB by bbox response cap]".to_string(),
+        };
         let target = Self::MCP_RESPONSE_CAP_BYTES.saturating_sub(suffix.len());
         let mut out = String::new();
         for ch in text.chars() {
@@ -70,7 +146,7 @@ impl BlackboxServer {
             }
             out.push(ch);
         }
-        out.push_str(suffix);
+        out.push_str(&suffix);
         out
     }
 
@@ -138,22 +214,35 @@ impl BlackboxServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::TestEnvGuard;
 
     #[test]
-    fn mcp_response_cap_limits_large_text() {
+    fn mcp_response_cap_spills_large_text_losslessly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = TestEnvGuard::new();
+        env.set("BLACKBOX_STATE_DIR", tmp.path());
+
         let huge = "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1024);
         let capped = BlackboxServer::cap_response_text(&huge);
-        let suffix = "\n\n[... response truncated to 80KB by bbox response cap]";
-        let target = BlackboxServer::MCP_RESPONSE_CAP_BYTES - suffix.len();
-        let expected = format!("{}{}", "x".repeat(target), suffix);
 
-        assert_eq!(capped, expected);
         assert_eq!(capped.len(), BlackboxServer::MCP_RESPONSE_CAP_BYTES);
-        assert!(capped.contains("response truncated"));
+        assert!(capped.contains("inline view truncated"));
+        assert!(capped.contains("response written to"));
+
+        // The full payload landed in <state_dir>/response-dumps, lossless.
+        let dump_dir = tmp.path().join("response-dumps");
+        let dumps: Vec<_> = std::fs::read_dir(&dump_dir).unwrap().flatten().collect();
+        assert_eq!(dumps.len(), 1);
+        assert_eq!(std::fs::read_to_string(dumps[0].path()).unwrap(), huge);
+        assert!(capped.contains(&dumps[0].path().display().to_string()));
     }
 
     #[test]
-    fn oversized_json_returns_valid_error_envelope() {
+    fn oversized_json_returns_valid_error_envelope_with_spill_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = TestEnvGuard::new();
+        env.set("BLACKBOX_STATE_DIR", tmp.path());
+
         let inputs = [
             format!(
                 "{{\"data\":\"{}\"}}",
@@ -176,7 +265,59 @@ mod tests {
             assert!(input.starts_with(preview));
             assert!(preview.len() <= BlackboxServer::JSON_RESPONSE_PREVIEW_BYTES);
             assert!(capped.len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+
+            // Lossless: the envelope points at a dump holding the full payload.
+            let spilled = parsed["spilled_to"].as_str().expect("spilled_to path");
+            assert!(spilled.ends_with(".json"));
+            assert_eq!(std::fs::read_to_string(spilled).unwrap(), input);
         }
+    }
+
+    #[test]
+    fn spill_failure_falls_back_to_inline_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Point the state dir at a file so create_dir_all fails.
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut env = TestEnvGuard::new();
+        env.set("BLACKBOX_STATE_DIR", &blocker);
+
+        let huge = "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1024);
+        let capped = BlackboxServer::cap_response_text(&huge);
+        assert_eq!(capped.len(), BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        assert!(capped.contains("response truncated to 80KB"));
+        assert!(!capped.contains("written to"));
+
+        let json = format!(
+            "{{\"data\":\"{}\"}}",
+            "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES)
+        );
+        let parsed: Value =
+            serde_json::from_str(&BlackboxServer::cap_response_text(&json)).unwrap();
+        assert_eq!(parsed["error"], "response_too_large");
+        assert!(parsed.get("spilled_to").is_none());
+    }
+
+    #[test]
+    fn old_dumps_are_pruned_on_spill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = TestEnvGuard::new();
+        env.set("BLACKBOX_STATE_DIR", tmp.path());
+
+        let dump_dir = tmp.path().join("response-dumps");
+        std::fs::create_dir_all(&dump_dir).unwrap();
+        let stale = dump_dir.join("resp-0-deadbeef.txt");
+        std::fs::write(&stale, b"old").unwrap();
+        let old_mtime = SystemTime::now() - BlackboxServer::DUMP_RETENTION - Duration::from_secs(60);
+        let f = std::fs::File::open(&stale).unwrap();
+        f.set_modified(old_mtime).unwrap();
+
+        let huge = "y".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1);
+        let _ = BlackboxServer::cap_response_text(&huge);
+
+        assert!(!stale.exists(), "stale dump pruned");
+        let count = std::fs::read_dir(&dump_dir).unwrap().flatten().count();
+        assert_eq!(count, 1, "only the fresh spill remains");
     }
 
     #[test]

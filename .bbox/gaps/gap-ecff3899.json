@@ -1,0 +1,20 @@
+{
+  "id": "gap-ecff3899",
+  "title": "Per-tool sizing for MCP tools that routinely produce over-cap responses",
+  "gap_kind": "mcp_surface",
+  "domain": "response-cap",
+  "wanted_capability": "Tools that routinely emit >80KB responses should size their output at the producer (pagination, filters, tail/limit params, structured-result accessors) instead of relying on the blanket MCP response cap. The cap is now lossless (over-cap payloads spill to <state_dir>/response-dumps/ with a spilled_to pointer in the envelope, src/server/response.rs), but a spill is still a failure of the producing tool's shaping: programmatic consumers (code-mode isolates, JS workflow scripts) get an indirection instead of data, and interactive agents burn a turn on file reads. Wanted: identify chronic over-producers from the per-call bytes field already logged at blackbox::tool (journalctl --user -u blackbox | grep bbox_), and give each a proper paginated/filtered variant. Known instance: bro_wait's ~81k multi-escaped result envelope (gap-55be3518).",
+  "missing_primitive": "Per-tool response shaping (pagination/limit/filter params) on chronic over-cap producers; observability query for which tools trip the cap most",
+  "fallback_used": "Made the blanket cap lossless via spill-to-disk (response-dumps + spilled_to path) so over-cap responses are recoverable instead of destroyed",
+  "evidence": [
+    "src/server/response.rs:47",
+    "src/server/mod.rs:29",
+    "gap-55be3518"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/response-cap/per-tool-oversized-producers",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T17:08:03Z",
+  "updated_at": "2026-06-12T17:08:03Z"
+}

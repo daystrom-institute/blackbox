@@ -57,6 +57,15 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- MCP response cap is now lossless: over-cap tool responses (>80KB) are
+  spilled to `<state_dir>/response-dumps/` before the inline reply is capped.
+  The JSON `response_too_large` envelope gains a `spilled_to` path (full
+  payload, readable with any file tool); oversized text responses name the
+  dump path in their truncation suffix. Previously the overflow was simply
+  destroyed (1KB preview for JSON, hard truncation for text), which broke
+  programmatic consumers (code-mode isolates) and forced interactive agents
+  to re-query. Spill failure falls back to the old inline truncation; dumps
+  older than 7 days are pruned on the next spill.
 - Worktree-scope cluster: dispatched agents working in daemon-managed
   worktrees now get coherent project scoping end to end. Dispatch emits a
   `pin:*.project_dir` worktree-confinement pin from one mechanical choke
