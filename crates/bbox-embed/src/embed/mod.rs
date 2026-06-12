@@ -1,6 +1,7 @@
 #![allow(dead_code)] // E1 lands provider/routing surface; E2/E3 wire live consumers.
 
 pub mod ollama;
+pub mod query_cache;
 pub mod queue;
 pub mod voyage;
 

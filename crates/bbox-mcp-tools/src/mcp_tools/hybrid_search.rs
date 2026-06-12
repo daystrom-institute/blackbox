@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -9,7 +9,7 @@ use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::search::rerank::{self, RerankFeatures};
 use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
 use bbox_embed::embed::queue::EmbedStatusResponse;
-use bbox_embed::embed::{Bucket, EmbeddingProvider, EmbeddingRouter};
+use bbox_embed::embed::{Bucket, EmbeddingRouter, query_cache};
 use bbox_embed::embed_queue;
 use bbox_indexing::index::{HybridBm25Hit, TranscriptIndex};
 use bbox_indexing::projects::ProjectRecord;
@@ -630,7 +630,6 @@ fn vector_ranked_lists(
     }
 
     let mut lists = Vec::new();
-    let mut embedded_queries = HashMap::<String, Vec<f32>>::new();
     for (route, metrics) in partitions {
         if metrics.active_count == 0 {
             continue;
@@ -657,24 +656,15 @@ fn vector_ranked_lists(
                 continue;
             };
             let bucket = *buckets.iter().next().unwrap_or(&Bucket::Knowledge);
-            let cache_key = format!("{route}:{}", bucket.as_str());
-            if !embedded_queries.contains_key(&cache_key) {
-                match embed_query(&router, bucket, query) {
-                    Ok(vector) => {
-                        embedded_queries.insert(cache_key.clone(), vector);
-                    }
-                    Err(err) => {
-                        degraded
-                            .vector_errors
-                            .insert(route.clone(), sanitize_error(&err));
-                        continue;
-                    }
+            match query_cache::embed_query_cached(&router, bucket, None, query) {
+                Ok(vector) => vector,
+                Err(err) => {
+                    degraded
+                        .vector_errors
+                        .insert(route.clone(), sanitize_error(&err));
+                    continue;
                 }
             }
-            embedded_queries
-                .get(&cache_key)
-                .cloned()
-                .unwrap_or_default()
         };
         let hits = vectors::search(route, &query_vector, fetch)
             .with_context(|| format!("searching vector partition {route}"))?;
@@ -699,26 +689,6 @@ fn vector_ranked_lists(
 fn fusion_weights(vector_weight: Option<f32>) -> (f32, f32) {
     let vector_weight = vector_weight.unwrap_or(VECTOR_WEIGHT).clamp(0.0, 1.0);
     (1.0 - vector_weight, vector_weight)
-}
-
-fn embed_query(router: &EmbeddingRouter, bucket: Bucket, query: &str) -> Result<Vec<f32>> {
-    let provider = router.route_for(bucket, None)?;
-    embed_with_provider(provider, query)
-}
-
-fn embed_with_provider(provider: Box<dyn EmbeddingProvider>, query: &str) -> Result<Vec<f32>> {
-    let texts = vec![query.to_string()];
-    let vectors = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts))),
-        Err(_) => {
-            let runtime = tokio::runtime::Runtime::new().context("creating embedding runtime")?;
-            runtime.block_on(provider.embed_batch(&texts))
-        }
-    }?;
-    vectors
-        .into_iter()
-        .next()
-        .context("embedding provider returned no query vector")
 }
 
 fn features_from_bm25(hits: &[HybridBm25Hit]) -> BTreeMap<String, RerankFeatures> {
@@ -938,6 +908,8 @@ fn sanitize_status_error(err: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use bbox_corpus_core::search::rrf::{FusedHit, RankedList};
     use bbox_knowledge::knowledge::{
         Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,

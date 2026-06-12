@@ -131,9 +131,3 @@ pub(crate) fn init_system_memory_for_tests() {
     system_memory::init_for_tests_from(&defaults);
 }
 
-use std::collections::BTreeMap;
-use std::sync::OnceLock;
-
-use parking_lot::RwLock;
-
-static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = OnceLock::new();

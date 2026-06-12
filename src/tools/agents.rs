@@ -1,8 +1,3 @@
-use std::collections::BTreeMap;
-
-use parking_lot::RwLock;
-
-use crate::AGENT_QUERY_EMBED_CACHE;
 use crate::artifacts;
 use crate::embed;
 use crate::orchestration;
@@ -238,35 +233,7 @@ impl BlackboxServer {
 
     pub(crate) fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
         let router = embed::EmbeddingRouter::load_default()?;
-        let route = router.route(embed::Bucket::AgentManifest, None)?;
-        let cache_key = format!("{}:{}:{}", route.provider_id, route.model, query);
-        let cache = AGENT_QUERY_EMBED_CACHE.get_or_init(|| RwLock::new(BTreeMap::new()));
-        if let Some(vector) = cache.read().get(&cache_key).cloned() {
-            return Ok(vector);
-        }
-        let provider = router.route_for(embed::Bucket::AgentManifest, None)?;
-        let texts = vec![query.to_string()];
-        let vectors = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts)))
-            }
-            Err(_) => {
-                let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(provider.embed_batch(&texts))
-            }
-        }?;
-        let vector = vectors
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("embedding provider returned no query vector"))?;
-        let mut guard = cache.write();
-        if guard.len() >= 256 {
-            if let Some(first) = guard.keys().next().cloned() {
-                guard.remove(&first);
-            }
-        }
-        guard.insert(cache_key, vector.clone());
-        Ok(vector)
+        embed::query_cache::embed_query_cached(&router, embed::Bucket::AgentManifest, None, query)
     }
 
     pub(crate) fn extract_inline_filters(inline: &serde_json::Value) -> (Vec<String>, Vec<String>) {
