@@ -13,8 +13,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "eval_coverage/tool-docs/manifest-dir-worktree-scan",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-a6523755",
   "created_at": "2026-06-12T02:51:41Z",
-  "updated_at": "2026-06-12T02:51:41Z"
+  "updated_at": "2026-06-12T17:50:48Z",
+  "resolved_at": "2026-06-12T17:50:48Z",
+  "resolution_note": "Fixed on beta/blackbox-v2: the tool-docs source-scan tests now resolve the workspace root at RUNTIME by walking up from the test cwd (cargo and nextest both set it to the running checkout's package manifest dir) to the [workspace] Cargo.toml, with a loud panic when none is found — never a fallback to the compile-time-baked CARGO_MANIFEST_DIR path. Validated behaviorally in a CoW-seeded worktree: an uncompiled probe file containing a #[tool] attribute dropped into the worktree's src/ tripped every_registered_tool_has_a_doc with no recompile of the scanning test binary — exactly the blindness the badgey-dissolution incident exposed."
 }
