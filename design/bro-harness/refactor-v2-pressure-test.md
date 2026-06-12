@@ -369,6 +369,41 @@ or `extract_java_class` — ported as a transform binding with the compact
 index + describe, probed on a Java fixture with the standard loop, before
 committing to the sweep.
 
+**Disposition (pilot built + probe-validated, 2026-06-12).** Two grounding
+corrections from the triage, then the pilot:
+
+- *Used-kind parity is the empty set.* Mining the transcript corpus for
+  real `bbox_refactor_plan` invocations found only Rust analysis kinds
+  (`rust_impl_partition_analysis`, `rust_top_level_dependency_analysis`,
+  `inline_mod_to_file_submodule`); every Java-kind hit is development
+  exhaust (building/testing the kinds, authoring atom JSON). This
+  corroborates §6.6's empty-registry signal: the sweep's justification is
+  *exposure for future consumption*, not parity with past use — which
+  strengthens bucket (c) and means most of the catalog should wait for a
+  real Java campaign to pull it.
+- *`java_jooq_extract_repository` was never a candidate*: its v1 planner
+  is a deliberately Blocked stub (refuses repository-scale extraction,
+  `PlanStatus::Blocked`, no edits). The pilot is `extract_java_class`,
+  the §4 worst case.
+
+The pilot (`crates/bro-harness/src/bindings/java_transforms.rs`):
+`java.extractClass` is a thin adapter over the v1 planner verbatim
+(`bbox_refactor::plan`, no LSP ctx) returning `{changes, creates,
+findings, fixme_count}` — planner-emitted new files (whole-content edits
+against the empty hash, v1's create idiom) convert to `creates` for
+`edits.createFile`; findings are the v1 analysis structs verbatim,
+re-keyed under a `finding` tag; refusals (e.g. `mutable_capture_with_write`)
+pass through as operator-actionable errors. Surface economics held:
+the namespace description is a one-line-per-transform index and
+`java.describe({transform})` returns the full contract in-isolate.
+Tree-sitter authority ⇒ `syntax_only` tier; no ledger issuance (the floor
+needs no record); Java `lsp_verified` waits on jdtls as gated above.
+*Probe-java-1 (GLM, standard loop):* 5 turns, zero errored cells — the
+agent batched `java.describe` + `code.items` in one cell, followed the
+contract's recipe verbatim (creates → merge → apply), and reported the
+choke point's `syntax_only` correctly. Cleanest probe of the series;
+describe-on-demand discoverability needed no nudge.
+
 ## 6.6 Macros fold down into recipes; the refactor-atom tier demotes
 
 **What `macro_*` is.** The macro synthesis layer

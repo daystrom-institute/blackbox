@@ -15,6 +15,7 @@
 
 pub mod code_facts;
 pub mod edit_algebra;
+pub mod java_transforms;
 pub mod ledger;
 pub mod lsp_facts;
 
@@ -47,6 +48,7 @@ pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(lsp_facts::LspState::default()),
         ledger,
     ));
+    tools.extend(java_transforms::tools());
     tools
 }
 
@@ -56,6 +58,7 @@ pub fn namespace_descriptions() -> BTreeMap<String, ToolNamespaceDescription> {
     BTreeMap::from([
         ("code".to_string(), code_facts::namespace_description()),
         ("edits".to_string(), edit_algebra::namespace_description()),
+        ("java".to_string(), java_transforms::namespace_description()),
         ("lsp".to_string(), lsp_facts::namespace_description()),
     ])
 }
