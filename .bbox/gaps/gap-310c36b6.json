@@ -7,8 +7,10 @@
   "impact": "low",
   "blocking_level": "none",
   "dedupe_key": "tooling/mcp-surfaces/wire-head-project-scoping",
-  "notes": "surface_entry() and surface_entry_sync() in src/server/handler.rs hardcode None for project on every call into cached_surface_entry / evaluate_tool_surface. The evaluator and cache already support project-scoped packet resolution (load_latest_by_domain with project), and dispatch_surface_filters() already plumbs project through — so the dispatch path works correctly. But an MCP client connecting to /mcp?surface=readonly can never hit a project-scoped surface packet, because the initialize handler doesn't know which project the session belongs to. Fix would require: (1) a way for MCP session init to carry project identity (header? separate URL path? mcp_name registration metadata?), and (2) threading that into surface_entry/surface_entry_sync.",
-  "resolution": "unresolved",
+  "notes": "Linked to the project-taxonomy-standardization arc (taxonomy/resolver-consolidation branch): resolve_project_context + ProjectContext (slice 1) and alias resolution (slice 2) give the wire head a single resolver to plumb ?project=/surface params through. Pull this in as a consumer after slice 3 (adapter migration) — the wire head becomes one more resolve_project_context(Read) call site rather than its own scoping mechanism.",
+  "resolution": "addressed",
   "created_at": "2026-06-11T16:38:59Z",
-  "updated_at": "2026-06-11T16:38:59Z"
+  "updated_at": "2026-06-12T20:17:38Z",
+  "resolved_at": "2026-06-12T20:17:38Z",
+  "resolution_note": "Shipped on taxonomy/resolver-consolidation: the wire MCP head now extracts ?project= alongside ?surface= at initialize, resolves it through resolve_project_context(Read) (accepts alias / project_id / any path inside a registered checkout or worktree → base canonical path; literal fallback for parity with bbox_mcp_surface), pins it to the session, and passes it through every surface lookup (get_tool/list_tools/call_tool). The SurfaceDecisionCache already keyed (surface, project) — only the wire extraction was missing. Project-scoped surface routing packets are now reachable through ?surface=...&project=... on the wire head, not only the dispatch path."
 }
