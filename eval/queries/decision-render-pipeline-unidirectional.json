@@ -11,7 +11,7 @@
     }
   ],
   "expected_entity_refs": [
-    "knowledge:sm-render-lifecycle"
+    "system_memory:sm-render-lifecycle"
   ],
   "required_evidence": {
     "kind": "edge_family",

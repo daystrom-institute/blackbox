@@ -6,12 +6,12 @@
     {
       "description": "The Rust struct definition for KnowledgeStore.",
       "entity_type_hint": "symbol",
-      "path_hint": "src/knowledge.rs",
+      "path_hint": "crates/bbox-knowledge/src/knowledge.rs",
       "symbol_hint": "KnowledgeStore"
     }
   ],
   "expected_entity_refs": [
-    "symbol:d723917f:KnowledgeStore:3867906959e7ff9c5c0c893d30ba43ea2663089aec664a3da19dffca6dd0df0d"
+    "symbol:d723917f:KnowledgeStore:40e76235daf19f7dbd2fb1d55f65eddde1a3de3c0cff98d94e25b42225b45c2d"
   ],
   "required_evidence": {
     "kind": "edge_family",

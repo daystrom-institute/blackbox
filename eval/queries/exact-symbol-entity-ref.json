@@ -6,12 +6,12 @@
     {
       "description": "The F1 EntityRef enum and parser surface.",
       "entity_type_hint": "symbol",
-      "path_hint": "src/entity_ref.rs",
+      "path_hint": "crates/bbox-corpus-core/src/entity_ref.rs",
       "symbol_hint": "EntityRef"
     }
   ],
   "expected_entity_refs": [
-    "symbol:d723917f:EntityRef:d750cf0ac8471da4b3c3bc94087c54e6795251e0f5c33d762ed534cb46144fb1"
+    "symbol:d723917f:EntityRef:63ac9b75419fc66f648a6722362f13a0544508ee6c146d99f643d9ed24853477"
   ],
   "required_evidence": {
     "kind": "edge_family",
