@@ -15,6 +15,7 @@
 
 pub mod code_facts;
 pub mod edit_algebra;
+pub mod ledger;
 pub mod lsp_facts;
 
 use std::collections::BTreeMap;
@@ -29,14 +30,23 @@ use bro_tools::Tool;
 /// surface.
 ///
 /// Called once per session (agent_loop tool assembly), which is what scopes
-/// the edits algebra's [`edit_algebra::EditStore`] to the session: EditSets
-/// survive across cells, die with the session.
+/// the edits algebra's [`edit_algebra::EditStore`] and the provenance
+/// [`ledger::ProvenanceLedger`] to the session: EditSets and issuance
+/// records survive across cells, die with the session. The ledger is shared
+/// between the producing bindings (`lsp.*`) and the consuming algebra
+/// (`edits.merge` / `edits.apply`) — that shared seam is what makes
+/// `semantic_status` lineage-computed rather than cell-claimed.
 pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
+    let ledger = Arc::new(ledger::ProvenanceLedger::default());
     let mut tools = code_facts::tools();
-    tools.extend(edit_algebra::tools(Arc::new(
-        edit_algebra::EditStore::default(),
-    )));
-    tools.extend(lsp_facts::tools(Arc::new(lsp_facts::LspState::default())));
+    tools.extend(edit_algebra::tools(
+        Arc::new(edit_algebra::EditStore::default()),
+        Arc::clone(&ledger),
+    ));
+    tools.extend(lsp_facts::tools(
+        Arc::new(lsp_facts::LspState::default()),
+        ledger,
+    ));
     tools
 }
 

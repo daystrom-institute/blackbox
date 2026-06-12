@@ -14,9 +14,14 @@
 //! findings (the bounce), rolling back any writes already made. Every
 //! finding carries enough to repair without re-running discovery.
 //!
-//! All edits are cell-/syntax-authored today, so applied results stamp
-//! `semantic_status: "syntax_only"`; lineage-computed status arrives with
-//! the ledger (code-mode-cell-dsl.md §4).
+//! `semantic_status` is **lineage-computed at the choke point**
+//! (code-mode-cell-dsl.md §4): every edit entering the set carries the
+//! authority tier of its PRODUCER — cell-authored verbs floor at
+//! `syntax_only`; `edits.merge` consults the provenance
+//! [`ledger`](super::ledger) and changes it recognizes (by content digest)
+//! keep their issuer's tier (e.g. `lsp.rename` → `lsp_verified`). The
+//! set's status is the weakest link across its members; creates are
+//! cell-authored. Cell-supplied provenance claims are never read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,13 +34,21 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::code_facts::{Span, read_file_bytes};
+use super::ledger::{AuthorityTier, ProvenanceLedger};
+
+/// One queued edit plus the authority tier of its producer (lineage).
+#[derive(Debug, Clone)]
+struct LedgeredEdit {
+    edit: TextEdit,
+    tier: AuthorityTier,
+}
 
 /// Accumulated edits for one file, pinned to the content hash of the first
 /// Span seen for that file.
 #[derive(Debug, Clone, Default)]
 struct FileAccum {
     expected_sha256: String,
-    edits: Vec<TextEdit>,
+    edits: Vec<LedgeredEdit>,
 }
 
 /// One pending file creation.
@@ -98,11 +111,13 @@ fn err(msg: impl std::fmt::Display) -> ToolResult {
 
 /// Record a span-addressed edit into the set, enforcing the one-hash-per-file
 /// rule: every Span for a file must carry the hash the first Span pinned.
+/// `tier` is the authority tier of the edit's producer (lineage).
 fn push_span_edit(
     store: &EditStore,
     es: &str,
     span: &Span,
     edit: TextEdit,
+    tier: AuthorityTier,
 ) -> Result<usize, String> {
     store.with_set(es, |set| {
         let accum = set.files.entry(span.file.clone()).or_default();
@@ -114,7 +129,7 @@ fn push_span_edit(
                 span.file, accum.expected_sha256, span.content_sha256
             ));
         }
-        accum.edits.push(edit);
+        accum.edits.push(LedgeredEdit { edit, tier });
         Ok(accum.edits.len())
     })
 }
@@ -233,7 +248,8 @@ macro_rules! span_edit_tool {
                 }
                 #[allow(clippy::redundant_closure_call)]
                 let edit: TextEdit = ($to_edit)(&params.span, params.text.unwrap_or_default());
-                match push_span_edit(&self.0, &params.es, &params.span, edit) {
+                // Direct verbs are cell-authored: lineage floors at syntax_only.
+                match push_span_edit(&self.0, &params.es, &params.span, edit, AuthorityTier::SyntaxOnly) {
                     Ok(count) => ToolResult::Json(json!({
                         "es": params.es,
                         "file": params.span.file,
@@ -359,8 +375,11 @@ impl Tool for EditsCreateFile {
 
 /// `edits.merge` — fold span-shaped changes (e.g. lsp.rename output) into
 /// an EditSet: server-authored and cell-authored edits compose into ONE
-/// artifact (refactor-tools-v2 §3.2).
-pub struct EditsMerge(pub Arc<EditStore>);
+/// artifact (refactor-tools-v2 §3.2). The consumption point of the
+/// provenance ledger: each change the ledger recognizes (by content
+/// digest) keeps its issuer's tier; unrecognized material floors at
+/// syntax_only — never an error, just a priced downgrade.
+pub struct EditsMerge(pub Arc<EditStore>, pub Arc<ProvenanceLedger>);
 
 #[derive(Deserialize)]
 struct MergeParams {
@@ -418,18 +437,32 @@ impl Tool for EditsMerge {
             return err("edits.merge: `changes` must be non-empty");
         }
         let mut total = 0usize;
+        let mut recognized = 0usize;
         for change in &params.changes {
             let edit = TextEdit {
                 byte_start: change.span.byte_start,
                 byte_end: change.span.byte_end,
                 replacement: change.new_text.clone(),
             };
-            match push_span_edit(&self.0, &params.es, &change.span, edit) {
+            let tier = self
+                .1
+                .recognize(&change.span, &change.new_text)
+                .unwrap_or(AuthorityTier::SyntaxOnly);
+            if tier > AuthorityTier::SyntaxOnly {
+                recognized += 1;
+            }
+            match push_span_edit(&self.0, &params.es, &change.span, edit, tier) {
                 Ok(_) => total += 1,
                 Err(e) => return err(format!("edits.merge: {e}")),
             }
         }
-        ToolResult::Json(json!({ "es": params.es, "merged": total }))
+        ToolResult::Json(json!({
+            "es": params.es,
+            "merged": total,
+            // How many changes the provenance ledger recognized as
+            // host-issued (they keep their issuer's tier at apply).
+            "ledgered": recognized,
+        }))
     }
 }
 
@@ -503,6 +536,27 @@ impl Tool for EditsApply {
             return err(format!("edits.apply: EditSet `{}` is empty", params.es));
         }
 
+        // Lineage recomputed at the choke point from the host-recorded tiers
+        // (cell-dsl §4) — never from anything the cell claims. The set's
+        // semantic_status is the weakest link across every member; file
+        // creations are cell-authored content, so they count syntax_only.
+        let mut lineage_lsp = 0usize;
+        let mut lineage_syntax = set.creates.len();
+        for accum in set.files.values() {
+            for le in &accum.edits {
+                match le.tier {
+                    AuthorityTier::LspVerified => lineage_lsp += 1,
+                    AuthorityTier::SyntaxOnly => lineage_syntax += 1,
+                }
+            }
+        }
+        let semantic_status = if lineage_syntax == 0 {
+            AuthorityTier::LspVerified.as_str()
+        } else {
+            AuthorityTier::SyntaxOnly.as_str()
+        };
+        let lineage = json!({ "lsp_verified": lineage_lsp, "syntax_only": lineage_syntax });
+
         // Resolve every touched path inside the root before any work.
         let mut resolved_edits: Vec<(String, PathBuf, FileAccum)> = Vec::new();
         for (file, accum) in &set.files {
@@ -555,7 +609,9 @@ impl Tool for EditsApply {
                     continue;
                 }
                 let source = String::from_utf8_lossy(&bytes).to_string();
-                match apply_text_edits(&source, &accum.edits) {
+                let text_edits: Vec<TextEdit> =
+                    accum.edits.iter().map(|le| le.edit.clone()).collect();
+                match apply_text_edits(&source, &text_edits) {
                     Ok(new_text) => planned.push((file.clone(), path.clone(), bytes, new_text)),
                     Err(e) => findings.push(finding(
                         "invalid_edits",
@@ -581,7 +637,7 @@ impl Tool for EditsApply {
                     "applied": false,
                     "es": es_id,
                     "findings": findings,
-                    "semantic_status": "syntax_only",
+                    "semantic_status": semantic_status,
                 }));
             }
 
@@ -614,7 +670,7 @@ impl Tool for EditsApply {
                         "findings": [finding("write_failed", file, format!("{e:#}"), "filesystem error — inspect and retry")],
                         "rolled_back": true,
                         "rollback_errors": rollback_errors,
-                        "semantic_status": "syntax_only",
+                        "semantic_status": semantic_status,
                     }));
                 }
                 written.push((file.clone(), path.clone(), pre_image.clone(), new_text.len()));
@@ -628,7 +684,7 @@ impl Tool for EditsApply {
                         "findings": [finding("create_exists", file, format!("{e:#}"), "the path appeared between detection and write — pick a different path")],
                         "rolled_back": true,
                         "rollback_errors": rollback_errors,
-                        "semantic_status": "syntax_only",
+                        "semantic_status": semantic_status,
                     }));
                 }
                 created.push((file.clone(), path.clone()));
@@ -665,7 +721,7 @@ impl Tool for EditsApply {
                         "findings": parse_findings,
                         "rolled_back": true,
                         "rollback_errors": rollback_errors,
-                        "semantic_status": "syntax_only",
+                        "semantic_status": semantic_status,
                     }));
                 }
             }
@@ -729,7 +785,8 @@ impl Tool for EditsApply {
                 "applied": true,
                 "es": es_id,
                 "summary": summary,
-                "semantic_status": "syntax_only",
+                "semantic_status": semantic_status,
+                "lineage": lineage,
                 "validations": if run_validation {
                     json!([{ "validation": "tree_sitter_no_errors", "status": "passed", "files_checked": written.len() + created.len() }])
                 } else {
@@ -747,8 +804,9 @@ fn remove_created(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
-/// The `edits.*` binding set, sharing one session-scoped [`EditStore`].
-pub fn tools(store: Arc<EditStore>) -> Vec<Arc<dyn Tool>> {
+/// The `edits.*` binding set, sharing one session-scoped [`EditStore`] and
+/// the session's provenance ledger (consumed by `edits.merge`).
+pub fn tools(store: Arc<EditStore>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(EditsBegin(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsReplace(Arc::clone(&store))) as Arc<dyn Tool>,
@@ -756,7 +814,7 @@ pub fn tools(store: Arc<EditStore>) -> Vec<Arc<dyn Tool>> {
         Arc::new(EditsInsertBefore(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsDelete(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsCreateFile(Arc::clone(&store))) as Arc<dyn Tool>,
-        Arc::new(EditsMerge(Arc::clone(&store))) as Arc<dyn Tool>,
+        Arc::new(EditsMerge(Arc::clone(&store), ledger)) as Arc<dyn Tool>,
         Arc::new(EditsApply(store)) as Arc<dyn Tool>,
     ]
 }
@@ -1029,17 +1087,162 @@ mod tests {
             "got: {result:?}"
         );
     }
+
+    // ---- Provenance ledger lineage (cell-dsl §4) ----
+
+    use super::super::ledger::{AuthorityTier, ProvenanceLedger};
+
+    const RENAMED_BETA: &str = "pub fn gamma() -> u8 {\n    7\n}";
+
+    #[tokio::test]
+    async fn ledgered_merge_applies_lsp_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (_, beta) = beta_span(&root, &cx).await;
+        let ledger = Arc::new(ProvenanceLedger::default());
+
+        // Host issues the change (as lsp.rename does), cell passes it through.
+        let span: Span = serde_json::from_value(beta["span"].clone()).unwrap();
+        ledger.record_changes(
+            "lsp.rename",
+            AuthorityTier::LspVerified,
+            [(&span, RENAMED_BETA)],
+        );
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        let merged = json_of(
+            EditsMerge(store.clone(), ledger)
+                .call(
+                    json!({ "es": es, "changes": [{ "span": beta["span"], "new_text": RENAMED_BETA }] }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(merged["ledgered"], 1, "{merged}");
+
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["semantic_status"], "lsp_verified", "{result}");
+        assert_eq!(result["lineage"]["lsp_verified"], 1);
+        assert_eq!(result["lineage"]["syntax_only"], 0);
+    }
+
+    #[tokio::test]
+    async fn hand_built_merge_floors_at_syntax_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (_, beta) = beta_span(&root, &cx).await;
+        // Empty ledger: the cell hand-built its changes array — laundering
+        // is possible and priced, never an error.
+        let ledger = Arc::new(ProvenanceLedger::default());
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        let merged = json_of(
+            EditsMerge(store.clone(), ledger)
+                .call(
+                    json!({ "es": es, "changes": [{ "span": beta["span"], "new_text": RENAMED_BETA }] }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(merged["ledgered"], 0, "{merged}");
+
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["semantic_status"], "syntax_only", "{result}");
+        assert_eq!(result["lineage"]["syntax_only"], 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_lineage_floors_at_weakest_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (items, beta) = beta_span(&root, &cx).await;
+        let alpha = items["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "Alpha")
+            .unwrap()
+            .clone();
+        let ledger = Arc::new(ProvenanceLedger::default());
+        let span: Span = serde_json::from_value(beta["span"].clone()).unwrap();
+        ledger.record_changes(
+            "lsp.rename",
+            AuthorityTier::LspVerified,
+            [(&span, RENAMED_BETA)],
+        );
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        json_of(
+            EditsMerge(store.clone(), ledger)
+                .call(
+                    json!({ "es": es, "changes": [{ "span": beta["span"], "new_text": RENAMED_BETA }] }),
+                    &cx,
+                )
+                .await,
+        );
+        // A cell-authored edit joins the same set: the weakest link wins.
+        json_of(
+            EditsInsertBefore(store.clone())
+                .call(
+                    json!({ "es": es, "span": alpha["span"], "text": "/// Cell-authored doc.\n" }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["semantic_status"], "syntax_only", "{result}");
+        assert_eq!(result["lineage"]["lsp_verified"], 1);
+        assert_eq!(result["lineage"]["syntax_only"], 1);
+    }
+
+    #[tokio::test]
+    async fn creates_count_as_cell_authored_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        json_of(
+            EditsCreateFile(store.clone())
+                .call(json!({ "es": es, "path": "fresh.rs", "content": "pub fn fresh() {}\n" }), &cx)
+                .await,
+        );
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["semantic_status"], "syntax_only", "{result}");
+        assert_eq!(result["lineage"]["syntax_only"], 1);
+    }
 }
 
 /// Hand-authored namespace documentation + TS declarations (cell-dsl §5.2).
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "edits".to_string(),
-        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, invalid_edits, create_exists, parse_error_after_apply, write_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is syntax_only for cell-authored edits."
+        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, invalid_edits, create_exists, parse_error_after_apply, write_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile content, and any hand-rewritten change floor at syntax_only. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
             .to_string(),
         declarations: r#"type Finding = { kind: "stale_span" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed"; file: string; detail: string; resolution_hint: string };
-type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; content_sha256: string }[]; semantic_status: "syntax_only"; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation — mint fresh Spans from it without re-calling code.items
-type Bounced = { applied: false; es: string; findings: Finding[]; rolled_back?: boolean; semantic_status: "syntax_only" };
+type SemanticStatus = "lsp_verified" | "syntax_only";  // lineage-computed weakest link, recomputed host-side at apply — cell-supplied claims are ignored
+type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; content_sha256: string }[]; semantic_status: SemanticStatus; lineage: { lsp_verified: number; syntax_only: number }; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation — mint fresh Spans from it without re-calling code.items
+type Bounced = { applied: false; es: string; findings: Finding[]; rolled_back?: boolean; semantic_status: SemanticStatus };
 declare const edits: {
   /** Open a fresh EditSet (host-side, session-scoped; survives across cells by id). */
   begin(args?: {}): Promise<string>;  // returns the EditSet id directly
@@ -1053,8 +1256,8 @@ declare const edits: {
   delete(args: { es: string; span: Span }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue creation of a new file (pure; never writes; bounces if it exists at apply). */
   createFile(args: { es: string; path: string; content: string }): Promise<{ es: string; creates: number }>;
-  /** Fold span-shaped changes (e.g. lsp.rename().changes) into the set — server-authored edits join the same artifact (pure; never writes). */
-  merge(args: { es: string; changes: { span: Span; new_text: string }[] }): Promise<{ es: string; merged: number }>;
+  /** Fold span-shaped changes (e.g. lsp.rename().changes) into the set — server-authored edits join the same artifact (pure; never writes). `ledgered` counts changes the provenance ledger recognized as host-issued (they keep their authority tier at apply; unrecognized changes floor at syntax_only). */
+  merge(args: { es: string; changes: { span: Span; new_text: string }[] }): Promise<{ es: string; merged: number; ledgered: number }>;
   /** THE choke point: apply the EditSet. Clean → Applied (EditSet consumed). Detected condition → Bounced with findings (EditSet retained for repair; writes rolled back). */
   apply(args: { es: string; validations?: "tree_sitter_no_errors"[] }): Promise<Applied | Bounced>;
 };"#

@@ -283,6 +283,23 @@ dissolve rather than resolve).
    produces. Without this, `lsp_verified` is unreachable from any real
    program.
 
+   **Disposition (decisions 3–4 built, 2026-06-12).** The provenance ledger
+   shipped harness-side (`crates/bro-harness/src/bindings/ledger.rs`) on the
+   merge/apply seam: `lsp.rename` records each returned `{span, new_text}`
+   change at `lsp_verified` under an issuance id; `edits.merge` recognizes
+   consumed changes and stores per-edit tiers in the EditSet; `edits.apply`
+   recomputes the set's `semantic_status` as the weakest link (file creates
+   are cell-authored) and reports a `lineage` breakdown. Recognition is **by
+   canonical content digest, not by id** — the cell idiom passes `r.changes`
+   bare through filters/spreads/JSON round-trips, so cell-dsl §9's "digest
+   re-matching backstop" is the primary mechanism by construction: per-change
+   keying means a filtered subset keeps its provenance, and a hand-rewritten
+   change silently floors at `syntax_only` (laundering priced, not
+   forbidden). The issuance id rides the producer envelope for correlation
+   only. The ledger is session-scoped beside the EditStore, so
+   `store()`/`load()` continuity across cells is free — cell-dsl §4's
+   `recalled` mark turned out unnecessary.
+
 ## 6.5 The mechanical toolbox: transform bindings (the lsp.rename shape, generalized)
 
 The v1 Java catalog (~40 kinds, ~38 modules, ~800KB of Rust: the

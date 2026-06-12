@@ -10,9 +10,11 @@
 //! Spans in, spans out: positions convert at the binding edge
 //! (byte offset ↔ UTF-16 line/character), and server-authored edits come
 //! back as the same hash-anchored `{span, new_text}` shape the edits
-//! algebra consumes (`edits.merge`). Until the provenance ledger lands,
-//! applied EditSets still stamp `syntax_only` even when wholly
-//! server-authored — conservative by design.
+//! algebra consumes (`edits.merge`). Every returned change is recorded in
+//! the provenance [`ledger`](super::ledger) at `lsp_verified`, so an
+//! EditSet assembled purely from these changes applies with
+//! `semantic_status: "lsp_verified"` — lineage is recomputed host-side at
+//! the choke point, never read from cell-supplied tags.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::code_facts::{Span, span_schema_pub};
+use super::ledger::{AuthorityTier, ProvenanceLedger};
 
 /// Session-scoped LSP binding state: the warm pool plus the documents this
 /// session has opened (with the content generation last sent to the server,
@@ -163,8 +166,9 @@ fn render_lsp_error(e: bro_lsp::Error) -> String {
     }
 }
 
-/// `lsp.rename` — server-authority rename, returning span-shaped changes.
-pub struct LspRename(pub Arc<LspState>);
+/// `lsp.rename` — server-authority rename, returning span-shaped changes
+/// recorded in the provenance ledger at `lsp_verified`.
+pub struct LspRename(pub Arc<LspState>, pub Arc<ProvenanceLedger>);
 
 #[derive(Deserialize)]
 struct RenameParams {
@@ -297,7 +301,7 @@ impl Tool for LspRename {
 
         // Convert to hash-anchored span changes, reading each touched file
         // once to mint its generation hash.
-        let mut changes: Vec<Value> = Vec::new();
+        let mut changes: Vec<(Span, String)> = Vec::new();
         for (uri, edits) in by_uri {
             let path = match uri.to_file_path() {
                 Ok(p) => p,
@@ -335,46 +339,60 @@ impl Tool for LspRename {
                     Ok(b) => b,
                     Err(e) => return err(format!("lsp.rename: {rel}: {e}")),
                 };
-                changes.push(json!({
-                    "span": Span {
+                changes.push((
+                    Span {
                         file: rel.clone(),
                         byte_start,
                         byte_end,
                         content_sha256: file_sha.clone(),
                     },
-                    "new_text": text_edit.new_text,
-                }));
+                    text_edit.new_text,
+                ));
             }
         }
-        let files: std::collections::BTreeSet<String> = changes
+        // Server-authored changes enter the ledger; edits.merge recognizes
+        // them by content digest, so the EditSet's lineage carries
+        // lsp_verified through to apply.
+        let issuance = self.1.record_changes(
+            "lsp.rename",
+            AuthorityTier::LspVerified,
+            changes.iter().map(|(span, text)| (span, text.as_str())),
+        );
+        let files: std::collections::BTreeSet<&str> = changes
             .iter()
-            .filter_map(|c| c["span"]["file"].as_str().map(str::to_string))
+            .map(|(span, _)| span.file.as_str())
             .collect();
         ToolResult::Json(json!({
-            "changes": changes,
+            "changes": changes
+                .iter()
+                .map(|(span, new_text)| json!({ "span": span, "new_text": new_text }))
+                .collect::<Vec<Value>>(),
             "files": files,
             "edit_count": changes.len(),
             "authority": "lsp",
             "language": "rust",
+            "issuance": issuance,
+            "provenance": AuthorityTier::LspVerified.as_str(),
         }))
     }
 }
 
-/// The `lsp.*` binding set, sharing one session-scoped [`LspState`].
-pub fn tools(state: Arc<LspState>) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(LspRename(state)) as Arc<dyn Tool>]
+/// The `lsp.*` binding set, sharing one session-scoped [`LspState`] and the
+/// session's provenance ledger.
+pub fn tools(state: Arc<LspState>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(LspRename(state, ledger)) as Arc<dyn Tool>]
 }
 
 /// Hand-authored namespace documentation + TS declarations (cell-dsl §5.2).
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "lsp".to_string(),
-        description: "Language-server authority (rust-analyzer; Rust only for now). Session-backed: the first call in a workspace warms the server (may take a few seconds on a cold crate — the call blocks, no need to poll); later calls are fast. Fails closed when the server is unavailable — there is deliberately no silent fallback to text matching (RX-V3). THE RENAME RECIPE: aim a Span at the symbol (e.g. a code.query name capture, or an item span start), then `const r = await lsp.rename({ span, newName: \"x\" })` → `await edits.merge({ es, changes: r.changes })` → `await edits.apply({ es })` — server-authored edits join the same EditSet artifact as cell-authored ones."
+        description: "Language-server authority (rust-analyzer; Rust only for now). Session-backed: the first call in a workspace warms the server (may take a few seconds on a cold crate — the call blocks, no need to poll); later calls are fast. Fails closed when the server is unavailable — there is deliberately no silent fallback to text matching (RX-V3). THE RENAME RECIPE: aim a Span at the symbol (e.g. a code.query name capture, or an item span start), then `const r = await lsp.rename({ span, newName: \"x\" })` → `await edits.merge({ es, changes: r.changes })` → `await edits.apply({ es })` — server-authored edits join the same EditSet artifact as cell-authored ones. Provenance: returned changes are ledgered host-side at lsp_verified; pass them through to edits.merge UNMODIFIED and the applied EditSet stamps semantic_status \"lsp_verified\" (filtering the array is fine, rewriting a change's bytes floors that edit at syntax_only — the ledger recognizes content, not claims)."
             .to_string(),
         declarations: r#"type SpanChange = { span: Span; new_text: string };
 declare const lsp: {
-  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Returns hash-anchored server-authored changes for edits.merge. Fails closed if rust-analyzer is unavailable; stale_span on content drift. */
-  rename(args: { span: Span; newName: string }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; authority: "lsp"; language: string }>;
+  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Returns hash-anchored server-authored changes for edits.merge; the host ledgers them at lsp_verified, so an EditSet built purely from them applies with semantic_status "lsp_verified" (hand-editing a change drops it to syntax_only). Fails closed if rust-analyzer is unavailable; stale_span on content drift. */
+  rename(args: { span: Span; newName: string }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
 };"#
             .to_string(),
     }
