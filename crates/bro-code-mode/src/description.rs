@@ -493,10 +493,14 @@ fn render_namespace_global_reference(
         return None;
     }
 
-    let mut sections = vec![
-        "Namespace globals: domain bindings are installed as globals beside `tools` — call them as `await <namespace>.<method>(...)` (for example `await code.items({ file: \"src/lib.rs\" })`), never via `tools.*`. They dispatch like nested tools and honor the same tool filter."
-            .to_string(),
-    ];
+    let bound = grouped
+        .keys()
+        .map(|namespace| format!("`{}`", normalize_code_mode_identifier(namespace)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sections = vec![format!(
+        "Namespace globals — bound in this session: {bound}. Domain bindings are installed as globals beside `tools` — call them as `await <namespace>.<method>(...)` (for example `await code.items({{ file: \"src/lib.rs\" }})`), never via `tools.*`. They dispatch like nested tools and honor the same tool filter."
+    )];
     for (namespace, tools) in grouped {
         let namespace_ident = normalize_code_mode_identifier(namespace);
         let mut section = format!("## `{namespace_ident}` namespace");

@@ -1,0 +1,20 @@
+{
+  "id": "gap-3ec052ea",
+  "title": "code.* namespace has no file enumeration; cells bootstrap via tools.glob",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools/code-facts",
+  "wanted_capability": "Cross-file fact composition in the code namespace: (a) code.files({ dir?, language? }) enumeration so fact pipelines are self-contained (original ask), and (b) multi-file fact calls — code.items accepting files: string[] (or a glob) and/or a cross-file symbol search — so \"find symbol X in the crate\" is one call. Recurrence pattern across four probes: probe-code-facts-1/3 and probe-lsp-1/2 all iterated files in sequential for-loops (the batching recipe notwithstanding), probe-lsp-1 hallucinated a bare content_search global, and probe-lsp-2 burned a turn guessing the wrong file before iterating. Single-file facts are sound; the per-crate fan-out is the recurring manual step.",
+  "missing_primitive": "code.files({ dir, language })",
+  "fallback_used": "tools.glob({ pattern: \"src/**/*.rs\" }) in the first cell.",
+  "evidence": [
+    "session probe-code-facts-1, cell 1",
+    "prompts/RETRO_ISOLATE_REFACTOR.md retro finding: missing-algebra (files)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/refactor-tools/code-files-enumeration",
+  "notes": "Bumped low→medium 2026-06-12 after the lsp probes: now the top recurring polish ask. Evidence sessions: probe-code-facts-1/3, probe-edits-1/2, probe-lsp-1/2 in BRO_HOME=/tmp/refactor-v2-probe/brohome.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T19:27:30Z",
+  "updated_at": "2026-06-12T20:33:33Z"
+}
