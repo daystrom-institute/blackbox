@@ -40,6 +40,7 @@ an agent is told to read.
 | [DOC_REVIEW.md](DOC_REVIEW.md) | Dispatch the 5-lens `blackbox-review` ensemble against a design doc. |
 | [RETRO_INTERACTIVE.md](RETRO_INTERACTIVE.md) | End-of-session retro for a **live interactive** agent (tools, MCP, instructions, operator steering). Files gaps + follow-up notes. |
 | [RETRO_HARNESS.md](RETRO_HARNESS.md) | End-of-session retro for a **`bro fleet` / bro-harness** session (built-in tools, injected context, intern, turn machinery). Files gaps. |
+| [RETRO_ISOLATE_REFACTOR.md](RETRO_ISOLATE_REFACTOR.md) | Post-probe retro for a **code-mode session driving the refactor namespace bindings** (`code.*`/`lsp.*`/`analysis.*`/`edits.*`) — the live-probe instrument for refactor-tools-v2. Files gaps in `*/refactor-tools/*`. |
 | [REFRESH_ALL_CLIS.md](REFRESH_ALL_CLIS.md) | Refresh the harness research corpus: fan the `MINE_CLI` lens over all CLI subjects at their latest versions, integrate, validate, commit. Dispatches bros pointed at [`agents/MINE_CLI.md`](agents/MINE_CLI.md). |
 
 ## Dispatched-Agent Lenses
