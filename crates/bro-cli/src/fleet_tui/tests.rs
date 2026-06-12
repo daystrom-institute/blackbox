@@ -1533,23 +1533,6 @@ Trailing paragraph.";
         );
     }
 
-    /// Regression for the D24 footer empty-prompt bug: a daemon-origin task
-    /// (bro_exec, agent dispatch, workflow) has no `initial_prompt` and the
-    /// daemon provides a `name` via `snap.name`. The zoom footer must fall
-    /// back to that name instead of rendering `""`.
-    #[test]
-    fn pick_zoom_label_prefers_initial_prompt_when_present() {
-        assert_eq!(pick_zoom_label("audit the dispatch path", "session-1"), "audit the dispatch path");
-    }
-
-    /// Empty `initial_prompt` (the cockpit never set one — daemon-origin
-    /// task) must fall back to the daemon-supplied name so the footer
-    /// always carries a non-empty label.
-    #[test]
-    fn pick_zoom_label_falls_back_to_name_when_prompt_empty() {
-        assert_eq!(pick_zoom_label("", "session-1"), "session-1");
-    }
-
     /// The roster model column must prefer the operator's per-agent
     /// intent (`selected_model`) over the live snapshot. The operator
     /// can change a model's mid-flight via `/model`; the cached intent

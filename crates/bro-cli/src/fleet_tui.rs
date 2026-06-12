@@ -1033,16 +1033,40 @@ fn sync_focused_tail(app: &mut App) {
     }
 }
 
+/// True when the zoom transcript for `idx` is served by the file-attached
+/// session event log (vs the in-process handle-buffer fallback).
+fn focused_tail_attached(app: &App, idx: usize) -> bool {
+    let path = app.agents[idx].task.snapshot().transcript_path;
+    matches!(
+        (&app.focused_tail, path),
+        (Some(tail), Some(path)) if tail.path() == std::path::Path::new(&path)
+    )
+}
+
 fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
     // Prefer the file-attached session event log (daemon-backed task handles
     // never fill their local event buffer, so `task.transcript()` is empty
     // for them). The handle buffer remains as a fallback for tasks whose
     // events are delivered in-process or whose session isn't resolved yet.
-    let path = app.agents[idx].task.snapshot().transcript_path;
-    if let (Some(tail), Some(path)) = (&app.focused_tail, path)
-        && tail.path() == std::path::Path::new(&path)
+    if focused_tail_attached(app, idx)
+        && let Some(tail) = &app.focused_tail
     {
-        return tail.items().to_vec();
+        let mut items = tail.items().to_vec();
+        // The logged first user turn is the AMBIENT-WRAPPED prompt (scope
+        // block, recall directive, … with the operator's text last). When
+        // this cockpit launched the dispatch it knows the operator's own
+        // text — render that instead of the preamble blob. The full wrapped
+        // turn stays in the event log for forensics; this is display only.
+        let initial = initial_prompt(&app.agents[idx]).trim_end().to_string();
+        if !initial.is_empty()
+            && let Some(TranscriptItem::UserSteer(text)) = items
+                .iter_mut()
+                .find(|item| matches!(item, TranscriptItem::UserSteer(_)))
+            && text.trim_end().ends_with(initial.as_str())
+        {
+            *text = initial;
+        }
+        return items;
     }
     app.agents[idx].task.transcript()
 }
@@ -1402,10 +1426,6 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
             SlashCmd {
                 name: "/fast",
                 desc: "toggle priority service tier for new Brodex dispatches",
-            },
-            SlashCmd {
-                name: "/closeout",
-                desc: "fold the selected worktree back to the target branch",
             },
             SlashCmd {
                 name: "/prune",
@@ -1938,8 +1958,21 @@ where
         let mut committed_now = false;
         let active_lines = if let Some(idx) = focus {
             let transcript = focused_transcript_items(app, idx);
-            let turn_active = app.agents[idx].task.snapshot().turn_active;
-            let stable_end = inline_stable_end(&transcript, turn_active);
+            // File-tail events are complete, append-only records — the
+            // harness logs whole steps (one assistant message per model
+            // step, tool-result batches), never revisions — so everything
+            // parsed from the file is stable and commits to native
+            // scrollback as it lands. Without this, a long tool-heavy turn
+            // traps its entire output in the live area and the terminal's
+            // scrollback holds only the initial prompt. The conservative
+            // turn-boundary watermark remains for the in-process fallback,
+            // whose active turn CAN be revised by later events.
+            let stable_end = if focused_tail_attached(app, idx) {
+                transcript.len()
+            } else {
+                let turn_active = app.agents[idx].task.snapshot().turn_active;
+                inline_stable_end(&transcript, turn_active)
+            };
             committed_now =
                 commit_inline_history(app, terminal, idx, &transcript, stable_end, width)?;
 
@@ -2195,17 +2228,29 @@ where
     B: ratatui::backend::Backend + Write,
 {
     let id = inline_commit_key(app, idx);
-    let cursor = app.inline_commits.get(&id).copied().unwrap_or_default();
+    let cursor = app.inline_commits.get(&id).copied().or_else(|| {
+        // The commit key migrates from task id to transcript path the moment
+        // the roster resolves the session file; carry the cursor across so
+        // already-committed lines (the initial prompt) aren't re-emitted
+        // under the new key.
+        app.inline_commits.remove(&app.agents[idx].task.id())
+    });
+    let cursor = cursor.unwrap_or_default();
 
     let mut lines = Vec::new();
-    if !cursor.committed_initial {
+    let mut committed_initial = cursor.committed_initial;
+    if !committed_initial {
         let initial = initial_prompt(&app.agents[idx]);
-        if !initial.is_empty() {
-            // When the focused transcript's first item already carries the
-            // initial prompt as a UserSteer, don't render it twice.
-            let already_in_transcript =
-                initial_prompt_already_in_transcript(initial, transcript);
-            if !already_in_transcript {
+        if initial.is_empty() {
+            committed_initial = true;
+        } else if !transcript.is_empty() {
+            // Decide only once the transcript has content: the file-attached
+            // transcript always carries the dispatch turn as its first user
+            // steer (the harness logs the authoritative user turn), but it
+            // arrives a few frames after launch. Deciding on an EMPTY
+            // transcript double-prints — the bare prompt commits first, then
+            // the file's own steer lands right under it.
+            if !initial_prompt_already_in_transcript(initial, transcript) {
                 lines.extend(render_steer_with_status(
                     initial,
                     width,
@@ -2213,6 +2258,7 @@ where
                 ));
                 lines.push(Line::from(""));
             }
+            committed_initial = true;
         }
     }
     if stable_end > cursor.committed {
@@ -2235,7 +2281,7 @@ where
         id,
         InlineCommit {
             committed: stable_end.min(transcript.len()),
-            committed_initial: true,
+            committed_initial,
         },
     );
     Ok(committed_now)
@@ -3034,11 +3080,14 @@ fn run_local_slash(app: &mut App) -> bool {
             toggle_fast_mode(app, arg);
             true
         }
-        // `/closeout` is discoverable + previewable from any zone. `run_closeout`
-        // gates mutating folds (discard/publish/merge/adopt) against daemon roster
-        // metadata: a managed worktree must be present, and workflow-owned rows
-        // require an explicit owner ack before mutation.
-        "/closeout" => {
+        // `/closeout` folds the FOCUSED agent's worktree — a zoom-view
+        // operation only. In the roster the "selected" row is a moving
+        // cursor over a live-sorted list; folding against it invites
+        // folding the wrong worktree, so the command doesn't exist there.
+        // `run_closeout` further gates mutating folds against daemon roster
+        // metadata: a managed worktree must be present, and workflow-owned
+        // rows require an explicit owner ack before mutation.
+        "/closeout" if app.zone == Zone::SingleAgent => {
             run_closeout(app, arg);
             true
         }
@@ -4544,16 +4593,10 @@ fn single_agent_status_spans(
             .or(views[idx].cwd.as_deref())
             .map(path_name)
             .unwrap_or_else(|| "project".to_string());
-        // The initial prompt is a cockpit-local field (the operator's own
-        // -p / composer text), so for daemon-origin tasks (bro_exec, agent
-        // dispatch, workflows) it is always None and the footer would
-        // render an empty `""`. Fall back to the agent's display name —
-        // which the daemon populates via `snap.name` for origin-tracked
-        // tasks — so the footer always carries something meaningful.
-        let prompt = truncate(agent_zoom_label(a), 44);
+        // No prompt/name excerpt here: the composer's TOP title already
+        // shows `steer <name>`, and the name defaults to the first-turn
+        // excerpt until renamed — rendering both was pure duplication.
         spans.push(Span::styled(format!(" {project} "), byline));
-        spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(format!(" \"{prompt}\" "), byline));
         spans.push(Span::styled("──", dim));
     }
 
@@ -4754,36 +4797,17 @@ fn initial_prompt(a: &Agent) -> &str {
     a.initial_prompt.as_deref().unwrap_or("")
 }
 
-/// Resolve the zoomed single-agent footer label. Cockpit-origin dispatches
-/// carry the operator's own prompt in `initial_prompt`; daemon-origin tasks
-/// (bro_exec, workflows, agent dispatch) don't, so fall back to the agent's
-/// display name — which the daemon populates via `snap.name` for
-/// origin-tracked tasks — so the footer always carries something
-/// meaningful instead of an empty `""`.
-///
-/// Pure helper split out from [`agent_zoom_label`] so it is unit-testable
-/// without needing to construct an [`Agent`] (which requires a live
-/// `AgentHandle`).
-fn pick_zoom_label<'a>(initial_prompt: &'a str, name: &'a str) -> &'a str {
-    if initial_prompt.is_empty() {
-        name
-    } else {
-        initial_prompt
-    }
-}
-
-/// The footer label for the zoomed single-agent view. See
-/// [`pick_zoom_label`] for the resolution rule.
-fn agent_zoom_label(a: &Agent) -> &str {
-    pick_zoom_label(initial_prompt(a), a.name.as_str())
-}
-
 /// Returns true when the transcript's first item is a `UserSteer` whose text
 /// matches `initial` — the focused transcript already carries it so the
 /// renderer shouldn't emit the initial prompt twice in scrollback.
 fn initial_prompt_already_in_transcript(initial: &str, transcript: &[TranscriptItem]) -> bool {
+    // The first user steer may be the ambient-wrapped form of the initial
+    // prompt (dispatch preamble + operator text last) when the substitution
+    // in `focused_transcript_items` didn't apply — suffix-match so the bare
+    // prompt is never committed alongside its wrapped twin.
     transcript.first().is_some_and(|item| {
-        matches!(item, TranscriptItem::UserSteer(text) if text == initial)
+        matches!(item, TranscriptItem::UserSteer(text)
+            if text.trim_end().ends_with(initial.trim_end()))
     })
 }
 

@@ -48,6 +48,10 @@ pub(super) struct ParsedCloseout {
     /// Explicit operator override for workflow/atom-owned rows. The value must
     /// name the owning origin shown by the daemon roster metadata.
     pub ack_owner: Option<String>,
+    /// Commit message for `publish` (`--message <text…>` — consumes the rest
+    /// of the line, so it must come last). The daemon hard-requires a
+    /// non-empty message for publish.
+    pub message: Option<String>,
 }
 
 /// A worktree-local rebase conflict that has been handed back to the owning
@@ -104,7 +108,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     let trimmed = arg.trim();
     if trimmed.is_empty() {
         return Err(
-            "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>] [--ack-owner <origin>]"
+            "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>] [--ack-owner <origin>] [--message <text…> (publish; last flag)]"
                 .to_string(),
         );
     }
@@ -116,6 +120,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     let mut dry_run = false;
     let mut target: Option<String> = None;
     let mut ack_owner: Option<String> = None;
+    let mut message: Option<String> = None;
     let mut tokens = trimmed.split_whitespace();
     while let Some(tok) = tokens.next() {
         match tok {
@@ -142,6 +147,19 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
                 }
                 ack_owner = Some(value.to_string());
             }
+            "--message" => {
+                // Consume the rest of the line verbatim — commit messages
+                // contain spaces and quoting rules aren't worth the
+                // complexity, so `--message` must come last.
+                let rest = tokens.by_ref().collect::<Vec<_>>().join(" ");
+                if rest.trim().is_empty() {
+                    return Err(
+                        "/closeout: --message requires the commit message text (must be the last flag)"
+                            .to_string(),
+                    );
+                }
+                message = Some(rest);
+            }
             _ if disposition.is_none() => disposition = Some(tok.to_string()),
             _ => {
                 return Err(format!(
@@ -152,7 +170,7 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
     }
 
     let disposition = disposition.ok_or_else(|| {
-        "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>] [--ack-owner <origin>]"
+        "usage: /closeout <discard|publish|merge|adopt> [--dry-run to preview] [--target <branch>] [--ack-owner <origin>] [--message <text…> (publish; last flag)]"
             .to_string()
     })?;
     if !is_valid_disposition(&disposition) {
@@ -174,12 +192,23 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
         "discard" | "publish" | "merge" | "adopt"
     );
 
+    // The daemon hard-rejects publish without a commit message; fail fast
+    // with the fix in hand instead of an opaque 400 round-trip.
+    if disposition == "publish" && !dry_run && message.as_deref().is_none_or(|m| m.trim().is_empty())
+    {
+        return Err(
+            "/closeout publish requires a commit message: /closeout publish --message <text…>"
+                .to_string(),
+        );
+    }
+
     Ok(ParsedCloseout {
         disposition,
         dry_run,
         target,
         confirm,
         ack_owner,
+        message,
     })
 }
 
@@ -212,10 +241,7 @@ fn build_request(
             .target
             .clone()
             .or_else(|| project.and_then(|p| p.target.clone())),
-        // commit_message: the cockpit's `/closeout` is read-only on the
-        // publish commit-message knob in Phase 3b (Phase 4 may add
-        // `--message`); the daemon enforces the non-empty guard.
-        commit_message: None,
+        commit_message: parsed.message.clone(),
         paths: Vec::new(),
         allow_branch_prefixes: project.and_then(|p| p.allow_branch_prefixes.clone()),
         // Stamped verbatim from the parsed command. The daemon's phased
@@ -617,12 +643,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_closeout_minimal_publish() {
-        let p = parsed("publish");
+    fn parse_closeout_publish_requires_message() {
+        // Bare publish can never succeed (the daemon hard-rejects an empty
+        // commit_message), so the parser fails fast with the fix in hand
+        // instead of an opaque 400 round-trip.
+        let err = parse_closeout("publish").unwrap_err();
+        assert!(
+            err.contains("--message"),
+            "error must name the missing flag: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_closeout_publish_with_message_takes_rest_of_line() {
+        let p = parsed("publish --message fix: fold the worktree cleanly");
         assert_eq!(p.disposition, "publish");
         assert!(!p.dry_run);
         assert!(p.target.is_none());
         assert!(p.confirm, "publish is mutating");
+        assert_eq!(
+            p.message.as_deref(),
+            Some("fix: fold the worktree cleanly"),
+            "--message consumes the rest of the line verbatim"
+        );
+    }
+
+    #[test]
+    fn parse_closeout_publish_dry_run_needs_no_message() {
+        let p = parsed("publish --dry-run");
+        assert_eq!(p.disposition, "publish");
+        assert!(p.dry_run);
+        assert!(p.message.is_none());
     }
 
     #[test]
@@ -706,6 +757,7 @@ mod tests {
                 target: None,
                 confirm: expected_confirm,
                 ack_owner: None,
+                message: None,
             };
             let req = build_request(&parsed, "/tmp/wt", None);
             assert_eq!(req.disposition, disp, "disposition roundtrip for {disp}");
@@ -728,6 +780,7 @@ mod tests {
                 target: None,
                 confirm: true,
                 ack_owner: None,
+                message: None,
             };
             let req = build_request(&parsed, "/tmp/wt", None);
             assert_eq!(req.disposition, disp, "disposition roundtrips for {disp} --dry-run");
@@ -910,7 +963,23 @@ mod tests {
         let mut app = App::new(orch, None, rt.handle().clone());
         app.composer_history_path = dir.path().join("composer_history.jsonl");
 
-        // Bare `/closeout` with no args — parse failure path in `run_closeout`.
+        // `/closeout` is a zoom-view command now: the roster zone rejects it
+        // as unknown (folding keys off the FOCUSED agent's worktree).
+        app.input = "/closeout".to_string();
+        app.cursor_pos = 9;
+        assert!(run_local_slash(&mut app), "roster: consumed as unknown");
+        assert!(
+            app.pending_cockpit_lines
+                .first()
+                .is_some_and(|l| l.contains("unknown command")),
+            "roster zone must not offer /closeout: got {:?}",
+            app.pending_cockpit_lines
+        );
+        app.pending_cockpit_lines.clear();
+
+        // Bare `/closeout` in the zoom view — parse failure path in
+        // `run_closeout`.
+        app.zone = Zone::SingleAgent;
         app.input = "/closeout".to_string();
         app.cursor_pos = 9;
 

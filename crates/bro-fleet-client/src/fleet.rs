@@ -1181,15 +1181,14 @@ impl DaemonFleetClient {
     }
 
     async fn post_json(&self, path: &str, body: Value) -> anyhow::Result<Value> {
-        let outer: Value = self
+        let resp = self
             .http
             .post(self.endpoint(path))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let resp = surface_error_body(resp, path).await?;
+        let outer: Value = resp.json().await?;
         parse_tool_result_json(outer)
     }
 
@@ -1209,8 +1208,8 @@ impl DaemonFleetClient {
             .post(self.endpoint(path))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let resp = surface_error_body(resp, path).await?;
         Ok(resp.json().await?)
     }
 
@@ -1343,6 +1342,31 @@ impl DaemonFleetClient {
             daemon: Some(daemon),
         }
     }
+}
+
+/// Replace `error_for_status`'s opaque "HTTP status client error (400 …) for
+/// url (…)" with the daemon's actual error body. The `/control/*` guard
+/// handlers return structured `{"error": "…"}` JSON on 4xx (e.g. closeout's
+/// "publish requires commit_message") and axum's Json extractor returns the
+/// serde message on 422 — both are the diagnosis, so show them.
+async fn surface_error_body(
+    resp: reqwest::Response,
+    path: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or(body);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        anyhow::bail!("{path}: daemon returned {status}");
+    }
+    anyhow::bail!("{path}: {detail} ({status})");
 }
 
 fn block_on_fleet_http<F, T>(future: F) -> anyhow::Result<T>
