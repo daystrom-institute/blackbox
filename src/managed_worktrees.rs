@@ -26,7 +26,7 @@ pub(crate) fn managed_worktree_path_for_cwd(cwd: &str, roots: &[PathBuf]) -> Opt
         let Ok(relative) = cwd.strip_prefix(&root) else {
             continue;
         };
-        
+
         // Find the worktree by looking for the nearest ancestor with a .git marker
         // (either a .git directory or a .git file for git worktrees)
         let mut current = cwd.clone();
@@ -36,7 +36,7 @@ pub(crate) fn managed_worktree_path_for_cwd(cwd: &str, roots: &[PathBuf]) -> Opt
             }
             current = current.parent()?.to_path_buf();
         }
-        
+
         // Fallback to first component if no .git found (for non-git managed worktrees)
         let first_component = relative.components().next()?;
         return Some(root.join(first_component.as_os_str()));

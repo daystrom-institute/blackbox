@@ -632,5 +632,4 @@ mod tests {
         assert_eq!(second, Some(expected));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
-
 }

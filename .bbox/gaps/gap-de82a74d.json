@@ -1,0 +1,24 @@
+{
+  "id": "gap-de82a74d",
+  "title": "Worktree bbox_learn and bbox_render use asymmetric project scoping",
+  "gap_kind": "mcp_surface",
+  "domain": "render",
+  "wanted_capability": "Learning a project-scoped entry from a managed worktree and immediately rendering project provider files should use the same resolved project scope, or otherwise make the mismatch explicit. The entry should not silently remain unrendered because bbox_learn stores it under the worktree path while bbox_render filters by the registered base repo path.",
+  "missing_primitive": "shared worktree-to-base project scoping for bbox_learn/bbox_render, or a render diagnostic for excluded project entries",
+  "fallback_used": "Identified the mismatch manually by grepping the worktree .bbox/knowledge entry and rendered provider files, then inspecting src/tools/render.rs and src/tools/knowledge.rs.",
+  "evidence": [
+    "src/tools/render.rs:23",
+    "src/tools/knowledge.rs:72",
+    "crates/bbox-knowledge/src/knowledge.rs:1939",
+    "crates/bbox-knowledge/src/knowledge.rs:3006",
+    ".bbox/knowledge/daee9651.json:3"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/render/worktree-learn-render-rescope-mismatch",
+  "suggested_owner": "blackbox",
+  "notes": "Observed while adding a project-scoped rustfmt convention from /home/invidious/repos/transcript-search/.claude/worktrees/fleet-tui-tool-source-rendering. bbox_learn wrote .bbox/knowledge/daee9651.json in the worktree, but bbox_render rescoped the same worktree path to the registered base project for filtering and generated provider files without the new entry.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T04:17:10Z",
+  "updated_at": "2026-06-12T04:17:10Z"
+}

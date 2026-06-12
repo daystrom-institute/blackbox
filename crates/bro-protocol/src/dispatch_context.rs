@@ -196,7 +196,10 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_version() {
         let err = DispatchContext::parse(r#"{"v": 2}"#).unwrap_err();
-        assert!(err.contains("unsupported dispatch context version 2"), "{err}");
+        assert!(
+            err.contains("unsupported dispatch context version 2"),
+            "{err}"
+        );
     }
 
     #[test]

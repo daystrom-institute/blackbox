@@ -8,13 +8,13 @@ use tantivy::schema::Term;
 use tantivy::{Index, IndexWriter};
 
 use super::knowledge_docs;
+pub use super::passes::*;
 use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, ReindexConfig};
 use crate::projects::ProjectRecord;
 use bbox_corpus_index::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
-pub use super::passes::*;
 
 // At the default 120s interval this is one full refresh per day. Full
 // project refreshes rewrite managed derived sidecars and trigger legacy
@@ -369,7 +369,8 @@ pub fn backfill_tool_edges_for_project(
     config: &ReindexConfig,
     project: &ProjectRecord,
 ) -> Result<usize> {
-    let edges_dir = bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
+    let edges_dir =
+        bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
     let ctx = ToolEdgeContext::for_project(project.clone(), edges_dir.clone());
     let registry = TranscriptAdapterRegistry::from_reindex_config(config);
     let mut collected: Vec<bbox_edge_index::edge_index::Edge> = Vec::new();
@@ -430,13 +431,13 @@ mod tests {
     use tantivy::schema::Field;
 
     use super::*;
-    use bbox_corpus_index::transcripts::projection::normalized_to_doc;
     use bbox_corpus_core::entity_ref;
-    use bro_core::Provider;
-    use bro_transcript::{MessageRole, ParsedEvent};
+    use bbox_corpus_index::transcripts::projection::normalized_to_doc;
     use bbox_corpus_index::transcripts::types::{
         NormalizedTranscriptEvent, RawTranscriptRef, TranscriptStorage,
     };
+    use bro_core::Provider;
+    use bro_transcript::{MessageRole, ParsedEvent};
     use tantivy::TantivyDocument;
 
     #[test]

@@ -362,10 +362,7 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
     );
     if mutating
         && !parsed.dry_run
-        && !closeout_mutation_enabled(
-            context.managed_worktree.as_deref(),
-            context.workflow_owned,
-        )
+        && !closeout_mutation_enabled(context.managed_worktree.as_deref(), context.workflow_owned)
     {
         if context.managed_worktree.is_none() {
             app.push_cockpit_line(format!(
@@ -388,9 +385,7 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
     let worktree = match context.managed_worktree.or(context.fallback_worktree) {
         Some(w) => w,
         None => {
-            app.push_cockpit_line(
-                "/closeout: no focused fleet agent worktree to preflight",
-            );
+            app.push_cockpit_line("/closeout: no focused fleet agent worktree to preflight");
             app.clear_input();
             return;
         }
@@ -411,7 +406,10 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
     // the drain loop continues the fold once the agent's turn completes).
     if parsed.disposition == "publish"
         && !parsed.dry_run
-        && parsed.message.as_deref().is_none_or(|m| m.trim().is_empty())
+        && parsed
+            .message
+            .as_deref()
+            .is_none_or(|m| m.trim().is_empty())
     {
         start_commit_message_handshake(app, &worktree, parsed.target.clone());
         app.clear_input();
@@ -660,9 +658,7 @@ pub(super) fn poll_pending_closeout_recovery(app: &mut App) {
 /// half of the publish handshake; the fold itself stays cockpit-owned.
 fn start_commit_message_handshake(app: &mut App, worktree: &str, target: Option<String>) {
     if app.pending_commit_message.is_some() {
-        app.push_cockpit_line(
-            "/closeout publish: a commit-message handshake is already in flight",
-        );
+        app.push_cockpit_line("/closeout publish: a commit-message handshake is already in flight");
         return;
     }
     let Some(idx) = agent_index_for_worktree(app, worktree) else {
@@ -715,9 +711,7 @@ pub(super) fn poll_pending_commit_message(app: &mut App) {
         .position(|agent| agent.task.id() == pending.agent_id)
     else {
         app.pending_commit_message = None;
-        app.push_cockpit_line(
-            "/closeout publish stopped: owning agent is no longer in the roster",
-        );
+        app.push_cockpit_line("/closeout publish stopped: owning agent is no longer in the roster");
         return;
     };
     let snap = app.agents[idx].task.snapshot();
@@ -807,7 +801,9 @@ fn spawn_closeout_followup(
             .or_else(|| project.as_ref().and_then(|p| p.target.clone())),
         commit_message,
         paths: Vec::new(),
-        allow_branch_prefixes: project.as_ref().and_then(|p| p.allow_branch_prefixes.clone()),
+        allow_branch_prefixes: project
+            .as_ref()
+            .and_then(|p| p.allow_branch_prefixes.clone()),
         dry_run: false,
         closeout_hooks: project.as_ref().and_then(resolve_closeout_hooks),
     };
@@ -878,7 +874,10 @@ mod tests {
         assert_eq!(p.disposition, "publish");
         assert!(!p.dry_run);
         assert!(p.confirm, "publish is mutating");
-        assert!(p.message.is_none(), "no override → agent supplies the message");
+        assert!(
+            p.message.is_none(),
+            "no override → agent supplies the message"
+        );
     }
 
     #[test]
@@ -903,26 +902,35 @@ mod tests {
 {}
 ",
                 line("working on it"),
-                line("fix(fleet): fold the worktree
+                line(
+                    "fix(fleet): fold the worktree
 
-body line")
+body line"
+                )
             ),
         )
         .unwrap();
         assert_eq!(
             last_assistant_reply(path.to_str().unwrap()).as_deref(),
-            Some("fix(fleet): fold the worktree
+            Some(
+                "fix(fleet): fold the worktree
 
-body line"),
+body line"
+            ),
             "must read the LAST assistant text"
         );
 
         std::fs::write(
             &path,
-            format!("{}
-", line("```
+            format!(
+                "{}
+",
+                line(
+                    "```
 feat: fenced despite instructions
-```")),
+```"
+                )
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -1045,7 +1053,10 @@ feat: fenced despite instructions
             assert!(req.commit_message.is_none());
             assert!(req.paths.is_empty());
             assert!(req.allow_branch_prefixes.is_none());
-            assert!(!req.dry_run, "dry_run defaults to false on the non-dry-run path");
+            assert!(
+                !req.dry_run,
+                "dry_run defaults to false on the non-dry-run path"
+            );
         }
     }
 
@@ -1061,9 +1072,15 @@ feat: fenced despite instructions
                 message: None,
             };
             let req = build_request(&parsed, "/tmp/wt", None);
-            assert_eq!(req.disposition, disp, "disposition roundtrips for {disp} --dry-run");
+            assert_eq!(
+                req.disposition, disp,
+                "disposition roundtrips for {disp} --dry-run"
+            );
             assert!(req.dry_run, "dry_run is stamped for {disp} --dry-run");
-            assert!(req.confirm, "confirm stays true on dry-run for mutating {disp}");
+            assert!(
+                req.confirm,
+                "confirm stays true on dry-run for mutating {disp}"
+            );
         }
     }
 
@@ -1184,7 +1201,10 @@ feat: fenced despite instructions
         app.cursor_pos = 6;
 
         let handled = run_local_slash(&mut app);
-        assert!(handled, "/bogus should be handled (not fall through to dispatch/steer)");
+        assert!(
+            handled,
+            "/bogus should be handled (not fall through to dispatch/steer)"
+        );
         assert!(
             app.input.is_empty(),
             "input should be cleared after unknown command; got {:?}",
@@ -1270,10 +1290,22 @@ feat: fenced despite instructions
         );
         let msg = &app.pending_cockpit_lines[0];
         assert!(msg.contains("usage:"), "usage line: got {msg:?}");
-        assert!(msg.contains("discard"), "should list dispositions: got {msg:?}");
-        assert!(msg.contains("publish"), "should list dispositions: got {msg:?}");
-        assert!(msg.contains("merge"), "should list dispositions: got {msg:?}");
-        assert!(msg.contains("adopt"), "should list dispositions: got {msg:?}");
+        assert!(
+            msg.contains("discard"),
+            "should list dispositions: got {msg:?}"
+        );
+        assert!(
+            msg.contains("publish"),
+            "should list dispositions: got {msg:?}"
+        );
+        assert!(
+            msg.contains("merge"),
+            "should list dispositions: got {msg:?}"
+        );
+        assert!(
+            msg.contains("adopt"),
+            "should list dispositions: got {msg:?}"
+        );
         // Input should be cleared.
         assert!(app.input.is_empty(), "input cleared: got {:?}", app.input);
     }
@@ -1313,7 +1345,11 @@ fn render_outcome(sent_disposition: &str, dry_run: bool, outcome: &CloseoutOutco
             let deferred = phases.iter().find_map(|p| {
                 let obj = p.content.as_object()?;
                 (obj.get("skipped").and_then(|v| v.as_str()) == Some("origin_diverged"))
-                    .then(|| obj.get("message").and_then(|v| v.as_str()).map(str::to_string))
+                    .then(|| {
+                        obj.get("message")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
                     .flatten()
             });
             if let Some(message) = deferred {
@@ -1387,4 +1423,3 @@ fn error_class_label(class: CloseoutErrorClass) -> &'static str {
         CloseoutErrorClass::Other => "other",
     }
 }
-

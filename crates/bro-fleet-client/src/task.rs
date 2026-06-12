@@ -191,7 +191,10 @@ impl Default for TaskStore {
 
 fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
     let now = now_ms();
-    let completed_at = task.status.is_terminal().then_some(task.last_event_at.unwrap_or(now));
+    let completed_at = task
+        .status
+        .is_terminal()
+        .then_some(task.last_event_at.unwrap_or(now));
     Arc::new(Task {
         inner: Mutex::new(TaskInner {
             id: task.task_id.as_str().to_string(),
@@ -208,7 +211,9 @@ fn task_from_roster(task: RosterSummaryV1) -> Arc<Task> {
             num_turns: task.turns,
             stderr: task.error_teaser.unwrap_or_default(),
             status: task.status,
-            started_at: task.started_at.unwrap_or_else(|| task.last_event_at.unwrap_or(now)),
+            started_at: task
+                .started_at
+                .unwrap_or_else(|| task.last_event_at.unwrap_or(now)),
             completed_at,
             cwd: task.cwd,
             bro_label: task.name.or(task.label),
@@ -240,7 +245,10 @@ fn update_task_from_roster(existing: &Task, task: RosterSummaryV1) {
     if inner.started_at == 0 {
         inner.started_at = task.last_event_at.unwrap_or_else(now_ms);
     }
-    inner.completed_at = task.status.is_terminal().then_some(task.last_event_at.unwrap_or_else(now_ms));
+    inner.completed_at = task
+        .status
+        .is_terminal()
+        .then_some(task.last_event_at.unwrap_or_else(now_ms));
     inner.cwd = task.cwd;
     inner.bro_label = task.name.or(task.label);
     inner.recoverable = false;
@@ -309,7 +317,10 @@ mod tests {
             seq: 2,
             task: summary("task-1", TaskStatus::Completed),
         };
-        assert_eq!(store.apply_delta(1, updated), RosterApply::Applied { seq: 2 });
+        assert_eq!(
+            store.apply_delta(1, updated),
+            RosterApply::Applied { seq: 2 }
+        );
         let task = store.all_tasks().pop().unwrap();
         assert_eq!(task.inner.lock().status, TaskStatus::Completed);
 
@@ -317,7 +328,10 @@ mod tests {
             seq: 3,
             task_id: TaskId::new("task-1"),
         };
-        assert_eq!(store.apply_delta(2, removed), RosterApply::Applied { seq: 3 });
+        assert_eq!(
+            store.apply_delta(2, removed),
+            RosterApply::Applied { seq: 3 }
+        );
         assert!(store.all_tasks().is_empty());
     }
 

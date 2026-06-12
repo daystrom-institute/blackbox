@@ -19,9 +19,7 @@ use serde_json::json;
 use std::sync::OnceLock;
 
 use crate::embed::queue::{EmbedRequest, EmbedStatusResponse};
-use crate::embed::{
-    Bucket, EmbeddingRouter,
-};
+use crate::embed::{Bucket, EmbeddingRouter};
 use crate::embed_queue::status_response;
 use crate::orchestration::agents::types::{AgentManifest, AgentRef};
 use crate::routing::RoutingVerdict;
@@ -29,14 +27,14 @@ use crate::server::dispatch::dispatch_routing_verdict_direct;
 use crate::server::state::SharedState;
 use std::path::PathBuf;
 
+use crate::embed::queue;
+use crate::embed_queue::content_hash;
+use crate::orchestration::agents::types::{AgentEmbedding, AgentEmbeddingComponents};
 use bbox_chunker::Chunk;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_index::index::EmbeddingSourceDoc;
-use bbox_threads::notes::NoteParams;
-use crate::embed::queue;
 use bbox_knowledge::knowledge::KnowledgeEntry;
-use crate::embed_queue::content_hash;
-use crate::orchestration::agents::types::{AgentEmbedding, AgentEmbeddingComponents};
+use bbox_threads::notes::NoteParams;
 
 /// Adapter with the queue worker's hook signature; registered via
 /// `embed::queue::register_contradiction_hook` at SharedState construction.
@@ -104,7 +102,6 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
             )
         })
 }
-
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RouteCoverage {
@@ -243,8 +240,7 @@ fn record_agent_manifest_coverage(
             AgentManifestComponent::WhenToUse,
             AgentManifestComponent::AntiPatterns,
         ] {
-            let Some(chunk_hash) = agent_component_hash(&manifest, component)
-            else {
+            let Some(chunk_hash) = agent_component_hash(&manifest, component) else {
                 continue;
             };
             record_coverage(
@@ -437,7 +433,6 @@ fn enqueue_reembed_routes(
     }
     Ok(enqueued)
 }
-
 
 fn enqueue_agent_manifest_artifacts(
     state: &Arc<SharedState>,
@@ -637,7 +632,6 @@ fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
     })
 }
 
-
 static CONTRADICTION_STATE: OnceLock<RwLock<Option<std::sync::Arc<SharedState>>>> = OnceLock::new();
 static CONTRADICTION_THRESHOLD: OnceLock<RwLock<f32>> = OnceLock::new();
 const DEFAULT_TIER0_COSINE_THRESHOLD: f32 = 0.85;
@@ -659,7 +653,6 @@ fn contradiction_threshold() -> f32 {
         .get_or_init(|| RwLock::new(DEFAULT_TIER0_COSINE_THRESHOLD))
         .read()
 }
-
 
 pub(crate) fn status_response_for_buckets(
     stores: &crate::providers::CorpusStores<'_>,
@@ -697,7 +690,6 @@ pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
         STATUS_COVERAGE_BUCKETS,
     )?)?)
 }
-
 
 pub(crate) fn agent_manifest_embedding(
     agent: &AgentRef,
@@ -861,7 +853,6 @@ fn agent_manifest_component_text(
     }
 }
 
-
 pub(crate) fn maybe_detect_knowledge_contradiction(
     request: &EmbedRequest,
     vector_route: &str,
@@ -966,8 +957,8 @@ mod tests {
     use super::*;
 
     use crate::embed_queue::thread_chunk_hash;
-    use bbox_threads::threads::ThreadParams;
     use crate::vectors::{VectorStore, install_test_global};
+    use bbox_threads::threads::ThreadParams;
 
     #[test]
     fn reembed_route_validation_accepts_all_and_rejects_unknown() {
@@ -1103,7 +1094,8 @@ mod tests {
             )
             .unwrap();
 
-        let status = status_response_for_buckets(&state.corpus_stores(), &[Bucket::Threads]).unwrap();
+        let status =
+            status_response_for_buckets(&state.corpus_stores(), &[Bucket::Threads]).unwrap();
         let threads = status.routes.get("threads").unwrap();
         assert_eq!(threads.source_count, Some(1));
         assert_eq!(threads.indexed_count, 1);

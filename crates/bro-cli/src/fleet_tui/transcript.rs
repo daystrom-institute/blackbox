@@ -4,6 +4,7 @@ use super::*;
 /// results, §2.3); a render-side backstop so one huge block can't dominate.
 const ARG_MAX_LINES: usize = 15;
 const RESULT_MAX_LINES: usize = 25;
+const TOOL_SOURCE_MAX_LINES: usize = 80;
 
 /// Verbose inline transcript (§5.4): render the parsed [`TranscriptItem`]s in
 /// temporal order, structure carried by markers + color rather than folding.
@@ -102,8 +103,12 @@ pub(super) fn render_item(
             if is_internal_tool(name) {
                 return Vec::new();
             }
-            if let Some(edit_lines) = render_file_edit_call(name, args, width) {
+            if let Some(report_lines) = render_report_tool_call(name, args, width) {
+                lines.extend(report_lines);
+            } else if let Some(edit_lines) = render_file_edit_call(name, args, width) {
                 lines.extend(edit_lines);
+            } else if let Some(source_lines) = render_source_tool_call(name, args, width) {
+                lines.extend(source_lines);
             } else if let Some(line) = compact_tool_call_line(name, args, width) {
                 lines.push(Line::from(Span::styled(line, tool_call_style())));
             } else {
@@ -193,7 +198,9 @@ pub(super) fn render_item(
 fn item_is_compact_tool_call(item: &TranscriptItem, width: usize) -> bool {
     match item {
         TranscriptItem::ToolCall { name, args } if !is_internal_tool(name) => {
-            render_file_edit_call(name, args, width).is_some()
+            render_report_tool_call(name, args, width).is_some()
+                || render_file_edit_call(name, args, width).is_some()
+                || render_source_tool_call(name, args, width).is_some()
                 || compact_tool_call_line(name, args, width).is_some()
         }
         _ => false,
@@ -242,7 +249,7 @@ pub(super) fn tool_call_style() -> Style {
 /// noise — the compact call rendering already shows what changed. Only
 /// suppress on success; errors still surface.
 pub(super) fn tool_result_suppress_ok(name: Option<&str>) -> bool {
-    matches!(name, Some("file_edit"))
+    matches!(name, Some("file_edit")) || name.is_some_and(is_report_tool)
 }
 
 pub(super) fn tool_result_is_verbose(name: Option<&str>) -> bool {
@@ -271,7 +278,11 @@ pub(super) fn shell_result_tool(name: Option<&str>) -> bool {
     matches!(name, Some("shell_run" | "shell_poll" | "shell_kill"))
 }
 
-pub(super) fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Line<'static>> {
+pub(super) fn shell_result_block(
+    content: &str,
+    is_error: bool,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
     const MAX_SHELL_RESULT_JSON_BYTES: usize = 200_000;
     if content.len() > MAX_SHELL_RESULT_JSON_BYTES {
         return vec![Line::from(Span::styled(
@@ -369,7 +380,11 @@ pub(super) fn shell_result_block(content: &str, is_error: bool, max_lines: usize
     out
 }
 
-pub(super) fn render_file_edit_call(name: &str, args: &str, width: usize) -> Option<Vec<Line<'static>>> {
+pub(super) fn render_file_edit_call(
+    name: &str,
+    args: &str,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
     if name != "file_edit" {
         return None;
     }
@@ -404,7 +419,168 @@ pub(super) fn render_file_edit_call(name: &str, args: &str, width: usize) -> Opt
     Some(out)
 }
 
-pub(super) fn diff_side_lines(text: &str, marker: char, color: Color, width: usize) -> Vec<Line<'static>> {
+pub(super) fn render_report_tool_call(
+    name: &str,
+    args: &str,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    if !is_report_tool(name) {
+        return None;
+    }
+    let message = extract_tool_string_arg(args, &["message", "body", "text"])?;
+    let compact = quote_flat_string(&message);
+    let max_width = width.saturating_sub(1).min(140).max(12);
+    let prefix = format!("{TOOL_CALL_GLYPH} report(");
+    let suffix = ")";
+    let available = max_width
+        .saturating_sub(prefix.chars().count() + suffix.chars().count())
+        .max(1);
+    let rendered = format!("{prefix}{}{suffix}", truncate(&compact, available));
+    Some(vec![Line::from(Span::styled(rendered, tool_call_style()))])
+}
+
+pub(super) fn render_source_tool_call(
+    name: &str,
+    args: &str,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    if is_apply_patch_tool(name) {
+        let source = extract_tool_string_arg(args, &["source", "patch", "input"])
+            .or_else(|| patch_source_from_raw_args(args))?;
+        return Some(render_apply_patch_source(name, &source, width));
+    }
+
+    if is_exec_source_tool(name) {
+        let source = extract_tool_string_arg(args, &["source", "code", "input"])?;
+        return Some(render_code_source_tool_call(name, "js", &source, width));
+    }
+
+    None
+}
+
+fn render_apply_patch_source(name: &str, source: &str, width: usize) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(2).max(12);
+    let mut out = vec![Line::from(Span::styled(
+        format!("{TOOL_CALL_GLYPH} {name}"),
+        tool_call_style(),
+    ))];
+    out.extend(diff_source_lines(source, content_width));
+    out
+}
+
+fn render_code_source_tool_call(
+    name: &str,
+    lang: &str,
+    source: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(2).max(12);
+    let mut out = vec![Line::from(Span::styled(
+        format!("{TOOL_CALL_GLYPH} {name}({lang})"),
+        tool_call_style(),
+    ))];
+    let capped = cap_source_lines(source, TOOL_SOURCE_MAX_LINES, "// ... truncated ...");
+    let fenced = format!("```{lang}\n{}\n```", capped.trim_matches('\n'));
+    out.extend(render_markdown_with_width(&fenced, content_width));
+    out
+}
+
+fn diff_source_lines(source: &str, width: usize) -> Vec<Line<'static>> {
+    let line_width = width.saturating_sub(2).max(1);
+    let mut out = Vec::new();
+    let mut lines = source.lines().peekable();
+    if lines.peek().is_none() {
+        out.push(Line::from(Span::styled(
+            "(empty patch)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return out;
+    }
+
+    for line in lines.by_ref().take(TOOL_SOURCE_MAX_LINES) {
+        let (color, bold) = apply_patch_line_style(line);
+        let mut style = Style::default().fg(color);
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        out.push(Line::from(Span::styled(truncate(line, line_width), style)));
+    }
+    if lines.next().is_some() {
+        out.push(Line::from(Span::styled(
+            "…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    out
+}
+
+fn apply_patch_line_style(line: &str) -> (Color, bool) {
+    if line.starts_with("*** Add File:") || line.starts_with('+') {
+        (Color::Green, line.starts_with("***"))
+    } else if line.starts_with("*** Delete File:") || line.starts_with('-') {
+        (Color::Red, line.starts_with("***"))
+    } else if line.starts_with("*** Update File:")
+        || line.starts_with("*** Move to:")
+        || line.starts_with("@@")
+    {
+        (Color::Yellow, true)
+    } else if line.starts_with("*** Begin Patch") || line.starts_with("*** End Patch") {
+        (Color::DarkGray, true)
+    } else {
+        (Color::Gray, false)
+    }
+}
+
+fn cap_source_lines(source: &str, max_lines: usize, truncation_line: &str) -> String {
+    let mut lines = source.lines();
+    let mut out: Vec<&str> = lines.by_ref().take(max_lines).collect();
+    if lines.next().is_some() {
+        out.push(truncation_line);
+    }
+    out.join("\n")
+}
+
+fn extract_tool_string_arg(args: &str, keys: &[&str]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(args).ok()?;
+    let obj = value.as_object()?;
+    keys.iter()
+        .find_map(|key| obj.get(*key).and_then(|value| value.as_str()))
+        .map(ToString::to_string)
+}
+
+fn patch_source_from_raw_args(args: &str) -> Option<String> {
+    args.trim_start()
+        .starts_with("*** Begin Patch")
+        .then(|| args.to_string())
+}
+
+fn is_apply_patch_tool(name: &str) -> bool {
+    tool_name_leaf(name) == "apply_patch"
+}
+
+fn is_exec_source_tool(name: &str) -> bool {
+    tool_name_leaf(name) == "exec"
+}
+
+fn is_report_tool(name: &str) -> bool {
+    matches!(tool_name_leaf(name).as_str(), "bro_report" | "report")
+}
+
+fn tool_name_leaf(name: &str) -> String {
+    let dotted = name.rsplit(['.', ':', '/']).next().unwrap_or(name);
+    dotted
+        .rsplit("__")
+        .next()
+        .unwrap_or(dotted)
+        .to_ascii_lowercase()
+}
+
+pub(super) fn diff_side_lines(
+    text: &str,
+    marker: char,
+    color: Color,
+    width: usize,
+) -> Vec<Line<'static>> {
     const MAX_DIFF_SIDE_LINES: usize = 12;
     let mut out = Vec::new();
     let mut lines = text.lines().peekable();

@@ -1796,8 +1796,14 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("?", "a"));
         assert!(!glob_match("?", "ab"));
-        assert!(glob_match("mcp__blackbox__bro_*", "mcp__blackbox__bro_exec"));
-        assert!(!glob_match("mcp__blackbox__bro_*", "mcp__blackbox__bbox_search"));
+        assert!(glob_match(
+            "mcp__blackbox__bro_*",
+            "mcp__blackbox__bro_exec"
+        ));
+        assert!(!glob_match(
+            "mcp__blackbox__bro_*",
+            "mcp__blackbox__bbox_search"
+        ));
         assert!(glob_match("*bbox*", "mcp__blackbox__bbox_search"));
         assert!(glob_match("a*b*c", "axxbyyc"));
         assert!(!glob_match("a*b*c", "axxbyy"));

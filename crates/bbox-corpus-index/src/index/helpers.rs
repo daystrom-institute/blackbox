@@ -7,8 +7,8 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::ReindexConfig;
-use bro_transcript as parser;
 use crate::transcripts::types::TranscriptStorage;
+use bro_transcript as parser;
 
 /// Extract a human-readable project name from the file path.
 /// Claude Code encodes project paths as directory names: `/home/user/repos/foo` → `-home-user-repos-foo`

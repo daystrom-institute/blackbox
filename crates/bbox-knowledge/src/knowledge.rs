@@ -1703,8 +1703,8 @@ impl Knowledge {
                 if let Some(p) = project_filter {
                     match &e.project {
                         Some(ep) => {
-                            let alias_hit = project_alias_filter
-                                .is_some_and(|alias| ep.contains(alias));
+                            let alias_hit =
+                                project_alias_filter.is_some_and(|alias| ep.contains(alias));
                             if !ep.contains(p) && !alias_hit {
                                 return None;
                             }
@@ -2957,13 +2957,23 @@ mod tests {
     #[test]
     fn list_project_alias_also_matches_worktree_scoped_entries() {
         let (_tmp, mut kb) = mk_kb();
-        let mut base_entry = entry("aaaa1111", "Base rule", "convention in base", Scope::Project);
+        let mut base_entry = entry(
+            "aaaa1111",
+            "Base rule",
+            "convention in base",
+            Scope::Project,
+        );
         base_entry.project = Some("/registry/base".into());
         kb.store.entries.push(base_entry);
         // Out-of-tree worktree path: does NOT contain the base path as a
         // substring, so without the alias it is invisible to a base-scoped
         // query (and vice versa).
-        let mut wt_entry = entry("bbbb2222", "Worktree rule", "written from a worktree", Scope::Project);
+        let mut wt_entry = entry(
+            "bbbb2222",
+            "Worktree rule",
+            "written from a worktree",
+            Scope::Project,
+        );
         wt_entry.project = Some("/state/fleet/worktrees/wt-1".into());
         kb.store.entries.push(wt_entry);
 

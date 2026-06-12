@@ -815,7 +815,6 @@ fn convert_core_color(c: ratatui_core::style::Color) -> Color {
 mod tests {
     use super::*;
 
-
     #[test]
     fn clap_parses_tail_repeatable_and_positional_selectors() {
         let cli = BroCli::parse_from([

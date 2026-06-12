@@ -46,8 +46,8 @@ pub fn init_for_tests_from(defaults_dir: &Path) {
 #[cfg(test)]
 pub fn init_for_tests() {
     // Repo-root fixtures, reached relative to this crate's manifest.
-    let defaults = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../system-defaults/memories");
+    let defaults =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../system-defaults/memories");
     init_for_tests_from(&defaults);
 }
 

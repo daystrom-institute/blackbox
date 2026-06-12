@@ -62,14 +62,14 @@ use bro_fleet_client::{
 };
 
 use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
+use closeout::*;
+use composer_history::*;
+use dispatch::*;
+use highlight::*;
 use markdown::*;
 use transcript::*;
 use view::*;
-use dispatch::*;
 use wrapping::*;
-use highlight::*;
-use closeout::*;
-use composer_history::*;
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
@@ -905,7 +905,9 @@ impl App {
             return;
         }
         if let Some(id) = &self.roster_anchor_id
-            && let Some(pos) = order.iter().position(|&idx| self.agents[idx].task.id() == *id)
+            && let Some(pos) = order
+                .iter()
+                .position(|&idx| self.agents[idx].task.id() == *id)
         {
             self.roster_selected = pos;
         }
@@ -1779,8 +1781,7 @@ fn inline_focus_idx(app: &App) -> Option<usize> {
 /// first commit so `insert_history` never writes into the viewport rows. Falls
 /// back to a composer-height viewport when there is no focused agent.
 fn inline_seed_viewport(app: &mut App, screen_w: u16, screen_h: u16) -> Rect {
-    let composer_h =
-        composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
+    let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
     let active_lines = if let Some(idx) = inline_focus_idx(app) {
         let transcript = app.agents[idx].task.transcript();
         let turn_active = app.agents[idx].task.snapshot().turn_active;
@@ -2273,10 +2274,7 @@ where
         let start = cursor.committed.min(transcript.len());
         let end = stable_end.min(transcript.len());
         if end > start {
-            lines.extend(render_committed_items(
-                &transcript[start..end],
-                width,
-            ));
+            lines.extend(render_committed_items(&transcript[start..end], width));
         }
     }
     let committed_now = !lines.is_empty();
@@ -2798,20 +2796,18 @@ fn prune_terminal_agents(app: &mut App) {
     let mut dirty_names: Vec<String> = Vec::new();
     for (wt_path, _task_id) in &worktrees_to_check {
         match worktree_clean_status(wt_path) {
-            Ok(true) => {
-                match remove_fleet_worktree(wt_path) {
-                    Some(FleetWorktreeRemoval::BranchDeleted { .. }) => {
-                        worktrees_removed += 1;
-                    }
-                    Some(FleetWorktreeRemoval::BranchKeptUnmerged { branch }) => {
-                        worktrees_removed += 1;
-                        worktree_branches_kept.push(branch);
-                    }
-                    None => {
-                        worktrees_failed += 1;
-                    }
+            Ok(true) => match remove_fleet_worktree(wt_path) {
+                Some(FleetWorktreeRemoval::BranchDeleted { .. }) => {
+                    worktrees_removed += 1;
                 }
-            }
+                Some(FleetWorktreeRemoval::BranchKeptUnmerged { branch }) => {
+                    worktrees_removed += 1;
+                    worktree_branches_kept.push(branch);
+                }
+                None => {
+                    worktrees_failed += 1;
+                }
+            },
             Ok(false) => {
                 worktrees_dirty += 1;
                 dirty_names.push(path_tail(wt_path));
@@ -2831,7 +2827,11 @@ fn prune_terminal_agents(app: &mut App) {
         worktrees_failed,
         &worktree_branches_kept,
     );
-    let ttl = if worktrees_dirty > 0 || !worktree_branches_kept.is_empty() { 8 } else { 5 };
+    let ttl = if worktrees_dirty > 0 || !worktree_branches_kept.is_empty() {
+        8
+    } else {
+        5
+    };
     tracing::debug!(
         prune_action = "executed",
         pruned,
@@ -3748,7 +3748,10 @@ fn resume_agent(app: &mut App, idx: usize, text: String) {
     // Capture everything the worker needs before any mutable borrow of app.
     let provider = app.agents[idx].provider;
     let cwd = snap.cwd.clone();
-    let model = app.agents[idx].selected_model.clone().or(snap.model.clone());
+    let model = app.agents[idx]
+        .selected_model
+        .clone()
+        .or(snap.model.clone());
     let effort = app.agents[idx].selected_effort.clone();
     let service_tier = app.agents[idx].selected_service_tier.clone();
     let name = app.agents[idx].name.clone();
@@ -4755,9 +4758,7 @@ fn sync_activity_clock(
             // recent in-turn activity), then the task start, then `now_ms` as
             // a last resort when no prior evidence exists. Clamp forward
             // timestamps (clock skew, future-dated events) to `now_ms`.
-            let seeded = turn_started_at
-                .map(|t| t.min(now_ms))
-                .unwrap_or(now_ms);
+            let seeded = turn_started_at.map(|t| t.min(now_ms)).unwrap_or(now_ms);
             clock.active_since_ms = Some(seeded);
         }
         (false, Some(started)) => {
@@ -5326,20 +5327,20 @@ fn age(started_ms: u64) -> String {
     }
 }
 
+mod dispatch;
+mod highlight;
+mod markdown;
 #[cfg(test)]
 mod tests;
-mod markdown;
 mod transcript;
 mod view;
-mod dispatch;
 mod wrapping;
-mod highlight;
 // Vendored ratatui Terminal reimpl: legitimately exposes a fuller API (extra
 // clear/cursor/viewport methods) than the standalone inline loop consumes.
+mod closeout;
+mod composer_history;
 #[allow(dead_code)]
 mod custom_terminal;
 mod insert_history;
-mod transcript_tail;
-mod closeout;
-mod composer_history;
 mod instance_lock;
+mod transcript_tail;

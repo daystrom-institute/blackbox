@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use bbox_corpus_core::entity_ref::EntityRef;
 use crate::providers::{self, EntityView, ProviderContext};
+use bbox_corpus_core::entity_ref::EntityRef;
 
 const LABEL_KEYS: &[&str] = &["title", "name", "qualified_name", "topic", "subject"];
 

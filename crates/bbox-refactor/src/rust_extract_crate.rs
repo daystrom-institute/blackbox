@@ -51,14 +51,15 @@ pub fn expand_extract_rust_crate_step(
         .item_names
         .clone()
         .filter(|names| !names.is_empty())
-        .ok_or_else(|| anyhow!("item_names (root modules to extract) is required for extract_rust_crate"))?;
+        .ok_or_else(|| {
+            anyhow!("item_names (root modules to extract) is required for extract_rust_crate")
+        })?;
     for name in &module_names {
         validate_rust_identifier(name, "item_names")?;
     }
-    let crate_name = params
-        .module_name
-        .clone()
-        .ok_or_else(|| anyhow!("module_name (new crate name) is required for extract_rust_crate"))?;
+    let crate_name = params.module_name.clone().ok_or_else(|| {
+        anyhow!("module_name (new crate name) is required for extract_rust_crate")
+    })?;
     validate_crate_name(&crate_name)?;
     let project_dir_arg = path_string(project_dir);
 
@@ -454,8 +455,10 @@ pub fn plan_rewrite_rust_crate_paths(p: &RefactorPlanParams) -> Result<String> {
     let mut leftovers = Vec::new();
     // Grouped `use crate::{...}` lines first (their spans subsume the plain
     // path matches inside them).
-    let mut edits = rewrite_use_groups_with_split(&source, &crate_ident, module_names, &mut leftovers);
-    let group_spans: Vec<(usize, usize)> = edits.iter().map(|e| (e.byte_start, e.byte_end)).collect();
+    let mut edits =
+        rewrite_use_groups_with_split(&source, &crate_ident, module_names, &mut leftovers);
+    let group_spans: Vec<(usize, usize)> =
+        edits.iter().map(|e| (e.byte_start, e.byte_end)).collect();
     for module_name in module_names {
         let old = format!("crate::{module_name}");
         let new = format!("{crate_ident}::{module_name}");
@@ -548,7 +551,9 @@ pub fn plan_rust_workspace_dag_check(p: &RefactorPlanParams) -> Result<String> {
         .and_then(|m| m.as_array())
     {
         for member in members {
-            let Some(member) = member.as_str() else { continue };
+            let Some(member) = member.as_str() else {
+                continue;
+            };
             if let Some(prefix) = member.strip_suffix("/*") {
                 let base = root.join(prefix);
                 if base.is_dir() {
@@ -602,11 +607,7 @@ pub fn plan_rust_workspace_dag_check(p: &RefactorPlanParams) -> Result<String> {
     for (name, _dir, edges) in &raw {
         let resolved: Vec<(String, PathBuf)> = edges
             .iter()
-            .filter_map(|target| {
-                dir_to_name
-                    .get(target)
-                    .map(|n| (n.clone(), target.clone()))
-            })
+            .filter_map(|target| dir_to_name.get(target).map(|n| (n.clone(), target.clone())))
             .collect();
         edge_count += resolved.len();
         deps_by_name.insert(name.clone(), resolved);
@@ -753,10 +754,7 @@ fn scan_foreign_crate_refs(
                         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                         .collect();
                     if !seg.is_empty() && !moved.contains(seg.as_str()) {
-                        offenders.push(format!(
-                            "src/{rel}:{}: crate::{seg}",
-                            line_idx + 1
-                        ));
+                        offenders.push(format!("src/{rel}:{}: crate::{seg}", line_idx + 1));
                     }
                 }
                 start = at + "crate::".len();
@@ -957,9 +955,12 @@ fn merge_workspace_member(doc: &mut toml_edit::DocumentMut, member: &str) -> Res
     if members.iter().any(|v| v.as_str() == Some(member)) {
         return Ok(());
     }
-    let multiline = members
-        .iter()
-        .any(|v| v.decor().prefix().and_then(|p| p.as_str()).is_some_and(|p| p.contains('\n')));
+    let multiline = members.iter().any(|v| {
+        v.decor()
+            .prefix()
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| p.contains('\n'))
+    });
     let mut value = toml_edit::Value::from(member);
     if multiline {
         value.decor_mut().set_prefix("\n    ");
@@ -970,11 +971,7 @@ fn merge_workspace_member(doc: &mut toml_edit::DocumentMut, member: &str) -> Res
 
 /// Add `<name> = { path = "<path>" }` to `[dependencies]`, creating the table
 /// when absent. No-op when the dependency already exists.
-fn insert_path_dependency(
-    doc: &mut toml_edit::DocumentMut,
-    name: &str,
-    path: &str,
-) -> Result<()> {
+fn insert_path_dependency(doc: &mut toml_edit::DocumentMut, name: &str, path: &str) -> Result<()> {
     let deps = doc["dependencies"]
         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
@@ -1004,12 +1001,18 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 fn alias_module_decl_edit(origin_lib: &str, module: &str, crate_ident: &str) -> Result<TextEdit> {
     let variants = [
-        (format!("pub mod {module};"), format!("pub use {crate_ident}::{module};")),
+        (
+            format!("pub mod {module};"),
+            format!("pub use {crate_ident}::{module};"),
+        ),
         (
             format!("pub(crate) mod {module};"),
             format!("pub(crate) use {crate_ident}::{module};"),
         ),
-        (format!("mod {module};"), format!("use {crate_ident}::{module};")),
+        (
+            format!("mod {module};"),
+            format!("use {crate_ident}::{module};"),
+        ),
     ];
     let mut offset = 0usize;
     for line in origin_lib.lines() {
@@ -1057,8 +1060,12 @@ fn rewrite_use_groups_with_split(
         } else {
             continue;
         };
-        let Some(close) = rest.find('}') else { continue };
-        let Some(_semi) = rest[close..].find(';') else { continue };
+        let Some(close) = rest.find('}') else {
+            continue;
+        };
+        let Some(_semi) = rest[close..].find(';') else {
+            continue;
+        };
         let inner = &rest[..close];
         if inner.contains('{') {
             leftovers.push(format!(

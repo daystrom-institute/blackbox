@@ -5,9 +5,9 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_providers::entity_loader;
-use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_providers::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

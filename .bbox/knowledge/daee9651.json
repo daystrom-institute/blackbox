@@ -1,0 +1,19 @@
+{
+  "id": "daee9651",
+  "title": "Use stable rustfmt with Rust 2024 edition",
+  "content": "Rust formatting in transcript-search uses the stable Rust toolchain's rustfmt with the workspace's latest Rust edition standard, currently Rust 2024. Run `cargo +stable fmt` / `cargo +stable fmt --check` from the workspace so rustfmt reads crate manifests and formats files in their module context; do not format included module files as standalone Rust sources.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-06-12T03:58:16Z",
+  "updated_at": "2026-06-12T04:00:49Z",
+  "recall_count": 0
+}

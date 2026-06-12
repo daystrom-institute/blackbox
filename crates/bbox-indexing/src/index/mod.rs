@@ -19,9 +19,7 @@ mod store_integration_tests;
 mod thread_docs;
 pub mod writer_actor;
 
-pub use knowledge_docs::{
-    indexable_knowledge_entry, knowledge_chunk_hash, knowledge_entity_id,
-};
+pub use knowledge_docs::{indexable_knowledge_entry, knowledge_chunk_hash, knowledge_entity_id};
 pub use reindex::backfill_tool_edges_for_project;
 pub use reindex::spawn_reindex_thread;
 pub use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};

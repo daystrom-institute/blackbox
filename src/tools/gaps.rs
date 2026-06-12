@@ -244,7 +244,14 @@ mod tests {
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         run_git(
             &base,
-            &["worktree", "add", "-b", "worktree-wt-a", wt.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree-wt-a",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let wt_canon = wt.canonicalize().unwrap();
 
@@ -257,11 +264,19 @@ mod tests {
                 ..Default::default()
             }))
             .await;
-        assert_ne!(resolved.is_error, Some(true), "resolve failed: {resolved:?}");
+        assert_ne!(
+            resolved.is_error,
+            Some(true),
+            "resolve failed: {resolved:?}"
+        );
 
         let wt_file = gap_file(&wt_canon, &id);
         assert!(wt_file.exists(), "resolve must write into the worktree");
-        assert!(std::fs::read_to_string(&wt_file).unwrap().contains("addressed"));
+        assert!(
+            std::fs::read_to_string(&wt_file)
+                .unwrap()
+                .contains("addressed")
+        );
         assert_eq!(
             std::fs::read_to_string(gap_file(&base_canon, &id)).unwrap(),
             base_before,
@@ -282,7 +297,14 @@ mod tests {
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         run_git(
             &base,
-            &["worktree", "add", "-b", "worktree-wt-u", wt.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree-wt-u",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let wt_canon = wt.canonicalize().unwrap();
 
@@ -322,7 +344,14 @@ mod tests {
         let wt = tmp.path().join("wt-fleet");
         run_git(
             &base,
-            &["worktree", "add", "-b", "bro-fleet/x", wt.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/x",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let wt_canon = wt.canonicalize().unwrap();
 
@@ -334,11 +363,22 @@ mod tests {
                 ..Default::default()
             }))
             .await;
-        assert_ne!(resolved.is_error, Some(true), "resolve failed: {resolved:?}");
+        assert_ne!(
+            resolved.is_error,
+            Some(true),
+            "resolve failed: {resolved:?}"
+        );
 
         let wt_file = gap_file(&wt_canon, &id);
-        assert!(wt_file.exists(), "resolve must write into the fleet worktree");
-        assert!(std::fs::read_to_string(&wt_file).unwrap().contains("addressed"));
+        assert!(
+            wt_file.exists(),
+            "resolve must write into the fleet worktree"
+        );
+        assert!(
+            std::fs::read_to_string(&wt_file)
+                .unwrap()
+                .contains("addressed")
+        );
         assert_eq!(
             std::fs::read_to_string(gap_file(&base_canon, &id)).unwrap(),
             base_before,
@@ -364,7 +404,11 @@ mod tests {
                 ..Default::default()
             }))
             .await;
-        assert_ne!(resolved.is_error, Some(true), "resolve failed: {resolved:?}");
+        assert_ne!(
+            resolved.is_error,
+            Some(true),
+            "resolve failed: {resolved:?}"
+        );
         assert!(
             std::fs::read_to_string(gap_file(&base_canon, &id))
                 .unwrap()
@@ -383,7 +427,11 @@ mod tests {
                 ..Default::default()
             }))
             .await;
-        assert_ne!(resolved.is_error, Some(true), "resolve failed: {resolved:?}");
+        assert_ne!(
+            resolved.is_error,
+            Some(true),
+            "resolve failed: {resolved:?}"
+        );
         assert!(
             std::fs::read_to_string(gap_file(&base_canon, &id))
                 .unwrap()
@@ -427,7 +475,14 @@ mod tests {
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         run_git(
             &base,
-            &["worktree", "add", "-b", "worktree-wt-g", wt.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree-wt-g",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let wt_canon = wt.canonicalize().unwrap();
 
@@ -439,7 +494,11 @@ mod tests {
                 ..Default::default()
             }))
             .await;
-        assert_ne!(resolved.is_error, Some(true), "resolve failed: {resolved:?}");
+        assert_ne!(
+            resolved.is_error,
+            Some(true),
+            "resolve failed: {resolved:?}"
+        );
 
         assert!(
             !gap_file(&wt_canon, &id).exists(),
@@ -452,7 +511,10 @@ mod tests {
         let gaps = server.state.gaps.read();
         let gap = gaps.all().iter().find(|g| g.id == id).unwrap();
         assert_eq!(gap.resolution, crate::gaps::GapResolution::Addressed);
-        assert!(gap.write_dir.is_none(), "global gap must ignore write-targeting");
+        assert!(
+            gap.write_dir.is_none(),
+            "global gap must ignore write-targeting"
+        );
     }
 
     #[tokio::test]

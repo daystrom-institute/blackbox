@@ -4,10 +4,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::server::state::SharedState;
 use crate::system_events::hub::SystemEventDraft;
 use crate::system_events::identity::ExternalIdentity;
 use crate::system_events::types::{ActionOutcome, ActionStatus, SystemEvent, SystemEventKind};
-use crate::server::state::SharedState;
 use blackbox::secrets::{SecretSources, resolve_with_sources, write_file_secret};
 
 const BUILTIN_REF: &str = "forgejo-ensure-user@v1";

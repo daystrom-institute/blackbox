@@ -48,7 +48,6 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/logs/HEAD");
 
-    let build_id = git_head_short(12)
-        .unwrap_or_else(|| fallback_timestamp().to_string());
+    let build_id = git_head_short(12).unwrap_or_else(|| fallback_timestamp().to_string());
     println!("cargo:rustc-env=BLACKBOX_BUILD_ID={build_id}");
 }

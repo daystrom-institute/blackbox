@@ -110,11 +110,7 @@ impl BbxWatcher {
 }
 
 /// Route a single debounced notify event to the appropriate artifact action.
-pub fn handle_event(
-    event: &notify::Event,
-    roots: &[(String, PathBuf)],
-    catalog: &ArtifactCatalog,
-) {
+pub fn handle_event(event: &notify::Event, roots: &[(String, PathBuf)], catalog: &ArtifactCatalog) {
     let is_create_or_rename_to = matches!(
         event.kind,
         notify::EventKind::Create(_)

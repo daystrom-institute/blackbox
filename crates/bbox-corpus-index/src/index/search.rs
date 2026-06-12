@@ -14,11 +14,11 @@ use tantivy::{IndexWriter, TantivyDocument, Term};
 use walkdir::WalkDir;
 
 use super::helpers::*;
-use super::project_files;
 use super::passes::*;
+use super::project_files;
 use super::{FileMeta, TranscriptIndex};
-use bro_transcript as parser;
 use bbox_corpus_core::query::smart_query_to_tantivy;
+use bro_transcript as parser;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -1375,7 +1375,9 @@ impl TranscriptIndex {
         let index_size = dir_size(self.config.meta_path.parent().unwrap_or(Path::new(".")));
         let segments = segment_count(&self.index);
         let tool_call_edges = count_tool_call_edges(
-            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&self.config.projects_path),
+            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &self.config.projects_path,
+            ),
         );
 
         format!(

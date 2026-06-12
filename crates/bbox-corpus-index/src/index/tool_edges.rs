@@ -7,10 +7,10 @@ use sha2::{Digest, Sha256};
 
 use super::{ReindexConfig, project_files};
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
-use bbox_edge_sidecar::edge_sidecar::Edge;
 use bbox_corpus_core::entity_ref::EntityRef;
-use bro_transcript::{self as parser, ParsedEvent, ToolCallInfo, ToolCallKind};
 use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
+use bbox_edge_sidecar::edge_sidecar::Edge;
+use bro_transcript::{self as parser, ParsedEvent, ToolCallInfo, ToolCallKind};
 
 pub struct ToolEdgeContext {
     projects: Vec<ProjectRecord>,
@@ -22,7 +22,9 @@ impl ToolEdgeContext {
     pub fn from_config(config: &ReindexConfig, emit_sidecars: bool) -> Result<Self> {
         Ok(Self {
             projects: load_project_records(&config.projects_path)?,
-            edges_dir: bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path),
+            edges_dir: bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &config.projects_path,
+            ),
             emit_sidecars,
         })
     }
@@ -201,10 +203,16 @@ impl ToolEdgeContext {
         };
         let project_id = match &edge.target {
             bbox_corpus_core::entity_ref::EntityRef::ProjectFile { project_id, .. }
-            | bbox_corpus_core::entity_ref::EntityRef::ProjectFileV2 { project_id, .. } => project_id.clone(),
+            | bbox_corpus_core::entity_ref::EntityRef::ProjectFileV2 { project_id, .. } => {
+                project_id.clone()
+            }
             _ => return Ok(0),
         };
-        bbox_edge_sidecar::edge_sidecar::append_observed_edges(&self.edges_dir, &project_id, &[edge])?;
+        bbox_edge_sidecar::edge_sidecar::append_observed_edges(
+            &self.edges_dir,
+            &project_id,
+            &[edge],
+        )?;
         Ok(1)
     }
 
@@ -240,7 +248,11 @@ impl ToolEdgeContext {
             confidence: EdgeConfidence::Exact,
             metadata: bash_metadata(event, tool_call, project, line_offset),
         };
-        bbox_edge_sidecar::edge_sidecar::append_observed_edges(&self.edges_dir, &project.project_id, &[edge])?;
+        bbox_edge_sidecar::edge_sidecar::append_observed_edges(
+            &self.edges_dir,
+            &project.project_id,
+            &[edge],
+        )?;
         Ok(1)
     }
 
@@ -306,7 +318,10 @@ fn anchor_metadata(
     }
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
-        event.timestamp.clone().unwrap_or_else(bbox_corpus_core::util::now_iso),
+        event
+            .timestamp
+            .clone()
+            .unwrap_or_else(bbox_corpus_core::util::now_iso),
     );
     metadata.insert("tool.name".to_string(), tool_call.name.clone());
     if let Some(id) = &tool_call.tool_use_id {
@@ -325,7 +340,10 @@ fn bash_metadata(
     metadata.insert("anchor.project_id".to_string(), project.project_id.clone());
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
-        event.timestamp.clone().unwrap_or_else(bbox_corpus_core::util::now_iso),
+        event
+            .timestamp
+            .clone()
+            .unwrap_or_else(bbox_corpus_core::util::now_iso),
     );
     metadata.insert("tool.name".to_string(), tool_call.name.clone());
     if let Some(id) = &tool_call.tool_use_id {

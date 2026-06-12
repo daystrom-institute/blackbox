@@ -2516,8 +2516,10 @@ mod tests {
             .compile(&schema_val)
             .expect("schema compile");
 
-        let workflows_dir =
-            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/slack/workflows"));
+        let workflows_dir = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/slack/workflows"
+        ));
         if !workflows_dir.is_dir() {
             // ok if the dir doesn't exist (e.g. running from a different cwd)
             return;
@@ -2551,7 +2553,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../examples/slack/packets/routing-slack.json"
         ))
-            .expect("routing-slack.json readable");
+        .expect("routing-slack.json readable");
         let packet: Value = serde_json::from_str(&raw).expect("valid JSON");
 
         assert_eq!(packet["domain"], "webhook-routing/slack");
@@ -2597,7 +2599,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../examples/slack/webhooks/slack.json"
         ))
-            .expect("slack.json readable");
+        .expect("slack.json readable");
         let spec: Value = serde_json::from_str(&raw).expect("valid JSON");
 
         assert_eq!(spec["name"], "slack");

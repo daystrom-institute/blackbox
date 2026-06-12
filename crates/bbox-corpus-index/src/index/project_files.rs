@@ -82,9 +82,7 @@ fn ref_snapshot_id(
     ))
 }
 
-pub fn scan_registered_project_files(
-    config: &ReindexConfig,
-) -> Result<Vec<(String, u64, u64)>> {
+pub fn scan_registered_project_files(config: &ReindexConfig) -> Result<Vec<(String, u64, u64)>> {
     let mut files = Vec::new();
     for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
@@ -110,7 +108,8 @@ pub fn index_registered_projects_standalone(
     force_git_full: bool,
 ) -> Result<ProjectIndexStats> {
     let mut stats = ProjectIndexStats::default();
-    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
     let git_meta_dir = super::git_history::git_meta_dir_from_projects_path(&config.projects_path);
     for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
@@ -439,7 +438,11 @@ fn index_project(
     }
     ctx.stats.emitted_edges += git_stats.emitted_edges;
     if ctx.force_git_full {
-        match bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(ctx.edges_dir, &project.project_id, true) {
+        match bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(
+            ctx.edges_dir,
+            &project.project_id,
+            true,
+        ) {
             Ok(stats) if stats.applied => {
                 tracing::info!(
                     project_id = %project.project_id,
@@ -936,8 +939,10 @@ fn materialization_is_current(
     // Version-aware expected snapshot for the current HEAD. `clean_snapshot_id`
     // folds INDEXER_VERSION/CHUNKER_VERSION, so a version bump with unchanged
     // mtimes yields a different id ⇒ mismatch ⇒ not skipped.
-    let expected_snap = bbox_edge_sidecar::snapshot::clean_snapshot_id(repo_id, project_id, head_sha);
-    let expected_snap_rel = bbox_edge_sidecar::snapshot::active_snapshot_rel(project_id, &expected_snap);
+    let expected_snap =
+        bbox_edge_sidecar::snapshot::clean_snapshot_id(repo_id, project_id, head_sha);
+    let expected_snap_rel =
+        bbox_edge_sidecar::snapshot::active_snapshot_rel(project_id, &expected_snap);
     if entry.active_snapshot.as_deref() != Some(expected_snap_rel.as_str()) {
         return false;
     }
@@ -948,7 +953,8 @@ fn materialization_is_current(
     // stale overlay, which `switch_to_clean_snapshot` must clear).
     let overlay_rel = bbox_edge_sidecar::snapshot::dirty_overlay_rel(project_id);
     let overlay_in_manifest = entry.dirty_overlay.as_deref() == Some(overlay_rel.as_str());
-    let overlay_on_disk = bbox_edge_sidecar::snapshot::dirty_overlay_dir(edges_dir, project_id).is_dir();
+    let overlay_on_disk =
+        bbox_edge_sidecar::snapshot::dirty_overlay_dir(edges_dir, project_id).is_dir();
     if worktree_dirty {
         if !overlay_in_manifest || !overlay_on_disk {
             return false;
@@ -960,7 +966,9 @@ fn materialization_is_current(
         // Clean ⇒ the active snapshot dir is what the loader reads; it must
         // exist. `active_materialized_paths` silently drops missing dirs, so a
         // GC between passes would lose this project from the graph if we skipped.
-        if !bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, project_id, &expected_snap).is_dir() {
+        if !bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, project_id, &expected_snap)
+            .is_dir()
+        {
             return false;
         }
     }
@@ -1004,10 +1012,16 @@ fn snapshot_after_reindex(
         return Ok(());
     }
 
-    let project_edges =
-        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(edges_dir, "project", &project.project_id)?;
-    let git_edges =
-        bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(edges_dir, "git", &project.project_id)?;
+    let project_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+        edges_dir,
+        "project",
+        &project.project_id,
+    )?;
+    let git_edges = bbox_edge_sidecar::edge_sidecar::read_managed_derived_edges(
+        edges_dir,
+        "git",
+        &project.project_id,
+    )?;
 
     let snapshot_edges: Vec<bbox_edge_sidecar::edge_sidecar::Edge> = project_edges
         .iter()
@@ -1063,8 +1077,8 @@ fn snapshot_after_reindex(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bbox_chunker::SourceFormatChunker;
     use crate::index::build_schema;
+    use bbox_chunker::SourceFormatChunker;
     use tantivy::schema::Field;
 
     #[test]

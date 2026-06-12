@@ -1689,11 +1689,8 @@ mod tests {
             served_signal.notify_one();
             // Park here until the test signals shutdown.
             let mut buf = [0_u8; 1024];
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                socket.read(&mut buf),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), socket.read(&mut buf))
+                .await;
         });
 
         let mut tx = AnthropicTransport {

@@ -715,11 +715,10 @@ impl Session {
         // restores persona/pins/non-`needs_scope` directives from side-state
         // with scope dropped. Strict parse — daemon-authored payloads fail
         // loudly, they do not degrade.
-        let dispatch_arg = crate::context::dispatch::resolve_dispatch_context_arg(
-            cli.dispatch_context.as_deref(),
-        )
-        .map_err(anyhow::Error::msg)
-        .context("--dispatch-context")?;
+        let dispatch_arg =
+            crate::context::dispatch::resolve_dispatch_context_arg(cli.dispatch_context.as_deref())
+                .map_err(anyhow::Error::msg)
+                .context("--dispatch-context")?;
         let dispatch = crate::context::dispatch::DispatchState::from_arg(dispatch_arg, &prior_side);
         let strategy = crate::context::dispatch::CompositionStrategy::for_transport(kind);
         if let Some(r) = &store.restored {
@@ -1251,8 +1250,11 @@ impl Session {
                 // suspicious-turn-end diagnostics (`out.stop` / `out.usage`),
                 // but recorded per step so a max_tokens cut mid-session is
                 // visible in events.jsonl without waiting for termination.
-                self.emitter
-                    .assistant_message(assistant_content, Some(&out.stop), Some(&out.usage));
+                self.emitter.assistant_message(
+                    assistant_content,
+                    Some(&out.stop),
+                    Some(&out.usage),
+                );
             }
 
             let has_tool_work = out.stop == StopReason::ToolCalls && !out.tool_calls.is_empty();
@@ -3112,7 +3114,10 @@ mod tests {
         session.prepare_context_for_user_turn();
         let pushed = shared.pushed_users.lock().unwrap();
         assert_eq!(*pushed, vec!["turn one".to_string()]);
-        assert!(session.reference_context_item.is_some(), "baseline advanced");
+        assert!(
+            session.reference_context_item.is_some(),
+            "baseline advanced"
+        );
     }
 
     #[test]

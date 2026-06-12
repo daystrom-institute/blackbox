@@ -377,7 +377,10 @@ mod tests {
         let ctx = restored.context.as_ref().expect("context restored");
         assert_eq!(ctx.scope, None, "scope must NEVER be restored");
         assert_eq!(restored.persona(), Some("You are a reviewer"));
-        assert_eq!(restored.context.as_ref().unwrap().pins.as_deref(), Some("pin block"));
+        assert_eq!(
+            restored.context.as_ref().unwrap().pins.as_deref(),
+            Some("pin block")
+        );
         // needs_scope directives drop without a current scope.
         assert_eq!(restored.standing_text().unwrap(), "Task-shape check");
         assert_eq!(restored.per_turn_text().unwrap(), "Recall directive");

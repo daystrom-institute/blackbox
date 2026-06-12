@@ -10,8 +10,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use bbox_chunker::EdgeProvenance;
 use crate::edge_index::Edge;
+use bbox_chunker::EdgeProvenance;
 
 const MIGRATION_VERSION: u32 = 1;
 

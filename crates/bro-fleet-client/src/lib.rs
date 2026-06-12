@@ -18,17 +18,17 @@ mod mcp;
 mod tail;
 mod task;
 
-pub use config::{bro_home, daemon_port};
-pub use fleet::{
-    AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, CloseoutEvent, DEFAULT_CLASSIFIER_PROMPT,
-    DispatchSpec, FleetConfig, FleetOrchestrator, HookOnFail, HookPolicy, INTERN_PREFIX,
-    ProjectCloseout, ProjectDispatch, Provider, ResumeSpec, seed_worktree_dirs, TaskSnapshot,
-    TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptItem, intern_rider,
-    parse_transcript, provider_supports_bidi,
-};
 pub use bro_protocol::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,
     PhaseResult, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY,
+};
+pub use config::{bro_home, daemon_port};
+pub use fleet::{
+    AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, CloseoutEvent,
+    DEFAULT_CLASSIFIER_PROMPT, DispatchSpec, FleetConfig, FleetOrchestrator, HookOnFail,
+    HookPolicy, INTERN_PREFIX, ProjectCloseout, ProjectDispatch, Provider, ResumeSpec,
+    TaskSnapshot, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptItem, intern_rider,
+    parse_transcript, provider_supports_bidi, seed_worktree_dirs,
 };
 pub use mcp::McpServerConfig;
 pub use tail::TailEvent;

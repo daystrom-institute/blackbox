@@ -3,9 +3,9 @@ use std::sync::OnceLock;
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
-use bbox_chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
 use crate::embed::{Bucket, queue};
+use bbox_chunker::Chunk;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_knowledge::knowledge::KnowledgeEntry;
 use bbox_threads::notes::Note;
@@ -89,10 +89,12 @@ pub fn tombstone_roadmap(entity_id: &str) {
 /// hooks (`index::embed_hook`). Called from the daemon's writer-actor spawn
 /// path; idempotent.
 pub fn register_index_embed_hooks() {
-    bbox_indexing::index::embed_hook::register_embed_hooks(bbox_indexing::index::embed_hook::EmbedHooks {
-        project_file: enqueue_project_file,
-        git_message: enqueue_git_message,
-    });
+    bbox_indexing::index::embed_hook::register_embed_hooks(
+        bbox_indexing::index::embed_hook::EmbedHooks {
+            project_file: enqueue_project_file,
+            git_message: enqueue_git_message,
+        },
+    );
 }
 
 pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) {
@@ -178,9 +180,7 @@ pub use bbox_indexing::index::embed_hook::project_file_entity_id;
 /// Parse an `agent_embed:<name>:v<version>:<component>` vector entity id
 /// into its plain parts. The agent-typed wrapper lives in the daemon's
 /// embed runtime; this layer stays free of orchestration types.
-pub fn parse_agent_component_entity_id_parts(
-    entity_id: &str,
-) -> Option<(String, u32, String)> {
+pub fn parse_agent_component_entity_id_parts(entity_id: &str) -> Option<(String, u32, String)> {
     let rest = entity_id.strip_prefix("agent_embed:")?;
     let (agent_part, component_part) = rest.rsplit_once(':')?;
     let (name, version_part) = agent_part.rsplit_once(":v")?;
@@ -374,16 +374,10 @@ pub fn enqueue(request: queue::EmbedRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
-    
-    
-    
     use bbox_threads::threads::{
-        EdgeKind, EdgeTarget, SessionLink, Thread, ThreadEdge, ThreadKind,
-        ThreadStatus,
+        EdgeKind, EdgeTarget, SessionLink, Thread, ThreadEdge, ThreadKind, ThreadStatus,
     };
-    
 
     fn sample_thread() -> Thread {
         Thread {

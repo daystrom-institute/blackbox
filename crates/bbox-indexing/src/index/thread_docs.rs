@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use tantivy::{IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta};
-use bbox_corpus_core::entity_ref::EntityRef;
 use crate::projects::ProjectRegistry;
+use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_threads::threads::{Thread, ThreadRecord, Threads};
 
 fn thread_entity_id(thread_id: &str) -> String {
@@ -81,7 +81,10 @@ fn build_thread_doc(thread: &Thread, threads_path: &Path, f: FieldHandles) -> Ta
     let content = thread_content(thread);
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "thread");
-    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
+    doc.add_text(
+        f.parser_version,
+        bbox_corpus_core::entity_ref::PARSER_VERSION,
+    );
     doc.add_text(f.content, &content);
     doc.add_text(f.entity_id, thread_entity_id(&thread.id));
     doc.add_text(f.account, "blackbox");
@@ -140,7 +143,10 @@ fn build_record_doc(
     // Indexed as a `thread` so a committed record is found exactly like the
     // live thread it snapshots (same entity_id); on a clone it is the only copy.
     doc.add_text(f.doc_type, "thread");
-    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
+    doc.add_text(
+        f.parser_version,
+        bbox_corpus_core::entity_ref::PARSER_VERSION,
+    );
     doc.add_text(f.content, &content);
     doc.add_text(f.entity_id, thread_entity_id(&record.id));
     doc.add_text(f.account, "blackbox");
@@ -356,7 +362,8 @@ mod tests {
         // snapshot explicitly (the production path persists via the actor).
         bbox_corpus_core::json_store::atomic_write_json_locked(
             projects_path,
-            &<ProjectRegistry as bbox_stores::store_persister::StoreSnapshot>::snapshot(&reg).unwrap(),
+            &<ProjectRegistry as bbox_stores::store_persister::StoreSnapshot>::snapshot(&reg)
+                .unwrap(),
         )
         .unwrap();
     }

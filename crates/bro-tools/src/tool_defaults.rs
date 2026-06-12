@@ -135,7 +135,8 @@ impl PinConflict {
             self.param,
             self.expected,
             self.actual,
-            serde_json::to_string(&rider.to_value()).unwrap_or_else(|_| rider.to_value().to_string())
+            serde_json::to_string(&rider.to_value())
+                .unwrap_or_else(|_| rider.to_value().to_string())
         ))
     }
 }
@@ -153,7 +154,11 @@ impl ToolArgDefaults {
         self.rules.is_empty()
     }
 
-    pub fn apply(&self, tool_name: &str, input: Value) -> Result<(Value, ToolArgRider), PinConflict> {
+    pub fn apply(
+        &self,
+        tool_name: &str,
+        input: Value,
+    ) -> Result<(Value, ToolArgRider), PinConflict> {
         if self.rules.is_empty() {
             return Ok((input, ToolArgRider::default()));
         }
@@ -374,10 +379,21 @@ mod tests {
         ]);
         assert!(!defaults.is_empty());
 
-        assert!(ToolArgDefaults::parse_map(BTreeMap::from([("mcp.x.y".into(), "v".into())])).is_err());
-        assert!(ToolArgDefaults::parse_map(BTreeMap::from([("maybe:mcp.x.y".into(), "v".into())])).is_err());
-        assert!(ToolArgDefaults::parse_map(BTreeMap::from([("default:mcp*foo.y".into(), "v".into())])).is_err());
-        assert!(ToolArgDefaults::parse_map(BTreeMap::from([("default:mcp.x.".into(), "v".into())])).is_err());
+        assert!(
+            ToolArgDefaults::parse_map(BTreeMap::from([("mcp.x.y".into(), "v".into())])).is_err()
+        );
+        assert!(
+            ToolArgDefaults::parse_map(BTreeMap::from([("maybe:mcp.x.y".into(), "v".into())]))
+                .is_err()
+        );
+        assert!(
+            ToolArgDefaults::parse_map(BTreeMap::from([("default:mcp*foo.y".into(), "v".into())]))
+                .is_err()
+        );
+        assert!(
+            ToolArgDefaults::parse_map(BTreeMap::from([("default:mcp.x.".into(), "v".into())]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -403,10 +419,7 @@ mod tests {
         assert_eq!(rider.defaults_applied["session_id"], "host");
 
         let (input, rider) = defaults
-            .apply(
-                "mcp__blackbox__bbox_note",
-                json!({"session_id": "model"}),
-            )
+            .apply("mcp__blackbox__bbox_note", json!({"session_id": "model"}))
             .unwrap();
         assert_eq!(input["session_id"], "model");
         assert!(rider.is_empty());
@@ -416,10 +429,7 @@ mod tests {
     fn pin_conflict_errors_without_overriding() {
         let defaults = table(&[("pin:mcp.bbox_note.session_id", "host")]);
         let err = defaults
-            .apply(
-                "mcp__blackbox__bbox_note",
-                json!({"session_id": "model"}),
-            )
+            .apply("mcp__blackbox__bbox_note", json!({"session_id": "model"}))
             .unwrap_err();
         assert_eq!(err.param, "session_id");
         assert_eq!(err.expected, "host");
@@ -432,10 +442,7 @@ mod tests {
         // param must be a complete no-op: no fill, no rider. Otherwise every
         // tool result in a worktree dispatch carries the pinned paths as
         // noise (regression observed live on a vibebh cockpit dispatch).
-        let defaults = table(&[
-            ("pin:*.cwd", "/repo/wt"),
-            ("pin:*.project_dir", "/repo/wt"),
-        ]);
+        let defaults = table(&[("pin:*.cwd", "/repo/wt"), ("pin:*.project_dir", "/repo/wt")]);
 
         let (out, rider) = defaults
             .apply(
@@ -443,7 +450,10 @@ mod tests {
                 json!({"project": "/repo/base", "status": "open"}),
             )
             .unwrap();
-        assert!(rider.is_empty(), "absent pinned params must stay rider-silent");
+        assert!(
+            rider.is_empty(),
+            "absent pinned params must stay rider-silent"
+        );
         assert_eq!(out.get("cwd"), None, "pins never fill");
         assert_eq!(out.get("project_dir"), None, "pins never fill");
 
@@ -481,10 +491,7 @@ mod tests {
         // (dispatch tools advertise `cwd`, accept `project_dir` as a
         // deprecated alias — gap-6366c92d). The daemon therefore emits pins
         // for BOTH names; either spelling of a wrong tree must refuse.
-        let defaults = table(&[
-            ("pin:*.cwd", "/repo/wt"),
-            ("pin:*.project_dir", "/repo/wt"),
-        ]);
+        let defaults = table(&[("pin:*.cwd", "/repo/wt"), ("pin:*.project_dir", "/repo/wt")]);
 
         // New canonical name, wrong tree: refused.
         let err = defaults
@@ -580,6 +587,10 @@ mod tests {
             defaults.validation_warnings([("mcp__blackbox__bbox_note", &schema)].into_iter());
         assert_eq!(warnings.len(), 2);
         assert!(warnings.iter().any(|w| w.contains("unknown param 'nope'")));
-        assert!(warnings.iter().any(|w| w.contains("matched no loaded tool")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("matched no loaded tool"))
+        );
     }
 }

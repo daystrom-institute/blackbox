@@ -1523,7 +1523,11 @@ mod tests {
         );
 
         store
-            .file(&project_params("fresh", "tooling/test-domain/fresh2", &root))
+            .file(&project_params(
+                "fresh",
+                "tooling/test-domain/fresh2",
+                &root,
+            ))
             .unwrap();
         assert!(
             broken.exists(),
@@ -1549,12 +1553,20 @@ mod tests {
             .unwrap();
 
         let (id, _) = store
-            .file(&project_params("mover", "tooling/test-domain/mover", &root_a))
+            .file(&project_params(
+                "mover",
+                "tooling/test-domain/mover",
+                &root_a,
+            ))
             .unwrap();
         // A second gap keeps root_a in the save's write set: purge only runs
         // for dirs being written (a fully-vacated dir is left untouched).
         store
-            .file(&project_params("stayer", "tooling/test-domain/stayer", &root_a))
+            .file(&project_params(
+                "stayer",
+                "tooling/test-domain/stayer",
+                &root_a,
+            ))
             .unwrap();
         let file_a = root_a.join(".bbox/gaps").join(format!("{id}.json"));
         assert!(file_a.exists());
@@ -1567,7 +1579,12 @@ mod tests {
             !file_a.exists(),
             "reassigned gap's old file should be purged"
         );
-        assert!(root_b.join(".bbox/gaps").join(format!("{id}.json")).exists());
+        assert!(
+            root_b
+                .join(".bbox/gaps")
+                .join(format!("{id}.json"))
+                .exists()
+        );
     }
 
     /// Write redirection (resolve/update from a worktree session) must leave
@@ -1596,7 +1613,11 @@ mod tests {
         // A second base-owned gap keeps `root` in the save's write set so the
         // generation purge actually runs there.
         store
-            .file(&project_params("stayer", "tooling/test-domain/stayer2", &root))
+            .file(&project_params(
+                "stayer",
+                "tooling/test-domain/stayer2",
+                &root,
+            ))
             .unwrap();
         let base_file = root.join(".bbox/gaps").join(format!("{id}.json"));
         assert!(base_file.exists());

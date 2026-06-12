@@ -1407,8 +1407,14 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Glm, Some("zai-nosearch"), None, store.path(), None)
-                .unwrap()
+            resolve_provider_env(
+                Provider::Glm,
+                Some("zai-nosearch"),
+                None,
+                store.path(),
+                None,
+            )
+            .unwrap()
         });
         // No lane-level default exists for BRO_HARNESS_WEB_SEARCH; the knob is
         // operator-scoped (account env here, or per-dispatch env_overrides),

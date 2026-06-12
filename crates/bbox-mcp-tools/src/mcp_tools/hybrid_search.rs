@@ -372,7 +372,8 @@ fn aggregate_bm25_by_file(chunks: &[bbox_indexing::index::HybridBm25Hit]) -> Vec
     // across many sections) ranks above a file with fewer but slightly
     // denser chunks. Score sum alone underweights breadth; sqrt(count)
     // alone overweights it. The geometric blend lifts coverage cleanly.
-    let mut by_file: HashMap<String, (f32, usize, &bbox_indexing::index::HybridBm25Hit)> = HashMap::new();
+    let mut by_file: HashMap<String, (f32, usize, &bbox_indexing::index::HybridBm25Hit)> =
+        HashMap::new();
     let mut non_file_hits: Vec<&bbox_indexing::index::HybridBm25Hit> = Vec::new();
     for hit in chunks {
         let Some(key) = file_dedup_key(&hit.entity_id) else {
@@ -556,14 +557,15 @@ fn diversify_by_chunk_kind(results: &mut [HybridResult], limit: usize) {
     }
 }
 
-
 /// Coverage-status hook: the daemon registers
 /// `embed_runtime::status_response_for_buckets` here at SharedState
 /// construction (dependency inversion — coverage walks daemon-side
 /// reembed routing this layer must not name). Unregistered means
 /// queue-local status only.
-type CoverageStatusFn =
-    fn(&bbox_providers::providers::CorpusStores<'_>, &[Bucket]) -> anyhow::Result<EmbedStatusResponse>;
+type CoverageStatusFn = fn(
+    &bbox_providers::providers::CorpusStores<'_>,
+    &[Bucket],
+) -> anyhow::Result<EmbedStatusResponse>;
 static COVERAGE_STATUS_HOOK: std::sync::OnceLock<CoverageStatusFn> = std::sync::OnceLock::new();
 
 /// Register the embedding coverage-status source. Idempotent; first wins.
@@ -936,10 +938,10 @@ fn sanitize_status_error(err: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bbox_corpus_core::search::rrf::{FusedHit, RankedList};
     use bbox_knowledge::knowledge::{
         Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,
     };
-    use bbox_corpus_core::search::rrf::{FusedHit, RankedList};
 
     #[test]
     fn response_shape_includes_vector_status() {
@@ -1308,7 +1310,14 @@ mod tests {
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(&base)
-            .args(["worktree", "add", "-b", "arc/x", worktree.to_str().unwrap(), "HEAD"])
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "arc/x",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ])
             .output()
             .unwrap();
         assert!(
@@ -1326,7 +1335,8 @@ mod tests {
         // path-derived id fallback.
         let plain = tmp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        let expected = bbox_corpus_core::entity_ref::project_id_for_path(plain.to_str().unwrap()).unwrap();
+        let expected =
+            bbox_corpus_core::entity_ref::project_id_for_path(plain.to_str().unwrap()).unwrap();
         assert_eq!(
             resolve_project_filter_path(plain.to_str().unwrap(), &registered),
             Some(expected)

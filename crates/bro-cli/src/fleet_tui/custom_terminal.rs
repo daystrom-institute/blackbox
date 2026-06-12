@@ -788,7 +788,6 @@ impl ModifierDiff {
     }
 }
 
-
 // NOTE: upstream #[cfg(test)] mod tests dropped on vendoring — it targeted a
 // newer ratatui Backend (scroll_region_*) + pretty_assertions. The dynamic
 // viewport is validated via tmux integration instead.

@@ -595,10 +595,7 @@ fn generation_bumps_on_writes_not_on_idempotent_skip() {
     );
 
     store.remove_domain("gen-test").unwrap();
-    assert!(
-        store.generation() > g1,
-        "remove must bump the generation"
-    );
+    assert!(store.generation() > g1, "remove must bump the generation");
 }
 
 #[test]

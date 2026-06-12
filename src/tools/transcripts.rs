@@ -62,7 +62,8 @@ impl BlackboxServer {
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            let provider_ctx = ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+            let provider_ctx =
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
             mcp_tools::hybrid_search::hybrid_search(
                 &server.state.idx.read(),
                 &server.state.kb.read(),
@@ -91,7 +92,8 @@ impl BlackboxServer {
                     .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            let provider_ctx = ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+            let provider_ctx =
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
             mcp_tools::discover_seed::discover_seed_entities(
                 &server.state.idx.read(),
                 &server.state.kb.read(),

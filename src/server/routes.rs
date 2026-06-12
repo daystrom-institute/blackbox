@@ -1527,7 +1527,9 @@ pub(crate) async fn install_artifact_value(
                 .parse::<u32>()
                 .map_err(|_| anyhow::anyhow!("agent artifact version must parse as u32"))?;
             let agent_ref = orchestration::agents::types::AgentRef { name, version };
-            manifest.embedding = Some(crate::embed_runtime::agent_manifest_embedding(&agent_ref, &manifest));
+            manifest.embedding = Some(crate::embed_runtime::agent_manifest_embedding(
+                &agent_ref, &manifest,
+            ));
             value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
             let install_warnings = agent_install_warnings(state, &manifest);
             installed_agent = Some((agent_ref, manifest, install_warnings));
@@ -3412,7 +3414,10 @@ mod tests {
         // (we don't pin specific values — only the contract that
         // the snapshot is identity-stamped, not identity-unknown).
         assert!(
-            snapshot.daemon_build_id.as_deref().is_some_and(|s| !s.is_empty()),
+            snapshot
+                .daemon_build_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
             "BLACKBOX_BUILD_ID must be a non-empty stamp"
         );
     }

@@ -22,10 +22,10 @@ use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 
-use bbox_edge_index::edge_index::Edge;
-use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_artifacts::artifacts::ArtifactCatalog;
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_corpus_index::index::TranscriptIndex;
+use bbox_edge_index::edge_index::Edge;
 use bbox_indexing::projects::ProjectRegistry;
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_packets::Packets;
@@ -221,10 +221,7 @@ pub fn ensure_type(r: &EntityRef, ty: EntityType) -> Result<()> {
     Ok(())
 }
 
-pub fn empty_neighborhood_view(
-    r: &EntityRef,
-    properties: BTreeMap<String, String>,
-) -> EntityView {
+pub fn empty_neighborhood_view(r: &EntityRef, properties: BTreeMap<String, String>) -> EntityView {
     EntityView {
         ref_string: r.to_string(),
         entity_type: r.entity_type(),

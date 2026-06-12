@@ -1,7 +1,7 @@
 //! System memory catalog and in-memory search primitives.
 
-use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 use anyhow::{Context, Result};
+use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -65,10 +65,9 @@ impl MemoryCatalog {
         }
 
         if let Some(user_dir) = user_dir {
-            let user_memories =
-                crate::loader::load_dir(user_dir).with_context(|| {
-                    format!("failed to load user memories from {}", user_dir.display())
-                })?;
+            let user_memories = crate::loader::load_dir(user_dir).with_context(|| {
+                format!("failed to load user memories from {}", user_dir.display())
+            })?;
             let mut seen_user = HashSet::new();
 
             for raw in user_memories {

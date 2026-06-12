@@ -5,11 +5,11 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
 
-use bbox_edge_index::edge_index::{Edge, EdgeIndex};
-use bbox_providers::entity_loader;
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::git::GitBlameLine;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_indexing::projects::ProjectRecord;
+use bbox_providers::entity_loader;
 use bbox_providers::providers::ProviderContext;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

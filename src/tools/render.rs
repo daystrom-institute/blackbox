@@ -20,10 +20,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 ///     the WORKTREE checkout root, filter by the registered base path
 ///     (`scope_project`);
 ///   - unregistered paths and non-path values → untouched.
-fn rescope_render_project(
-    p: &mut RenderParams,
-    projects: &[crate::projects::ProjectRecord],
-) {
+fn rescope_render_project(p: &mut RenderParams, projects: &[crate::projects::ProjectRecord]) {
     let Some(raw) = p.project.as_deref().filter(|raw| raw.starts_with('/')) else {
         return;
     };

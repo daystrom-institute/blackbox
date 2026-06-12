@@ -77,7 +77,8 @@ impl BlackboxServer {
                     ));
                 }
             };
-            let provider_ctx = ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+            let provider_ctx =
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
             mcp_tools::inspect::inspect_entity(
                 &p,
                 &provider_ctx,
@@ -119,7 +120,8 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_find_paths", move || {
-            let provider_ctx = ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+            let provider_ctx =
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
             mcp_tools::find_paths::find_paths(
                 &p,
                 &provider_ctx,
@@ -140,7 +142,8 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_bundle_evidence", move || {
-            let provider_ctx = ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+            let provider_ctx =
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
             mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
@@ -161,7 +164,8 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
-            let provider_ctx = ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+            let provider_ctx =
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
             mcp_tools::ref_size::ref_size(&p, &provider_ctx)
         })
         .await
@@ -203,7 +207,8 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_blame", move || {
-            let provider_ctx = ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+            let provider_ctx =
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
             let projects = server.state.projects.read().list();
             mcp_tools::blame::blame(
                 &p,

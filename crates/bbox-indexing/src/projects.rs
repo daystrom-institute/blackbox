@@ -448,12 +448,10 @@ fn resolve_managed_fleet_worktree<'a>(
     }
     let fleet_branch = bbox_corpus_core::git::current_branch(&worktree)
         .is_some_and(|branch| branch.starts_with("bro-fleet/"));
-    let under_managed_root = util::cockpit_managed_worktree_roots()
-        .iter()
-        .any(|root| {
-            let root = root.canonicalize().unwrap_or_else(|_| root.clone());
-            worktree.starts_with(&root)
-        });
+    let under_managed_root = util::cockpit_managed_worktree_roots().iter().any(|root| {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        worktree.starts_with(&root)
+    });
     if !fleet_branch && !under_managed_root {
         return None;
     }

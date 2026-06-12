@@ -14,9 +14,9 @@
 //! layer owns its own context so it can carry Java-specific state without
 //! polluting the general refactor plumbing.
 
-use bbox_lsp::LspSessionManager;
 use crate::backend::{JavaMacroBackend, UnavailableBackend};
 use crate::probe::{ProbeRunner, UnavailableProbeRunner};
+use bbox_lsp::LspSessionManager;
 
 // ---------------------------------------------------------------------------
 // MacroPlannerContext

@@ -41,8 +41,8 @@ pub(crate) mod rust_compile_fix;
 pub(crate) mod rust_deep;
 pub(crate) mod rust_delegate_field;
 pub(crate) mod rust_error_migrate;
-pub(crate) mod rust_extract_region;
 pub(crate) mod rust_extract_crate;
+pub(crate) mod rust_extract_region;
 mod rust_extract_to_submodule;
 pub(crate) mod rust_extract_trait;
 pub(crate) mod rust_inline_mod;
@@ -1371,7 +1371,11 @@ pub fn plan_kinds(p: &RefactorPlanKindsParams) -> Result<String> {
         "text",
         &["mod_item", "use_declaration"],
         &["item_names", "module_name"],
-        &["bbox_refactor_status", "sm-refactor-rust", "rust_workspace_dag_check"],
+        &[
+            "bbox_refactor_status",
+            "sm-refactor-rust",
+            "rust_workspace_dag_check",
+        ],
         "Workspace crate extraction (monolith -> workspace member). extract_rust_crate \
          is run-only (bbox_refactor_run): it expands to the scaffold plan + DAG guard + \
          cargo check --workspace + compile-fix round. The scaffold refuses non-leaf \
@@ -1966,9 +1970,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "rust_public_api_guard" => plan_rust_public_api_guard(p),
         "rust_minimize_imports" => rust_minimize_imports::plan_minimize_imports(p),
         "rewrite_rust_bin_crate_paths" => plan_rewrite_rust_bin_crate_paths(p),
-        "extract_rust_crate_scaffold" => {
-            rust_extract_crate::plan_extract_rust_crate_scaffold(p)
-        }
+        "extract_rust_crate_scaffold" => rust_extract_crate::plan_extract_rust_crate_scaffold(p),
         "rewrite_rust_crate_paths" => rust_extract_crate::plan_rewrite_rust_crate_paths(p),
         "rust_workspace_dag_check" => rust_extract_crate::plan_rust_workspace_dag_check(p),
         "extract_rust_crate" => bail!(
@@ -3395,9 +3397,7 @@ fn expand_refactor_run_steps(
                     project_dir,
                 )?);
             }
-            RefactorRunStep::Plan { params, optional }
-                if params.kind == "extract_rust_crate" =>
-            {
+            RefactorRunStep::Plan { params, optional } if params.kind == "extract_rust_crate" => {
                 expanded.extend(rust_extract_crate::expand_extract_rust_crate_step(
                     params,
                     *optional,

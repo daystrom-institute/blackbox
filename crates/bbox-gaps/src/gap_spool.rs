@@ -343,21 +343,21 @@ mod tests {
         )
         .unwrap();
 
-        let canonical = project.canonicalize().unwrap().to_string_lossy().to_string();
+        let canonical = project
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let roots = vec![canonical.clone()];
         let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let report =
-            import_gap_spool_from_dirs(&mut gaps, &roots, &dir.path().join("state"), None)
-                .unwrap();
+            import_gap_spool_from_dirs(&mut gaps, &roots, &dir.path().join("state"), None).unwrap();
 
         assert_eq!(report.imported.len(), 1);
         assert!(inbox.join("imported/gap.json").exists());
         assert_eq!(gaps.all().len(), 1);
-        assert_eq!(
-            gaps.all()[0].project.as_deref(),
-            Some(canonical.as_str())
-        );
+        assert_eq!(gaps.all()[0].project.as_deref(), Some(canonical.as_str()));
     }
 
     #[test]

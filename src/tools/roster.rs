@@ -93,10 +93,8 @@ impl BlackboxServer {
         // Filter status parses through the in-process enum (no
         // `Pending` variant) and is then converted to the wire
         // enum for comparison against `RosterSummaryV1.status`.
-        let filter_status: Option<bro_protocol::TaskStatus> = p
-            .status
-            .as_deref()
-            .and_then(|s| match s {
+        let filter_status: Option<bro_protocol::TaskStatus> =
+            p.status.as_deref().and_then(|s| match s {
                 "pending" => Some(bro_protocol::TaskStatus::Pending),
                 "running" => Some(bro_protocol::TaskStatus::Running),
                 "completed" => Some(bro_protocol::TaskStatus::Completed),
@@ -165,8 +163,7 @@ impl BlackboxServer {
                     metrics.dispatch_count += 1;
                     match s.status {
                         bro_protocol::TaskStatus::Completed => metrics.success_count += 1,
-                        bro_protocol::TaskStatus::Failed
-                        | bro_protocol::TaskStatus::Cancelled => {
+                        bro_protocol::TaskStatus::Failed | bro_protocol::TaskStatus::Cancelled => {
                             metrics.failure_count += 1;
                         }
                         bro_protocol::TaskStatus::Running | bro_protocol::TaskStatus::Pending => {}
@@ -1491,8 +1488,8 @@ mod tests {
     mod dashboard_view {
         use super::*;
         use bro_core::{Origin, SessionId, TaskId};
-        use bro_protocol::{BroReportV1, RosterSummaryV1};
         use bro_protocol::TaskStatus as WireTaskStatus;
+        use bro_protocol::{BroReportV1, RosterSummaryV1};
 
         fn live_summary(id: &str, provider: Provider, started_at: u64) -> RosterSummaryV1 {
             RosterSummaryV1 {
@@ -1523,7 +1520,7 @@ mod tests {
                 }),
                 interrupted: false,
                 error_teaser: None,
-            transcript_path: None,
+                transcript_path: None,
             }
         }
 
@@ -1555,7 +1552,7 @@ mod tests {
                 report_full: None,
                 interrupted: false,
                 error_teaser: None,
-            transcript_path: None,
+                transcript_path: None,
             }
         }
 
@@ -1607,8 +1604,14 @@ mod tests {
             assert_eq!(live["provider"], "glm");
             assert_eq!(live["status"], "running");
             assert_eq!(live["sessionId"], "sess-live-1");
-            assert!(!live["hasResult"].as_bool().unwrap_or(true), "live task must not report hasResult=true");
-            assert!(live["hasLastMessage"].as_bool().unwrap_or(false), "live task with snippet should have hasLastMessage=true");
+            assert!(
+                !live["hasResult"].as_bool().unwrap_or(true),
+                "live task must not report hasResult=true"
+            );
+            assert!(
+                live["hasLastMessage"].as_bool().unwrap_or(false),
+                "live task with snippet should have hasLastMessage=true"
+            );
             assert_eq!(live["broLabel"], "team::executor");
             assert_eq!(live["agentLabel"], "agent-live-1@v1");
             assert_eq!(live["report"]["message"], "writing focused tests");
@@ -1667,10 +1670,10 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let server = test_server(&tmp);
             let t = 1_700_000_000_000_u64;
-            server.state.roster_view.upsert(
-                "a".to_string(),
-                live_summary("a", Provider::Glm, t),
-            );
+            server
+                .state
+                .roster_view
+                .upsert("a".to_string(), live_summary("a", Provider::Glm, t));
             server.state.roster_view.upsert(
                 "b".to_string(),
                 terminal_summary("b", Provider::Deepseek, t, t + 1000),
@@ -1760,10 +1763,10 @@ mod tests {
                 "old".to_string(),
                 terminal_summary("old", Provider::Glm, 1_000, 2_000),
             );
-            server.state.roster_view.upsert(
-                "new".to_string(),
-                live_summary("new", Provider::Glm, 9_000),
-            );
+            server
+                .state
+                .roster_view
+                .upsert("new".to_string(), live_summary("new", Provider::Glm, 9_000));
             server.state.roster_view.upsert(
                 "mid".to_string(),
                 terminal_summary("mid", Provider::Glm, 5_000, 6_000),
@@ -1893,8 +1896,14 @@ mod tests {
             assert_eq!(live["status"], "running");
             assert_eq!(live["broLabel"], "team::executor");
             assert_eq!(live["agentLabel"], "agent-live-1@v1");
-            assert!(!live["hasResult"].as_bool().unwrap_or(true), "live task must not report hasResult");
-            assert!(live["hasLastMessage"].as_bool().unwrap_or(false), "live task with message should have hasLastMessage");
+            assert!(
+                !live["hasResult"].as_bool().unwrap_or(true),
+                "live task must not report hasResult"
+            );
+            assert!(
+                live["hasLastMessage"].as_bool().unwrap_or(false),
+                "live task with message should have hasLastMessage"
+            );
 
             let done = by_id.get("done-1").expect("done-1 row");
             assert_eq!(done["provider"], "deepseek");

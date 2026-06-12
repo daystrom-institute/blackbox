@@ -745,9 +745,7 @@ mod tests {
     use bbox_whiteboards::whiteboards::Role;
     use tempfile::tempdir;
 
-    fn empty_context(
-        dir: &tempfile::TempDir,
-    ) -> (Knowledge, Threads, WhiteboardRegistry) {
+    fn empty_context(dir: &tempfile::TempDir) -> (Knowledge, Threads, WhiteboardRegistry) {
         (
             Knowledge::open(&dir.path().join("kb.json")).unwrap(),
             Threads::open(&dir.path().join("th.json")).unwrap(),

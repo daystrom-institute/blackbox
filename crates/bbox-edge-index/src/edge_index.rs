@@ -9,11 +9,11 @@ use anyhow::Result;
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_index::index::{EdgeProjectionDoc, TranscriptIndex};
-use bbox_knowledge::knowledge::{Knowledge, KnowledgeEdgeKind};
-use bbox_threads::notes::Notes;
-use bbox_stores::roadmap::Roadmap;
-use bbox_threads::threads::{EdgeKind, EdgeTarget, Threads};
 pub use bbox_edge_sidecar::edge_sidecar::*;
+use bbox_knowledge::knowledge::{Knowledge, KnowledgeEdgeKind};
+use bbox_stores::roadmap::Roadmap;
+use bbox_threads::notes::Notes;
+use bbox_threads::threads::{EdgeKind, EdgeTarget, Threads};
 
 #[derive(Default)]
 pub struct EdgeIndex {
@@ -2553,12 +2553,12 @@ mod tests {
 
     mod cross_phase {
         use super::*;
+        use crate::storage_health::{
+            GcParams, GcPolicy, SnapshotRetentionPolicy, plan_gc_with_policy, scan_storage_health,
+        };
         use bbox_edge_sidecar::manifest::ManifestIndex;
         use bbox_edge_sidecar::snapshot::{
             clean_snapshot_id, snapshot_dir, switch_to_clean_snapshot, switch_to_dirty_overlay,
-        };
-        use crate::storage_health::{
-            GcParams, GcPolicy, SnapshotRetentionPolicy, plan_gc_with_policy, scan_storage_health,
         };
 
         fn derived_edge(source: &str, kind: &str, target: &str) -> Edge {

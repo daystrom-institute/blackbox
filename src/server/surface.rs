@@ -1301,7 +1301,10 @@ mod cache_tests {
             decision(&[], &[]),
             decision(&["bbox_*"], &[]),
             decision(&[], &["bro_*"]),
-            decision(&["mcp__blackbox__bbox_*"], &["mcp__blackbox__bbox_knowledge"]),
+            decision(
+                &["mcp__blackbox__bbox_*"],
+                &["mcp__blackbox__bbox_knowledge"],
+            ),
             decision(&["mcp__blackbox__.bbox_search"], &[]),
             decision(&["bbox_search", "work_?hell"], &["work_*"]),
             decision(&["nomatch_*"], &[]),
@@ -1354,10 +1357,7 @@ mod cache_tests {
                     "consequent": serde_json::to_string(&consequent).unwrap(),
                     "classification": "tool_surface",
                 }]),
-                classification_lattice: Some(vec![
-                    "tool_surface".to_string(),
-                    "deny".to_string(),
-                ]),
+                classification_lattice: Some(vec!["tool_surface".to_string(), "deny".to_string()]),
                 prefix_inference: Some(Default::default()),
                 scope: Some("global".to_string()),
                 project: None,

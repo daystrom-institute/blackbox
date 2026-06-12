@@ -1082,7 +1082,10 @@ mod tests {
             ),
         ] {
             let props = schema["properties"].as_object().unwrap();
-            assert!(props.contains_key("cwd"), "{name} schema must advertise cwd");
+            assert!(
+                props.contains_key("cwd"),
+                "{name} schema must advertise cwd"
+            );
             assert!(
                 !props.contains_key("project_dir"),
                 "{name} schema must not advertise project_dir (alias only)"

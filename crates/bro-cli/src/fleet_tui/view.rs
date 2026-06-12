@@ -300,7 +300,10 @@ fn roster_tab_header(app: &App) -> Line<'static> {
         spans.push(Span::styled(format!(" {} ", tab.label()), style));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled("Tab cycles", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        "Tab cycles",
+        Style::default().fg(Color::DarkGray),
+    ));
     Line::from(spans)
 }
 
@@ -406,7 +409,10 @@ pub(super) fn draw_roster(
         };
         let hint = Paragraph::new(vec![
             Line::from(""),
-            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                hint_text,
+                Style::default().fg(Color::DarkGray),
+            )),
         ]);
         f.render_widget(hint, inner);
         return;
@@ -425,7 +431,10 @@ pub(super) fn draw_roster(
         Constraint::Length(7),
         Constraint::Length(7),
     ];
-    let header = Row::new(["", "", "prov", "agent", "model", "report", "started", "last"]).style(
+    let header = Row::new([
+        "", "", "prov", "agent", "model", "report", "started", "last",
+    ])
+    .style(
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),

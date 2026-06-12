@@ -71,7 +71,8 @@ pub fn apply_patch(patch_text: &str, base: &Path) -> Result<ApplyOutcome, ApplyE
                     )));
                 }
                 if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| io_err("create dir for", path, e))?;
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| io_err("create dir for", path, e))?;
                 }
                 std::fs::write(&abs, contents).map_err(|e| io_err("write", path, e))?;
                 outcome.changes.push(FileChange {
@@ -107,7 +108,8 @@ pub fn apply_patch(patch_text: &str, base: &Path) -> Result<ApplyOutcome, ApplyE
                     std::fs::create_dir_all(parent)
                         .map_err(|e| io_err("create dir for", dest_rel, e))?;
                 }
-                std::fs::write(&dest_abs, &new_contents).map_err(|e| io_err("write", dest_rel, e))?;
+                std::fs::write(&dest_abs, &new_contents)
+                    .map_err(|e| io_err("write", dest_rel, e))?;
 
                 if move_path.is_some() && dest_abs != src_abs {
                     std::fs::remove_file(&src_abs)
@@ -164,9 +166,12 @@ fn compute_replacements(
     for chunk in chunks {
         // A `change_context` narrows down where the chunk applies.
         if let Some(ctx_line) = &chunk.change_context {
-            if let Some(idx) =
-                seek_sequence(original_lines, std::slice::from_ref(ctx_line), line_index, false)
-            {
+            if let Some(idx) = seek_sequence(
+                original_lines,
+                std::slice::from_ref(ctx_line),
+                line_index,
+                false,
+            ) {
                 line_index = idx + 1;
             } else {
                 return Err(ApplyError::Context {
@@ -207,7 +212,10 @@ fn compute_replacements(
         } else {
             return Err(ApplyError::Context {
                 path: path.display().to_string(),
-                message: format!("failed to find expected lines:\n{}", chunk.old_lines.join("\n")),
+                message: format!(
+                    "failed to find expected lines:\n{}",
+                    chunk.old_lines.join("\n")
+                ),
             });
         }
     }

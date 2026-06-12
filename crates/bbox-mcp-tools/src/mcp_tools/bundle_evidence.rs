@@ -5,11 +5,11 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use bbox_edge_index::edge_index::EdgeIndex;
-use bbox_providers::entity_loader;
-use bbox_corpus_core::entity_ref::EntityRef;
 use crate::mcp_tools::find_paths::{render_node, render_path};
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_edge_index::edge_index::EdgeIndex;
+use bbox_providers::entity_loader;
 use bbox_providers::providers::ProviderContext;
 
 const ENTITY_CAP: usize = 50;

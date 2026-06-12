@@ -234,7 +234,11 @@ pub(super) fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: St
     app.history_cursor = None;
     app.scroll_from_bottom = 0;
     app.set_status(
-        if is_resume { "resuming…" } else { "starting…" },
+        if is_resume {
+            "resuming…"
+        } else {
+            "starting…"
+        },
         Duration::from_secs(4),
     );
     app.rt.spawn(async move {
@@ -429,9 +433,7 @@ pub(super) fn prepare_dispatch_worktree(
         .map(|d| d.seed_dirs.clone())
         .unwrap_or_default();
     if !seed_dirs.is_empty() {
-        for outcome in
-            bro_fleet_client::seed_worktree_dirs(&git_root, &worktree_path, &seed_dirs)
-        {
+        for outcome in bro_fleet_client::seed_worktree_dirs(&git_root, &worktree_path, &seed_dirs) {
             tracing::info!(worktree = %worktree_path.display(), "{outcome}");
         }
     }

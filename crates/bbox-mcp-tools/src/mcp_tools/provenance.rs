@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
-use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_indexing::projects::ProjectRecord;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

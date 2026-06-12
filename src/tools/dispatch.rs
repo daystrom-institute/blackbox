@@ -340,7 +340,10 @@ impl BlackboxServer {
             request.exec_opts = Some(o);
         }
 
-        let dispatch_model = request.exec_opts.as_ref().and_then(|opts| opts.model.clone());
+        let dispatch_model = request
+            .exec_opts
+            .as_ref()
+            .and_then(|opts| opts.model.clone());
         let default_name = request
             .display_name
             .clone()
@@ -497,9 +500,7 @@ impl BlackboxServer {
         let brofile_runtime = p
             .bro
             .as_deref()
-            .and_then(|name| {
-                self.resolve_exec_brofile_for_allocator(name, p.cwd.as_deref())
-            })
+            .and_then(|name| self.resolve_exec_brofile_for_allocator(name, p.cwd.as_deref()))
             .and_then(|bf| bf.runtime);
         let mut allocation_request = match exec_params_runtime_request(&p, brofile_runtime) {
             Ok(request) => request,
@@ -1683,10 +1684,7 @@ impl BlackboxServer {
             };
             // Persist AFTER dropping the write guard, off the async worker —
             // never hold the store write lock across the file write.
-            crate::orchestration::request_persist(
-                &self.state.task_store,
-                &self.state.store_dir,
-            );
+            crate::orchestration::request_persist(&self.state.task_store, &self.state.store_dir);
             let roster_events = self.state.roster_events();
             for task_id in &dropped {
                 roster_events.emit_removed(task_id.clone());

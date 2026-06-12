@@ -590,9 +590,7 @@ mod tests {
         assert!(out.is_none());
     }
 
-    fn init_repo_with_worktree(
-        tmp: &std::path::Path,
-    ) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn init_repo_with_worktree(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::process::Command;
         let base = tmp.join("repo");
         std::fs::create_dir_all(&base).unwrap();

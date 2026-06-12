@@ -1376,7 +1376,11 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
         chunk_hash: "h-new".into(),
         text: "use provider A for embeddings".into(),
     };
-    crate::embed_runtime::maybe_detect_knowledge_contradiction(&request, "knowledge-test", &[0.99, 0.01]);
+    crate::embed_runtime::maybe_detect_knowledge_contradiction(
+        &request,
+        "knowledge-test",
+        &[0.99, 0.01],
+    );
 
     assert!(server.state.notes.read().all().iter().any(|note| {
         note.body.contains("Tier-0 contradiction detected")
@@ -1386,7 +1390,11 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
 
     crate::embed_runtime::install_contradiction_threshold(1.0);
     let note_count = server.state.notes.read().all().len();
-    crate::embed_runtime::maybe_detect_knowledge_contradiction(&request, "knowledge-test", &[0.99, 0.01]);
+    crate::embed_runtime::maybe_detect_knowledge_contradiction(
+        &request,
+        "knowledge-test",
+        &[0.99, 0.01],
+    );
     assert_eq!(server.state.notes.read().all().len(), note_count);
     crate::embed_runtime::install_contradiction_threshold(0.85);
 }

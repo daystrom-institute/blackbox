@@ -91,10 +91,7 @@ impl TranscriptAdapterRegistry {
         self.adapters.iter().map(|adapter| adapter.as_ref())
     }
 
-    pub fn adapter_for(
-        &self,
-        source: TranscriptSource,
-    ) -> Option<&dyn TranscriptReadAdapter> {
+    pub fn adapter_for(&self, source: TranscriptSource) -> Option<&dyn TranscriptReadAdapter> {
         self.adapters().find(|adapter| adapter.source() == source)
     }
 

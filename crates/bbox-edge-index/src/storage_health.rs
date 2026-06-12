@@ -230,16 +230,18 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
         }
         Err(reason) => match reason {
             bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated => None,
-            bbox_edge_sidecar::manifest::ManifestFallbackReason::Corrupt { error } => Some(ManifestStatus {
-                index_exists: true,
-                workspace_count: 0,
-                status: "corrupt".to_string(),
-                fallback_reason: Some(error),
-                active_materialized_bytes: 0,
-                active_materialized_files: 0,
-                inactive_materialized_bytes: inactive_bytes,
-                inactive_materialized_files: inactive_files,
-            }),
+            bbox_edge_sidecar::manifest::ManifestFallbackReason::Corrupt { error } => {
+                Some(ManifestStatus {
+                    index_exists: true,
+                    workspace_count: 0,
+                    status: "corrupt".to_string(),
+                    fallback_reason: Some(error),
+                    active_materialized_bytes: 0,
+                    active_materialized_files: 0,
+                    inactive_materialized_bytes: inactive_bytes,
+                    inactive_materialized_files: inactive_files,
+                })
+            }
             bbox_edge_sidecar::manifest::ManifestFallbackReason::Stale {
                 missing_manifests,
                 missing_paths,
@@ -585,7 +587,9 @@ fn collect_project_storage_facts(edges_dir: &Path) -> ProjectStorageFacts {
         if !manifest_path.is_file() {
             continue;
         }
-        let Ok(manifest) = bbox_edge_sidecar::manifest::WorkspaceManifest::read_from(&manifest_path) else {
+        let Ok(manifest) =
+            bbox_edge_sidecar::manifest::WorkspaceManifest::read_from(&manifest_path)
+        else {
             continue;
         };
         facts.manifest_projects.insert(manifest.project_id.clone());

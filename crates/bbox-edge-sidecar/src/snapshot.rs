@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use bbox_chunker::EdgeProvenance;
 use crate::edge_sidecar::Edge;
-use bbox_corpus_core::entity_ref::EntityRef;
 use crate::manifest::{
     ManifestIndex, OverlayManifest, WorkspaceIndexEntry, WorkspaceManifest, materialized_dir,
 };
+use bbox_chunker::EdgeProvenance;
+use bbox_corpus_core::entity_ref::EntityRef;
 
 const INDEXER_VERSION: &str = "project-index-v1";
 const CHUNKER_VERSION: &str = "chunker-v1";

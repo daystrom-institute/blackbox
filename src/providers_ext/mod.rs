@@ -110,7 +110,6 @@ mod tests {
         assert_eq!(value["per_ref"][0]["source"], "entity_properties_json");
     }
 
-
     #[test]
     fn file_ref_measures_registered_project_file_content() {
         let store = tempfile::tempdir().unwrap();
@@ -141,7 +140,6 @@ mod tests {
         assert_eq!(value["per_ref"][0]["entity_type"], "file");
         assert_eq!(value["per_ref"][0]["source"], "file_content");
     }
-
 
     #[test]
     fn file_ref_project_dir_resolves_worktree_only_file() {
@@ -174,6 +172,4 @@ mod tests {
         assert_eq!(value["per_ref"][0]["ref"], "file:scripts/guard.py");
         assert_eq!(value["per_ref"][0]["source"], "file_content");
     }
-
-
 }

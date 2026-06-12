@@ -45,7 +45,10 @@ pub fn normalized_to_doc(
     let byte_offset = event.raw.byte_offset.unwrap_or_default();
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "transcript");
-    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
+    doc.add_text(
+        f.parser_version,
+        bbox_corpus_core::entity_ref::PARSER_VERSION,
+    );
     doc.add_text(f.content, &parsed.content);
     doc.add_text(f.session_id, &parsed.session_id);
     doc.add_text(f.account, account);
@@ -104,7 +107,10 @@ pub fn normalized_to_tool_call_doc(
 
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "tool_call");
-    doc.add_text(f.parser_version, bbox_corpus_core::entity_ref::PARSER_VERSION);
+    doc.add_text(
+        f.parser_version,
+        bbox_corpus_core::entity_ref::PARSER_VERSION,
+    );
     doc.add_text(f.content, &parsed.content);
     doc.add_text(f.session_id, &parsed.session_id);
     doc.add_text(f.account, account);

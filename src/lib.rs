@@ -33,8 +33,8 @@ mod badgey_eval_check;
 // chunker extracted into the bbox-chunker crate (stage 1); aliased back to
 // `crate::chunker` so existing call sites resolve unchanged.
 use bbox_chunker as chunker;
-pub use bbox_indexing::code_nav;
 pub use bbox_config::config;
+pub use bbox_indexing::code_nav;
 mod crons;
 pub mod dispatch_mcp;
 use bbox_edge_index::edge_index;
@@ -65,19 +65,19 @@ use bbox_macros as macros;
 mod managed_worktrees;
 use bbox_edge_sidecar::manifest;
 mod mcp_client;
-use bbox_mcp_tools::mcp_tools;
 use bbox_edge_index::migration;
+use bbox_mcp_tools::mcp_tools;
 use bbox_threads::notes;
 mod orchestration;
 // `packets` extracted into bbox-packets (root-crate split); aliased back to
 // `crate::packets` so existing call sites resolve unchanged.
+use bbox_mcp_tools::path_cache;
 use bbox_packets as packets;
+use bbox_stores::pins;
 /// The transcript parser lives in the shared `bro-transcript` crate (the
 /// daemon's indexer and the `bro` cockpit both link it). Re-exported as
 /// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.
 pub use bro_transcript as parser;
-use bbox_mcp_tools::path_cache;
-use bbox_stores::pins;
 mod pollers;
 use bbox_indexing::projects;
 use bbox_providers::providers;
@@ -87,25 +87,25 @@ mod providers_ext;
 // now use bbox_corpus_core::query directly.)
 // `refactor` extracted into bbox-refactor (stage 3); aliased back to
 // `crate::refactor` so existing call sites resolve unchanged.
-use bbox_refactor as refactor;
 pub use bbox_knowledge::render;
+use bbox_refactor as refactor;
 use bbox_stores::roadmap;
 mod routing;
 pub use bbox_config::secrets;
 pub mod server;
+use bbox_edge_index::storage_health;
+use bbox_indexing::slices;
 pub use bbox_slack::slack_channel_bindings;
 pub use bbox_slack::slack_proposal_links;
 use bbox_slack::slack_thread_store;
-use bbox_indexing::slices;
-use bbox_edge_index::storage_health;
 use bbox_stores::store_persister;
 use bbox_system_events::system_events;
 mod system_events_runtime;
 // `system_memory` extracted into bbox-system-memory (root-crate split);
 // aliased back to `crate::system_memory` so existing call sites resolve
 // unchanged.
-use bbox_system_memory as system_memory;
 use bbox_corpus_core::template;
+use bbox_system_memory as system_memory;
 use bbox_threads::threads;
 use bbox_tool_docs::tool_docs;
 mod tools;
@@ -114,8 +114,8 @@ pub use bbox_util::util;
 // `vectors` was extracted into the `bbox-vectors` workspace crate (build-time
 // decomposition). Aliased back to `crate::vectors` so existing `crate::vectors::*`
 // call sites resolve unchanged.
-use bbox_vectors as vectors;
 use bbox_artifacts::watcher;
+use bbox_vectors as vectors;
 mod webhooks;
 use bbox_whiteboards::whiteboards;
 mod workflow;

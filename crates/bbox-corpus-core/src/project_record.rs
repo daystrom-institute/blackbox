@@ -34,7 +34,9 @@ struct ProjectStoreView {
 /// file. Returns an empty list when the file does not exist. This is the
 /// thin static read used by index passes; registry mutation stays with the
 /// daemon-side `ProjectRegistry`.
-pub fn load_project_records(path: impl AsRef<std::path::Path>) -> anyhow::Result<Vec<ProjectRecord>> {
+pub fn load_project_records(
+    path: impl AsRef<std::path::Path>,
+) -> anyhow::Result<Vec<ProjectRecord>> {
     let path = path.as_ref();
     if !path.exists() {
         return Ok(Vec::new());

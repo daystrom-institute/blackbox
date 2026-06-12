@@ -2118,7 +2118,8 @@ mod tests {
             force_path: Some(true), // bypass worktree check for tempdir
         };
         let projects = vec![];
-        let apply_result = bbox_refactor::apply(&apply_params, &projects).expect("apply should succeed");
+        let apply_result =
+            bbox_refactor::apply(&apply_params, &projects).expect("apply should succeed");
         assert!(
             apply_result.contains("Generated.java") || apply_result.contains("files_written"),
             "apply result should mention the file: {apply_result}"

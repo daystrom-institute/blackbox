@@ -4,14 +4,14 @@ use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use bbox_edge_index::edge_index::{Edge, EdgeIndex};
-use bbox_providers::entity_loader;
-use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_indexing::index::TranscriptIndex;
-use bbox_knowledge::knowledge::Knowledge;
 use crate::mcp_tools::hybrid_search::{
     self, HybridDegraded, HybridResult, HybridSearchParams, HybridVectorStatus,
 };
+use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_indexing::index::TranscriptIndex;
+use bbox_knowledge::knowledge::Knowledge;
+use bbox_providers::entity_loader;
 use bbox_providers::providers::{self, Neighborhood, ProviderContext};
 
 const DEFAULT_LIMIT: u64 = 8;

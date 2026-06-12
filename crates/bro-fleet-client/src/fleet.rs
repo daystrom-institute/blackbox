@@ -658,7 +658,9 @@ impl AgentHandle {
             last_assistant_message: inner.last_assistant_message.clone(),
             // Prefer a live harness `report` line when events are present; daemon
             // roster rows provide the persisted BroReport teaser for thin views.
-            report_message: stream.report_message.or_else(|| inner.report_message.clone()),
+            report_message: stream
+                .report_message
+                .or_else(|| inner.report_message.clone()),
             needs_input: stream.needs_input,
             turn_active: stream.turn_active,
             worktree_finished: stream.worktree_finished,
@@ -672,7 +674,10 @@ impl AgentHandle {
             stderr: inner.stderr.clone(),
             // Prefer the model persisted at dispatch time (survives reload for
             // providers whose stream events lack a top-level `model` field).
-            model: inner.model.clone().or_else(|| model_from_events(&inner.events)),
+            model: inner
+                .model
+                .clone()
+                .or_else(|| model_from_events(&inner.events)),
             // The cockpit's durable display name (stored in bro_label, §5).
             name: inner.bro_label.clone(),
             recoverable: inner.recoverable,
@@ -1281,10 +1286,9 @@ impl DaemonFleetClient {
     /// parsing — design/fleet-tui/closeout-command.md §4.3). Used by the
     /// cockpit `/closeout <disposition> [--dry-run]` command (Phase 3b).
     fn closeout(&self, req: &CloseoutRequest) -> anyhow::Result<CloseoutOutcome> {
-        let value: Value = block_on_fleet_http(self.post_json_value(
-            "/control/closeout",
-            serde_json::to_value(req)?,
-        ))?;
+        let value: Value = block_on_fleet_http(
+            self.post_json_value("/control/closeout", serde_json::to_value(req)?),
+        )?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -1488,7 +1492,8 @@ fn daemon_task(
     })
 }
 
-type SnapshotFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<RosterSnapshotV1>> + Send + 'a>>;
+type SnapshotFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<RosterSnapshotV1>> + Send + 'a>>;
 
 trait RosterTransport {
     fn fetch_roster_snapshot(&self) -> SnapshotFuture<'_>;
@@ -1546,7 +1551,10 @@ async fn apply_roster_delta_or_resync<T: RosterTransport + ?Sized>(
 #[derive(Debug, PartialEq)]
 enum RosterSseItem {
     Delta(RosterDelta),
-    Resync { reason: Option<String>, skipped: Option<u64> },
+    Resync {
+        reason: Option<String>,
+        skipped: Option<u64>,
+    },
 }
 
 fn parse_sse_frame(frame: &str) -> (Option<String>, String) {
@@ -1624,14 +1632,11 @@ async fn handle_roster_sse_item<T: RosterTransport + ?Sized>(
 /// Reconnect pacing for `roster_subscription_loop`: start at 750ms and double
 /// up to a 15s cap so a downed daemon isn't hammered at a fixed cadence. The
 /// loop resets to the floor on every successful connect.
-const ROSTER_RECONNECT_BACKOFF_FLOOR: std::time::Duration =
-    std::time::Duration::from_millis(750);
+const ROSTER_RECONNECT_BACKOFF_FLOOR: std::time::Duration = std::time::Duration::from_millis(750);
 const ROSTER_RECONNECT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn next_roster_reconnect_backoff(current: std::time::Duration) -> std::time::Duration {
-    current
-        .saturating_mul(2)
-        .min(ROSTER_RECONNECT_BACKOFF_CAP)
+    current.saturating_mul(2).min(ROSTER_RECONNECT_BACKOFF_CAP)
 }
 
 async fn roster_subscription_loop(
@@ -1640,7 +1645,9 @@ async fn roster_subscription_loop(
     tail_tx: broadcast::Sender<TailEvent>,
     initial_seq: u64,
 ) {
-    let mut state = RosterSubscriptionState { last_seq: initial_seq };
+    let mut state = RosterSubscriptionState {
+        last_seq: initial_seq,
+    };
     let mut buffer = String::new();
     let mut backoff = ROSTER_RECONNECT_BACKOFF_FLOOR;
     loop {
@@ -1906,7 +1913,6 @@ impl FleetOrchestrator {
         &self.store_dir
     }
 
-
     /// Spawn a new top-level entrypoint agent over the daemon control plane.
     /// Returns an [`AgentHandle`] — the cockpit holds it to read state and drive
     /// the session.
@@ -2035,7 +2041,11 @@ fn default_daemon_url() -> String {
 pub fn provider_supports_bidi(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Brodex | Provider::VibeBh
+        Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh
     )
 }
 
@@ -2122,7 +2132,9 @@ mod tests {
         spec.code_mode = Some("only".to_string());
         spec.service_tier = Some(SERVICE_TIER_PRIORITY.to_string());
         assert_eq!(
-            dispatch_body(&spec).get("code_mode").and_then(|v| v.as_str()),
+            dispatch_body(&spec)
+                .get("code_mode")
+                .and_then(|v| v.as_str()),
             Some("only")
         );
         assert_eq!(

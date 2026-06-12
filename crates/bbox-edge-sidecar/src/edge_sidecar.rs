@@ -28,7 +28,6 @@ pub struct Edge {
     pub metadata: BTreeMap<String, String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgeKey {
     source: EntityRef,
@@ -37,7 +36,6 @@ pub struct EdgeKey {
     provenance: EdgeProvenance,
     confidence: EdgeConfidence,
 }
-
 
 impl Edge {
     pub fn dedup_key(&self) -> EdgeKey {
@@ -50,7 +48,6 @@ impl Edge {
         }
     }
 }
-
 
 pub fn count_materialized_jsonl_files(edges_dir: &Path) -> usize {
     let mat_dir = crate::manifest::materialized_dir(edges_dir);
@@ -74,7 +71,6 @@ pub fn count_materialized_jsonl_files(edges_dir: &Path) -> usize {
     count_jsonl_recursive(&mat_dir)
 }
 
-
 pub fn scan_lane_project_ids(lane_dir: &Path) -> HashSet<String> {
     let mut ids = HashSet::new();
     let Ok(entries) = fs::read_dir(lane_dir) else {
@@ -92,7 +88,6 @@ pub fn scan_lane_project_ids(lane_dir: &Path) -> HashSet<String> {
     ids
 }
 
-
 pub fn sidecar_project_id_is_registered(
     project_id: &str,
     registered: Option<&HashSet<String>>,
@@ -103,14 +98,12 @@ pub fn sidecar_project_id_is_registered(
     registered.contains(project_id)
 }
 
-
 pub fn edges_dir_from_bro_store(store_dir: &Path) -> PathBuf {
     store_dir
         .parent()
         .map(|parent| parent.join("edges"))
         .unwrap_or_else(|| store_dir.join("edges"))
 }
-
 
 pub fn edges_dir_from_projects_path(projects_path: &Path) -> PathBuf {
     projects_path
@@ -119,16 +112,13 @@ pub fn edges_dir_from_projects_path(projects_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("edges"))
 }
 
-
 pub fn managed_derived_edges_dir(edges_dir: &Path) -> PathBuf {
     edges_dir.join("derived")
 }
 
-
 pub fn sidecar_file_stem(path: &Path) -> Option<&str> {
     path.file_stem().and_then(|s| s.to_str())
 }
-
 
 pub fn scan_managed_derived_project_ids(managed_dir: &Path) -> HashSet<String> {
     let mut ids = HashSet::new();
@@ -156,7 +146,6 @@ pub fn scan_managed_derived_project_ids(managed_dir: &Path) -> HashSet<String> {
     ids
 }
 
-
 pub fn sidecar_project_is_registered(
     path: &Path,
     registered_project_ids: Option<&HashSet<String>>,
@@ -172,7 +161,6 @@ pub fn sidecar_project_is_registered(
     }
     registered_project_ids.contains(stem)
 }
-
 
 /// Test-fixture helper: append raw chunker edges to a project's JSONL lane.
 /// Deliberately un-gated (no `#[cfg(test)]`) so consumer-crate tests can use
@@ -204,7 +192,6 @@ pub fn append_project_edges(
     writer.flush()?;
     Ok(())
 }
-
 
 // edge sidecar writes run on the reindex/writer-actor thread.
 #[allow(clippy::disallowed_methods)]
@@ -254,7 +241,6 @@ pub fn replace_project_edges(
     Ok(())
 }
 
-
 pub fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
     if edges.is_empty() {
         return Ok(());
@@ -271,12 +257,7 @@ pub fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Resul
     Ok(())
 }
 
-
-pub fn append_edges_dedup(
-    edges_dir: &Path,
-    project_id: &str,
-    edges: &[Edge],
-) -> Result<usize> {
+pub fn append_edges_dedup(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<usize> {
     if edges.is_empty() {
         return Ok(0);
     }
@@ -306,7 +287,6 @@ pub fn append_edges_dedup(
     Ok(written)
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 pub struct EdgeSidecarCompactionStats {
     pub project_id: String,
@@ -323,7 +303,6 @@ pub struct EdgeSidecarCompactionStats {
     pub malformed_lines_retained: u64,
     pub blank_lines_dropped: u64,
 }
-
 
 // invoked from bbox_edge_compact's run_blocking closure.
 #[allow(clippy::disallowed_methods)]
@@ -436,7 +415,6 @@ pub fn compact_legacy_sidecar(
     Ok(stats)
 }
 
-
 pub fn edge_import_key(edge: &Edge) -> String {
     let mut hasher = Sha256::new();
     hasher.update(edge.source.to_string());
@@ -450,7 +428,6 @@ pub fn edge_import_key(edge: &Edge) -> String {
     }
     hex::encode(hasher.finalize())
 }
-
 
 pub fn derived_tool_projection(edge: &Edge) -> Option<Edge> {
     if edge.kind != "EDITED_FILE" {
@@ -477,7 +454,6 @@ pub fn derived_tool_projection(edge: &Edge) -> Option<Edge> {
     })
 }
 
-
 pub fn exact_edge(
     source: EntityRef,
     kind: &str,
@@ -494,7 +470,6 @@ pub fn exact_edge(
     }
 }
 
-
 pub fn line_provenance_is_derived(line: &str) -> bool {
     let Some(pos) = line.find("\"provenance\"") else {
         return false;
@@ -507,7 +482,6 @@ pub fn line_provenance_is_derived(line: &str) -> bool {
     let after_colon = rest[1..].trim_start();
     after_colon.starts_with("\"derived\"")
 }
-
 
 // ---------------------------------------------------------------------------
 // Phase 2: Lifecycle-specific write APIs
@@ -541,11 +515,7 @@ pub fn line_provenance_is_derived(line: &str) -> bool {
 //   workflow/ops.rs   → append_explicit_edges
 // ---------------------------------------------------------------------------
 
-pub fn append_explicit_edges(
-    edges_dir: &Path,
-    project_id: &str,
-    edges: &[Edge],
-) -> Result<usize> {
+pub fn append_explicit_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<usize> {
     for e in edges {
         debug_assert!(
             e.provenance != EdgeProvenance::Derived,
@@ -557,12 +527,7 @@ pub fn append_explicit_edges(
     append_edges_dedup(edges_dir, project_id, edges)
 }
 
-
-pub fn append_observed_edges(
-    edges_dir: &Path,
-    project_id: &str,
-    edges: &[Edge],
-) -> Result<()> {
+pub fn append_observed_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
     for e in edges {
         debug_assert!(
             e.provenance != EdgeProvenance::Derived,
@@ -573,7 +538,6 @@ pub fn append_observed_edges(
     }
     append_edges(edges_dir, project_id, edges)
 }
-
 
 pub fn replace_materialized_edges(
     edges_dir: &Path,
@@ -591,7 +555,6 @@ pub fn replace_materialized_edges(
     }
     replace_project_edges(edges_dir, namespace, project_id, edges)
 }
-
 
 pub fn read_managed_derived_edges(
     edges_dir: &Path,
@@ -621,7 +584,6 @@ pub fn read_managed_derived_edges(
     Ok(edges)
 }
 
-
 pub fn rel_path_hashes_of(edges: &[bbox_chunker::Edge]) -> HashSet<String> {
     let mut hashes = HashSet::new();
     for e in edges {
@@ -639,7 +601,6 @@ pub fn rel_path_hashes_of(edges: &[bbox_chunker::Edge]) -> HashSet<String> {
     hashes
 }
 
-
 pub fn edge_touches_any_path_hash(edge: &Edge, stale_hashes: &HashSet<String>) -> bool {
     match (&edge.source, &edge.target) {
         (EntityRef::ProjectFile { rel_path_hash, .. }, _)
@@ -649,7 +610,6 @@ pub fn edge_touches_any_path_hash(edge: &Edge, stale_hashes: &HashSet<String>) -
         _ => false,
     }
 }
-
 
 pub fn replace_materialized_edges_incremental(
     edges_dir: &Path,
@@ -686,7 +646,6 @@ pub fn replace_materialized_edges_incremental(
     replace_project_edges(edges_dir, namespace, project_id, &merged)
 }
 
-
 /// Drop managed derived edges whose source or target is a project file in
 /// `stale_hashes` (rel_path_hash). Used to purge a deleted file's file-anchored
 /// edges, which the mtime/size incremental path never revisits once the file is
@@ -721,7 +680,6 @@ pub fn purge_managed_edges_for_path_hashes(
     }
     Ok(purged)
 }
-
 
 pub fn merge_materialized_edges(
     edges_dir: &Path,
@@ -768,7 +726,6 @@ pub fn merge_materialized_edges(
     replace_project_edges(edges_dir, namespace, project_id, &merged)
 }
 
-
 // ---------------------------------------------------------------------------
 // Phase 2: Legacy edge extraction dry-run
 // ---------------------------------------------------------------------------
@@ -786,7 +743,6 @@ pub struct LegacyExtractionPlan {
     pub managed_replacement_exists: bool,
     pub extractable: bool,
 }
-
 
 pub fn plan_legacy_edge_extraction(
     edges_dir: &Path,

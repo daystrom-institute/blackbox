@@ -32,14 +32,12 @@ pub fn conservative_log_merge_policy() -> tantivy::merge_policy::LogMergePolicy 
     policy
 }
 
-
 pub fn segment_count(index: &Index) -> usize {
     index
         .searchable_segment_metas()
         .map(|segments| segments.len())
         .unwrap_or(0)
 }
-
 
 pub fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
     if !path.exists() {
@@ -48,7 +46,6 @@ pub fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
 }
-
 
 pub fn save_meta(path: &Path, meta: &HashMap<String, FileMeta>) -> Result<()> {
     let raw = serde_json::to_string(meta)?;
@@ -61,7 +58,6 @@ pub fn save_meta(path: &Path, meta: &HashMap<String, FileMeta>) -> Result<()> {
     Ok(())
 }
 
-
 pub fn dir_size(path: &Path) -> u64 {
     WalkDir::new(path)
         .into_iter()
@@ -72,7 +68,6 @@ pub fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
-
 pub fn count_jsonl_files(dir: &Path) -> usize {
     WalkDir::new(dir)
         .into_iter()
@@ -80,7 +75,6 @@ pub fn count_jsonl_files(dir: &Path) -> usize {
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .count()
 }
-
 
 // ── Background auto-reindex ────────────────────────────────────────
 
@@ -107,7 +101,6 @@ pub fn scan_jsonl_dir(dir: &Path, out: &mut Vec<(String, u64, u64)>) {
     }
 }
 
-
 /// Stat a single file and push if not too recent.
 pub fn scan_single_file(path: &Path, out: &mut Vec<(String, u64, u64)>) {
     if let Ok(meta) = fs::metadata(path) {
@@ -120,7 +113,6 @@ pub fn scan_single_file(path: &Path, out: &mut Vec<(String, u64, u64)>) {
         out.push((path.to_string_lossy().to_string(), mtime, meta.len()));
     }
 }
-
 
 /// Collect (path, mtime, size) for all JSONL files across all roots.
 pub fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
@@ -149,7 +141,6 @@ pub fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
 
     files
 }
-
 
 /// Collect (path, mtime, size) for every transcript file owned by a
 /// registered transcript adapter (harness session event logs, gemini tmp
@@ -186,7 +177,6 @@ pub fn scan_adapter_source_files(config: &ReindexConfig, files: &mut Vec<(String
     }
 }
 
-
 pub fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
     let mut files = scan_source_files(config);
     if config.knowledge_path.exists() {
@@ -211,7 +201,6 @@ pub fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> 
     files
 }
 
-
 // ── Standalone indexing functions (no &self — usable from background thread) ──
 
 pub fn should_skip_file(
@@ -226,7 +215,6 @@ pub fn should_skip_file(
         false
     }
 }
-
 
 /// Adapter-driven transcript indexing. Replaces the per-provider standalone
 /// loops with a uniform pipeline: each registered adapter discovers locations
@@ -284,7 +272,6 @@ pub fn index_transcripts_via_adapters(
     }
     Ok(())
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub fn index_adapter_location(
@@ -387,7 +374,6 @@ pub fn index_adapter_location(
     }
     Ok(())
 }
-
 
 pub fn human_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;

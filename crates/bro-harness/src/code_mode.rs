@@ -61,7 +61,10 @@ impl CodeMode {
     /// default on an unrecognized token.
     pub fn parse_or_default(s: &str) -> Self {
         s.parse().unwrap_or_else(|()| {
-            eprintln!("bro-harness: unknown code-mode '{s}', using '{:?}'", CodeMode::default());
+            eprintln!(
+                "bro-harness: unknown code-mode '{s}', using '{:?}'",
+                CodeMode::default()
+            );
             CodeMode::default()
         })
     }

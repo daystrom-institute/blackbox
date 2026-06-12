@@ -485,7 +485,10 @@ fn fleet_mcp_args_converts_client_local_map() {
     let value: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
     assert_eq!(value["mcpServers"]["tmux"]["type"], "stdio");
     assert_eq!(value["mcpServers"]["tmux"]["command"], "tmux-mcp");
-    assert_eq!(value["mcpServers"]["tmux"]["env"]["TMUX_MCP_TOKEN"], "tok-123");
+    assert_eq!(
+        value["mcpServers"]["tmux"]["env"]["TMUX_MCP_TOKEN"],
+        "tok-123"
+    );
     assert_eq!(value["mcpServers"]["ctx"]["headers"]["X-Plain"], "v");
 
     assert!(fleet_mcp_args(Provider::Glm, &Default::default()).is_empty());

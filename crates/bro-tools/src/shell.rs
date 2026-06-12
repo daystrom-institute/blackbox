@@ -368,7 +368,10 @@ where
 /// Apply the standard child-process environment for a non-interactive shell
 /// command: augmented PATH, clean/uncolored output, and the host scrub set.
 /// Per-command `args.env` is layered on top by the caller and wins.
-fn apply_child_env(cmd: &mut tokio::process::Command, shell_env: &std::collections::BTreeMap<String, String>) {
+fn apply_child_env(
+    cmd: &mut tokio::process::Command,
+    shell_env: &std::collections::BTreeMap<String, String>,
+) {
     // Non-interactive execution: deterministic, uncolored output for the model.
     cmd.env("NO_COLOR", "1");
     cmd.env("FORCE_COLOR", "0");
@@ -662,11 +665,7 @@ impl Tool for ShellPoll {
             signal_child(&session, sig);
         }
 
-        let yield_at = yield_deadline(
-            Instant::now(),
-            args.yield_time_ms,
-            DEFAULT_POLL_YIELD_MS,
-        );
+        let yield_at = yield_deadline(Instant::now(), args.yield_time_ms, DEFAULT_POLL_YIELD_MS);
         match drive(&mut session.child, yield_at, session.kill_at).await {
             Outcome::Exited(code) => {
                 let (so, se) = drain_final(&mut session, max_tokens).await;
@@ -1017,7 +1016,6 @@ mod tests {
         assert_eq!(v["stdout"], "done\n");
     }
 
-
     #[tokio::test]
     async fn generous_yield_blocks_slow_command_to_completion() {
         let v = as_json(
@@ -1028,7 +1026,10 @@ mod tests {
                 )
                 .await,
         );
-        assert_eq!(v["running"], false, "generous yield should finish inline: {v}");
+        assert_eq!(
+            v["running"], false,
+            "generous yield should finish inline: {v}"
+        );
         assert_eq!(v["exit_code"], 0, "{v}");
         assert_eq!(v["stdout"], "done\n");
         assert!(
@@ -1045,7 +1046,10 @@ mod tests {
                 .call(json!({"command": "sleep 2", "yield_time_ms": 50}), &c)
                 .await,
         );
-        assert_eq!(v["running"], true, "short yield should return a session: {v}");
+        assert_eq!(
+            v["running"], true,
+            "short yield should return a session: {v}"
+        );
         assert!(
             v["session_id"].as_str().is_some(),
             "yielded command needs a session id: {v}"
@@ -1163,7 +1167,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn shell_poll_short_yield_keeps_session_running() {
         let c = cx();
@@ -1179,7 +1182,10 @@ mod tests {
                 .call(json!({"session_id": sid, "yield_time_ms": 50}), &c)
                 .await,
         );
-        assert_eq!(p["running"], true, "short poll yield should keep session: {p}");
+        assert_eq!(
+            p["running"], true,
+            "short poll yield should keep session: {p}"
+        );
 
         let sid = p["session_id"].as_str().unwrap().to_string();
         let _ = ShellKill
@@ -1205,7 +1211,10 @@ mod tests {
                 .call(json!({"session_id": sid, "yield_time_ms": 0}), &c)
                 .await,
         );
-        assert_eq!(p["running"], false, "zero poll yield should block to exit: {p}");
+        assert_eq!(
+            p["running"], false,
+            "zero poll yield should block to exit: {p}"
+        );
         assert_eq!(p["exit_code"], 0, "{p}");
         assert_eq!(p["stdout"], "done\n");
     }

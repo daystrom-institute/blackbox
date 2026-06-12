@@ -5,10 +5,10 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
 
-use bbox_edge_index::edge_index::EdgeIndex;
-use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use crate::mcp_tools::inspect::compact_label;
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection, PathStep};
+use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
+use bbox_edge_index::edge_index::EdgeIndex;
 use bbox_providers::providers::ProviderContext;
 
 const RENDERED_TEXT_CAP_BYTES: usize = 30 * 1024;

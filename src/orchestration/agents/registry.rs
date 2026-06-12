@@ -522,7 +522,8 @@ fn agent_component_scores(
     let hits = crate::vectors::search(vector_route, query_vector, fetch)?;
     let mut out = BTreeMap::<String, ComponentScores>::new();
     for hit in hits {
-        let Some((agent, component)) = crate::embed_runtime::parse_agent_component_entity_id(&hit.id)
+        let Some((agent, component)) =
+            crate::embed_runtime::parse_agent_component_entity_id(&hit.id)
         else {
             continue;
         };

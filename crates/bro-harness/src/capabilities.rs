@@ -110,23 +110,22 @@ impl ToolCapability for HostTools {
                 ),
             )
         })?;
-        let (content, is_error, content_type) =
-            match crate::registry::call_tool_with_arg_defaults(
-                tool.as_ref(),
-                &invocation.name,
-                invocation.input_json,
-                &self.cx,
-            )
-            .await
-            {
-                ToolResult::Text(t) => (t, false, "text/plain"),
-                ToolResult::Json(v) => (
-                    serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
-                    false,
-                    "application/json",
-                ),
-                ToolResult::Error(e) => (e, true, "text/plain"),
-            };
+        let (content, is_error, content_type) = match crate::registry::call_tool_with_arg_defaults(
+            tool.as_ref(),
+            &invocation.name,
+            invocation.input_json,
+            &self.cx,
+        )
+        .await
+        {
+            ToolResult::Text(t) => (t, false, "text/plain"),
+            ToolResult::Json(v) => (
+                serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
+                false,
+                "application/json",
+            ),
+            ToolResult::Error(e) => (e, true, "text/plain"),
+        };
         Ok(ToolCallOutput {
             content,
             is_error,

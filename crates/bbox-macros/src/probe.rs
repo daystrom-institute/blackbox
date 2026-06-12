@@ -40,15 +40,15 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::expr::Context;
+use crate::model::{MacroInvocation, MacroSemanticStatus};
 use bbox_code_nav::semantic::{WorkspaceSymbolItem, java_workspace_symbols};
 use bbox_code_nav::{
     CodeQueryParams, CodeQueryResponse, CodeSymbolSearchParams, CodeSymbolSearchResponse,
     ProjectTextMatch, ProjectTextNormalization, project_text_search,
 };
-use bbox_lsp::LspSessionManager;
-use crate::expr::Context;
-use crate::model::{MacroInvocation, MacroSemanticStatus};
 use bbox_corpus_core::project_record::ProjectRecord;
+use bbox_lsp::LspSessionManager;
 
 // ---------------------------------------------------------------------------
 // Caps

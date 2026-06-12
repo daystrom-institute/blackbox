@@ -182,14 +182,22 @@ mod tests {
     fn unknown_language_falls_back_to_plain_lines() {
         let lines = highlight_code_to_lines("a\nb\nc", "no-such-lang-xyz");
         assert_eq!(lines.len(), 3);
-        assert!(lines.iter().all(|l| l.spans.iter().all(|s| s.style.fg.is_none())));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.style.fg.is_none()))
+        );
     }
 
     #[test]
     fn oversize_input_falls_back_to_plain() {
         let big = "x\n".repeat(MAX_HIGHLIGHT_LINES + 1);
         let lines = highlight_code_to_lines(&big, "rust");
-        assert!(lines.iter().all(|l| l.spans.iter().all(|s| s.style.fg.is_none())));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.style.fg.is_none()))
+        );
     }
 
     #[test]

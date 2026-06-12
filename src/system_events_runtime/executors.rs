@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use crate::server::state::SharedState;
 use crate::system_events::gate;
 use crate::system_events::hub::{EventHub, SystemEventDraft};
 use crate::system_events::template::UnresolvedPolicy;
 use crate::system_events::types::*;
-use crate::server::state::SharedState;
 
 const SUMMARY_CAP: usize = 4096;
 
@@ -402,8 +402,11 @@ fn render_value(
 ) -> std::result::Result<Value, anyhow::Error> {
     match val {
         Value::String(s) => {
-            let rendered =
-                crate::system_events::template::render_template_with_roots(s, roots, UnresolvedPolicy::HardError)?;
+            let rendered = crate::system_events::template::render_template_with_roots(
+                s,
+                roots,
+                UnresolvedPolicy::HardError,
+            )?;
             Ok(Value::String(rendered))
         }
         Value::Object(map) => {

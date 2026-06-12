@@ -3,9 +3,9 @@ pub mod agents;
 pub mod allocator;
 pub mod atoms;
 pub mod badgey;
-pub mod consultant;
 pub mod brofile;
 pub mod capabilities;
+pub mod consultant;
 pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
@@ -796,7 +796,7 @@ mod roster_view_tests {
                 report_full: None,
                 interrupted: false,
                 error_teaser: None,
-            transcript_path: None,
+                transcript_path: None,
             },
         );
         assert_eq!(view.snapshot().len(), 1);
@@ -919,7 +919,7 @@ mod roster_view_tests {
                 report_full: None,
                 interrupted: false,
                 error_teaser: None,
-            transcript_path: None,
+                transcript_path: None,
             },
         );
         let mut store = TaskStore::new();
@@ -1031,14 +1031,9 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         // Error teaser for failed/cancelled tasks: the last non-empty line
         // of stderr, trimmed and capped, so the fleet cockpit zoom view can
         // show why a dispatch failed without querying bro_status.
-        error_teaser: if inner.status.is_terminal()
-            && !inner.stderr.trim().is_empty()
-        {
+        error_teaser: if inner.status.is_terminal() && !inner.stderr.trim().is_empty() {
             let trimmed = inner.stderr.trim();
-            let last_line = trimmed
-                .lines()
-                .next_back()
-                .unwrap_or(trimmed);
+            let last_line = trimmed.lines().next_back().unwrap_or(trimmed);
             Some(last_line.chars().take(200).collect::<String>())
         } else {
             None
@@ -1931,7 +1926,8 @@ const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] =
 /// target), and on resolve/update a global gap ignores the param entirely.
 /// `bbox_gaps` (list) is deliberately absent — its `project` is a result
 /// filter where None means "all projects".
-const GAP_WRITE_TARGET_DEFAULT_TOOLS: &[&str] = &["bbox_gap", "bbox_gap_resolve", "bbox_gap_update"];
+const GAP_WRITE_TARGET_DEFAULT_TOOLS: &[&str] =
+    &["bbox_gap", "bbox_gap_resolve", "bbox_gap_update"];
 
 /// Code-nav read tools whose `project_dir` param is the read root (file
 /// resolution / parse scan / LSP session root). All read-only; the mutating
@@ -2034,19 +2030,13 @@ impl AmbientContext {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| cwd.to_string());
             for tool in RETRIEVAL_PROJECT_DEFAULT_TOOLS {
-                defaults.insert(
-                    format!("default:mcp.{tool}.project"),
-                    canonical_cwd.clone(),
-                );
+                defaults.insert(format!("default:mcp.{tool}.project"), canonical_cwd.clone());
             }
             // Gap write-targeting defaults (gap-b94129ba): same gating as the
             // retrieval defaults — only filled when the model elides the
             // param, and `scope="global"` / global gaps still win server-side.
             for tool in GAP_WRITE_TARGET_DEFAULT_TOOLS {
-                defaults.insert(
-                    format!("default:mcp.{tool}.project"),
-                    canonical_cwd.clone(),
-                );
+                defaults.insert(format!("default:mcp.{tool}.project"), canonical_cwd.clone());
             }
             // `project_dir`-named read params need explicit defaults on every
             // dispatch shape: the `pin` flavor only refuses mismatches, it
@@ -3075,7 +3065,9 @@ fn ingest_harness_event(
             };
             provider.parse_event(&evt, &mut sink);
             apply_cwd_updates_from_event(&mut inner, &evt);
-            inner.supervision.observe_event(&evt, &sink, &supervision::config(), now_ms());
+            inner
+                .supervision
+                .observe_event(&evt, &sink, &supervision::config(), now_ms());
             apply_sink_updates(&mut inner, sink);
             // A terminal `result` event with `is_error: true` fails the task and
             // preserves the message in stderr. The subprocess path derives this
@@ -3911,16 +3903,20 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     if inner.session_id == "pending" {
                         inner.session_id = sid;
                         session_id_observed = true;
-                        inner
-                            .supervision
-                            .observe_bulk_sink(&sink, &supervision::config(), now_ms());
+                        inner.supervision.observe_bulk_sink(
+                            &sink,
+                            &supervision::config(),
+                            now_ms(),
+                        );
                         apply_sink_updates(&mut inner, sink);
                     } else if inner.session_id != sid {
                         reject_forked_session(&mut inner, &sid);
                     } else {
-                        inner
-                            .supervision
-                            .observe_bulk_sink(&sink, &supervision::config(), now_ms());
+                        inner.supervision.observe_bulk_sink(
+                            &sink,
+                            &supervision::config(),
+                            now_ms(),
+                        );
                         apply_sink_updates(&mut inner, sink);
                     }
                 } else {
@@ -4425,14 +4421,11 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     // Gate the liveness row out of terminal, healthy responses — on a finished
     // task it would only restate `ok: true`. Live or alerting tasks keep it
     // (idle / tool_running / alerts still carry signal).
-    if let Some(supervision) = inner
-        .supervision
-        .snapshot_for_response_gated(
-            &supervision::config(),
-            supervision_now,
-            inner.status.is_terminal(),
-        )
-    {
+    if let Some(supervision) = inner.supervision.snapshot_for_response_gated(
+        &supervision::config(),
+        supervision_now,
+        inner.status.is_terminal(),
+    ) {
         obj["supervision"] = supervision;
     }
     if inner.status == TaskStatus::Failed {
@@ -4966,7 +4959,9 @@ mod tests {
         let mut args = fleet_mcp_dispatch_args(Provider::Glm, bro_core::Origin::Cockpit);
         assert_eq!(args[0], "--mcp-config");
 
-        let config = build_in_process_mcp_config(&mut args, None).unwrap().unwrap();
+        let config = build_in_process_mcp_config(&mut args, None)
+            .unwrap()
+            .unwrap();
         assert!(args.is_empty(), "--mcp-config consumed from argv");
         assert!(config.servers.iter().any(|s| s.name() == "tmux"));
         assert!(config.servers.iter().any(|s| s.name() == "selfbox"));
@@ -6330,7 +6325,10 @@ mod tests {
         // Text recursion guard retired: no directive carries it for any
         // provider — guarding is mechanical via dispatch tool filters.
         assert!(
-            payload.directives.iter().all(|d| !d.text.contains("IMPORTANT:")),
+            payload
+                .directives
+                .iter()
+                .all(|d| !d.text.contains("IMPORTANT:")),
             "text recursion guard leaked into a directive"
         );
         // The payload is ingredients only — never the operator's prompt.
@@ -6438,7 +6436,10 @@ mod tests {
             "default:mcp.bbox_hybrid_search.project",
             "default:mcp.bbox_discover_seed_entities.project",
         ] {
-            assert_eq!(defaults.get(key).map(String::as_str), Some(cwd_str.as_str()));
+            assert_eq!(
+                defaults.get(key).map(String::as_str),
+                Some(cwd_str.as_str())
+            );
         }
         for tool in super::CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS {
             assert_eq!(

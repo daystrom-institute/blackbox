@@ -75,10 +75,9 @@ impl<'de> Deserialize<'de> for TranscriptSource {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "gemini" => Ok(Self::Gemini),
-            other => other
-                .parse::<Provider>()
-                .map(Self::Harness)
-                .map_err(|_| serde::de::Error::custom(format!("unknown transcript source: {other}"))),
+            other => other.parse::<Provider>().map(Self::Harness).map_err(|_| {
+                serde::de::Error::custom(format!("unknown transcript source: {other}"))
+            }),
         }
     }
 }

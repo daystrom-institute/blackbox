@@ -693,7 +693,8 @@ impl BlackboxServer {
         // selects.
         let action_results = match descriptor.hooks {
             crate::orchestration::consultant::descriptor::ConsumerHooks::Badgey => {
-                self.badgey_post_process_turn(&instance, &turn_start).await?
+                self.badgey_post_process_turn(&instance, &turn_start)
+                    .await?
             }
             crate::orchestration::consultant::descriptor::ConsumerHooks::None => Vec::new(),
         };

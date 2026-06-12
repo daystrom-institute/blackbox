@@ -6879,7 +6879,11 @@ existing = { path = "crates/existing" }
             "mod inner;\n\npub fn two() -> i32 { inner::two() }\n",
         )
         .unwrap();
-        fs::write(src.join("beta/inner.rs"), "pub(crate) fn two() -> i32 { 2 }\n").unwrap();
+        fs::write(
+            src.join("beta/inner.rs"),
+            "pub(crate) fn two() -> i32 { 2 }\n",
+        )
+        .unwrap();
         fs::write(src.join("gamma.rs"), "pub fn three() -> i32 { 3 }\n").unwrap();
     }
 
@@ -7103,7 +7107,10 @@ existing = { path = "crates/existing" }
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("cycle"), "unexpected error: {msg}");
-        assert!(msg.contains("aa") && msg.contains("bb"), "cycle names missing: {msg}");
+        assert!(
+            msg.contains("aa") && msg.contains("bb"),
+            "cycle names missing: {msg}"
+        );
     }
 
     #[test]

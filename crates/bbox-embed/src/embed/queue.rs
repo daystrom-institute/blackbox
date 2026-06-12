@@ -85,7 +85,6 @@ pub fn register_contradiction_hook(hook: fn(&EmbedRequest, &str, &[f32])) {
     let _ = CONTRADICTION_HOOK.set(hook);
 }
 
-
 #[derive(Clone)]
 pub struct EmbedQueueHandle {
     inner: Arc<EmbedQueueInner>,

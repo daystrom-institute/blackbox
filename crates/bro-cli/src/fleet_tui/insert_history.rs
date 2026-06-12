@@ -12,13 +12,11 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crossterm::Command;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::{
-    Attribute, Color as CColor, Colors, Print, SetAttribute, SetColors,
-};
+use crossterm::style::{Attribute, Color as CColor, Colors, Print, SetAttribute, SetColors};
 use crossterm::terminal::{Clear, ClearType};
-use crossterm::Command;
 use ratatui::layout::Size;
 use ratatui::prelude::Backend;
 use ratatui::style::{Modifier, Style};
@@ -110,7 +108,11 @@ fn line_display_width(line: &Line<'_>) -> usize {
 
 /// Write one already-wrapped line: paint the line background to EOL, then emit
 /// each span with its (line-merged) style.
-fn write_history_line<W: Write>(writer: &mut W, line: &Line<'_>, _wrap_width: usize) -> io::Result<()> {
+fn write_history_line<W: Write>(
+    writer: &mut W,
+    line: &Line<'_>,
+    _wrap_width: usize,
+) -> io::Result<()> {
     let line_fg = line.style.fg.map(Into::into).unwrap_or(CColor::Reset);
     let line_bg = line.style.bg.map(Into::into).unwrap_or(CColor::Reset);
     queue!(writer, SetColors(Colors::new(line_fg, line_bg)))?;

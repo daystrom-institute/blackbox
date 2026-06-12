@@ -476,10 +476,7 @@ impl TranscriptIndex {
         }
     }
 
-    pub fn entity_properties(
-        &self,
-        entity_id: &str,
-    ) -> Result<Option<BTreeMap<String, String>>> {
+    pub fn entity_properties(&self, entity_id: &str) -> Result<Option<BTreeMap<String, String>>> {
         let searcher = self.reader.searcher();
         let query = TermQuery::new(
             Term::from_field_text(self.fields.entity_id, entity_id),
@@ -816,7 +813,10 @@ mod tests {
         docs.sort_by(|a, b| a.doc_type.cmp(&b.doc_type));
         assert_eq!(docs[0].doc_type, "project_file");
         assert_eq!(docs[0].file_path, "src/lib.rs");
-        assert_eq!(docs[0].entity_id.as_deref(), Some("pfile:proj1234:src/lib.rs:0"));
+        assert_eq!(
+            docs[0].entity_id.as_deref(),
+            Some("pfile:proj1234:src/lib.rs:0")
+        );
         assert_eq!(docs[1].doc_type, "transcript");
         assert_eq!(docs[1].account, "claude");
         assert_eq!(docs[1].session_id, "sess-1");
@@ -849,8 +849,7 @@ mod tests {
         writer.commit().unwrap();
         index.reader_reload_for_test();
 
-        let result =
-            index.for_each_edge_projection_doc(|_| anyhow::bail!("stop"));
+        let result = index.for_each_edge_projection_doc(|_| anyhow::bail!("stop"));
         assert!(result.is_err());
     }
 
@@ -1075,17 +1074,16 @@ mod tests {
             Some(chunk.chunk_hash.as_str())
         );
     }
-
 }
 
 pub mod code_tokenizer;
 pub mod embed_hook;
 pub mod git_history;
 pub mod helpers;
+pub mod passes;
 pub mod project_files;
 pub mod search;
 pub mod tool_edges;
-pub mod passes;
 
 pub use helpers::find_session_file;
 pub use search::{

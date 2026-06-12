@@ -572,14 +572,19 @@ mod tests {
         );
         let wire: Vec<String> = optional.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"exec".to_string()));
-        assert!(wire.contains(&"file_read".to_string()), "optional: {wire:?}");
+        assert!(
+            wire.contains(&"file_read".to_string()),
+            "optional: {wire:?}"
+        );
 
         // only (defer_builtins=true): exec pinned/visible, file_read deferred.
-        let only =
-            Registry::with_options(builtins, vec![], &pin, &ToolFilter::default(), true);
+        let only = Registry::with_options(builtins, vec![], &pin, &ToolFilter::default(), true);
         let wire: Vec<String> = only.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"exec".to_string()), "only wire: {wire:?}");
-        assert!(!wire.contains(&"file_read".to_string()), "only wire: {wire:?}");
+        assert!(
+            !wire.contains(&"file_read".to_string()),
+            "only wire: {wire:?}"
+        );
         assert!(
             only.manifest().iter().any(|(n, _)| n == "file_read"),
             "deferred builtin must be tool_search-loadable"

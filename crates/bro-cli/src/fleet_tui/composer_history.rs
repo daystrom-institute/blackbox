@@ -95,8 +95,7 @@ pub fn append_history(path: &Path, text: &str) -> std::io::Result<()> {
         ts,
         text: text.to_string(),
     };
-    let line = serde_json::to_string(&entry)
-        .expect("HistoryEntry is always serializable");
+    let line = serde_json::to_string(&entry).expect("HistoryEntry is always serializable");
 
     // Open (or create) the file for read+write.
     let file = OpenOptions::new()
@@ -178,8 +177,7 @@ fn trim_locked(file: &File, path: &Path) -> std::io::Result<()> {
     {
         let mut tmp = File::create(&tmp_path)?;
         for entry in tail {
-            let line = serde_json::to_string(entry)
-                .expect("HistoryEntry is always serializable");
+            let line = serde_json::to_string(entry).expect("HistoryEntry is always serializable");
             tmp.write_all(line.as_bytes())?;
             tmp.write_all(b"\n")?;
         }
@@ -221,7 +219,11 @@ mod tests {
         // Verify it's one physical line in the file.
         let contents = fs::read_to_string(&path).unwrap();
         let physical_lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(physical_lines.len(), 1, "multi-line prompt must be one JSONL record");
+        assert_eq!(
+            physical_lines.len(),
+            1,
+            "multi-line prompt must be one JSONL record"
+        );
     }
 
     #[test]
@@ -249,7 +251,10 @@ mod tests {
         {
             let mut f = File::create(&path).unwrap();
             for i in 0..10 {
-                let entry = HistoryEntry { ts: i, text: format!("entry-{i}") };
+                let entry = HistoryEntry {
+                    ts: i,
+                    text: format!("entry-{i}"),
+                };
                 writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
             }
         }
@@ -275,7 +280,10 @@ mod tests {
         // We'll write fewer and test the trim_locked function directly.
         let mut entries = Vec::new();
         for i in 0..200 {
-            entries.push(HistoryEntry { ts: i, text: format!("entry-{i}") });
+            entries.push(HistoryEntry {
+                ts: i,
+                text: format!("entry-{i}"),
+            });
         }
 
         // Write all entries directly.
@@ -310,7 +318,10 @@ mod tests {
         {
             let mut f = File::create(&path).unwrap();
             for i in 0..count {
-                let entry = HistoryEntry { ts: i as u64, text: format!("entry-{i}") };
+                let entry = HistoryEntry {
+                    ts: i as u64,
+                    text: format!("entry-{i}"),
+                };
                 writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
             }
         }
@@ -339,7 +350,10 @@ mod tests {
         // Write a valid entry, then a truncated one.
         {
             let mut f = File::create(&path).unwrap();
-            let entry = HistoryEntry { ts: 1, text: "good".to_string() };
+            let entry = HistoryEntry {
+                ts: 1,
+                text: "good".to_string(),
+            };
             writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
             // Write a partial/truncated JSON line (no trailing newline).
             write!(f, "{{\"ts\":2,\"text\":\"truncate").unwrap();

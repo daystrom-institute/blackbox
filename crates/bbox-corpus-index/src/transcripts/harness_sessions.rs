@@ -98,7 +98,12 @@ impl HarnessSessionsAdapter {
         self.dir.join(format!("{session_id}{EVENT_LOG_SUFFIX}"))
     }
 
-    fn location_for(&self, session_id: &str, path: PathBuf, meta: &SessionMeta) -> TranscriptLocation {
+    fn location_for(
+        &self,
+        session_id: &str,
+        path: PathBuf,
+        meta: &SessionMeta,
+    ) -> TranscriptLocation {
         TranscriptLocation {
             source: TranscriptSource::Harness(self.provider),
             storage: TranscriptStorage::JsonlFile,
@@ -528,7 +533,12 @@ mod tests {
 
         let adapter = HarnessSessionsAdapter::new(Provider::Glm, root.clone());
         let location = adapter.locate("sess-1").unwrap().expect("located");
-        assert!(location.path.to_string_lossy().ends_with("sess-1.events.jsonl"));
+        assert!(
+            location
+                .path
+                .to_string_lossy()
+                .ends_with("sess-1.events.jsonl")
+        );
 
         let batch = adapter.read_since(&location, None).unwrap();
         assert!(batch.reached_end);
@@ -536,10 +546,10 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                TranscriptEventKind::Message,   // user prompt
-                TranscriptEventKind::Thinking,  // assistant thinking
-                TranscriptEventKind::Message,   // assistant text
-                TranscriptEventKind::ToolUse,   // file_edit
+                TranscriptEventKind::Message,  // user prompt
+                TranscriptEventKind::Thinking, // assistant thinking
+                TranscriptEventKind::Message,  // assistant text
+                TranscriptEventKind::ToolUse,  // file_edit
                 TranscriptEventKind::ToolResult,
             ]
         );

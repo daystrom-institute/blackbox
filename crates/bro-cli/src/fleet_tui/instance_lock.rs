@@ -82,7 +82,10 @@ mod tests {
             msg.contains(&format!("pid {}", std::process::id())),
             "error must name the holding pid: {msg}"
         );
-        assert!(msg.contains("--force"), "error must mention the override: {msg}");
+        assert!(
+            msg.contains("--force"),
+            "error must mention the override: {msg}"
+        );
     }
 
     #[test]

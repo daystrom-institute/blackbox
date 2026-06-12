@@ -205,7 +205,10 @@ mod tests {
         // Append a SPLIT line: first half without the newline…
         let full = log_line(assistant_event("two"));
         let (head, rest) = full.split_at(10);
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(head.as_bytes()).unwrap();
         f.flush().unwrap();
         assert!(!tail.poll(), "partial line must not parse yet");

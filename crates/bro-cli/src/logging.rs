@@ -31,7 +31,9 @@ static PANIC_HOOK: Once = Once::new();
 /// while debugging live cockpit state. The non-blocking worker flushes promptly
 /// on its own thread.
 #[must_use = "hold the returned WorkerGuard for the cockpit's lifetime, or logs are lost"]
-pub fn init_cockpit_logging(store_dir: &Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+pub fn init_cockpit_logging(
+    store_dir: &Path,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = store_dir.join("logs");
     if std::fs::create_dir_all(&log_dir).is_err() {
         return None;

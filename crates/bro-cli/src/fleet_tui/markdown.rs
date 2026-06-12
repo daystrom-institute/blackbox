@@ -27,7 +27,10 @@ pub(super) fn render_markdown_preserving_breaks_with_width(
     render_markdown_with_limit(&harden_line_breaks(text), Some(width.max(1)))
 }
 
-pub(super) fn render_markdown_with_limit(text: &str, max_width: Option<usize>) -> Vec<Line<'static>> {
+pub(super) fn render_markdown_with_limit(
+    text: &str,
+    max_width: Option<usize>,
+) -> Vec<Line<'static>> {
     let text = unwrap_markdown_table_fences(text);
     markdown_blocks_preserving_terminal_shapes(&text)
         .into_iter()
@@ -53,8 +56,8 @@ fn harden_line_breaks(text: &str) -> String {
         let trimmed = body.trim_start();
         match fence_marker {
             Some(marker) => {
-                let is_close = trimmed.starts_with(marker)
-                    && trimmed[marker.len()..].trim().is_empty();
+                let is_close =
+                    trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty();
                 out.push_str(body);
                 if had_nl {
                     out.push('\n');
@@ -163,7 +166,10 @@ pub(super) enum MarkdownBlock {
     Rule,
 }
 
-pub(super) fn render_markdown_block(block: MarkdownBlock, max_width: Option<usize>) -> Vec<Line<'static>> {
+pub(super) fn render_markdown_block(
+    block: MarkdownBlock,
+    max_width: Option<usize>,
+) -> Vec<Line<'static>> {
     match block {
         MarkdownBlock::Markdown(text) => {
             let text = rewrite_task_list_markers(&text);
@@ -256,7 +262,10 @@ pub(super) fn markdown_blocks_preserving_terminal_shapes(text: &str) -> Vec<Mark
 /// Render a markdown table (header row, separator row, then data rows) as a
 /// box-drawn grid with aligned columns. Falls back to styling the raw lines if
 /// the block is malformed.
-pub(super) fn render_table_block(lines: Vec<String>, max_width: Option<usize>) -> Vec<Line<'static>> {
+pub(super) fn render_table_block(
+    lines: Vec<String>,
+    max_width: Option<usize>,
+) -> Vec<Line<'static>> {
     if lines.len() < 2 {
         return lines
             .into_iter()
@@ -348,10 +357,15 @@ pub(super) fn render_table_block(lines: Vec<String>, max_width: Option<usize>) -
     out
 }
 
-pub(super) fn render_code_block(language: Option<String>, lines: Vec<String>) -> Vec<Line<'static>> {
+pub(super) fn render_code_block(
+    language: Option<String>,
+    lines: Vec<String>,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let border = Style::default().fg(Color::DarkGray);
-    let lang = language.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
+    let lang = language
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
     let title = match &lang {
         Some(l) => format!("┌─ {l}"),
         None => "┌─ code".to_string(),
@@ -378,7 +392,10 @@ pub(super) fn render_code_block(language: Option<String>, lines: Vec<String>) ->
 /// Render a blockquote: recursively render the (prefix-stripped) inner markdown,
 /// then prepend a `▌ ` gutter to every produced line so multi-line quotes read
 /// as a quote rather than collapsing into one run-on line.
-pub(super) fn render_quote_block(lines: Vec<String>, max_width: Option<usize>) -> Vec<Line<'static>> {
+pub(super) fn render_quote_block(
+    lines: Vec<String>,
+    max_width: Option<usize>,
+) -> Vec<Line<'static>> {
     let gutter = Style::default().fg(Color::DarkGray);
     let inner = render_markdown_with_limit(&lines.join("\n"), max_width);
     inner
@@ -414,7 +431,10 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
-        assert!(text.contains('┌') && text.contains('│'), "expected a table: {text:?}");
+        assert!(
+            text.contains('┌') && text.contains('│'),
+            "expected a table: {text:?}"
+        );
     }
 
     #[test]

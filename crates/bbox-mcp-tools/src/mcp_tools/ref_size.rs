@@ -6,8 +6,8 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use bbox_providers::entity_loader;
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
+use bbox_providers::entity_loader;
 use bbox_providers::providers::ProviderContext;
 
 const REF_CAP: usize = 500;

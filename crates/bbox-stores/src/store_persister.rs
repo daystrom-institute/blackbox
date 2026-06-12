@@ -55,11 +55,7 @@ impl PersistAck {
 }
 
 impl<S: StoreSnapshot> StorePersister<S> {
-    pub fn spawn(
-        name: impl Into<String>,
-        store: Arc<RwLock<S>>,
-        store_path: PathBuf,
-    ) -> Self {
+    pub fn spawn(name: impl Into<String>, store: Arc<RwLock<S>>, store_path: PathBuf) -> Self {
         let name = name.into();
         let (tx, rx) = mpsc::channel::<PersistRequest>();
         let store_w = store.clone();

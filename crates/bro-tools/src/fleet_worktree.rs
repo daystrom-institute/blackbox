@@ -2828,9 +2828,16 @@ mod tests {
 
         let result = phase_remove(&req);
 
-        assert!(result.ok, "discard remove should succeed: {:?}", result.content);
+        assert!(
+            result.ok,
+            "discard remove should succeed: {:?}",
+            result.content
+        );
         assert!(!cwd.exists(), "worktree should be removed");
-        assert_eq!(result.content["deleted_branch"], json!("bro-fleet/test-branch"));
+        assert_eq!(
+            result.content["deleted_branch"],
+            json!("bro-fleet/test-branch")
+        );
         assert!(
             !branch_exists(repo.path(), "bro-fleet/test-branch"),
             "discard keeps operator-authorized branch deletion"
@@ -2874,7 +2881,11 @@ mod tests {
 
         let result = phase_remove(&req);
 
-        assert!(result.ok, "branch delete failure stays a warning: {:?}", result.content);
+        assert!(
+            result.ok,
+            "branch delete failure stays a warning: {:?}",
+            result.content
+        );
         assert!(!cwd.exists(), "worktree should be removed");
         assert!(
             result.content.get("deleted_branch").is_none(),
@@ -3785,13 +3796,25 @@ mod tests {
         // Local fold landed: base main contains the worktree's work AND the
         // local-only commit.
         let log = git_capture(repo.path(), &["log", "--format=%s", "main"]).unwrap();
-        assert!(log.contains("worktree commit"), "fold commit on local main: {log}");
-        assert!(log.contains("local-only commit"), "local-only commit survives: {log}");
+        assert!(
+            log.contains("worktree commit"),
+            "fold commit on local main: {log}"
+        );
+        assert!(
+            log.contains("local-only commit"),
+            "local-only commit survives: {log}"
+        );
 
         // Nothing reached origin; the worktree survives for /closeout adopt.
         let origin_main_after = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
-        assert_eq!(origin_main_before, origin_main_after, "push must be deferred");
-        assert!(cwd.exists(), "worktree must be kept for the follow-up adopt");
+        assert_eq!(
+            origin_main_before, origin_main_after,
+            "push must be deferred"
+        );
+        assert!(
+            cwd.exists(),
+            "worktree must be kept for the follow-up adopt"
+        );
         std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
     }
 
