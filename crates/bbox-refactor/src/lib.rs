@@ -5525,7 +5525,7 @@ fn render_snippet_window(source: &str, line: usize, context: usize) -> String {
     out
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
@@ -5552,7 +5552,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// `link` / `rename` with an existence check.  On failure the temp file is
 /// cleaned up automatically; the caller receives an error and must NOT push
 /// the target into the rollback list (no pre-existing file was touched).
-fn write_atomic_noclobber(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic_noclobber(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;

@@ -46,6 +46,12 @@ fn span_schema() -> Value {
     })
 }
 
+/// Span JSON schema for sibling binding modules (the edits algebra consumes
+/// the same hash-anchored Spans the facts mint).
+pub(super) fn span_schema_pub() -> Value {
+    span_schema()
+}
+
 fn err(msg: impl std::fmt::Display) -> ToolResult {
     ToolResult::Error(msg.to_string())
 }
@@ -56,9 +62,10 @@ fn resolve(root: &Path, file: &str) -> anyhow::Result<std::path::PathBuf> {
     bro_tools::workspace::resolve_in_root(root, file)
 }
 
-// Called from code.read's call_blocking closure (blocking pool).
+// Called from binding call_blocking closures (blocking pool); shared with
+// the edits algebra for hash checks and snapshots.
 #[allow(clippy::disallowed_methods)]
-fn read_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(super) fn read_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 

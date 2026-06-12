@@ -186,6 +186,26 @@ pub fn file_query(
     })
 }
 
+/// Parse health of one source file.
+#[derive(Debug, Clone)]
+pub struct ParseCheckFacts {
+    pub language: &'static str,
+    pub error_nodes: usize,
+    pub missing_nodes: usize,
+}
+
+/// Tree-sitter parse check for `path` — the post-apply validation primitive.
+/// Errors for unsupported extensions; callers skip validation for those.
+pub fn parse_check(path: &Path) -> Result<ParseCheckFacts> {
+    let parsed = super::parse_source_file(path)?;
+    let report = super::parse_report(parsed.tree.root_node());
+    Ok(ParseCheckFacts {
+        language: parsed.language,
+        error_nodes: report.error_nodes,
+        missing_nodes: report.missing_nodes,
+    })
+}
+
 /// One parameter of a function signature.
 #[derive(Debug, Clone)]
 pub struct FnParamFact {

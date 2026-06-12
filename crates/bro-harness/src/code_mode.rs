@@ -767,6 +767,56 @@ text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
     }
 
     #[tokio::test]
+    async fn cell_composes_facts_algebra_and_choke_point() {
+        // Full mutation slice in one cell: query a span, queue a replacement,
+        // apply — and the bytes land on disk with the EditSet consumed.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("probe.rs"),
+            "pub fn answer() -> u8 {\n    41\n}\n",
+        )
+        .unwrap();
+        let cx = ToolCx {
+            root: dir.path().to_path_buf(),
+            safety: Arc::new(bro_tools::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
+            shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
+            edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(BTreeMap::new()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
+            shell_env: Arc::new(Default::default()),
+        };
+        let callable = crate::bindings::binding_tools();
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            cx.clone(),
+        ));
+        let exec = code_mode_tools(
+            &callable,
+            seam,
+            CodeMode::Only,
+            &crate::bindings::namespace_descriptions(),
+        )
+        .remove(0);
+        let source = r#"
+const inv = await code.items({ file: "probe.rs" });
+const fn41 = inv.items.find(i => i.name === "answer");
+const { es } = await edits.begin();
+await edits.replace({ es, span: fn41.span, text: "pub fn answer() -> u8 {\n    42\n}" });
+const r = await edits.apply({ es });
+text(`${r.applied}:${r.semantic_status}:${r.validations[0].status}`);
+"#;
+        let result = exec.call(json!({ "source": source }), &cx).await;
+        match result {
+            ToolResult::Text(t) => assert!(t.contains("true:syntax_only:passed"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        let on_disk = std::fs::read_to_string(dir.path().join("probe.rs")).unwrap();
+        assert!(on_disk.contains("42"), "{on_disk}");
+    }
+
+    #[tokio::test]
     async fn exec_description_documents_namespace_globals_in_optional_mode() {
         // D3 regression guard (refactor-v2-pressure-test.md §1): namespace
         // declarations render even when code_mode != only.
