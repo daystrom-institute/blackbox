@@ -399,7 +399,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file."
+        description: "Pure syntax facts over the working set (tree-sitter). Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The four methods below are the complete `code` surface. Independent calls are safe to batch with `Promise.all`. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that language's grammar."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type SyntaxItemFact = { name?: string; kind: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
