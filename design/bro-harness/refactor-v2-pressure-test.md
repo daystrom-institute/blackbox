@@ -300,6 +300,15 @@ dissolve rather than resolve).
    `store()`/`load()` continuity across cells is free — cell-dsl §4's
    `recalled` mark turned out unnecessary.
 
+   *Probe-validated (probe-ledger-1, 2026-06-12):* a GLM agent given the
+   standard cross-file rename task produced an apply result of
+   `lineage {lsp_verified: 2, syntax_only: 0}`,
+   `semantic_status: "lsp_verified"` — read from the raw tool result, not
+   agent paraphrase — in 7 turns with zero errored cells (parity with the
+   best prior lsp probe; the ledger added no friction). Program 1's
+   producer-not-selector claim now holds end-to-end: `lsp_verified` is
+   reachable from a real dispatched program.
+
 ## 6.5 The mechanical toolbox: transform bindings (the lsp.rename shape, generalized)
 
 The v1 Java catalog (~40 kinds, ~38 modules, ~800KB of Rust: the
