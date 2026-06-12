@@ -1,6 +1,6 @@
 {
   "name": "badgey-apply-proposal-arc",
-  "version": 3,
+  "version": 4,
   "vars_schema": {
     "team_id":          { "kind": "string", "required": true },
     "channel_id":       { "kind": "string", "required": true },
@@ -68,9 +68,10 @@
           "op": "mcp_call",
           "args": {
             "server": "blackbox",
-            "tool": "badgey_proposal_begin_apply",
+            "tool": "consultant_proposal_begin_apply",
             "arguments": {
-              "badgey_id": "${vars.instance_id}",
+              "consumer": "badgey",
+              "consultant_id": "${vars.instance_id}",
               "proposal_id": "${vars.proposal_id}"
             },
             "timeout_secs": 30
@@ -224,9 +225,10 @@
           "op": "mcp_call",
           "args": {
             "server": "blackbox",
-            "tool": "badgey_proposal_complete_apply",
+            "tool": "consultant_proposal_complete_apply",
             "arguments": {
-              "badgey_id": "${vars.instance_id}",
+              "consumer": "badgey",
+              "consultant_id": "${vars.instance_id}",
               "proposal_id": "${vars.proposal_id}",
               "outcome": "${actor_results.Dispatch.status}",
               "task_id": "${actor_results.Dispatch.taskId}",
@@ -242,9 +244,10 @@
           "op": "mcp_call",
           "args": {
             "server": "blackbox",
-            "tool": "badgey_proposal_complete_apply",
+            "tool": "consultant_proposal_complete_apply",
             "arguments": {
-              "badgey_id": "${vars.instance_id}",
+              "consumer": "badgey",
+              "consultant_id": "${vars.instance_id}",
               "proposal_id": "${vars.proposal_id}",
               "outcome": "completed",
               "artifact_ref": "${vars.artifact_ref}",

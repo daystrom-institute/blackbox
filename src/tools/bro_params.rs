@@ -1174,3 +1174,78 @@ mod tests {
         assert_eq!(p.service_tier.as_deref(), Some("priority"));
     }
 }
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsultantProposalsListParams {
+    /// Registered consultant consumer (e.g. `badgey`).
+    pub(crate) consumer: String,
+    /// Consultant instance id (`<prefix>-<8hex>-<8hex>`) whose
+    /// proposals to list.
+    pub(crate) consultant_id: String,
+    /// Optional ISO timestamp lower bound on `created_at`. Returns
+    /// proposals at or after this moment.
+    #[serde(default)]
+    pub(crate) since: Option<String>,
+    /// When true, exclude terminal-state proposals (Applied / Failed).
+    /// Defaults to false (returns all states).
+    #[serde(default)]
+    pub(crate) only_pending: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsultantApplyProposalParams {
+    /// Registered consultant consumer (e.g. `badgey`).
+    pub(crate) consumer: String,
+    /// Consultant instance id that owns the proposal.
+    pub(crate) consultant_id: String,
+    /// Proposal id within that instance (e.g. `P-3`).
+    pub(crate) proposal_id: String,
+    /// When true, retry a proposal currently in Failed state.
+    /// Default false — unretried Failed proposals are rejected.
+    #[serde(default)]
+    pub(crate) retry_failed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsultantProposalBeginApplyParams {
+    /// Registered consultant consumer (e.g. `badgey`).
+    pub(crate) consumer: String,
+    /// Consultant instance id.
+    pub(crate) consultant_id: String,
+    /// Proposal id within that instance.
+    pub(crate) proposal_id: String,
+    /// When true, retry a proposal currently in Failed state.
+    #[serde(default)]
+    pub(crate) retry_failed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsultantProposalCompleteApplyParams {
+    /// Registered consultant consumer (e.g. `badgey`).
+    pub(crate) consumer: String,
+    /// Consultant instance id.
+    pub(crate) consultant_id: String,
+    /// Proposal id.
+    pub(crate) proposal_id: String,
+    /// Outcome of the dispatched work as observed by the caller.
+    /// Maps to TaskStatus serialization: `completed` / `failed` /
+    /// `cancelled`. Workflow callers pass the actor's
+    /// `actor_results.<NodeId>.status` here. `timed_out` is treated
+    /// as failure.
+    pub(crate) outcome: String,
+    /// Task id of the dispatched work, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    /// Artifact reference for artifact-install proposals
+    /// (`<kind>:<name>@<version>`). Omitted for redispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) artifact_ref: Option<String>,
+    /// One-line summary of the work performed. Stored on the
+    /// proposal's audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<String>,
+}

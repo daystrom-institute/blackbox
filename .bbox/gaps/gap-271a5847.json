@@ -1,0 +1,20 @@
+{
+  "id": "gap-271a5847",
+  "title": "tool_docs source-scan tests are blind in CoW-seeded worktrees until bbox-tool-docs recompiles",
+  "gap_kind": "eval_coverage",
+  "domain": "tool-docs",
+  "wanted_capability": "every_registered_tool_has_a_doc / description_summary_parity should always scan the source tree of the checkout the tests run in. They resolve src/ via compile-time env!(\"CARGO_MANIFEST_DIR\"), so a test binary carried into a worktree by the seed_dirs CoW target/ clone (or any cached build) scans the checkout it was COMPILED in. Observed live during the badgey dissolution: 4 new consultant_* #[tool] handlers added in a worktree passed the coverage test (binary scanned the base repo, which lacked them); the gap only surfaced after editing tool_docs.rs forced a recompile. Fix direction: resolve the scan root at runtime (e.g. walk up from std::env::current_dir() to the workspace root, or pass the root via a runtime env var nextest sets), or assert the baked path matches the runtime workspace and fail loudly on mismatch.",
+  "missing_primitive": "Runtime-rooted source scan (or baked-path-vs-runtime-root mismatch guard) in bbox-tool-docs source-parsing tests.",
+  "fallback_used": "Touched crates/bbox-tool-docs/src/tool_docs.rs (adding the consultant_ prefix + stanzas) which forced a recompile in the worktree, re-rooting the scan correctly.",
+  "evidence": [
+    "crates/bbox-tool-docs/src/tool_docs.rs:2152",
+    "thread-a6523755"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "eval_coverage/tool-docs/manifest-dir-worktree-scan",
+  "resolution": "unresolved",
+  "thread_id": "thread-a6523755",
+  "created_at": "2026-06-12T02:51:41Z",
+  "updated_at": "2026-06-12T02:51:41Z"
+}

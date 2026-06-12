@@ -1,6 +1,6 @@
 {
   "name": "badgey-triage-channel-arc",
-  "version": 1,
+  "version": 2,
   "vars_schema": {
     "binding": { "kind": "object", "required": true },
     "team_id": { "kind": "string" },
@@ -125,9 +125,10 @@
           "op": "mcp_call",
           "args": {
             "server": "blackbox",
-            "tool": "badgey_proposals_list",
+            "tool": "consultant_proposals_list",
             "arguments": {
-              "badgey_id": "${vars.badgey_id}",
+              "consumer": "badgey",
+              "consultant_id": "${vars.badgey_id}",
               "since": "${meta.started_at}",
               "only_pending": true
             },

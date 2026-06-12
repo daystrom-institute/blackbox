@@ -1132,6 +1132,42 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "consultant_proposals_list",
+        category: ToolCategory::Orchestration,
+        summary: "List proposal records owned by a consultant instance of any registered consumer. Returns full proposal objects (id, kind, state, draft, created_at, updated_at, events, applied_task_id) sorted by proposal_id number. Optional `since` filter (ISO timestamp) restricts to proposals created at or after that moment. Consumer-agnostic equivalent of `badgey_proposals_list`.",
+        when_to_use: "Workflow nodes that need full proposal records without hard-coding a consumer's tool name — pass `consumer` (e.g. `badgey`) plus the instance id. Prefer this over `badgey_proposals_list` in new consumer-agnostic arcs; the badgey_* form remains as the pinned shim.",
+        example: Some(
+            r#"consultant_proposals_list(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", since="2026-05-07T08:00:00Z", only_pending=true)"#,
+        ),
+    },
+    ToolDoc {
+        name: "consultant_apply_proposal",
+        category: ToolCategory::Orchestration,
+        summary: "Apply a stored consultant proposal for any registered consumer — state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact kinds → bbox_artifact_install; redispatch_task → privileged task spawn), record applied_task_id, transition (Applying → Applied | Failed). One-shot wrapper; workflow callers that want the engine to track the dispatched work natively should use the split `consultant_proposal_begin_apply` + `consultant_proposal_complete_apply` pair. Consumer-agnostic equivalent of `badgey_apply_proposal`.",
+        when_to_use: "One-shot applies from consumer-agnostic callers. Returns `{status: applied|already_applied|failed|bad_input, summary}` like the badgey shim. Pass `retry_failed=true` only when explicitly retrying a Failed proposal.",
+        example: Some(
+            r#"consultant_apply_proposal(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
+        ),
+    },
+    ToolDoc {
+        name: "consultant_proposal_begin_apply",
+        category: ToolCategory::Orchestration,
+        summary: "Phase 1 of the consumer-agnostic split apply path. Transitions a proposal Pending|Failed → Applying and returns dispatch parameters (prompt + brofile + label for redispatch_task; artifact_kind + source + version for artifact installs). Does NOT spawn the bro or install the artifact — the workflow caller does that via an actor node or `bbox_artifact_install` mcp_call, then calls `consultant_proposal_complete_apply` with the outcome. Consumer-agnostic equivalent of `badgey_proposal_begin_apply`.",
+        when_to_use: "First mcp_call of a consumer-agnostic apply arc. Read the returned `outcome`: `redispatch` → run an actor with `prompt`; `install` → mcp_call bbox_artifact_install with the returned source/kind; `already_applied` → skip dispatch and the complete call; `rejected` → skip with a failure post.",
+        example: Some(
+            r#"consultant_proposal_begin_apply(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
+        ),
+    },
+    ToolDoc {
+        name: "consultant_proposal_complete_apply",
+        category: ToolCategory::Orchestration,
+        summary: "Phase 2 of the consumer-agnostic split apply path. Given the outcome of the dispatched work (`completed` / `failed` / `cancelled` / `timed_out`), transitions the proposal Applying → Applied or Applying → Failed and writes the audit decision. Always returns `{status: applied|failed, ...}` so the workflow's outcome node can read the final state. Consumer-agnostic equivalent of `badgey_proposal_complete_apply`.",
+        when_to_use: "Last mcp_call before the outcome node in a consumer-agnostic apply arc. For the redispatch path pass `outcome=${actor_results.Dispatch.status}` and `task_id=${actor_results.Dispatch.taskId}`; for the artifact-install path pass `outcome=completed` with the installed `artifact_ref`. Skip on the `already_applied` / `rejected` short-circuit paths.",
+        example: Some(
+            r#"consultant_proposal_complete_apply(consumer="badgey", consultant_id="bg-deadbeef-cafef00d", proposal_id="P-3", outcome="completed", task_id="3c2df23e-...", summary="Done")"#,
+        ),
+    },
+    ToolDoc {
         name: "bro_slack_link_record",
         category: ToolCategory::Orchestration,
         summary: "Record a SlackProposalLink mapping a posted Slack message back to its BadgeyProposal. Called by the per-channel triage workflow's emit-proposal subworkflow after chat.postMessage so inbound reactions/replies can resolve back to (BadgeyId, proposal_id) and the apply/refine hooks fire.",
@@ -2220,6 +2256,7 @@ mod tests {
                 if n.starts_with("bbox_")
                     || n.starts_with("bro_")
                     || n.starts_with("badgey_")
+                    || n.starts_with("consultant_")
                     || n.starts_with("whiteboard_")
                     || n.starts_with("work_")
                     || n.starts_with("atom_")

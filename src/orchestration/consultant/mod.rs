@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+pub mod consumers;
 pub mod descriptor;
 pub mod journal;
 pub mod proposals;
