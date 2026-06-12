@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use bbox_stores::store_persister::StoreSnapshot;
 
+const NOTE_ID_PREFIX: &str = "note-";
+const NOTE_ID_FORMAT_HINT: &str = "note-<8hex>";
+
 // ── embed-sink hook ────────────────────────────────────────────────
 //
 // Same inversion as `threads::register_thread_embed_hook`: the daemon
@@ -115,17 +118,64 @@ pub struct NoteListParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NoteResolveParams {
-    /// Note ID. Canonical form is `note-<8 hex>` (e.g. `note-a1b2c3d4`) — the
-    /// exact string returned by `bbox_note` and listed by `bbox_notes` /
-    /// `bbox_inbox`. The bare 8-hex suffix (`a1b2c3d4`) is accepted as a
-    /// fallback for ergonomics, but prefer the canonical form.
+    /// Note ID for the single-note path. Canonical form is `note-<8 hex>` (e.g.
+    /// `note-a1b2c3d4`) — the exact string returned by `bbox_note` and listed
+    /// by `bbox_notes` / `bbox_inbox`. The bare 8-hex suffix (`a1b2c3d4`) is
+    /// accepted as a fallback for ergonomics, but prefer the canonical form.
+    #[serde(default)]
     #[schemars(regex(pattern = r"^(note-)?[0-9a-f]{8}$"))]
-    pub id: String,
+    pub id: Option<String>,
+    /// Batch note IDs to resolve in one mutation and one durable persist. Use
+    /// this when closing multiple notes from an inbox/round cleanup.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    pub ids: Vec<String>,
     /// One of: unresolved, acknowledged, addressed
     pub resolution: String,
     /// Optional resolution note
     #[serde(default)]
     pub note: Option<String>,
+    /// Per-note resolution details keyed by note ID. Map keys also act as
+    /// batch IDs, so `notes={"note-a1b2c3d4":"fixed"}` is enough to resolve
+    /// that note with a distinct detail.
+    #[serde(default)]
+    pub notes: std::collections::BTreeMap<String, String>,
+}
+
+impl NoteResolveParams {
+    fn requested_ids(&self) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        if let Some(id) = self.id.as_deref().filter(|id| !id.trim().is_empty()) {
+            ids.push(id.to_string());
+        }
+        ids.extend(self.ids.iter().filter(|id| !id.trim().is_empty()).cloned());
+        ids.extend(
+            self.notes
+                .keys()
+                .filter(|id| !id.trim().is_empty())
+                .cloned(),
+        );
+        if ids.is_empty() {
+            anyhow::bail!("Either 'id', 'ids', or 'notes' is required");
+        }
+        Ok(ids)
+    }
+
+    fn resolution_note_for(&self, requested_id: &str, canonical_id: &str) -> Option<&String> {
+        let bare_id = canonical_id
+            .strip_prefix(NOTE_ID_PREFIX)
+            .unwrap_or(canonical_id);
+        self.notes
+            .get(requested_id)
+            .or_else(|| self.notes.get(canonical_id))
+            .or_else(|| self.notes.get(bare_id))
+            .or(self.note.as_ref())
+    }
+}
+
+struct ResolvedNoteTarget {
+    requested_id: String,
+    index: usize,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -339,35 +389,75 @@ impl Notes {
             )
         })?;
 
+        let requested_ids = p.requested_ids()?;
+        let note_targets = self.resolve_targets(&requested_ids)?;
+        let now = Self::now_iso();
+        for target in &note_targets {
+            let canonical_id = self.store.notes[target.index].id.clone();
+            let resolution_note = p
+                .resolution_note_for(&target.requested_id, &canonical_id)
+                .cloned();
+            let note = &mut self.store.notes[target.index];
+            note.resolution = resolution;
+            note.updated_at = now.clone();
+            note.resolved_at = if matches!(resolution, NoteResolution::Unresolved) {
+                None
+            } else {
+                Some(now.clone())
+            };
+            if let Some(txt) = resolution_note {
+                note.resolution_note = Some(txt);
+            }
+        }
+
+        if note_targets.len() == 1 {
+            Ok(format!(
+                "Note {} → {}",
+                self.store.notes[note_targets[0].index].id,
+                resolution.as_ref()
+            ))
+        } else {
+            Ok(format!(
+                "{} notes → {}",
+                note_targets.len(),
+                resolution.as_ref()
+            ))
+        }
+    }
+
+    fn resolve_targets(&self, requested_ids: &[String]) -> Result<Vec<ResolvedNoteTarget>> {
+        let mut note_targets = Vec::with_capacity(requested_ids.len());
+        for requested_id in requested_ids {
+            let index = self.find_note_index(requested_id).with_context(|| {
+                format!(
+                    "Note not found: {} (expected `{}`, e.g. `note-a1b2c3d4`)",
+                    requested_id, NOTE_ID_FORMAT_HINT
+                )
+            })?;
+            if !note_targets
+                .iter()
+                .any(|target: &ResolvedNoteTarget| target.index == index)
+            {
+                note_targets.push(ResolvedNoteTarget {
+                    requested_id: requested_id.clone(),
+                    index,
+                });
+            }
+        }
+        Ok(note_targets)
+    }
+
+    fn find_note_index(&self, requested_id: &str) -> Option<usize> {
         // Canonical IDs are `note-<8hex>`. Accept the bare suffix as a
         // fallback — agents sometimes strip the prefix treating it as display
         // decoration; fail loudly rather than silently on true misses.
-        let needle = p.id.as_str();
-        let note = self
-            .store
+        let needle = requested_id
+            .strip_prefix(NOTE_ID_PREFIX)
+            .unwrap_or(requested_id);
+        self.store
             .notes
-            .iter_mut()
-            .find(|n| n.id == needle || n.id.strip_prefix("note-") == Some(needle))
-            .with_context(|| {
-                format!(
-                    "Note not found: {} (expected `note-<8hex>`, e.g. `note-a1b2c3d4`)",
-                    p.id
-                )
-            })?;
-
-        let now = Self::now_iso();
-        note.resolution = resolution;
-        note.updated_at = now.clone();
-        note.resolved_at = if matches!(resolution, NoteResolution::Unresolved) {
-            None
-        } else {
-            Some(now)
-        };
-        if let Some(txt) = p.note.as_deref() {
-            note.resolution_note = Some(txt.to_string());
-        }
-
-        Ok(format!("Note {} → {}", p.id, resolution.as_ref()))
+            .iter()
+            .position(|n| n.id == requested_id || n.id.strip_prefix(NOTE_ID_PREFIX) == Some(needle))
     }
 
     // ── bbox_notes (list) ──────────────────────────────────────────
@@ -401,8 +491,8 @@ impl Notes {
             .iter()
             .filter(|n| {
                 if let Some(id) = id_filter.as_deref() {
-                    let needle = id.strip_prefix("note-").unwrap_or(id);
-                    if n.id != id && n.id.strip_prefix("note-") != Some(needle) {
+                    let needle = id.strip_prefix(NOTE_ID_PREFIX).unwrap_or(id);
+                    if n.id != id && n.id.strip_prefix(NOTE_ID_PREFIX) != Some(needle) {
                         return false;
                     }
                 }
@@ -566,9 +656,11 @@ mod tests {
         notes
             .write()
             .resolve(&NoteResolveParams {
-                id: id.clone(),
+                id: Some(id.clone()),
+                ids: Vec::new(),
                 resolution: "addressed".into(),
                 note: Some("verified".into()),
+                notes: Default::default(),
             })
             .unwrap();
         persister.request_durable().await.unwrap();
@@ -712,9 +804,11 @@ mod tests {
 
         notes
             .resolve(&NoteResolveParams {
-                id: target_id.clone(),
+                id: Some(target_id.clone()),
+                ids: Vec::new(),
                 resolution: "addressed".into(),
                 note: None,
+                notes: Default::default(),
             })
             .unwrap();
 
@@ -833,9 +927,11 @@ mod tests {
 
         notes
             .resolve(&NoteResolveParams {
-                id: id.clone(),
+                id: Some(id.clone()),
+                ids: Vec::new(),
                 resolution: "acknowledged".into(),
                 note: Some("will investigate next round".into()),
+                notes: Default::default(),
             })
             .unwrap();
 
@@ -869,9 +965,11 @@ mod tests {
 
         notes
             .resolve(&NoteResolveParams {
-                id: id.clone(),
+                id: Some(id.clone()),
+                ids: Vec::new(),
                 resolution: "addressed".into(),
                 note: None,
+                notes: Default::default(),
             })
             .unwrap();
 
@@ -938,9 +1036,11 @@ mod tests {
 
         notes
             .resolve(&NoteResolveParams {
-                id: bare,
+                id: Some(bare),
+                ids: Vec::new(),
                 resolution: "addressed".into(),
                 note: None,
+                notes: Default::default(),
             })
             .unwrap();
 
@@ -948,13 +1048,199 @@ mod tests {
     }
 
     #[test]
+    fn resolve_batch_updates_multiple_notes_once() {
+        let (_tmp, mut notes) = mk_store();
+        for body in ["first", "second", "third"] {
+            notes
+                .create(&NoteParams {
+                    kind: "done".into(),
+                    body: body.into(),
+                    session_id: None,
+                    project: None,
+                    task_id: None,
+                    thread_id: None,
+                    provider: None,
+                    bro: None,
+                })
+                .unwrap();
+        }
+        let first_id = notes.store.notes[0].id.clone();
+        let second_bare = notes.store.notes[1]
+            .id
+            .strip_prefix(NOTE_ID_PREFIX)
+            .unwrap()
+            .to_string();
+
+        let out = notes
+            .resolve(&NoteResolveParams {
+                id: Some(first_id),
+                ids: vec![second_bare],
+                resolution: "addressed".into(),
+                note: Some("batch cleanup".into()),
+                notes: Default::default(),
+            })
+            .unwrap();
+
+        assert_eq!(out, "2 notes → addressed");
+        assert_eq!(notes.store.notes[0].resolution, NoteResolution::Addressed);
+        assert_eq!(notes.store.notes[1].resolution, NoteResolution::Addressed);
+        assert_eq!(notes.store.notes[2].resolution, NoteResolution::Unresolved);
+        assert_eq!(
+            notes.store.notes[0].resolution_note.as_deref(),
+            Some("batch cleanup")
+        );
+        assert_eq!(
+            notes.store.notes[1].resolution_note.as_deref(),
+            Some("batch cleanup")
+        );
+    }
+
+    #[test]
+    fn resolve_batch_validates_all_ids_before_mutating() {
+        let (_tmp, mut notes) = mk_store();
+        notes
+            .create(&NoteParams {
+                kind: "done".into(),
+                body: "keep unresolved on error".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        let valid_id = notes.store.notes[0].id.clone();
+
+        let err = notes
+            .resolve(&NoteResolveParams {
+                id: None,
+                ids: vec![valid_id, "note-deadbeef".into()],
+                resolution: "addressed".into(),
+                note: None,
+                notes: Default::default(),
+            })
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("note-deadbeef"),
+            "error should name missing batch id: {err:#}"
+        );
+        assert_eq!(notes.store.notes[0].resolution, NoteResolution::Unresolved);
+    }
+
+    #[test]
+    fn resolve_requires_id_or_ids() {
+        let (_tmp, mut notes) = mk_store();
+        let err = notes
+            .resolve(&NoteResolveParams {
+                id: None,
+                ids: Vec::new(),
+                resolution: "addressed".into(),
+                note: None,
+                notes: Default::default(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("Either 'id', 'ids', or 'notes'"));
+    }
+
+    #[test]
+    fn resolve_batch_accepts_per_id_resolution_notes() {
+        let (_tmp, mut notes) = mk_store();
+        for body in ["first", "second"] {
+            notes
+                .create(&NoteParams {
+                    kind: "done".into(),
+                    body: body.into(),
+                    session_id: None,
+                    project: None,
+                    task_id: None,
+                    thread_id: None,
+                    provider: None,
+                    bro: None,
+                })
+                .unwrap();
+        }
+        let first_id = notes.store.notes[0].id.clone();
+        let second_id = notes.store.notes[1].id.clone();
+        let mut resolution_notes = std::collections::BTreeMap::new();
+        resolution_notes.insert(first_id.clone(), "fixed first".into());
+        resolution_notes.insert(second_id.clone(), "fixed second".into());
+
+        let out = notes
+            .resolve(&NoteResolveParams {
+                id: None,
+                ids: Vec::new(),
+                resolution: "addressed".into(),
+                note: None,
+                notes: resolution_notes,
+            })
+            .unwrap();
+
+        assert_eq!(out, "2 notes → addressed");
+        assert_eq!(
+            notes.store.notes[0].resolution_note.as_deref(),
+            Some("fixed first")
+        );
+        assert_eq!(
+            notes.store.notes[1].resolution_note.as_deref(),
+            Some("fixed second")
+        );
+    }
+
+    #[test]
+    fn resolve_batch_map_notes_override_shared_note_by_id() {
+        let (_tmp, mut notes) = mk_store();
+        for body in ["first", "second"] {
+            notes
+                .create(&NoteParams {
+                    kind: "done".into(),
+                    body: body.into(),
+                    session_id: None,
+                    project: None,
+                    task_id: None,
+                    thread_id: None,
+                    provider: None,
+                    bro: None,
+                })
+                .unwrap();
+        }
+        let first_id = notes.store.notes[0].id.clone();
+        let second_id = notes.store.notes[1].id.clone();
+        let second_bare = second_id.strip_prefix(NOTE_ID_PREFIX).unwrap().to_string();
+        let mut resolution_notes = std::collections::BTreeMap::new();
+        resolution_notes.insert(second_bare, "specific second".into());
+
+        notes
+            .resolve(&NoteResolveParams {
+                id: Some(first_id),
+                ids: vec![second_id],
+                resolution: "addressed".into(),
+                note: Some("shared fallback".into()),
+                notes: resolution_notes,
+            })
+            .unwrap();
+
+        assert_eq!(
+            notes.store.notes[0].resolution_note.as_deref(),
+            Some("shared fallback")
+        );
+        assert_eq!(
+            notes.store.notes[1].resolution_note.as_deref(),
+            Some("specific second")
+        );
+    }
+
+    #[test]
     fn resolve_unknown_id_errors_with_format_hint() {
         let (_tmp, mut notes) = mk_store();
         let e = notes
             .resolve(&NoteResolveParams {
-                id: "does-not-exist".into(),
+                id: Some("does-not-exist".into()),
+                ids: Vec::new(),
                 resolution: "addressed".into(),
                 note: None,
+                notes: Default::default(),
             })
             .unwrap_err();
         let msg = e.to_string();

@@ -684,10 +684,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_note_resolve",
         category: ToolCategory::Notes,
-        summary: "Mark a note acknowledged or addressed.",
-        when_to_use: "Orchestrator close-the-loop move. Pass the full `note-<8hex>` ID verbatim. `addressed` removes the note from the default inbox view; `acknowledged` keeps it visible as deferred. See `sm-side-channel-notes` via `bbox_knowledge` for the full loop.",
+        summary: "Mark one note, or a batch of notes, acknowledged or addressed.",
+        when_to_use: "Orchestrator close-the-loop move. Pass the full `note-<8hex>` ID verbatim as `id` for one note, pass `ids=[...]` to close multiple notes with a shared `note`, or pass `notes={\"note-<8hex>\":\"detail\"}` for per-note resolution details. The batch forms use one mutation and one durable persist. `addressed` removes notes from the default inbox view; `acknowledged` keeps them visible as deferred. See `sm-side-channel-notes` via `bbox_knowledge` for the full loop.",
         example: Some(
-            r#"bbox_note_resolve(id="note-a1b2c3d4", resolution="addressed", note="fixed in commit abc123")"#,
+            r#"bbox_note_resolve(notes={"note-a1b2c3d4":"fixed parser","note-deadbeef":"deferred to thread-12345678"}, resolution="addressed")"#,
         ),
     },
     // ── Gap notes ────────────────────────────────────────────────────

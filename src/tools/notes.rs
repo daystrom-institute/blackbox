@@ -78,7 +78,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_note_resolve",
-        description = "Mark a note acknowledged or addressed."
+        description = "Mark one note, or a batch of notes, acknowledged or addressed."
     )]
     pub(crate) async fn bbox_note_resolve(
         &self,
