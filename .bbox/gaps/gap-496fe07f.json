@@ -1,0 +1,21 @@
+{
+  "id": "gap-496fe07f",
+  "title": "symbol entities invisible to hybrid_search and inspect_entity despite live edges — exact-symbol eval queries cannot pass",
+  "gap_kind": "tooling",
+  "domain": "corpus-index/symbol-entities",
+  "wanted_capability": "Symbol entities resolvable on the retrieval surfaces. Schema reports ~110k symbol vertices and the edge sidecar serves DEFINED_IN/CONTAINS_SYMBOL edges naming them, but (1) bbox_hybrid_search returns zero symbol-type results even BM25-only with doc_type=symbol for exact names (KnowledgeStore, EntityRef, resolve_project_context), and (2) bbox_inspect_entity returns error.not_found for the exact symbol ref the edge sidecar itself emits (SymbolProvider::get_entity requires idx.entity_properties, which misses). Consequence: the eval suite's exact-symbol queries can never surface their expected symbol refs through search (R@k ceiling visibly depressed on the refreshed suite), and graph hops landing on a symbol vertex cannot be inspected. Wanted: symbol entity docs present in the entity index (backfilled on reindex after the g8 schema bump, if that is the cause) or an inspect/search path that resolves symbols from the edge sidecar.",
+  "fallback_used": "Derived current symbol refs mechanically via bbox_refactor_project_refs (defn_hash == defining chunk_hash) and verified existence through the chunk's DEFINED_IN in-edge instead of inspect/search.",
+  "evidence": [
+    "crates/bbox-providers/src/providers/symbol.rs:140 (entity_properties not_found path)",
+    "crates/bbox-corpus-index/src/index/project_files.rs:709 (symbol_ref derivation)",
+    "live probe 2026-06-12: symbol:d723917f:KnowledgeStore:40e76235... not_found via inspect while DEFINED_IN edge names it",
+    "thread-098387b3"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/corpus-index/symbol-entities-unsearchable",
+  "resolution": "unresolved",
+  "thread_id": "thread-098387b3",
+  "created_at": "2026-06-12T23:43:18Z",
+  "updated_at": "2026-06-12T23:43:18Z"
+}

@@ -11,7 +11,9 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/eval-observability/expected-refs-drift",
   "notes": "Corpus content changes; `eval/scripts/refresh_expected_refs.sh` to detect + propose updates.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:05:57Z",
-  "updated_at": "2026-06-11T18:05:57Z"
+  "updated_at": "2026-06-12T23:42:55Z",
+  "resolved_at": "2026-06-12T23:42:55Z",
+  "resolution_note": "eval/scripts/refresh_expected_refs.{sh,py} landed on worktree-search-arc-residuals commit ae9f5005 (plus shared bbox_mcp.py client and the gap-39b3ce16 cap-sweep driver landed from /tmp). Re-derives refs from target_locators via bbox_refactor_project_refs (symbol defn_hash == defining chunk_hash), chases moved files, auto-migrates knowledge:sm-* → system_memory:sm-*. Applied: 15 manifests refreshed; 5 transcript-span refs remain dead (byte offsets shifted on reparse) and are flagged for manual relocation. Sweep on refreshed refs validates rerank_cap=1.75 (MRR saturates exactly there; R@1 doubles vs 1.5)."
 }

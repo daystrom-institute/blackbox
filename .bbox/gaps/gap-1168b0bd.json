@@ -14,7 +14,9 @@
   "impact": "medium",
   "blocking_level": "none",
   "dedupe_key": "tooling/hnsw/connectivity-guard",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-12T22:48:39Z",
-  "updated_at": "2026-06-12T22:48:39Z"
+  "updated_at": "2026-06-12T23:42:51Z",
+  "resolved_at": "2026-06-12T23:42:51Z",
+  "resolution_note": "Connectivity guard wired on worktree-search-arc-residuals commit 5ca393d6: (a) workflow compaction lane gates on connectivity — read_vector_status emits max_connectivity_route/ratio, compact_vector_partitions qualifies on deleted_ratio OR connectivity breach (size-floored, MIN_CONNECTIVITY_GUARD_NODES=1000), embed/compaction-policy packet v2 compacts >5% / notifies >2%; deliberately NOT in the in-process 5-min compactor (unquiesced ~25min write-lock hold). (b) bbox_inbox renders a live \"Vector connectivity risk\" section from metrics_nonblocking() — never stalls behind a rebuild, not project-filtered. (c) bbox_embed_status recall_probe_route exposes HnswIndex::self_recall_probe via try_read (errors busy mid-rebuild). Composes with gap-bfe61876: the workflow op already iterates ALL qualifying partitions per run, ordered by worst axis."
 }
