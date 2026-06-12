@@ -1,0 +1,20 @@
+{
+  "id": "gap-72fd5932",
+  "title": "Transcript/cwd-keyed history lanes can't aggregate worktree sessions under their base project filter",
+  "gap_kind": "tooling",
+  "domain": "transcript-index",
+  "wanted_capability": "Filtering cwd-keyed history by a project should match work done in every checkout of that project, including out-of-tree worktrees. bbox_search / bbox_cite / bbox_sessions_list and work_tool_calls key records by the literal session/call cwd and filter by substring, so: in-tree worktree records (.claude/worktrees/...) accidentally match a base-path filter (path containment), but out-of-tree fleet/agent worktree sessions (under $BRO_HOME/fleet|agent/worktrees) are invisible under a base filter, and a worktree-path filter sees only that one checkout. Query-time rescoping is the WRONG fix here (unlike the store surfaces fixed in 372fac2..a9eaef1): the record key is the literal cwd, and per-candidate git probes at query time are too expensive. Wanted: index-time base-project resolution — stamp each transcript/tool-call doc with a resolved base-project key (via resolve_base_project_for_scope at ingest) alongside the raw cwd, let the project filter match either, and backfill on reindex.",
+  "missing_primitive": "resolved base-project field on transcript/tool-call index docs (ingest-time worktree→base resolution + reindex backfill)",
+  "fallback_used": "Query with substring fragments that match both path shapes (e.g. the repo directory name), or query per-worktree-path and merge manually.",
+  "evidence": [
+    "crates/bbox-corpus-index/src/index/search.rs:1178 (substring project filter on recorded cwd)",
+    "src/tools/workspace.rs:346 (work_tool_calls project filter, same semantics)",
+    "crates/bbox-indexing/src/projects.rs:513 (resolve_base_project_for_scope — the ingest-time resolver to reuse)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/transcript-index/worktree-session-base-project-keying",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T17:21:00Z",
+  "updated_at": "2026-06-12T17:21:00Z"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "gap-ee8c4373",
+  "title": "Worktree-redirected repo-owned writes are invisible to the daemon between a restart and the branch merge",
+  "gap_kind": "tooling",
+  "domain": "repo-owned-stores",
+  "wanted_capability": "Repo-owned artifacts redirected into a worktree checkout (gap notes via write_dir, knowledge entries via the Knowledge write-redirect map, thread records via record_dir) should remain queryable across a daemon restart that happens before the worktree branch merges into the base. Today the redirect state is deliberately transient (serde-skip / in-memory side map, cleared on reload) and reload only spools repo-owned files from registered base roots — so a restart in the redirect window makes the entry/gap vanish from list/render/inject surfaces until the branch lands in the base checkout. Self-heals on merge, but the window is silent: nothing tells the operator that N redirected records are currently carried only by un-merged worktree branches. Wanted: either (a) central-store retention for redirected records until their committed file is observed under a base root (the load-side id-collision self-heal already supports dropping them later), or (b) a doctor/inbox surface that enumerates redirected records living only in worktree checkouts.",
+  "missing_primitive": "central-store retention (or visibility surface) for repo-owned records whose committed file is redirected into an un-merged worktree",
+  "fallback_used": "Mirrored the existing gaps-store contract knowingly when adding the knowledge write redirect (commit 372fac2): accept the window, rely on prompt fold-to-base (the corpus-worktree-scoping flow folded within the same session, closing the window in minutes).",
+  "evidence": [
+    "crates/bbox-knowledge/src/knowledge.rs (write_redirects map: cleared in reload; central_snapshot excludes repo-owned carriers)",
+    "crates/bbox-gaps/src/gaps.rs:182 (#[serde(skip)] write_dir — same transience)",
+    "crates/bbox-knowledge/src/knowledge.rs load_project_entries (spools from project_roots only)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/repo-owned-stores/worktree-redirect-restart-window",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T17:19:36Z",
+  "updated_at": "2026-06-12T17:19:36Z"
+}
