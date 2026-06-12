@@ -201,6 +201,27 @@ impl BlackboxServer {
                     effective_limits,
                 )
             }
+            AtomImplementation::Consultant { consumer } => {
+                if runtime_override.is_some() {
+                    return Err(
+                        "error.unsupported(code=runtime_with_consultant_atom): runtime overrides require a profile-backed atom"
+                            .into(),
+                    );
+                }
+                self.atom_invoke_consultant(
+                    &invocation_id,
+                    &atom_ref,
+                    &manifest,
+                    consumer,
+                    &p,
+                    &args_to_validate,
+                    &owner,
+                    input_digest,
+                    dispatch_cost,
+                    effective_limits,
+                )
+                .await
+            }
         }
     }
 
@@ -569,6 +590,156 @@ impl BlackboxServer {
             "data": result.data,
             "output_shape": output_shape,
             "errors": result.errors,
+        }))
+    }
+
+    /// One consultant TURN per invocation. Args without `consultant_id`
+    /// open a new instance of the consumer (using `brief`/`prompt` as the
+    /// initial brief); args with `consultant_id` resume that instance for
+    /// one turn (requires `prompt`). The instance outlives the invocation
+    /// — atom_status reports the turn, not the instance lifetime
+    /// (consultant-runtime.md §4.10).
+    #[allow(clippy::too_many_arguments)]
+    async fn atom_invoke_consultant(
+        &self,
+        invocation_id: &str,
+        atom_ref: &str,
+        manifest: &orchestration::atoms::types::AtomManifest,
+        consumer: &str,
+        p: &AtomInvokeParams,
+        args_to_validate: &serde_json::Value,
+        owner: &str,
+        input_digest: Option<String>,
+        dispatch_cost: u64,
+        effective_limits: orchestration::atoms::invocation::InvocationLimits,
+    ) -> Result<serde_json::Value, String> {
+        use orchestration::atoms::invocation::{
+            AtomHandle, AtomInvocation, EffectsObserved, InvocationCost, InvocationStatus,
+        };
+
+        let descriptor =
+            orchestration::consultant::consumers::lookup(consumer).ok_or_else(|| {
+                format!(
+                    "error.bad_input(code=unknown_consumer): no consultant consumer '{consumer}' (known: {})",
+                    orchestration::consultant::consumers::names().join(", ")
+                )
+            })?;
+        let requested_id = args_to_validate
+            .get("consultant_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let prompt = args_to_validate
+            .get("prompt")
+            .and_then(serde_json::Value::as_str);
+        let brief = args_to_validate
+            .get("brief")
+            .and_then(serde_json::Value::as_str);
+        let project_dir = args_to_validate
+            .get("project_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let timeout_seconds = args_to_validate
+            .get("timeout_seconds")
+            .and_then(serde_json::Value::as_f64);
+
+        let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let start = std::time::Instant::now();
+        let turn = match &requested_id {
+            Some(raw_id) => {
+                let prompt = prompt.ok_or_else(|| {
+                    "error.bad_input(code=missing_prompt): a consultant turn with consultant_id requires `prompt`"
+                        .to_string()
+                })?;
+                self.consultant_resume_internal(descriptor, raw_id, prompt, timeout_seconds)
+                    .await
+            }
+            None => {
+                let brief = brief.or(prompt).map(str::to_string);
+                self.consultant_exec_internal(
+                    descriptor,
+                    project_dir,
+                    brief,
+                    Some(descriptor.agent_ref.to_string()),
+                )
+                .await
+            }
+        };
+        let (status, data, errors) = match turn {
+            Ok(value) => (InvocationStatus::Succeeded, value, Vec::new()),
+            Err(e) => (
+                InvocationStatus::Failed,
+                serde_json::json!({ "error": e }),
+                vec![e],
+            ),
+        };
+        let consultant_id = data
+            .get("consultant_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or(requested_id)
+            .unwrap_or_default();
+        let handle = AtomHandle::Consultant {
+            consumer: consumer.to_string(),
+            consultant_id,
+            session_id: data
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            task_id: data
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        };
+        let output_shape = validate_atom_output(manifest, &data);
+        let output_text = serde_json::to_string(&data).unwrap_or_default();
+        let mut owners = HashSet::new();
+        owners.insert(owner.to_string());
+        let inv = AtomInvocation {
+            invocation_id: invocation_id.to_string(),
+            atom_ref: atom_ref.to_string(),
+            parent_invocation_id: p.parent_invocation_id.clone(),
+            owners,
+            handle,
+            status: status.clone(),
+            started_at,
+            ended_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            input_digest,
+            output_digest: Some(sha256_json_value(&data)),
+            output_shape: Some(output_shape.clone()),
+            structured_output: None,
+            effective_limits: Some(effective_limits),
+            summary: Some(output_text.chars().take(500).collect()),
+            effects_observed: EffectsObserved {
+                dispatches_runs: Some(dispatch_cost),
+                ..EffectsObserved::default()
+            },
+            cost: InvocationCost {
+                dispatched_runs: Some(dispatch_cost),
+                wall_time_ms: Some(start.elapsed().as_millis() as u64),
+                ..InvocationCost::default()
+            },
+            children: Vec::new(),
+            errors: errors.clone(),
+            artifacts: Vec::new(),
+        };
+        self.state.atom_invocation_store.write().insert(inv);
+        self.record_child_invocation(
+            p.parent_invocation_id.as_deref(),
+            invocation_id,
+            dispatch_cost,
+        );
+
+        Ok(serde_json::json!({
+            "invocation_id": invocation_id,
+            "atom_ref": atom_ref,
+            "status": match status {
+                InvocationStatus::Succeeded => "succeeded",
+                InvocationStatus::Failed => "failed",
+                _ => "running",
+            },
+            "data": data,
+            "output_shape": output_shape,
+            "errors": errors,
         }))
     }
 }

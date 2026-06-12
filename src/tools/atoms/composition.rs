@@ -118,6 +118,7 @@ impl BlackboxServer {
                     })?;
                 self.workflow_static_dispatch_upper_bound(&workflow, 0)
             }
+            orchestration::atoms::types::AtomImplementation::Consultant { .. } => Ok(1),
             orchestration::atoms::types::AtomImplementation::Deterministic { .. }
             | orchestration::atoms::types::AtomImplementation::Adapter { .. } => Ok(0),
         }

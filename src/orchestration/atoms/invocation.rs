@@ -51,6 +51,15 @@ pub enum AtomHandle {
         adapter_name: String,
         adapter_handle: Option<String>,
     },
+    /// One consultant TURN. The consultant instance outlives any
+    /// invocation: invoke-per-turn, with `consultant_id` binding turns to
+    /// the same instance (consultant-runtime.md §4.10).
+    Consultant {
+        consumer: String,
+        consultant_id: String,
+        session_id: Option<String>,
+        task_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -128,6 +137,7 @@ impl AtomInvocation {
     pub fn task_id(&self) -> Option<String> {
         match &self.handle {
             AtomHandle::Profile { task_id, .. } => Some(task_id.clone()),
+            AtomHandle::Consultant { task_id, .. } => task_id.clone(),
             AtomHandle::Workflow {
                 root_task_id: Some(task_id),
                 ..
@@ -262,6 +272,7 @@ impl AtomInvocation {
             AtomHandle::Workflow { .. } => "workflow",
             AtomHandle::Deterministic { .. } => "deterministic",
             AtomHandle::Adapter { .. } => "adapter",
+            AtomHandle::Consultant { .. } => "consultant",
         };
         serde_json::json!({
             "invocation_id": self.invocation_id,

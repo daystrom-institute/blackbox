@@ -138,6 +138,11 @@ pub enum AtomImplementation {
     Workflow { workflow_ref: String },
     Deterministic { runner: String },
     Adapter { adapter_name: String },
+    /// Stateful-consultant turn: each invocation runs one turn against a
+    /// consultant instance of the named registered consumer (e.g.
+    /// `badgey`). Args without `consultant_id` open a new instance; args
+    /// with `consultant_id` resume it for one turn.
+    Consultant { consumer: String },
 }
 
 // ---------------------------------------------------------------------------

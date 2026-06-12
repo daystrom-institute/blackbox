@@ -551,6 +551,23 @@ fn validate_implementation<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
                 });
             }
         }
+        super::types::AtomImplementation::Consultant { consumer } => {
+            if consumer.trim().is_empty() {
+                return Err(ValidationError {
+                    step: "lint_implementation",
+                    message: "implementation.consumer must not be empty".into(),
+                });
+            }
+            if crate::orchestration::consultant::consumers::lookup(consumer).is_none() {
+                return Err(ValidationError {
+                    step: "lint_implementation",
+                    message: format!(
+                        "implementation.consumer '{consumer}' is not a registered consultant consumer (known: {})",
+                        crate::orchestration::consultant::consumers::names().join(", ")
+                    ),
+                });
+            }
+        }
         super::types::AtomImplementation::Adapter { adapter_name } => {
             if adapter_name.trim().is_empty() {
                 return Err(ValidationError {
@@ -1018,6 +1035,24 @@ mod tests {
         let err = validate_atom_install_helper(&v);
         assert_eq!(err.step, "refactor_subcontract");
         assert!(err.message.contains("acknowledge_risk"));
+    }
+
+    #[test]
+    fn consultant_implementation_requires_registered_consumer() {
+        let mut atom: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../system-defaults/atoms/consultant/badgey-consult.json"
+        ))
+        .unwrap();
+        let ctx = InstallCtx {
+            brofile_exists: |_| true,
+            atom_exists: |_| false,
+        };
+        validate_atom_install(&atom, &ctx).unwrap();
+
+        atom["manifest"]["implementation"]["consumer"] = serde_json::json!("nonexistent");
+        let err = validate_atom_install(&atom, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_implementation");
+        assert!(err.message.contains("not a registered consultant consumer"));
     }
 
     fn validate_atom_install_helper(v: &serde_json::Value) -> ValidationError {

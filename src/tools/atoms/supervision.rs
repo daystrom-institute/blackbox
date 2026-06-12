@@ -465,8 +465,10 @@ impl BlackboxServer {
                 "error": "linked task record not found",
                 "supervision": serde_json::json!({"ok": false, "event_count": 0}),
             });
-            let snapshot = orchestration::supervision::SupervisionState::default()
-                .snapshot(&orchestration::supervision::config(), orchestration::now_ms());
+            let snapshot = orchestration::supervision::SupervisionState::default().snapshot(
+                &orchestration::supervision::config(),
+                orchestration::now_ms(),
+            );
             (
                 attached_task,
                 snapshot,

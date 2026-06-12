@@ -303,6 +303,9 @@ impl BlackboxServer {
                     orchestration::atoms::types::AtomImplementation::Adapter { .. } => {
                         "adapter".to_string()
                     }
+                    orchestration::atoms::types::AtomImplementation::Consultant { .. } => {
+                        "consultant".to_string()
+                    }
                 }),
             ),
             (

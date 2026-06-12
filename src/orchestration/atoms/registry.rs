@@ -123,6 +123,7 @@ impl<'a> AtomRegistry<'a> {
                     "deterministic".to_string()
                 }
                 super::types::AtomImplementation::Adapter { .. } => "adapter".to_string(),
+                super::types::AtomImplementation::Consultant { .. } => "consultant".to_string(),
             });
 
             // Read subcontract from raw artifact value

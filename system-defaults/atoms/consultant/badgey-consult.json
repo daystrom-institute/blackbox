@@ -1,0 +1,91 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "badgey-consult",
+  "version": 1,
+  "subcontract": "consultant/v1",
+  "manifest": {
+    "description": "Run one Badgey consultant turn through the consultant atom backend. Without consultant_id the invocation opens a new Badgey instance using brief/prompt as the initial brief; with consultant_id (and prompt) it resumes that instance for one turn. The instance outlives the invocation — pass the returned consultant_id to subsequent invocations to continue the same consultation.",
+    "when_to_use": [
+      "running a Badgey consultation turn from a workflow atom binding instead of a badgey_* mcp_call",
+      "opening a consultant instance whose id later turns (and other atoms) can resume",
+      "composing consultant turns under atom ownership, effects, and budget accounting"
+    ],
+    "anti_patterns": [
+      "do not use for the proposal apply path — use consultant_proposal_begin_apply / consultant_proposal_complete_apply",
+      "do not treat the invocation as the consultation: the instance persists after the turn and must be dismissed via badgey_dismiss when done"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "consultant_id": {
+            "type": "string",
+            "description": "Existing instance to resume (omit to open a new instance)"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Turn prompt (required with consultant_id; used as the brief when opening without one)"
+          },
+          "brief": {
+            "type": "string",
+            "description": "Initial brief when opening a new instance"
+          },
+          "project_dir": {
+            "type": "string",
+            "description": "Project scope for a new instance"
+          },
+          "timeout_seconds": {
+            "type": "number",
+            "description": "Resume turn timeout"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["consultant_id", "task_id", "session_id", "thread_id"],
+        "properties": {
+          "consultant_id": { "type": "string" },
+          "badgey_id": { "type": "string" },
+          "task_id": { "type": "string" },
+          "session_id": { "type": "string" },
+          "provider": { "type": "string" },
+          "thread_id": { "type": "string" },
+          "status": { "type": "string" },
+          "result": {},
+          "actions": { "type": "array" },
+          "resolved_brofile": { "type": "string" },
+          "merged_filters": {}
+        },
+        "additionalProperties": true
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 1,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": { "kind": "none" }
+    },
+    "implementation": {
+      "kind": "consultant",
+      "consumer": "badgey"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_request"
+    },
+    "cost_class": "expensive",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-system-defaults",
+      "created_at": "2026-06-11T00:00:00Z"
+    }
+  }
+}
