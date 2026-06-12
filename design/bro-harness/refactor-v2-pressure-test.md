@@ -390,9 +390,14 @@ prepare-time ceremony, no four-tier taxonomy. Two rungs:
   context — NARF §4's context economics, kept.
 - **Durable rung — a plain `recipes/` directory.** A recipe is a
   self-contained JS function file with a doc-comment contract (inputs,
-  required namespaces, effects, authority gates — what `MacroDefinition`
-  got right, as prose). Git is the registry; review is the trust; the
-  version is the commit. Promotion is mundane: a proven stored function is
+  required namespaces, effects, authority gates, **and usage idioms** —
+  what `MacroDefinition` got right, as prose, plus the revive-once/store
+  pattern inline). The header is the recipe's own doc surface: the reviver
+  necessarily reads it at the moment of use, so per-recipe guidance lands
+  better-timed there than behind a system-memory signpost (sm signposts
+  remain for cross-cutting knowledge like query grammar, which no single
+  artifact owns). Git is the registry; review is the trust; the version is
+  the commit. Promotion is mundane: a proven stored function is
   written to the file (by the cell through the choke point, or by the
   operator); recall is `file_read` + the same revive. No `recipes.*`
   bindings unless discovery measurably hurts in probes — list/describe
