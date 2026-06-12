@@ -7,7 +7,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 pub use bbox_corpus_core::language::Language;
-pub use bbox_corpus_core::project_record::ProjectRecord;
+pub use bbox_corpus_core::project_record::{CheckoutContext, ProjectContext, ProjectRecord};
 
 use bbox_corpus_core::entity_ref;
 use bbox_stores::store_persister::StoreSnapshot;
@@ -572,6 +572,106 @@ pub fn resolve_scope_and_checkout_dir(
     ))
 }
 
+/// How a [`resolve_project_context`] caller intends to use the resolution.
+/// Preserves the deliberate read/write asymmetry of the underlying gates
+/// instead of collapsing it: retrieval may alias broadly, writes must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveIntent {
+    /// Retrieval scope ("which corpus do I query?"). Uses the broad gate
+    /// ([`resolve_base_project_for_scope`]): descendants and ANY worktree of
+    /// a registered repo alias to the base project.
+    Read,
+    /// Write-side aliasing (where gap files, threads, slice edits land).
+    /// Uses the conservative managed gate ([`resolve_managed_fleet_worktree`]):
+    /// only managed worktrees (fleet/agent dispatch, in-tree linked) alias;
+    /// anything else resolves to `None` so callers keep their fail-closed
+    /// fallback.
+    Write,
+}
+
+/// Single entry point for project-selector resolution
+/// (design/corpus/agentic-corpus/project-taxonomy-standardization.md,
+/// §Resolution Order). Accepts, in order:
+///
+/// 1. an exact `project_id` or registered canonical path;
+/// 2. (registered alias — taxonomy slice 2, not yet an input form;)
+/// 3. an absolute path: a registered root, a descendant, or a worktree of a
+///    registered repo, gated by `intent`.
+///
+/// Returns `None` when no registered project owns the selector; callers keep
+/// their existing legacy fallback (deterministic path-hash id, raw filter
+/// pass-through, etc.). Existing resolvers (`ProjectRegistry::resolve`,
+/// `fleet_worktree_scope_and_dir`, `resolve_scope_and_checkout_dir`) are the
+/// gates this composes; consumers should migrate to this entry point rather
+/// than growing new bespoke chains.
+///
+/// Known write-side quirk, deliberately NOT codified here: the legacy write
+/// chain (`resolve_project_write_scope`) lets a plain subdirectory of a
+/// registered root fall through to canonicalize-pass-through, keying state
+/// under the subdirectory itself. Under `Write` intent this resolver returns
+/// the base for the root/exact matches and `None` for plain subdirectories,
+/// leaving that fallback decision explicit at the call site.
+pub fn resolve_project_context(
+    raw: &str,
+    projects: &[ProjectRecord],
+    intent: ResolveIntent,
+) -> Option<ProjectContext> {
+    // 1. Exact project_id or registered canonical path.
+    if let Some(record) = projects
+        .iter()
+        .find(|project| project.project_id == raw || project.canonical_path == raw)
+    {
+        return Some(base_context(record));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+    match intent {
+        ResolveIntent::Read => {
+            let base = resolve_base_project_for_scope(raw, projects)?;
+            let (_, checkout_dir) = resolve_scope_and_checkout_dir(raw, projects)?;
+            let checkout = (checkout_dir != base.canonical_path).then(|| CheckoutContext {
+                managed: resolve_managed_fleet_worktree(Some(raw), projects).is_some(),
+                checkout_dir,
+            });
+            Some(ProjectContext {
+                checkout,
+                ..base_context(base)
+            })
+        }
+        ResolveIntent::Write => {
+            // A canonicalized form of a registered root still resolves.
+            if let Ok(canonical) = fs::canonicalize(path) {
+                if let Some(record) = projects
+                    .iter()
+                    .find(|project| Path::new(&project.canonical_path) == canonical)
+                {
+                    return Some(base_context(record));
+                }
+            }
+            let (base, worktree) = resolve_managed_fleet_worktree(Some(raw), projects)?;
+            Some(ProjectContext {
+                checkout: Some(CheckoutContext {
+                    checkout_dir: worktree.to_string_lossy().into_owned(),
+                    managed: true,
+                }),
+                ..base_context(base)
+            })
+        }
+    }
+}
+
+fn base_context(record: &ProjectRecord) -> ProjectContext {
+    ProjectContext {
+        project_id: record.project_id.clone(),
+        repo_id: record.repo_id.clone(),
+        aliases: Vec::new(),
+        host_root: record.canonical_path.clone(),
+        checkout: None,
+    }
+}
+
 /// Walk a project root (capped at depth 4) collecting language
 /// fingerprints. Skips heavy build/output directories so a polyglot
 /// monorepo doesn't pay an O(everything) cost on registration.
@@ -1012,6 +1112,86 @@ mod tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: true,
             languages: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_project_context_honors_selector_forms_and_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let base_str = base_canon.to_str().unwrap();
+        let registered = vec![record_for(&base_canon, "base-project")];
+
+        // Selector form 1: exact project_id, both intents.
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let ctx = resolve_project_context("base-project", &registered, intent)
+                .expect("project_id should resolve");
+            assert_eq!(ctx.project_id, "base-project");
+            assert_eq!(ctx.host_root, base_str);
+            assert!(ctx.checkout.is_none());
+        }
+
+        // Selector form: registered canonical path.
+        let ctx = resolve_project_context(base_str, &registered, ResolveIntent::Write)
+            .expect("canonical path should resolve");
+        assert_eq!(ctx.project_id, "base-project");
+        assert!(ctx.checkout.is_none());
+
+        // Plain subdirectory: Read aliases to base with no checkout; Write
+        // stays unresolved (the legacy pass-through stays at the call site).
+        let subdir = base_canon.join("src");
+        fs::create_dir_all(&subdir).unwrap();
+        let sub_str = subdir.to_str().unwrap();
+        let ctx = resolve_project_context(sub_str, &registered, ResolveIntent::Read)
+            .expect("subdirectory should read-resolve to base");
+        assert_eq!(ctx.project_id, "base-project");
+        assert!(ctx.checkout.is_none());
+        assert!(resolve_project_context(sub_str, &registered, ResolveIntent::Write).is_none());
+
+        // Out-of-tree worktree on an arbitrary branch: Read resolves with an
+        // unmanaged checkout; Write refuses (fail-closed aliasing gate).
+        let wt = tmp.path().join("wt-arbitrary");
+        add_worktree(&base, "arc/anything", &wt);
+        let wt_canon = wt.canonicalize().unwrap();
+        let wt_str = wt_canon.to_str().unwrap();
+        let ctx = resolve_project_context(wt_str, &registered, ResolveIntent::Read)
+            .expect("arbitrary worktree should read-resolve to base");
+        assert_eq!(ctx.project_id, "base-project");
+        assert_eq!(ctx.host_root, base_str);
+        let checkout = ctx.checkout.expect("worktree input carries checkout");
+        assert_eq!(checkout.checkout_dir, wt_str);
+        assert!(!checkout.managed);
+        assert!(resolve_project_context(wt_str, &registered, ResolveIntent::Write).is_none());
+
+        // Managed fleet worktree (bro-fleet/* branch): both intents resolve,
+        // checkout marked managed.
+        let fleet = tmp.path().join("wt-fleet");
+        add_worktree(&base, "bro-fleet/task-1", &fleet);
+        let fleet_canon = fleet.canonicalize().unwrap();
+        let fleet_str = fleet_canon.to_str().unwrap();
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let ctx = resolve_project_context(fleet_str, &registered, intent)
+                .expect("managed fleet worktree should resolve");
+            assert_eq!(ctx.project_id, "base-project");
+            assert_eq!(ctx.host_root, base_str);
+            let checkout = ctx.checkout.expect("worktree input carries checkout");
+            assert_eq!(checkout.checkout_dir, fleet_str);
+            assert!(checkout.managed);
+        }
+
+        // Unrelated directory: nothing resolves; relative input: nothing.
+        let stranger = tmp.path().join("stranger");
+        fs::create_dir_all(&stranger).unwrap();
+        let stranger_str = stranger.canonicalize().unwrap();
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            assert!(
+                resolve_project_context(stranger_str.to_str().unwrap(), &registered, intent)
+                    .is_none()
+            );
+            assert!(resolve_project_context("not-a-project", &registered, intent).is_none());
         }
     }
 

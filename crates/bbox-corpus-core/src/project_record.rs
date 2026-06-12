@@ -20,6 +20,52 @@ pub struct ProjectRecord {
     pub languages: BTreeSet<Language>,
 }
 
+/// Resolved project identity plus the concrete checkout view that produced
+/// it — the structured result of project-selector resolution per
+/// `design/corpus/agentic-corpus/project-taxonomy-standardization.md`.
+///
+/// Identity fields (`project_id`, `repo_id`, `host_root`) describe the
+/// durable registered project; `checkout` describes the specific checkout
+/// the caller's input pointed into when that differs from the base root.
+/// Tools that only search the corpus stop at `project_id`; tools that touch
+/// files continue to `checkout`. The forward-looking workspace layer
+/// (`/work` mounts, path maps) is deliberately absent until a containment
+/// consumer exists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProjectContext {
+    /// Registry project id (8-hex, host-scoped realpath hash).
+    pub project_id: String,
+    /// Cross-host repo identity (first-commit SHA hash) when known.
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    /// Registered alias selectors. Empty until alias materialization lands
+    /// (taxonomy slice 2).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Canonical path of the registered base checkout — the durable
+    /// project-scope key on this host.
+    pub host_root: String,
+    /// Present when the resolved input was inside a checkout other than the
+    /// base root (an in-tree linked worktree or an out-of-tree worktree).
+    /// `None` for the base root and its plain subdirectories.
+    #[serde(default)]
+    pub checkout: Option<CheckoutContext>,
+}
+
+/// The concrete non-base checkout a [`ProjectContext`] resolution passed
+/// through. `checkout_dir` doubles as the checkout identity until a
+/// consumer needs a minted `checkout_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct CheckoutContext {
+    /// Canonical top of the checkout containing the input path.
+    pub checkout_dir: String,
+    /// True when the worktree carries a managed marker (fleet/agent
+    /// dispatch worktrees, in-tree linked worktrees) — the write-side
+    /// aliasing gate. Arbitrary user worktrees of a registered repo resolve
+    /// with `managed = false` and must not receive write-side aliasing.
+    pub managed: bool,
+}
+
 /// Minimal read-side view of the on-disk project registry file
 /// (`projects.json`). The authoritative store type (versioning, writes,
 /// migration) lives daemon-side in `projects::ProjectStore`; this
