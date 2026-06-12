@@ -11,7 +11,9 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/embed-on-search/latency",
   "notes": "100-500ms per interactive query. Cache query embeddings or async-fill BM25-first.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:05:37Z",
-  "updated_at": "2026-06-11T18:05:37Z"
+  "updated_at": "2026-06-12T19:30:10Z",
+  "resolved_at": "2026-06-12T19:30:10Z",
+  "resolution_note": "Shipped the query-embedding LRU: embed::query_cache in bbox-embed — bounded (256-entry, LRU-evicting) process-wide cache keyed (provider, model, query), with debug-level hit/miss + embed-latency tracing. hybrid_search's vector lane and embed_agent_query both route through it; the bespoke AGENT_QUERY_EMBED_CACHE and the duplicated block_in_place embed code are removed. BM25-first async-fill rendering was evaluated and rejected: the whole hybrid pipeline runs synchronously on the blocking pool, and the cache removes the repeat-query cost that motivated the gap. Landed on beta/blackbox-v2."
 }
