@@ -1,7 +1,7 @@
 ---
 title: "Dispatch prompt slots: harness-owned composition of the dispatch context"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - bro-harness

@@ -55,7 +55,8 @@ impl CompositionStrategy {
 pub enum DispatchContextArg {
     /// Flag present, non-empty: the payload replaces persisted
     /// persona/directives/pins wholesale and sets the current scope.
-    Provided(DispatchContext),
+    /// Boxed: the payload dwarfs the unit variants.
+    Provided(Box<DispatchContext>),
     /// Flag present but empty (`""`/`{}`): explicit clear.
     Clear,
     /// Flag absent: restore persona/pins/directives from session side-state;
@@ -76,7 +77,7 @@ pub fn resolve_dispatch_context_arg(flag: Option<&str>) -> Result<DispatchContex
     match raw.as_deref() {
         None => Ok(DispatchContextArg::Absent),
         Some(s) if s.trim().is_empty() || s.trim() == "{}" => Ok(DispatchContextArg::Clear),
-        Some(s) => DispatchContext::parse(s).map(DispatchContextArg::Provided),
+        Some(s) => DispatchContext::parse(s).map(|ctx| DispatchContextArg::Provided(Box::new(ctx))),
     }
 }
 
@@ -103,7 +104,7 @@ impl DispatchState {
         let emitted_pins = emitted["pins"].as_str().map(str::to_string);
         match arg {
             DispatchContextArg::Provided(ctx) => Self {
-                context: Some(ctx),
+                context: Some(*ctx),
                 emitted_scope,
                 emitted_pins,
             },
@@ -320,7 +321,7 @@ mod tests {
         let raw = serde_json::to_string(&ctx).unwrap();
         assert_eq!(
             resolve_dispatch_context_arg(Some(&raw)).unwrap(),
-            DispatchContextArg::Provided(ctx)
+            DispatchContextArg::Provided(Box::new(ctx))
         );
         assert_eq!(
             resolve_dispatch_context_arg(Some("")).unwrap(),
@@ -346,7 +347,7 @@ mod tests {
     #[test]
     fn provided_replaces_and_sets_scope() {
         let state = DispatchState::from_arg(
-            DispatchContextArg::Provided(ctx_with(Some(full_scope()))),
+            DispatchContextArg::Provided(Box::new(ctx_with(Some(full_scope())))),
             &Value::Null,
         );
         assert!(state.scope_render().is_some());
@@ -365,7 +366,7 @@ mod tests {
     #[test]
     fn restore_round_trip_excludes_scope_and_drops_needs_scope() {
         let provided = DispatchState::from_arg(
-            DispatchContextArg::Provided(ctx_with(Some(full_scope()))),
+            DispatchContextArg::Provided(Box::new(ctx_with(Some(full_scope())))),
             &Value::Null,
         );
         let side = json!({
@@ -418,7 +419,7 @@ mod tests {
     #[test]
     fn scope_fragment_renders_markers_and_ordered_fields() {
         let state = DispatchState::from_arg(
-            DispatchContextArg::Provided(ctx_with(Some(full_scope()))),
+            DispatchContextArg::Provided(Box::new(ctx_with(Some(full_scope())))),
             &Value::Null,
         );
         let rendered = state.scope_render().unwrap();
@@ -433,7 +434,7 @@ mod tests {
     #[test]
     fn empty_scope_renders_nothing() {
         let state = DispatchState::from_arg(
-            DispatchContextArg::Provided(ctx_with(Some(DispatchScope::default()))),
+            DispatchContextArg::Provided(Box::new(ctx_with(Some(DispatchScope::default())))),
             &Value::Null,
         );
         assert_eq!(state.scope_render(), None);

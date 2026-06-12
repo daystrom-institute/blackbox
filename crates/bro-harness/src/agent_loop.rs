@@ -2982,7 +2982,7 @@ mod tests {
             scope,
             pins: Some("PINS_UNIQUE active arc".into()),
         };
-        DispatchState::from_arg(DispatchContextArg::Provided(ctx), &Value::Null)
+        DispatchState::from_arg(DispatchContextArg::Provided(Box::new(ctx)), &Value::Null)
     }
 
     fn test_scope(task: &str) -> crate::context::dispatch::DispatchScope {
