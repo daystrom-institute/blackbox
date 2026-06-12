@@ -517,6 +517,35 @@ Trailing paragraph.";
     }
 
     #[test]
+    fn roster_shift_tab_cycles_next_provider() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        assert_eq!(app.zone, Zone::Roster);
+        assert_eq!(app.roster_tab, RosterTab::FleetAgents);
+        assert_eq!(app.next_provider, Provider::Brodex);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(app.zone, Zone::Roster);
+        assert_eq!(app.roster_tab, RosterTab::FleetAgents);
+        assert_eq!(app.next_provider, Provider::VibeBh);
+        assert_eq!(app.next_model.as_deref(), default_model_for(Provider::VibeBh));
+        assert_eq!(
+            app.next_effort.as_deref(),
+            default_effort_for(Provider::VibeBh)
+        );
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+
+        assert_eq!(app.next_provider, Provider::Glm);
+        assert_eq!(app.roster_tab, RosterTab::FleetAgents);
+    }
+
+    #[test]
     fn splice_paste_keeps_multiline_as_one_buffer() {
         // The 16-phantom-dispatch regression: a multi-line paste must land as a
         // single composer buffer with embedded soft newlines, NOT one dispatch

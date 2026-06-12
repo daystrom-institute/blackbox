@@ -2410,9 +2410,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     app.prune_armed_until = None;
     // Completion carveouts: slash commands and roster @project aliases own Tab
     // and ↑/↓ while their menus are up. Otherwise Tab cycles roster tabs from
-    // home, or the current provider / model / effort sub-selector level.
+    // home, Shift+Tab cycles the next roster dispatch provider, or Tab cycles
+    // the current provider / model / effort sub-selector level.
     let slash = slash_active(app);
     let project = project_active(app);
+    let shift_tab = key.code == KeyCode::BackTab || (key.code == KeyCode::Tab && shift);
+    if shift_tab && !slash && !project && app.zone == Zone::Roster {
+        cycle_provider(app, 1);
+        return;
+    }
     if key.code == KeyCode::Tab {
         if slash {
             complete_slash(app);
