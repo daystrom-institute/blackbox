@@ -46,39 +46,9 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
   `BRO_HOME`, so a leaked env var writes into the operator's real session
   store.
 
-## Cell bindings (`src/bindings/`) — the refactor DSL namespaces
+## Cell bindings (`src/bindings/`)
 
-The `code.*` / `edits.*` / `lsp.*` namespace globals projected into code-mode
-cells. Design home: `design/bro-harness/refactor-v2-pressure-test.md` (read
-it before extending); trust model from refactor-tools-v2 §3–4.
-
-- **Cell-only constructs.** Bindings join the code-mode callable set + seam
-  (ToolFilter still gates by canonical name, e.g. `"code.items"`) and NEVER
-  the flat wire registry. They are harness-native: pure functions of the
-  working set, zero daemon reach-back (decision af3c4783 — the container
-  test). A binding that needs daemon state is in the wrong layer.
-- **One mutation path, no confirm flags.** `edits.apply` is the only write;
-  the gate is detection (stale spans, invalid edits, create collisions,
-  post-write parse errors) bouncing with structured findings + rollback. A
-  confirm/ack flag a cell can author is theater — operator authority arrives
-  dispatch-side (RX-V1), never as a cell argument.
-- **Spans are hash-anchored at read time**; an EditSet pins one content hash
-  per file; after a successful apply every older Span for that file is stale
-  BY DESIGN — consumers re-derive facts, and bindings check expected hashes
-  BEFORE interpreting byte ranges (drift must fail as `stale_span`, not as a
-  structural miss against the new tree).
-- **Provenance is host-computed lineage**, never cell-supplied tags: the
-  ledger records what authority produced which changes; the choke point
-  recomputes the set's `semantic_status` as the weakest link. Cell-authored
-  bytes floor at `syntax_only`; laundering is possible and priced, not
-  forbidden.
-- **Session-scoped state** (EditStore, LSP pool, ledger) is scoped by
-  `binding_tools()` being called once per session — construct it twice and
-  EditSets/provenance silently fork.
-- **Probe-first evolution.** Binding ergonomics changed only through live
-  probes + `prompts/RETRO_ISOLATE_REFACTOR.md` retros; fix at the source
-  (binding > declarations > gap note in `*/refactor-tools/*`). Several
-  current shapes are probe-derived and look arbitrary without that history:
-  `edits.begin()` returning a bare string, lenient input normalization,
-  `lsp.rename` snapping item spans to the name identifier, the namespace
-  declarations rendering in every code mode.
+Dense leaf with its own CLAUDE.md: `src/bindings/CLAUDE.md` carries the
+refactor cell-DSL invariants (cell-only placement, one-mutation-path trust
+model, hash-anchored span discipline, host-computed lineage, probe-derived
+shapes). Read it before touching the namespaces.
