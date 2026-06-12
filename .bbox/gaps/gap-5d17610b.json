@@ -1,0 +1,24 @@
+{
+  "id": "gap-5d17610b",
+  "title": "Refactor plan-kind catalog needs bounded field projection and pagination",
+  "gap_kind": "mcp_surface",
+  "domain": "refactor-tools",
+  "wanted_capability": "An isolate-friendly plan-kind catalog API that can return only kind/backend/safety/required_schema/examples for a requested language, with pagination or projection, without hitting MCP response caps or requiring parsing large previews.",
+  "missing_primitive": "bbox_refactor_plan_kinds pagination/field projection",
+  "fallback_used": "Filtered to language=rust and manually reduced the JSON inside exec; unfiltered all-language catalog returned response_too_large.",
+  "evidence": [
+    "tool:bbox_refactor_plan_kinds(language=null) response_too_large",
+    "tool:bbox_refactor_plan_kinds(language=rust) returned 31 kinds",
+    "tool:bbox_refactor_status(src/lib.rs) returned hash/range inventory"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/refactor-tools/plan-kind-catalog-pagination-projection",
+  "suggested_owner": "blackbox",
+  "notes": "Observed all-language bbox_refactor_plan_kinds response_too_large at 100862 bytes over an 81920 cap while exploring isolate usage.",
+  "resolution": "unresolved",
+  "task_id": "a0143f51-0a2b-43e7-a300-4c9ce4d3fa80",
+  "session_id": "da082ef9-697e-41e1-b321-f476006ce2a5",
+  "created_at": "2026-06-12T15:51:14Z",
+  "updated_at": "2026-06-12T15:51:14Z"
+}

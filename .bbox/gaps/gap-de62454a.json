@@ -1,0 +1,24 @@
+{
+  "id": "gap-de62454a",
+  "title": "Refactor workflows need server-side handles for isolate continuity",
+  "gap_kind": "workflow",
+  "domain": "refactor-tools",
+  "wanted_capability": "A server-side refactor session or prepare handle that pins project_dir, source hashes, selected items, generated plans, preflight results, and apply eligibility across fresh JS isolates without copying giant plan JSON through model context or exec KV.",
+  "missing_primitive": "bbox_refactor_session/bbox_refactor_prepare handle",
+  "fallback_used": "Stored intermediate catalog/status data in exec store/load and relied on the model to remember the pipeline.",
+  "evidence": [
+    "tool:bbox_refactor_plan_kinds(language=null) response_too_large",
+    "tool:bbox_refactor_plan_kinds(language=rust) returned 31 kinds",
+    "tool:bbox_refactor_status(src/lib.rs) returned hash/range inventory"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "workflow/refactor-tools/server-side-refactor-session-handles",
+  "suggested_owner": "blackbox",
+  "notes": "Exec store/load is session-local and useful, but the refactor daemon should own refactor state when plans cross isolate/tool turns.",
+  "resolution": "unresolved",
+  "task_id": "a0143f51-0a2b-43e7-a300-4c9ce4d3fa80",
+  "session_id": "da082ef9-697e-41e1-b321-f476006ce2a5",
+  "created_at": "2026-06-12T15:51:14Z",
+  "updated_at": "2026-06-12T15:51:14Z"
+}

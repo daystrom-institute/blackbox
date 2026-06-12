@@ -1,0 +1,24 @@
+{
+  "id": "gap-374fba64",
+  "title": "Refactor plan kinds need per-kind JSON schemas and examples",
+  "gap_kind": "mcp_surface",
+  "domain": "refactor-tools",
+  "wanted_capability": "A single-kind describe API returning exact JSON schema, required and optional field types, operator opt-out flags, semantic status, preflight commands, example invocations, and expected response shape for one refactor kind.",
+  "missing_primitive": "bbox_refactor_kind_describe(kind)",
+  "fallback_used": "Used the broad plan-kind catalog and runbook prose, which gives required field names but not a precise per-kind invocation schema.",
+  "evidence": [
+    "tool:bbox_refactor_plan_kinds(language=null) response_too_large",
+    "tool:bbox_refactor_plan_kinds(language=rust) returned 31 kinds",
+    "tool:bbox_refactor_status(src/lib.rs) returned hash/range inventory"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/refactor-tools/per-kind-schema-describe",
+  "suggested_owner": "blackbox",
+  "notes": "The current broad bbox_refactor_plan schema is too large and union-shaped for reliable isolate composition.",
+  "resolution": "unresolved",
+  "task_id": "a0143f51-0a2b-43e7-a300-4c9ce4d3fa80",
+  "session_id": "da082ef9-697e-41e1-b321-f476006ce2a5",
+  "created_at": "2026-06-12T15:51:14Z",
+  "updated_at": "2026-06-12T15:51:14Z"
+}
