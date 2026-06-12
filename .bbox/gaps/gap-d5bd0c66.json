@@ -3,7 +3,7 @@
   "title": "Multimodal X-* chunker markers (7 formats)",
   "gap_kind": "refactor_primitive",
   "domain": "multimodal",
-  "wanted_capability": "Chunker markers for the 7 deferred multimodal formats: X-PDF, X-IPYNB, X-XLSX, X-DOCX-PPTX, X-HTML, X-AV, X-IMG. Embedding model selection (per design/multimodal-embedding-routing.md) is the X-IMG blocker.",
+  "wanted_capability": "Chunker markers for the 7 deferred multimodal formats: X-PDF, X-IPYNB, X-XLSX, X-DOCX-PPTX, X-HTML, X-AV, X-IMG. The X-IMG embedding-model blocker is RESOLVED (2026-06-12 rewrite of design/corpus/agentic-corpus/multimodal-embedding-routing.md, Layer 4): voyage-multimodal-3.5 @ 1024 float, own compatibility family voyage-multimodal-3.5:1024:float, no text-space sharing. Remaining prerequisite is the Layer 0 routing substrate (provider alias map, input_type, compatibility families) plus the VoyageMultimodalProvider (migration Phase 6).",
   "evidence": [
     "thread-3cfbf9e0 (X-* markers)",
     "design/multimodal-embedding-routing.md (8cade63b)"
@@ -11,8 +11,8 @@
   "impact": "high",
   "blocking_level": "none",
   "dedupe_key": "refactor_primitive/multimodal/x-markers",
-  "notes": "X-PDF (highest user priority per design A3), X-IPYNB, X-XLSX, X-DOCX-PPTX, X-HTML, X-AV (audio/video transcripts), X-IMG (standalone images, blocked on multimodal embed model selection per design §20.3). Embedding routing design now exists.",
+  "notes": "2026-06-12: embedding model selection answered by the routing-design rewrite; gap now blocks on Layer 0/Phase 6 implementation, not on model choice.",
   "resolution": "unresolved",
   "created_at": "2026-06-11T18:06:14Z",
-  "updated_at": "2026-06-11T18:06:14Z"
+  "updated_at": "2026-06-12T20:07:58Z"
 }

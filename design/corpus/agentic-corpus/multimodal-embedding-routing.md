@@ -10,119 +10,219 @@ topic:
 
 # Multimodal and Embedding Routing Design
 
-Date: 2026-05-07
+Date: 2026-06-12 (rewrite; supersedes the 2026-05-07 revision in-place)
 
 ## Problem
 
-The original agentic-corpus design correctly made embeddings bucket-routed, but
-the concrete implementation now lags the model landscape and the intended
-future multimodal path:
+The embedding stack is well-partitioned but **single-model, role-unmarked,
+and a generation old**. Verified against code and the live daemon on
+2026-06-12:
 
-- `src/embed/voyage.rs` defaults to `voyage-code-3` for the single `voyage`
-  provider slot.
-- `EmbeddingRouter` can route buckets to provider ids (`voyage`, `ollama`),
-  but cannot express multiple Voyage-backed routes with different models.
-- Query embedding uses the same `embed_batch` path as document embedding, so
-  Voyage `input_type` is omitted for both stored chunks and live queries.
-- The design open question still names `voyage-multimodal-3`; current Voyage
-  multimodal guidance points at `voyage-multimodal-3.5`.
-- Existing vector partitions are model-scoped, but the search layer needs a
-  stricter rule: only embed a query with the model family that produced the
-  partition being searched. Same dimensions do not imply shared vector space.
-- The current config schema has hardcoded `voyage` and `ollama` provider
-  fields. A multi-Voyage design therefore requires a real provider-map
-  migration, not just new route names in TOML.
+- Every bucket — `code`, `docs`, `knowledge`, `notes`, `threads`,
+  `git_message`, `agent_manifest` — embeds with `voyage-code-3`, a
+  code-specialized model. The prose corpus has never been on a prose model.
+- The provider trait is still `embed_batch(&[String])`
+  (`crates/bbox-embed/src/embed/mod.rs`). No `input_type` is sent anywhere:
+  stored chunks and live queries reach Voyage role-unmarked.
+- Provider config is still hardcoded `ProviderConfigs { voyage, ollama }`,
+  not an alias map. Multiple Voyage-backed routes with different models
+  cannot be expressed.
+- `Route` carries provider/model/dimensions only — no `endpoint_kind`,
+  `compatibility_family`, or `output_dtype`. Dimensions are hardcoded
+  consts (1024 voyage / 768 ollama); Matryoshka output dims are unused.
+- No partition lifecycle tooling (list/prune) exists, which becomes urgent
+  the moment any deliberate model migration orphans the current partitions.
+- No multimodal code exists anywhere in embed/vectors/chunker.
 
-This doc supersedes only the embedding-model selection and multimodal-routing
-parts of `design/corpus/agentic-corpus/agentic-corpus.md` and `design/corpus/agentic-corpus/agentic-corpus-impl.md`. The
-chunker registry, bucket model, HNSW partitioning, and RRF fusion strategy stay.
+Two things from the prior revision have shipped since:
 
-## Current Baseline
+- A process-wide query-embedding cache keyed `(provider_id, model, query)`
+  (`crates/bbox-embed/src/embed/query_cache.rs`) — already
+  compatibility-family-shaped.
+- Ranking metrics (MRR / recall@k) and a sweepable rerank cap
+  (`crates/bbox-corpus-core/src/search/{rerank,metrics}.rs`) — the eval
+  substrate the migration phases below lean on.
 
-Implemented buckets:
+And the prior revision's "zero coverage for knowledge/notes/threads" has
+mostly self-healed: live status 2026-06-12 shows knowledge 93%, threads
+100%, notes 68% (lagging — worth investigation), transcripts 0
+(`include_transcripts` opt-in).
 
-- `knowledge`
-- `code`
-- `docs`
-- `transcripts`
-- `git_message`
-- `notes`
-- `threads`
-- `agent_manifest`
-
-Implemented providers:
-
-- `voyage`: hardcoded 1024 dimensions, default model `voyage-code-3`
-- `ollama`: default model `nomic-embed-text`
-
-Implemented partition identity:
-
-- `Route::vector_route_id()` includes provider id, model, dimensions, and a
-  short hash. This is correct and must remain the isolation boundary.
-
-Observed gap in `blackbox-dev` on 2026-05-07:
-
-- `code`, `docs`, and `git_message` are mostly/fully indexed under
-  `voyage-code-3`.
-- `knowledge`, `notes`, and `threads` have source counts but zero indexed
-  vectors. That coverage issue is independent of model choice and should be
-  fixed before judging retrieval quality for those buckets.
+This doc supersedes only the embedding-model selection, routing, and
+ranking-pipeline parts of `agentic-corpus.md` / `agentic-corpus-impl.md`.
+The chunker registry, bucket model, HNSW partitioning, and RRF fusion
+strategy stay. Chunker phases live in
+`agentic-corpus-multimodal-chunkers.md`.
 
 ## External Model Facts
 
-These facts come from Voyage documentation and release notes, checked on
-2026-05-07.
+Checked against Voyage documentation on 2026-06-12.
 
-- Voyage text embeddings are served at `/v1/embeddings`; recommended text
-  models include `voyage-4-large`, `voyage-4`, `voyage-4-lite`,
-  `voyage-3-large`, `voyage-3.5`, `voyage-3.5-lite`, `voyage-code-3`,
-  `voyage-finance-2`, and `voyage-law-2`.
-- For retrieval/search, Voyage recommends setting `input_type` to `query` for
-  query embeddings and `document` for stored corpus embeddings. Embeddings
-  generated with and without `input_type` are compatible inside the same model.
-- `voyage-4-large`, `voyage-4`, `voyage-4-lite`, `voyage-3-large`,
-  `voyage-3.5`, `voyage-3.5-lite`, and `voyage-code-3` support 2048, 1024,
-  512, and 256 output dimensions.
-- The Voyage 4 text family has an explicit shared embedding-space guarantee:
+Text embeddings (`/v1/embeddings`):
+
+- **voyage-4 family** — `voyage-4-large`, `voyage-4`, `voyage-4-lite`,
+  `voyage-4-nano`. Explicit **shared embedding space across the family**:
   documents embedded with one 4-series model can be searched with queries
-  embedded by another 4-series model.
-- No source found states that `voyage-code-3` vectors are compatible with
-  `voyage-4` or with `voyage-multimodal-3.5`. Do not infer compatibility from
+  embedded by another. Matryoshka output dims 256/512/1024/2048.
+  Quantized output dtypes: `int8`, `uint8`, `binary`, `ubinary` alongside
+  float.
+- **voyage-4-nano is open-weight** (HuggingFace) — a local/offline fallback
+  that stays inside the hosted family's vector space, strictly better for
+  this corpus than an unrelated local model (`nomic-embed-text`).
+- `voyage-code-3` remains the code-retrieval specialist; no documented
+  compatibility with the voyage-4 space. Do not infer compatibility from
   equal dimensions.
-- `voyage-multimodal-3.5` embeds interleaved text, images, and videos through
-  the multimodal endpoint. It supports `input_type=query|document`, videos,
-  and the same 256/512/1024/2048 dimension choices. It is not just a text model
-  replacement; it is a separate route family for visual-native content.
+
+Contextualized chunk embeddings (`voyage-context-3`, `voyage-context-4`
+preview) — **new since the prior revision**:
+
+- Each chunk is encoded in the context of the other chunks of the same
+  document; chunk-level vectors, document-level semantics.
+- API takes document-grouped input (`List[List[str]]`); queries stay flat
+  `List[str]` with `input_type="query"`. Same flexible dims
+  (256/512/1024/2048) and output formats.
+- Own vector space — its own compatibility family, not interchangeable
+  with voyage-4 standard embeddings.
+
+Rerankers (`/v1/rerank`):
+
+- `rerank-2.5` (quality, instruction-following) and `rerank-2.5-lite`
+  (latency/cost) — cross-encoders, 32K combined query+doc tokens, query ≤
+  8K tokens, ≤ 1,000 documents per call, ≤ 600K total tokens.
+
+Multimodal (`/v1/multimodalembeddings`):
+
+- `voyage-multimodal-3.5`: interleaved text / image / video parts
+  (URL or base64, not mixed per request), `input_type=query|document`,
+  output dims 256/512/**1024 default**/2048. Video is 3.5-only.
+- Limits: image ≤ 20 MB and ≤ 16M pixels; video ≤ 20 MB; ≤ 32K tokens per
+  input, ≤ 320K per batch, ≤ 1,000 inputs per request (560 px per image
+  token, 1120 px per video token).
+- **No documented compatibility with the voyage-4 text space.** Multimodal
+  is a separate route family, not a text-model replacement.
 
 Primary references:
 
 - https://docs.voyageai.com/docs/embeddings
-- https://docs.voyageai.com/reference/embeddings-api
+- https://docs.voyageai.com/docs/contextualized-chunk-embeddings
+- https://docs.voyageai.com/docs/reranker
 - https://docs.voyageai.com/docs/multimodal-embeddings
-- https://blog.voyageai.com/2026/01/15/voyage-4/
-- https://blog.voyageai.com/2026/01/15/voyage-multimodal-3-5/
+- https://docs.voyageai.com/reference/multimodal-embeddings-api
 
 ## Design Principles
 
 1. Model compatibility is explicit, not dimension-derived.
-2. Text-first chunkers must not block on multimodal embeddings.
-3. Visual-native retrieval is a new route family, not a global replacement.
-4. Route identity must include every parameter that changes vector space:
-   provider, endpoint kind, model, output dimension, dtype, and compatibility
-   family.
-5. Query embedding must be route-local. A partition produced by a given route
-   is searched with that route's query encoder, except when an explicit
-   compatibility-family rule allows asymmetric retrieval.
-6. Ranking fusion remains cross-route RRF. Raw cosine scores across unrelated
-   model families are not directly comparable.
-7. Corpus export policy remains bucket-scoped. Adding multimodal must make
-   image/video/PDF pixel export explicit.
+2. Compatibility family includes **dtype**. Binary-quantized voyage-4
+   vectors are not comparable with float voyage-4 vectors at the same
+   dimension. Family = provider type + model family + dim + dtype.
+3. Text-first chunkers must not block on multimodal embeddings.
+4. Visual-native retrieval is a new route family, not a global replacement.
+5. Query embedding is route-local, except where an explicit
+   family rule allows **asymmetric retrieval** (voyage-4: embed documents
+   with `voyage-4-large`, queries with `voyage-4-lite`/`-nano`).
+6. Contextualized document encoding is the preferred default for chunked
+   prose and code corpora once the queue can batch per-document; standard
+   embeddings remain for buckets whose units are not document-grouped.
+7. Ranking is a pipeline: BM25 + vector → RRF fusion → cross-encoder
+   rerank of the fused top-k → heuristic adjustments (type/temporal)
+   last. Raw cosine scores across unrelated families are never merged
+   before rank normalization.
+8. Corpus export policy remains bucket-scoped; multimodal makes
+   image/video/PDF pixel export explicit and opt-in.
+
+## Layered Target Architecture
+
+Dependency-ordered. Layer 0 gates everything.
+
+### Layer 0 — Routing substrate (unchanged prerequisite)
+
+Provider alias map with a `type` discriminator, `input_type` on the
+provider trait, and `endpoint_kind` + `compatibility_family` +
+`output_dtype` in route metadata. Detailed below in Recommended Routing /
+Compatibility Families / Provider Interface.
+
+### Layer 1 — Re-route the prose corpus + asymmetric retrieval
+
+`code` stays on `voyage-code-3` until the eval suite says otherwise.
+All prose buckets (`knowledge`, `notes`, `threads`, `docs`,
+`git_message`, `agent_manifest`, `transcripts`) move to the voyage-4
+family. The family's shared-space guarantee enables asymmetric retrieval:
+document embeddings on `voyage-4-large` (one-time indexing cost), query
+embeddings on `voyage-4-lite` or local `voyage-4-nano` (per-search
+latency/cost). Expressed as `document_model` / `query_model` within one
+provider alias — both must derive the same compatibility family or the
+route loader rejects the config. The query cache key moves from
+`(provider_id, model, query)` to `(compatibility_family, query)`.
+
+### Layer 2 — Contextualized chunk embeddings
+
+`voyage-context-3` (or `-4` once stable) becomes the document encoder for
+buckets whose chunks are document-grouped — `code`, `docs`, and
+transcript sessions are the strongest fits; chunk-in-document context is
+the known weakness of independent chunk embedding on exactly this corpus.
+
+Queue implication (the real work): the embed queue currently batches flat
+text across documents. Contextualized routes need a **document-grouped
+batch boundary** — requests carry a document grouping key and the worker
+assembles `Vec<Vec<String>>` per document, never splitting one document
+across batches (subject to the per-batch token budget; oversized documents
+fall back to windowed grouping). `EmbedInput` anticipates this with a
+`DocumentChunks` variant from day one so Layer 0's shapes don't churn.
+
+Queries against context partitions are flat text with `input_type=query` —
+no query-side grouping, so hybrid search needs no structural change beyond
+family-aware encoding.
+
+### Layer 3 — Cross-encoder rerank stage
+
+The current "rerank" is a heuristic feature multiplier (type × temporal
+decay, capped — `bbox-corpus-core/src/search/rerank.rs`). Insert a real
+rerank stage: after RRF fusion, send the fused top-k (text content, k
+≈ 50–100) to `rerank-2.5-lite` with the query; re-order by relevance
+score; apply heuristic adjustments after (or fold them into the rerank
+score as a small multiplier under the existing cap machinery). Opt-in per
+call (`rerank="model"|"heuristic"|"none"`), heuristic remains the default
+until the eval suite shows the win and the latency budget is accepted.
+This is the designated instrument for the "learned ranking" ambition —
+a hosted cross-encoder is cheaper and better calibrated than per-turn LLM
+scoring (gap-85c45849), and the metrics substrate (MRR/recall@k) makes it
+A/B-able from day one. Degradation rule: rerank API failure falls back to
+the heuristic path and reports `degraded.rerank_unavailable`.
+
+### Layer 4 — Multimodal route family (opt-in)
+
+`voyage-multimodal-3.5` at 1024d as its own compatibility family. Visual
+payload sidecars outside Tantivy, pixel-export policy, PDF text-first.
+This resolves the X-IMG model-selection blocker (gap-d5bd0c66): the
+selection is `voyage-multimodal-3.5`, 1024 float, family
+`voyage-multimodal-3.5:1024:float`, no text-space sharing. Details in
+Multimodal Chunk Model below; chunker phases in
+`agentic-corpus-multimodal-chunkers.md`.
+
+### Layer 5 — Partition lifecycle (before the migrations, not after)
+
+Layers 1–2 are deliberate model migrations that orphan every current
+partition. `bbox_embed_partitions(action="list|prune")` (or CLI
+equivalent) lands first:
+
+- `list` reports exact route id, provider, endpoint kind, model, dim,
+  dtype, compatibility family, active_count, last_write, and whether any
+  configured bucket currently maps to it.
+- `prune` is dry-run by default and only deletes partitions that are both
+  unmapped by current route config and older than an operator-supplied age
+  threshold.
+- Never auto-prune as part of `bbox_reembed`.
+
+### Sequencing
+
+Layer 0 → Layer 5 → Layer 1 → Layer 3 (independent of 1–2; may move
+earlier) → Layer 2 → Layer 4 (demand-driven per the chunker doc's
+"picking the next one" criteria).
 
 ## Recommended Routing
 
-Default hosted configuration should split Voyage into named routes. This
-requires replacing the current hardcoded `ProviderConfigs { voyage, ollama }`
-shape with a map keyed by provider alias:
+Replace hardcoded `ProviderConfigs { voyage, ollama }` with a map keyed by
+provider alias:
 
 ```toml
 [embed.providers.voyage_code]
@@ -134,13 +234,14 @@ output_dimension = 1024
 [embed.providers.voyage_text]
 type = "voyage_text"
 api_key_env = "VOYAGE_API_KEY"
-model = "voyage-4"
+document_model = "voyage-4-large"   # one-time indexing cost
+query_model = "voyage-4-lite"       # per-search cost; same family enforced
 output_dimension = 1024
 
-[embed.providers.voyage_text_large]
-type = "voyage_text"
+[embed.providers.voyage_context]
+type = "voyage_context"
 api_key_env = "VOYAGE_API_KEY"
-model = "voyage-4-large"
+model = "voyage-context-3"
 output_dimension = 1024
 
 [embed.providers.voyage_visual]
@@ -149,13 +250,24 @@ api_key_env = "VOYAGE_API_KEY"
 model = "voyage-multimodal-3.5"
 output_dimension = 1024
 
+[embed.providers.local_nano]
+type = "local_voyage4"              # open-weight voyage-4-nano; same family
+model = "voyage-4-nano"
+output_dimension = 1024
+
 [embed.providers.ollama]
 type = "ollama"
 endpoint = "http://localhost:11434"
 model = "nomic-embed-text"
 
+[embed.rerank]
+provider = "voyage"
+model = "rerank-2.5-lite"
+api_key_env = "VOYAGE_API_KEY"
+top_k = 64
+
 [embed.routes]
-code = "voyage_code"
+code = "voyage_code"            # → voyage_context after Layer 2 eval
 docs = "voyage_text"
 knowledge = "voyage_text"
 notes = "voyage_text"
@@ -174,34 +286,20 @@ video_segment = "voyage_visual"
 
 Backward compatibility:
 
-- Existing configs with `[embed.providers.voyage]` continue to parse.
-- During load, legacy `voyage` is treated as a normal provider alias with
-  `type = "voyage_text"` and whatever model it configured.
-- If no config exists, defaults synthesize `voyage_code`, `voyage_text`, and
-  `ollama` aliases internally.
-- Unknown route provider ids remain errors; silently falling back to `voyage`
-  would hide typos and could search the wrong vector space.
-
-Rationale:
-
-- `code` keeps the code-specialized model until a local eval proves
-  `voyage-4-large` or `voyage-4` is better for this repo's code queries.
-- `knowledge`, `notes`, `threads`, `agent_manifest`, `git_message`, and most
-  `docs` move to the Voyage 4 family because these are semantic text and
-  operational prose, not code corpora.
-- `voyage_text_large` is available for one-time document indexing if we want
-  asymmetric Voyage 4 retrieval later: embed stored text with
-  `voyage-4-large`, query with `voyage-4` or `voyage-4-lite`.
-- `voyage_visual` is opt-in and used only for chunks that preserve meaningful
-  visual evidence.
+- Legacy `[embed.providers.voyage]` parses as alias `voyage` with
+  `type = "voyage_text"` and its configured model.
+- Absent config synthesizes `voyage_code`, `voyage_text`, and `ollama`.
+- Unknown route provider ids remain errors; silent fallback would search
+  the wrong vector space.
 
 ## Compatibility Families
 
-Add an explicit compatibility family to route metadata:
+Route metadata grows explicit family identity:
 
 ```rust
 enum EmbedEndpointKind {
     Text,
+    ContextualizedText,
     Multimodal,
     Ollama,
 }
@@ -211,60 +309,42 @@ struct Route {
     project_id: Option<String>,
     provider_id: String,
     endpoint_kind: EmbedEndpointKind,
-    model: String,
+    document_model: String,
+    query_model: String,          // == document_model unless asymmetric
     dimensions: usize,
-    output_dtype: OutputDType,
+    output_dtype: OutputDType,    // float | int8 | uint8 | binary | ubinary
     compatibility_family: String,
 }
 ```
 
-Examples:
+Derivation is code-owned (never operator-supplied):
 
-- `voyage-4-large`, `voyage-4`, `voyage-4-lite`, and `voyage-4-nano` at the
-  same output dimension: `compatibility_family = "voyage-4:1024:float"`.
-- `voyage-code-3` at 1024 float:
-  `compatibility_family = "voyage-code-3:1024:float"`.
-- `voyage-multimodal-3.5` at 1024 float:
-  `compatibility_family = "voyage-multimodal-3.5:1024:float"`.
-- `nomic-embed-text` at 768 float:
-  `compatibility_family = "ollama:nomic-embed-text:768:float"`.
+- voyage-4 family (incl. nano, local or hosted) → `voyage-4:<dim>:<dtype>`
+- `voyage-code-3` → `voyage-code-3:<dim>:<dtype>`
+- `voyage-context-3` → `voyage-context-3:<dim>:<dtype>`
+- `voyage-multimodal-3.5` → `voyage-multimodal-3.5:<dim>:<dtype>`
+- `nomic-embed-text` → `ollama:nomic-embed-text:768:float`
+- Unknown future models default to exact-model families until classified.
 
-`vector_route_id()` should continue to identify exact partitions. Search may
-reuse a query vector across partitions only when compatibility families match.
+Rules:
 
-Compatibility family must be derived by code from provider type, model,
-dimension, and dtype. It must not be an operator-supplied string in config.
-Provider implementations own the derivation table:
-
-- Voyage 4 text models map to `voyage-4:<dim>:<dtype>`.
-- `voyage-code-3` maps to `voyage-code-3:<dim>:<dtype>`.
-- `voyage-multimodal-3.5` maps to
-  `voyage-multimodal-3.5:<dim>:<dtype>`.
-- Unknown future models default to exact-model families until explicitly
-  classified.
-
-The route loader should reject a family if provider-derived dimensions do not
-match the configured output dimension. This makes family/dimension mismatches
-fail before indexing, rather than surfacing later as search degradation.
+- `vector_route_id()` keeps identifying exact partitions; it must grow
+  dtype. A query vector is reused across partitions only when families
+  match exactly.
+- Asymmetric `document_model`/`query_model` pairs must derive the same
+  family or the route loader rejects the config at load, not at search.
+- The loader rejects dimension/family mismatches before indexing.
 
 ## Provider Interface
 
-The current trait conflates document and query embeddings:
+Replace the conflated trait:
 
 ```rust
-async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
-```
-
-Replace or extend it with:
-
-```rust
-enum EmbedInputType {
-    Query,
-    Document,
-}
+enum EmbedInputType { Query, Document }
 
 enum EmbedInput {
     Text(String),
+    DocumentChunks(Vec<String>),      // contextualized routes
     Multimodal(Vec<MultimodalPart>),
 }
 
@@ -279,10 +359,11 @@ trait EmbeddingProvider {
         &self,
         inputs: &[EmbedInput],
         input_type: EmbedInputType,
-    ) -> Result<Vec<Vec<f32>>>;
+    ) -> Result<Vec<EmbedOutput>>;   // DocumentChunks yields one vector per chunk
 
     fn dimensions(&self) -> usize;
-    fn model_name(&self) -> &str;
+    fn document_model(&self) -> &str;
+    fn query_model(&self) -> &str;
     fn endpoint_kind(&self) -> EmbedEndpointKind;
     fn compatibility_family(&self) -> &str;
 }
@@ -290,54 +371,30 @@ trait EmbeddingProvider {
 
 Rules:
 
-- Queue workers call with `input_type = Document`.
-- Hybrid search calls with `input_type = Query`.
-- Agent lookup and other semantic lookup helpers call with
-  `input_type = Query`.
-- Text providers reject non-text `EmbedInput` with a typed error.
-- Multimodal providers accept text-only inputs too, but text-only buckets should
-  not route there by default because that makes every query pay the multimodal
-  route cost and changes the compatibility family.
+- Queue workers send `Document`; hybrid search and agent/semantic lookup
+  helpers send `Query`. The query/document split is a correctness fix —
+  today neither value is sent.
+- Text providers reject non-text inputs with a typed error; contextualized
+  providers reject `Multimodal`; multimodal providers accept text but
+  text-only buckets must not route there by default.
+- Asymmetric providers select `document_model` vs `query_model` from
+  `input_type` internally.
 
-The query/document split is a correctness fix, not an optimization. The current
-implementation sends neither value, so Voyage embeds stored corpus chunks and
-live search queries as unspecified text. Voyage documents that retrieval inputs
-should be marked by role; keeping the field unset leaves relevance on the table
-and makes future eval results harder to interpret.
-
-Implementation call sites that must change:
-
-- `src/embed/queue.rs` workers: `provider.embed_batch(..., Document)`
-- `src/mcp_tools/hybrid_search.rs::embed_with_provider`:
-  `provider.embed_batch(..., Query)`
-- `src/main.rs` agent-query helper paths that embed live lookup text:
-  `provider.embed_batch(..., Query)`
-- provider tests/mocks in `src/embed/voyage.rs`, `src/embed/ollama.rs`, and
-  `src/embed/queue.rs`
+Call sites that must change: `embed/queue.rs` workers (`Document`),
+`mcp_tools/hybrid_search.rs` + `query_cache.rs` (`Query`,
+family-scoped cache key), agent-lookup embed paths (`Query`), and the
+provider mocks/tests.
 
 ## Multimodal Chunk Model
 
-Keep text-first chunks in the existing `project_file` path:
+Unchanged from the prior revision. Text-first chunks ride the existing
+`project_file` path (`pdf_page`, `pdf_table`, `spreadsheet_sheet`,
+`notebook_cell`, `slide`, `web_section`, `transcript_segment`, …).
+Visual payload sidecars only where pixels are semantically load-bearing
+(`pdf_figure`, `spreadsheet_chart`, `slide_image`, `image_caption`,
+`video_segment`).
 
-- `pdf_page` text
-- `pdf_table` extracted text or markdown table
-- `spreadsheet_sheet` summary text
-- `spreadsheet_cell_range` formula/value text
-- `notebook_cell`
-- `slide` text
-- `web_section`
-- `transcript_segment`
-
-Add visual payload sidecars only for chunks where pixels are semantically
-load-bearing:
-
-- `pdf_figure`
-- `spreadsheet_chart`
-- `slide_image`
-- `image_caption`
-- `video_segment`
-
-Do not store raw image/video bytes in Tantivy. Store a sidecar object with:
+No raw image/video bytes in Tantivy; a content-hash-addressed sidecar:
 
 ```rust
 struct VisualPayloadRef {
@@ -355,141 +412,126 @@ struct VisualPayloadRef {
 }
 ```
 
-The chunk's text `content` remains searchable by BM25 and text embeddings. The
-visual route embeds `MultimodalPart::ImageBytes` or `VideoBytes` plus optional
-context text such as caption, page heading, neighboring OCR, or filename.
+Sidecar anchoring should use the `file:` virtual entity once it lands
+(gap-ab3ef97f) rather than the chunk[0]-as-file proxy. Payload guards
+match current provider limits (image ≤ 20 MB / ≤ 16M px, video ≤ 20 MB,
+≤ 32K tokens per input by provider accounting).
 
 ## Search Semantics
 
 For a text query:
 
 1. Run BM25 as today.
-2. Resolve current route metadata for every configured bucket.
-3. Group active vector partitions by compatibility family.
-4. For each family, embed the query with that family's configured query model.
-5. Search exact partitions in that family.
-6. Fuse BM25 and vector rank lists via RRF.
+2. Resolve route metadata for every configured bucket; group active vector
+   partitions by compatibility family.
+3. Embed the query once per family with that family's `query_model`
+   (cache key: `(family, query)`).
+4. Search exact partitions per family; fuse BM25 + vector lists via RRF.
+5. Optional model rerank: send fused top-k to `rerank-2.5-lite`, re-order
+   by relevance score. On API failure fall back to heuristic rerank and
+   report `degraded.rerank_unavailable`.
+6. Apply heuristic type/temporal adjustments under the existing cap.
 
-Partitions that have no current configured route metadata are skipped by
-default and reported under `degraded.skipped_partitions`. This is the safe
-behavior for orphaned partitions after a model migration. An operator-only
-diagnostic mode can search orphaned partitions later, but normal retrieval
-should not guess which query encoder to use.
+Partitions with no current route metadata are skipped and reported under
+`degraded.skipped_partitions` — never guess a query encoder for orphaned
+partitions.
 
-For a visual query in the future:
-
-1. Accept an explicit query payload (`text`, `image`, or interleaved parts).
-2. Search only compatible multimodal families unless the caller asks for
-   text-only fallback.
-3. Fuse with BM25 only when the query has text.
+For a future visual query: accept explicit parts (`text`/`image`/
+interleaved), search only compatible multimodal families unless text-only
+fallback is requested, fuse with BM25 only when the query has text.
 
 Never:
 
-- Search a `voyage-code-3` partition with a `voyage-4` query vector.
-- Search a `voyage-multimodal-3.5` partition with a `voyage-code-3` query
-  vector.
-- Merge cosine scores from unrelated route families before rank normalization.
+- Search a `voyage-code-3` partition with a voyage-4 query vector (or any
+  cross-family pairing — equal dims prove nothing).
+- Merge cosine scores across families before rank normalization.
 
 ## Migration Plan
 
-Phase 1: Text routing correction
+Phase 1 — Routing substrate (Layer 0):
 
-- Add named provider config with `type`.
-- Replace hardcoded `ProviderConfigs { voyage, ollama }` with a provider map
-  keyed by alias plus a typed provider enum.
-- Keep legacy `[embed.providers.voyage]` readable as alias `voyage`.
-- Add `output_dimension`, `output_dtype`, `endpoint_kind`, and
-  `compatibility_family` to route metadata.
-- Send `input_type=document` for every queue/stored-corpus embedding path.
-- Send `input_type=query` for every live retrieval embedding path, including
-  `bbox_hybrid_search`, agent lookup, and any future visual query endpoint.
-- Add a mock Voyage test that asserts document paths and query paths serialize
-  different `input_type` values.
-- Add route-loader tests for:
-  - two Voyage aliases with different models
-  - unknown route alias rejection
-  - legacy `[embed.providers.voyage]` parsing
-  - provider-derived compatibility family values
-- Update defaults: `code = voyage_code`; prose buckets route to `voyage_text`.
-- Add `bbox_reembed` guidance because changing model/dim/family creates new
-  partitions; old partitions remain until pruned.
+- Provider alias map with `type`; legacy `[embed.providers.voyage]` still
+  parses.
+- `input_type` on the trait; `Document` on all queue paths, `Query` on all
+  live retrieval paths.
+- `output_dimension`, `output_dtype`, `endpoint_kind`,
+  `compatibility_family` in route metadata; dtype into
+  `vector_route_id()`.
+- Tests: document vs query serialize different `input_type`; two Voyage
+  aliases with different models; unknown alias rejection; legacy parsing;
+  derived family values; asymmetric pair family mismatch rejected.
 
-Phase 2: Backfill existing non-code buckets
+Phase 2 — Partition lifecycle (Layer 5): `bbox_embed_partitions`
+list/prune as specified above, before any deliberate migration.
 
-- Fix the observed zero-coverage state for `knowledge`, `notes`, and `threads`.
-- Add a regression test that source_count > 0 for those buckets can produce
-  indexed_count > 0 under a mock provider.
-- Run `bbox_reembed` for each prose bucket after route migration.
+Phase 3 — Prose re-route + asymmetric retrieval (Layer 1):
 
-Phase 3: Multimodal provider support
+- Prose buckets → `voyage_text` (voyage-4 family); `code` stays on
+  `voyage_code` pending eval.
+- `bbox_reembed` per bucket; old partitions pruned via Phase 2 tooling
+  after verification.
+- Investigate the `notes` coverage lag (68% on 2026-06-12) before
+  re-routing so the backfill and the migration aren't conflated.
 
-- Add `VoyageMultimodalProvider` against `/v1/multimodalembeddings`.
-- Add payload-size guards matching provider limits:
-  - image <= 20 MB and <= 16M pixels
-  - video <= 20 MB
-  - per-input <= 32K tokens by provider accounting
-- Add export-policy docs for pixel/video data leaving the host.
+Phase 4 — Model rerank stage (Layer 3): `[embed.rerank]` config, opt-in
+param, eval A/B against heuristic-only using the metrics substrate; ship
+as default only on a measured win.
 
-Phase 4: First visual chunker
+Phase 5 — Contextualized embeddings (Layer 2): document-grouped queue
+batching, `DocumentChunks` input, `voyage_context` route for `code`/`docs`
+behind an eval comparison vs their Layer-1 routes.
 
-- Implement `X-PDF` as text-first first: `pdf_page` and `pdf_table`.
-- Add `pdf_figure` visual sidecar support only after the multimodal provider
-  path exists.
-- Gate OCR/tesseract shell-outs behind availability checks and timeouts.
+Phase 6 — Multimodal provider + first visual chunker (Layer 4):
 
-Phase 5: Visual eval
-
-- Add an eval query set for figure/table/chart retrieval before making
-  multimodal default for any visual kind.
-- Compare:
-  - text-only extraction through `voyage-4`
-  - visual sidecar through `voyage-multimodal-3.5`
-  - optional local/open baseline if available
-
-Phase 6: Partition lifecycle
-
-- Add `bbox_embed_partitions(action="list|prune")` or equivalent CLI/MCP
-  surface before encouraging broad route churn.
-- `list` reports exact route id, provider, endpoint kind, model, dim, dtype,
-  compatibility family, active_count, last_write, and whether any configured
-  bucket currently maps to it.
-- `prune` is dry-run by default and only deletes partitions that are both:
-  - unmapped by current route config
-  - older than an operator-supplied age threshold
-- Never auto-prune as part of `bbox_reembed`; reembed proves replacement
-  vectors exist, but deletion is a separate destructive lifecycle operation.
+- `VoyageMultimodalProvider` against `/v1/multimodalembeddings` with the
+  payload guards above; export-policy docs for pixels leaving the host.
+- `X-PDF` text-first (`pdf_page`, `pdf_table`); `pdf_figure` sidecar only
+  after the provider path exists; OCR shell-outs gated behind
+  availability checks and timeouts.
+- Visual eval (figure/table/chart query set) before multimodal becomes
+  default for any visual kind: text-only extraction via voyage-4 vs
+  visual sidecar via voyage-multimodal-3.5.
 
 ## Acceptance Criteria
 
-- Config can route `code` and `knowledge` to two different Voyage models.
-- Provider config is a typed alias map, while legacy `[embed.providers.voyage]`
-  still parses.
-- Route status reports provider id, endpoint kind, model, dim, dtype, and
-  compatibility family.
-- Stored embeddings use `input_type=document`; query embeddings use
+- Config routes `code` and `knowledge` to different Voyage models; provider
+  config is a typed alias map; legacy config still parses.
+- Stored embeddings send `input_type=document`; queries send
   `input_type=query`.
-- Hybrid search embeds once per compatibility family, not once per arbitrary
-  route string.
-- Equal-dimension incompatible partitions are not searched with the same query
-  vector.
-- Existing legacy config remains readable.
-- A route/model change creates a new partition and does not corrupt old vectors.
-- Orphaned partitions are visible and skipped by normal search unless their
-  compatibility family is still configured.
-- Partition pruning has an explicit dry-run and age threshold.
-- Visual payloads are stored outside Tantivy and are content-hash addressed.
-- Multimodal export is documented separately from text export.
-- `X-PDF` can ship text-first without selecting a visual embedding model.
+- Route status reports provider id, endpoint kind, models (document/query),
+  dim, dtype, and compatibility family.
+- Hybrid search embeds once per compatibility family; the query cache is
+  family-keyed.
+- An asymmetric route (document `voyage-4-large`, query `voyage-4-lite`)
+  works end-to-end; a cross-family asymmetric pair is rejected at config
+  load.
+- Equal-dimension incompatible partitions are never searched with the same
+  query vector; a dtype change alone forces a new family and partition.
+- Orphaned partitions are visible (`list`), skipped by search, and
+  prunable only via explicit dry-run-default tooling with an age threshold.
+- Model rerank is opt-in, A/B-measurable via MRR/recall@k, and degrades to
+  heuristic rerank on API failure with an explicit degraded marker.
+- Contextualized routes never split one document's chunks across batches.
+- Visual payloads live outside Tantivy, content-hash addressed; multimodal
+  export is documented separately from text export.
+- `X-PDF` ships text-first without a visual embedding model.
 
 ## Open Questions
 
-- Should prose defaults use `voyage-4` or `voyage-4-large` for stored corpus?
-  `voyage-4-large` maximizes document quality, but `voyage-4` is a cheaper
-  balanced default. The route model should allow either without code changes.
-- Should Voyage 4 asymmetric retrieval be represented as separate
-  document/query provider ids or as one provider with `document_model` and
-  `query_model` fields?
-- Do we keep `docs` entirely prose-routed, or split code-adjacent docs from
-  general markdown using chunk metadata? Current extension-based bucket
-  selection cannot answer that.
-- What is the right local/offline multimodal fallback, if any?
+- Quantization posture: at ~150K indexed vectors (2026-06-12), float at
+  1024d is cheap; int8/binary buys little until the corpus grows 10–50×.
+  Defer a quantized family until partition size or memory pressure says
+  otherwise?
+- `voyage-context-4` is preview — adopt `-3` now and re-embed on `-4` GA
+  (new family either way), or wait?
+- Local query encoding via open-weight `voyage-4-nano`: worth the
+  inference dependency for offline/latency wins, or keep queries hosted on
+  `voyage-4-lite`?
+- Do we keep `docs` entirely prose-routed, or split code-adjacent docs
+  from general markdown via chunk metadata? Extension-based bucket
+  selection still cannot answer this.
+- Per-project route keys (`per_project` map) should resolve through the
+  shared project resolver from
+  `design/corpus/agentic-corpus/project-taxonomy-standardization.md`
+  (logical project ids/aliases, not paths) — coordinate when that
+  resolver lands.
