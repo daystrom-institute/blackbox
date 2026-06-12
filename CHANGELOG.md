@@ -71,6 +71,16 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `bro_arc_result` MCP tool (gap-55be3518): read a completed workflow arc's
+  structured result — `structuredExit` (vars._structured_exit), final `vars`
+  (filterable via `keys`), `arcThreadId`, `actorSessions`, optional
+  `nodeOutputs` — by arcId or task id, without parsing bro_wait's escaped
+  envelope. Alongside it, the workflow task result envelope no longer
+  duplicates the arc's event log (events stay in the task event log,
+  readable via `bro_status` tail), which shrinks bro_wait's workflow result
+  from ~81k chars to the structured fields; and `bro_wait` / awaited
+  `bro_orchestrate_run` now lift `structuredExit` first-class on workflow
+  tasks.
 - MCP response cap is now lossless: over-cap tool responses (>80KB) are
   spilled to `<state_dir>/response-dumps/` before the inline reply is capped.
   The JSON `response_too_large` envelope gains a `spilled_to` path (full

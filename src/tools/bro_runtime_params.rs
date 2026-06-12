@@ -36,6 +36,19 @@ pub(crate) struct ArcCancelParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ArcResultParams {
+    /// Arc id (`arcId` from bro_orchestrate_run) or the workflow task id.
+    pub(crate) arc_id: String,
+    /// Optional var names to return. When omitted, all final vars are
+    /// included. `_structured_exit` is always surfaced separately.
+    #[serde(default)]
+    pub(crate) keys: Option<Vec<String>>,
+    /// Include per-node prose outputs (can be large). Default false.
+    #[serde(default)]
+    pub(crate) include_node_outputs: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WebhookReplayParams {
     /// Installed webhook name to replay against.
     pub(crate) name: String,

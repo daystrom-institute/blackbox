@@ -14,7 +14,9 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/workflow/arc-structured-result-accessor",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-02T20:26:50Z",
-  "updated_at": "2026-06-02T20:26:50Z"
+  "updated_at": "2026-06-12T17:53:09Z",
+  "resolved_at": "2026-06-12T17:53:09Z",
+  "resolution_note": "Three-part fix in src/tools/orchestrate.rs + src/orchestration/mod.rs: (1) new bro_arc_result MCP tool — reads a completed arc's structuredExit, final vars (filterable via keys), arcThreadId, actorSessions, optional nodeOutputs by arcId or task id; (2) the workflow task result envelope no longer duplicates the arc event log (events live in the task event log, readable via bro_status tail), shrinking the bro_wait result from ~81k chars to the structured fields; (3) bro_wait / awaited bro_orchestrate_run lift structuredExit as a first-class field on workflow tasks. Webhook/SSE-ingress arcs are not task-backed and remain out of scope for the accessor (arc thread carries the audit trail)."
 }

@@ -1210,6 +1210,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bro_arc_status(arc_id="thread-abc12345")"#),
     },
     ToolDoc {
+        name: "bro_arc_result",
+        category: ToolCategory::Workflows,
+        summary: "Read a completed workflow arc's structured result without the event-log bulk: `structuredExit` (vars._structured_exit), final `vars` (optionally filtered by `keys`), `arcThreadId`, and `actorSessions`. Accepts the arcId from bro_orchestrate_run or the workflow task id. `include_node_outputs=true` adds per-node prose. Covers task-backed arcs (bro_orchestrate_run); webhook/SSE-ingress arcs are not task-backed.",
+        when_to_use: "Use after a workflow finishes to consume its output — the replacement for parsing bro_wait's escaped result envelope. `keys` narrows to the vars you actually need (e.g. keys=[\"sieve\"]). Running arcs return {status: running}; pair with bro_arc_status for live position and bbox_notes(thread_id=<arc_thread_id>) for the audit trail.",
+        example: Some(r#"bro_arc_result(arc_id="arc-c60058fe9116dad8465043a39987a76c", keys=["sieve"])"#),
+    },
+    ToolDoc {
         name: "bro_webhook_replay",
         category: ToolCategory::Workflows,
         summary: "Replay an arbitrary payload through an installed webhook's extractor + routing packet WITHOUT dispatching the verdict. Returns the extracted entity, the routing verdict's classification, and the resolved consequent (after `${entity.X}` substitution). Skips signature verification — same path as the HTTP `/webhook/:name/replay` endpoint, surfaced as MCP so routing-rule iteration happens inside the tool surface. Records the replay into the same delivery ring buffer (`source: replay`) so `bro_webhook_deliveries` shows it.",

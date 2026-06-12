@@ -4356,6 +4356,17 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
 
     if let Some(ref msg) = inner.last_assistant_message {
         obj["result"] = Value::String(msg.clone());
+        // Workflow task results are a serialized WorkflowRunResult; lift the
+        // machine-readable exit value out of the escaped envelope so callers
+        // (bro_wait, awaited bro_orchestrate_run) get it first-class instead
+        // of bracket-matching the result string (gap-55be3518).
+        if inner.provider == Provider::Workflow
+            && let Ok(parsed) = serde_json::from_str::<Value>(msg)
+            && let Some(exit) = parsed.get("structured_exit")
+            && !exit.is_null()
+        {
+            obj["structuredExit"] = exit.clone();
+        }
     }
     if inner.interrupted {
         obj["interrupted"] = Value::Bool(true);

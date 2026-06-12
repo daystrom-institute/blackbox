@@ -11,7 +11,7 @@ use crate::server::workflow_capabilities::validate_workflow_capabilities;
 use crate::system_memory;
 use crate::tools::bro_helpers::extract_and_compile_workflow;
 use crate::tools::bro_runtime_params::{
-    ArcCancelParams, ArcSignalParams, ArcStatusParams, CronInstallParams, CronUpcomingParams,
+    ArcCancelParams, ArcResultParams, ArcSignalParams, ArcStatusParams, CronInstallParams, CronUpcomingParams,
     OrchestrateAuthorParams, OrchestrateRunParams, PollerInstallParams, SignalsParams,
     WebhookDeliveriesParams, WebhookInstallParams, WebhookReplayParams, WorkflowInstallParams,
 };
@@ -234,6 +234,13 @@ Constraints:\n\
                     orch::push_in_process_event(&task_for_run, event.clone(), &state.tail_tx);
                 }
             }
+            // Events live in the task event log (streamed above or replayed
+            // by the fallback loop) and are readable via bro_status tail.
+            // Duplicating them in the result envelope made bro_wait return
+            // an ~80KB escaped blob for any nontrivial arc (gap-55be3518);
+            // the envelope keeps only the structured fields.
+            let mut result = result;
+            result.events = Vec::new();
             let result_text = serde_json::to_string(&result).unwrap_or_else(|err| {
                 serde_json::json!({
                     "status": "serialization_error",
@@ -366,6 +373,82 @@ Constraints:\n\
             "snapshot": snap,
             "pending_waits": waits,
         }))
+    }
+
+    #[tool(
+        name = "bro_arc_result",
+        description = "Read a completed workflow arc's structured result without the event-log bulk: `structuredExit` (vars._structured_exit), final `vars` (optionally filtered by `keys`), `arcThreadId`, and `actorSessions`. Accepts the arcId from bro_orchestrate_run or the workflow task id. `include_node_outputs=true` adds per-node prose. Covers task-backed arcs (bro_orchestrate_run); webhook/SSE-ingress arcs are not task-backed."
+    )]
+    pub(crate) async fn bro_arc_result(
+        &self,
+        Parameters(p): Parameters<ArcResultParams>,
+    ) -> CallToolResult {
+        let task = {
+            let store = self.state.task_store.read();
+            store.all_tasks().into_iter().find(|t| {
+                let inner = t.inner.lock();
+                inner.provider == Provider::Workflow
+                    && (inner.session_id == p.arc_id || inner.id == p.arc_id)
+            })
+        };
+        let Some(task) = task else {
+            return Self::err_text(&format!(
+                "no workflow task found for arc/task id {:?}; only bro_orchestrate_run arcs are \
+                 task-backed (webhook/SSE-ingress arcs are not). For live state use \
+                 bro_arc_status; for the audit trail use bbox_notes(thread_id=<arc_thread_id>).",
+                p.arc_id
+            ));
+        };
+        let inner = task.inner.lock();
+        let mut out = serde_json::json!({
+            "taskId": inner.id,
+            "arcId": inner.session_id,
+            "status": inner.status,
+        });
+        if !inner.status.is_terminal() {
+            out["hint"] = Value::String(
+                "arc still running; result vars are available at terminal state — poll \
+                 bro_status(task_id=...) or inspect live position with bro_arc_status"
+                    .to_string(),
+            );
+            return Self::ok_json(&out);
+        }
+        let Some(msg) = inner.last_assistant_message.as_deref() else {
+            out["hint"] = Value::String(
+                "task terminal but no result envelope was captured".to_string(),
+            );
+            return Self::ok_json(&out);
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(msg) else {
+            out["hint"] =
+                Value::String("task result is not a JSON WorkflowRunResult envelope".to_string());
+            return Self::ok_json(&out);
+        };
+        out["workflowStatus"] = parsed.get("status").cloned().unwrap_or(Value::Null);
+        out["structuredExit"] = parsed.get("structured_exit").cloned().unwrap_or(Value::Null);
+        if let Some(thread) = parsed.get("arc_thread_id") {
+            out["arcThreadId"] = thread.clone();
+        }
+        if let Some(sessions) = parsed.get("actor_sessions") {
+            out["actorSessions"] = sessions.clone();
+        }
+        if let Some(Value::Object(vars)) = parsed.get("vars") {
+            let filtered: serde_json::Map<String, Value> = match &p.keys {
+                Some(keys) => vars
+                    .iter()
+                    .filter(|(k, _)| keys.iter().any(|w| w == *k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                None => vars.clone(),
+            };
+            out["vars"] = Value::Object(filtered);
+        }
+        if p.include_node_outputs.unwrap_or(false)
+            && let Some(node_outputs) = parsed.get("node_outputs")
+        {
+            out["nodeOutputs"] = node_outputs.clone();
+        }
+        Self::ok_json(&out)
     }
 
     #[tool(
@@ -725,6 +808,92 @@ mod tests {
         let result: Value = serde_json::from_str(status["result"].as_str().unwrap()).unwrap();
         assert_eq!(result["status"], "completed");
         assert_eq!(result["arc_id"], arc_id);
+    }
+
+    #[tokio::test]
+    async fn bro_arc_result_returns_structured_exit_without_events() {
+        use crate::tools::bro_runtime_params::ArcResultParams;
+        use crate::workflow::{compile, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+        "name": "structured-exit-workflow",
+        "version": 1,
+        "actors": {},
+        "vars_schema": {
+            "_structured_exit": {"kind": "object"},
+            "sieve": {"kind": "string"},
+            "noise": {"kind": "string"}
+        },
+        "nodes": {
+            "Only": {
+                "actor": "",
+                "prompt": "done",
+                "on_enter": [
+                    {"op": "set_var", "args": {"key": "sieve", "value": "kept"}},
+                    {"op": "set_var", "args": {"key": "noise", "value": "dropped"}},
+                    {"op": "set_var", "args": {"key": "_structured_exit", "value": {"verdict": "ok"}}}
+                ],
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Only"
+    }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let (task, arc_id) =
+            server.spawn_workflow_task(compiled, None, Some(5), serde_json::Map::new());
+        assert!(orch::wait_for_task_with_timeout(&task, Some(5.0)).await);
+
+        // The stored envelope is event-free — events live in the task event
+        // log only (gap-55be3518's 81k escaped blob).
+        let status = orch::task_status_json(&task, 5);
+        let envelope: Value = serde_json::from_str(status["result"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["events"], serde_json::json!([]));
+        assert!(status["eventCount"].as_u64().unwrap_or_default() > 1);
+
+        // bro_wait-shaped result lifts structuredExit first-class.
+        let result_json = orch::task_result_json(&task);
+        assert_eq!(result_json["structuredExit"]["verdict"], "ok");
+
+        // bro_arc_result by arc id, vars filtered to the requested keys,
+        // node outputs withheld unless asked for.
+        let r = server
+            .bro_arc_result(Parameters(ArcResultParams {
+                arc_id: arc_id.clone(),
+                keys: Some(vec!["sieve".into()]),
+                include_node_outputs: None,
+            }))
+            .await;
+        let text = r.content[0].as_text().expect("text content").text.clone();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["arcId"], arc_id);
+        assert_eq!(v["workflowStatus"], "completed");
+        assert_eq!(v["structuredExit"]["verdict"], "ok");
+        assert_eq!(v["vars"]["sieve"], "kept");
+        assert!(v["vars"].get("noise").is_none());
+        assert!(v.get("nodeOutputs").is_none());
+
+        // Task-id lookup works too; unknown ids fail with guidance.
+        let by_task = server
+            .bro_arc_result(Parameters(ArcResultParams {
+                arc_id: status["taskId"].as_str().unwrap().to_string(),
+                keys: None,
+                include_node_outputs: Some(true),
+            }))
+            .await;
+        let text = by_task.content[0].as_text().unwrap().text.clone();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["vars"]["noise"], "dropped");
+        assert!(v.get("nodeOutputs").is_some());
+
+        let missing = server
+            .bro_arc_result(Parameters(ArcResultParams {
+                arc_id: "arc-doesnotexist".into(),
+                keys: None,
+                include_node_outputs: None,
+            }))
+            .await;
+        assert_eq!(missing.is_error, Some(true));
     }
 
     #[tokio::test]
