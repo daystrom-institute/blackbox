@@ -582,6 +582,18 @@ impl AgentHandle {
         self.daemon.is_some() && matches!(self.task.inner.lock().status, TaskStatus::Running)
     }
 
+    /// When the `/control/exec`/`/control/resume` request itself failed, the
+    /// handle wraps a local stub (no daemon backing, born `Failed`, error text
+    /// in `stderr`) instead of a daemon task. Returns that error so callers
+    /// can keep their existing row/UI instead of installing the dead stub.
+    pub fn launch_error(&self) -> Option<String> {
+        if self.daemon.is_some() {
+            return None;
+        }
+        let inner = self.task.inner.lock();
+        matches!(inner.status, TaskStatus::Failed).then(|| inner.stderr.clone())
+    }
+
     /// A clone of this handle marking it non-live (a later steer resumes it
     /// rather than driving a dead session). In daemon-only mode there is no
     /// local pipe to drop, so this is a plain clone kept for cockpit API
@@ -2073,19 +2085,28 @@ impl FleetOrchestrator {
     /// the summary row after the resume lands.
     pub fn resume(&self, spec: ResumeSpec) -> AgentHandle {
         let handle = self.daemon.resume(spec);
-        self.task_store
-            .write()
-            .insert_if_absent(handle.id(), handle.task.clone());
+        self.register_resume_handle(&handle);
         handle
     }
 
     /// Async form for TUI workers: await `/control/resume` without blocking draw.
     pub async fn resume_async(&self, spec: ResumeSpec) -> AgentHandle {
         let handle = self.daemon.resume_async(spec).await;
+        self.register_resume_handle(&handle);
+        handle
+    }
+
+    /// A failed `/control/resume` produces a daemon-less stub with a synthetic
+    /// id; registering it would ghost a dead "(session)" row into the roster
+    /// that no daemon delete can ever clear (the daemon 404s unknown ids).
+    /// The caller still has the original row to surface the error on.
+    fn register_resume_handle(&self, handle: &AgentHandle) {
+        if handle.launch_error().is_some() {
+            return;
+        }
         self.task_store
             .write()
             .insert_if_absent(handle.id(), handle.task.clone());
-        handle
     }
 
     /// Drive `/control/closeout` for a focused fleet agent. The daemon returns

@@ -671,6 +671,15 @@ impl BlackboxServer {
         if let Some(service_tier) = p.service_tier.clone() {
             exec_opts.get_or_insert_with(Default::default).service_tier = Some(service_tier);
         }
+        // Operator pins beat the brofile-derived defaults, mirroring exec's
+        // allocator pin semantics. `build_resume_args` normalizes the model id
+        // per provider, so catalog-prefixed ids from the roster are accepted.
+        if let Some(model) = p.pin_model.clone() {
+            exec_opts.get_or_insert_with(Default::default).model = Some(model);
+        }
+        if let Some(effort) = p.pin_effort.clone() {
+            exec_opts.get_or_insert_with(Default::default).effort = Some(effort);
+        }
 
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let task_id = uuid::Uuid::new_v4().to_string();

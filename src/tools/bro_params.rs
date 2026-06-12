@@ -158,6 +158,15 @@ pub(crate) struct ResumeParams {
     /// When absent, resume defers to the brofile/session/harness default.
     #[serde(default)]
     pub(crate) service_tier: Option<String>,
+    /// Model override for the resumed turns. When absent, resume defers to
+    /// the brofile/session default. Same name as the `bro_exec` pin so
+    /// clients (the fleet cockpit) can thread one selection through both.
+    #[serde(default)]
+    pub(crate) pin_model: Option<String>,
+    /// Reasoning-effort override for the resumed turns; absent defers to the
+    /// brofile/session default.
+    #[serde(default)]
+    pub(crate) pin_effort: Option<String>,
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
     pub(crate) allow_recursion: Option<bool>,
@@ -1128,5 +1137,31 @@ mod tests {
             args_schema["type"], "object",
             "atom_invoke.args must be advertised as an object, not a string"
         );
+    }
+
+    /// Contract with the fleet cockpit's `/control/resume` body
+    /// (`bro-fleet-client::resume_body`): every field the cockpit sends must
+    /// deserialize under `deny_unknown_fields`. Regression guard: the
+    /// 2026-06-10 deny_unknown_fields hardening turned the cockpit's
+    /// previously-silently-dropped `pin_model`/`pin_effort` into a 422 on
+    /// every fleet resume (axum Json rejection), which the cockpit surfaced
+    /// as a wiped transcript + "HTTP status client error" flash.
+    #[test]
+    fn resume_params_accept_cockpit_resume_body() {
+        let body = serde_json::json!({
+            "provider": "brodex",
+            "session_id": "sess-1",
+            "prompt": "next turn",
+            "allow_recursion": true,
+            "cwd": "/repo/x",
+            "pin_model": "gpt-5.2-codex",
+            "pin_effort": "high",
+            "service_tier": "priority",
+        });
+        let p: ResumeParams =
+            serde_json::from_value(body).expect("cockpit resume body must deserialize");
+        assert_eq!(p.pin_model.as_deref(), Some("gpt-5.2-codex"));
+        assert_eq!(p.pin_effort.as_deref(), Some("high"));
+        assert_eq!(p.service_tier.as_deref(), Some("priority"));
     }
 }

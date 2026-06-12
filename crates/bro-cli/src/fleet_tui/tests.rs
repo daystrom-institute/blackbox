@@ -2521,3 +2521,109 @@ Trailing paragraph.";
             "build-mismatch banner must be visible when no status flash, got: {text}"
         );
     }
+
+    /// Zoom-view `/rename <name>` is TUI-local and must be matched by
+    /// `run_local_slash` — the unknown-command catch-all would otherwise eat
+    /// it before `submit`'s zone routing (the regression that returned
+    /// "unknown command" for an advertised command).
+    #[test]
+    fn zoom_rename_slash_renames_focused_agent() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        setup_terminal_agent(&mut app, "rename-1", "/rename sharper name");
+
+        submit(&mut app);
+
+        assert_eq!(app.agents[0].name, "sharper name");
+        assert!(app.agents[0].name_overridden, "rename must pin the name");
+        assert!(app.input.is_empty(), "composer must clear after /rename");
+        assert!(
+            app.status.as_deref().is_some_and(|s| s.contains("renamed")),
+            "status should confirm the rename: got {:?}",
+            app.status
+        );
+    }
+
+    /// Bare `/rename` (no argument) surfaces usage instead of steering the
+    /// literal text into the session.
+    #[test]
+    fn zoom_rename_slash_without_arg_shows_usage() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        setup_terminal_agent(&mut app, "rename-2", "/rename");
+
+        submit(&mut app);
+
+        assert_eq!(app.agents[0].name, "agent-rename-2", "name must not change");
+        assert!(
+            app.status.as_deref().is_some_and(|s| s.contains("usage: /rename")),
+            "status should show usage: got {:?}",
+            app.status
+        );
+    }
+
+    /// In the zoom view with a live agent, an unmatched slash command belongs
+    /// to the session (`/compact`, provider-native commands): run_local_slash
+    /// must fall through so `submit` steers it, not eat it as unknown.
+    #[test]
+    fn zoom_unknown_slash_falls_through_to_steer() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        setup_terminal_agent(&mut app, "steer-slash-1", "/compact");
+
+        assert!(
+            !run_local_slash(&mut app),
+            "/compact must fall through to submit's steer routing"
+        );
+        assert!(
+            app.pending_cockpit_lines.is_empty(),
+            "no unknown-command line for session-bound slash input"
+        );
+    }
+
+    /// A failed `/control/resume` returns a daemon-less Failed stub. Installing
+    /// it used to wipe the row's transcript, forget the REAL terminal task from
+    /// the daemon roster, and point the zoom view at a bogus task id. The
+    /// failure must instead keep the row and hand the turn back.
+    #[test]
+    fn install_resume_failure_keeps_row_and_restores_turn() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = make_test_app(rt.handle());
+        setup_terminal_agent(&mut app, "resume-fail-1", "");
+        app.resuming.insert("resume-fail-1".to_string());
+
+        install_resume(
+            &mut app,
+            ResumeOutcome {
+                agent_id: "resume-fail-1".to_string(),
+                task: AgentHandle::for_test(TaskStatus::Failed, "dead-stub"),
+                classifier_cfg: None,
+                text: "the lost turn".to_string(),
+            },
+        );
+
+        assert_eq!(app.agents.len(), 1, "row must survive a failed resume");
+        assert_eq!(
+            app.agents[0].task.id(),
+            "resume-fail-1",
+            "row must keep the real terminal task, not the dead stub"
+        );
+        assert_eq!(
+            app.focused_agent_id.as_deref(),
+            Some("resume-fail-1"),
+            "zoom focus must not repoint at the stub id"
+        );
+        assert_eq!(app.input, "the lost turn", "turn must return to the composer");
+        assert!(!app.resuming.contains("resume-fail-1"), "resume gate must clear");
+        assert!(
+            app.pending_cockpit_lines
+                .first()
+                .is_some_and(|l| l.contains("resume failed")),
+            "failure must surface durably: got {:?}",
+            app.pending_cockpit_lines
+        );
+    }

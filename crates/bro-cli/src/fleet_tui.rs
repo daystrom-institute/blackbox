@@ -1262,6 +1262,9 @@ struct ResumeOutcome {
     agent_id: String,
     task: AgentHandle,
     classifier_cfg: Option<ClassifierConfig>,
+    /// The operator turn the resume carried — restored to the composer when
+    /// the `/control/resume` request itself fails, so the turn isn't lost.
+    text: String,
 }
 
 /// Result of an off-thread steer/interrupt control write, applied on the render
@@ -3140,21 +3143,12 @@ fn submit(app: &mut App) {
         return;
     }
     match app.zone {
-        // Single-agent view: `/rename <name>` is TUI-local; everything else
-        // (including `/compact`) steers the live session — a user-turn into the
-        // bidirectional session (queues at the next turn boundary, §1.1).
+        // Single-agent view: TUI-local commands (`/rename`, …) were already
+        // consumed by `run_local_slash`; everything else (including `/compact`)
+        // steers the live session — a user-turn into the bidirectional session
+        // (queues at the next turn boundary, §1.1).
         Zone::SingleAgent => {
-            if let Some(name) = app.input.trim().strip_prefix("/rename ") {
-                let name = name.trim().to_string();
-                if let Some(idx) = app.selected_agent() {
-                    if !name.is_empty() {
-                        app.agents[idx].name = truncate(&name, NAME_LEN);
-                        app.agents[idx].name_overridden = true;
-                    }
-                }
-                app.clear_input();
-                app.set_status("renamed", Duration::from_secs(2));
-            } else if app.mode.is_standalone() && app.agents.is_empty() {
+            if app.mode.is_standalone() && app.agents.is_empty() {
                 launch_standalone_current_input(app);
             } else {
                 // Terminal-agent guard: if the focused agent is finished /
@@ -3248,25 +3242,55 @@ fn run_local_slash(app: &mut App) -> bool {
             stop_all_running_agents(app);
             true
         }
+        // `/rename <name>` is TUI-local in the zoom view (the roster path is
+        // Ctrl+R). Must be matched here — the catch-all below would otherwise
+        // eat it as an unknown command before `submit`'s zone routing runs.
+        "/rename" if app.zone == Zone::SingleAgent => {
+            rename_focused(app, arg);
+            true
+        }
         _ => {
-            // Unmatched slash command: surface the error with available
-            // commands for the zone. Do NOT fall through to `submit`'s
-            // zone-specific routing — that would dispatch the text as a
-            // new task (roster) or steer it to an agent (single-agent).
-            if input.starts_with('/') {
-                let cmds = zone_slash_commands(app);
-                let names: Vec<&str> = cmds.iter().map(|c| c.name).collect();
-                app.push_cockpit_line(format!(
-                    "unknown command: {cmd} (available: {})",
-                    names.join(", ")
-                ));
-                app.clear_input();
-                true
-            } else {
-                false
+            if !input.starts_with('/') {
+                return false;
             }
+            // In the zoom view with a live agent to steer, an unmatched slash
+            // command belongs to the SESSION, not the cockpit — `/compact` and
+            // provider-native slash commands are delivered as user turns
+            // (§1.1). Fall through to `submit`'s steer routing.
+            let steers_session = app.zone == Zone::SingleAgent
+                && !(app.mode.is_standalone() && app.agents.is_empty());
+            if steers_session {
+                return false;
+            }
+            // Everywhere else the fall-through would dispatch the text as a
+            // NEW task; surface the error with the zone's available commands.
+            let cmds = zone_slash_commands(app);
+            let names: Vec<&str> = cmds.iter().map(|c| c.name).collect();
+            app.push_cockpit_line(format!(
+                "unknown command: {cmd} (available: {})",
+                names.join(", ")
+            ));
+            app.clear_input();
+            true
         }
     }
+}
+
+/// `/rename <name>` in the zoom view: rename the focused agent (TUI-local,
+/// mirrors the roster's Ctrl+R rename).
+fn rename_focused(app: &mut App, arg: &str) {
+    let name = arg.trim();
+    if name.is_empty() {
+        app.set_status("usage: /rename <name>", Duration::from_secs(4));
+        return;
+    }
+    let Some(idx) = app.selected_agent() else {
+        app.set_status("no agent focused", Duration::from_secs(4));
+        return;
+    };
+    app.agents[idx].name = truncate(name, NAME_LEN);
+    app.agents[idx].name_overridden = true;
+    app.set_status("renamed", Duration::from_secs(2));
 }
 
 fn toggle_fast_mode(app: &mut App, arg: &str) {
@@ -3871,7 +3895,7 @@ fn resume_agent(app: &mut App, idx: usize, text: String) {
     let _ = append_history(&app.composer_history_path, &text);
     app.set_status("resuming session…", Duration::from_secs(4));
     app.rt.spawn(async move {
-        let mut spec = ResumeSpec::new(provider, session_id, text);
+        let mut spec = ResumeSpec::new(provider, session_id, text.clone());
         spec.cwd = cwd;
         spec.model = model;
         spec.effort = effort;
@@ -3883,6 +3907,7 @@ fn resume_agent(app: &mut App, idx: usize, text: String) {
             agent_id: old_id,
             task,
             classifier_cfg,
+            text,
         });
     });
 }
@@ -3891,6 +3916,17 @@ fn resume_agent(app: &mut App, idx: usize, text: String) {
 /// pre-resume id, since the roster may have re-sorted while the resume ran).
 fn install_resume(app: &mut App, outcome: ResumeOutcome) {
     app.resuming.remove(&outcome.agent_id);
+    // The `/control/resume` request itself failed: `outcome.task` is a
+    // daemon-less stub, not a live session. Installing it would wipe the
+    // row's transcript and forget the REAL terminal task from the daemon
+    // roster. Keep the row as-is, hand the turn back, surface the error.
+    if let Some(err) = outcome.task.launch_error() {
+        if app.input.trim().is_empty() {
+            app.set_input(outcome.text);
+        }
+        app.push_cockpit_line(format!("resume failed: {err}"));
+        return;
+    }
     let Some(idx) = app
         .agents
         .iter()
