@@ -125,6 +125,15 @@ pub trait Tool: Send + Sync {
     fn annotations(&self) -> ToolAnnotations {
         ToolAnnotations::default()
     }
+    /// Code-mode projection override. When set, the tool is installed in the
+    /// cell as `<namespace>.<method>(...)` — a nested namespace global beside
+    /// `tools` — instead of a flat `tools.*` property. Dispatch is unchanged:
+    /// the cell call routes through the seam by canonical [`Tool::name`]
+    /// (conventionally `"<namespace>.<method>"`), honoring the same filter.
+    /// Domain bindings (`code.*`, `lsp.*`, …) set this; ordinary tools don't.
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        None
+    }
 }
 
 /// Derive a JSON Schema object for a typed tool input.

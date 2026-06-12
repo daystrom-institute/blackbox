@@ -140,12 +140,35 @@ pub struct ToolDefinition {
     pub kind: CodeModeToolKind,
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
+    /// Local addition (not vendored): when set, the tool projects into the
+    /// cell as `<namespace>.<method>(...)` — a nested namespace global
+    /// installed beside `tools` — instead of a flat `tools.*` property. The
+    /// tool still dispatches through the host seam by its canonical `name`,
+    /// honoring the same deny filter. See design/bro-harness/code-mode-cell-dsl.md §5.
+    pub namespace_binding: Option<NamespaceBinding>,
+}
+
+/// Local addition (not vendored): nested-namespace projection for a tool —
+/// the cell-visible `<namespace>.<method>` split of a domain binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NamespaceBinding {
+    /// Namespace global the binding is installed under (e.g. `code`).
+    pub namespace: String,
+    /// Method name on the namespace object (e.g. `items`).
+    pub method: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolNamespaceDescription {
     pub name: String,
     pub description: String,
+    /// Local addition (not vendored): hand-authored TypeScript declaration
+    /// block for the namespace's value types and binding signatures. When
+    /// non-empty it replaces the schema-rendered declarations for the
+    /// namespace's bindings in the exec description (curated cross-binding
+    /// value types like `Span` need authored docs, not generated leaf
+    /// shapes). Empty for plain MCP-prefix grouping entries.
+    pub declarations: String,
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -263,6 +286,15 @@ pub fn build_exec_tool_description(
     if deferred_tools_available {
         sections.push(DEFERRED_NESTED_TOOLS_GUIDANCE.to_string());
     }
+    // Namespace globals are documented regardless of code-mode-only: their
+    // declarations are hand-authored and compact (unlike the schema-rendered
+    // flat catalog below), and a cell cannot discover `code.*`-style globals
+    // from `ALL_TOOLS` alone.
+    if let Some(namespace_reference) =
+        render_namespace_global_reference(enabled_tools, namespace_descriptions)
+    {
+        sections.push(namespace_reference);
+    }
     if !code_mode_only {
         return sections.join("\n\n");
     }
@@ -275,6 +307,11 @@ pub fn build_exec_tool_description(
             .any(|tool| mcp_structured_content_schema(tool.output_schema.as_ref()).is_some());
 
         for tool in enabled_tools {
+            // Namespace-bound bindings are documented in their namespace
+            // section above, and are not properties of `tools`.
+            if tool.namespace_binding.is_some() {
+                continue;
+            }
             let name = tool.name.as_str();
             let nested_description = render_code_mode_sample_for_definition(tool);
             let namespace_description = tool
@@ -362,6 +399,7 @@ pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
         global_name: normalize_code_mode_identifier(&definition.name),
         description: definition.description.clone(),
         kind: definition.kind,
+        namespace_binding: definition.namespace_binding.clone(),
     }
 }
 
@@ -371,6 +409,9 @@ pub struct EnabledToolMetadata {
     pub global_name: String,
     pub description: String,
     pub kind: CodeModeToolKind,
+    /// Local addition (not vendored): nested-namespace projection — see
+    /// [`ToolDefinition::namespace_binding`].
+    pub namespace_binding: Option<NamespaceBinding>,
 }
 
 pub fn render_code_mode_sample(
@@ -388,6 +429,17 @@ pub fn render_code_mode_sample(
 }
 
 fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
+    let (input_name, input_type, output_type) = rendered_signature_types(definition);
+    render_code_mode_sample(
+        &definition.description,
+        &definition.name,
+        input_name,
+        input_type,
+        output_type,
+    )
+}
+
+fn rendered_signature_types(definition: &ToolDefinition) -> (&'static str, String, String) {
     let input_name = match definition.kind {
         CodeModeToolKind::Function => "args",
         CodeModeToolKind::Freeform => "input",
@@ -416,13 +468,73 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
             .map(render_json_schema_to_typescript)
             .unwrap_or_else(|| "unknown".to_string())
     };
-    render_code_mode_sample(
-        &definition.description,
-        &definition.name,
-        input_name,
-        input_type,
-        output_type,
-    )
+    (input_name, input_type, output_type)
+}
+
+/// Local addition (not vendored): document namespace globals — domain
+/// bindings projected as `<namespace>.<method>(...)` beside `tools`. Each
+/// namespace renders one section: its hand-authored declaration block when
+/// the host supplied one ([`ToolNamespaceDescription::declarations`]), or
+/// schema-rendered member signatures as the fallback.
+fn render_namespace_global_reference(
+    enabled_tools: &[ToolDefinition],
+    namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
+) -> Option<String> {
+    let mut grouped: BTreeMap<&str, Vec<&ToolDefinition>> = BTreeMap::new();
+    for tool in enabled_tools {
+        if let Some(binding) = &tool.namespace_binding {
+            grouped
+                .entry(binding.namespace.as_str())
+                .or_default()
+                .push(tool);
+        }
+    }
+    if grouped.is_empty() {
+        return None;
+    }
+
+    let mut sections = vec![
+        "Namespace globals: domain bindings are installed as globals beside `tools` — call them as `await <namespace>.<method>(...)` (for example `await code.items({ file: \"src/lib.rs\" })`), never via `tools.*`. They dispatch like nested tools and honor the same tool filter."
+            .to_string(),
+    ];
+    for (namespace, tools) in grouped {
+        let namespace_ident = normalize_code_mode_identifier(namespace);
+        let mut section = format!("## `{namespace_ident}` namespace");
+        let described = namespace_descriptions.get(namespace);
+        if let Some(description) = described.map(|d| d.description.trim())
+            && !description.is_empty()
+        {
+            section.push('\n');
+            section.push_str(description);
+        }
+        let declarations = described
+            .map(|d| d.declarations.trim())
+            .filter(|d| !d.is_empty());
+        match declarations {
+            Some(declarations) => {
+                section.push_str(&format!("\n```ts\n{declarations}\n```"));
+            }
+            None => {
+                let members = tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let binding = tool.namespace_binding.as_ref()?;
+                        let (input_name, input_type, output_type) = rendered_signature_types(tool);
+                        Some(format!(
+                            "{}({input_name}: {input_type}): Promise<{output_type}>;",
+                            normalize_code_mode_identifier(&binding.method)
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                section.push_str(&format!(
+                    "\n```ts\ndeclare const {namespace_ident}: {{ {members} }};\n```"
+                ));
+            }
+        }
+        sections.push(section);
+    }
+    Some(sections.join("\n\n"))
 }
 
 fn render_code_mode_tool_declaration(
@@ -797,6 +909,7 @@ mod tests {
                 "properties": { "ok": { "type": "boolean" } },
                 "required": ["ok"]
             })),
+            namespace_binding: None,
         };
 
         let description = augment_tool_definition(definition).description;
@@ -842,6 +955,7 @@ mod tests {
                 },
                 "required": ["forecast"]
             })),
+            namespace_binding: None,
         };
 
         let description = augment_tool_definition(definition).description;
@@ -866,6 +980,7 @@ mod tests {
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
                 output_schema: None,
+                namespace_binding: None,
             }],
             &BTreeMap::new(),
             /*code_mode_only*/ true,
@@ -918,6 +1033,7 @@ bar"
             ToolNamespaceDescription {
                 name: "mcp__sample".to_string(),
                 description: "Shared namespace guidance.".to_string(),
+                declarations: String::new(),
             },
         )]);
         let description = build_exec_tool_description(
@@ -937,6 +1053,7 @@ bar"
                         "properties": {},
                         "additionalProperties": false
                     }))),
+                    namespace_binding: None,
                 },
                 ToolDefinition {
                     name: "mcp__sample__beta".to_string(),
@@ -953,6 +1070,7 @@ bar"
                         "properties": {},
                         "additionalProperties": false
                     }))),
+                    namespace_binding: None,
                 },
             ],
             &namespace_descriptions,
@@ -976,6 +1094,7 @@ bar"
             ToolNamespaceDescription {
                 name: "mcp__sample".to_string(),
                 description: String::new(),
+                declarations: String::new(),
             },
         )]);
         let description = build_exec_tool_description(
@@ -994,6 +1113,7 @@ bar"
                     "properties": {},
                     "additionalProperties": false
                 }))),
+                namespace_binding: None,
             }],
             &namespace_descriptions,
             /*code_mode_only*/ true,
@@ -1039,6 +1159,7 @@ bar"
                 "required": ["content"],
                 "additionalProperties": false
             })),
+            namespace_binding: None,
         });
         let second_tool = augment_tool_definition(ToolDefinition {
             name: "mcp__sample__beta".to_string(),
@@ -1073,6 +1194,7 @@ bar"
                 "required": ["content"],
                 "additionalProperties": false
             })),
+            namespace_binding: None,
         });
 
         let description = build_exec_tool_description(
@@ -1084,6 +1206,7 @@ bar"
                     kind: first_tool.kind,
                     input_schema: first_tool.input_schema,
                     output_schema: first_tool.output_schema,
+                    namespace_binding: None,
                 },
                 ToolDefinition {
                     name: second_tool.name,
@@ -1092,6 +1215,7 @@ bar"
                     kind: second_tool.kind,
                     input_schema: second_tool.input_schema,
                     output_schema: second_tool.output_schema,
+                    namespace_binding: None,
                 },
             ],
             &BTreeMap::new(),

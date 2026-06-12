@@ -18,10 +18,11 @@ use async_trait::async_trait;
 use bro_capabilities::{ToolCapability, ToolInvocation};
 use bro_code_mode::{
     CellId, CodeModeNestedToolCall, CodeModeService, CodeModeSessionDelegate, CodeModeToolKind,
-    ExecuteRequest, FunctionCallOutputContentItem, NotificationFuture, PUBLIC_TOOL_NAME,
-    RuntimeResponse, ToolDefinition, ToolInvocationFuture, ToolName, WAIT_TOOL_NAME, WaitOutcome,
-    WaitRequest, build_exec_tool_description, build_wait_tool_description,
-    is_code_mode_nested_tool, parse_exec_source,
+    ExecuteRequest, FunctionCallOutputContentItem, NamespaceBinding, NotificationFuture,
+    PUBLIC_TOOL_NAME, RuntimeResponse, ToolDefinition, ToolInvocationFuture, ToolName,
+    ToolNamespaceDescription, WAIT_TOOL_NAME, WaitOutcome, WaitRequest,
+    build_exec_tool_description, build_wait_tool_description, is_code_mode_nested_tool,
+    parse_exec_source,
 };
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
@@ -435,6 +436,7 @@ pub fn code_mode_tools(
     callable: &[Arc<dyn Tool>],
     seam: Arc<dyn ToolCapability>,
     mode: CodeMode,
+    namespaces: &BTreeMap<String, ToolNamespaceDescription>,
 ) -> Vec<Arc<dyn Tool>> {
     let catalog: Vec<ToolDefinition> = callable
         .iter()
@@ -446,12 +448,15 @@ pub fn code_mode_tools(
             kind: CodeModeToolKind::Function,
             input_schema: Some(t.input_schema()),
             output_schema: None,
+            namespace_binding: t
+                .namespace_binding()
+                .map(|(namespace, method)| NamespaceBinding { namespace, method }),
         })
         .collect();
 
     let description = build_exec_tool_description(
         &catalog,
-        &BTreeMap::new(),
+        namespaces,
         /*code_mode_only*/ mode == CodeMode::Only,
         false,
     );
@@ -511,7 +516,7 @@ mod tests {
             callable.clone(),
             test_cx(),
         ));
-        code_mode_tools(&callable, seam, CodeMode::Only).remove(0)
+        code_mode_tools(&callable, seam, CodeMode::Only, &BTreeMap::new()).remove(0)
     }
 
     #[test]
@@ -566,7 +571,7 @@ mod tests {
             callable.clone(),
             cx.clone(),
         ));
-        let exec = code_mode_tools(&callable, seam, CodeMode::Only).remove(0);
+        let exec = code_mode_tools(&callable, seam, CodeMode::Only, &BTreeMap::new()).remove(0);
         let result = exec
             .call(
                 json!({ "source": "const r = await tools.file_read({ file_path: 'probe.txt' }); text(typeof r === 'string' ? r : JSON.stringify(r));" }),
@@ -638,6 +643,161 @@ mod tests {
         }
     }
 
+    /// Namespace-bound echo: canonical name `ns.echo`, projected into cells
+    /// as the namespace global `ns.echo(...)` instead of `tools.*`.
+    struct NamespacedEcho;
+
+    #[async_trait]
+    impl Tool for NamespacedEcho {
+        fn name(&self) -> &str {
+            "ns.echo"
+        }
+        fn description(&self) -> &str {
+            "Echo the input back from a namespace global."
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn namespace_binding(&self) -> Option<(String, String)> {
+            Some(("ns".to_string(), "echo".to_string()))
+        }
+        async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+            ToolResult::Json(json!({ "echoed": input }))
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_binding_projects_as_namespace_global() {
+        let exec = exec_with(vec![Arc::new(NamespacedEcho) as Arc<dyn Tool>]);
+        let result = exec
+            .call(
+                json!({ "source": "const r = await ns.echo({ a: 1 }); text(JSON.stringify(r));" }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Text(t) => assert!(t.contains("\"a\":1"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_binding_is_absent_from_flat_tools_object() {
+        let exec = exec_with(vec![Arc::new(NamespacedEcho) as Arc<dyn Tool>]);
+        let result = exec
+            .call(
+                json!({ "source": "text(typeof ns.echo); text(typeof tools['ns_echo']); text(typeof tools['ns.echo']);" }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Text(t) => {
+                let lines: Vec<&str> = t.lines().collect();
+                assert_eq!(lines[0], "function", "got: {t}");
+                assert_eq!(lines[1], "undefined", "got: {t}");
+                assert_eq!(lines[2], "undefined", "got: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_binding_dispatches_through_seam_filter() {
+        // The §4.5 deny-bypass guard holds for namespace globals too: in the
+        // projected namespace but absent from the seam ⇒ fail closed.
+        let callable = vec![Arc::new(NamespacedEcho) as Arc<dyn Tool>];
+        let empty_seam: Arc<dyn ToolCapability> =
+            Arc::new(crate::capabilities::HostTools::new(Vec::new(), test_cx()));
+        let exec = code_mode_tools(&callable, empty_seam, CodeMode::Only, &BTreeMap::new()).remove(0);
+        let result = exec
+            .call(json!({ "source": "await ns.echo({ a: 1 });" }), &test_cx())
+            .await;
+        assert!(
+            matches!(result, ToolResult::Error(_)),
+            "denied namespace binding must fail closed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cell_composes_code_facts_bindings() {
+        // Slice-1 proof: a cell chains code.items → code.read over real file
+        // facts, values staying in the isolate, hash-anchored Spans intact.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("probe.rs"),
+            "pub struct Alpha;\n\npub fn beta() -> u8 {\n    7\n}\n",
+        )
+        .unwrap();
+        let cx = ToolCx {
+            root: dir.path().to_path_buf(),
+            safety: Arc::new(bro_tools::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
+            shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
+            edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(BTreeMap::new()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
+            shell_env: Arc::new(Default::default()),
+        };
+        let callable = crate::bindings::binding_tools();
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            cx.clone(),
+        ));
+        let exec = code_mode_tools(
+            &callable,
+            seam,
+            CodeMode::Only,
+            &crate::bindings::namespace_descriptions(),
+        )
+        .remove(0);
+        let source = r#"
+const inv = await code.items({ file: "probe.rs" });
+const beta = inv.items.find(i => i.name === "beta");
+const body = await code.read({ span: beta.span });
+text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
+"#;
+        let result = exec.call(json!({ "source": source }), &cx).await;
+        match result {
+            ToolResult::Text(t) => {
+                assert!(t.contains("rust:function_item:true"), "got: {t}")
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_description_documents_namespace_globals_in_optional_mode() {
+        // D3 regression guard (refactor-v2-pressure-test.md §1): namespace
+        // declarations render even when code_mode != only.
+        let callable = vec![Arc::new(NamespacedEcho) as Arc<dyn Tool>];
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            test_cx(),
+        ));
+        let namespaces = BTreeMap::from([(
+            "ns".to_string(),
+            ToolNamespaceDescription {
+                name: "ns".to_string(),
+                description: "Namespace guidance.".to_string(),
+                declarations: "declare const ns: { echo(args: {}): Promise<unknown>; };"
+                    .to_string(),
+            },
+        )]);
+        let exec = code_mode_tools(&callable, seam, CodeMode::Optional, &namespaces).remove(0);
+        let description = exec.description();
+        assert!(description.contains("## `ns` namespace"), "{description}");
+        assert!(description.contains("Namespace guidance."), "{description}");
+        assert!(
+            description.contains("declare const ns: { echo(args: {}): Promise<unknown>; };"),
+            "{description}"
+        );
+        assert!(
+            description.contains("installed as globals beside `tools`"),
+            "{description}"
+        );
+    }
+
     #[tokio::test]
     async fn denied_tool_fails_closed_in_cell() {
         // `echo` is in the projected namespace but NOT in the seam — the §4.5
@@ -645,7 +805,7 @@ mod tests {
         let callable = vec![Arc::new(Echo) as Arc<dyn Tool>];
         let empty_seam: Arc<dyn ToolCapability> =
             Arc::new(crate::capabilities::HostTools::new(Vec::new(), test_cx()));
-        let exec = code_mode_tools(&callable, empty_seam, CodeMode::Only).remove(0);
+        let exec = code_mode_tools(&callable, empty_seam, CodeMode::Only, &BTreeMap::new()).remove(0);
         let result = exec
             .call(
                 json!({ "source": "await tools.echo({ a: 1 });" }),

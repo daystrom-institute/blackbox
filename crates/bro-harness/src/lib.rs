@@ -5,6 +5,7 @@
 //! changing the existing subprocess entrypoint.
 
 pub mod agent_loop;
+pub mod bindings;
 pub mod bound;
 pub mod capabilities;
 pub mod cli;

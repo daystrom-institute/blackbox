@@ -986,6 +986,7 @@ mod tests {
             kind: CodeModeToolKind::Function,
             input_schema: None,
             output_schema: None,
+            namespace_binding: None,
         }
     }
 
@@ -1275,6 +1276,7 @@ mod tests {
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
                     output_schema: None,
+                    namespace_binding: None,
                 }],
                 source: r#"
 await Promise.all([
@@ -1322,6 +1324,7 @@ await Promise.all([
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
                     output_schema: None,
+                    namespace_binding: None,
                 }],
                 source: r#"
 setTimeout(() => {

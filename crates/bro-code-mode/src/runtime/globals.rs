@@ -31,6 +31,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let exit = helper_function(scope, "exit", exit_callback)?;
 
     set_global(scope, global, "tools", tools.into())?;
+    install_namespace_globals(scope, global)?;
     set_global(scope, global, "ALL_TOOLS", all_tools)?;
     set_global(scope, global, "clearTimeout", clear_timeout.into())?;
     set_global(scope, global, "setTimeout", set_timeout.into())?;
@@ -54,12 +55,80 @@ fn build_tools_object<'s>(
         .unwrap_or_default();
 
     for (tool_index, tool) in enabled_tools.iter().enumerate() {
+        // Namespace-bound bindings project as `<namespace>.<method>` globals
+        // (install_namespace_globals), not as flat `tools.*` properties.
+        if tool.namespace_binding.is_some() {
+            continue;
+        }
         let name = v8::String::new(scope, &tool.global_name)
             .ok_or_else(|| "failed to allocate tool name".to_string())?;
         let function = tool_function(scope, tool_index)?;
         tools.set(scope, name.into(), function.into());
     }
     Ok(tools)
+}
+
+/// Globals the runtime owns; a namespace global may not shadow them.
+const RESERVED_GLOBALS: [&str; 11] = [
+    "tools",
+    "ALL_TOOLS",
+    "text",
+    "image",
+    "store",
+    "load",
+    "notify",
+    "yield_control",
+    "exit",
+    "setTimeout",
+    "clearTimeout",
+];
+
+/// Local addition (not vendored): install nested namespace objects for tools
+/// carrying a [`NamespaceBinding`](crate::description::NamespaceBinding) —
+/// e.g. a tool named `code.items` bound to namespace `code` / method `items`
+/// becomes `await code.items(...)` in the cell. Dispatch is identical to
+/// `tools.*`: the same per-index trampoline, the same host seam and filter.
+fn install_namespace_globals<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+) -> Result<(), String> {
+    let enabled_tools = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| state.enabled_tools.clone())
+        .unwrap_or_default();
+
+    let mut grouped: std::collections::BTreeMap<String, Vec<(String, usize)>> =
+        std::collections::BTreeMap::new();
+    for (tool_index, tool) in enabled_tools.iter().enumerate() {
+        if let Some(binding) = &tool.namespace_binding {
+            grouped
+                .entry(crate::description::normalize_code_mode_identifier(
+                    &binding.namespace,
+                ))
+                .or_default()
+                .push((
+                    crate::description::normalize_code_mode_identifier(&binding.method),
+                    tool_index,
+                ));
+        }
+    }
+
+    for (namespace, methods) in grouped {
+        if RESERVED_GLOBALS.contains(&namespace.as_str()) {
+            return Err(format!(
+                "namespace global `{namespace}` would shadow a runtime global"
+            ));
+        }
+        let object = v8::Object::new(scope);
+        for (method, tool_index) in methods {
+            let key = v8::String::new(scope, &method)
+                .ok_or_else(|| "failed to allocate namespace method name".to_string())?;
+            let function = tool_function(scope, tool_index)?;
+            object.set(scope, key.into(), function.into());
+        }
+        set_global(scope, global, &namespace, object.into())?;
+    }
+    Ok(())
 }
 
 fn build_all_tools_value<'s>(

@@ -28,6 +28,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_ENV_LOCK.lock().expect("test env lock poisoned")
 }
 
+pub mod facts;
 mod rust;
 use rust::*;
 mod java;

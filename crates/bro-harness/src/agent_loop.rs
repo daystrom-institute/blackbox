@@ -842,6 +842,16 @@ impl Session {
         // and `only` register + pin them; `only` additionally hides the flat
         // builtins from the wire array (below), making exec/wait the surface.
         if code_mode.enables_code_surface() {
+            // Domain bindings (code-mode-cell-dsl.md §5): cell-only constructs
+            // projected as namespace globals (`code.*`). They join the callable
+            // set + seam — the surface ToolFilter still gates them by canonical
+            // name — but never the flat wire registry: a binding exists only
+            // inside cells.
+            cm_callable.extend(
+                crate::bindings::binding_tools()
+                    .into_iter()
+                    .filter(|t| tool_filter.permits(t.name())),
+            );
             let cm_seam: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
                 crate::capabilities::HostTools::new(cm_callable.clone(), cx.clone()),
             );
@@ -849,6 +859,7 @@ impl Session {
                 &cm_callable,
                 cm_seam,
                 code_mode,
+                &crate::bindings::namespace_descriptions(),
             ));
             pin.also_pin(bro_code_mode::PUBLIC_TOOL_NAME);
             pin.also_pin(bro_code_mode::WAIT_TOOL_NAME);

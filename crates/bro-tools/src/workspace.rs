@@ -283,8 +283,9 @@ fn is_sensitive_env_key(key: &str) -> bool {
 /// Resolve a caller-supplied path against the effective worktree root and
 /// refuse escapes (`..`, absolute paths outside root, symlink traversal).
 /// Shared with the `shell` module so shell `cwd` resolution uses the same
-/// confinement.
-pub(crate) fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+/// confinement, and pub for harness domain bindings (`code.*`) so cell-facing
+/// file access composes the same guard.
+pub fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     let root = effective_root(root);
     let joined = if Path::new(rel).is_absolute() {
         PathBuf::from(rel)
