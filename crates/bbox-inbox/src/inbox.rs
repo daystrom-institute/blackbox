@@ -41,12 +41,26 @@ pub struct InboxParams {
 
 // ── Aggregator ────────────────────────────────────────────────────
 
+/// One vector partition whose HNSW connectivity has degraded past the
+/// notify threshold — live vector-recall risk (gap-1168b0bd). Plain rows
+/// like `failed_task_rows`: the vector store sits outside this crate's
+/// DAG, so the adapter in the daemon's attention tool builds these from
+/// partition metrics.
+#[derive(Debug, Clone)]
+pub struct VectorConnectivityAlert {
+    pub route: String,
+    pub active_nodes: usize,
+    pub zero_in_degree_nodes: usize,
+    pub risk_ratio: f32,
+}
+
 pub fn compute_inbox(
     kb: &Knowledge,
     threads: &Threads,
     notes: &Notes,
     gaps: &GapStore,
     failed_task_rows: &[(String, String, u64)],
+    vector_alerts: &[VectorConnectivityAlert],
     whiteboards: &WhiteboardRegistry,
     p: &InboxParams,
 ) -> Result<String> {
@@ -73,6 +87,26 @@ pub fn compute_inbox(
                 n.kind,
                 n.id,
                 truncate(&n.body, 120)
+            ));
+        }
+        out.push('\n');
+    }
+
+    // 1b. Vector connectivity risk — host-level search-recall degradation
+    // (gap-1168b0bd). Not project-filtered: orphaned vectors degrade
+    // retrieval for every project on the host.
+    if !vector_alerts.is_empty() {
+        out.push_str(&format!(
+            "## Vector connectivity risk ({})\n",
+            vector_alerts.len()
+        ));
+        for alert in vector_alerts {
+            out.push_str(&format!(
+                "  {} — {:.2}% of {} active vectors unreachable ({} zero-in-degree); schedule a rebuild via embed-compaction-arc\n",
+                alert.route,
+                alert.risk_ratio * 100.0,
+                alert.active_nodes,
+                alert.zero_in_degree_nodes,
             ));
         }
         out.push('\n');
@@ -869,6 +903,7 @@ mod tests {
             &notes,
             &gaps,
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -883,6 +918,50 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("clean plate"));
+    }
+
+    /// Connectivity alerts are host-level recall risk: they render their own
+    /// section, survive a project filter, and defeat the clean plate.
+    #[test]
+    fn inbox_surfaces_vector_connectivity_alerts() {
+        let dir = tempdir().unwrap();
+        let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        let threads = Threads::open(&dir.path().join("th.json")).unwrap();
+        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = empty_gaps(&dir);
+        let whiteboards = WhiteboardRegistry::new();
+        let alerts = vec![VectorConnectivityAlert {
+            route: "voyage-1024".into(),
+            active_nodes: 399_000,
+            zero_in_degree_nodes: 12_000,
+            risk_ratio: 0.0301,
+        }];
+
+        let out = compute_inbox(
+            &kb,
+            &threads,
+            &notes,
+            &gaps,
+            &[],
+            &alerts,
+            &whiteboards,
+            &InboxParams {
+                project: Some("/repo/unrelated-project".into()),
+                limit: None,
+                stale_days: None,
+                include_tasks: None,
+                import_gap_spool: None,
+                aggregate_gaps: None,
+                check_gap_closeouts: None,
+                gap_commit_range: None,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("## Vector connectivity risk (1)"));
+        assert!(out.contains("voyage-1024"));
+        assert!(out.contains("3.01%"));
+        assert!(out.contains("embed-compaction-arc"));
+        assert!(!out.contains("clean plate"));
     }
 
     #[test]
@@ -1025,6 +1104,7 @@ mod tests {
             &notes,
             &gaps,
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -1087,6 +1167,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &whiteboards,
             &InboxParams {
@@ -1183,6 +1264,7 @@ mod tests {
             &notes,
             &gaps,
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
@@ -1245,6 +1327,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &whiteboards,
             &InboxParams {
@@ -1315,6 +1398,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &whiteboards,
             &InboxParams {

@@ -277,6 +277,21 @@ pub fn try_metrics() -> Option<BTreeMap<String, PartitionMetrics>> {
     try_global().map(|store| store.metrics())
 }
 
+/// Non-blocking partition metrics: None during cold-start warmup, and
+/// partitions under an active write-lock hold (rebuild) are omitted.
+pub fn metrics_nonblocking() -> Option<BTreeMap<String, PartitionMetrics>> {
+    try_global().map(|store| store.metrics_nonblocking())
+}
+
+/// Sampled self-recall probe against the installed global store. Degrades to
+/// Ok(None) during cold-start warmup (same contract as `try_metrics`).
+pub fn self_recall_probe(route: &str, sample_every: usize, k: usize) -> Result<Option<f64>> {
+    let Some(store) = try_global() else {
+        return Ok(None);
+    };
+    store.self_recall_probe(route, sample_every, k)
+}
+
 pub fn default_vectors_dir() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {
@@ -531,11 +546,47 @@ impl VectorStore {
         self.partitions.read().len()
     }
 
+    /// Sampled self-recall diagnostic for one route (gap-1168b0bd c).
+    /// O(sample × search) — operator-invoked probe, never a metrics()-path
+    /// stat. Uses `try_read` so a probe issued during a long write-lock
+    /// rebuild errors with "busy" instead of hanging the caller; returns
+    /// Ok(None) when the partition has no graph yet.
+    pub fn self_recall_probe(
+        &self,
+        route: &str,
+        sample_every: usize,
+        k: usize,
+    ) -> Result<Option<f64>> {
+        let partition = self.partition(route)?;
+        let guard = partition.try_read().ok_or_else(|| {
+            anyhow::anyhow!("partition {route} is busy (rebuild/compaction in progress)")
+        })?;
+        Ok(guard
+            .hnsw
+            .as_ref()
+            .map(|hnsw| hnsw.self_recall_probe(sample_every, k)))
+    }
+
     pub fn metrics(&self) -> BTreeMap<String, PartitionMetrics> {
         self.partitions
             .read()
             .iter()
             .map(|(route, partition)| (route.clone(), partition.read().metrics()))
+            .collect()
+    }
+
+    /// Like `metrics()` but skips partitions whose lock is held (e.g. a
+    /// long write-lock rebuild). For surfaces that must never block behind
+    /// compaction — the inbox attention layer reads through this.
+    pub fn metrics_nonblocking(&self) -> BTreeMap<String, PartitionMetrics> {
+        self.partitions
+            .read()
+            .iter()
+            .filter_map(|(route, partition)| {
+                partition
+                    .try_read()
+                    .map(|guard| (route.clone(), guard.metrics()))
+            })
             .collect()
     }
 
@@ -582,6 +633,31 @@ pub struct PartitionMetrics {
     pub deleted_ratio: f32,
     pub hnsw_rebuilds: usize,
     pub hnsw: Option<HnswMetricsSerde>,
+}
+
+impl PartitionMetrics {
+    /// Fraction of active nodes unreachable by graph traversal
+    /// (`zero_in_degree_nodes / active_nodes`) — vector-recall risk
+    /// (gap-1168b0bd). 0.0 for empty or graph-less partitions. Below
+    /// `MIN_CONNECTIVITY_GUARD_NODES` active nodes the ratio is noise;
+    /// gate consumers must check that floor, this is the raw fraction.
+    pub fn connectivity_risk_ratio(&self) -> f32 {
+        let Some(hnsw) = &self.hnsw else { return 0.0 };
+        if hnsw.active_nodes == 0 {
+            return 0.0;
+        }
+        hnsw.zero_in_degree_nodes as f32 / hnsw.active_nodes as f32
+    }
+
+    /// True when this partition's connectivity degradation merits attention
+    /// at `threshold` (and the partition is large enough for the ratio to
+    /// be signal rather than noise).
+    pub fn connectivity_breach(&self, threshold: f32) -> bool {
+        self.hnsw
+            .as_ref()
+            .is_some_and(|hnsw| hnsw.active_nodes >= MIN_CONNECTIVITY_GUARD_NODES)
+            && self.connectivity_risk_ratio() >= threshold
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -699,6 +775,25 @@ const COMPACT_INTERVAL_SECS: u64 = 300;
 const COMPACT_DELETED_RATIO: f32 = 0.30;
 const COMPACT_MIN_DELETED_ENTRIES: usize = 10_000;
 const COMPACT_MIN_WAL_SURPLUS_RECORDS: usize = 100_000;
+
+/// Connectivity thresholds (gap-1168b0bd). These gate the WORKFLOW
+/// compaction lane (embed-compaction-arc: quiesce → rebuild → swap) and the
+/// inbox attention layer — deliberately NOT the in-process periodic
+/// compactor above, because a connectivity-triggered rebuild holds the
+/// partition write lock for the full rebuild (~25 min at 399k×1024d) and
+/// must not fire unquiesced on a 5-minute tick.
+///
+/// Fraction is `zero_in_degree_nodes / active_nodes` — the leading
+/// indicator of reverse-edge orphaning. Calibration from the gap-2eabd96d
+/// incident: 16.7% disconnected at detection; ~1.4% residual
+/// (exact-duplicate degeneracy) after rebuild; healthy partitions sit
+/// ≤0.3%.
+pub const COMPACT_CONNECTIVITY_RATIO: f32 = 0.05;
+pub const NOTIFY_CONNECTIVITY_RATIO: f32 = 0.02;
+/// Partitions smaller than this have rebuilds cheap enough that the
+/// deleted-ratio gate covers them; connectivity ratios on tiny graphs are
+/// also noisy (one orphan in 50 nodes is 2%).
+pub const MIN_CONNECTIVITY_GUARD_NODES: usize = 1_000;
 
 #[derive(Debug, Clone, Copy)]
 struct CompactionStats {
@@ -1679,6 +1774,99 @@ mod tests {
         assert_eq!(empty.dims, 2);
         assert_eq!(empty.active_count, 0);
         assert_eq!(empty.state, PartitionState::Empty);
+    }
+
+    fn metrics_with_connectivity(active_nodes: usize, zero_in: usize) -> PartitionMetrics {
+        PartitionMetrics {
+            route: "voyage-1024".into(),
+            state: PartitionState::Active { dims: 2 },
+            dims: 2,
+            wal_records: active_nodes,
+            active_count: active_nodes,
+            deleted_count: 0,
+            deleted_ratio: 0.0,
+            hnsw_rebuilds: 0,
+            hnsw: Some(HnswMetricsSerde {
+                total_nodes: active_nodes,
+                active_nodes,
+                deleted_nodes: 0,
+                dimensions: 2,
+                max_level: 0,
+                entry_point: Some(0),
+                neighbor_refs: active_nodes * 4,
+                avg_neighbor_degree: 4.0,
+                layer_distribution: vec![active_nodes],
+                disconnected_nodes: zero_in,
+                zero_in_degree_nodes: zero_in,
+            }),
+        }
+    }
+
+    #[test]
+    fn connectivity_risk_ratio_is_zero_in_over_active() {
+        let metrics = metrics_with_connectivity(10_000, 600);
+        assert!((metrics.connectivity_risk_ratio() - 0.06).abs() < 1e-6);
+
+        let healthy = metrics_with_connectivity(10_000, 0);
+        assert_eq!(healthy.connectivity_risk_ratio(), 0.0);
+
+        let graphless = PartitionMetrics {
+            hnsw: None,
+            ..metrics_with_connectivity(10_000, 600)
+        };
+        assert_eq!(graphless.connectivity_risk_ratio(), 0.0);
+    }
+
+    #[test]
+    fn connectivity_breach_requires_threshold_and_size_floor() {
+        // Over threshold, over the size floor: breach.
+        assert!(metrics_with_connectivity(10_000, 600)
+            .connectivity_breach(COMPACT_CONNECTIVITY_RATIO));
+        // Under threshold: no breach.
+        assert!(!metrics_with_connectivity(10_000, 100)
+            .connectivity_breach(COMPACT_CONNECTIVITY_RATIO));
+        // Tiny partition: ratio is noise, never a breach regardless of value.
+        assert!(!metrics_with_connectivity(50, 10).connectivity_breach(COMPACT_CONNECTIVITY_RATIO));
+    }
+
+    #[test]
+    fn self_recall_probe_reports_healthy_partition_near_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for idx in 0..32 {
+            let theta = idx as f32 * 0.1;
+            store
+                .upsert(
+                    "voyage-1024",
+                    &format!("id-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin()],
+                )
+                .unwrap();
+        }
+        let recall = store
+            .self_recall_probe("voyage-1024", 1, 5)
+            .unwrap()
+            .expect("partition has a graph");
+        assert!(recall > 0.9, "healthy graph self-recall was {recall}");
+    }
+
+    #[test]
+    fn metrics_nonblocking_skips_write_locked_partitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("route-a", "a", "h1", vec![1.0, 0.0])
+            .unwrap();
+        store
+            .upsert("route-b", "b", "h2", vec![0.0, 1.0])
+            .unwrap();
+
+        let partition_a = store.partition("route-a").unwrap();
+        let _write_hold = partition_a.write();
+        let metrics = store.metrics_nonblocking();
+        assert!(!metrics.contains_key("route-a"));
+        assert!(metrics.contains_key("route-b"));
     }
 
     #[test]

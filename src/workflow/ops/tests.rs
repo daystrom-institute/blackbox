@@ -1257,6 +1257,42 @@ async fn embed_compaction_arc_gates_against_vector_status_vars() {
     assert_eq!(after.deleted_count, 0);
 }
 
+/// read_vector_status must emit the connectivity fields the v2
+/// compaction-policy packet gates on (gap-1168b0bd), and must not nominate
+/// a connectivity route for partitions below the size floor where the
+/// ratio is noise.
+#[tokio::test]
+async fn read_vector_status_reports_connectivity_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vector_store = Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+    let _guard = vectors::install_test_global(vector_store.clone());
+    let route = "test-connectivity-route";
+    for idx in 0..8 {
+        let theta = idx as f32 * 0.2;
+        vector_store
+            .upsert(
+                route,
+                &format!("entity-{idx}"),
+                &format!("hash-{idx}"),
+                vec![theta.cos(), theta.sin()],
+            )
+            .unwrap();
+    }
+
+    let effect = exec_read_vector_status(&json!({}), None).unwrap();
+    let OpEffect::SetVar { key, value } = effect else {
+        panic!("read_vector_status should set a var");
+    };
+    assert_eq!(key, "vector_status");
+    assert_eq!(value["max_connectivity_ratio"], json!(0.0));
+    assert!(
+        value["max_connectivity_route"].is_null(),
+        "an 8-node partition sits below MIN_CONNECTIVITY_GUARD_NODES and \
+         must not be nominated: {value}"
+    );
+    assert_eq!(value["max_deleted_route"], json!(route));
+}
+
 #[tokio::test]
 async fn write_semantic_edge_projects_describes_sidecar() {
     let tmp = tempfile::tempdir().unwrap();

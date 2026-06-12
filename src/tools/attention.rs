@@ -110,12 +110,14 @@ impl BlackboxServer {
             let gaps = server.state.gaps.read();
             let task_store = server.state.task_store.read();
             let failed_rows = collect_failed_tasks(&task_store);
+            let vector_alerts = collect_vector_connectivity_alerts();
             let inbox = inbox::compute_inbox(
                 &kb,
                 &threads,
                 &notes,
                 &gaps,
                 &failed_rows,
+                &vector_alerts,
                 &server.state.whiteboards,
                 &p,
             )?;
@@ -226,6 +228,30 @@ mod tests {
                 .is_none()
         );
     }
+}
+
+/// HNSW connectivity breaches for the inbox (gap-1168b0bd b). Caller-side
+/// adapter like `collect_failed_tasks`: the inbox crate sits below
+/// bbox-vectors in the DAG and takes plain rows. Reads non-blocking
+/// metrics so the inbox never stalls behind a long write-lock rebuild,
+/// and degrades to empty during cold-start warmup.
+fn collect_vector_connectivity_alerts() -> Vec<crate::inbox::VectorConnectivityAlert> {
+    let Some(metrics) = bbox_vectors::metrics_nonblocking() else {
+        return Vec::new();
+    };
+    metrics
+        .into_values()
+        .filter(|m| m.connectivity_breach(bbox_vectors::NOTIFY_CONNECTIVITY_RATIO))
+        .map(|m| {
+            let hnsw = m.hnsw.as_ref().expect("breach implies hnsw metrics");
+            crate::inbox::VectorConnectivityAlert {
+                route: m.route.clone(),
+                active_nodes: hnsw.active_nodes,
+                zero_in_degree_nodes: hnsw.zero_in_degree_nodes,
+                risk_ratio: m.connectivity_risk_ratio(),
+            }
+        })
+        .collect()
 }
 
 /// Extract (task_id, provider, started_at) rows for every failed task.

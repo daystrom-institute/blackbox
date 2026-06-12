@@ -1,6 +1,6 @@
 {
   "domain": "embed/compaction-policy",
-  "version": 1,
+  "version": 2,
   "scope": "global",
   "classification_lattice": ["compact", "notify", "skip"],
   "rules": [
@@ -15,12 +15,32 @@
       "consequent": "compact"
     },
     {
+      "id": "compact_connectivity_over_5pct",
+      "classification": "compact",
+      "antecedent": {
+        "op": "GtF",
+        "field": "vars.vector_status.max_connectivity_ratio",
+        "value": 0.05
+      },
+      "consequent": "compact"
+    },
+    {
       "id": "notify_deleted_ratio_over_15pct",
       "classification": "notify",
       "antecedent": {
         "op": "GtF",
         "field": "vars.vector_status.max_deleted_ratio",
         "value": 0.15
+      },
+      "consequent": "notify"
+    },
+    {
+      "id": "notify_connectivity_over_2pct",
+      "classification": "notify",
+      "antecedent": {
+        "op": "GtF",
+        "field": "vars.vector_status.max_connectivity_ratio",
+        "value": 0.02
       },
       "consequent": "notify"
     },

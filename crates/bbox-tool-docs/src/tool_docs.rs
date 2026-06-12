@@ -230,9 +230,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_embed_status",
         category: ToolCategory::Transcripts,
-        summary: "Return route embedding health and health_reason.",
-        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, and sanitized error",
-        example: None,
+        summary: "Return route embedding health and health_reason. recall_probe_route runs a sampled HNSW self-recall probe against that vector partition (vector-recall diagnostic, seconds on large partitions).",
+        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, and sanitized error. Pass recall_probe_route (a vector partition, e.g. \"voyage-1024\") for a sampled HNSW self-recall probe — the connectivity diagnostic for reverse-edge orphaning; ~1.0 is healthy. O(sample x search): seconds on large partitions, errors \"busy\" mid-rebuild.",
+        example: Some("bbox_embed_status(recall_probe_route=\"voyage-1024\")"),
     },
     ToolDoc {
         name: "bbox_topics",

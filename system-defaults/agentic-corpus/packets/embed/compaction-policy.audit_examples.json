@@ -11,6 +11,50 @@
         }
       },
       "expected": "compact"
+    },
+    {
+      "entity": {
+        "vars": {
+          "vector_status": {
+            "max_deleted_ratio": 0.05,
+            "max_connectivity_ratio": 0.08
+          }
+        }
+      },
+      "expected": "compact"
+    },
+    {
+      "entity": {
+        "vars": {
+          "vector_status": {
+            "max_deleted_ratio": 0.2,
+            "max_connectivity_ratio": 0.01
+          }
+        }
+      },
+      "expected": "notify"
+    },
+    {
+      "entity": {
+        "vars": {
+          "vector_status": {
+            "max_deleted_ratio": 0.05,
+            "max_connectivity_ratio": 0.03
+          }
+        }
+      },
+      "expected": "notify"
+    },
+    {
+      "entity": {
+        "vars": {
+          "vector_status": {
+            "max_deleted_ratio": 0.05,
+            "max_connectivity_ratio": 0.005
+          }
+        }
+      },
+      "expected": "skip"
     }
   ]
 }
