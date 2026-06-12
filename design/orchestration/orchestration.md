@@ -18,6 +18,7 @@ agentic work.
 - [Atom System - Implementation Plan](atoms/atom-system-impl.md)
 - [Agent System](agents/agent-system.md)
 - [Agent System - Implementation Skeleton](agents/agent-system-impl.md)
+- [Consultant Runtime - Badgey dissolution](agents/consultant-runtime.md)
 - [Atom Capability Runtime](atoms/atom-capability-runtime.md)
 
 ## Provider Transport & Cockpit (moved out)
