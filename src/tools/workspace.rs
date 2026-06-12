@@ -506,6 +506,7 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
             "tool_outcome": doc_text(&doc, fields.tool_outcome),
             "session_id":   doc_text(&doc, fields.session_id),
             "project":      doc_text(&doc, fields.project),
+            "base_project_id": doc_text(&doc, fields.base_project_id),
             "timestamp":    doc_text(&doc, fields.timestamp),
             "task_id":      doc_text(&doc, fields.task_id),
         }));
@@ -524,11 +525,17 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
         });
     }
     if let Some(ref project) = p.project {
+        // Substring on the literal cwd OR exact match on the stamped base
+        // project (gap-72fd5932) — a base-project selector matches calls
+        // made from every checkout/worktree of the project.
+        let filter_base = idx.base_project_filter_id(project);
         rows.retain(|r| {
             r["project"]
                 .as_str()
                 .unwrap_or("")
                 .contains(project.as_str())
+                || (filter_base.is_some()
+                    && r["base_project_id"].as_str() == filter_base.as_deref())
         });
     }
     if let Some(ref since) = p.since {

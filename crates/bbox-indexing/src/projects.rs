@@ -554,43 +554,12 @@ fn in_tree_linked_worktree_top(path: &Path, root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a caller-supplied filesystem path to the registered project that
-/// owns it, for project-scoped RETRIEVAL (index / graph / knowledge scope
-/// resolution). Acceptance, in order:
-///
-/// 1. the path is a registered root or a descendant of one → that record.
-///    Covers plain subdirectories AND in-tree worktrees (e.g.
-///    `.claude/worktrees/<name>` under the repo) — both scope to the root
-///    project for retrieval purposes.
-/// 2. the path is inside any git worktree whose common dir matches a
-///    registered project's → that record. Covers out-of-tree worktrees —
-///    fleet (`bro-fleet/*`), agent dispatch, workflow arcs — regardless of
-///    branch name or parent directory.
-///
-/// This is intentionally broader than [`resolve_managed_fleet_worktree`]:
-/// scope resolution here is read-only (which corpus do I query?), so aliasing
-/// an arbitrary user worktree of a registered repo to its base project is
-/// harmless and exactly what a caller scoping a query wants. Write-side
-/// aliasing (gaps/threads/slices/code_nav) keeps the conservative managed
-/// gate. Returns `None` for paths no registered project owns; callers keep
-/// their existing fallback (deterministic path-hash id, raw filter, etc.).
-pub fn resolve_base_project_for_scope<'a>(
-    path: &str,
-    projects: &'a [ProjectRecord],
-) -> Option<&'a ProjectRecord> {
-    let canonical = fs::canonicalize(path).ok()?;
-    if let Some(record) = projects.iter().find(|project| {
-        let root = Path::new(&project.canonical_path);
-        canonical == root || canonical.starts_with(root)
-    }) {
-        return Some(record);
-    }
-    let common = bbox_corpus_core::git::git_common_dir(&canonical)?;
-    projects.iter().find(|project| {
-        bbox_corpus_core::git::git_common_dir(Path::new(&project.canonical_path))
-            .is_some_and(|base_common| base_common == common)
-    })
-}
+// Read-side base-project resolution lives in bbox-corpus-core (next to
+// ProjectRecord) so index ingest passes below this crate can stamp docs
+// with it; re-exported here for the daemon-side callers. The write-side
+// aliasing gates (gaps/threads/slices/code_nav) stay with the conservative
+// [`resolve_managed_fleet_worktree`] in this module.
+pub use bbox_corpus_core::project_record::resolve_base_project_for_scope;
 
 /// For surfaces that both READ project-scoped state and WRITE files into the
 /// project directory (e.g. `bbox_render` scope=project): resolve a path to

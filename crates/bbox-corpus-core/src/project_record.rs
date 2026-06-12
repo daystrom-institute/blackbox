@@ -71,6 +71,44 @@ pub struct CheckoutContext {
     pub managed: bool,
 }
 
+/// Resolve a caller-supplied filesystem path to the registered project that
+/// owns it, for project-scoped RETRIEVAL (index / graph / knowledge scope
+/// resolution). Acceptance, in order:
+///
+/// 1. the path is a registered root or a descendant of one → that record.
+///    Covers plain subdirectories AND in-tree worktrees (e.g.
+///    `.claude/worktrees/<name>` under the repo) — both scope to the root
+///    project for retrieval purposes.
+/// 2. the path is inside any git worktree whose common dir matches a
+///    registered project's → that record. Covers out-of-tree worktrees —
+///    fleet (`bro-fleet/*`), agent dispatch, workflow arcs — regardless of
+///    branch name or parent directory.
+///
+/// This is intentionally broader than the conservative managed write gate
+/// (`resolve_managed_fleet_worktree` in bbox-indexing): scope resolution
+/// here is read-only (which corpus do I query?), so aliasing an arbitrary
+/// user worktree of a registered repo to its base project is harmless and
+/// exactly what a caller scoping a query wants. Returns `None` for paths no
+/// registered project owns; callers keep their existing fallback
+/// (deterministic path-hash id, raw filter, etc.).
+pub fn resolve_base_project_for_scope<'a>(
+    path: &str,
+    projects: &'a [ProjectRecord],
+) -> Option<&'a ProjectRecord> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if let Some(record) = projects.iter().find(|project| {
+        let root = std::path::Path::new(&project.canonical_path);
+        canonical == root || canonical.starts_with(root)
+    }) {
+        return Some(record);
+    }
+    let common = crate::git::git_common_dir(&canonical)?;
+    projects.iter().find(|project| {
+        crate::git::git_common_dir(std::path::Path::new(&project.canonical_path))
+            .is_some_and(|base_common| base_common == common)
+    })
+}
+
 /// Minimal read-side view of the on-disk project registry file
 /// (`projects.json`). The authoritative store type (versioning, writes,
 /// migration) lives daemon-side in `projects::ProjectStore`; this

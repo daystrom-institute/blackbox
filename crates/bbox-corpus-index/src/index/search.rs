@@ -176,6 +176,56 @@ pub struct SessionsListParams {
 }
 
 impl TranscriptIndex {
+    /// Resolve a project FILTER value to the base project_id stamped on
+    /// transcript/tool_call docs at ingest (gap-72fd5932). Accepts a
+    /// project_id, a registered alias, or any path inside a registered
+    /// checkout/worktree. `None` when no registered project matches —
+    /// callers keep the literal substring lane.
+    pub fn base_project_filter_id(&self, raw: &str) -> Option<String> {
+        let records =
+            bbox_corpus_core::project_record::load_project_records(&self.config.projects_path)
+                .ok()?;
+        if let Some(record) = records.iter().find(|record| record.project_id == raw) {
+            return Some(record.project_id.clone());
+        }
+        let mut aliased = records.iter().filter(|record| record.aliases.contains(raw));
+        if let Some(record) = aliased.next() {
+            // Ambiguous alias claims fail closed to the substring lane.
+            return aliased.next().is_none().then(|| record.project_id.clone());
+        }
+        bbox_corpus_core::project_record::resolve_base_project_for_scope(raw, &records)
+            .map(|record| record.project_id.clone())
+    }
+
+    /// Project filter as an OR of the legacy substring lane (literal cwd in
+    /// the `project` field) and an exact term on the stamped
+    /// `base_project_id`, so a base-project selector matches sessions from
+    /// every checkout/worktree (gap-72fd5932).
+    fn push_project_filter_clause(
+        &self,
+        clauses: &mut Vec<(Occur, Box<dyn tantivy::query::Query>)>,
+        project: &str,
+    ) {
+        let mut lanes: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+        let mut pqp = QueryParser::for_index(&self.index, vec![self.fields.project]);
+        pqp.set_conjunction_by_default();
+        if let Ok(pq) = pqp.parse_query(project) {
+            lanes.push((Occur::Should, pq));
+        }
+        if let Some(base_id) = self.base_project_filter_id(project) {
+            lanes.push((
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.base_project_id, &base_id),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if !lanes.is_empty() {
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(lanes))));
+        }
+    }
+
     // ── Search ──────────────────────────────────────────────────────
 
     pub fn search(&self, p: &SearchParams) -> Result<String> {
@@ -246,12 +296,7 @@ impl TranscriptIndex {
         }
 
         if let Some(project) = p.project.as_deref() {
-            // Project filter: parse as a query against the project field only
-            let mut pqp = QueryParser::for_index(&self.index, vec![self.fields.project]);
-            pqp.set_conjunction_by_default();
-            if let Ok(pq) = pqp.parse_query(project) {
-                clauses.push((Occur::Must, pq));
-            }
+            self.push_project_filter_clause(&mut clauses, project);
         }
 
         // Caller-session auto-exclude. Disabled by default — the heuristic
@@ -524,11 +569,7 @@ impl TranscriptIndex {
         }
 
         if let Some(project) = p.project.as_deref() {
-            let mut pqp = QueryParser::for_index(&self.index, vec![self.fields.project]);
-            pqp.set_conjunction_by_default();
-            if let Ok(pq) = pqp.parse_query(project) {
-                clauses.push((Occur::Must, pq));
-            }
+            self.push_project_filter_clause(&mut clauses, project);
         }
 
         let query = BooleanQuery::new(clauses);
@@ -1132,6 +1173,43 @@ impl TranscriptIndex {
         let limit = p.limit.unwrap_or(30).min(100) as usize;
         let offset = p.offset.unwrap_or(0) as usize;
 
+        // Base-project lane for the project filter (gap-72fd5932): sessions
+        // are listed from metadata files (not stamped index docs), so when
+        // the filter resolves to a registered project, each candidate
+        // session's cwd resolves through the same gate — memoized per
+        // distinct cwd, so the git probes are bounded by checkout count,
+        // not session count.
+        let filter_base_id = project_filter.and_then(|pf| self.base_project_filter_id(pf));
+        let base_records = if filter_base_id.is_some() {
+            bbox_corpus_core::project_record::load_project_records(&self.config.projects_path)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut cwd_base_memo: HashMap<String, Option<String>> = HashMap::new();
+        let mut project_matches = |pf: &str, session_cwd: &str| -> bool {
+            if session_cwd.to_lowercase().contains(&pf.to_lowercase()) {
+                return true;
+            }
+            let Some(filter_base) = filter_base_id.as_deref() else {
+                return false;
+            };
+            if session_cwd.is_empty() {
+                return false;
+            }
+            cwd_base_memo
+                .entry(session_cwd.to_string())
+                .or_insert_with(|| {
+                    bbox_corpus_core::project_record::resolve_base_project_for_scope(
+                        session_cwd,
+                        &base_records,
+                    )
+                    .map(|record| record.project_id.clone())
+                })
+                .as_deref()
+                == Some(filter_base)
+        };
+
         // Load session name maps
         let claude_names = load_claude_session_names(&self.config.roots);
         let codex_names = load_codex_session_names(self.config.codex_root.as_ref());
@@ -1176,7 +1254,7 @@ impl TranscriptIndex {
 
                 let project = v["project_path"].as_str().unwrap_or("").to_string();
                 if let Some(pf) = project_filter {
-                    if !project.to_lowercase().contains(&pf.to_lowercase()) {
+                    if !project_matches(pf, &project) {
                         continue;
                     }
                 }
@@ -1238,7 +1316,7 @@ impl TranscriptIndex {
                         let project = cwd.as_deref().unwrap_or("");
 
                         if let Some(pf) = project_filter {
-                            if !project.to_lowercase().contains(&pf.to_lowercase()) {
+                            if !project_matches(pf, project) {
                                 continue;
                             }
                         }

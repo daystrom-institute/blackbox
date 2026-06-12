@@ -33,12 +33,14 @@ impl NormalizedTranscriptEvent {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn normalized_to_doc(
     event: &NormalizedTranscriptEvent,
     account: &str,
     file_path: &str,
     is_subagent: bool,
     project_fallback: &str,
+    base_project_id: Option<&str>,
     f: FieldHandles,
 ) -> Option<TantivyDocument> {
     let parsed = event.to_parsed_event()?;
@@ -53,6 +55,9 @@ pub fn normalized_to_doc(
     doc.add_text(f.session_id, &parsed.session_id);
     doc.add_text(f.account, account);
     doc.add_text(f.project, parsed.cwd.as_deref().unwrap_or(project_fallback));
+    if let Some(base) = base_project_id {
+        doc.add_text(f.base_project_id, base);
+    }
     doc.add_text(f.role, parsed.role.as_ref());
     doc.add_text(f.file_path, file_path);
     doc.add_u64(f.byte_offset, byte_offset);
@@ -84,12 +89,14 @@ pub fn normalized_to_doc(
     Some(doc)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn normalized_to_tool_call_doc(
     event: &NormalizedTranscriptEvent,
     account: &str,
     file_path: &str,
     is_subagent: bool,
     project_fallback: &str,
+    base_project_id: Option<&str>,
     f: FieldHandles,
 ) -> Option<TantivyDocument> {
     let parsed = event.to_parsed_event()?;
@@ -115,6 +122,9 @@ pub fn normalized_to_tool_call_doc(
     doc.add_text(f.session_id, &parsed.session_id);
     doc.add_text(f.account, account);
     doc.add_text(f.project, parsed.cwd.as_deref().unwrap_or(project_fallback));
+    if let Some(base) = base_project_id {
+        doc.add_text(f.base_project_id, base);
+    }
     doc.add_text(f.role, parsed.role.as_ref());
     doc.add_text(f.file_path, file_path);
     doc.add_u64(f.byte_offset, byte_offset);
@@ -322,9 +332,14 @@ mod tests {
             "/tmp/session.jsonl",
             false,
             "",
+            Some("feedbeef"),
             fields,
         )
         .expect("tool call doc");
+        assert_eq!(
+            crate::index::first_text(&doc, fields.base_project_id),
+            "feedbeef"
+        );
 
         assert_eq!(crate::index::first_text(&doc, fields.doc_type), "tool_call");
         assert_eq!(

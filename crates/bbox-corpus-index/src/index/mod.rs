@@ -12,7 +12,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g7-transcript-tool-calls";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g8-base-project-id";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -73,6 +73,11 @@ pub struct FieldHandles {
     /// `chunk.project_id`.
     #[allow(dead_code)]
     pub project_id: Field,
+    /// Resolved base-project id stamped on transcript and tool_call docs at
+    /// ingest (gap-72fd5932): the registered project owning the session's
+    /// cwd, including any worktree of it. Lets a project filter match work
+    /// from every checkout while `project` keeps the literal session cwd.
+    pub base_project_id: Field,
     #[allow(dead_code)]
     pub chunk_kind: Field,
     #[allow(dead_code)]
@@ -640,6 +645,7 @@ pub fn build_schema() -> (Schema, FieldHandles) {
         agent_slug: builder.add_text_field("agent_slug", STRING | STORED),
         doc_type: builder.add_text_field("doc_type", STRING | STORED),
         project_id: builder.add_text_field("project_id", STRING | STORED),
+        base_project_id: builder.add_text_field("base_project_id", STRING | STORED),
         chunk_kind: builder.add_text_field("chunk_kind", STRING | STORED),
         language: builder.add_text_field("language", STRING | STORED),
         // Use code_tokenizer on `symbol` so qualified names like
@@ -920,6 +926,80 @@ mod tests {
             })
             .unwrap();
         assert!(result.contains("/tmp/repo/src/lib.rs"), "{result}");
+    }
+
+    /// gap-72fd5932 contract: transcript docs stamped with base_project_id
+    /// at ingest are reachable through the project filter by project_id and
+    /// registered alias, even when their literal cwd (the `project` field)
+    /// is an out-of-tree worktree path the substring lane cannot match.
+    #[test]
+    fn project_filter_matches_stamped_base_project_by_id_and_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_path = dir.path().join("projects.json");
+        std::fs::write(
+            &projects_path,
+            serde_json::json!({
+                "projects": [{
+                    "project_id": "feedbeef",
+                    "repo_id": null,
+                    "canonical_path": "/tmp/registered-base",
+                    "registered_at": "2026-01-01T00:00:00Z",
+                    "is_git_repo": true,
+                    "aliases": ["blackbox"],
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            projects_path,
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        let mut add_doc = |session: &str, cwd: &str, base: Option<&str>| {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(fields.doc_type, "transcript");
+            doc.add_text(fields.content, "worktree stamping probe");
+            doc.add_text(fields.session_id, session);
+            doc.add_text(fields.project, cwd);
+            doc.add_u64(fields.is_subagent, 0);
+            if let Some(base) = base {
+                doc.add_text(fields.base_project_id, base);
+            }
+            writer.add_document(doc).unwrap();
+        };
+        // Out-of-tree worktree session: literal cwd shares no substring
+        // with the base path, only the stamp links it.
+        add_doc("wt-session", "/state/fleet/worktrees/task-9", Some("feedbeef"));
+        add_doc("base-session", "/tmp/registered-base", Some("feedbeef"));
+        add_doc("other-session", "/somewhere/else", None);
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        for selector in ["feedbeef", "blackbox"] {
+            let result = index
+                .search(&SearchParams {
+                    query: "stamping probe".into(),
+                    mode: None,
+                    account: None,
+                    project: Some(selector.into()),
+                    role: None,
+                    include_subagents: None,
+                    limit: Some(10),
+                    exclude_self: None,
+                })
+                .unwrap();
+            assert!(result.contains("wt-session"), "{selector}: {result}");
+            assert!(result.contains("base-session"), "{selector}: {result}");
+            assert!(!result.contains("other-session"), "{selector}: {result}");
+        }
     }
 
     /// CN-D3 contract: project_file docs carry symbol_kind, parent_kind,
