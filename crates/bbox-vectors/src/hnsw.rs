@@ -49,6 +49,11 @@ pub struct HnswMetrics {
     pub avg_neighbor_degree: f64,
     pub layer_distribution: Vec<usize>,
     pub disconnected_nodes: usize,
+    /// Active nodes with no inbound edge from any active node. The leading
+    /// indicator of reverse-edge-prune orphaning (gap-2eabd96d): out-degree
+    /// stats cannot see it, and a zero-in-degree node is unreachable by
+    /// graph traversal at any ef.
+    pub zero_in_degree_nodes: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -178,7 +183,60 @@ impl HnswIndex {
             },
             layer_distribution: self.layer_distribution(),
             disconnected_nodes: self.disconnected_nodes(),
+            zero_in_degree_nodes: self.zero_in_degree_nodes(),
         }
+    }
+
+    fn zero_in_degree_nodes(&self) -> usize {
+        let mut has_inbound = vec![false; self.ids.len()];
+        if let Some(entry_point) = self.entry_point {
+            // The entry point is reachable by definition.
+            has_inbound[entry_point] = true;
+        }
+        for (ordinal, layers) in self.graph.iter().enumerate() {
+            if !self.active[ordinal] {
+                continue;
+            }
+            for neighbors in layers {
+                for &neighbor in neighbors {
+                    has_inbound[neighbor] = true;
+                }
+            }
+        }
+        self.active
+            .iter()
+            .zip(has_inbound.iter())
+            .filter(|(active, inbound)| **active && !**inbound)
+            .count()
+    }
+
+    /// Sampled self-recall: search every `sample_every`-th active vector and
+    /// report the fraction whose own id appears in its top-`k`. A healthy
+    /// graph scores ~1.0; reverse-edge orphaning (gap-2eabd96d) drags this
+    /// down because orphaned vectors cannot be reached for any query.
+    /// O(sample * search) — a diagnostic probe, not a metrics()-path stat.
+    pub fn self_recall_probe(&self, sample_every: usize, k: usize) -> f64 {
+        let step = sample_every.max(1);
+        let mut sampled = 0usize;
+        let mut hits = 0usize;
+        for ordinal in (0..self.ids.len()).step_by(step) {
+            if !self.active[ordinal] {
+                continue;
+            }
+            sampled += 1;
+            let query = self.vectors.get(ordinal).to_vec();
+            if self
+                .search(&query, k)
+                .iter()
+                .any(|hit| hit.id == self.ids[ordinal])
+            {
+                hits += 1;
+            }
+        }
+        if sampled == 0 {
+            return 1.0;
+        }
+        hits as f64 / sampled as f64
     }
 
     pub fn push(&mut self, id: String, vector: Vec<f32>) -> Result<(), String> {
@@ -401,26 +459,35 @@ impl HnswIndex {
         selected
     }
 
+    /// Add `new_node` to `neighbor`'s adjacency, shrinking a saturated list
+    /// with the same diversity heuristic as forward selection (the HNSW
+    /// paper's SHRINK-CONNECTIONS) instead of distance-sort-truncate.
+    ///
+    /// Pure-distance truncation mass-orphans members of near-duplicate
+    /// clusters larger than max_neighbors: every saturated list in the
+    /// cluster evicts the same global losers, their in-degree hits zero,
+    /// and search (forward-edge traversal from the entry point) can never
+    /// reach them again (gap-2eabd96d: ~17% of the prod partition
+    /// disconnected; 35% self-recall loss in the cluster repro). The
+    /// diversity rule decorrelates evictions — a member pruned from one
+    /// list because it sits closer to a kept neighbor stays reachable
+    /// through that neighbor — and `select_neighbors`' distance backfill
+    /// doubles as keep-pruned-connections.
     fn add_reverse_edge(&mut self, neighbor: usize, new_node: usize, layer: usize) {
         let max_n = self.max_neighbors(layer);
-        let mut current = self.graph[neighbor][layer].clone();
-        if current.len() < max_n {
-            current.push(new_node);
-            self.graph[neighbor][layer] = current;
+        if self.graph[neighbor][layer].len() < max_n {
+            self.graph[neighbor][layer].push(new_node);
             return;
         }
-        current.push(new_node);
         let neighbor_vec = self.vectors.get(neighbor);
-        let mut candidates = current
-            .into_iter()
+        let mut candidates = self.graph[neighbor][layer]
+            .iter()
+            .copied()
+            .chain(std::iter::once(new_node))
             .map(|ordinal| (ordinal, self.distance_to_ordinal(neighbor_vec, ordinal)))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
-        self.graph[neighbor][layer] = candidates
-            .into_iter()
-            .take(max_n)
-            .map(|(ordinal, _)| ordinal)
-            .collect();
+        self.graph[neighbor][layer] = self.select_neighbors(&candidates, max_n);
     }
 
     fn max_neighbors(&self, layer: usize) -> usize {
@@ -620,6 +687,46 @@ mod tests {
         index.entry_point = Some(0);
         index.max_level = 0;
         assert_eq!(index.metrics().disconnected_nodes, 1);
+    }
+
+    /// gap-2eabd96d regression: near-duplicate clusters much larger than
+    /// m0, inserted cluster-consecutively (prod's incremental arrival
+    /// order). Distance-truncate reverse-edge pruning orphaned ~28% of
+    /// nodes here (zero in-degree, 35% self-recall loss); the diversity
+    /// shrink must keep the graph connected and self-recall near-perfect.
+    #[test]
+    fn large_near_duplicate_clusters_stay_connected_under_push_order() {
+        let dims = 32;
+        let mut rng = SplitMix64::new(7);
+        let mut corpus = Vec::new();
+        for c in 0..6 {
+            let centroid = gaussian_unit_vector(&mut rng, dims);
+            for i in 0..200 {
+                let mut vector = centroid
+                    .iter()
+                    .map(|value| value + gaussian(&mut rng) * 0.05)
+                    .collect::<Vec<f32>>();
+                normalize(&mut vector);
+                corpus.push((format!("c{c}-n{i}"), vector));
+            }
+        }
+
+        let mut index = HnswIndex::empty(dims, HnswOptions::default()).unwrap();
+        for (id, vector) in &corpus {
+            index.push(id.clone(), vector.clone()).unwrap();
+        }
+
+        let metrics = index.metrics();
+        let disconnected_ratio = metrics.disconnected_nodes as f64 / metrics.active_nodes as f64;
+        assert!(
+            disconnected_ratio < 0.01,
+            "disconnected {}/{} (zero_in {})",
+            metrics.disconnected_nodes,
+            metrics.active_nodes,
+            metrics.zero_in_degree_nodes,
+        );
+        let self_recall = index.self_recall_probe(5, 10);
+        assert!(self_recall >= 0.98, "self-recall {self_recall}");
     }
 
     #[test]

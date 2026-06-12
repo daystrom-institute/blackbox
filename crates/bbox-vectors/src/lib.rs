@@ -634,6 +634,10 @@ pub struct HnswMetricsSerde {
     pub avg_neighbor_degree: f64,
     pub layer_distribution: Vec<usize>,
     pub disconnected_nodes: usize,
+    /// Active nodes with no inbound active edge (gap-2eabd96d leading
+    /// indicator). Defaults for snapshots written before the field existed.
+    #[serde(default)]
+    pub zero_in_degree_nodes: usize,
 }
 
 impl From<HnswMetrics> for HnswMetricsSerde {
@@ -649,6 +653,7 @@ impl From<HnswMetrics> for HnswMetricsSerde {
             avg_neighbor_degree: value.avg_neighbor_degree,
             layer_distribution: value.layer_distribution,
             disconnected_nodes: value.disconnected_nodes,
+            zero_in_degree_nodes: value.zero_in_degree_nodes,
         }
     }
 }
