@@ -13,6 +13,15 @@ use crate::threads;
 use serde_json::{Map, Value, json};
 
 impl BlackboxServer {
+    pub(crate) fn badgey_parse_id(
+        &self,
+        raw: &str,
+    ) -> Result<orchestration::badgey::types::BadgeyId, String> {
+        orchestration::badgey::descriptor()
+            .parse_id(raw)
+            .map_err(|e| format!("error.bad_input(code=invalid_badgey_id): {e}"))
+    }
+
     pub(crate) fn badgey_parse_proposal_kind(
         &self,
         value: &Value,
@@ -499,11 +508,12 @@ impl BlackboxServer {
                     .consultant_proposals
                     .create(&instance.id, kind.as_str(), draft.clone(), idempotency_key)
                     .map_err(|e| format!("creating badgey proposal: {e}"))?;
-                self.badgey_write_event(
+                self.consultant_write_event(
+                    orchestration::badgey::descriptor(),
                     instance,
                     orchestration::badgey::events::ThreadEvent::ProposalEmitted {
                         proposal_id: proposal.id.clone(),
-                        kind,
+                        kind: kind.as_str().to_string(),
                         draft_ref: draft
                             .get("source")
                             .or_else(|| draft.get("draft_path"))
@@ -558,7 +568,8 @@ impl BlackboxServer {
                     );
                     return Err(err);
                 }
-                self.badgey_write_event(
+                self.consultant_write_event(
+                    orchestration::badgey::descriptor(),
                     instance,
                     orchestration::badgey::events::ThreadEvent::SubbroSpawned {
                         task_id: task_id.clone(),
@@ -574,7 +585,8 @@ impl BlackboxServer {
                 json!({"task_id": task_id})
             }
             "bg-action-escalate-dispute" => {
-                self.badgey_write_event(
+                self.consultant_write_event(
+                    orchestration::badgey::descriptor(),
                     instance,
                     orchestration::badgey::events::ThreadEvent::DisputeEscalated {
                         subbro_results: body
@@ -952,7 +964,8 @@ impl BlackboxServer {
                     .and_then(Value::as_str)
                     .unwrap_or("task")
                     .to_string();
-                self.badgey_write_event(
+                self.consultant_write_event(
+                    orchestration::badgey::descriptor(),
                     &instance,
                     orchestration::badgey::events::ThreadEvent::ProposalApplied {
                         proposal_id: proposal_id.to_string(),
@@ -1249,7 +1262,8 @@ impl BlackboxServer {
             let audit_ref = artifact_ref
                 .map(String::from)
                 .unwrap_or_else(|| "task".to_string());
-            self.badgey_write_event(
+            self.consultant_write_event(
+                orchestration::badgey::descriptor(),
                 &instance,
                 orchestration::badgey::events::ThreadEvent::ProposalApplied {
                     proposal_id: proposal_id.to_string(),
@@ -1329,7 +1343,8 @@ impl BlackboxServer {
                 Some("rejected by user".to_string()),
             )
             .map_err(|e| format!("rejecting proposal: {e}"))?;
-        self.badgey_write_event(
+        self.consultant_write_event(
+            orchestration::badgey::descriptor(),
             &instance,
             orchestration::badgey::events::ThreadEvent::ProposalRejected {
                 proposal_id: proposal_id.to_string(),
@@ -1357,7 +1372,8 @@ impl BlackboxServer {
             .dismiss(&id)
             .map_err(|e| e.to_string())?;
         let reason = reason.unwrap_or_else(|| "dismissed by caller".to_string());
-        self.badgey_write_event(
+        self.consultant_write_event(
+            orchestration::badgey::descriptor(),
             &instance,
             orchestration::badgey::events::ThreadEvent::Dismiss {
                 reason: reason.clone(),

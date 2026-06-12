@@ -1,6 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-mod lifecycle;
 mod proposals;
 mod reports;
 use crate::orchestration;
@@ -32,7 +31,12 @@ impl BlackboxServer {
         Parameters(p): Parameters<BadgeyExecParams>,
     ) -> CallToolResult {
         match self
-            .badgey_exec_internal(p.project_dir, p.brief, Some("agent:badgey@v1".to_string()))
+            .consultant_exec_internal(
+                orchestration::badgey::descriptor(),
+                p.project_dir,
+                p.brief,
+                Some("agent:badgey@v1".to_string()),
+            )
             .await
         {
             Ok(value) => Self::ok_json(&value),
@@ -49,7 +53,12 @@ impl BlackboxServer {
         Parameters(p): Parameters<BadgeyResumeParams>,
     ) -> CallToolResult {
         match self
-            .badgey_resume_internal(&p.badgey_id, &p.prompt, p.timeout_seconds)
+            .consultant_resume_internal(
+                orchestration::badgey::descriptor(),
+                &p.badgey_id,
+                &p.prompt,
+                p.timeout_seconds,
+            )
             .await
         {
             Ok(value) => Self::ok_json(&value),
@@ -66,7 +75,12 @@ impl BlackboxServer {
         Parameters(p): Parameters<BadgeyAskParams>,
     ) -> CallToolResult {
         match self
-            .badgey_resume_internal(&p.badgey_id, &p.question, p.timeout_seconds)
+            .consultant_resume_internal(
+                orchestration::badgey::descriptor(),
+                &p.badgey_id,
+                &p.question,
+                p.timeout_seconds,
+            )
             .await
         {
             Ok(value) => Self::ok_json(&value),
@@ -133,7 +147,8 @@ impl BlackboxServer {
             Err(err) => return Self::err_text(&err.to_string()),
         };
         let scout_id = format!("scout-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        if let Err(err) = self.badgey_write_event(
+        if let Err(err) = self.consultant_write_event(
+            orchestration::badgey::descriptor(),
             &instance,
             orchestration::badgey::events::ThreadEvent::ScoutDispatched {
                 scout_id: scout_id.clone(),
@@ -150,7 +165,12 @@ impl BlackboxServer {
             p.charter
         );
         match self
-            .badgey_resume_internal(&p.badgey_id, &prompt, p.timeout_seconds)
+            .consultant_resume_internal(
+                orchestration::badgey::descriptor(),
+                &p.badgey_id,
+                &prompt,
+                p.timeout_seconds,
+            )
             .await
         {
             Ok(mut value) => {
@@ -302,7 +322,8 @@ impl BlackboxServer {
             scope,
         );
         let exec_result = match self
-            .badgey_exec_internal(
+            .consultant_exec_internal(
+                orchestration::badgey::descriptor(),
                 Some(scope.clone()),
                 Some(initial_brief),
                 Some(format!("badgey-slack-{}", p.channel_id)),
@@ -797,7 +818,11 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["proposal_id"], "P-1");
-        let proposals = server.state.consultant_proposals.list_by_instance(&id).unwrap();
+        let proposals = server
+            .state
+            .consultant_proposals
+            .list_by_instance(&id)
+            .unwrap();
         assert_eq!(proposals.len(), 1);
         assert_eq!(
             proposals[0].kind,
@@ -1010,7 +1035,7 @@ mod tests {
         // Test setup is sync-only; thread persistence is write-behind here.
         server.state.threads_persister.request();
         let thread_id = server
-            .badgey_thread_id_from_open_result(&thread_result)
+            .consultant_thread_id_from_open_result(&thread_result)
             .unwrap();
         let scope = orchestration::badgey::types::BadgeyScope {
             project_id: tmp.path().to_string_lossy().into_owned(),
@@ -1076,7 +1101,7 @@ mod tests {
         // Test setup is sync-only; thread persistence is write-behind here.
         server.state.threads_persister.request();
         let thread_id = server
-            .badgey_thread_id_from_open_result(&thread_result)
+            .consultant_thread_id_from_open_result(&thread_result)
             .unwrap();
         let scope = orchestration::badgey::types::BadgeyScope {
             project_id: tmp.path().to_string_lossy().into_owned(),
@@ -1138,7 +1163,8 @@ mod tests {
             .register(instance.clone())
             .unwrap();
         server
-            .badgey_write_event(
+            .consultant_write_event(
+                orchestration::badgey::descriptor(),
                 &instance,
                 orchestration::badgey::events::ThreadEvent::SubbroSpawned {
                     task_id: "task-1".to_string(),
@@ -1149,7 +1175,8 @@ mod tests {
             )
             .unwrap();
         server
-            .badgey_write_event(
+            .consultant_write_event(
+                orchestration::badgey::descriptor(),
                 &instance,
                 orchestration::badgey::events::ThreadEvent::SubbroSpawned {
                     task_id: "task-2".to_string(),
@@ -1256,7 +1283,7 @@ mod tests {
             })
             .unwrap();
         let thread_id = server
-            .badgey_thread_id_from_open_result(&thread_result)
+            .consultant_thread_id_from_open_result(&thread_result)
             .unwrap();
 
         let triage = server
@@ -1267,7 +1294,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(triage["proposal_sheet"]["proposals"][0]["stored"], true);
-        let proposals = server.state.consultant_proposals.list_by_instance(&id).unwrap();
+        let proposals = server
+            .state
+            .consultant_proposals
+            .list_by_instance(&id)
+            .unwrap();
         assert_eq!(proposals.len(), 1);
         assert_eq!(
             proposals[0].kind,

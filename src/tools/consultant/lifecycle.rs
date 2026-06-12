@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::notes;
 use crate::orchestration;
 use crate::orchestration as orch;
+use crate::orchestration::consultant::descriptor::ConsumerDescriptor;
 use crate::orchestration::providers::Provider;
 use crate::orchestration::providers::dispatch_prelude::*;
 use crate::server::progress::{cleanup_policy_file_when_done, resolve_dispatch_filters};
@@ -12,16 +13,10 @@ use crate::util;
 use serde_json::{Value, json};
 
 impl BlackboxServer {
-    pub(crate) fn badgey_parse_id(
+    pub(crate) fn consultant_thread_id_from_open_result(
         &self,
-        raw: &str,
-    ) -> Result<orchestration::badgey::types::BadgeyId, String> {
-        orchestration::badgey::descriptor()
-            .parse_id(raw)
-            .map_err(|e| format!("error.bad_input(code=invalid_badgey_id): {e}"))
-    }
-
-    pub(crate) fn badgey_thread_id_from_open_result(&self, result: &str) -> Result<String, String> {
+        result: &str,
+    ) -> Result<String, String> {
         let re = regex::Regex::new(r"Thread created: (thread-[0-9a-f]{8})")
             .map_err(|e| format!("internal regex error: {e}"))?;
         re.captures(result)
@@ -29,8 +24,9 @@ impl BlackboxServer {
             .ok_or_else(|| format!("could not parse thread id from bbox_thread result: {result}"))
     }
 
-    pub(crate) fn badgey_scope_bind(
+    pub(crate) fn consultant_scope_bind(
         &self,
+        descriptor: &'static ConsumerDescriptor,
         id: &orchestration::badgey::types::BadgeyId,
         thread_id: &str,
         scope: &orchestration::badgey::types::BadgeyScope,
@@ -81,23 +77,26 @@ impl BlackboxServer {
             .collect::<Vec<_>>()
             .join(", ");
         let budget_extensions = self.badgey_budget_extensions(thread_id);
-        let budget_remaining = 50_000 + (budget_extensions * 50_000);
+        let budget_remaining =
+            descriptor.turn_budget_tokens + budget_extensions * descriptor.turn_budget_tokens;
         format!(
-            "[badgey-scope]\nbadgey_id: {id}\nthread_of_record: {thread_id}\nproject: {project}\ncurrent_time: {current_time}\nbrief: {brief}\nqueue: {queue_status}\nrecent_paths: {recent_paths}\nrecent_proposals: {recent_proposals}\nbudget_remaining: {budget_remaining}\n[/badgey-scope]\n",
+            "[{name}-scope]\n{name}_id: {id}\nthread_of_record: {thread_id}\nproject: {project}\ncurrent_time: {current_time}\nbrief: {brief}\nqueue: {queue_status}\nrecent_paths: {recent_paths}\nrecent_proposals: {recent_proposals}\nbudget_remaining: {budget_remaining}\n[/{name}-scope]\n",
+            name = descriptor.name,
             current_time = util::now_iso(),
             project = scope.project_id
         )
     }
 
-    pub(crate) fn badgey_write_event(
+    pub(crate) fn consultant_write_event(
         &self,
+        descriptor: &'static ConsumerDescriptor,
         instance: &orchestration::badgey::registry::BadgeyInstance,
         event: orchestration::badgey::events::ThreadEvent,
         task_id: Option<String>,
     ) -> Result<String, String> {
         let kind = event.note_kind().to_string();
         let body = serde_json::to_string(&event)
-            .map_err(|e| format!("serializing badgey thread event: {e}"))?;
+            .map_err(|e| format!("serializing consultant thread event: {e}"))?;
         self.state
             .notes
             .write()
@@ -109,13 +108,14 @@ impl BlackboxServer {
                 project: Some(instance.scope.project_id.clone()),
                 thread_id: Some(instance.thread_of_record_id.clone()),
                 provider: Some(instance.provider.as_str().to_string()),
-                bro: Some("badgey".to_string()),
+                bro: Some(descriptor.name.to_string()),
             })
-            .map_err(|e| format!("writing badgey thread event: {e:#}"))
+            .map_err(|e| format!("writing consultant thread event: {e:#}"))
     }
 
-    pub(crate) fn badgey_launch_exec(
+    pub(crate) fn consultant_launch_exec(
         &self,
+        descriptor: &'static ConsumerDescriptor,
         id: &orchestration::badgey::types::BadgeyId,
         scope: &orchestration::badgey::types::BadgeyScope,
         thread_id: &str,
@@ -139,7 +139,8 @@ impl BlackboxServer {
             brofile_filters,
             _coerce_workspace,
             brofile_context,
-        ) = self.resolve_exec_target(Some(orchestration::badgey::descriptor().brofile_ref), None, Some(&scope.project_id))?;
+        ) =
+            self.resolve_exec_target(Some(descriptor.brofile_ref), None, Some(&scope.project_id))?;
         let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
             exec_opts,
             brofile_context.as_ref(),
@@ -147,21 +148,18 @@ impl BlackboxServer {
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = "pending".to_string();
-        let scope_bind = self.badgey_scope_bind(id, thread_id, scope);
-        let prompt = format!(
-            "{}\nInitialize this Badgey consultation and answer the initial brief. Keep all durable observations in the thread of record.\n",
-            scope_bind
-        );
+        let scope_bind = self.consultant_scope_bind(descriptor, id, thread_id, scope);
+        let prompt = format!("{}\n{}\n", scope_bind, descriptor.exec_init_prompt);
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
             project_dir: cwd.clone(),
-            bro_name: Some(orchestration::badgey::descriptor().brofile_ref.to_string()),
+            bro_name: Some(descriptor.brofile_ref.to_string()),
             thread_id: Some(thread_id.to_string()),
             work_item_id: Some(id.as_str().to_string()),
             pin_block: self.ambient_pin_block(
                 cwd.as_deref(),
-                Some(orchestration::badgey::descriptor().brofile_ref),
+                Some(descriptor.brofile_ref),
                 Some(session_id.as_str()),
                 Some(thread_id),
                 Some(id.as_str()),
@@ -199,9 +197,9 @@ impl BlackboxServer {
             bro_label.clone(),
             bro_label,
             Some(self.state.system_events.clone()),
-            // badgey_launch_exec is the badgey runtime's first-turn
+            // consultant_launch_exec is the consultant runtime's first-turn
             // launch — operator-initiated persona. See the Slice 1b
-            // dispatch note: badgey is classed as AgentDispatch
+            // dispatch note: consultant exec is classed as AgentDispatch
             // (user-driven tool that dispatches an agent context).
             bro_core::Origin::AgentDispatch,
         );
@@ -209,7 +207,7 @@ impl BlackboxServer {
         Ok((task, provider, session_id, effective_filters))
     }
 
-    pub(crate) async fn badgey_wait_for_observed_session_id(
+    pub(crate) async fn consultant_wait_for_observed_session_id(
         &self,
         task: &Arc<orch::Task>,
         timeout_seconds: f64,
@@ -237,13 +235,14 @@ impl BlackboxServer {
         tokio::time::timeout(std::time::Duration::from_secs_f64(timeout_seconds), wait)
             .await
             .map_err(|_| {
-                "provider session id was not observed before Badgey registration timeout"
+                "provider session id was not observed before consultant registration timeout"
                     .to_string()
             })?
     }
 
-    pub(crate) async fn badgey_exec_internal(
+    pub(crate) async fn consultant_exec_internal(
         &self,
+        descriptor: &'static ConsumerDescriptor,
         project_dir: Option<String>,
         brief: Option<String>,
         bro_label: Option<String>,
@@ -255,7 +254,7 @@ impl BlackboxServer {
                     .map(|p| p.to_string_lossy().to_string())
             })
             .unwrap_or_default();
-        let id = orchestration::badgey::descriptor().generate_id();
+        let id = descriptor.generate_id();
         let scope = orchestration::badgey::types::BadgeyScope {
             project_id: project_id.clone(),
             initial_brief: brief.clone(),
@@ -266,10 +265,11 @@ impl BlackboxServer {
             .write()
             .thread(&threads::ThreadParams {
                 action: "open".to_string(),
-                name: Some(format!("badgey:{}", id.as_str())),
+                name: Some(format!("{}:{}", descriptor.name, id.as_str())),
                 id: None,
                 topic: Some(format!(
-                    "Badgey consultation: {}",
+                    "{} consultation: {}",
+                    descriptor.display_name,
                     brief.as_deref().unwrap_or("general consultation")
                 )),
                 project: Some(project_id.clone()),
@@ -277,7 +277,7 @@ impl BlackboxServer {
                 provider: None,
                 session_name: None,
                 handoff_doc: None,
-                note: Some("Badgey thread of record".to_string()),
+                note: Some(format!("{} thread of record", descriptor.display_name)),
                 target: None,
                 target_type: None,
                 edge: None,
@@ -285,21 +285,24 @@ impl BlackboxServer {
                 kind: Some("work_item".to_string()),
                 origin: None,
             })
-            .map_err(|e| format!("opening badgey thread of record: {e:#}"))?;
+            .map_err(|e| format!("opening consultant thread of record: {e:#}"))?;
         // This sync thread helper cannot await; threads persistence is write-behind here.
         self.state.threads_persister.request();
-        let thread_id = self.badgey_thread_id_from_open_result(&thread_result)?;
+        let thread_id = self.consultant_thread_id_from_open_result(&thread_result)?;
         let (task, provider, _initial_session_id, merged_filters) =
-            self.badgey_launch_exec(&id, &scope, &thread_id, bro_label)?;
+            self.consultant_launch_exec(descriptor, &id, &scope, &thread_id, bro_label)?;
         let task_id = task.inner.lock().id.clone();
-        let session_id = match self.badgey_wait_for_observed_session_id(&task, 10.0).await {
+        let session_id = match self
+            .consultant_wait_for_observed_session_id(&task, 10.0)
+            .await
+        {
             Ok(session_id) => session_id,
             Err(err) => {
                 let _ = self.state.notes.write().create(&notes::NoteParams {
                     kind: "surprise".to_string(),
                     body: json!({
-                        "event": "badgey_exec_unobserved_session",
-                        "badgey_id": id,
+                        "event": format!("{}_exec_unobserved_session", descriptor.name),
+                        "consultant_id": id,
                         "task_id": task_id,
                         "reason": err,
                     })
@@ -309,7 +312,7 @@ impl BlackboxServer {
                     project: Some(project_id),
                     thread_id: Some(thread_id),
                     provider: Some(provider.as_str().to_string()),
-                    bro: Some("badgey".to_string()),
+                    bro: Some(descriptor.name.to_string()),
                 });
                 return Err(err);
             }
@@ -333,7 +336,7 @@ impl BlackboxServer {
             project: None,
             session_id: Some(session_id.clone()),
             provider: Some(provider.as_str().to_string()),
-            session_name: Some("badgey".to_string()),
+            session_name: Some(descriptor.name.to_string()),
             handoff_doc: None,
             note: None,
             target: None,
@@ -347,10 +350,11 @@ impl BlackboxServer {
             // This sync thread helper cannot await; threads persistence is write-behind here.
             self.state.threads_persister.request();
         }
-        self.badgey_write_event(
+        self.consultant_write_event(
+            descriptor,
             &instance,
             orchestration::badgey::events::ThreadEvent::Exec {
-                brofile_version: orchestration::badgey::descriptor().brofile_ref.to_string(),
+                brofile_version: descriptor.brofile_ref.to_string(),
                 scope,
                 charter: brief.unwrap_or_else(|| "general consultation".to_string()),
                 provider,
@@ -358,31 +362,44 @@ impl BlackboxServer {
             },
             Some(task_id.clone()),
         )?;
-        Ok(json!({
-            "badgey_id": id,
+        let mut out = json!({
+            "consultant_id": id,
             "task_id": task_id,
             "session_id": session_id,
             "provider": provider,
             "thread_id": thread_id,
             "status": "running",
-            "resolved_brofile": orchestration::badgey::descriptor().brofile_ref,
+            "resolved_brofile": descriptor.brofile_ref,
             "merged_filters": merged_filters,
-        }))
+        });
+        // Legacy consumer-keyed id (e.g. `badgey_id`) kept for wire compat.
+        out[format!("{}_id", descriptor.name)] = json!(id);
+        Ok(out)
     }
 
-    pub(crate) async fn badgey_resume_internal(
+    pub(crate) async fn consultant_resume_internal(
         &self,
-        badgey_id: &str,
+        descriptor: &'static ConsumerDescriptor,
+        raw_id: &str,
         prompt: &str,
         timeout_seconds: Option<f64>,
     ) -> Result<Value, String> {
         use orchestration::badgey::commands::{WrapperCommand, parse_command};
 
-        let id = self.badgey_parse_id(badgey_id)?;
-        match parse_command(prompt) {
+        let id = descriptor
+            .parse_id(raw_id)
+            .map_err(|e| format!("error.bad_input(code=invalid_{}_id): {e}", descriptor.name))?;
+        // Consumer command dispatch: the wrapper-command grammar and its
+        // handlers are Badgey's code-owned vocabulary. Replaced by a
+        // descriptor-selected handler registry when a second consumer lands.
+        let command = if descriptor.name == "badgey" {
+            parse_command(prompt)
+        } else {
+            None
+        };
+        match command {
             Some(WrapperCommand::Dismiss) => {
-                return self
-                    .badgey_dismiss_internal(badgey_id, Some("wrapper command".to_string()));
+                return self.badgey_dismiss_internal(raw_id, Some("wrapper command".to_string()));
             }
             Some(WrapperCommand::ApplyProposal(proposal_id)) => {
                 return self
@@ -434,7 +451,7 @@ impl BlackboxServer {
                     &instance,
                     &uuid::Uuid::new_v4().to_string(),
                     "budget_extended",
-                    json!({"added_tokens": 50_000}),
+                    json!({"added_tokens": descriptor.turn_budget_tokens}),
                 )?;
                 return Ok(json!({
                     "badgey_id": id,
@@ -456,21 +473,24 @@ impl BlackboxServer {
                         orchestration::badgey::types::ProposalKind::Brofile.as_str(),
                         json!({
                             "action": "revert_brofile",
-                            "name": orchestration::badgey::descriptor().brofile_ref,
+                            "name": descriptor.brofile_ref,
                             "version": version,
                             "source": format!(
                                 "artifact:brofile:{}@{version}",
-                                orchestration::badgey::descriptor().brofile_ref
+                                descriptor.brofile_ref
                             ),
                         }),
                         Some(format!("revert-brofile:{version}")),
                     )
                     .map_err(|e| format!("creating brofile revert proposal: {e}"))?;
-                self.badgey_write_event(
+                self.consultant_write_event(
+                    descriptor,
                     &instance,
                     orchestration::badgey::events::ThreadEvent::ProposalEmitted {
                         proposal_id: proposal.id.clone(),
-                        kind: orchestration::badgey::types::ProposalKind::Brofile,
+                        kind: orchestration::badgey::types::ProposalKind::Brofile
+                            .as_str()
+                            .to_string(),
                         draft_ref: format!("badgey-persona@{version}"),
                         state: proposal.state,
                     },
@@ -545,7 +565,7 @@ impl BlackboxServer {
             brofile_filters,
             _coerce_workspace,
             brofile_context,
-        ) = self.resolve_exec_target(Some(orchestration::badgey::descriptor().brofile_ref), None, cwd.as_deref())?;
+        ) = self.resolve_exec_target(Some(descriptor.brofile_ref), None, cwd.as_deref())?;
         // Resume must honor the policy the original badgey dispatch
         // was launched under, not whatever badgey-persona says today.
         // Look up the lease for this provider-session and prefer its
@@ -591,19 +611,23 @@ impl BlackboxServer {
                 )
             })
             .or(exec_opts);
-        let scope_bind =
-            self.badgey_scope_bind(&id, &instance.thread_of_record_id, &instance.scope);
+        let scope_bind = self.consultant_scope_bind(
+            descriptor,
+            &id,
+            &instance.thread_of_record_id,
+            &instance.scope,
+        );
         let wrapped_user_prompt = format!("{scope_bind}\n{prompt}");
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(instance.provider_session_id.clone()),
             project_dir: cwd.clone(),
-            bro_name: Some(orchestration::badgey::descriptor().brofile_ref.to_string()),
+            bro_name: Some(descriptor.brofile_ref.to_string()),
             thread_id: Some(instance.thread_of_record_id.clone()),
             work_item_id: Some(id.as_str().to_string()),
             pin_block: self.ambient_pin_block(
                 cwd.as_deref(),
-                Some(orchestration::badgey::descriptor().brofile_ref),
+                Some(descriptor.brofile_ref),
                 Some(instance.provider_session_id.as_str()),
                 Some(instance.thread_of_record_id.as_str()),
                 Some(id.as_str()),
@@ -649,12 +673,12 @@ impl BlackboxServer {
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             Some(self.state.roster_events()),
-            Some("badgey".to_string()),
-            Some("agent:badgey@v1".to_string()),
+            Some(descriptor.name.to_string()),
+            Some(descriptor.agent_ref.to_string()),
             Some(self.state.system_events.clone()),
-            // badgey_resume_internal is the badgey runtime's
+            // consultant_resume_internal is the consultant runtime's
             // continuation dispatch; same source class as
-            // badgey_launch_exec (AgentDispatch).
+            // consultant_launch_exec (AgentDispatch).
             bro_core::Origin::AgentDispatch,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
@@ -664,11 +688,17 @@ impl BlackboxServer {
         } else {
             orch::timeout_snapshot_json(&task)
         };
-        let action_results = self
-            .badgey_post_process_turn(&instance, &turn_start)
-            .await?;
+        // Consumer intent post-processing: parses the consumer's intent-note
+        // grammar and dispatches its code-owned handlers. Routed by consumer
+        // name until a descriptor-selected handler registry exists.
+        let action_results = if descriptor.name == "badgey" {
+            self.badgey_post_process_turn(&instance, &turn_start).await?
+        } else {
+            Vec::new()
+        };
         let refs_consumed = self.badgey_refs_consumed_from_result(&result);
-        self.badgey_write_event(
+        self.consultant_write_event(
+            descriptor,
             &instance,
             orchestration::badgey::events::ThreadEvent::Turn {
                 turn_id: self.badgey_next_turn_id(&instance.thread_of_record_id),
@@ -696,8 +726,8 @@ impl BlackboxServer {
             },
             Some(task_id.clone()),
         )?;
-        Ok(json!({
-            "badgey_id": id,
+        let mut out = json!({
+            "consultant_id": id,
             "task_id": task_id,
             "session_id": instance.provider_session_id,
             "provider": provider,
@@ -705,6 +735,9 @@ impl BlackboxServer {
             "result": result,
             "actions": action_results,
             "merged_filters": effective_filters,
-        }))
+        });
+        // Legacy consumer-keyed id (e.g. `badgey_id`) kept for wire compat.
+        out[format!("{}_id", descriptor.name)] = json!(id);
+        Ok(out)
     }
 }

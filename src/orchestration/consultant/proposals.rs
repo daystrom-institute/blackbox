@@ -142,7 +142,11 @@ impl ProposalStore {
         Ok(proposal)
     }
 
-    pub fn get(&self, instance_id: &ConsultantId, proposal_id: &str) -> Result<Option<ConsultantProposal>> {
+    pub fn get(
+        &self,
+        instance_id: &ConsultantId,
+        proposal_id: &str,
+    ) -> Result<Option<ConsultantProposal>> {
         let path = self.proposal_path(instance_id, proposal_id)?;
         if !path.exists() {
             return Ok(None);

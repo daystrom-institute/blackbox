@@ -255,7 +255,12 @@ impl orchestration::agents::adapter::AgentDispatchAdapter for BadgeyAgentAdapter
                     });
                 }
                 server
-                    .badgey_resume_internal(badgey_id, prompt, None)
+                    .consultant_resume_internal(
+                        orchestration::badgey::descriptor(),
+                        badgey_id,
+                        prompt,
+                        None,
+                    )
                     .await
                     .map_err(|message| AgentDispatchError::AdapterFailed { message })?
             } else {
@@ -266,7 +271,12 @@ impl orchestration::agents::adapter::AgentDispatchAdapter for BadgeyAgentAdapter
                     .and_then(Value::as_str)
                     .map(String::from);
                 server
-                    .badgey_exec_internal(project_dir.clone(), brief, ctx.bro_label_prefix.clone())
+                    .consultant_exec_internal(
+                        orchestration::badgey::descriptor(),
+                        project_dir.clone(),
+                        brief,
+                        ctx.bro_label_prefix.clone(),
+                    )
                     .await
                     .map_err(|message| AgentDispatchError::AdapterFailed { message })?
             };

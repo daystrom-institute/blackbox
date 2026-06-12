@@ -13,6 +13,7 @@
 
 pub mod consumers;
 pub mod descriptor;
+pub mod events;
 pub mod journal;
 pub mod proposals;
 pub mod queue;

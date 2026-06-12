@@ -42,7 +42,11 @@ impl BlackboxServer {
             .into_iter()
             .filter(|instance| include_dismissed || !instance.is_dismissed())
             .map(|instance| {
-                let queue = self.state.consultant_registry.queue_status(&instance.id).ok();
+                let queue = self
+                    .state
+                    .consultant_registry
+                    .queue_status(&instance.id)
+                    .ok();
                 json!({
                     "id": instance.id,
                     "scope": instance.scope,
@@ -93,7 +97,11 @@ impl BlackboxServer {
                         event,
                         "scout_dispatched" | "subbro_spawned" | "scout_done" | "subbro_done"
                     )
-                    || event.starts_with(orchestration::badgey::descriptor().action_note_kind("spawn-subbro").as_str())
+                    || event.starts_with(
+                        orchestration::badgey::descriptor()
+                            .action_note_kind("spawn-subbro")
+                            .as_str(),
+                    )
             })
             .filter(|note| {
                 let body = serde_json::from_str::<Value>(&note.body).unwrap_or_else(

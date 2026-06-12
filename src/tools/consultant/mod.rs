@@ -25,6 +25,8 @@ use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 use serde_json::{Value, json};
 
+mod lifecycle;
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::consultant_tools()
 }

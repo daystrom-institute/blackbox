@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::orchestration::providers::Provider;
 
-use super::types::{BadgeyScope, ProposalKind, ProposalState};
+use super::types::{ConsultantScope, ProposalState};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CallerRef {
@@ -23,7 +23,7 @@ pub struct PathEdge {
 pub enum ThreadEvent {
     Exec {
         brofile_version: String,
-        scope: BadgeyScope,
+        scope: ConsultantScope,
         charter: String,
         provider: Provider,
         provider_session_id: String,
@@ -59,7 +59,8 @@ pub enum ThreadEvent {
     },
     ProposalEmitted {
         proposal_id: String,
-        kind: ProposalKind,
+        /// Consumer-vocabulary proposal kind (serde snake_case string).
+        kind: String,
         draft_ref: String,
         state: ProposalState,
     },
@@ -108,7 +109,7 @@ mod tests {
 
     #[test]
     fn thread_events_round_trip_and_report_note_kind() {
-        let scope = BadgeyScope {
+        let scope = ConsultantScope {
             project_id: "project-1".to_string(),
             initial_brief: Some("brief".to_string()),
         };
@@ -154,7 +155,7 @@ mod tests {
             },
             ThreadEvent::ProposalEmitted {
                 proposal_id: "P-1".to_string(),
-                kind: ProposalKind::Agent,
+                kind: "agent".to_string(),
                 draft_ref: "file.json".to_string(),
                 state: ProposalState::Pending,
             },

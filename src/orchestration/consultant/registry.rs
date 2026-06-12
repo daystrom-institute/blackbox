@@ -110,7 +110,10 @@ impl ConsultantRegistry {
         Ok(instance)
     }
 
-    pub fn get_including_dismissed(&self, id: &ConsultantId) -> Result<ConsultantInstance, RegistryError> {
+    pub fn get_including_dismissed(
+        &self,
+        id: &ConsultantId,
+    ) -> Result<ConsultantInstance, RegistryError> {
         self.instances
             .read()
             .get(id)
@@ -141,7 +144,11 @@ impl ConsultantRegistry {
         instances
     }
 
-    pub fn enqueue_resume(&self, id: &ConsultantId, turn: PendingTurn) -> Result<usize, RegistryError> {
+    pub fn enqueue_resume(
+        &self,
+        id: &ConsultantId,
+        turn: PendingTurn,
+    ) -> Result<usize, RegistryError> {
         let queue = self.queue_for_active_instance(id)?;
         queue
             .enqueue(turn)
@@ -188,7 +195,10 @@ impl ConsultantRegistry {
         Ok(self.queue_for_existing_instance(id)?.status())
     }
 
-    fn queue_for_active_instance(&self, id: &ConsultantId) -> Result<Arc<ResumeQueue>, RegistryError> {
+    fn queue_for_active_instance(
+        &self,
+        id: &ConsultantId,
+    ) -> Result<Arc<ResumeQueue>, RegistryError> {
         self.get(id)?;
         self.queue_for_existing_instance(id)
     }

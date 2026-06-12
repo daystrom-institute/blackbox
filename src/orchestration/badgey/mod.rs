@@ -8,8 +8,11 @@
 //! See design/orchestration/agents/consultant-runtime.md.
 
 pub mod commands;
-pub mod events;
 pub mod vocabulary;
+
+pub mod events {
+    pub use crate::orchestration::consultant::events::*;
+}
 
 pub use vocabulary::descriptor;
 

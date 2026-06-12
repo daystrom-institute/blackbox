@@ -12,8 +12,20 @@ use super::types::ConsultantId;
 /// (design/orchestration/agents/consultant-runtime.md §4.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerDescriptor {
-    /// Catalog name of the consumer (e.g. `badgey`).
+    /// Catalog name of the consumer (e.g. `badgey`). Used as the bro label,
+    /// thread-name prefix (`<name>:<id>`), session name, and scope-bind
+    /// header (`[<name>-scope]`).
     pub name: &'static str,
+    /// Human-facing display name (e.g. `Badgey`) for thread topics and
+    /// operator-visible prose.
+    pub display_name: &'static str,
+    /// Agent catalog ref used as the dispatch label (e.g. `agent:badgey@v1`).
+    pub agent_ref: &'static str,
+    /// First-turn instruction appended after the scope-bind block on exec.
+    pub exec_init_prompt: &'static str,
+    /// Per-consultation soft token budget surfaced in the scope-bind block;
+    /// budget-extend commands add this amount again.
+    pub turn_budget_tokens: u64,
     /// Instance-id prefix (e.g. `bg` → `bg-<8hex>-<8hex>`).
     pub id_prefix: &'static str,
     /// Prefix of the intent notes the post-turn processor consumes
@@ -74,6 +86,10 @@ mod tests {
 
     const TEST: ConsumerDescriptor = ConsumerDescriptor {
         name: "testc",
+        display_name: "Testc",
+        agent_ref: "agent:testc@v1",
+        exec_init_prompt: "Initialize this Testc consultation.",
+        turn_budget_tokens: 1_000,
         id_prefix: "tc",
         intent_note_prefix: "tc-action-",
         brofile_ref: "testc-persona",

@@ -9,6 +9,10 @@ use crate::orchestration::consultant::descriptor::ConsumerDescriptor;
 
 pub const BADGEY: ConsumerDescriptor = ConsumerDescriptor {
     name: "badgey",
+    display_name: "Badgey",
+    agent_ref: "agent:badgey@v1",
+    exec_init_prompt: "Initialize this Badgey consultation and answer the initial brief. Keep all durable observations in the thread of record.",
+    turn_budget_tokens: 50_000,
     id_prefix: "bg",
     intent_note_prefix: "bg-action-",
     brofile_ref: "badgey-persona",
@@ -104,7 +108,10 @@ mod tests {
 
     #[test]
     fn descriptor_matches_legacy_badgey_grammar() {
-        assert_eq!(BADGEY.parse_id("bg-3f7a91c4-91ff04cc").unwrap().prefix(), "bg");
+        assert_eq!(
+            BADGEY.parse_id("bg-3f7a91c4-91ff04cc").unwrap().prefix(),
+            "bg"
+        );
         assert!(BADGEY.parse_id("xx-3f7a91c4-91ff04cc").is_err());
         assert!(BADGEY.is_action_kind("bg-action-emit-proposal"));
         assert_eq!(BADGEY.action_note_kind("failed"), "bg-action-failed");
