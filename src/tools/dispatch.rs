@@ -372,12 +372,10 @@ impl BlackboxServer {
             provider: Some(request.provider),
             coerce_workspace: request.coerce_workspace,
         };
-        let final_prompt = orch::apply_brofile_lens(
-            &orch::apply_ambient(&request.prompt, &ambient_ctx),
-            request.lens.as_deref(),
-        );
+        let dispatch_context = ambient_ctx.dispatch_context(request.lens.as_deref());
         let mut args = request.provider.build_exec_args(
-            &final_prompt,
+            &request.prompt,
+            Some(&dispatch_context),
             &session_id,
             request.cwd.as_deref(),
             request.exec_opts.as_ref(),
@@ -638,7 +636,7 @@ impl BlackboxServer {
         let (
             provider,
             session_id,
-            _lens,
+            lens,
             mut exec_opts,
             env_overrides,
             cwd,
@@ -686,11 +684,12 @@ impl BlackboxServer {
             Err(err) => return Self::err_text(&err),
         };
 
-        // Re-apply ambient on resume: each resume is its own dispatch with a
-        // fresh task_id, and the per-turn recall directive + completion
-        // contract need to ride with every follow-up (memory-file
-        // reinforcement decays at depth). The brofile lens was injected on
-        // exec and lives in the transcript — not re-prepended here.
+        // Re-pass the full dispatch context on resume: each resume is its own
+        // dispatch with a fresh task_id, and the per-turn recall directive +
+        // completion contract need to ride with every follow-up. Persona is
+        // included — the harness places it idempotently in the system slot
+        // (the old resume branches dropped the lens; dispatch-prompt-slots.md
+        // §6 classifies that as a bug, not behavior to preserve).
         let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
@@ -715,9 +714,14 @@ impl BlackboxServer {
             provider: Some(provider),
             coerce_workspace,
         };
-        let wrapped_prompt = orch::apply_ambient(&p.prompt, &ambient_ctx);
+        let dispatch_context = ambient_ctx.dispatch_context(lens.as_deref());
 
-        let mut args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
+        let mut args = provider.build_resume_args(
+            &session_id,
+            &p.prompt,
+            Some(&dispatch_context),
+            exec_opts.as_ref(),
+        );
         // Filters (mechanical recursion guard + user-configured allow/
         // disallow) must ride with every dispatch — exec AND resume.
         // Without this, a resumed session re-acquires the orchestration
@@ -1336,38 +1340,36 @@ impl BlackboxServer {
             let extra = combine_dispatch_filters(brofile.filters.as_ref(), params_extra.as_ref());
             let extra = combine_dispatch_filters(extra.as_ref(), member_surface_filters.as_ref());
 
-            // Build first-turn prompt with ambient scope + brofile lens.
-            // Only applies on fresh-session exec paths; resumes use the
-            // raw prompt so ambient/lens aren't re-injected each turn.
-            let build_exec_prompt = |task_id: &str, session_id: &str| -> String {
-                let ctx = orch::AmbientContext {
-                    task_id: Some(task_id.to_string()),
-                    session_id: Some(session_id.to_string()),
-                    project_dir: cwd.clone(),
-                    bro_name: Some(member.name.clone()),
-                    thread_id: None,
-                    work_item_id: None,
-                    pin_block: self.ambient_pin_block(
-                        cwd.as_deref(),
-                        Some(member.name.as_str()),
-                        Some(session_id),
-                        None,
-                        None,
-                    ),
-                    completion_contract: if allow_recursion {
-                        None
-                    } else {
-                        Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
-                    },
-                    allow_recursion,
-                    provider: Some(brofile.provider),
-                    coerce_workspace: member_coerce_workspace,
+            // Per-member dispatch context: full payload — persona included —
+            // on BOTH the fresh and resume branches (the old resume branch
+            // sent the raw prompt with no ambient at all; design §6 audit).
+            let build_dispatch_context =
+                |task_id: &str, session_id: &str| -> bro_protocol::DispatchContext {
+                    let ctx = orch::AmbientContext {
+                        task_id: Some(task_id.to_string()),
+                        session_id: Some(session_id.to_string()),
+                        project_dir: cwd.clone(),
+                        bro_name: Some(member.name.clone()),
+                        thread_id: None,
+                        work_item_id: None,
+                        pin_block: self.ambient_pin_block(
+                            cwd.as_deref(),
+                            Some(member.name.as_str()),
+                            Some(session_id),
+                            None,
+                            None,
+                        ),
+                        completion_contract: if allow_recursion {
+                            None
+                        } else {
+                            Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
+                        },
+                        allow_recursion,
+                        provider: Some(brofile.provider),
+                        coerce_workspace: member_coerce_workspace,
+                    };
+                    ctx.dispatch_context(brofile.lens.as_deref())
                 };
-                orch::apply_brofile_lens(
-                    &orch::apply_ambient(&p.prompt, &ctx),
-                    brofile.lens.as_deref(),
-                )
-            };
 
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
@@ -1397,8 +1399,13 @@ impl BlackboxServer {
                             continue;
                         }
                     };
-                    let mut args =
-                        effective_provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
+                    let dispatch_context = build_dispatch_context(&task_id, sid);
+                    let mut args = effective_provider.build_resume_args(
+                        sid,
+                        &p.prompt,
+                        Some(&dispatch_context),
+                        exec_opts.as_ref(),
+                    );
                     let df = match resolve_dispatch_filters(
                         effective_provider,
                         member_cwd.as_deref(),
@@ -1443,9 +1450,10 @@ impl BlackboxServer {
             } else {
                 let task_id = uuid::Uuid::new_v4().to_string();
                 let session_id = "pending".to_string();
-                let exec_prompt = build_exec_prompt(&task_id, &session_id);
+                let dispatch_context = build_dispatch_context(&task_id, &session_id);
                 let mut args = brofile.provider.build_exec_args(
-                    &exec_prompt,
+                    &p.prompt,
+                    Some(&dispatch_context),
                     &session_id,
                     cwd.as_deref(),
                     exec_opts.as_ref(),
@@ -1790,7 +1798,11 @@ impl BlackboxServer {
             cwd.as_deref(),
         )?;
         let prompt = orch::workload_retro_prompt(session_id, cwd.as_deref());
-        let mut args = provider.build_resume_args(session_id, &prompt, exec_opts.as_ref());
+        // Deliberately NO dispatch context: the retro prompt is self-contained
+        // (inline scope, names the exact bbox_gap call it wants) and the
+        // recall/task-shape directives would miscue a reflection turn
+        // (dispatch-prompt-slots.md §8).
+        let mut args = provider.build_resume_args(session_id, &prompt, None, exec_opts.as_ref());
         // Retro probes never orchestrate — keep the mechanical recursion
         // guard on so a probe can't fan out (or re-trigger prune-retro).
         let dispatch_filters =

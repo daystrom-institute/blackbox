@@ -1524,19 +1524,19 @@ impl TaskStore {
 // Spawn + lifecycle
 // ---------------------------------------------------------------------------
 
-// ── Ambient prompt layer (per-turn, scoping + guardrails) ───────────
+// ── Dispatch-context layer (typed ingredients, harness-composed) ────
 //
-// The per-turn injection carries only what the agent cannot otherwise
-// derive: guardrails (recursion guard) and pre-bound scoping IDs
-// (session, project, bro, thread, work-item). It does NOT carry tool
-// vocabulary or protocol definitions — those belong to the start-of-
-// session layer rendered from `tool_docs` into the global memory files.
-//
-// This is deliberately separate from the brofile lens (persona / role
-// system-prompt). `apply_ambient` and `apply_brofile_lens` compose
-// freely but have distinct responsibilities:
-//   - ambient  = guardrail + scope (daemon-controlled, every dispatch)
-//   - lens     = persona / system-prompt (user-authored, per brofile)
+// The daemon owns CONTENT SELECTION only (dispatch-prompt-slots.md §3):
+// which directives fire for a dispatch, each directive's empirically-
+// calibrated cadence, the persona resolved from the brofile, the
+// pre-bound scoping IDs (task, session, project, bro, thread,
+// work-item), and the resolved pin block. It does NOT compose prompt
+// text — `AmbientContext::dispatch_context` serializes the typed
+// payload and the harness routes each ingredient to its per-transport
+// slot (`--dispatch-context`, bro-protocol `DispatchContext`). The
+// operator's prompt rides `-p` VERBATIM; nothing is ever glued onto it.
+// Tool vocabulary and protocol definitions stay in the start-of-session
+// layer rendered from `tool_docs` into the global memory files.
 
 // Text recursion guard retired 2026-04-17. Every dispatch-capable
 // provider (Claude, Copilot, Codex, Gemini) now has a mechanical tool
@@ -1645,11 +1645,11 @@ result would help the orchestrator act — but it is optional unless this \
 dispatch's instructions require one.\n\
 \n\
 When you do emit a note, include the correlation keys so it lands:\n\
-  task_id=<copy `task:` from [scope] above EXACTLY — not the project path, not \
-prose, not \"pending\">\n\
-  project=<`project` from [scope], if present>\n\
-  bro=<`bro` from [scope], if present>\n\
-  session_id=<`session` from [scope], if present>";
+  task_id=<copy `task:` from the `bbox_scope` context block EXACTLY — not the \
+project path, not prose, not \"pending\">\n\
+  project=<`project` from the `bbox_scope` block, if present>\n\
+  bro=<`bro` from the `bbox_scope` block, if present>\n\
+  session_id=<`session` from the `bbox_scope` block, if present>";
 
 /// Per-turn milestone-reporting nudge for every dispatch. Empirically,
 /// only brodex agents called `bro_report` mid-run across 12+ fleet
@@ -1935,32 +1935,6 @@ impl AmbientContext {
         }
     }
 
-    fn scope_fields(&self) -> Vec<String> {
-        let mut parts = Vec::new();
-        // task ID comes first — it's the stable correlation key and
-        // agents should always have it. Contract tells them to copy
-        // it into bbox_note.task_id.
-        if let Some(t) = &self.task_id {
-            parts.push(format!("task: {t}"));
-        }
-        if let Some(s) = self.session_field() {
-            parts.push(format!("session: {s}"));
-        }
-        if let Some(p) = &self.project_dir {
-            parts.push(format!("project: {p}"));
-        }
-        if let Some(b) = &self.bro_name {
-            parts.push(format!("bro: {b}"));
-        }
-        if let Some(t) = &self.thread_id {
-            parts.push(format!("thread: {t}"));
-        }
-        if let Some(w) = &self.work_item_id {
-            parts.push(format!("work_item: {w}"));
-        }
-        parts
-    }
-
     pub fn tool_arg_defaults(&self) -> Option<BTreeMap<String, String>> {
         let mut defaults = BTreeMap::new();
         if let Some(session_id) = self.session_field() {
@@ -2066,89 +2040,109 @@ impl AmbientContext {
     }
 }
 
-/// Wrap a prompt with the per-turn ambient prefix (scope block +
-/// recall directive + optional orchestrator hint + optional completion
-/// contract). Does NOT touch the brofile lens.
-///
-/// Recursion guarding (blocking sub-bro dispatch) is done mechanically
-/// via provider-specific tool-filter args (`--disallowedTools`,
-/// `--deny-tool`, `-c disabled_tools=…`, or `--policy <file>`), appended
-/// to argv outside this function. No text recursion guard is emitted.
-///
-/// The ambient prefix fires for every dispatch regardless of
-/// `allow_recursion`: the scope block lets the agent correlate notes,
-/// the recall directive prompts context lookup when relevant, and the
-/// orchestrator hint surfaces packet primitives for fan-out coordinators.
-/// These are purely textual — they don't interact with the mechanical
-/// recursion filter.
-pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
-    let mut prefix = String::new();
+impl AmbientContext {
+    /// Serialize this dispatch's typed ingredients — persona (brofile lens),
+    /// the selected directive set with declared cadence, the scope fields,
+    /// and the pin block — into the `--dispatch-context` payload
+    /// (dispatch-prompt-slots.md §4/§6). The harness owns composition;
+    /// nothing here is prompt text.
+    ///
+    /// Recursion guarding (blocking sub-bro dispatch) stays mechanical via
+    /// provider tool-filter args appended to argv outside this function; no
+    /// text recursion guard is emitted.
+    ///
+    /// Cadence declarations carry the empirical calibration the old glued
+    /// preamble encoded positionally: `recall` and `milestone` are per-turn
+    /// (session-start guidance attention-decays within-session; per-turn
+    /// injection survives — see the doc comments on RECALL_DIRECTIVE and
+    /// MILESTONE_REPORT_HINT), the rest are standing. `contract` and
+    /// `milestone` declare `needs_scope`: their texts reference the
+    /// `bbox_scope` correlation keys, so the harness drops them whenever no
+    /// current scope exists.
+    pub fn dispatch_context(&self, lens: Option<&str>) -> bro_protocol::DispatchContext {
+        use bro_protocol::{DirectiveCadence, DispatchDirective, DispatchScope};
 
-    let fields = ctx.scope_fields();
-    if !fields.is_empty() {
-        prefix.push_str("[scope] ");
-        prefix.push_str(&fields.join(" · "));
-        prefix.push_str("\n\n");
-    }
+        let directive = |id: &str, cadence: DirectiveCadence, needs_scope: bool, text: &str| {
+            DispatchDirective {
+                id: id.to_string(),
+                cadence,
+                needs_scope,
+                text: text.to_string(),
+            }
+        };
+        let mut directives = vec![
+            directive("recall", DirectiveCadence::PerTurn, false, RECALL_DIRECTIVE),
+            directive(
+                "task_shape",
+                DirectiveCadence::Standing,
+                false,
+                TASK_SHAPE_HINT,
+            ),
+        ];
+        // allow_recursion ⇒ this agent is a fan-out orchestrator. Surface the
+        // packet primitive — the most common silent miss for these agents is
+        // writing a prose rubric and pasting it into N identical sub-agent
+        // prompts.
+        if self.allow_recursion {
+            directives.push(directive(
+                "orchestrator",
+                DirectiveCadence::Standing,
+                false,
+                ORCHESTRATOR_HINT,
+            ));
+        }
+        if let Some(contract) = self
+            .completion_contract
+            .as_deref()
+            .map(str::trim_end)
+            .filter(|c| !c.is_empty())
+        {
+            directives.push(directive(
+                "contract",
+                DirectiveCadence::Standing,
+                true,
+                contract,
+            ));
+        }
+        directives.push(directive(
+            "milestone",
+            DirectiveCadence::PerTurn,
+            true,
+            MILESTONE_REPORT_HINT,
+        ));
+        if self.coerce_workspace {
+            directives.push(directive(
+                "workspace",
+                DirectiveCadence::Standing,
+                false,
+                WORKSPACE_TOOLS_APPENDIX,
+            ));
+        }
 
-    if let Some(pin_block) = &ctx.pin_block {
-        prefix.push_str("[scoped pins]\n");
-        prefix.push_str(pin_block.trim_end());
-        prefix.push_str("\n\n");
-    }
+        let scope = DispatchScope {
+            task: self.task_id.clone(),
+            session: self.session_field().map(str::to_string),
+            project: self.project_dir.clone(),
+            bro: self.bro_name.clone(),
+            thread: self.thread_id.clone(),
+            work_item: self.work_item_id.clone(),
+        };
 
-    // Per-turn recall reinforcement. Session-start memory guidance
-    // decays at depth on Claude and Gemini; ambient survives because
-    // it rides with every turn.
-    prefix.push_str("[recall before acting]\n");
-    prefix.push_str(RECALL_DIRECTIVE);
-    prefix.push_str("\n\n");
-
-    // Packet-primitive awareness nudge for every dispatch. Addresses
-    // the S11-shape silent-bypass where the agent doesn't have
-    // `bbox_compile` in their mental toolkit when a structured-task
-    // prompt arrives. Puts it there before plan formation.
-    prefix.push_str("[task shape]\n");
-    prefix.push_str(TASK_SHAPE_HINT);
-    prefix.push_str("\n\n");
-
-    // When the caller explicitly enabled recursion, this agent is a
-    // fan-out orchestrator. Surface the packet primitive — the most
-    // common silent miss for these agents is writing a prose rubric
-    // and pasting it into N identical sub-agent prompts.
-    if ctx.allow_recursion {
-        prefix.push_str("[orchestrator]\n");
-        prefix.push_str(ORCHESTRATOR_HINT);
-        prefix.push_str("\n\n");
-    }
-
-    if let Some(contract) = &ctx.completion_contract {
-        prefix.push_str("[completion contract]\n");
-        prefix.push_str(contract.trim_end());
-        prefix.push_str("\n\n");
-    }
-
-    // Milestone reporting nudge — late-positioned per convention so it
-    // survives attention decay on weaker providers.
-    prefix.push_str("[milestone reporting]\n");
-    prefix.push_str(MILESTONE_REPORT_HINT);
-    prefix.push_str("\n\n");
-
-    if ctx.coerce_workspace {
-        prefix.push_str(WORKSPACE_TOOLS_APPENDIX);
-        prefix.push_str("\n\n");
-    }
-
-    format!("{prefix}{prompt}")
-}
-
-/// Prepend the brofile lens (persona / system prompt) to a prompt.
-/// Kept deliberately separate from `apply_ambient` — they're orthogonal
-/// layers. Compose: `apply_brofile_lens(&apply_ambient(p, &ctx), lens)`.
-pub fn apply_brofile_lens(prompt: &str, lens: Option<&str>) -> String {
-    match lens {
-        Some(l) if !l.trim().is_empty() => format!("{l}\n\n{prompt}"),
-        _ => prompt.to_string(),
+        bro_protocol::DispatchContext {
+            v: bro_protocol::DISPATCH_CONTEXT_VERSION,
+            persona: lens
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
+            directives,
+            scope: (!scope.is_empty()).then_some(scope),
+            pins: self
+                .pin_block
+                .as_deref()
+                .map(str::trim_end)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
+        }
     }
 }
 
@@ -6207,7 +6201,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_emits_scope_block_no_text_guard() {
+    fn dispatch_context_emits_typed_scope_no_text_guard() {
         let ctx = AmbientContext {
             session_id: Some("sess-abc".into()),
             project_dir: Some("/repo/x".into()),
@@ -6216,14 +6210,27 @@ mod tests {
             provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
-        let out = apply_ambient("do stuff", &ctx);
-        assert!(!out.contains("IMPORTANT:"), "text recursion guard retired");
-        assert!(out.contains("[scope]"));
-        assert!(out.contains("session: sess-abc"));
-        assert!(out.contains("project: /repo/x"));
-        assert!(out.contains("bro: executor"));
-        assert!(out.contains("do stuff"));
-        assert!(!out.contains("STRUCTURED SIDE CHANNEL"));
+        let payload = ctx.dispatch_context(None);
+        let scope = payload.scope.as_ref().expect("scope present");
+        assert_eq!(
+            scope.fields(),
+            vec![
+                ("session", "sess-abc"),
+                ("project", "/repo/x"),
+                ("bro", "executor"),
+            ]
+        );
+        // Text recursion guard retired: no directive carries it for any
+        // provider — guarding is mechanical via dispatch tool filters.
+        assert!(
+            payload.directives.iter().all(|d| !d.text.contains("IMPORTANT:")),
+            "text recursion guard leaked into a directive"
+        );
+        // The payload is ingredients only — never the operator's prompt.
+        let raw = serde_json::to_string(&payload).unwrap();
+        assert!(!raw.contains("do stuff"));
+        // And it round-trips through the harness's strict parser.
+        assert_eq!(bro_protocol::DispatchContext::parse(&raw).unwrap(), payload);
     }
 
     #[test]
@@ -6607,277 +6614,203 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ambient_no_text_guard_for_any_provider() {
-        // Every provider relies on mechanical filtering now. Vibe has
-        // no MCP to recurse through at all.
-        for p in [
-            providers::Provider::Glm,
-            providers::Provider::VibeBh,
-            providers::Provider::Brodex,
-            providers::Provider::Deepseek,
-            providers::Provider::VibeBh,
-        ] {
-            let ctx = AmbientContext {
-                allow_recursion: false,
-                provider: Some(p),
-                ..Default::default()
-            };
-            let out = apply_ambient("work", &ctx);
-            assert!(
-                !out.contains("IMPORTANT:"),
-                "text guard leaked for provider {p:?}"
-            );
-        }
+    fn directive_ids(payload: &bro_protocol::DispatchContext) -> Vec<&str> {
+        payload.directives.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    fn directive<'a>(
+        payload: &'a bro_protocol::DispatchContext,
+        id: &str,
+    ) -> &'a bro_protocol::DispatchDirective {
+        payload
+            .directives
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("directive {id} missing"))
     }
 
     #[test]
-    fn ambient_skips_pending_session() {
+    fn dispatch_context_skips_pending_session() {
         let ctx = AmbientContext {
             session_id: Some("pending".into()),
             project_dir: Some("/repo/x".into()),
             ..Default::default()
         };
-        let out = apply_ambient("x", &ctx);
-        assert!(
-            !out.contains("session:"),
-            "pending session should be elided"
-        );
-        assert!(out.contains("project: /repo/x"));
+        let scope = ctx.dispatch_context(None).scope.expect("scope");
+        assert_eq!(scope.session, None, "pending session should be elided");
+        assert_eq!(scope.project.as_deref(), Some("/repo/x"));
     }
 
     #[test]
-    fn ambient_allow_recursion_still_emits_scope_and_recall() {
-        // Ambient prefix fires for every dispatch regardless of
-        // `allow_recursion`. Recursion guarding is mechanical (tool
-        // filter) not textual, and fan-out orchestrators still need
-        // scope correlation + recall guidance + the packet nudge.
+    fn dispatch_context_allow_recursion_keeps_scope_and_recall() {
+        // The payload carries scope + recall for every dispatch regardless of
+        // `allow_recursion`. Recursion guarding is mechanical (tool filter)
+        // not textual; fan-out orchestrators additionally get the packet
+        // nudge as a standing directive.
         let ctx = AmbientContext {
             session_id: Some("sess-orch".into()),
             allow_recursion: true,
             provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
-        let out = apply_ambient("coordinate stuff", &ctx);
-        assert!(out.contains("[scope]"));
-        assert!(out.contains("session: sess-orch"));
-        assert!(out.contains("[recall before acting]"));
-        assert!(out.contains("bbox_knowledge"));
-        assert!(out.contains("[orchestrator]"));
-        assert!(out.contains("bbox_compile"));
-        assert!(out.contains("coordinate stuff"));
+        let payload = ctx.dispatch_context(None);
+        assert_eq!(
+            payload.scope.as_ref().unwrap().session.as_deref(),
+            Some("sess-orch")
+        );
+        let recall = directive(&payload, "recall");
+        assert!(recall.text.contains("bbox_knowledge"));
+        let orch = directive(&payload, "orchestrator");
+        assert!(orch.text.contains("bbox_compile"));
+        assert_eq!(orch.cadence, bro_protocol::DirectiveCadence::Standing);
     }
 
     #[test]
-    fn ambient_emits_completion_contract_when_present() {
+    fn dispatch_context_contract_is_standing_and_needs_scope() {
         let ctx = AmbientContext {
             completion_contract: Some(
                 "call bbox_note(kind=\"done\", body=\"summary\") before returning".into(),
             ),
             ..Default::default()
         };
-        let out = apply_ambient("work", &ctx);
-        assert!(out.contains("[completion contract]"));
-        assert!(out.contains("bbox_note"));
+        let payload = ctx.dispatch_context(None);
+        let contract = directive(&payload, "contract");
+        assert!(contract.text.contains("bbox_note"));
+        assert_eq!(contract.cadence, bro_protocol::DirectiveCadence::Standing);
+        assert!(
+            contract.needs_scope,
+            "contract references bbox_scope keys, so it must drop without scope"
+        );
     }
 
     #[test]
-    fn ambient_emits_scoped_pin_block_when_present() {
+    fn default_contract_references_bbox_scope_block() {
+        // Wording follow-through (dispatch-prompt-slots.md §6): the contract's
+        // correlation-key guidance is placement-neutral — it names the
+        // `bbox_scope` context block, valid for both the contextual-user and
+        // system-section renderings, never "[scope] above".
+        assert!(DEFAULT_COMPLETION_CONTRACT.contains("`bbox_scope` context block"));
+        assert!(!DEFAULT_COMPLETION_CONTRACT.contains("[scope]"));
+    }
+
+    #[test]
+    fn dispatch_context_carries_pin_block_verbatim() {
         let ctx = AmbientContext {
             pin_block: Some(
                 "- [bro:executor] Active arc: validate cuts against canonical doc".into(),
             ),
             ..Default::default()
         };
-        let out = apply_ambient("work", &ctx);
-        assert!(out.contains("[scoped pins]"));
-        assert!(out.contains("Active arc"));
+        let payload = ctx.dispatch_context(None);
+        assert!(payload.pins.as_deref().unwrap().contains("Active arc"));
     }
 
     #[test]
-    fn ambient_emits_recall_directive() {
-        let ctx = AmbientContext::default();
-        let out = apply_ambient("work", &ctx);
-        assert!(out.contains("[recall before acting]"));
-        assert!(out.contains("bbox_knowledge"));
-        assert!(out.contains("durable knowledge"));
-        assert!(out.contains("system runbooks"));
-        assert!(out.contains("not the surface for scoped pins"));
-        assert!(out.contains("short phrase"));
-        assert!(!out.contains("FIRST tool call"));
+    fn dispatch_context_recall_directive_is_per_turn() {
+        let payload = AmbientContext::default().dispatch_context(None);
+        let recall = directive(&payload, "recall");
+        // Calibration: session-start guidance attention-decays within-session;
+        // per-turn injection survives (RECALL_DIRECTIVE doc comment).
+        assert_eq!(recall.cadence, bro_protocol::DirectiveCadence::PerTurn);
+        assert!(!recall.needs_scope);
+        assert!(recall.text.contains("bbox_knowledge"));
+        assert!(recall.text.contains("not the surface for scoped pins"));
+        assert!(recall.text.contains("short phrase"));
+        assert!(!recall.text.contains("FIRST tool call"));
     }
 
     #[test]
-    fn ambient_task_shape_hint_fires_for_every_dispatch() {
-        // Solo task: [task shape] should appear with bbox_compile +
-        // bbox_packet_gap named. Addresses the S11 silent-bypass mode.
+    fn dispatch_context_directive_order_and_conditionals() {
+        // Solo executor: recall → task_shape → contract → milestone.
         let solo = AmbientContext {
             allow_recursion: false,
+            completion_contract: Some(DEFAULT_COMPLETION_CONTRACT.to_string()),
             ..Default::default()
         };
-        let out_solo = apply_ambient("work", &solo);
-        assert!(out_solo.contains("[task shape]"));
-        assert!(out_solo.contains("bbox_compile"));
-        assert!(out_solo.contains("bbox_packet_gap"));
+        let payload = solo.dispatch_context(None);
+        assert_eq!(
+            directive_ids(&payload),
+            vec!["recall", "task_shape", "contract", "milestone"]
+        );
+        let task_shape = directive(&payload, "task_shape");
+        assert!(task_shape.text.contains("bbox_compile"));
+        assert!(task_shape.text.contains("bbox_packet_gap"));
+        assert_eq!(task_shape.cadence, bro_protocol::DirectiveCadence::Standing);
 
-        // Orchestrator task: both hints fire, composed.
+        // Orchestrator with workspace coercion: orchestrator after task_shape,
+        // workspace last (the old preamble's ordering, preserved as the
+        // directive vec order).
         let orch = AmbientContext {
             allow_recursion: true,
+            coerce_workspace: true,
             ..Default::default()
         };
-        let out_orch = apply_ambient("coord", &orch);
-        assert!(out_orch.contains("[task shape]"));
-        assert!(out_orch.contains("[orchestrator]"));
-        // Orchestrator hint follows task-shape hint in order.
-        let shape_idx = out_orch.find("[task shape]").unwrap();
-        let orch_idx = out_orch.find("[orchestrator]").unwrap();
-        assert!(shape_idx < orch_idx);
+        let payload = orch.dispatch_context(None);
+        assert_eq!(
+            directive_ids(&payload),
+            vec![
+                "recall",
+                "task_shape",
+                "orchestrator",
+                "milestone",
+                "workspace"
+            ]
+        );
     }
 
     #[test]
-    fn ambient_orchestrator_hint_fires_under_allow_recursion() {
-        // Fan-out orchestrators should see the packet-primitive nudge.
-        // It's purely textual; the recursion guard is mechanical and
-        // handled elsewhere via provider-specific tool filters.
-        let ctx = AmbientContext {
-            allow_recursion: true,
-            ..Default::default()
-        };
-        let out = apply_ambient("work", &ctx);
-        assert!(out.contains("[orchestrator]"));
-        assert!(out.contains("bbox_compile"));
-        assert!(out.contains("packet_id"));
+    fn dispatch_context_orchestrator_absent_without_recursion() {
+        let payload = AmbientContext::default().dispatch_context(None);
+        assert!(!directive_ids(&payload).contains(&"orchestrator"));
     }
 
     #[test]
-    fn ambient_orchestrator_hint_absent_without_recursion() {
-        // Regular executors don't dispatch sub-agents, so the packet
-        // nudge would be noise.
-        let ctx = AmbientContext {
-            allow_recursion: false,
-            ..Default::default()
-        };
-        let out = apply_ambient("work", &ctx);
-        assert!(!out.contains("[orchestrator]"));
-    }
-
-    #[test]
-    fn coerce_workspace_false_omits_appendix() {
-        let ctx = AmbientContext {
+    fn coerce_workspace_gates_workspace_directive() {
+        let payload = AmbientContext {
             coerce_workspace: false,
             ..Default::default()
-        };
-        let out = apply_ambient("work", &ctx);
-        assert!(
-            !out.contains("[workspace-tools mode]"),
-            "appendix must not appear when coerce_workspace is false"
-        );
-    }
+        }
+        .dispatch_context(None);
+        assert!(!directive_ids(&payload).contains(&"workspace"));
 
-    #[test]
-    fn coerce_workspace_true_injects_workspace_tools_appendix() {
-        let ctx = AmbientContext {
+        let payload = AmbientContext {
             coerce_workspace: true,
             ..Default::default()
-        };
-        let out = apply_ambient("work", &ctx);
-        assert!(
-            out.contains("[workspace-tools mode]"),
-            "appendix header must appear when coerce_workspace is true"
-        );
-        assert!(
-            out.contains("work_smart_read"),
-            "appendix must reference work_smart_read"
-        );
-        assert!(
-            out.contains("work_bash"),
-            "appendix must reference work_bash"
-        );
-        assert!(
-            out.contains("work_git_status"),
-            "appendix must reference work_git_status"
-        );
-        assert!(
-            out.contains("work_git_diff"),
-            "appendix must reference work_git_diff"
-        );
-        assert!(
-            out.contains("work_git_log"),
-            "appendix must reference work_git_log"
-        );
-        assert!(
-            out.contains("bbox_note(kind=learned"),
-            "appendix must reference bbox_note fallback"
-        );
+        }
+        .dispatch_context(None);
+        let ws = directive(&payload, "workspace");
+        for needle in [
+            "[workspace-tools mode]",
+            "work_smart_read",
+            "work_bash",
+            "work_git_status",
+            "work_git_diff",
+            "work_git_log",
+            "bbox_note(kind=learned",
+        ] {
+            assert!(ws.text.contains(needle), "appendix must reference {needle}");
+        }
+        assert_eq!(ws.cadence, bro_protocol::DirectiveCadence::Standing);
     }
 
     #[test]
-    fn workspace_tools_appendix_placed_after_completion_contract() {
-        let ctx = AmbientContext {
-            coerce_workspace: true,
-            completion_contract: Some("do the thing".into()),
-            ..Default::default()
-        };
-        let out = apply_ambient("work", &ctx);
-        let contract_idx = out.find("[completion contract]").unwrap();
-        let ws_idx = out.find("[workspace-tools mode]").unwrap();
-        assert!(
-            contract_idx < ws_idx,
-            "workspace-tools appendix must follow completion contract"
-        );
-    }
-
-    #[test]
-    fn coerce_workspace_true_composes_with_other_ambient_sections() {
-        let ctx = AmbientContext {
-            task_id: Some("task-123".into()),
-            coerce_workspace: true,
-            allow_recursion: true,
-            completion_contract: Some("emit done".into()),
-            provider: Some(providers::Provider::Glm),
-            ..Default::default()
-        };
-        let out = apply_ambient("work", &ctx);
-        assert!(out.contains("[scope]"));
-        assert!(out.contains("[recall before acting]"));
-        assert!(out.contains("[task shape]"));
-        assert!(out.contains("[orchestrator]"));
-        assert!(out.contains("[completion contract]"));
-        assert!(out.contains("[workspace-tools mode]"));
-        assert!(out.contains("work"));
-    }
-
-    #[test]
-    fn brofile_lens_prepends_persona() {
+    fn dispatch_context_persona_normalizes_lens() {
+        let ctx = AmbientContext::default();
         assert_eq!(
-            apply_brofile_lens("work", Some("You are a reviewer")),
-            "You are a reviewer\n\nwork"
+            ctx.dispatch_context(Some("You are a reviewer")).persona,
+            Some("You are a reviewer".to_string())
         );
-        assert_eq!(apply_brofile_lens("work", None), "work");
-        assert_eq!(apply_brofile_lens("work", Some("   ")), "work");
+        assert_eq!(ctx.dispatch_context(None).persona, None);
+        assert_eq!(ctx.dispatch_context(Some("   ")).persona, None);
     }
 
     #[test]
-    fn ambient_and_lens_compose_cleanly() {
-        let ctx = AmbientContext {
-            session_id: Some("sess-xyz".into()),
-            allow_recursion: false,
-            provider: Some(providers::Provider::Glm),
-            ..Default::default()
-        };
-        let wrapped = apply_brofile_lens(&apply_ambient("work", &ctx), Some("You are a reviewer"));
-        assert!(wrapped.starts_with("You are a reviewer"));
-        assert!(wrapped.contains("[scope]"));
-        assert!(wrapped.contains("sess-xyz"));
-        assert!(wrapped.contains("work"));
-        assert!(!wrapped.contains("IMPORTANT:"), "text guard retired");
-    }
-
-    #[test]
-    fn milestone_report_hint_fires_for_every_dispatch() {
-        // The reporting nudge is unconditional — fires for every provider
-        // regardless of allow_recursion, coerce_workspace, or completion
-        // contract state.
+    fn milestone_directive_fires_for_every_provider() {
+        // The reporting nudge is unconditional — every provider, regardless
+        // of allow_recursion / coerce_workspace / contract state — declared
+        // per-turn (the empirical claim: session-start reporting guidance
+        // decays at depth on weaker models) and needs_scope (its bro_report
+        // correlation rides the scope keys).
         for p in [
             providers::Provider::Glm,
             providers::Provider::Deepseek,
@@ -6885,35 +6818,19 @@ mod tests {
             providers::Provider::Brodex,
             providers::Provider::VibeBh,
         ] {
-            let ctx = AmbientContext {
+            let payload = AmbientContext {
                 provider: Some(p),
                 ..Default::default()
-            };
-            let out = apply_ambient("work", &ctx);
+            }
+            .dispatch_context(None);
+            let milestone = directive(&payload, "milestone");
             assert!(
-                out.contains("[milestone reporting]"),
-                "milestone reporting missing for provider {p:?}"
-            );
-            assert!(
-                out.contains("bro_report"),
+                milestone.text.contains("bro_report"),
                 "bro_report reference missing for provider {p:?}"
             );
+            assert_eq!(milestone.cadence, bro_protocol::DirectiveCadence::PerTurn);
+            assert!(milestone.needs_scope);
         }
-    }
-
-    #[test]
-    fn milestone_report_placed_after_completion_contract() {
-        let ctx = AmbientContext {
-            completion_contract: Some("emit done".into()),
-            ..Default::default()
-        };
-        let out = apply_ambient("work", &ctx);
-        let contract_idx = out.find("[completion contract]").unwrap();
-        let report_idx = out.find("[milestone reporting]").unwrap();
-        assert!(
-            contract_idx < report_idx,
-            "milestone reporting must follow completion contract"
-        );
     }
 
     #[test]

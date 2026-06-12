@@ -943,10 +943,13 @@ Next step: <one concrete steering suggestion>\n",
                     provider: Some(effective_provider),
                     coerce_workspace: brofile.coerce_workspace.unwrap_or(false),
                 };
-                let wrapped_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
+                // Resume passes the full dispatch context, persona included
+                // (dispatch-prompt-slots.md §6).
+                let dispatch_context = ambient_ctx.dispatch_context(brofile.lens.as_deref());
                 let mut args = effective_provider.build_resume_args(
                     session_id,
-                    &wrapped_prompt,
+                    &prompt,
+                    Some(&dispatch_context),
                     exec_opts.as_ref(),
                 );
                 let dispatch_filters = match resolve_dispatch_filters(
@@ -1004,12 +1007,10 @@ Next step: <one concrete steering suggestion>\n",
                     provider: Some(provider),
                     coerce_workspace: brofile.coerce_workspace.unwrap_or(false),
                 };
-                let wrapped_prompt = orch::apply_brofile_lens(
-                    &orch::apply_ambient(&prompt, &ambient_ctx),
-                    brofile.lens.as_deref(),
-                );
+                let dispatch_context = ambient_ctx.dispatch_context(brofile.lens.as_deref());
                 let mut args = provider.build_exec_args(
-                    &wrapped_prompt,
+                    &prompt,
+                    Some(&dispatch_context),
                     &session_id,
                     cwd.as_deref(),
                     exec_opts.as_ref(),

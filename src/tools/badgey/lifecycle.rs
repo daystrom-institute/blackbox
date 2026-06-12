@@ -170,10 +170,10 @@ impl BlackboxServer {
             provider: Some(provider),
             coerce_workspace: false,
         };
-        let final_prompt =
-            orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());
+        let dispatch_context = ambient_ctx.dispatch_context(lens.as_deref());
         let mut args = provider.build_exec_args(
-            &final_prompt,
+            &prompt,
+            Some(&dispatch_context),
             &session_id,
             cwd.as_deref(),
             exec_opts.as_ref(),
@@ -534,7 +534,7 @@ impl BlackboxServer {
             .or_else(|| Some(instance.scope.project_id.clone()));
         let (
             provider,
-            _lens,
+            lens,
             exec_opts,
             mut env_overrides,
             _resolved_cwd,
@@ -609,10 +609,13 @@ impl BlackboxServer {
             provider: Some(effective_provider),
             coerce_workspace: false,
         };
-        let final_prompt = orch::apply_ambient(&wrapped_user_prompt, &ambient_ctx);
+        // Full dispatch context on resume, persona included
+        // (dispatch-prompt-slots.md §6).
+        let dispatch_context = ambient_ctx.dispatch_context(lens.as_deref());
         let mut args = effective_provider.build_resume_args(
             &instance.provider_session_id,
-            &final_prompt,
+            &wrapped_user_prompt,
+            Some(&dispatch_context),
             orchestration::providers::exec_opts_with_provider_defaults(
                 exec_opts,
                 effective_context,

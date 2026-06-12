@@ -177,21 +177,38 @@ pub trait ProviderExec {
     fn bin(&self) -> String;
     /// Like [`bin`](Self::bin) but allowing a per-provider config override.
     fn bin_with_config(&self, cfg: &ProviderConfig) -> String;
-    /// Build the args for a fresh dispatch.
+    /// Build the args for a fresh dispatch. `prompt` is the operator's text
+    /// VERBATIM; `dispatch_context` is the typed payload the harness composes
+    /// per transport (dispatch-prompt-slots.md §4/§6) — the two never mix.
     fn build_exec_args(
         &self,
         prompt: &str,
+        dispatch_context: Option<&bro_protocol::DispatchContext>,
         session_id: &str,
         cwd: Option<&str>,
         opts: Option<&ExecOpts>,
     ) -> Vec<String>;
-    /// Build the args for resuming an existing session.
+    /// Build the args for resuming an existing session. Resume passes the
+    /// full dispatch context too — persona included (the harness places it
+    /// idempotently in the system slot; dropping it on resume was the old
+    /// `_lens` bug, dispatch-prompt-slots.md §6).
     fn build_resume_args(
         &self,
         session_id: &str,
         prompt: &str,
+        dispatch_context: Option<&bro_protocol::DispatchContext>,
         opts: Option<&ExecOpts>,
     ) -> Vec<String>;
+}
+
+/// Serialize the payload for the `--dispatch-context` flag. The DTO is plain
+/// strings/enums, so serialization cannot fail in practice.
+fn dispatch_context_flag(args: &mut Vec<String>, ctx: Option<&bro_protocol::DispatchContext>) {
+    if let Some(ctx) = ctx
+        && let Ok(json) = serde_json::to_string(ctx)
+    {
+        args.extend(["--dispatch-context".into(), json]);
+    }
 }
 
 impl ProviderExec for Provider {
@@ -216,6 +233,7 @@ impl ProviderExec for Provider {
     fn build_exec_args(
         &self,
         prompt: &str,
+        dispatch_context: Option<&bro_protocol::DispatchContext>,
         session_id: &str,
         _cwd: Option<&str>,
         opts: Option<&ExecOpts>,
@@ -247,6 +265,7 @@ impl ProviderExec for Provider {
                     "--include-partial-messages".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
+                dispatch_context_flag(&mut args, dispatch_context);
                 if suppress_provider_defaults {
                     args.extend([
                         "--system-prompt".into(),
@@ -281,6 +300,7 @@ impl ProviderExec for Provider {
         &self,
         session_id: &str,
         prompt: &str,
+        dispatch_context: Option<&bro_protocol::DispatchContext>,
         opts: Option<&ExecOpts>,
     ) -> Vec<String> {
         let model = opts
@@ -312,6 +332,7 @@ impl ProviderExec for Provider {
                     "--include-partial-messages".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
+                dispatch_context_flag(&mut args, dispatch_context);
                 if suppress_provider_defaults {
                     args.extend([
                         "--system-prompt".into(),

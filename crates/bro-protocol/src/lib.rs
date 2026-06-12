@@ -8,9 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod dispatch;
+mod dispatch_context;
 mod transcript;
 
 pub use dispatch::{CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest, DispatchSpec, PhaseResult, ResumeSpec, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY};
+pub use dispatch_context::{
+    DISPATCH_CONTEXT_VERSION, DirectiveCadence, DispatchContext, DispatchDirective, DispatchScope,
+};
 pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

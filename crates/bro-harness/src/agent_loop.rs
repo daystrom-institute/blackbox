@@ -570,6 +570,15 @@ struct Session {
     /// lives in `user_instructions`, not in the system slot.
     explicit_system: Option<String>,
     user_instructions: Option<crate::context::UserInstructions>,
+    /// Per-transport composition strategy: where persona, directives, memory,
+    /// scope, and pins land for this session's transport
+    /// (design/bro-harness/dispatch-prompt-slots.md §5).
+    strategy: crate::context::dispatch::CompositionStrategy,
+    /// Typed dispatch-context state (`--dispatch-context`): the current
+    /// in-memory context plus the last-emitted user-lane baselines. Persisted
+    /// in the `dispatch_context` / `dispatch_emitted` side cells (scope is
+    /// NEVER persisted/restored — per-dispatch correlation data).
+    dispatch: crate::context::dispatch::DispatchState,
     max_turns: u64,
     compaction: crate::compaction::CompactionPolicy,
     compact_threshold: Option<u64>,
@@ -701,6 +710,18 @@ impl Session {
         let restored_reference_context = crate::context::TurnContextItem::from_side(
             prior_side.get("reference_context").unwrap_or(&Value::Null),
         );
+        // Dispatch-context resolution (dispatch-prompt-slots.md §4): the flag
+        // replaces the persisted context wholesale; empty clears; absent
+        // restores persona/pins/non-`needs_scope` directives from side-state
+        // with scope dropped. Strict parse — daemon-authored payloads fail
+        // loudly, they do not degrade.
+        let dispatch_arg = crate::context::dispatch::resolve_dispatch_context_arg(
+            cli.dispatch_context.as_deref(),
+        )
+        .map_err(anyhow::Error::msg)
+        .context("--dispatch-context")?;
+        let dispatch = crate::context::dispatch::DispatchState::from_arg(dispatch_arg, &prior_side);
+        let strategy = crate::context::dispatch::CompositionStrategy::for_transport(kind);
         if let Some(r) = &store.restored {
             if r.transport != tx.name() {
                 anyhow::bail!(
@@ -918,6 +939,8 @@ impl Session {
             compact_threshold,
             tool_result_cap,
             dump_dir,
+            strategy,
+            dispatch,
             store,
             event_log,
             prior_side,
@@ -1095,7 +1118,7 @@ impl Session {
                 self.push_user_text_raw(prompt);
             }
             let mut sys = compose_system(
-                self.explicit_system.as_deref(),
+                &self.system_sections(),
                 &self.reg,
                 self.output_schema.is_some(),
             );
@@ -1105,6 +1128,19 @@ impl Session {
                     v.push('\n');
                 }
                 v.push_str(&t);
+            }
+            // Per-turn directives ride the volatile lane AFTER the existing
+            // channels (structured-output reminder, tail nudges) — design §8.
+            // On openai-chat after-tool turns the transport folds the volatile
+            // tail into the leading system block (Mistral forbids
+            // system-after-tool); everywhere else this is the uncached
+            // trailing slot, late relative to the task.
+            if let Some(per_turn) = self.dispatch.per_turn_text() {
+                let v = sys.volatile.get_or_insert_with(String::new);
+                if !v.is_empty() {
+                    v.push('\n');
+                }
+                v.push_str(&per_turn);
             }
             let opts = TurnOpts {
                 system: sys,
@@ -1525,11 +1561,45 @@ impl Session {
         }
     }
 
+    /// Strategy-routed sections for the stable system slot. Codex-shaped:
+    /// persona + standing directives only (memory/scope/pins ride the
+    /// contextual-user lane). Vibe-shaped: memory, environment, scope, and
+    /// pins additionally fold into the leading system block, rebuilt in place
+    /// per request (vibe's `update_system_prompt` shape) — nothing
+    /// context-shaped enters the user lane on that strategy.
+    fn system_sections(&self) -> SystemSections {
+        let mut sections = SystemSections {
+            explicit: self.explicit_system.clone(),
+            persona: self.dispatch.persona().map(str::to_string),
+            standing: self.dispatch.standing_text(),
+            ..SystemSections::default()
+        };
+        if !self.strategy.context_rides_user_lane() {
+            sections.memory = self
+                .user_instructions
+                .as_ref()
+                .map(crate::context::ContextualUserFragment::render);
+            sections.environment = Some(crate::context::ContextualUserFragment::render(
+                &crate::context::EnvironmentContext::from_tool_cx(&self.cx),
+            ));
+            sections.scope = self.dispatch.scope_render();
+            sections.pins = self.dispatch.pins_render();
+        }
+        sections
+    }
+
     fn prepare_context_for_user_turn(&mut self) {
         if self.reference_context_item.is_none() {
             self.emit_initial_context_if_needed();
-        } else {
+        } else if self.strategy.context_rides_user_lane() {
             self.emit_environment_context_diff_if_needed();
+            self.emit_dispatch_context_changes_if_needed();
+        } else {
+            // Vibe-shaped: the leading system rebuild carries
+            // environment/scope/pins; advance the baseline silently so
+            // side-state stays current.
+            let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
+            self.reference_context_item = Some(env.to_turn_context_item());
         }
     }
 
@@ -1538,11 +1608,58 @@ impl Session {
             return;
         }
         let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
-        let mut sections = Vec::new();
-        if let Some(instructions) = &self.user_instructions {
-            sections.push(crate::context::ContextualUserFragment::render(instructions));
+        // The emitter is strategy-aware (design §5, review round 2 blocker):
+        // on the vibe-shaped strategy memory/environment/scope/pins resolve to
+        // the stable system slot, so the initial-context emitter contributes
+        // NOTHING to the user lane.
+        if self.strategy.context_rides_user_lane() {
+            // Turn-1 contextual user message ordering (codex order):
+            // UserInstructions (AGENTS.md) → scope → pins → environment LAST.
+            let mut sections = Vec::new();
+            if let Some(instructions) = &self.user_instructions {
+                sections.push(crate::context::ContextualUserFragment::render(instructions));
+            }
+            if let Some(scope) = self.dispatch.scope_render() {
+                self.dispatch.emitted_scope = Some(scope.clone());
+                sections.push(scope);
+            }
+            if let Some(pins) = self.dispatch.pins_render() {
+                self.dispatch.emitted_pins = Some(pins.clone());
+                sections.push(pins);
+            }
+            sections.push(crate::context::ContextualUserFragment::render(&env));
+            if let Some(message) = crate::context::build_contextual_user_message(sections) {
+                let added_tokens = message
+                    .text_blocks
+                    .iter()
+                    .map(|section| est_tokens(section))
+                    .fold(0u64, u64::saturating_add);
+                self.tx.push_user_text_blocks(message.text_blocks);
+                self.pending_input_estimate =
+                    self.pending_input_estimate.saturating_add(added_tokens);
+            }
         }
-        sections.push(crate::context::ContextualUserFragment::render(&env));
+        self.reference_context_item = Some(env.to_turn_context_item());
+    }
+
+    /// Re-emit scope/pins fragments when the current dispatch context differs
+    /// from the last-emitted baselines (resume with a changed scope, pin
+    /// update). No current scope ⇒ nothing emitted and the baseline survives
+    /// for future comparison (design §4/§7).
+    fn emit_dispatch_context_changes_if_needed(&mut self) {
+        let mut sections: Vec<String> = Vec::new();
+        if let Some(scope) = self.dispatch.scope_render()
+            && self.dispatch.emitted_scope.as_deref() != Some(scope.as_str())
+        {
+            self.dispatch.emitted_scope = Some(scope.clone());
+            sections.push(scope);
+        }
+        if let Some(pins) = self.dispatch.pins_render()
+            && self.dispatch.emitted_pins.as_deref() != Some(pins.as_str())
+        {
+            self.dispatch.emitted_pins = Some(pins.clone());
+            sections.push(pins);
+        }
         if let Some(message) = crate::context::build_contextual_user_message(sections) {
             let added_tokens = message
                 .text_blocks
@@ -1552,7 +1669,6 @@ impl Session {
             self.tx.push_user_text_blocks(message.text_blocks);
             self.pending_input_estimate = self.pending_input_estimate.saturating_add(added_tokens);
         }
-        self.reference_context_item = Some(env.to_turn_context_item());
     }
 
     fn emit_environment_context_diff_if_needed(&mut self) {
@@ -1734,6 +1850,8 @@ impl Session {
             .as_ref()
             .map(crate::context::TurnContextItem::to_side)
             .unwrap_or(Value::Null);
+        side["dispatch_context"] = self.dispatch.context_to_side();
+        side["dispatch_emitted"] = self.dispatch.emitted_to_side();
         side
     }
 }
@@ -1957,26 +2075,63 @@ fn est_tool_results(results: &[transport::ToolResult]) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
+/// Strategy-routed sections feeding the stable system slot
+/// (design/bro-harness/dispatch-prompt-slots.md §5). `explicit`, `persona`,
+/// and `standing` apply under every strategy; `memory`, `environment`,
+/// `scope`, and `pins` are filled only by the vibe-shaped strategy, where
+/// those classes fold into the leading system message instead of the
+/// contextual-user lane.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SystemSections {
+    explicit: Option<String>,
+    persona: Option<String>,
+    standing: Option<String>,
+    memory: Option<String>,
+    environment: Option<String>,
+    scope: Option<String>,
+    pins: Option<String>,
+}
+
 /// Compose the effective system prompt as a cache-stable prefix plus a volatile
 /// tail. See the transport `SystemPrompt` docs.
-fn compose_system(base: Option<&str>, reg: &Registry, has_structured_output: bool) -> SystemPrompt {
-    let mut stable = base.unwrap_or("").to_string();
+///
+/// Stable ordering (both strategies; base instructions render before all of
+/// this, transport-side): explicit `--system-prompt` override → persona →
+/// standing directives → memory → pinned-tools → environment → scope → pins.
+/// The per-resume-mutable sections (scope/pins) sit at the suffix so the
+/// prefix stays byte-identical across leading-block rebuilds on the chat
+/// lane (cache vs salience trade, design §5).
+fn compose_system(
+    sections: &SystemSections,
+    reg: &Registry,
+    has_structured_output: bool,
+) -> SystemPrompt {
+    fn push_part(parts: &mut Vec<String>, s: Option<&str>) {
+        if let Some(s) = s
+            && !s.trim().is_empty()
+        {
+            parts.push(s.trim_end().to_string());
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    push_part(&mut parts, sections.explicit.as_deref());
+    push_part(&mut parts, sections.persona.as_deref());
+    push_part(&mut parts, sections.standing.as_deref());
+    push_part(&mut parts, sections.memory.as_deref());
 
     let pinned = reg.pinned();
     if !pinned.is_empty() {
-        if !stable.is_empty() {
-            stable.push_str("\n\n");
-        }
-        stable.push_str(
+        let mut block = String::new();
+        block.push_str(
             "## Always-available tools\n\
              These are loaded and ready — prefer them for their purpose; do not search for them. \
              `tool_search` loads anything else on demand.\n",
         );
         for (name, desc) in pinned {
-            stable.push_str(&format!("- `{name}` — {desc}\n"));
+            block.push_str(&format!("- `{name}` — {desc}\n"));
         }
         if reg.contains("shell_poll") {
-            stable.push_str(
+            block.push_str(
                 "\nShell sessions: `shell_run` waits up to `yield_time_ms` for exit (default ~1s; \
                  `0` waits until exit/timeout). If `shell_run` or `shell_poll` returns `running=true`, \
                  the command is still active; call `shell_poll` with the returned `session_id` \
@@ -1984,7 +2139,12 @@ fn compose_system(base: Option<&str>, reg: &Registry, has_structured_output: boo
                  if you are abandoning it.\n",
             );
         }
+        parts.push(block.trim_end().to_string());
     }
+    push_part(&mut parts, sections.environment.as_deref());
+    push_part(&mut parts, sections.scope.as_deref());
+    push_part(&mut parts, sections.pins.as_deref());
+    let stable = parts.join("\n\n");
 
     let mut volatile = String::new();
     if has_structured_output {
@@ -2159,6 +2319,9 @@ mod tests {
         /// Count of read-only probe calls that rendezvoused at the shared
         /// barrier — only reaches 2 if the batch ran concurrently (phase 1).
         rendezvous: Arc<AtomicUsize>,
+        /// SystemPrompt observed by each run_turn call, for slot-routing
+        /// assertions (volatile-lane ordering, stable composition).
+        seen_systems: Arc<Mutex<Vec<SystemPrompt>>>,
     }
 
     struct MockTransport {
@@ -2182,10 +2345,15 @@ mod tests {
         async fn run_turn(
             &mut self,
             _tools: &[transport::ToolSpec],
-            _opts: &TurnOpts,
+            opts: &TurnOpts,
             _sink: &dyn transport::TurnSink,
         ) -> Result<transport::TurnOutput> {
             self.shared.started.fetch_add(1, Ordering::SeqCst);
+            self.shared
+                .seen_systems
+                .lock()
+                .unwrap()
+                .push(opts.system.clone());
             let script = self
                 .scripts
                 .lock()
@@ -2386,6 +2554,8 @@ mod tests {
             cx,
             reference_context_item: None,
             hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
+            strategy: crate::context::dispatch::CompositionStrategy::CodexShaped,
+            dispatch: crate::context::dispatch::DispatchState::default(),
             emitter: Emitter::new("test".into()),
             base_opts: TurnOpts {
                 model: "m".into(),
@@ -2719,10 +2889,10 @@ mod tests {
             text: agents.into(),
         });
 
-        let system = compose_system(session.explicit_system.as_deref(), &session.reg, false);
+        let system = compose_system(&session.system_sections(), &session.reg, false);
         assert!(
             !system.stable_text().unwrap_or("").contains(agents),
-            "AGENTS text must not stay in system stable"
+            "AGENTS text must not stay in system stable on the codex-shaped strategy"
         );
 
         session.push_user_text("hello");
@@ -2745,7 +2915,7 @@ mod tests {
     fn no_agents_emits_only_environment_context_and_pinned_system() {
         let (mut session, shared) = mk_session(vec![]);
 
-        let system = compose_system(session.explicit_system.as_deref(), &session.reg, false);
+        let system = compose_system(&session.system_sections(), &session.reg, false);
         let stable = system.stable_text().expect("pinned tools stable block");
         assert!(stable.contains("Always-available tools"));
         assert!(!stable.contains("AGENTS_UNIQUE_RULE"));
@@ -2766,7 +2936,7 @@ mod tests {
         session.explicit_system = Some(explicit.into());
         session.user_instructions = None;
 
-        let system = compose_system(session.explicit_system.as_deref(), &session.reg, false);
+        let system = compose_system(&session.system_sections(), &session.reg, false);
         assert!(system.stable_text().unwrap().contains(explicit));
 
         session.push_user_text("hello");
@@ -2784,6 +2954,272 @@ mod tests {
     fn user_turns_after_initial_context(users: &[String]) -> &[String] {
         assert!(users[0].starts_with("<environment_context>"), "{users:?}");
         &users[1..]
+    }
+
+    // --- dispatch-context composition strategies (dispatch-prompt-slots.md §5/§7) ---
+
+    fn test_dispatch_state(
+        scope: Option<crate::context::dispatch::DispatchScope>,
+    ) -> crate::context::dispatch::DispatchState {
+        use crate::context::dispatch::*;
+        let ctx = DispatchContext {
+            v: 1,
+            persona: Some("PERSONA_UNIQUE reviewer".into()),
+            directives: vec![
+                DispatchDirective {
+                    id: "task_shape".into(),
+                    cadence: DirectiveCadence::Standing,
+                    needs_scope: false,
+                    text: "STANDING_UNIQUE task-shape check".into(),
+                },
+                DispatchDirective {
+                    id: "recall".into(),
+                    cadence: DirectiveCadence::PerTurn,
+                    needs_scope: false,
+                    text: "PER_TURN_UNIQUE recall".into(),
+                },
+            ],
+            scope,
+            pins: Some("PINS_UNIQUE active arc".into()),
+        };
+        DispatchState::from_arg(DispatchContextArg::Provided(ctx), &Value::Null)
+    }
+
+    fn test_scope(task: &str) -> crate::context::dispatch::DispatchScope {
+        crate::context::dispatch::DispatchScope {
+            task: Some(task.into()),
+            session: Some("sess-1".into()),
+            ..Default::default()
+        }
+    }
+
+    fn ordered<'a>(haystack: &'a str, needles: &[&str]) {
+        let mut last = 0usize;
+        for needle in needles {
+            let idx = haystack
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing from:\n{haystack}"));
+            assert!(idx >= last, "{needle} out of order in:\n{haystack}");
+            last = idx;
+        }
+    }
+
+    #[test]
+    fn codex_shaped_initial_context_orders_agents_scope_pins_env() {
+        let (mut session, shared) = mk_session(vec![]);
+        session.user_instructions = Some(crate::context::UserInstructions {
+            directory: "/repo".into(),
+            text: "AGENTS_UNIQUE_RULE".into(),
+        });
+        session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
+
+        // Persona + standing directives ride the stable system slot; per-turn
+        // directives do NOT (they ride the volatile tail per request); memory/
+        // scope/pins do NOT (contextual user lane).
+        let system = compose_system(&session.system_sections(), &session.reg, false);
+        let stable = system.stable_text().unwrap();
+        ordered(stable, &["PERSONA_UNIQUE", "STANDING_UNIQUE"]);
+        for absent in [
+            "PER_TURN_UNIQUE",
+            "AGENTS_UNIQUE_RULE",
+            "<bbox_scope>",
+            "<bbox_pins>",
+            "<environment_context>",
+        ] {
+            assert!(!stable.contains(absent), "{absent} must not ride stable");
+        }
+
+        session.push_user_text("hello");
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(pushed.len(), 2);
+        // Turn-1 contextual user message ordering (codex order): AGENTS →
+        // scope → pins → environment LAST.
+        ordered(
+            &pushed[0],
+            &[
+                "# AGENTS.md instructions",
+                "<bbox_scope>",
+                "task: task-1",
+                "<bbox_pins>",
+                "PINS_UNIQUE",
+                "<environment_context>",
+            ],
+        );
+        assert_eq!(pushed[1], "hello");
+        // Baselines recorded for change/compaction re-emit.
+        assert!(session.dispatch.emitted_scope.is_some());
+        assert!(session.dispatch.emitted_pins.is_some());
+    }
+
+    #[test]
+    fn vibe_shaped_folds_context_into_stable_and_keeps_user_lane_clean() {
+        let (mut session, shared) = mk_session(vec![]);
+        session.strategy = crate::context::dispatch::CompositionStrategy::VibeShaped;
+        session.user_instructions = Some(crate::context::UserInstructions {
+            directory: "/repo".into(),
+            text: "AGENTS_UNIQUE_RULE".into(),
+        });
+        session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
+
+        // The leading-block ordering trades cache granularity for salience:
+        // stable-first, per-resume-mutable sections (scope/pins) at the
+        // suffix (design §5).
+        let system = compose_system(&session.system_sections(), &session.reg, false);
+        let stable = system.stable_text().unwrap();
+        ordered(
+            stable,
+            &[
+                "PERSONA_UNIQUE",
+                "STANDING_UNIQUE",
+                "AGENTS_UNIQUE_RULE",
+                "Always-available tools",
+                "<environment_context>",
+                "<bbox_scope>",
+                "<bbox_pins>",
+            ],
+        );
+        assert!(!stable.contains("PER_TURN_UNIQUE"));
+
+        // The initial-context emitter contributes NOTHING to the user lane:
+        // the task is the only user message (the gap-00efeb12 fix).
+        session.push_user_text("one-line task");
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(*pushed, vec!["one-line task".to_string()]);
+    }
+
+    #[test]
+    fn vibe_shaped_post_compaction_emits_nothing_user_lane() {
+        let (mut session, shared) = mk_session(vec![]);
+        session.strategy = crate::context::dispatch::CompositionStrategy::VibeShaped;
+        session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
+        session.push_user_text("turn one");
+        // Compaction resets the baseline; the vibe-shaped strategy still
+        // emits nothing — the leading system block is not part of the
+        // compacted buffer.
+        session.reference_context_item = None;
+        session.prepare_context_for_user_turn();
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(*pushed, vec!["turn one".to_string()]);
+        assert!(session.reference_context_item.is_some(), "baseline advanced");
+    }
+
+    #[test]
+    fn codex_shaped_scope_change_re_emits_fragment_once() {
+        let (mut session, shared) = mk_session(vec![]);
+        session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
+        session.push_user_text("turn one");
+        assert_eq!(shared.pushed_users.lock().unwrap().len(), 2);
+
+        // Same scope on the next turn ⇒ nothing re-emitted.
+        session.prepare_context_for_user_turn();
+        assert_eq!(shared.pushed_users.lock().unwrap().len(), 2);
+
+        // A resume re-passing a CHANGED scope ⇒ one short fragment, baseline
+        // advanced. Pins unchanged ⇒ not re-emitted.
+        session.dispatch.context.as_mut().unwrap().scope = Some(test_scope("task-2"));
+        session.prepare_context_for_user_turn();
+        {
+            let pushed = shared.pushed_users.lock().unwrap();
+            assert_eq!(pushed.len(), 3);
+            assert!(pushed[2].starts_with("<bbox_scope>"), "{}", pushed[2]);
+            assert!(pushed[2].contains("task: task-2"));
+            assert!(!pushed[2].contains("<bbox_pins>"));
+        }
+
+        // And it converges: same scope again ⇒ silent.
+        session.prepare_context_for_user_turn();
+        assert_eq!(shared.pushed_users.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn codex_shaped_no_scope_emits_nothing_and_keeps_baseline() {
+        // Restored session (scope never restored): no scope ⇒ no fragment,
+        // and the persisted baseline survives for future delta comparison.
+        let (mut session, shared) = mk_session(vec![]);
+        session.dispatch = test_dispatch_state(None);
+        session.dispatch.emitted_scope = Some("<bbox_scope>\ntask: old\n</bbox_scope>".into());
+        session.push_user_text("follow-up");
+        let pushed = shared.pushed_users.lock().unwrap();
+        // Initial context = pins + environment only (no scope, no AGENTS).
+        assert_eq!(pushed.len(), 2);
+        assert!(!pushed[0].contains("<bbox_scope>"));
+        assert!(pushed[0].contains("<bbox_pins>"));
+        assert_eq!(
+            session.dispatch.emitted_scope.as_deref(),
+            Some("<bbox_scope>\ntask: old\n</bbox_scope>"),
+            "baseline must survive a scope-less run"
+        );
+    }
+
+    #[test]
+    fn codex_shaped_post_compaction_re_emits_current_context() {
+        let (mut session, shared) = mk_session(vec![]);
+        session.user_instructions = Some(crate::context::UserInstructions {
+            directory: "/repo".into(),
+            text: "AGENTS_UNIQUE_RULE".into(),
+        });
+        session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
+        session.push_user_text("turn one");
+
+        // Simulate a resume that changed the scope, then compaction resetting
+        // the reference item (agent_loop compaction paths set it to None):
+        // the deterministic re-emit renders the CURRENT in-memory context.
+        session.dispatch.context.as_mut().unwrap().scope = Some(test_scope("task-9"));
+        session.reference_context_item = None;
+        session.prepare_context_for_user_turn();
+
+        let pushed = shared.pushed_users.lock().unwrap();
+        let re_emitted = pushed.last().unwrap();
+        ordered(
+            re_emitted,
+            &[
+                "# AGENTS.md instructions",
+                "<bbox_scope>",
+                "task: task-9",
+                "<bbox_pins>",
+                "<environment_context>",
+            ],
+        );
+        assert_eq!(
+            session.dispatch.emitted_scope.as_deref(),
+            session.dispatch.scope_render().as_deref(),
+            "post-compaction re-emit must update the baseline"
+        );
+    }
+
+    #[test]
+    fn suppressed_defaults_with_dispatch_context_keeps_persona_and_directives() {
+        // `--system-prompt ""` clears explicit_system AND disables AGENTS
+        // discovery, but a dispatch context still lands persona + directives
+        // in stable (design §8): base + persona + directives, no AGENTS.
+        let (mut session, _shared) = mk_session(vec![]);
+        session.explicit_system = None;
+        session.user_instructions = None;
+        session.dispatch = test_dispatch_state(None);
+        let system = compose_system(&session.system_sections(), &session.reg, false);
+        let stable = system.stable_text().unwrap();
+        assert!(stable.contains("PERSONA_UNIQUE"));
+        assert!(stable.contains("STANDING_UNIQUE"));
+        assert!(!stable.contains("# AGENTS.md instructions"));
+    }
+
+    #[tokio::test]
+    async fn per_turn_directives_ride_volatile_after_nudge() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
+        session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
+        session.tail_nudge = Some("NUDGE_UNIQUE".into());
+        run_user_turn(&mut session, "go").await;
+
+        let systems = shared.seen_systems.lock().unwrap();
+        let volatile = systems
+            .last()
+            .and_then(|s| s.volatile_text())
+            .expect("volatile tail present");
+        // Per-turn directives share the volatile lane with the existing
+        // channels, AFTER them (design §8).
+        ordered(volatile, &["NUDGE_UNIQUE", "PER_TURN_UNIQUE"]);
+        let stable = systems.last().and_then(|s| s.stable_text()).unwrap();
+        assert!(!stable.contains("PER_TURN_UNIQUE"));
     }
 
     #[tokio::test]

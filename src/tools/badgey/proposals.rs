@@ -666,10 +666,10 @@ impl BlackboxServer {
             provider: Some(provider),
             coerce_workspace: false,
         };
-        let final_prompt =
-            orch::apply_brofile_lens(&orch::apply_ambient(prompt, &ambient_ctx), lens.as_deref());
+        let dispatch_context = ambient_ctx.dispatch_context(lens.as_deref());
         let mut args = provider.build_exec_args(
-            &final_prompt,
+            prompt,
+            Some(&dispatch_context),
             &session_id,
             cwd.as_deref(),
             exec_opts.as_ref(),

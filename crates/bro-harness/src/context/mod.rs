@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 
+pub mod dispatch;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentRole {
     User,

@@ -709,9 +709,16 @@ impl BlackboxServer {
             provider: Some(provider),
             coerce_workspace: bf.coerce_workspace.unwrap_or(false),
         };
-        let wrapped_prompt = orchestration::apply_ambient(&p.prompt, &ambient_ctx);
+        // Full dispatch context on resume, persona included
+        // (dispatch-prompt-slots.md §6).
+        let dispatch_context = ambient_ctx.dispatch_context(bf.lens.as_deref());
 
-        let mut args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
+        let mut args = provider.build_resume_args(
+            &session_id,
+            &p.prompt,
+            Some(&dispatch_context),
+            exec_opts.as_ref(),
+        );
         // §6: fold the brofile's surface-packet verdict into the dispatch filter
         // plane (disallow-wins), so this in-process session is surface-governed
         // by the same evaluate_tool_surface authority the wire head applies.

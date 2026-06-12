@@ -209,13 +209,20 @@ impl BlackboxServer {
             provider: Some(provider),
             coerce_workspace: false,
         };
-        let ambient_prompt = orch::apply_ambient(prompt, &ambient_ctx);
+        // Fresh and resume branches both compose the full payload, persona
+        // included (dispatch-prompt-slots.md §6).
+        let dispatch_context = ambient_ctx.dispatch_context(lens.as_deref());
         let mut args = if is_resume {
-            provider.build_resume_args(&session_id, &ambient_prompt, exec_opts.as_ref())
+            provider.build_resume_args(
+                &session_id,
+                prompt,
+                Some(&dispatch_context),
+                exec_opts.as_ref(),
+            )
         } else {
-            let final_prompt = orch::apply_brofile_lens(&ambient_prompt, lens.as_deref());
             provider.build_exec_args(
-                &final_prompt,
+                prompt,
+                Some(&dispatch_context),
                 &session_id,
                 cwd.as_deref(),
                 exec_opts.as_ref(),

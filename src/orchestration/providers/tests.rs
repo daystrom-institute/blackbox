@@ -40,7 +40,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         service_tier: Some(SERVICE_TIER_PRIORITY.into()),
         output_schema: Some(r#"{"type":"object"}"#.into()),
     };
-    let glm = Provider::Glm.build_exec_args("hello", "sid-1", None, Some(&glm_opts));
+    let glm = Provider::Glm.build_exec_args("hello", None, "sid-1", None, Some(&glm_opts));
     assert_eq!(glm[0], "-p");
     assert!(glm.contains(&"--output-format".to_string()));
     assert!(glm.contains(&"stream-json".to_string()));
@@ -72,7 +72,8 @@ fn harness_exec_and_resume_args_use_stream_json() {
         service_tier: Some(SERVICE_TIER_DEFAULT.into()),
         output_schema: None,
     };
-    let deepseek = Provider::Deepseek.build_resume_args("sid-2", "continue", Some(&deepseek_opts));
+    let deepseek =
+        Provider::Deepseek.build_resume_args("sid-2", "continue", None, Some(&deepseek_opts));
     assert!(deepseek.contains(&"--resume".to_string()));
     assert!(deepseek.contains(&"sid-2".to_string()));
     assert!(deepseek.contains(&"--model".to_string()));
@@ -96,8 +97,13 @@ fn harness_exec_and_resume_args_use_stream_json() {
         service_tier: None,
         output_schema: None,
     };
-    let minimax =
-        Provider::Minimax.build_exec_args("hello minimax", "sid-3", None, Some(&minimax_opts));
+    let minimax = Provider::Minimax.build_exec_args(
+        "hello minimax",
+        None,
+        "sid-3",
+        None,
+        Some(&minimax_opts),
+    );
     assert!(minimax.contains(&"--model".to_string()));
     assert!(minimax.contains(&"MiniMax-M3".to_string()));
     assert!(!minimax.contains(&"minimax/MiniMax-M3".to_string()));
@@ -106,15 +112,55 @@ fn harness_exec_and_resume_args_use_stream_json() {
 #[test]
 fn harness_providers_default_model_when_none_supplied() {
     for provider in Provider::ALL {
-        let args = provider.build_exec_args("hi", "", None, None);
+        let args = provider.build_exec_args("hi", None, "", None, None);
         assert!(
             args.contains(&"--model".to_string()),
             "{provider:?} raw dispatch must include --model"
         );
     }
 
-    let resume = Provider::Glm.build_resume_args("sid", "go", None);
+    let resume = Provider::Glm.build_resume_args("sid", "go", None, None);
     assert!(resume.contains(&"--model".to_string()));
+}
+
+#[test]
+fn dispatch_context_rides_its_own_flag_with_verbatim_prompt() {
+    let ambient = crate::orchestration::AmbientContext {
+        task_id: Some("task-9".into()),
+        session_id: Some("sid-9".into()),
+        project_dir: Some("/repo/x".into()),
+        completion_contract: Some(crate::orchestration::DEFAULT_COMPLETION_CONTRACT.to_string()),
+        ..Default::default()
+    };
+    let payload = ambient.dispatch_context(Some("You are a reviewer"));
+
+    for provider in Provider::ALL {
+        for args in [
+            provider.build_exec_args("one-line task", Some(&payload), "sid-9", None, None),
+            provider.build_resume_args("sid-9", "one-line task", Some(&payload), None),
+        ] {
+            // The operator's prompt rides -p VERBATIM — no preamble glue.
+            let p_idx = args.iter().position(|a| a == "-p").expect("-p present");
+            assert_eq!(args[p_idx + 1], "one-line task", "{provider}");
+            // The payload rides its own flag and round-trips strictly.
+            let dc_idx = args
+                .iter()
+                .position(|a| a == "--dispatch-context")
+                .expect("--dispatch-context present");
+            let parsed = bro_protocol::DispatchContext::parse(&args[dc_idx + 1])
+                .expect("strict parse of daemon-authored payload");
+            assert_eq!(parsed, payload, "{provider}");
+            assert_eq!(parsed.persona.as_deref(), Some("You are a reviewer"));
+            assert_eq!(
+                parsed.scope.as_ref().unwrap().task.as_deref(),
+                Some("task-9")
+            );
+        }
+    }
+
+    // No payload ⇒ no flag (workload-retro bypass shape).
+    let bare = Provider::Glm.build_exec_args("hi", None, "sid", None, None);
+    assert!(!bare.contains(&"--dispatch-context".to_string()));
 }
 
 #[test]
