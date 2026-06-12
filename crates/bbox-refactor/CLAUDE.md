@@ -8,9 +8,13 @@ this engine, deliberately without a behavioral fork:
   — **legacy, on the kill list** (decision af3c4783; refactor-tools-v2 §7
   strangler). Keep them working; do not grow them. The 100+ plan-kind
   catalog is CLOSED: new capability does not get a new `kind`.
-- bro-harness cell bindings (`code.*`/`edits.*`/`lsp.*`) — the future. New
-  capability lands as pure, data-returning substrate functions (the `facts`
-  module pattern) or changes-returning transforms, consumed by bindings.
+- bro-harness cell bindings (`code.*`/`edits.*`/`lsp.*`/`java.*`/`analysis.*`)
+  — the future. New capability lands as pure, data-returning substrate
+  functions (the `facts` module pattern), changes-returning transforms
+  (`java.*`, consumed by `edits.merge`), or **reductions** (`analysis.*`:
+  run the graph/analysis Rust-side, return a small structured answer — the
+  raw edges never cross into the cell). All three are thin adapters over
+  `plan`; none of them gets a new `kind`.
 
 ## The facts charter (load-bearing for the container test)
 
@@ -36,9 +40,27 @@ the cell choke point reuses it.
   crate-private on purpose: expose derived data, never parse state.
 - tree-sitter query iteration needs `streaming_iterator::StreamingIterator`
   — the cursor's matches are not a std Iterator.
+- **Constructors are noise in cohesion / field-graph reductions.** The class
+  walker counts a constructor as a method, and a constructor assigns ~every
+  field, so its `method_to_field` edges transitively merge every concern into
+  one cluster — fatal on the god classes `cohesive_clusters` exists to split.
+  It now drops methods whose name == the class name before partitioning. Any
+  new reduction over the method/field graph must decide whether constructors
+  are signal; for cohesion they are not. (Coarse transitive-closure
+  clustering still collapses on a single bridge field — the connector-aware
+  refinement is gap-2a3f03e5.)
+- **Constructor-body inserts obey the `super()`/`this()` first-statement rule
+  (JLS 8.8.7).** `constructor_body_insert_position` anchors AFTER a leading
+  `explicit_constructor_invocation` when present; inserting delegate-wiring
+  before it makes the call no longer first, produces a tree-sitter error
+  node, and the cell choke point bounces the apply on post-write validation.
+  Synthetic fixtures without `super()` hide this — it bit only on a real
+  class whose constructor began with `super()`.
 
 ## Sibling boundary
 
 `bbox-macros` (the declarative macro layer) is folding down into cell
-recipes + the function store (pressure-test doc §6.6); its Java emission
-sidecar is the salvage. Don't add new coupling from here to there.
+recipes + the function store (pressure-test doc §6.6; kill-list formalized
+in decision b8dc263d — `macro_*` + the planner/registry/expr DSL retire at
+parity). Its Java emission sidecar is the salvage. Don't add new coupling
+from here to there.

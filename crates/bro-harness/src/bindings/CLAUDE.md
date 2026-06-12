@@ -1,4 +1,4 @@
-# bindings/ — the refactor cell-DSL namespaces (`code.*`, `edits.*`, `lsp.*`)
+# bindings/ — the refactor cell-DSL namespaces (`code.*`, `edits.*`, `lsp.*`, `java.*`, `analysis.*`)
 
 Domain bindings projected into code-mode cells as namespace globals. Design
 home: `design/bro-harness/refactor-v2-pressure-test.md` (read before
@@ -21,6 +21,55 @@ platform contract from `design/bro-harness/code-mode-cell-dsl.md`.
   deliberately shared between producers (`lsp.*`) and consumers
   (`edits.merge`/`apply`) — that shared seam is what makes lineage
   host-computed.
+
+## Two tiers: facts vs analysis (don't conflate them)
+
+- **`code.*` facts** answer "where is X?" for editing — they return
+  hash-anchored Spans and are **aggregate-capped**. A multi-file
+  `code.query({files})` over a whole repo is bounded
+  (`MAX_AGGREGATE_QUERY_CAPTURES`) and reports `aggregate_capped` +
+  `files_scanned`/`files_total` + a narrow-it hint. The cap is not a
+  nuisance: values-not-refs means every returned value lives in the V8
+  isolate heap (V8 default, ~1.5 GB here), and a broad repo-wide query
+  flattened past it and OOM'd the isolate — a fatal `FatalProcessOutOfMemory`
+  in JSON parse, not a catchable error (gap-fb7a1f99). **Any new
+  fan-out/multi-file binding MUST bound its payload to the isolate heap.**
+- **`analysis.*`** answers "what is the *structure* of X?" — it runs the
+  reduction Rust-side and returns a small structured result (a cluster
+  graph, a dependency summary). The raw intermediate (every field touch,
+  every call edge) never enters the isolate; the reduced answer is the
+  product. Still values-not-refs: the value IS the reduced answer, computed
+  where the data lives. Cohesion / dependency / reference-count questions
+  belong HERE — never reconstructed in JS from `code.query` captures
+  (that path OOMs on a sweep, or burns ~50 cells doing the reduction by
+  hand). Two-tier rationale: pressure-test §6.7.
+
+## Porting a v1 planner as a binding (the `lsp.rename` shape, generalized)
+
+`java.*` transforms and `analysis.*` reductions are thin adapters over
+`bbox_refactor::plan`: run the v1 analysis/synthesis verbatim, strip the
+MCP/plan-apply envelope, return data for the edits algebra (transforms:
+`{changes, creates, findings}`) or a reduced structure (analysis). They
+NEVER write; findings are the v1 structs verbatim, re-keyed under one array.
+Footguns that bit:
+
+- **Planner-emitted NEW files arrive as whole-content `0..0` edits against
+  the empty-file hash** (v1's create idiom — its apply created missing
+  files). Convert them to `creates` (→ `edits.createFile`), or the algebra
+  stale_span-bounces them against a file that does not exist yet.
+- **Transforms are NOT idempotent over their own output.** A re-call after a
+  successful apply hits the planner's target-exists refusal — that is the
+  DONE signal, not a retry. Without that framing an agent shell-deletes the
+  created file and loops; the error and the describe contract both name it.
+- **Wide toolboxes stay a compact index.** The namespace description is one
+  line per transform; `java.describe`/`analysis.describe` returns the full
+  contract at runtime (values stay in the isolate — no MCP cap, no
+  exec-prompt bloat). Do not inline N signatures into the description.
+- **Extract-to-delegate transforms preserve the public API on demand.**
+  `java.extractClass`'s `wrappers` leaves delegating stubs on the source so
+  external callers compile unchanged. Survey callers first (the one-call
+  `code.files` → `code.query({files})`); the transform can't know whether
+  anything off-file uses a moved method.
 
 ## The trust model (don't re-litigate per binding)
 
