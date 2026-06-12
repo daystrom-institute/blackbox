@@ -1,0 +1,21 @@
+{
+  "id": "gap-fb7a1f99",
+  "title": "code.query multi-file fan-out had no aggregate cap — OOM'd the V8 isolate on a repo-wide query",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools/code-facts",
+  "wanted_capability": "A payload ceiling on code.query({files}) so a broad query over a large repo cannot flatten to a multi-MB captures array that OOMs the isolate. ADDRESSED in the same session: MAX_AGGREGATE_QUERY_CAPTURES=20k caps the flat array, sets aggregate_capped + files_scanned/files_total + a narrow-it hint when the ceiling bites before the file set is exhausted. Filed for the record because it is a reusable invariant (every values-not-refs multi-file binding must bound its payload to the isolate heap — cell-dsl §9), not just a one-off.",
+  "missing_primitive": "aggregate payload ceiling on code.query({files})",
+  "fallback_used": "Added MAX_AGGREGATE_QUERY_CAPTURES; committing in this session.",
+  "evidence": [
+    "probe-dash-1 cell 14 (code.query over ~1,700 files)",
+    "V8 FatalProcessOutOfMemory in JsonParser::ParseJsonArray",
+    "/tmp/refactor-v2-probe/run-dash.err"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_task",
+  "dedupe_key": "tooling/refactor-tools/multi-file-payload-cap",
+  "resolution": "unresolved",
+  "thread_id": "thread-370679a5",
+  "created_at": "2026-06-12T22:49:53Z",
+  "updated_at": "2026-06-12T22:49:53Z"
+}

@@ -1,0 +1,19 @@
+{
+  "id": "b2261ea4",
+  "title": "No private client details in committed artifacts (public repo)",
+  "content": "This is a PUBLIC repo — never commit private client/customer identifiers into any repo artifact. No real repo names, company/org names, package paths, or class/method/field/file names from a client codebase may appear in design docs, code comments, system memories, knowledge entries, gap notes, or commit messages. When a probe, refactor, or campaign runs against a real client codebase, genericize before committing: \"a ~3,700-line Vaadin view\", \"an admin service class\", \"a write-concern method cluster\", \"a large client repo\". Probe/session labels (probe-pg-1, probe-dash-1) are fine — they do not identify the client. Synthetic fixtures use neutral names (com.acme, OrderService). Scrub before every commit; a leaked blob in pushed history is a real exposure even after the tip is fixed.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-06-12T23:16:50Z",
+  "updated_at": "2026-06-12T23:16:50Z",
+  "recall_count": 0
+}

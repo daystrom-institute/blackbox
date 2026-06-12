@@ -1,0 +1,20 @@
+{
+  "id": "af3c4783",
+  "title": "Refactor tooling is harness-native; daemon refactor surfaces retire with no bridge",
+  "content": "Refactor tooling end state is harness-native, zero daemon reach-back. Refactor bindings (facts/algebra/apply choke point) run inside bro-harness against its working set — container test: harness + working set + spawned language servers must run every refactor binding with the daemon absent. The daemon keeps only dispatch composition and integration. The shipped daemon-backed path retires with no bridge: DaemonRefactor/install_refactor, the RefactorCapability trait, refactor_plan/refactor_plan_get flat tools, and the bbox_refactor_*/bbox_slice_* MCP adapters all die at used-kind parity.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Containerized/remote harness workers hold their own filesystem truth; daemon-resident LSP pools and plan stores would compute claims about files they cannot see (design/bro-harness/remote-worker-boundary.md). The refactor-tools gap cluster (gap-374fba64, gap-5d17610b, gap-de62454a, gap-903f6949) empirically showed the v1 MCP surface composing badly from code-mode cells. Sharpens refactor-tools-v2.md §7 \"in-harness only (decided)\": the interim RefactorCapability daemon path that shipped is on the kill list too, not kept as a bridge. Spike artifact: design/bro-harness/refactor-v2-pressure-test.md.",
+  "source": "user",
+  "created_at": "2026-06-12T18:54:55Z",
+  "updated_at": "2026-06-12T18:54:55Z",
+  "recall_count": 0
+}

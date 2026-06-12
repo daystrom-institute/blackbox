@@ -1,0 +1,21 @@
+{
+  "id": "gap-2a3f03e5",
+  "title": "cohesionClusters transitive-field clustering is too coarse — a connector field merges concerns into a megablob",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools/analysis",
+  "wanted_capability": "Connector-aware cohesion clustering. The v1 extract_java_class_cohesive_clusters partitions by transitive field-sharing: two methods cluster iff they share a field, transitively. On a deeply-tangled god class one high-fan-out connector field (a shared UI container, a refresh-dispatcher method) bridges otherwise-distinct concerns and collapses them into a single megacluster. On a real ~3,700-line Vaadin view the binding returns 5 clusters but the dominant one is 56 methods / 124 fields — a fine-grained seam a model found by hand (probe-dash-2) is buried inside it. Want: down-weight or cut high-degree bridge fields/methods before partitioning (community detection / modularity rather than transitive closure), plus better name_hint inference than method-prefix. Constructor exclusion already landed and helped (1 cluster → 5); this is the next quality step. The tier and binding are shipped and useful as-is; this is a refinement, not a blocker.",
+  "missing_primitive": "connector-aware / modularity-based cluster partitioning",
+  "fallback_used": "Shipped transitive-closure clustering with constructor exclusion; agent drills into the megacluster or extracts the clean small clusters.",
+  "evidence": [
+    "probe-dash-2 manual seam (7-method cluster)",
+    "cohesion analysis on a large view class: top cluster 56 methods/124 fields score 0.97",
+    "thread-370679a5"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/connector-aware-cohesion-clustering",
+  "resolution": "unresolved",
+  "thread_id": "thread-370679a5",
+  "created_at": "2026-06-12T23:06:59Z",
+  "updated_at": "2026-06-12T23:06:59Z"
+}

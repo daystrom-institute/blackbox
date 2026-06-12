@@ -3,6 +3,10 @@
 
 ## Conventions
 
+**Crate-scope CLAUDE.mds: concepts/footguns not lines; finer grain for dense leaves**
+
+Crate-scope CLAUDE.md convention: crates carry a CLAUDE.md holding concepts, footguns, invariants, and domain-scoped details that belong to that crate — never file/line anchors, which rot immediately. Finer grains than crate scope can be considered for sufficiently-dense leaves (e.g. a subdirectory module cluster with its own trust model or domain), with the crate-level file keeping a one-line pointer to the leaf file rather than duplicating it.
+
 **Fleet/worktree dispatch env is project/language-agnostic (no hardcoded build env)**
 
 Fleet/worktree dispatch env is project/language-agnostic. No dispatch path may hardcode language-specific build env (no shared `CARGO_TARGET_DIR` — each worktree uses its own `target/`, so concurrent builds don't serialize on cargo's build lock). Per-project build/dispatch config lives in `fleet.json`: `project_dispatch.env` (opt-in dispatch env, e.g. `RUSTC_WRAPPER=sccache`, best-effort load) is resolved DAEMON-SIDE at task spawn for every dispatch path (bro_exec, agent dispatch, workflows, fleet cockpit), keyed by task cwd with worktree→base-repo mapping, and delivered to harness shell children on the dedicated non-secret `shell_env` lane — never the transport session env, which shells deliberately don't inherit. `project_dispatch.seed_dirs` (e.g. `["target"]`) lists repo-relative dirs to copy-on-write clone from the base repo into freshly created worktrees (cockpit + workflow WorktreeCreate) so a dispatched agent's first build is incremental, not cold; best-effort, CoW-only (no plain-copy fallback). `project_closeout` (fold target/prefixes/`closeout_hooks`) is strict-loaded so a typo fails `/closeout` loudly. Setup documented in `docs/developing-blackbox.md`. Closeout hooks are a general lifecycle surface — worktree removal auto-reclaims per-worktree targets (CoW clones included). Supersedes the retired "Share CARGO_TARGET_DIR across worktrees" convention.
@@ -14,6 +18,10 @@ Multiple agents operate concurrently in this repo — the main worktree plus add
 Why: a clean repo at session start does not stay clean — background/peer agents mutate brofiles, .bbox state, and source mid-session. A blanket `git add -A`, `git commit -a`, `git checkout -- .`, or `git stash` can swallow or destroy a peer's in-flight work.
 
 How to apply: scope every git mutation to your own files by explicit path. Before discarding or overwriting anything you didn't create, inspect it and surface it to the operator rather than reverting. When you need a clean tree to rebase, stash only the peer-foreign dirty files by path and restore them afterward. Complements the test-isolation invariants (per-test tempdirs / real-HOME isolation) and the ask-before-mutating-shared-services convention.
+
+**No private client details in committed artifacts (public repo)**
+
+This is a PUBLIC repo — never commit private client/customer identifiers into any repo artifact. No real repo names, company/org names, package paths, or class/method/field/file names from a client codebase may appear in design docs, code comments, system memories, knowledge entries, gap notes, or commit messages. When a probe, refactor, or campaign runs against a real client codebase, genericize before committing: "a ~3,700-line Vaadin view", "an admin service class", "a write-concern method cluster", "a large client repo". Probe/session labels (probe-pg-1, probe-dash-1) are fine — they do not identify the client. Synthetic fixtures use neutral names (com.acme, OrderService). Scrub before every commit; a leaked blob in pushed history is a real exposure even after the tip is fixed.
 
 **RX-V1: operator-authority opt-out invariant for refactor flags**
 
@@ -46,6 +54,10 @@ The shared **contract bottom** — `bro-core` (ids/refs/errors), `bro-protocol` 
 **Use nextest for test runs — never default to cargo test**
 
 Use nextest for test runs — never default to `cargo test`, and ALWAYS pass `--workspace`. The test gates run under cargo-nextest (`brew install cargo-nextest`): `cargo nextest run --workspace` is the mid-cycle gate (~24s, 3,700 tests across all crates/targets; `.config/nextest.toml` quarantines the two >45s tests and applies per-test slow-timeouts so newly slow tests get named), and `cargo nextest run --workspace --profile full` is the fold/closeout gate running the entire suite (~85s, pinned by the 80s index/search agentic test). `--workspace` is load-bearing: the root manifest is workspace+package, so a bare run covers the root package only and silently drops the ~1,800 tests in the peeled bbox-*/bro-* crates. Plain `cargo test --lib` is a no-install fallback only: single-process, root-package-only, ~25x slower, no quarantine or timeouts. Note nextest is process-per-test: `test_env_lock()` no longer serializes there (per-process env isolation supersedes it) but remains required for plain `cargo test`. Measured timing story lives in docs/developing-blackbox.md → Build and test.
+
+**Use stable rustfmt with Rust 2024 edition**
+
+Rust formatting in transcript-search uses the stable Rust toolchain's rustfmt with the workspace's latest Rust edition standard, currently Rust 2024. Run `cargo +stable fmt` / `cargo +stable fmt --check` from the workspace so rustfmt reads crate manifests and formats files in their module context; do not format included module files as standalone Rust sources.
 
 **prompts/ corpus: operator-pointed prompts + dispatched-agent lenses**
 

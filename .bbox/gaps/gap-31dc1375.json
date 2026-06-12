@@ -1,0 +1,20 @@
+{
+  "id": "gap-31dc1375",
+  "title": "Cohesion analysis wants reference COUNTS per symbol, not full capture payloads",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools/code-facts",
+  "wanted_capability": "A counting/aggregation mode on code.query (or a dedicated code.references) that returns per-symbol reference counts and the files they live in, without materializing every full Span. probe-dash-1 was doing exactly the right god-class cohesion analysis — counting where each field is used across the repo to tell a real concern from a forwarded-field false seam — but the only tool for it returns full capture payloads, which is both wasteful (it wanted counts) and what drove the isolate OOM. A count-mode would make cross-repo cohesion analysis cheap and bounded, and is the natural substrate for porting the extract_java_class_cohesive_clusters analysis as a binding.",
+  "missing_primitive": "code.query count-mode / code.references aggregation",
+  "fallback_used": "Agent fanned out full-payload queries across the repo (and OOM'd before the cap).",
+  "evidence": [
+    "probe-dash-1 cells 12-14 (per-method/per-field reference hunting)",
+    "thread-370679a5"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/symbol-reference-counts",
+  "resolution": "unresolved",
+  "thread_id": "thread-370679a5",
+  "created_at": "2026-06-12T22:49:59Z",
+  "updated_at": "2026-06-12T22:49:59Z"
+}
