@@ -2185,9 +2185,8 @@ mod tests {
     /// case separately.
     fn parse_registered_tools() -> Vec<(String, String)> {
         // The #[tool] registrations live in the root crate's src/ (this
-        // crate holds only the doc stanzas) — re-root the scan two levels
-        // up from this crate's manifest.
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src");
+        // crate holds only the doc stanzas).
+        let src_dir = runtime_workspace_root().join("src");
         let mut paths = Vec::new();
         collect_rust_files(&src_dir, &mut paths);
         paths.sort();
@@ -2199,6 +2198,38 @@ mod tests {
             out.extend(parse_registered_tools_from_source(&src));
         }
         out
+    }
+
+    /// Workspace root of the checkout the tests are RUNNING in, resolved at
+    /// runtime — never `env!("CARGO_MANIFEST_DIR")`, which is baked at
+    /// compile time: a test binary carried into a worktree by the seed_dirs
+    /// CoW `target/` clone (or any cached build) would scan the checkout it
+    /// was COMPILED in and silently pass on handlers the worktree added
+    /// (gap-271a5847; bit for real during the badgey dissolution). Cargo and
+    /// nextest both set the test cwd to the running checkout's package
+    /// manifest dir, so walking up to the `[workspace]` manifest lands on
+    /// the right tree; failing to find one is a loud error, never a fallback
+    /// to the baked path.
+    fn runtime_workspace_root() -> std::path::PathBuf {
+        let cwd = std::env::current_dir().expect("test cwd must be readable");
+        let mut cursor = cwd.as_path();
+        loop {
+            let manifest = cursor.join("Cargo.toml");
+            if manifest.is_file()
+                && std::fs::read_to_string(&manifest)
+                    .map(|raw| raw.contains("[workspace]"))
+                    .unwrap_or(false)
+            {
+                return cursor.to_path_buf();
+            }
+            cursor = cursor.parent().unwrap_or_else(|| {
+                panic!(
+                    "no [workspace] Cargo.toml above test cwd {} — cannot locate the \
+                     running checkout's root src/ to scan for #[tool] registrations",
+                    cwd.display()
+                )
+            });
+        }
     }
 
     fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

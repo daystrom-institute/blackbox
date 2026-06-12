@@ -10,6 +10,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- The tool-docs coverage tests (`every_registered_tool_has_a_doc`,
+  `description_summary_parity`) now resolve their `src/` scan root at
+  runtime (walking up from the test cwd to the `[workspace]` manifest)
+  instead of compile-time `CARGO_MANIFEST_DIR` — a test binary carried into
+  a worktree by the CoW-seeded `target/` clone previously scanned the
+  checkout it was compiled in and silently passed on handlers the worktree
+  added.
 - Worktree-redirected repo-owned records (knowledge entries and gap notes)
   now survive a daemon restart that happens before their worktree branch
   merges: the central store retains the record (with its redirect marker)
