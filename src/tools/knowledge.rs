@@ -86,6 +86,23 @@ fn rescope_project_filter(
     p.project = Some(scope);
 }
 
+impl BlackboxServer {
+    /// Rescope a knowledge WRITE's `project` param through worktree→base
+    /// resolution: the entry's durable scope becomes the registered base
+    /// (so render/list/inject filters keyed by the base path match it), and
+    /// the returned write-dir — `Some` only for a recognized worktree —
+    /// redirects the repo-owned `.bbox/knowledge/` file into the caller's
+    /// checkout so it travels with the branch (gap-de82a74d). Absence of
+    /// `project` means GLOBAL write scope (tool-arg-defaulting §3.1) and is
+    /// never touched; empty/whitespace values are left for store validation.
+    fn rescope_knowledge_write(&self, project: &mut Option<String>) -> Option<String> {
+        let raw = project.clone().filter(|s| !s.trim().is_empty())?;
+        let (scope, write_dir) = self.resolve_project_write_scope(&raw);
+        *project = Some(scope);
+        write_dir
+    }
+}
+
 fn matches_system_memory_catalog(category: Option<&str>) -> bool {
     matches!(
         category,
@@ -132,8 +149,10 @@ impl BlackboxServer {
         let start = std::time::Instant::now();
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
+            let mut p = p;
+            let write_dir = server.rescope_knowledge_write(&mut p.project);
             let mut kb = server.state.kb.write();
-            let result = kb.learn_result(&p, false)?;
+            let result = kb.learn_result_with_write_dir(&p, false, write_dir.as_deref())?;
             let rider = kb.repo_record_rider(&result.id);
             Ok::<_, anyhow::Error>((result, rider))
         })
@@ -206,8 +225,10 @@ impl BlackboxServer {
         let start = std::time::Instant::now();
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
+            let mut p = p;
+            let write_dir = server.rescope_knowledge_write(&mut p.project);
             let mut kb = server.state.kb.write();
-            let result = kb.remember_result(&p, false)?;
+            let result = kb.remember_result_with_write_dir(&p, false, write_dir.as_deref())?;
             let rider = kb.repo_record_rider(&result.id);
             Ok::<_, anyhow::Error>((result, rider))
         })
@@ -249,8 +270,10 @@ impl BlackboxServer {
         let start = std::time::Instant::now();
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
+            let mut p = p;
+            let write_dir = server.rescope_knowledge_write(&mut p.project);
             let mut kb = server.state.kb.write();
-            let result = kb.decide_result(&p, false)?;
+            let result = kb.decide_result_with_write_dir(&p, false, write_dir.as_deref())?;
             let rider = kb.repo_record_rider(&result.id);
             Ok::<_, anyhow::Error>((result, rider))
         })
@@ -709,5 +732,119 @@ mod tests {
         rescope_project_filter(&mut p, &projects);
         assert_eq!(p.project.as_deref(), Some(stranger.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
+    }
+
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// End-to-end repro of gap-de82a74d: an agent inside an in-tree linked
+    /// worktree (`<root>/.claude/worktrees/<name>`) learns a project-scoped
+    /// entry. The entry must key to the registered BASE (durable scope), the
+    /// committed `.bbox/knowledge/` file must land in the WORKTREE (travels
+    /// with the branch, never mutates the base checkout), and an immediate
+    /// `bbox_render` from the same worktree must include the entry — the
+    /// asymmetry that motivated the gap.
+    #[tokio::test]
+    async fn bbox_learn_from_worktree_keys_base_writes_worktree_and_renders() {
+        use crate::knowledge::RenderParams;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        run_git(&base, &["init", "-b", "main"]);
+        run_git(&base, &["config", "user.email", "t@example.com"]);
+        run_git(&base, &["config", "user.name", "T"]);
+        // Repo-owned: the checkout (and thus the worktree) carries .bbox/knowledge/.
+        std::fs::create_dir_all(base.join(".bbox").join("knowledge")).unwrap();
+        std::fs::write(base.join(".bbox").join("knowledge").join(".gitkeep"), "").unwrap();
+        std::fs::write(base.join("README.md"), "base").unwrap();
+        run_git(&base, &["add", "."]);
+        run_git(&base, &["commit", "-m", "init"]);
+        let base_canon = base.canonicalize().unwrap();
+
+        let worktree = base.join(".claude").join("worktrees").join("wt");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        run_git(
+            &base,
+            &["worktree", "add", "-b", "arc/kb", worktree.to_str().unwrap(), "HEAD"],
+        );
+        let wt_canon = worktree.canonicalize().unwrap();
+        let wt = wt_canon.to_string_lossy().into_owned();
+
+        let server = crate::server::BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(tmp.path()),
+        ));
+        server
+            .state
+            .projects
+            .write()
+            .register_path(&base_canon)
+            .unwrap();
+
+        let learn = server
+            .bbox_learn(Parameters(LearnParams {
+                content: "WORKTREE_KB_MARKER: prefer rustls".into(),
+                category: "convention".into(),
+                scope: Some("project".into()),
+                project: Some(wt.clone()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(learn.is_error, Some(true), "learn failed: {learn:?}");
+
+        // Durable scope = registered base; committed file = worktree checkout.
+        let (id, project) = {
+            let kb = server.state.kb.read();
+            let entry = kb
+                .all_entries()
+                .iter()
+                .find(|e| e.content.contains("WORKTREE_KB_MARKER"))
+                .expect("entry stored");
+            (entry.id.clone(), entry.project.clone())
+        };
+        assert_eq!(
+            project.as_deref(),
+            Some(base_canon.to_string_lossy().as_ref()),
+            "entry must key to the registered base, not the worktree"
+        );
+        let rel = std::path::Path::new(".bbox")
+            .join("knowledge")
+            .join(format!("{id}.json"));
+        assert!(
+            wt_canon.join(&rel).exists(),
+            "committed entry file must land in the worktree"
+        );
+        assert!(
+            !base_canon.join(&rel).exists(),
+            "the daemon must not mutate the base checkout"
+        );
+
+        // The other half of the gap: render from the worktree sees the entry.
+        let render = server
+            .bbox_render(Parameters(RenderParams {
+                provider: Some("claude".into()),
+                project: Some(wt.clone()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(render.is_error, Some(true), "render failed: {render:?}");
+        let rendered = std::fs::read_to_string(wt_canon.join("CLAUDE.md")).unwrap();
+        assert!(
+            rendered.contains("WORKTREE_KB_MARKER"),
+            "worktree render must include the just-learned entry: {rendered}"
+        );
     }
 }

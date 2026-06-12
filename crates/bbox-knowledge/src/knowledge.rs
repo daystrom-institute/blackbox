@@ -22,6 +22,7 @@ use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 // one-file change.
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Default)]
 pub struct LearnParams {
     /// The instruction, fact, or preference
     pub content: String,
@@ -62,6 +63,7 @@ pub struct LearnParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Default)]
 pub struct RememberParams {
     /// The fact, observation, or note
     pub content: String,
@@ -195,6 +197,7 @@ pub struct BootstrapParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Default)]
 pub struct DecideParams {
     /// The decision itself — the commitment being made
     pub content: String,
@@ -868,6 +871,7 @@ fn persist_repo_kb_entries(
     project_dir: &Path,
     entries: &[&KnowledgeEntry],
     purge: bool,
+    redirected_away: &BTreeSet<&str>,
 ) -> Result<()> {
     let dir = repo_kb_dir(project_dir);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -880,7 +884,11 @@ fn persist_repo_kb_entries(
                 continue;
             }
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if !keep.contains(stem) {
+                // `redirected_away` ids currently persist into a worktree
+                // checkout instead of this base dir; an already-committed
+                // base file is an older generation owned by the branch, not
+                // a removed entry — never purge it.
+                if !keep.contains(stem) && !redirected_away.contains(stem) {
                     let _ = fs::remove_file(&path);
                 }
             }
@@ -964,6 +972,18 @@ pub struct Knowledge {
     /// with the checkout); the central store holds only global entries. These
     /// roots tell `reload` which repos to spool project entries from.
     project_roots: Vec<PathBuf>,
+    /// Transient committed-file write redirects: entry id → worktree checkout
+    /// dir. Registered when a write arrived from a recognized worktree: the
+    /// entry's `project` stays the durable base scope (so render/list/inject
+    /// filters match) while its repo-owned `.bbox/knowledge/<id>.json` lands
+    /// in the worktree checkout and travels with the agent's branch — the
+    /// same redirect contract as gap notes' `write_dir` and thread records'
+    /// `record_dir`. In-memory only, cleared on reload: after a restart the
+    /// committed worktree file is the sole carrier until the branch merges
+    /// into the base checkout. Kept as a side map (not a `KnowledgeEntry`
+    /// field) because it is store-routing state, not entry content — entries
+    /// are constructed across many crates and serialized into index docs.
+    write_redirects: HashMap<String, String>,
 }
 
 impl Knowledge {
@@ -972,6 +992,7 @@ impl Knowledge {
             store_path: store_path.to_path_buf(),
             store: KnowledgeStore::new(),
             project_roots: Vec::new(),
+            write_redirects: HashMap::new(),
         };
         k.reload()?;
         Ok(k)
@@ -999,39 +1020,88 @@ impl Knowledge {
             entries: Vec::new(),
         };
         for e in &self.store.entries {
-            match e.project.as_deref() {
-                // Route to the repo only for projects that are already
-                // repo-owned. A project-scoped entry for a not-yet-migrated
-                // project stays in central until an explicit eject/init opts it
-                // in — so deploying never bulk-migrates every repo at boot.
-                Some(dir) if !dir.is_empty() && project_is_repo_owned(Path::new(dir)) => {}
-                _ => central.entries.push(e.clone()),
+            // Route to the repo only for entries with a repo-owned carrier
+            // dir. A project-scoped entry for a not-yet-migrated project
+            // stays in central until an explicit eject/init opts it in — so
+            // deploying never bulk-migrates every repo at boot.
+            if self.repo_owned_carrier(e).is_none() {
+                central.entries.push(e.clone());
             }
         }
         central
     }
 
+    /// The repo-owned directory that carries this entry's committed
+    /// `.bbox/knowledge/<id>.json`, when one exists: a registered write
+    /// redirect (worktree checkout) when it is repo-owned, else the entry's
+    /// own `project` dir when repo-owned, else `None` — the entry stays in
+    /// the central store. Mirrors the gap store's `write_dir` routing.
+    fn repo_owned_carrier(&self, e: &KnowledgeEntry) -> Option<String> {
+        let project = e.project.as_deref().filter(|d| !d.is_empty())?;
+        if let Some(redirect) = self.write_redirects.get(&e.id) {
+            if project_is_repo_owned(Path::new(redirect)) {
+                return Some(redirect.clone());
+            }
+        }
+        project_is_repo_owned(Path::new(project)).then(|| project.to_string())
+    }
+
+    /// Register (or drop) a committed-file write redirect for an entry. Only
+    /// non-empty dirs that differ from the entry's durable `project` scope
+    /// are recorded — redirection is not reassignment.
+    fn set_write_redirect(&mut self, id: &str, write_dir: Option<&str>) {
+        let Some(dir) = write_dir.map(str::trim).filter(|d| !d.is_empty()) else {
+            return;
+        };
+        let project = self
+            .store
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.project.as_deref());
+        if project == Some(dir) {
+            self.write_redirects.remove(id);
+        } else {
+            self.write_redirects.insert(id.to_string(), dir.to_string());
+        }
+    }
+
     fn persist_repo_owned_entries(&self) -> Result<()> {
         // Persistence is split by scope. The central store owns only global
         // (non-project) entries and is written by StorePersister. Project-scoped
-        // entries for repo-owned projects stay synchronous one-file writes here.
-        let mut by_project: HashMap<PathBuf, Vec<&KnowledgeEntry>> = HashMap::new();
+        // entries for repo-owned projects stay synchronous one-file writes here,
+        // grouped by their carrier dir (the write redirect when one is active,
+        // else the entry's own project dir).
+        let mut by_carrier: HashMap<PathBuf, Vec<&KnowledgeEntry>> = HashMap::new();
+        // Per durable-project dir: ids whose committed file was redirected into
+        // a worktree (`carrier != project`). Their committed base files are
+        // protected from the generation purge — redirection is not
+        // reassignment (the branch, not the daemon, updates the base).
+        let mut redirected: HashMap<PathBuf, BTreeSet<&str>> = HashMap::new();
         for e in &self.store.entries {
-            if let Some(dir) = e.project.as_deref()
-                && !dir.is_empty()
-                && project_is_repo_owned(Path::new(dir))
-            {
-                by_project.entry(PathBuf::from(dir)).or_default().push(e);
+            let Some(carrier) = self.repo_owned_carrier(e) else {
+                continue;
+            };
+            if let Some(project) = e.project.as_deref() {
+                if carrier != project {
+                    redirected
+                        .entry(PathBuf::from(project))
+                        .or_default()
+                        .insert(e.id.as_str());
+                }
             }
+            by_carrier.entry(PathBuf::from(carrier)).or_default().push(e);
         }
         // Purge only for projects whose repo entries we actually loaded (root is
         // tracked) — otherwise our in-memory set is not authoritative and
         // purging would delete committed entries that were never loaded.
         let loaded: std::collections::HashSet<&Path> =
             self.project_roots.iter().map(|p| p.as_path()).collect();
-        for (dir, entries) in &by_project {
+        let no_redirects = BTreeSet::new();
+        for (dir, entries) in &by_carrier {
             let purge = loaded.contains(dir.as_path());
-            persist_repo_kb_entries(dir, entries, purge)?;
+            let redirected_away = redirected.get(dir.as_path()).unwrap_or(&no_redirects);
+            persist_repo_kb_entries(dir, entries, purge, redirected_away)?;
         }
         Ok(())
     }
@@ -1044,6 +1114,11 @@ impl Knowledge {
     }
 
     pub fn reload(&mut self) -> Result<()> {
+        // Write redirects are session-transient routing state: after a reload
+        // the committed worktree file is the carrier (the entry is absent from
+        // both central and the base root until the branch merges), so stale
+        // redirects must not survive into the rebuilt store.
+        self.write_redirects.clear();
         if self.store_path.exists() {
             let raw = fs::read_to_string(&self.store_path)
                 .with_context(|| format!("reading {}", self.store_path.display()))?;
@@ -1228,7 +1303,21 @@ impl Knowledge {
     // ── CRUD ───────────────────────────────────────────────────────
 
     pub fn learn_result(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
-        self.learn_result_locked(p, from_agent)
+        self.learn_result_locked(p, from_agent, None)
+    }
+
+    /// `learn_result` with a committed-file write redirect: the entry keeps
+    /// `p.project` as its durable scope while its repo-owned
+    /// `.bbox/knowledge/<id>.json` is written under `write_dir` (a worktree
+    /// checkout resolved by the MCP adapter) so it travels with the agent's
+    /// branch. `None` preserves today's behavior.
+    pub fn learn_result_with_write_dir(
+        &mut self,
+        p: &LearnParams,
+        from_agent: bool,
+        write_dir: Option<&str>,
+    ) -> Result<LearnWriteResult> {
+        self.learn_result_locked(p, from_agent, write_dir)
     }
 
     /// Commit-this rider for a just-written entry, when it persisted into a
@@ -1240,19 +1329,18 @@ impl Knowledge {
         if entry.scope != Scope::Project {
             return None;
         }
-        let dir = entry.project.as_deref().filter(|d| !d.is_empty())?;
-        let project_dir = Path::new(dir);
-        if !project_is_repo_owned(project_dir) {
-            return None;
-        }
-        let path = repo_kb_dir(project_dir).join(format!("{id}.json"));
-        Some(bbox_util::util::repo_artifact_rider(dir, &path))
+        // The rider names the checkout that actually carries the file — the
+        // write-redirect worktree when one is active, else the project dir.
+        let dir = self.repo_owned_carrier(entry)?;
+        let path = repo_kb_dir(Path::new(&dir)).join(format!("{id}.json"));
+        Some(bbox_util::util::repo_artifact_rider(&dir, &path))
     }
 
     fn learn_result_locked(
         &mut self,
         p: &LearnParams,
         from_agent: bool,
+        write_dir: Option<&str>,
     ) -> Result<LearnWriteResult> {
         let category = Category::from_str(&p.category)
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
@@ -1373,6 +1461,7 @@ impl Knowledge {
                     ));
                 }
 
+                self.set_write_redirect(id, write_dir);
                 self.persist_repo_owned_entries()?;
                 let summary = if changes.is_empty() {
                     "no-op (all fields unchanged)".to_string()
@@ -1425,6 +1514,7 @@ impl Knowledge {
         };
 
         self.store.entries.push(entry);
+        self.set_write_redirect(&id, write_dir);
         self.persist_repo_owned_entries()?;
         // Signal render-lifecycle state: entries are stored + indexed but NOT
         // automatically rendered into provider markdown (CLAUDE.md / AGENTS.md /
@@ -1458,13 +1548,25 @@ impl Knowledge {
         p: &RememberParams,
         from_agent: bool,
     ) -> Result<KnowledgeWriteResult> {
-        self.remember_result_locked(p, from_agent)
+        self.remember_result_locked(p, from_agent, None)
+    }
+
+    /// `remember_result` with a committed-file write redirect (see
+    /// [`Self::learn_result_with_write_dir`]).
+    pub fn remember_result_with_write_dir(
+        &mut self,
+        p: &RememberParams,
+        from_agent: bool,
+        write_dir: Option<&str>,
+    ) -> Result<KnowledgeWriteResult> {
+        self.remember_result_locked(p, from_agent, write_dir)
     }
 
     fn remember_result_locked(
         &mut self,
         p: &RememberParams,
         from_agent: bool,
+        write_dir: Option<&str>,
     ) -> Result<KnowledgeWriteResult> {
         // None → Memory (schema default). Some(invalid) → error rather than
         // silently landing the entry in the wrong bucket.
@@ -1516,6 +1618,7 @@ impl Knowledge {
             last_recalled: None,
         });
 
+        self.set_write_redirect(&id, write_dir);
         self.persist_repo_owned_entries()?;
         Ok(KnowledgeWriteResult {
             id: id.clone(),
@@ -1537,13 +1640,25 @@ impl Knowledge {
         p: &DecideParams,
         from_agent: bool,
     ) -> Result<KnowledgeWriteResult> {
-        self.decide_result_locked(p, from_agent)
+        self.decide_result_locked(p, from_agent, None)
+    }
+
+    /// `decide_result` with a committed-file write redirect (see
+    /// [`Self::learn_result_with_write_dir`]).
+    pub fn decide_result_with_write_dir(
+        &mut self,
+        p: &DecideParams,
+        from_agent: bool,
+        write_dir: Option<&str>,
+    ) -> Result<KnowledgeWriteResult> {
+        self.decide_result_locked(p, from_agent, write_dir)
     }
 
     fn decide_result_locked(
         &mut self,
         p: &DecideParams,
         from_agent: bool,
+        write_dir: Option<&str>,
     ) -> Result<KnowledgeWriteResult> {
         if p.content.trim().is_empty() {
             anyhow::bail!("'content' is required");
@@ -1614,6 +1729,7 @@ impl Knowledge {
             }
         }
 
+        self.set_write_redirect(&id, write_dir);
         self.persist_repo_owned_entries()?;
         let message = if let Some(old_id) = p.supersedes.as_deref() {
             format!("Decided entry {id} (supersedes {old_id})")
@@ -3049,6 +3165,123 @@ mod tests {
         assert!(!other_root.join("CLAUDE.md").exists());
     }
 
+    /// A write redirect (worktree caller) keeps the entry keyed to the base
+    /// scope while the committed file lands in the worktree checkout — and
+    /// the entry leaves the central store (the worktree file is the carrier).
+    #[test]
+    fn learn_with_write_dir_redirects_repo_file_and_keeps_base_scope() {
+        let central = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        let wt_root = worktree.path().canonicalize().unwrap();
+        // Both checkouts carry `.bbox/knowledge/` (repo-owned).
+        std::fs::create_dir_all(repo_kb_dir(&base_root)).unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&wt_root)).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        let result = kb
+            .learn_result_with_write_dir(
+                &LearnParams {
+                    content: "use rustls, not openssl".into(),
+                    category: "convention".into(),
+                    scope: Some("project".into()),
+                    project: Some(base_root.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                false,
+                Some(wt_root.to_str().unwrap()),
+            )
+            .expect("learn should succeed");
+        let id = result.id;
+
+        // Durable scope stays the base; the committed file is in the worktree.
+        let entry = kb.entry(&id).expect("entry stored");
+        assert_eq!(entry.project.as_deref(), Some(base_root.to_str().unwrap()));
+        assert!(repo_kb_dir(&wt_root).join(format!("{id}.json")).exists());
+        assert!(!repo_kb_dir(&base_root).join(format!("{id}.json")).exists());
+
+        // Central excludes it (the worktree file is the carrier), and the
+        // commit-this rider resolves against the carrier checkout — it names
+        // the relative artifact path, which exists under the worktree (the
+        // file-location asserts above), not under the base.
+        assert!(!kb.central_snapshot().entries.iter().any(|e| e.id == id));
+        let rider = kb.repo_record_rider(&id).expect("rider for repo-owned entry");
+        assert!(
+            rider.contains(&format!("{id}.json")),
+            "rider should reference the committed entry file: {rider}"
+        );
+    }
+
+    /// Updating a base-committed entry from a worktree redirects the rewrite
+    /// into the worktree WITHOUT purging the already-committed base file:
+    /// redirection is not reassignment — the branch, not the daemon, updates
+    /// the base checkout.
+    #[test]
+    fn redirected_update_protects_base_committed_file_from_purge() {
+        let central = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        let wt_root = worktree.path().canonicalize().unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&base_root)).unwrap();
+        std::fs::create_dir_all(repo_kb_dir(&wt_root)).unwrap();
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        // Base is a loaded root → base persists run with purge=true.
+        kb.set_project_roots(vec![base_root.clone()]).unwrap();
+
+        let base_params = |content: &str| LearnParams {
+            content: content.into(),
+            category: "convention".into(),
+            scope: Some("project".into()),
+            project: Some(base_root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let kept = kb
+            .learn_result(&base_params("kept in base"), false)
+            .unwrap()
+            .id;
+        let redirected = kb
+            .learn_result(&base_params("authored in base, edited from worktree"), false)
+            .unwrap()
+            .id;
+        assert!(repo_kb_dir(&base_root).join(format!("{kept}.json")).exists());
+        assert!(repo_kb_dir(&base_root)
+            .join(format!("{redirected}.json"))
+            .exists());
+
+        // Edit the second entry from the worktree: rewrite goes to the
+        // worktree; the base copy (older generation, owned by the branch)
+        // survives the authoritative purge that `kept` still drives.
+        kb.learn_result_with_write_dir(
+            &LearnParams {
+                id: Some(redirected.clone()),
+                content: "edited from worktree".into(),
+                ..base_params("ignored")
+            },
+            false,
+            Some(wt_root.to_str().unwrap()),
+        )
+        .expect("redirected update should succeed");
+
+        assert!(repo_kb_dir(&wt_root)
+            .join(format!("{redirected}.json"))
+            .exists());
+        assert!(
+            repo_kb_dir(&base_root)
+                .join(format!("{redirected}.json"))
+                .exists(),
+            "base committed file must survive the purge while redirected"
+        );
+        assert!(repo_kb_dir(&base_root).join(format!("{kept}.json")).exists());
+
+        // Reload drops the transient redirect; the base file (still committed)
+        // carries the pre-edit generation again.
+        kb.reload().unwrap();
+        assert!(kb.entry(&redirected).is_some());
+    }
+
     #[test]
     fn list_reports_content_bytes_for_complete_entry() {
         let (_tmp, mut kb) = mk_kb();
@@ -3489,9 +3722,15 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // the agent's branch and merges to base via adopt/publish — not into the
         // registered base checkout. Knowledge writes follow `entry.project` and
         // `project` is re-stamped from the loading root, so base-scope is
-        // recovered automatically once the entry merges into the base. No
-        // scope/write-dir split (as threads needed) is required — only the path
-        // the agent passes. This guards that the write path stays project-driven.
+        // recovered automatically once the entry merges into the base.
+        //
+        // Superseded in part by gap-de82a74d: worktree-path keying left the
+        // entry invisible to base-scoped render/list/inject until that merge,
+        // so the MCP adapter now resolves recognized worktrees to a
+        // base-scope + write-dir split (`learn_result_with_write_dir`) BEFORE
+        // calling the store. This test still guards the store-level contract
+        // for direct project-driven writes (no redirect): the file follows
+        // `entry.project` into the checkout the caller named.
         let central = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
@@ -3733,7 +3972,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             last_recalled: Some("2026-05-30T00:00:00Z".into()),
         };
 
-        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        persist_repo_kb_entries(&repo_root, &[&entry], true, &BTreeSet::new()).unwrap();
 
         // Committed file holds durable content only — no recall telemetry.
         let committed_path = repo_kb_dir(&repo_root).join("recl0001.json");
@@ -3764,7 +4003,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let before = fs::read(&committed_path).unwrap();
         entry.recall_count = 99;
         entry.last_recalled = Some("2026-05-31T00:00:00Z".into());
-        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        persist_repo_kb_entries(&repo_root, &[&entry], true, &BTreeSet::new()).unwrap();
         let after = fs::read(&committed_path).unwrap();
         assert_eq!(
             before, after,
@@ -3815,7 +4054,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             last_recalled: Some("2026-05-30T00:00:00Z".into()),
         };
         // Authoritative save seeds the sidecar with real stats.
-        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        persist_repo_kb_entries(&repo_root, &[&entry], true, &BTreeSet::new()).unwrap();
         assert!(
             fs::read_to_string(repo_kb_stats_path(&repo_root))
                 .unwrap()
@@ -3825,7 +4064,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Additive save with zero in-memory telemetry must preserve the stat.
         entry.recall_count = 0;
         entry.last_recalled = None;
-        persist_repo_kb_entries(&repo_root, &[&entry], false).unwrap();
+        persist_repo_kb_entries(&repo_root, &[&entry], false, &BTreeSet::new()).unwrap();
         let sidecar = fs::read_to_string(repo_kb_stats_path(&repo_root)).unwrap();
         assert!(
             sidecar.contains("keep0001") && sidecar.contains("\"recall_count\": 5"),

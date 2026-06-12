@@ -29,6 +29,7 @@ pub mod refactor;
 pub mod render;
 pub mod roadmap;
 pub mod roster;
+pub mod scope;
 pub mod sessions;
 pub mod slices;
 pub mod storage_gc;

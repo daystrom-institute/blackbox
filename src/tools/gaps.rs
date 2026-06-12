@@ -11,27 +11,11 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 
 impl BlackboxServer {
     /// Resolve a raw project path/id to its durable gap scope and optional
-    /// committed-file write target. Recognized worktrees (managed fleet
-    /// worktrees AND in-tree linked worktrees like `.claude/worktrees/<name>`)
-    /// key to the registered base but write repo-owned files into the worktree
-    /// so the branch carries the gap — for filing and for the resolve/update
-    /// rewrites alike. Other registered projects resolve through the registry;
-    /// unregistered paths fall back to filesystem canonicalization.
-    // false positive: called from bbox_gap's run_blocking closure.
-    #[allow(clippy::disallowed_methods)]
+    /// committed-file write target — for filing and for the resolve/update
+    /// rewrites alike. Delegates to the store-shared resolution in
+    /// [`BlackboxServer::resolve_project_write_scope`] (`src/tools/scope.rs`).
     fn resolve_gap_project(&self, raw: &str) -> (String, Option<String>) {
-        if let Some((base, worktree)) =
-            crate::projects::fleet_worktree_scope_and_dir(raw, &self.state.projects.read().list())
-        {
-            return (base, Some(worktree));
-        }
-        if let Ok(Some(record)) = self.state.projects.read().resolve(raw) {
-            return (record.canonical_path, None);
-        }
-        let project = std::fs::canonicalize(raw)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| raw.to_string());
-        (project, None)
+        self.resolve_project_write_scope(raw)
     }
 }
 
