@@ -595,6 +595,7 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
         if !ff_base.ok {
             return CloseoutOutcome::Failed(ff_base);
         }
+        let base_diverged = phase_marks_divergence(&ff_base);
         results.push(ff_base);
 
         let rebase = phase_rebase(req);
@@ -608,6 +609,31 @@ pub fn run_closeout_phases(req: &CloseoutRequest) -> CloseoutOutcome {
             return CloseoutOutcome::Failed(ff_merge);
         }
         results.push(ff_merge);
+
+        if base_diverged {
+            // The LOCAL fold is complete. Pushing a diverged branch cannot
+            // succeed without integrating the operator's local-only commits
+            // with origin's — a judgment call deferred to the operator (the
+            // cockpit resumes the agent in assess-only mode to brief them).
+            // The worktree is kept too, so `/closeout adopt` finishes the
+            // fold cleanly after reconciliation. (recover_push_reject's
+            // reset-to-origin stays safe: it can only run when ff_base
+            // actually synced local to origin.)
+            results.push(PhaseResult {
+                phase: CloseoutPhase::Push,
+                repo_cwd: req.base_repo.clone(),
+                ok: true,
+                error_class: CloseoutErrorClass::None,
+                content: json!({
+                    "skipped": "origin_diverged",
+                    "message": format!(
+                        "folded locally; {} and origin/{} have diverged — reconcile, then `/closeout adopt` to push and clean up",
+                        req.target, req.target
+                    ),
+                }),
+            });
+            return CloseoutOutcome::Success { phases: results };
+        }
 
         // pre_push hook: after the local ff-merge, before publishing. A
         // blocking failure aborts before anything reaches the remote.
@@ -1158,6 +1184,26 @@ fn phase_ff_base(req: &CloseoutRequest) -> PhaseResult {
     }
     let ff_ref = format!("origin/{target}");
     if let Err(e) = git_run(base_repo, &["merge", "--ff-only", &ff_ref]) {
+        // Local target and origin have DIVERGED (each has commits the other
+        // lacks). Integrating them rewrites or merges the operator's local
+        // history — a judgment call, not a mechanical step — so it must not
+        // block the LOCAL fold, which needs nothing from origin. Mark the
+        // divergence; the driver folds locally and defers push + removal.
+        if local_and_origin_diverged(base_repo, target) {
+            let (ahead, behind) = divergence_counts(base_repo, target);
+            return PhaseResult {
+                phase: CloseoutPhase::FfBase,
+                repo_cwd: base_repo.clone(),
+                ok: true,
+                error_class: CloseoutErrorClass::None,
+                content: json!({
+                    "diverged": true,
+                    "ref": ff_ref,
+                    "local_only": ahead,
+                    "origin_only": behind,
+                }),
+            };
+        }
         return PhaseResult {
             phase: CloseoutPhase::FfBase,
             repo_cwd: base_repo.clone(),
@@ -1173,6 +1219,33 @@ fn phase_ff_base(req: &CloseoutRequest) -> PhaseResult {
         error_class: CloseoutErrorClass::None,
         content: json!({"fetched": ff_ref, "ff_merged": ff_ref}),
     }
+}
+
+/// True when `<target>` and `origin/<target>` each carry commits the other
+/// lacks — neither is an ancestor of the other.
+fn local_and_origin_diverged(base_repo: &Path, target: &str) -> bool {
+    let remote = format!("origin/{target}");
+    !git_ok(base_repo, &["merge-base", "--is-ancestor", &remote, target])
+        && !git_ok(base_repo, &["merge-base", "--is-ancestor", target, &remote])
+}
+
+/// (`local-only`, `origin-only`) commit counts between `<target>` and
+/// `origin/<target>`, best-effort (0,0 when unparseable).
+fn divergence_counts(base_repo: &Path, target: &str) -> (u64, u64) {
+    let range = format!("{target}...origin/{target}");
+    git_capture(base_repo, &["rev-list", "--left-right", "--count", &range])
+        .ok()
+        .and_then(|out| {
+            let mut it = out.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .unwrap_or((0, 0))
+}
+
+/// True when this phase result carries the diverged-base marker set by
+/// [`phase_ff_base`].
+fn phase_marks_divergence(phase: &PhaseResult) -> bool {
+    phase.content.get("diverged").and_then(|v| v.as_bool()) == Some(true)
 }
 
 fn phase_rebase(req: &CloseoutRequest) -> PhaseResult {
@@ -3644,6 +3717,82 @@ mod tests {
             on_fail,
             timeout_secs: 30,
         }
+    }
+
+    /// Diverged base: the LOCAL fold is mechanical and must complete (rebase
+    /// + ff-merge onto the local target); the push and the worktree removal
+    /// are judgment-deferred to the operator. Nothing reaches origin, no
+    /// local-only commit is dropped, the worktree survives for the
+    /// follow-up `/closeout adopt`.
+    #[tokio::test]
+    async fn publish_onto_diverged_base_folds_locally_and_defers_push() {
+        let (repo, origin, value, cwd, branch) = seed_foldable_worktree().await;
+
+        // Local-only commit on the base target…
+        std::fs::write(repo.path().join("local-only.txt"), "local\n").unwrap();
+        run_git(repo.path(), &["add", "local-only.txt"]);
+        run_git(repo.path(), &["commit", "-m", "local-only commit"]);
+
+        // …and a different origin-only commit, pushed from a second clone.
+        let clone = tempfile::tempdir().unwrap();
+        run_git(
+            clone.path(),
+            &["clone", origin.path().to_str().unwrap(), "c"],
+        );
+        let clone_repo = clone.path().join("c");
+        run_git(&clone_repo, &["config", "user.email", "peer@test"]);
+        run_git(&clone_repo, &["config", "user.name", "peer"]);
+        std::fs::write(clone_repo.join("origin-only.txt"), "origin\n").unwrap();
+        run_git(&clone_repo, &["add", "origin-only.txt"]);
+        run_git(&clone_repo, &["commit", "-m", "origin-only commit"]);
+        run_git(&clone_repo, &["push", "origin", "main"]);
+
+        let origin_main_before = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
+
+        let req = CloseoutRequest {
+            worktree: cwd.clone(),
+            base_repo: repo.path().canonicalize().unwrap(),
+            branch,
+            target: "main".to_string(),
+            disposition: "adopt".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+        let phases = match run_closeout_phases(&req) {
+            CloseoutOutcome::Success { phases } => phases,
+            CloseoutOutcome::Failed(p) => {
+                panic!("diverged fold must land locally, got {:?}", p.content)
+            }
+        };
+
+        let deferral = phases
+            .iter()
+            .find(|p| p.content.get("skipped").and_then(|v| v.as_str()) == Some("origin_diverged"))
+            .expect("a deferred-push phase must be recorded");
+        assert!(
+            deferral
+                .content
+                .get("message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m.contains("/closeout adopt")),
+            "the deferral must tell the operator how to finish: {:?}",
+            deferral.content
+        );
+
+        // Local fold landed: base main contains the worktree's work AND the
+        // local-only commit.
+        let log = git_capture(repo.path(), &["log", "--format=%s", "main"]).unwrap();
+        assert!(log.contains("worktree commit"), "fold commit on local main: {log}");
+        assert!(log.contains("local-only commit"), "local-only commit survives: {log}");
+
+        // Nothing reached origin; the worktree survives for /closeout adopt.
+        let origin_main_after = git_capture(origin.path(), &["rev-parse", "main"]).unwrap();
+        assert_eq!(origin_main_before, origin_main_after, "push must be deferred");
+        assert!(cwd.exists(), "worktree must be kept for the follow-up adopt");
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
     }
 
     /// post_success fires after a successful adopt fold and sees the closeout

@@ -473,11 +473,20 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
             target,
             outcome,
         } => {
-            if maybe_resume_rebase_recovery(app, &worktree, target.clone(), &outcome) {
+            if maybe_resume_agent_recovery(app, &worktree, target.clone(), &outcome) {
                 return;
             }
             let line = render_outcome(&sent_disposition, dry_run, &outcome);
             app.push_cockpit_line(line);
+            // Deferred fold: landed on the LOCAL target but origin has
+            // diverged — push and worktree removal are deferred to the
+            // operator. Keep the row (the worktree is still there; adopt
+            // finishes it) and have the agent assess the divergence for the
+            // operator's decision.
+            if let Some(detail) = deferred_divergence_detail(&outcome) {
+                resume_agent_for_assessment(app, &worktree, &detail);
+                return;
+            }
             // A SUCCESSFUL mutating fold removed the worktree, so the agent's row
             // is now a dead end (re-running /closeout would fail "no worktree").
             // Drop it from the roster so a folded agent doesn't linger looking
@@ -506,7 +515,15 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
     }
 }
 
-fn maybe_resume_rebase_recovery(
+/// Mechanical/judgment split for fold problems:
+/// - A rebase conflict in the WORKTREE is the agent reconciling its own
+///   work — resume it to resolve + commit, then the cockpit auto-reruns the
+///   fold as adopt (the existing recovery loop).
+/// - A BASE-repo state problem (terminal ff/push failures) is operator
+///   territory: the agent is resumed in ASSESS-ONLY mode — inspect,
+///   summarize, recommend, flag needs-input — and the operator decides.
+///   Nothing mutates, nothing auto-retries.
+fn maybe_resume_agent_recovery(
     app: &mut App,
     worktree: &str,
     target: Option<String>,
@@ -515,11 +532,23 @@ fn maybe_resume_rebase_recovery(
     let CloseoutOutcome::Failed(result) = outcome else {
         return false;
     };
-    if result.error_class != CloseoutErrorClass::RebaseConflict {
-        return false;
-    }
-    if !same_path(&result.repo_cwd, worktree) {
-        return false;
+    match result.error_class {
+        CloseoutErrorClass::RebaseConflict if same_path(&result.repo_cwd, worktree) => {}
+        CloseoutErrorClass::FfBaseFailed
+        | CloseoutErrorClass::FfMergeFailed
+        | CloseoutErrorClass::PushRejected => {
+            let detail = phase_failure_detail(result);
+            resume_agent_for_assessment(
+                app,
+                worktree,
+                &format!(
+                    "phase {:?} failed ({:?}): {detail}",
+                    result.phase, result.error_class
+                ),
+            );
+            return true;
+        }
+        _ => return false,
     }
     let Some(idx) = agent_index_for_worktree(app, worktree) else {
         app.push_cockpit_line(format!(
@@ -545,6 +574,64 @@ fn maybe_resume_rebase_recovery(
     let prompt = rebase_recovery_prompt(worktree, result);
     resume_agent(app, idx, prompt);
     true
+}
+
+/// `Some(message)` when a Success outcome carries the driver's
+/// `origin_diverged` deferral (push + removal skipped; local fold landed).
+fn deferred_divergence_detail(outcome: &CloseoutOutcome) -> Option<String> {
+    let CloseoutOutcome::Success { phases } = outcome else {
+        return None;
+    };
+    phases.iter().find_map(|p| {
+        let obj = p.content.as_object()?;
+        (obj.get("skipped").and_then(|v| v.as_str()) == Some("origin_diverged")).then(|| {
+            obj.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local target and origin have diverged; push deferred")
+                .to_string()
+        })
+    })
+}
+
+fn phase_failure_detail(result: &bro_fleet_client::PhaseResult) -> String {
+    result
+        .content
+        .as_object()
+        .and_then(|obj| obj.get("message").or_else(|| obj.get("error")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("closeout phase failed")
+        .to_string()
+}
+
+/// Resume the worktree's agent in ASSESS-ONLY mode for a base-repo state
+/// problem. No pending continuation is armed: the agent inspects and briefs,
+/// the OPERATOR decides what happens to their history.
+fn resume_agent_for_assessment(app: &mut App, worktree: &str, situation: &str) {
+    let Some(idx) = agent_index_for_worktree(app, worktree) else {
+        app.push_cockpit_line(format!(
+            "/closeout: base-repo state needs operator attention ({situation}); no owning agent to assess"
+        ));
+        return;
+    };
+    let provider = app.agents[idx].provider;
+    if !provider_supports_bidi(provider) {
+        app.push_cockpit_line(format!(
+            "/closeout: base-repo state needs operator attention ({situation}); {provider} cannot be resumed to assess"
+        ));
+        return;
+    }
+    let name = app.agents[idx].name.clone();
+    app.push_cockpit_line(format!(
+        "/closeout: asking {name} to assess the base-repo state for you — decision stays yours"
+    ));
+    let prompt = assessment_prompt(worktree, situation);
+    resume_agent(app, idx, prompt);
+}
+
+fn assessment_prompt(worktree: &str, situation: &str) -> String {
+    format!(
+        "Closeout of your worktree ({worktree}) needs an operator decision about the BASE repository's state: {situation}. ASSESS ONLY — do not run any mutating git command anywhere (no rebase, merge, reset, commit, push). Inspect the base repository read-only (git -C <base> status / log / rev-list --left-right --count <target>...origin/<target> / diff --stat) and produce a short brief for the operator: what the local-only commits are, what the origin-only commits are, whether they touch overlapping files, and your recommended integration (e.g. rebase local onto origin vs merge) with the exact commands. Then call the report tool with needs_input=true and a one-line recommendation so the cockpit flags the row as waiting. The operator will reconcile and finish the fold with /closeout adopt."
+    )
 }
 
 pub(super) fn poll_pending_closeout_recovery(app: &mut App) {
@@ -1240,6 +1327,15 @@ fn render_outcome(sent_disposition: &str, dry_run: bool, outcome: &CloseoutOutco
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             });
+            let deferred = phases.iter().find_map(|p| {
+                let obj = p.content.as_object()?;
+                (obj.get("skipped").and_then(|v| v.as_str()) == Some("origin_diverged"))
+                    .then(|| obj.get("message").and_then(|v| v.as_str()).map(str::to_string))
+                    .flatten()
+            });
+            if let Some(message) = deferred {
+                return format!("/closeout {sent_disposition}: {message}");
+            }
             let prefix = if dry_run {
                 format!("preflight of {sent_disposition}: ready")
             } else {
