@@ -80,7 +80,7 @@ pub struct ThreadParams {
     pub origin: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ThreadListParams {
     /// Filter by lifecycle status: open, active, resolved, promoted.
     #[serde(default)]
@@ -351,6 +351,11 @@ pub fn load_repo_records(project_dir: &Path) -> Vec<ThreadRecord> {
 
 pub struct Threads {
     store: ThreadStore,
+    /// Where this store was loaded from — surfaced in lookup diagnostics so
+    /// a caller chasing a "Thread not found" for an id another surface just
+    /// listed can tell which store answered (gap-518d7215: list/resolve
+    /// divergence is a two-stores symptom, not a lookup bug).
+    store_path: PathBuf,
 }
 
 impl StoreSnapshot for Threads {
@@ -371,7 +376,23 @@ impl Threads {
         } else {
             ThreadStore::new()
         };
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            store_path: store_path.to_path_buf(),
+        })
+    }
+
+    /// One-line store-identity breadcrumb for lookup diagnostics: which
+    /// store file answered and how much it holds. Lookup is global by id —
+    /// `project` never narrows it — so a miss for an id some listing just
+    /// returned means that listing came from a DIFFERENT store/daemon, not
+    /// that a scope filter excluded it.
+    fn store_identity(&self) -> String {
+        format!(
+            "store {} holds {} thread(s)",
+            self.store_path.display(),
+            self.store.threads.len()
+        )
     }
 
     fn now_iso() -> String {
@@ -717,7 +738,10 @@ impl Threads {
                 return Ok(t.id.clone());
             }
             anyhow::bail!(
-                "Thread not found: {id} (expected `thread-<8hex>`, e.g. `thread-7f01324e`)"
+                "Thread not found: {id} (expected `thread-<8hex>`, e.g. `thread-7f01324e`). \
+                 Lookup is global by id — `project` never narrows it; {}. \
+                 If a listing just returned this id, that listing came from a different store/daemon.",
+                self.store_identity()
             );
         }
         if let Some(name) = p.name.as_deref() {
@@ -731,7 +755,11 @@ impl Threads {
             }) {
                 return Ok(t.id.clone());
             }
-            anyhow::bail!("Thread not found: {name}");
+            anyhow::bail!(
+                "Thread not found: {name}. Lookup is global by name — \
+                 `project` never narrows it; {}.",
+                self.store_identity()
+            );
         }
         anyhow::bail!("'id' or 'name' is required");
     }
@@ -1019,7 +1047,18 @@ impl Threads {
         }
 
         if results.is_empty() {
-            return Ok("No threads found.".to_string());
+            // Differentiate filter-miss from empty store: a caller staring at
+            // an unexpected empty listing needs to know whether their filters
+            // excluded everything or this store simply isn't the one that
+            // holds their threads (gap-518d7215).
+            return Ok(if self.store.threads.is_empty() {
+                format!("No threads found (store {} is empty).", self.store_path.display())
+            } else {
+                format!(
+                    "No threads found ({}; filters matched none).",
+                    self.store_identity()
+                )
+            });
         }
 
         // Sort by last_activity descending
@@ -1250,6 +1289,50 @@ mod tests {
             })
             .unwrap();
         created.split_whitespace().nth(2).unwrap().to_string()
+    }
+
+    /// Not-found and empty-list responses carry store identity, so a caller
+    /// whose listing came from a DIFFERENT daemon/store (gap-518d7215) can
+    /// see the divergence instead of retrying with project params that the
+    /// global-by-id lookup never consults.
+    #[test]
+    fn lookup_miss_and_empty_list_surface_store_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store_path = root.join("threads.json");
+        let mut threads = Threads::open(&store_path).unwrap();
+
+        let err = threads
+            .thread(&ThreadParams {
+                id: Some("thread-deadbeef".into()),
+                project: Some("/repo/x".into()),
+                ..params("resolve")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("thread-deadbeef"), "{err}");
+        assert!(err.contains("`project` never narrows it"), "{err}");
+        assert!(err.contains(store_path.to_str().unwrap()), "{err}");
+        assert!(err.contains("holds 0 thread(s)"), "{err}");
+
+        // Empty store vs filters-matched-none are distinguishable.
+        let empty = threads
+            .thread_list(&ThreadListParams {
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(empty.contains("is empty"), "{empty}");
+        assert!(empty.contains(store_path.to_str().unwrap()), "{empty}");
+
+        open_thread_id(&mut threads, "real topic", "/repo/x");
+        let filtered = threads
+            .thread_list(&ThreadListParams {
+                project: Some("/repo/other".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(filtered.contains("filters matched none"), "{filtered}");
+        assert!(filtered.contains("holds 1 thread(s)"), "{filtered}");
     }
 
     #[test]
