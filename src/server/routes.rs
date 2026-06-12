@@ -1463,7 +1463,47 @@ pub(crate) async fn install_artifact_value(
             }
         }
         artifacts::ArtifactKind::Team => {
-            // Teams are stored as artifacts but have no additional validation at install time.
+            // A team artifact IS a teamplate. Install materializes it like
+            // its siblings (brofile → brofile store, cron → spec + loop):
+            // write the teamplate store, then instantiate the team under the
+            // teamplate's own name, so ensemble actors — which resolve
+            // instantiated teams only (`load_team`, no teamplate fallback) —
+            // can dispatch it immediately (gap-37a280a6).
+            let tp: orchestration::team::Teamplate = serde_json::from_value(value.clone())?;
+            if tp.advisor.is_some() {
+                anyhow::bail!(
+                    "team artifact '{}' declares an advisor; advisor initialization requires a \
+                     live dispatch, which install never performs — create the team via \
+                     bro_team(action=create, template=\"{}\") instead",
+                    tp.name,
+                    tp.name
+                );
+            }
+            // Same fail-loud-at-install posture as agent installs: member
+            // brofiles must already exist (install brofiles before teams).
+            for member in &tp.members {
+                if orchestration::brofile::resolve_brofile(
+                    &member.brofile,
+                    &state.store_dir,
+                    None,
+                )
+                .is_none()
+                {
+                    anyhow::bail!(
+                        "team artifact '{}': member brofile not found: {} \
+                         (install brofiles before teams)",
+                        tp.name,
+                        member.brofile
+                    );
+                }
+            }
+            orchestration::team::save_teamplate(&tp, "global", &state.store_dir, None);
+            // Re-install/upgrade must not clobber a live team's member
+            // sessions: instantiate only when no team holds the name yet.
+            let _lock = orchestration::team::lock_teams();
+            if orchestration::team::load_team(&tp.name, &state.store_dir).is_none() {
+                orchestration::team::instantiate_team(&tp, &tp.name, None, &state.store_dir);
+            }
         }
         artifacts::ArtifactKind::Cron => {
             let spec: crons::CronSpec = serde_json::from_value(value.clone())?;
@@ -1598,6 +1638,11 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
         .into_iter()
         .filter(|entry| entry.active)
         .filter(|entry| {
+            // Team is deliberately absent: boot-restoring teams from active
+            // artifacts would resurrect deliberately-dissolved teams
+            // (dissolution must stick; re-install is the explicit
+            // re-materialization path). Teamplate/team stores are
+            // file-backed and survive restarts on their own.
             matches!(
                 entry.kind,
                 artifacts::ArtifactKind::Workflow

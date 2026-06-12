@@ -88,11 +88,26 @@ and a vars payload.
 |---|---|---|
 | `embed-compaction-nightly.json` | `0 3 * * *` (3am daily) | `embed-compaction-arc` |
 
+## Teams (`teams/`)
+
+Team artifacts are teamplate-shaped. `bbox_artifact_install kind=team`
+materializes them: it writes the teamplate store AND instantiates the team
+(validating member brofiles exist), so ensemble actors can dispatch the team
+immediately. Install brofiles before teams.
+
+| File | Members | Used by |
+|---|---|---|
+| `contradiction-specialists.json` | provenance / lifecycle / coherence | `contradiction-review-arc` ensemble actor (member aliases match the arc's whiteboard registrations) |
+
+`auto-edge-arc` references an `auto-edge-classifiers` team whose membership
+has never been designed in-repo — author its brofiles + team artifact before
+adopting that arc.
+
 ## Scripts (`scripts/`)
 
 | File | Purpose |
 |---|---|
-| `install-teams.sh` | One-shot installer that creates the contradiction-specialists + auto-edge-classifiers ensemble teams from the brofiles already installed. Run after the brofile catalog has been seeded. |
+| `install-teams.sh` | Legacy one-shot installer for contradiction-specialists via `/admin/team/upsert`. Superseded by the `teams/` artifact + `bbox_artifact_install kind=team` (which preserves the member aliases the arc's whiteboard registrations expect — the script's generated `m1/m2/m3` names do not). |
 
 ## Lifecycle: how the artifacts get installed
 

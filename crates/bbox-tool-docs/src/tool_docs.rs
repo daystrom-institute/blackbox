@@ -738,7 +738,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
         summary: "Install a workflow, packet, brofile, agent, atom, team, or cron artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
-        when_to_use: "Use for producer-side artifacts shipped under system-defaults/agentic-corpus, system-defaults/atoms, system-defaults/maintenance, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, team, or cron path, then records version/source/supersession metadata in the catalog.",
+        when_to_use: "Use for producer-side artifacts shipped under system-defaults/agentic-corpus, system-defaults/atoms, system-defaults/maintenance, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, team, or cron path, then records version/source/supersession metadata in the catalog. Team artifacts are teamplate-shaped and materialize on install: the teamplate store is written and the team instantiated under the teamplate's name (member brofiles must already be installed; re-install never clobbers a live team's sessions; advisor-carrying teamplates are rejected — use bro_team create).",
         example: Some(
             r#"bbox_artifact_install(kind="workflow", source="system-defaults/agentic-corpus/workflows/schema-migration-arc.json")"#,
         ),

@@ -1,0 +1,8 @@
+{
+  "name": "contradiction-specialists",
+  "members": [
+    { "brofile": "contradiction-provenance", "alias": "provenance" },
+    { "brofile": "contradiction-lifecycle", "alias": "lifecycle" },
+    { "brofile": "contradiction-coherence", "alias": "coherence" }
+  ]
+}

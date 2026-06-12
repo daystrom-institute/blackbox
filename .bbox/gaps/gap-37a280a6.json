@@ -12,8 +12,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/teams/team-artifact-install-auto-instantiate",
   "notes": "Extracted from thread-cc07f395 item 5 during thread triage.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-cc07f395",
   "created_at": "2026-06-11T17:07:52Z",
-  "updated_at": "2026-06-11T17:07:52Z"
+  "updated_at": "2026-06-12T05:18:00Z",
+  "resolved_at": "2026-06-12T05:18:00Z",
+  "resolution_note": "Team artifact install now materializes (operator-selected: instantiate-at-install): ArtifactKind::Team install parses the artifact as a Teamplate, validates member brofiles exist (fail-loud at install, parity with agent installs), writes the teamplate store, and instantiates the team under the teamplate's own name — so ensemble actors (load_team, no fallback) dispatch immediately after install. Guard rails: re-install never clobbers a live team (member sessions preserved; refreshed teamplate picked up by future creates); advisor-carrying teamplates are rejected at install (advisor init needs a live dispatch — bro_team create remains their path); boot restore deliberately excludes Team so dissolution sticks. Shipped system-defaults/agentic-corpus/teams/contradiction-specialists.json with aliases provenance/lifecycle/coherence matching contradiction-review-arc's whiteboard registrations (install-teams.sh's generated m1/m2/m3 names did not — script marked legacy)."
 }

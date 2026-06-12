@@ -186,6 +186,155 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
+    async fn install_team_brofile(server: &BlackboxServer, name: &str) {
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: format!("{name}.json"),
+                name: None,
+                version: Some("1".into()),
+                supersedes: None,
+            },
+            json!({"name": name, "provider": "glm"}),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn install_team_value(
+        server: &BlackboxServer,
+        value: Value,
+        version: &str,
+    ) -> anyhow::Result<artifacts::ArtifactMetadata> {
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Team,
+                source: "team.json".into(),
+                name: None,
+                version: Some(version.into()),
+                supersedes: None,
+            },
+            value,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn team_artifact_install_materializes_teamplate_and_team() {
+        // gap-37a280a6: install must reach the runtime stores — ensemble
+        // actors resolve instantiated teams only (load_team, no teamplate
+        // fallback), so a stored-only artifact is a dispatch-time trap.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_team_brofile(&server, "tm-specialist").await;
+
+        install_team_value(
+            &server,
+            json!({
+                "name": "tm-panel",
+                "members": [{"brofile": "tm-specialist", "alias": "lens", "count": 2}]
+            }),
+            "1",
+        )
+        .await
+        .unwrap();
+
+        let store_dir = &server.state.store_dir;
+        assert!(
+            orchestration::team::resolve_teamplate("tm-panel", store_dir, None).is_some(),
+            "teamplate store written"
+        );
+        let team = orchestration::team::load_team("tm-panel", store_dir)
+            .expect("team instantiated under the teamplate's own name");
+        assert_eq!(team.members.len(), 2, "count expansion applied");
+        assert_eq!(team.members[0].name, "lens-1");
+    }
+
+    #[tokio::test]
+    async fn team_artifact_install_fails_on_missing_member_brofile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let err = install_team_value(
+            &server,
+            json!({"name": "tm-broken", "members": [{"brofile": "no-such-brofile"}]}),
+            "1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("member brofile not found"),
+            "got: {err:#}"
+        );
+        assert!(
+            orchestration::team::load_team("tm-broken", &server.state.store_dir).is_none(),
+            "failed install must not half-instantiate"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_artifact_install_rejects_advisor_teamplates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_team_brofile(&server, "tm-adv").await;
+        let err = install_team_value(
+            &server,
+            json!({
+                "name": "tm-advised",
+                "members": [{"brofile": "tm-adv"}],
+                "advisor": {"brofile": "tm-adv", "charter": "watch the panel"}
+            }),
+            "1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("advisor"),
+            "advisor teamplates need bro_team create (live dispatch): {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_artifact_reinstall_preserves_live_team_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_team_brofile(&server, "tm-live").await;
+        install_team_value(
+            &server,
+            json!({"name": "tm-durable", "members": [{"brofile": "tm-live"}]}),
+            "1",
+        )
+        .await
+        .unwrap();
+
+        // A member acquires live session state between installs.
+        let store_dir = server.state.store_dir.clone();
+        let mut team = orchestration::team::load_team("tm-durable", &store_dir).unwrap();
+        team.members[0].session_id = Some("sess-live".into());
+        orchestration::team::save_team(&team, &store_dir);
+
+        install_team_value(
+            &server,
+            json!({"name": "tm-durable", "members": [{"brofile": "tm-live", "count": 3}]}),
+            "2",
+        )
+        .await
+        .unwrap();
+
+        let team = orchestration::team::load_team("tm-durable", &store_dir).unwrap();
+        assert_eq!(
+            team.members[0].session_id.as_deref(),
+            Some("sess-live"),
+            "re-install must not clobber a live team's member sessions"
+        );
+        assert_eq!(team.members.len(), 1, "live roster untouched by upgrade");
+        // The refreshed teamplate IS picked up for future creates.
+        let tp =
+            orchestration::team::resolve_teamplate("tm-durable", &store_dir, None).unwrap();
+        assert_eq!(tp.members[0].count, 3);
+    }
+
     #[tokio::test]
     async fn active_workflow_artifact_restores_runtime_registry_on_boot() {
         let tmp = tempfile::tempdir().unwrap();

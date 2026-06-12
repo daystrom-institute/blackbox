@@ -11,7 +11,9 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/team/artifact-install-paths",
   "notes": "`contradiction-specialists` and `auto-edge-classifiers` teams referenced by ensemble actors but no automated install. Either F4 catalog grows team artifact kind OR install-teams.sh script.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:05:26Z",
-  "updated_at": "2026-06-11T18:05:26Z"
+  "updated_at": "2026-06-12T05:18:04Z",
+  "resolved_at": "2026-06-12T05:18:04Z",
+  "resolution_note": "Both asks had already materialized when re-verified (ArtifactKind::Team exists in the F4 catalog; install-teams.sh exists), but the catalog path was a stored-only trap — fixed by gap-37a280a6's instantiate-at-install (same commit). contradiction-specialists now ships as a first-class team artifact (system-defaults/agentic-corpus/teams/). Honest residue, now documented in agentic-corpus-defaults.md: auto-edge-classifiers' membership was never designed in-repo (no brofiles, no teamplate, not instantiated on the live daemon) — auto-edge-arc remains unadoptable until its panel is authored; that residue belongs to the ensemble live-proof scope (gap-9d0f9159), not to install plumbing."
 }
