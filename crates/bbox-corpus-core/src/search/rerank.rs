@@ -43,7 +43,11 @@ pub fn temporal_decay(features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
     };
     let age_days = (now - created_at).num_seconds().max(0) as f32 / 86_400.0;
     let base = 1.0 / (1.0 + age_days / 365.0);
-    let recall_boost = (1.0 + features.recall_count as f32).ln_1p().min(0.25);
+    // Graded by recall frequency: zero at recall_count=0, ~0.06 at 1, ~0.19 at
+    // 10, saturating at the 0.25 cap near 30 recalls. The previous form
+    // ln_1p(1 + count) was >= ln(2) at count=0, so the cap saturated for every
+    // entry and the recall signal was dead.
+    let recall_boost = ((features.recall_count as f32).ln_1p() * 0.08).min(0.25);
     let recency_boost = parse_time(features.last_recalled.as_deref())
         .map(|last| {
             let days = (now - last).num_seconds().max(0) as f32 / 86_400.0;
@@ -103,6 +107,28 @@ mod tests {
         };
         assert!(temporal_decay(&stale, now) < 1.0);
         assert_eq!(temporal_decay(&code, now), 1.0);
+    }
+
+    #[test]
+    fn recall_boost_is_zero_when_never_recalled_and_grades_with_count() {
+        let now = DateTime::parse_from_rfc3339("2026-05-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let knowledge = |recall_count: u32| RerankFeatures {
+            doc_type: Some("knowledge".into()),
+            created_at: Some("2026-05-05T00:00:00Z".into()),
+            recall_count,
+            ..RerankFeatures::default()
+        };
+        let cold = temporal_decay(&knowledge(0), now);
+        let warm = temporal_decay(&knowledge(5), now);
+        let hot = temporal_decay(&knowledge(100), now);
+        // Fresh entry never recalled gets no boost at all.
+        assert_eq!(cold, 1.0);
+        assert!(warm > cold);
+        assert!(hot > warm);
+        // Recall boost saturates at the 0.25 cap, then the overall clamp holds.
+        assert_eq!(hot, 1.25);
     }
 
     #[test]
