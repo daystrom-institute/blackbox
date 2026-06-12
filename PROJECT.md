@@ -259,6 +259,7 @@ or system memories and link/pointer from here.
 - `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md`,
   `docs/rule-packets.md` - orchestration and event routing.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
+  `docs/consultant-runtime.md`,
   `docs/whiteboards.md` - agentic coordination surfaces.
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
 - `research/research-corpus.md` - map for the research corpus: a point-in-time,

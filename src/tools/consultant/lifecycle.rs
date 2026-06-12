@@ -389,13 +389,13 @@ impl BlackboxServer {
         let id = descriptor
             .parse_id(raw_id)
             .map_err(|e| format!("error.bad_input(code=invalid_{}_id): {e}", descriptor.name))?;
-        // Consumer command dispatch: the wrapper-command grammar and its
-        // handlers are Badgey's code-owned vocabulary. Replaced by a
-        // descriptor-selected handler registry when a second consumer lands.
-        let command = if descriptor.name == "badgey" {
-            parse_command(prompt)
-        } else {
-            None
+        // Consumer hook dispatch: the wrapper-command grammar and its
+        // handlers are code-owned hook sets the descriptor selects.
+        let command = match descriptor.hooks {
+            crate::orchestration::consultant::descriptor::ConsumerHooks::Badgey => {
+                parse_command(prompt)
+            }
+            crate::orchestration::consultant::descriptor::ConsumerHooks::None => None,
         };
         match command {
             Some(WrapperCommand::Dismiss) => {
@@ -689,12 +689,13 @@ impl BlackboxServer {
             orch::timeout_snapshot_json(&task)
         };
         // Consumer intent post-processing: parses the consumer's intent-note
-        // grammar and dispatches its code-owned handlers. Routed by consumer
-        // name until a descriptor-selected handler registry exists.
-        let action_results = if descriptor.name == "badgey" {
-            self.badgey_post_process_turn(&instance, &turn_start).await?
-        } else {
-            Vec::new()
+        // grammar and dispatches the code-owned hook set the descriptor
+        // selects.
+        let action_results = match descriptor.hooks {
+            crate::orchestration::consultant::descriptor::ConsumerHooks::Badgey => {
+                self.badgey_post_process_turn(&instance, &turn_start).await?
+            }
+            crate::orchestration::consultant::descriptor::ConsumerHooks::None => Vec::new(),
         };
         let refs_consumed = self.badgey_refs_consumed_from_result(&result);
         self.consultant_write_event(

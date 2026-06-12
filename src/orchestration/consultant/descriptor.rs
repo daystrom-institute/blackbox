@@ -1,6 +1,20 @@
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use super::types::ConsultantId;
+
+/// Code-owned consumer hook selection. The runtime turn loop consults this
+/// instead of comparing consumer names: a descriptor *selects* a compiled-in
+/// hook set (wrapper-command grammar + intent post-processor), it can never
+/// define one in data (concern 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerHooks {
+    /// No wrapper commands, no intent post-processing.
+    None,
+    /// Badgey's wrapper-command grammar (`orchestration::badgey::commands`)
+    /// and `bg-action-*` intent post-processor.
+    Badgey,
+}
 
 /// The configuration boundary between the generic consultant runtime and one
 /// configured consumer (Badgey is the first; see
@@ -42,6 +56,13 @@ pub struct ConsumerDescriptor {
     /// Proposal-kind vocabulary (serde snake_case strings) this consumer
     /// writes to the proposal store.
     pub proposal_kinds: &'static [&'static str],
+    /// Compiled-in hook set the turn loop runs for this consumer.
+    pub hooks: ConsumerHooks,
+    /// Legacy on-disk state subdirectory. Badgey keeps its pre-dissolution
+    /// `state_dir/badgey/` layout permanently (migration judged riskier than
+    /// the path asymmetry — design §4.1/§5 Phase 4); new consumers get
+    /// `state_dir/consultant/<name>/`.
+    pub legacy_state_subdir: Option<&'static str>,
 }
 
 impl ConsumerDescriptor {
@@ -72,6 +93,23 @@ impl ConsumerDescriptor {
         self.proposal_kinds.contains(&kind)
     }
 
+    fn state_root(&self, state_dir: &Path) -> PathBuf {
+        match self.legacy_state_subdir {
+            Some(subdir) => state_dir.join(subdir),
+            None => state_dir.join("consultant").join(self.name),
+        }
+    }
+
+    /// Proposal-store root for this consumer under the daemon state dir.
+    pub fn proposals_root(&self, state_dir: &Path) -> PathBuf {
+        self.state_root(state_dir).join("proposals")
+    }
+
+    /// Action-journal root for this consumer under the daemon state dir.
+    pub fn action_journal_root(&self, state_dir: &Path) -> PathBuf {
+        self.state_root(state_dir).join("action_journal")
+    }
+
     fn bad_id(&self, raw: &str) -> String {
         format!(
             "invalid {} id '{raw}', expected {}-<8hex>-<8hex>",
@@ -96,6 +134,8 @@ mod tests {
         scout_brofile_ref: "testc-scout-persona",
         action_kinds: &["tc-action-emit-proposal"],
         proposal_kinds: &["packet", "agent"],
+        hooks: ConsumerHooks::None,
+        legacy_state_subdir: None,
     };
 
     #[test]
@@ -106,6 +146,23 @@ mod tests {
         let err = TEST.parse_id("bg-3f7a91c4-91ff04cc").unwrap_err();
         assert!(err.contains("invalid testc id"), "{err}");
         assert!(TEST.parse_id("tc-nope").is_err());
+    }
+
+    #[test]
+    fn state_roots_follow_legacy_subdir_policy() {
+        let dir = Path::new("/state");
+        assert_eq!(
+            TEST.proposals_root(dir),
+            Path::new("/state/consultant/testc/proposals")
+        );
+        let legacy = ConsumerDescriptor {
+            legacy_state_subdir: Some("testc-legacy"),
+            ..TEST.clone()
+        };
+        assert_eq!(
+            legacy.action_journal_root(dir),
+            Path::new("/state/testc-legacy/action_journal")
+        );
     }
 
     #[test]

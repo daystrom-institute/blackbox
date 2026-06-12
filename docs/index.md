@@ -42,6 +42,7 @@ The crate is `blackbox`. It produces four binaries:
 | [Artifact Catalog](artifact-catalog.md) | Install, list, supersede, and reason about `system-defaults/` |
 | [Agent System](agent-system.md) | Legacy registered-agent compatibility surface |
 | [Badgey](badgey.md) | Evidence-carrying corpus consultant, persistent instances, and proposals |
+| [Consultant Runtime](consultant-runtime.md) | Generic stateful-consultant substrate (instances, proposals, action journal); Badgey is its first consumer |
 | [Project Roadmap](roadmap.md) | Generated roadmap for this repository |
 | [Roadmap Tool](roadmap-tool.md) | Operator-directed prospective work tracker |
 | [Ingress Paths](ingress-paths.md) | Webhooks, pollers, and crons. One routing pipeline. |

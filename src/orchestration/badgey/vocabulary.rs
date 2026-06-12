@@ -32,6 +32,8 @@ pub const BADGEY: ConsumerDescriptor = ConsumerDescriptor {
         "redispatch_task",
         "artifact_promotion",
     ],
+    hooks: crate::orchestration::consultant::descriptor::ConsumerHooks::Badgey,
+    legacy_state_subdir: Some("badgey"),
 };
 
 pub fn descriptor() -> &'static ConsumerDescriptor {

@@ -1,7 +1,7 @@
 ---
 title: "Consultant Runtime - Badgey dissolution into generic primitives"
 kind: design
-lifecycle: proposed
+lifecycle: implemented
 corpus: blackbox-design
 topic:
   - orchestration
@@ -199,7 +199,16 @@ These are the load-bearing risks; each phase below must hold them.
   `state_dir/badgey/` → `state_dir/consultant/badgey/` (or adopt legacy-path
   read for the Badgey consumer permanently), deprecate shims, update
   `docs/badgey.md` + add `docs/consultant-runtime.md`, archive this design to
-  implemented. Concerns 1/6/7 live here.
+  implemented. Concerns 1/6/7 live here. *(Done: legacy-path-read chosen
+  permanently and encoded as descriptor policy (`legacy_state_subdir`; new
+  consumers get `state_dir/consultant/<name>/`) — migration judged riskier
+  than the path asymmetry given mid-flight non-terminal state and
+  idempotency-key preservation (concerns 1/7). The consumer name-gates were
+  replaced by code-owned `ConsumerHooks` selection. `badgey_*` tools remain
+  intentionally as pinned shims — operator UX, not debt scheduled for
+  removal. Docs: `docs/consultant-runtime.md` + `docs/badgey.md` note. Slack
+  channel bindings keep the `badgey_id` field (concern 6) — data compat,
+  revisit only if a second Slack-bound consumer appears.)*
 
 ## 6. Non-goals
 

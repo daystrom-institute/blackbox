@@ -206,13 +206,11 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     }
     let task_ttl = cfg.daemon.task_ttl_ms;
     let task_store = TaskStore::load(&store_dir, task_ttl);
-    // Legacy on-disk layout: the Badgey consumer keeps state under
-    // state_dir/badgey/ until the dissolution's migration phase.
     let consultant_proposals = Arc::new(orchestration::consultant::ProposalStore::new(
-        store_dir.join("badgey").join("proposals"),
+        orchestration::badgey::descriptor().proposals_root(&store_dir),
     )?);
     let consultant_journal = Arc::new(orchestration::consultant::ActionJournal::new(
-        store_dir.join("badgey").join("action_journal"),
+        orchestration::badgey::descriptor().action_journal_root(&store_dir),
     )?);
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);

@@ -11,6 +11,14 @@ Badgey is not a code editor and not a direct knowledge-store CRUD shim.
 It synthesizes evidence-grounded proposals; a human (or the
 apply-proposal arc) executes them.
 
+Since the consultant-runtime dissolution (gap-9dae9a60), Badgey is a
+*configured consumer* of the generic consultant runtime — see
+`docs/consultant-runtime.md`. Instance identity, the proposal store, the
+action journal, and the turn loop are consumer-agnostic; Badgey supplies a
+descriptor (vocabulary, persona brofiles, intent-note grammar, hooks). The
+`badgey_*` proposal tools remain supported as pinned shims of the generic
+`consultant_*` proposal tools.
+
 ## Core concept: instances and proposals
 
 A **Badgey instance** (`badgey_id`) is a persistent consultation session
