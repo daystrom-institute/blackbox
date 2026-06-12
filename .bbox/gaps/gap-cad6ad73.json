@@ -15,7 +15,9 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/fleet-dispatch/operator-mcp-server-injection-unwired",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-12T02:17:13Z",
-  "updated_at": "2026-06-12T02:17:13Z"
+  "updated_at": "2026-06-12T04:16:34Z",
+  "resolved_at": "2026-06-12T04:16:34Z",
+  "resolution_note": "Shipped in f37ce3de (worktree-fleet-mcp-servers-wiring): spawn_task_with_tool_placement now resolves fleet.json mcpServers via fleet_mcp_dispatch_args and appends provider-translated --mcp-config to the dispatch argv; client-local shape converts to daemon SecretString shape by serde round-trip; skip-with-warning on unconvertible/unresolvable servers. Policy (operator-selected): Cockpit-origin only — automation origins (workflow/atom/cron/webhook) inject nothing; the gate short-circuits before any fleet.json read. Wire form is the harness's own --mcp-config CLI flag in the parsed argv, preserving extraction of bro-harness to a standalone subprocess with zero rewiring (harness-daemon-boundary.md §7). /control/resume keeps Cockpit origin so follow-up turns re-inject."
 }
