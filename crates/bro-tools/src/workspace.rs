@@ -1252,7 +1252,7 @@ impl Tool for Glob {
         "glob"
     }
     fn description(&self) -> &str {
-        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths, capped at max_results (default 1000) with a truncation marker. NOTE: results are sorted by modification time (newest first) by DEFAULT; pass sort=\"name\" for lexicographic order."
+        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths as ONE newline-delimited STRING (not an array — in code-mode cells use `result.split(\"\\n\")`), capped at max_results (default 1000) with a truncation marker. NOTE: results are sorted by modification time (newest first) by DEFAULT; pass sort=\"name\" for lexicographic order."
     }
     fn input_schema(&self) -> Value {
         schema_for::<GlobInput>()

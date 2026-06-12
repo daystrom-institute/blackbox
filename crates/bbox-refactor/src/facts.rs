@@ -15,6 +15,20 @@ use anyhow::{Result, anyhow};
 use crate::chunker;
 use crate::{SyntaxItem, sha256_hex};
 
+/// One inventoried item plus the facts the inventory walk doesn't carry.
+///
+/// `visibility` exists because its absence actively misleads: probe
+/// `probe-code-facts-2` read an empty `attributes` array on a `pub fn` as
+/// "this surface doesn't understand visibility" and abandoned the namespace.
+#[derive(Debug, Clone)]
+pub struct ItemFact {
+    pub item: SyntaxItem,
+    /// Visibility modifier text (`pub`, `pub(crate)`, `public`, …);
+    /// `None` = private/default visibility (or not derivable for the
+    /// language).
+    pub visibility: Option<String>,
+}
+
 /// Top-level syntax-item inventory of one source file — the same per-language
 /// item walk `bbox_refactor_status` uses, with the source hash captured at
 /// read time so callers can mint drift-guarded spans.
@@ -23,7 +37,7 @@ pub struct FileItemsFacts {
     pub language: &'static str,
     pub content_sha256: String,
     pub source_len: usize,
-    pub items: Vec<SyntaxItem>,
+    pub items: Vec<ItemFact>,
 }
 
 /// Inventory the top-level syntax items of `path`.
@@ -34,12 +48,52 @@ pub fn file_items(path: &Path) -> Result<FileItemsFacts> {
         "java" => super::java_status_items(&parsed),
         _ => super::generic_top_level_items(&parsed),
     };
+    let root = parsed.tree.root_node();
+    let items = items
+        .into_iter()
+        .map(|item| {
+            let visibility = root
+                .named_descendant_for_byte_range(item.byte_start, item.byte_end)
+                .and_then(|node| item_visibility(node, parsed.language, &parsed.source));
+            ItemFact { item, visibility }
+        })
+        .collect();
     Ok(FileItemsFacts {
         language: parsed.language,
         content_sha256: sha256_hex(parsed.source.as_bytes()),
         source_len: parsed.source.len(),
         items,
     })
+}
+
+/// Visibility modifier text of an item node, per language. Rust reads the
+/// `visibility_modifier` child; Java reads `public`/`protected`/`private`
+/// out of the `modifiers` child. Other languages return `None`.
+fn item_visibility(
+    node: tree_sitter::Node<'_>,
+    language: &str,
+    source: &str,
+) -> Option<String> {
+    let text_of = |n: tree_sitter::Node<'_>| source.get(n.start_byte()..n.end_byte());
+    let mut cursor = node.walk();
+    match language {
+        "rust" => node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "visibility_modifier")
+            .and_then(text_of)
+            .map(str::to_string),
+        "java" => node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "modifiers")
+            .and_then(text_of)
+            .and_then(|modifiers| {
+                ["public", "protected", "private"]
+                    .iter()
+                    .find(|keyword| modifiers.split_whitespace().any(|m| m == **keyword))
+                    .map(|keyword| keyword.to_string())
+            }),
+        _ => None,
+    }
 }
 
 /// One capture from a tree-sitter query run.
@@ -290,13 +344,26 @@ mod facts_tests {
         let facts = file_items(&path).unwrap();
         assert_eq!(facts.language, "rust");
         assert_eq!(facts.content_sha256.len(), 64);
+        assert_eq!(facts.source_len, fs::read(&path).unwrap().len());
         let names: Vec<_> = facts
             .items
             .iter()
-            .filter_map(|i| i.name.as_deref())
+            .filter_map(|i| i.item.name.as_deref())
             .collect();
         assert!(names.contains(&"Alpha"), "items: {names:?}");
         assert!(names.contains(&"beta"), "items: {names:?}");
+        let beta = facts
+            .items
+            .iter()
+            .find(|i| i.item.name.as_deref() == Some("beta"))
+            .unwrap();
+        assert_eq!(beta.visibility.as_deref(), Some("pub"));
+        let gamma = facts
+            .items
+            .iter()
+            .find(|i| i.item.name.as_deref() == Some("gamma"))
+            .unwrap();
+        assert_eq!(gamma.visibility, None);
     }
 
     #[test]

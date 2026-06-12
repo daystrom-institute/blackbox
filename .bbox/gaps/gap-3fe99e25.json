@@ -1,0 +1,22 @@
+{
+  "id": "gap-3fe99e25",
+  "title": "No signature facts binding: \"public fns returning Result\" needs query-guess + read + string-match",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools/code-facts",
+  "wanted_capability": "Signature introspection as a fact binding: code.signature(span) returning { name, visibility, return_type, params } from the AST, and/or code.functions(file, { public, returns }) semantic filtering. Tree-sitter structural queries can express visibility presence but not return-type identity, so the probe's core predicate (\"public functions returning Result\") was inexpressible in the v0 algebra. Empirically validates the analysis.fnSignature binding already sketched in the pressure-test v0 set (it was deferred out of slice 1).",
+  "missing_primitive": "code.signature(span) / code.functions(file, filters)",
+  "fallback_used": "Structural query for pub fns, then code.read each span and JavaScript string match for \"-> Result\" — correct on the fixture, fragile in general (collapses 3 cells into what should be 1 call).",
+  "evidence": [
+    "session probe-code-facts-1, cells 3-6",
+    "prompts/RETRO_ISOLATE_REFACTOR.md retro findings: query-authoring, missing-algebra",
+    "design/bro-harness/refactor-v2-pressure-test.md §5 (analysis.fnSignature in v0 set)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/signature-facts-binding",
+  "resolution": "addressed",
+  "created_at": "2026-06-12T19:27:25Z",
+  "updated_at": "2026-06-12T19:46:50Z",
+  "resolved_at": "2026-06-12T19:46:50Z",
+  "resolution_note": "code.signature(span) landed in commit 09c1863 (worktree branch refactor-v2-isolate): facts::fn_signature AST walk (Rust; other languages fail closed) returning name/visibility/is_async/params/return_type/generics, with the stale_span hash check BEFORE byte-range interpretation. Probe comparison on the identical recon task: probe-1 (no binding) 8 turns / 2 query failures; probe-3 (binding + recipe in declarations + visibility on code.items) 5 turns / 4 cells, composed items → Promise.all(signature) → read with zero query authoring and zero shell fallback. Probe-2 (binding present but idiom prose-buried) showed uptake needs steering — tracked under gap-47b8f954's doc half."
+}

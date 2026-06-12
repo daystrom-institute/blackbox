@@ -1,0 +1,21 @@
+{
+  "id": "gap-47b8f954",
+  "title": "code.query authoring is blind: no tree-sitter node-kind introspection",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools/code-facts",
+  "wanted_capability": "Query-authoring support for cells, two halves. (1) Binding half: code.nodeKinds(file|language) enumerating valid tree-sitter node type names (and ideally field names). (2) Doc half — operator direction 2026-06-12: as the query surface expands, do NOT keep growing inline declaration prose; create an sm-tree-sitter system memory holding per-language grammar guidance + example queries, and signpost it from the tool docs/declarations (\"use bbox_knowledge to read sm-tree-sitter before authoring code queries\"). Caveat for the signpost: standalone harness probes have no bbox MCP surface — daemon dispatches can follow it from cells via tools.mcp__blackbox__bbox_knowledge, standalone agents need the binding half or inline minimum. Probe-2 evidence sharpened the failure mode: a VALID query returning empty captures collapsed the agent's confidence in the whole namespace (now mitigated by an empty-vs-invalid line in the declarations, but the deep fix is grammar knowledge on demand).",
+  "missing_primitive": "code.nodeKinds(language) binding + example queries in declarations",
+  "fallback_used": "Abandoned semantic queries after 2 failed cells; fell back to a structural (function_item (visibility_modifier)) query plus code.read + JS string matching.",
+  "evidence": [
+    "session probe-code-facts-1 (BRO_HOME=/tmp/refactor-v2-probe/brohome), cells 3-5",
+    "prompts/RETRO_ISOLATE_REFACTOR.md retro findings: query-authoring x2, errors",
+    "design/bro-harness/refactor-v2-pressure-test.md §7"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/refactor-tools/ts-query-node-kind-introspection",
+  "notes": "Inline mitigations landed (commits 27b8236, and the probe-3 round): two example queries, empty-vs-invalid semantics, node-kind provenance note. These are holding the line but are exactly the inline growth the operator wants capped — next expansion goes to sm-tree-sitter + signpost instead.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T19:27:18Z",
+  "updated_at": "2026-06-12T19:46:57Z"
+}

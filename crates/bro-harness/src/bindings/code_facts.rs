@@ -111,10 +111,12 @@ impl Tool for CodeItems {
                 let items: Vec<Value> = found
                     .items
                     .iter()
-                    .map(|item| {
+                    .map(|fact| {
+                        let item = &fact.item;
                         json!({
                             "name": item.name,
                             "kind": item.kind,
+                            "visibility": fact.visibility,
                             "span": Span {
                                 file: file.clone(),
                                 byte_start: item.byte_start,
@@ -137,6 +139,7 @@ impl Tool for CodeItems {
                     "file": file,
                     "language": found.language,
                     "content_sha256": found.content_sha256,
+                    "source_len": found.source_len,
                     "items": items,
                 }))
             }
@@ -477,13 +480,13 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The five methods below are the complete `code` surface. Independent calls are safe to batch with `Promise.all`. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. Signature predicates (\"public fns returning Result\") compose as: `code.items` → filter `kind === \"function_item\"` → `Promise.all(fns.map(f => code.signature({ span: f.span })))` → filter on `visibility`/`return_type` — prefer that over hand-writing queries. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that language's grammar."
+        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The five methods below are the complete `code` surface. Independent calls are safe to batch: `const invs = await Promise.all(files.map(f => code.items({ file: f })))`. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public fns returning Result\"): `code.items` → filter `kind === \"function_item\"` (the `visibility` field tells you pub/private already) → `Promise.all(fns.map(f => code.signature({ span: f.span })))` → filter on `return_type`. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
-type SyntaxItemFact = { name?: string; kind: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
+type SyntaxItemFact = { name?: string; kind: string; visibility?: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
 declare const code: {
-  /** Inventory the top-level syntax items of one source file. */
-  items(args: { file: string }): Promise<{ file: string; language: string; content_sha256: string; items: SyntaxItemFact[] }>;
+  /** Inventory the top-level syntax items of one source file. visibility is "pub"/"public"/... or undefined = private. source_len enables whole-file Spans. */
+  items(args: { file: string }): Promise<{ file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] }>;
   /** Run a tree-sitter query; captures carry hash-anchored Spans. */
   query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } }): Promise<{ file: string; language: string; content_sha256: string; captures: { capture: string; kind: string; text: string; span: Span }[]; truncated: boolean }>;
   /** Read the exact text of a Span; errors with stale_span on content drift. */
