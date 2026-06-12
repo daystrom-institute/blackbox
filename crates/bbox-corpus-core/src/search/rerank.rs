@@ -57,10 +57,16 @@ pub fn temporal_decay(features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
     (base + recall_boost + recency_boost).clamp(0.50, 1.25)
 }
 
-/// Default ceiling on the combined type x temporal multiplier. Untuned
-/// (gap-39b3ce16): sweep candidate caps through `apply_rerank_with_cap`
-/// against the eval-suite ranking metrics before trusting this number.
-pub const DEFAULT_COMBINED_CAP: f32 = 1.50;
+/// Default ceiling on the combined type x temporal multiplier. Tuned
+/// empirically (gap-39b3ce16, 2026-06-12): sweeping caps
+/// {1.0, 1.25, 1.5, 1.75, 2.0, 2.5} over the 30-query eval suite against
+/// the live corpus, MRR rose monotonically to 1.75 (0.066 → 0.175,
+/// recall@1 0 → 0.13) and plateaued exactly from there — today's maximum
+/// legitimate boost product is UserConfirmed 1.35 × temporal 1.25 =
+/// 1.6875, so 1.5 truncated real knowledge promotions while any cap
+/// ≥ 1.6875 never binds. 1.75 is the smallest plateau value: it frees the
+/// current signals and still backstops future boost stacking.
+pub const DEFAULT_COMBINED_CAP: f32 = 1.75;
 
 pub fn apply_rerank(base_score: f32, features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
     apply_rerank_with_cap(base_score, features, now, DEFAULT_COMBINED_CAP)
@@ -148,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_rerank_caps_stacked_boosts_at_fifty_percent() {
+    fn default_cap_passes_max_legitimate_boost_and_explicit_cap_truncates() {
         let now = DateTime::parse_from_rfc3339("2026-05-05T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -161,6 +167,14 @@ mod tests {
             ..RerankFeatures::default()
         };
 
-        assert_eq!(apply_rerank(0.2, &fresh_confirmed, now), 0.3);
+        // Max legitimate product today: type 1.35 x temporal clamp 1.25 =
+        // 1.6875 — below the tuned 1.75 default, so the cap does not bind
+        // (the gap-39b3ce16 sweep showed a binding cap costs MRR).
+        let scored = apply_rerank(0.2, &fresh_confirmed, now);
+        assert!((scored - 0.2 * 1.6875).abs() < 1e-6, "{scored}");
+
+        // An explicit lower cap still truncates stacked boosts.
+        let capped = apply_rerank_with_cap(0.2, &fresh_confirmed, now, 1.5);
+        assert!((capped - 0.3).abs() < 1e-6, "{capped}");
     }
 }

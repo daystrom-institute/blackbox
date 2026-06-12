@@ -963,7 +963,7 @@ mod tests {
         .unwrap();
         let fields = index.field_handles();
         let mut writer = index.index_handle().writer(50_000_000).unwrap();
-        let mut add_doc = |session: &str, cwd: &str, base: Option<&str>| {
+        let add_doc = |session: &str, cwd: &str, base: Option<&str>| {
             let mut doc = TantivyDocument::new();
             doc.add_text(fields.doc_type, "transcript");
             doc.add_text(fields.content, "worktree stamping probe");
