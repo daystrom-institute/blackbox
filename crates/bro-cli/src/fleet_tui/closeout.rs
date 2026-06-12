@@ -487,30 +487,13 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
                 resume_agent_for_assessment(app, &worktree, &detail);
                 return;
             }
-            // A SUCCESSFUL mutating fold removed the worktree, so the agent's row
-            // is now a dead end (re-running /closeout would fail "no worktree").
-            // Drop it from the roster so a folded agent doesn't linger looking
-            // re-foldable. keep/preflight/--dry-run leave the worktree intact, so
-            // they keep their row.
-            let mutating = matches!(
-                sent_disposition.as_str(),
-                "discard" | "publish" | "merge" | "adopt"
-            );
-            if !dry_run
-                && mutating
-                && matches!(outcome, CloseoutOutcome::Success { .. })
-                && let Some(idx) = agent_index_for_worktree(app, &worktree)
-            {
-                match remove_agent_row(app, idx) {
-                    Ok(()) => {
-                        if app.zone == Zone::SingleAgent {
-                            app.focused_agent_id = None;
-                            app.zone = Zone::Roster;
-                        }
-                    }
-                    Err(e) => app.push_cockpit_line(format!("closeout cleanup: {e:#}")),
-                }
-            }
+            // The outcome line above IS the operator's success/fail signal —
+            // it must be read, so a successful fold no longer yanks the
+            // operator to the roster or hides the row. The folded agent's
+            // row and transcript stay where the operator is looking; the
+            // worktree is gone, so a stray re-/closeout fails loudly with a
+            // clear preflight error, and Ctrl+K / /prune clean the terminal
+            // row up when the operator is done with it.
         }
     }
 }

@@ -1706,6 +1706,18 @@ impl Session {
                 tracing::info!("deferring /compact received during active turn");
                 continue;
             }
+            // Log the steer like the turn-start user log above: the event log
+            // is THE transcript (the fleet zoom renders it and reconciles
+            // queued-steer echoes against it), so an operator turn injected
+            // mid-turn must appear in it at the position the model saw it.
+            self.event_log.append_event(&json!({
+                "type": "user",
+                "session_id": self.session_id(),
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                },
+            }));
             self.push_user_text_raw(&prompt);
         }
     }

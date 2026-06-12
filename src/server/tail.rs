@@ -495,16 +495,7 @@ pub(crate) async fn roster_stream_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::TranscriptIndex;
-    use crate::orchestration::TaskStatus;
-    use crate::orchestration::tail::TailEvent;
-    use axum::body::to_bytes;
-    use axum::http::Request;
-    use axum::routing::get;
-    use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tempfile::tempdir;
-    use tower::ServiceExt;
 
     #[tokio::test]
     async fn task_bro_ref_cache_hit_avoids_resolution() {
