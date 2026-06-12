@@ -1,0 +1,20 @@
+{
+  "id": "gap-1168b0bd",
+  "title": "No automatic HNSW connectivity guard — degradation is only visible to an operator eyeballing partition stats",
+  "gap_kind": "tooling",
+  "domain": "hnsw",
+  "wanted_capability": "Operational wiring for the connectivity diagnostics shipped with gap-2eabd96d. The compaction cron gates on deleted_ratio only, so the 17% disconnection incident was invisible to every automatic path — it was caught by an operator reading partition stats in a hybrid_search response. Wanted: (a) feed zero_in_degree_nodes / disconnected_nodes ratio into the compaction policy gate (compose with gap-bfe61876 multi-partition ticks) so a partition whose connectivity degrades past a threshold gets a rebuild scheduled; (b) surface threshold breaches through bbox_inbox so the attention layer sees vector-recall risk; (c) expose HnswIndex::self_recall_probe(sample_every, k) on an operational surface (bbox_storage_health or embed status) — today it is a method only, callable by nothing. The graph degrades under incremental push (the diversity-shrink fix slows this massively but exact-duplicate degeneracy still orphans ~1% on real corpora and regrowth is plausible); without a guard, the next regression repeats the silent-for-weeks pattern.",
+  "missing_primitive": "Connectivity-ratio trigger in the compaction policy + self_recall_probe MCP exposure",
+  "evidence": [
+    "gap-2eabd96d (incident + fix)",
+    "crates/bbox-vectors/src/hnsw.rs (self_recall_probe, zero_in_degree_nodes)",
+    "post-rebuild residuals 2026-06-12: linux 5,516/399,136 (1.38%), mac 287/95,979 (0.30%)",
+    "compaction gate: compact_partitions_with_policy deleted_ratio threshold only"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/hnsw/connectivity-guard",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T22:48:39Z",
+  "updated_at": "2026-06-12T22:48:39Z"
+}

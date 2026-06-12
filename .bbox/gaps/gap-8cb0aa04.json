@@ -1,0 +1,18 @@
+{
+  "id": "gap-8cb0aa04",
+  "title": "atom_search is substring-only while bro_agent_search is vector-backed — sibling registries, asymmetric retrieval",
+  "gap_kind": "mcp_surface",
+  "domain": "search-surfaces",
+  "wanted_capability": "Retrieval parity (or an explicit decision against it) for the two manifest registries. bro_agent_search embeds queries against the AgentManifest bucket and resolves through the shared process-wide query cache (resolve_agent_vector_search); atom_search over the same kind of registry is field-substring matching only. Either atoms deserve the same vector lane (atom manifests are prose-rich — purpose/effects/contracts paraphrase poorly for substring match) or neither registry does and agent search's vector lane is over-engineering — but the asymmetry today is an accident of implementation order, not a decision. Surfaced by the 2026-06-12 corpus-search-surface scrutiny (one of four structural inconsistencies; the other three — parser fragmentation, project-scoping split, rerank divergence — were addressed by the taxonomy arc and the smart-mode/ranking work, leaving this one).",
+  "evidence": [
+    "src/tools/agents.rs (embed_agent_query via shared query cache)",
+    "src/tools/atoms.rs atom_search (substring filters)",
+    "2026-06-12 search-surface inventory: ~15 surfaces, 4 inconsistency classes"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "mcp_surface/search-surfaces/atom-agent-vector-asymmetry",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T22:48:53Z",
+  "updated_at": "2026-06-12T22:48:53Z"
+}
