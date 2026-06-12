@@ -70,6 +70,16 @@ Use these terms consistently:
 
 `workspace` is an alias layer. `project` is an identity layer.
 
+One caveat the table glosses over: today's `project_id` is a hash of the
+canonicalized host realpath (`entity_ref::project_id_for_path`,
+`crates/bbox-corpus-core`). It survives `bbox_project_rename` only because the
+registry preserves it in-place; a fresh registration of the same repo at a
+different path — or on another host — mints a different id. So `project_id`
+is host-scoped registry identity. Cross-host and cross-checkout durability
+comes from `repo_id` (first-commit SHA) plus the alias layer below; the alias
+is what lets two hosts refer to "the same project" without sharing a path
+hash.
+
 ## Tool Semantics
 
 Corpus and coordination tools should prefer logical project selectors:
@@ -141,13 +151,42 @@ Path rendering depends on audience:
 This preserves the token savings of contained workspaces without making the
 container mount point part of the corpus model.
 
+## Existing Precedent
+
+Much of this taxonomy already has partial code conformance; the migration is
+consolidation, not greenfield:
+
+- `ProjectRegistry::resolve` (`crates/bbox-indexing/src/projects.rs`) already
+  accepts a `project_id` hex, a registered canonical path, or any absolute
+  path (canonicalized). Aliases are the missing input form.
+- Worktree→base mapping exists (`resolve_managed_fleet_worktree`) and is used
+  by the store write-scope resolver (`src/tools/scope.rs`) and dispatch env
+  resolution. It currently synthesizes a pseudo project record with a
+  `:fleet-worktree` id suffix; `ProjectContext { project_id, checkout_id? }`
+  should subsume that hack.
+- Dispatch sessions already bind project implicitly: `AmbientContext`
+  (`src/orchestration/mod.rs`) pins `cwd`/`project_dir` for worktree
+  confinement and fills `default:mcp.*.project` from the canonical dispatch
+  cwd.
+- Durable entities already key on `project_id + rel_path_hash`
+  (`EntityRef::ProjectFile`), and provenance git notes store relative paths
+  plus `project_id` — both are already container-portable.
+- `bbox_blame` already renders audience-aware dual paths
+  (`BlameTarget { file_path, display_path }`).
+
+The genuinely new slices are: aliases, the structured `ProjectContext` return
+type, and the session workspace map. The workspace layer (`/work`, mount
+tables, `path_map`) has no code today — no container, VM, or sandbox
+execution exists — so resolution step 4 and agent-facing path translation
+are forward-looking and must not block the resolver consolidation.
+
 ## Migration Shape
 
 Additive migration is enough:
 
-1. Introduce a shared project/workspace resolver used by `bbox_*`, `bro_*`, and
-   workflow code that currently accepts `project`, `project_dir`, `cwd`, or
-   path-like parameters.
+1. Consolidate the existing resolution logic into a shared project/workspace
+   resolver used by `bbox_*`, `bro_*`, and workflow code that currently
+   accepts `project`, `project_dir`, `cwd`, or path-like parameters.
 2. Add alias support for registered projects so `project="blackbox"` and
    `project="d723917f"` resolve identically.
 3. Attach an optional session workspace map to dispatched agents:
@@ -173,13 +212,42 @@ It also does not require every project to have a globally unique human alias.
 Aliases are convenience selectors over stable project ids. Ambiguous aliases
 must fail closed and ask for an id or registered root.
 
+## Resolved Questions
+
+Resolved 2026-06-12 after grounding the proposal in the current code.
+
+**Alias storage: both, with distinct roles.** `.bbox/config.toml` declares the
+canonical alias — repo-owned, reviewable, travels with the checkout, and
+compensates for the host-scoped `project_id` (two hosts registering the same
+repo converge on the same alias). The central project registry materializes
+declared aliases at register/reindex time (query-time resolution cannot read
+every repo's config) and additionally accepts operator-set host-local aliases
+for projects that cannot carry a committed config (non-git roots, third-party
+repos). Conflicting aliases fail closed at registration and at resolution.
+
+**Checkout/worktree stay implicit in tool schemas.** The dispatch session
+already binds the execution target (`AmbientContext` pins, structural worktree
+detection, store redirects keyed on worktree paths); adding a checkout
+selector to every file-touching tool would bloat the surface with no current
+consumer. The resolver mints checkout identity internally from the canonical
+path. Only cross-checkout admin tools (`bbox_project_rename`,
+`bbox_project_eject`, and successors) take explicit paths, as they already do.
+Revisit only when a concrete cross-checkout targeting consumer appears.
+
+**Snapshot/branch selectors: deferred, hook reserved.** Indexing remains
+single-checkout, current-HEAD. The designated extension point is
+`EntityRef::ProjectFileV2.snapshot_id` (hash of `repo_id` + `project_id` +
+HEAD SHA, behind `BBOX_PROJECT_REFS_V2`), which already exists in the ref
+schema. A `snapshot=`/`rev=` query selector should be specified only when
+multi-checkout indexing lands, and must key on that dimension.
+
+**Dual path fields: yes — standardize the blame pattern.** `bbox_blame`
+already ships `BlameTarget { file_path, display_path }`. New and migrating
+tools adopt the same shape: an audience-rendered `display_path` alongside the
+canonical form whenever the two differ (today, project-relative vs
+host-absolute; later, workspace-mapped vs host). Lossless during migration
+and precedented in code.
+
 ## Open Questions
 
-- Should project aliases be stored in `.bbox/config.toml`, the central project
-  registry, or both?
-- Should tool schemas expose `checkout` / `worktree` explicitly, or keep those
-  mostly implicit through the active dispatch session?
-- Should search support snapshot or branch selectors once code indexing becomes
-  multi-checkout aware?
-- Should responses include both `display_path` and `canonical_path` fields
-  during the migration to avoid lossy path translation?
+None currently. Earlier open questions were resolved above.
