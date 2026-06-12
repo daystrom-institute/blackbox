@@ -79,6 +79,17 @@ impl BlackboxServer {
         // the read stack below; only in-memory work happens under the stack.)
         let server = self.clone();
         Self::run_blocking("bbox_inbox", move || {
+            // Worktree filter paths map to the registered base (where every
+            // aggregated store keys its state); substring filters pass
+            // through untouched.
+            let mut p = p;
+            if let Some(base) = p
+                .project
+                .as_deref()
+                .and_then(|raw| server.rescope_project_filter_value(raw))
+            {
+                p.project = Some(base);
+            }
             let import_report = if p.import_gap_spool.unwrap_or(false) {
                 let projects = server.state.projects.read();
                 let mut gaps = server.state.gaps.write();

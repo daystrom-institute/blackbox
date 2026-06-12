@@ -8,6 +8,21 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Fixed
+
+- Corpus ops from inside a worktree now key durable state to the registered
+  base project. `bbox_learn` / `bbox_remember` / `bbox_decide` resolve a
+  worktree `project` to the base scope and redirect the repo-owned
+  `.bbox/knowledge/` file into the worktree checkout (so an immediate
+  `bbox_render` from the same worktree includes the entry — the
+  gap-de82a74d asymmetry); pins key to the base and dispatch injection
+  aliases the literal worktree cwd; notes, roadmap items, and whiteboards
+  rescope their `project` on write; notes/roadmap/inbox filters map
+  worktree paths to the base scope. `bbox_thread` lookup misses and empty
+  listings now carry a store-identity breadcrumb (lookup is global by id;
+  `project` never narrows it) so cross-daemon list/resolve divergence
+  (gap-518d7215) is visible instead of mystifying.
+
 ### Removed
 
 - Councils feature removed (`bro_council_list`, `bro_council_open`,

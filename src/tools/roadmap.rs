@@ -207,7 +207,7 @@ impl BlackboxServer {
 }
 
 impl BlackboxServer {
-    async fn roadmap_create(&self, p: RoadmapCreateParams) -> anyhow::Result<String> {
+    pub(crate) async fn roadmap_create(&self, p: RoadmapCreateParams) -> anyhow::Result<String> {
         let priority = roadmap::RoadmapPriority::parse(p.priority.as_deref().unwrap_or("medium"))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let category =
@@ -219,6 +219,14 @@ impl BlackboxServer {
         if scope == "project" && p.project.is_none() {
             anyhow::bail!("scope='project' requires a 'project' path");
         }
+        // Durable item scope is the registered base project — a worktree
+        // caller's path must not key the item to an ephemeral checkout.
+        let project = match p.project {
+            Some(raw) if !raw.trim().is_empty() => {
+                Some(self.resolve_project_write_scope(&raw).0)
+            }
+            other => other,
+        };
 
         let item = {
             let mut rm = self.state.roadmap.write();
@@ -239,7 +247,7 @@ impl BlackboxServer {
                 category,
                 priority,
                 scope,
-                p.project,
+                project,
                 None,
             )?
             .clone()
@@ -362,6 +370,16 @@ impl BlackboxServer {
     }
 
     fn roadmap_search(&self, p: RoadmapSearchParams) -> anyhow::Result<String> {
+        // Worktree filter paths map to the registered base (where items are
+        // keyed); substring filters pass through untouched.
+        let mut p = p;
+        if let Some(mapped) = p
+            .project
+            .as_deref()
+            .and_then(|raw| self.rescope_project_filter_value(raw))
+        {
+            p.project = Some(mapped);
+        }
         let rm = self.state.roadmap.read();
         let project_filter = |i: &&roadmap::RoadmapItem| -> bool {
             if let Some(ref proj) = p.project {
@@ -486,7 +504,11 @@ impl BlackboxServer {
     fn roadmap_next(&self, p: RoadmapNextParams) -> anyhow::Result<String> {
         let rm = self.state.roadmap.read();
         let n = p.n.unwrap_or(5);
-        let project = p.project.as_deref().or(p.project_dir.as_deref());
+        let raw_project = p.project.as_deref().or(p.project_dir.as_deref());
+        // Worktree paths (e.g. an ambient project_dir from a dispatched
+        // agent) rank against the registered base scope.
+        let mapped = raw_project.and_then(|raw| self.rescope_project_filter_value(raw));
+        let project = mapped.as_deref().or(raw_project);
 
         let items = rm.next(n, p.include_blocked, project);
 
@@ -544,11 +566,22 @@ impl BlackboxServer {
             item.body,
         );
 
+        // Same scope/write-dir split as the bbox_thread adapter: a worktree
+        // project_dir keys the thread to its registered base while the
+        // committed record snapshots into the worktree checkout.
+        let raw_project = p.project_dir.or(item.project.clone());
+        let resolved = raw_project.as_deref().and_then(|proj| {
+            crate::projects::fleet_worktree_scope_and_dir(proj, &self.state.projects.read().list())
+        });
+        let (thread_project, write_dir) = match resolved {
+            Some((base, worktree)) => (Some(base), Some(worktree)),
+            None => (raw_project, None),
+        };
         let params = threads::ThreadParams {
             action: "open".into(),
             topic: Some(thread_topic),
             kind: Some("work_item".into()),
-            project: p.project_dir.or(item.project.clone()),
+            project: thread_project,
             handoff_doc: Some(thread_note),
             name: None,
             id: None,
@@ -564,7 +597,7 @@ impl BlackboxServer {
         };
         let result = {
             let mut th = self.state.threads.write();
-            th.thread(&params)?
+            th.thread_mutation(&params, write_dir.as_deref())?.message
         };
         self.state.persist_threads_durable().await?;
 

@@ -24,11 +24,17 @@ impl BlackboxServer {
         name = "whiteboard_open",
         description = "Open a new whiteboard for structured deliberation. The board collects posts (blind phase), annotations (validate/debate phases), and votes (debate phase) from registered agents, advanced through phases by a facilitator-or-operator role. Returns when the board is created and the opener is registered as facilitator. Idempotent re-open against an existing id is rejected — use whiteboard_state to inspect."
     )]
-    async fn whiteboard_open(
+    pub(crate) async fn whiteboard_open(
         &self,
         Parameters(p): Parameters<WhiteboardOpenParams>,
     ) -> CallToolResult {
-        let project = p.project.clone().unwrap_or_default();
+        // Boards key by the registered base project (inbox scoping) — a
+        // worktree opener's path must not scope the board to an ephemeral
+        // checkout.
+        let project = match p.project.clone().filter(|s| !s.trim().is_empty()) {
+            Some(raw) => self.resolve_project_write_scope(&raw).0,
+            None => String::new(),
+        };
         let domain = p.domain.clone().unwrap_or_else(|| "facilitation".into());
         if let Err(e) = self.state.whiteboards.open(
             &p.board_id,

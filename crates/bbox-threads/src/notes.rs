@@ -64,7 +64,7 @@ pub struct NoteParams {
     pub bro: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NoteListParams {
     /// Exact note ID. Canonical form is `note-<8 hex>` (e.g.
     /// `note-a1b2c3d4`). The bare 8-hex suffix is accepted as a fallback.

@@ -17,7 +17,23 @@ impl BlackboxServer {
     )]
     pub(crate) async fn bbox_note(&self, Parameters(p): Parameters<NoteParams>) -> CallToolResult {
         let start = std::time::Instant::now();
-        let text = match self.state.notes.write().create(&p) {
+        let server = self.clone();
+        // Project resolution does fs/git probes — keep it (and the store
+        // mutation behind it) off the tokio workers. Notes key by the
+        // registered base scope so orchestrators filtering at round
+        // boundaries see worktree-authored notes.
+        let create_result = tokio::task::spawn_blocking(move || {
+            let mut p = p;
+            if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
+                let (scope, _write_dir) = server.resolve_project_write_scope(&raw);
+                p.project = Some(scope);
+            }
+            server.state.notes.write().create(&p)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("note task failed: {e}"))
+        .and_then(std::convert::identity);
+        let text = match create_result {
             Ok(text) => text,
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -45,7 +61,19 @@ impl BlackboxServer {
         description = "List / filter notes by exact id, kind, project, session, thread, resolution."
     )]
     pub(crate) fn bbox_notes(&self, Parameters(p): Parameters<NoteListParams>) -> CallToolResult {
-        Self::run("bbox_notes", || self.state.notes.read().list(&p))
+        Self::run("bbox_notes", || {
+            // Worktree filter paths map to the registered base (where notes
+            // are keyed); substring filters pass through untouched.
+            let mut p = p;
+            if let Some(base) = p
+                .project
+                .as_deref()
+                .and_then(|raw| self.rescope_project_filter_value(raw))
+            {
+                p.project = Some(base);
+            }
+            self.state.notes.read().list(&p)
+        })
     }
 
     #[tool(
