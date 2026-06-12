@@ -24,6 +24,7 @@ projects them into a typed entity graph, and exposes search/provenance surfaces.
 - [Agentic Corpus Multimodal Chunkers](agentic-corpus-multimodal-chunkers.md)
 - [Multimodal And Embedding Routing](multimodal-embedding-routing.md)
 - [Reflective Project Graph](reflective-project-graph.md)
+- [Project Taxonomy Standardization](project-taxonomy-standardization.md)
 
 ## Crosscuts
 
