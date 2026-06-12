@@ -5,13 +5,15 @@
   "domain": "rerank",
   "wanted_capability": "Empirically tune the combined rerank multiplier against the eval suite — current 1.5× cap is a guess.",
   "evidence": [
-    "thread-3cfbf9e0 (H1 review #3)"
+    "crates/bbox-corpus-core/src/search/metrics.rs",
+    "crates/bbox-corpus-core/src/search/rerank.rs:60",
+    "crates/bbox-mcp-tools/src/mcp_tools/hybrid_search.rs:56"
   ],
   "impact": "medium",
   "blocking_level": "none",
   "dedupe_key": "eval_coverage/rerank/empirical-tuning",
-  "notes": "Capped at 1.5× via H1 fix; empirical tuning against eval suite still open.",
+  "notes": "Measurement substrate shipped on beta/blackbox-v2: bbox_corpus_core::search::metrics (MRR, recall@k, aggregate report), apply_rerank_with_cap + DEFAULT_COMBINED_CAP, and an operator-probe rerank_cap param on bbox_hybrid_search (clamped [1.0,4.0]). Remaining work to close: run the live sweep — per candidate cap in ~{1.0,1.25,1.5,1.75,2.0,2.5}, run the 30 eval-suite queries (eval/check.rs MANIFEST_SOURCES) through bbox_hybrid_search with rerank_cap set and limit=50 against the populated corpus, aggregate ranked entity_ids vs expected_entity_refs with metrics::aggregate, pick the cap by MRR/recall@10, and bake it into DEFAULT_COMBINED_CAP. Needs a daemon running this build. NOTE: the recall_boost dead-signal bug (rerank.rs ln_1p(1+count) saturation) was fixed in the same batch — sweep results predate-invalid any earlier intuition about the temporal lane.",
   "resolution": "unresolved",
   "created_at": "2026-06-11T18:05:35Z",
-  "updated_at": "2026-06-11T18:05:35Z"
+  "updated_at": "2026-06-12T19:37:07Z"
 }
