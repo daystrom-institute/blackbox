@@ -23,6 +23,7 @@ pub use events::{Disruption, EventSink, Usage};
 pub use exec_args::{ExecOpts, dispatch_path_env, exec_opts_with_provider_defaults, resolve_bin};
 #[cfg(test)]
 use mcp_args::MatchState;
+pub use mcp_args::fleet_mcp_args;
 
 /// Bring every provider dispatch trait into scope with one glob import:
 /// `use crate::orchestration::providers::dispatch_prelude::*;`

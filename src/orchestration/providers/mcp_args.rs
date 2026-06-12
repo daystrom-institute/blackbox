@@ -43,10 +43,10 @@ pub trait ProviderMcp {
     #[allow(dead_code)]
     fn supports_dispatch_filter(&self) -> bool;
     /// Translate a normalized fleet MCP server map into provider-native dispatch
-    /// args. Currently unused: the fleet client is daemon-only (§7), so MCP
-    /// injection moved to the daemon; kept for daemon-side wiring of fleet.json
-    /// `mcpServers` into `/control/exec`.
-    #[allow(dead_code)]
+    /// args. Reached at dispatch spawn via [`fleet_mcp_args`]: the daemon
+    /// resolves fleet.json `mcpServers` and injects them as harness CLI argv
+    /// (`--mcp-config`), keeping the wire form on the harness's own CLI
+    /// contract (§7) rather than an in-process struct back-channel.
     fn build_fleet_mcp_args(&self, servers: &BTreeMap<String, mcp::McpServerConfig>)
     -> Vec<String>;
 }
@@ -160,7 +160,6 @@ impl ProviderMcp for Provider {
     /// the bro-harness providers) is implemented; everything else returns empty
     /// (no per-dispatch MCP-injection seam in its CLI yet). When a future
     /// provider grows one, it slots in here against the same input map.
-    #[allow(dead_code)]
     fn build_fleet_mcp_args(
         &self,
         servers: &BTreeMap<String, mcp::McpServerConfig>,
@@ -186,7 +185,6 @@ impl ProviderMcp for Provider {
 /// concrete strings here — the wire form the CLIs expect. A server whose secret
 /// can't resolve is skipped with a warning rather than failing the whole
 /// dispatch; the rest still load.
-#[allow(dead_code)] // only reached via build_fleet_mcp_args — see its note (§7)
 pub fn fleet_mcp_config_json(servers: &BTreeMap<String, mcp::McpServerConfig>) -> String {
     use mcp::McpServerConfig as C;
     let mut map = serde_json::Map::new();
@@ -231,13 +229,47 @@ pub fn fleet_mcp_config_json(servers: &BTreeMap<String, mcp::McpServerConfig>) -
     serde_json::json!({ "mcpServers": Value::Object(map) }).to_string()
 }
 
-#[allow(dead_code)] // only reached via fleet_mcp_config_json (§7)
 fn to_json_object(m: &BTreeMap<String, String>) -> Value {
     Value::Object(
         m.iter()
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
             .collect(),
     )
+}
+
+/// Fleet MCP injection for one dispatch: convert fleet.json's client-local
+/// server map and translate it to the provider's dispatch args
+/// (`--mcp-config <json>` for the harness providers). Empty map → no args.
+pub fn fleet_mcp_args(
+    provider: Provider,
+    servers: &BTreeMap<String, bro_fleet_client::McpServerConfig>,
+) -> Vec<String> {
+    if servers.is_empty() {
+        return Vec::new();
+    }
+    provider.build_fleet_mcp_args(&daemon_servers_from_fleet(servers))
+}
+
+/// Convert the client-local fleet.json MCP server map (header/env values kept
+/// as opaque JSON by the thin client, which never resolves secrets) into the
+/// daemon shape (`SecretString`-typed). The serde wire forms mirror by design
+/// (`type`-tagged, lowercase; plain string or `{"$secret": ENV}` values), so
+/// conversion is a JSON round-trip; a server that doesn't fit the daemon
+/// shape is skipped with a warning rather than failing the dispatch.
+fn daemon_servers_from_fleet(
+    servers: &BTreeMap<String, bro_fleet_client::McpServerConfig>,
+) -> BTreeMap<String, mcp::McpServerConfig> {
+    let mut out = BTreeMap::new();
+    for (name, cfg) in servers {
+        match serde_json::to_value(cfg).and_then(serde_json::from_value) {
+            Ok(converted) => {
+                out.insert(name.clone(), converted);
+            }
+            Err(e) => tracing::warn!(server = %name,
+                "fleet MCP: skipping server (client\u{2192}daemon shape mismatch): {e:#}"),
+        }
+    }
+    out
 }
 
 fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {

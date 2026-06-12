@@ -457,6 +457,41 @@ fn fleet_mcp_config_json_resolves_secret_headers_and_stdio() {
 }
 
 #[test]
+fn fleet_mcp_args_converts_client_local_map() {
+    let _guard = crate::util::test_env_lock();
+    unsafe { std::env::set_var("FLEET_TEST_CLIENT_TOKEN", "tok-123") };
+
+    // The client-local fleet.json shape: secret values are opaque JSON the
+    // thin client never resolves; the daemon-side conversion must carry the
+    // `$secret` ref through to injection-time resolution.
+    let parsed: std::collections::BTreeMap<String, bro_fleet_client::McpServerConfig> =
+        serde_json::from_value(serde_json::json!({
+            "tmux": {
+                "type": "stdio",
+                "command": "tmux-mcp",
+                "args": ["--socket", "fleet"],
+                "env": {"TMUX_MCP_TOKEN": {"$secret": "FLEET_TEST_CLIENT_TOKEN"}}
+            },
+            "ctx": {
+                "type": "http",
+                "url": "https://ctx.example/mcp",
+                "headers": {"X-Plain": "v"}
+            }
+        }))
+        .unwrap();
+
+    let args = fleet_mcp_args(Provider::Glm, &parsed);
+    assert_eq!(args[0], "--mcp-config");
+    let value: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+    assert_eq!(value["mcpServers"]["tmux"]["type"], "stdio");
+    assert_eq!(value["mcpServers"]["tmux"]["command"], "tmux-mcp");
+    assert_eq!(value["mcpServers"]["tmux"]["env"]["TMUX_MCP_TOKEN"], "tok-123");
+    assert_eq!(value["mcpServers"]["ctx"]["headers"]["X-Plain"], "v");
+
+    assert!(fleet_mcp_args(Provider::Glm, &Default::default()).is_empty());
+}
+
+#[test]
 fn resolve_bin_passes_through_paths_with_separators() {
     assert_eq!(
         resolve_bin("/usr/local/bin/bro-harness").as_deref(),

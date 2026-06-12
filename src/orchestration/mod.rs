@@ -2663,6 +2663,25 @@ fn project_dispatch_shell_env(
     (!env.is_empty()).then_some(env)
 }
 
+/// Resolve fleet.json `mcpServers` into provider dispatch args for one
+/// dispatch. Cockpit-origin only, by policy: operator MCP servers (whose
+/// `$secret` refs resolve at injection) reach the agents the operator
+/// live-drives from the cockpit — never automation origins
+/// (workflow/atom/cron/webhook), which keep their restricted tool surfaces.
+///
+/// The injection rides the harness CLI argv (`--mcp-config`), so the same
+/// args would drive a standalone `bro-harness` subprocess unchanged — the
+/// daemon never reaches into the harness `McpConfig` directly
+/// (harness-daemon-boundary.md §7). Best-effort like the dispatch env: a
+/// missing/malformed fleet.json injects nothing.
+fn fleet_mcp_dispatch_args(provider: Provider, origin: bro_core::Origin) -> Vec<String> {
+    if origin != bro_core::Origin::Cockpit {
+        return Vec::new();
+    }
+    let cfg = bro_fleet_client::FleetConfig::load();
+    providers::fleet_mcp_args(provider, &cfg.mcp_servers)
+}
+
 /// Resolve the worktree-confinement pin target for a dispatch cwd: the
 /// canonical worktree root when `cwd` lies inside a daemon-managed worktree,
 /// `None` otherwise (plain repos and non-repo dirs never pin).
@@ -2773,6 +2792,13 @@ pub fn spawn_task_with_tool_placement(
     // process env below. Resolved here so every dispatch path — bro_exec,
     // agent dispatch, workflows, cockpit — behaves identically.
     let dispatch_shell_env = project_dispatch_shell_env(cwd.as_deref());
+    // Cockpit dispatches additionally carry the operator's fleet.json
+    // `mcpServers`, injected as `--mcp-config` argv that
+    // build_in_process_mcp_config consumes at spawn (and that a future
+    // standalone harness subprocess would parse itself) — see
+    // fleet_mcp_dispatch_args for the origin policy.
+    let mut args = args;
+    args.extend(fleet_mcp_dispatch_args(provider, origin));
     if matches!(
         provider,
         Provider::Glm
@@ -4889,6 +4915,61 @@ mod tests {
                 .tool_placement
                 .contains_key("mcp__external__ignored_json_source")
         );
+    }
+
+    #[test]
+    fn fleet_mcp_dispatch_args_is_cockpit_only() {
+        // The gate must short-circuit BEFORE any fleet.json read: automation
+        // origins inject nothing regardless of operator config (and the test
+        // stays isolated from the host's real fleet.json).
+        use bro_core::Origin;
+        for origin in [
+            Origin::Unknown,
+            Origin::AgentDispatch,
+            Origin::Workflow,
+            Origin::Atom,
+            Origin::Cron,
+            Origin::Webhook,
+        ] {
+            assert!(
+                fleet_mcp_dispatch_args(Provider::Glm, origin).is_empty(),
+                "{origin} must not receive fleet MCP servers"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_mcp_dispatch_args_cockpit_injects_fleet_servers() {
+        // Cockpit origin end-to-end: fleet.json beside the selected config
+        // (BLACKBOX_CONFIG keys the lookup, keeping the test off the host's
+        // real config) lands in the dispatch argv as `--mcp-config`, and
+        // build_in_process_mcp_config merges it with the transient blackbox
+        // server — the same consumption the spawn path runs.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        std::fs::write(
+            dir.path().join("fleet.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "tmux": {"type": "stdio", "command": "tmux-mcp"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", config_path.to_str().unwrap());
+        env.set("BLACKBOX_MCP_URL", "http://127.0.0.1:7264/mcp");
+        env.set("BLACKBOX_MCP_NAME", "selfbox");
+
+        let mut args = fleet_mcp_dispatch_args(Provider::Glm, bro_core::Origin::Cockpit);
+        assert_eq!(args[0], "--mcp-config");
+
+        let config = build_in_process_mcp_config(&mut args, None).unwrap().unwrap();
+        assert!(args.is_empty(), "--mcp-config consumed from argv");
+        assert!(config.servers.iter().any(|s| s.name() == "tmux"));
+        assert!(config.servers.iter().any(|s| s.name() == "selfbox"));
     }
 
     #[test]

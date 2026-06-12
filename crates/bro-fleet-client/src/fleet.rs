@@ -39,9 +39,11 @@ pub use bro_protocol::{
 /// the daemon plus per-project indexing, inappropriate for the cockpit.
 ///
 /// `mcpServers` / `pinTools` are parsed and round-tripped but not interpreted by
-/// the client: since 1b the daemon owns MCP/tool injection, so these are kept so
-/// a user's `fleet.json` survives a config-panel save and can later be forwarded
-/// to `/control/exec`.
+/// the client: since 1b the daemon owns MCP/tool injection. The daemon reads
+/// this same file at dispatch spawn and injects `mcpServers` into
+/// cockpit-origin harness dispatches as `--mcp-config` argv (blackbox
+/// `fleet_mcp_dispatch_args`); the client's only job is to make sure a user's
+/// `fleet.json` survives a config-panel save.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FleetConfig {
     #[serde(default, rename = "mcpServers")]
