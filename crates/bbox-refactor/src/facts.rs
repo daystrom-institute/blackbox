@@ -186,6 +186,33 @@ pub fn file_query(
     })
 }
 
+/// Byte range of the `name` identifier of the item at (or enclosing) the
+/// given byte range — e.g. the `spawn_worker` of `pub fn spawn_worker(...)`.
+/// Lets position-sensitive consumers (LSP rename) accept whole-item spans:
+/// aiming at an item's `byte_start` hits the `pub` keyword, which
+/// rust-analyzer refuses with "No references found at position".
+pub fn name_span(path: &Path, byte_start: usize, byte_end: usize) -> Result<Option<(usize, usize)>> {
+    let parsed = super::parse_source_file(path)?;
+    let len = parsed.source.len();
+    let (start, end) = (byte_start.min(len), byte_end.min(len).max(byte_start.min(len)));
+    let mut node = match parsed.tree.root_node().named_descendant_for_byte_range(start, end) {
+        Some(node) => node,
+        None => return Ok(None),
+    };
+    loop {
+        if node.kind() == "identifier" {
+            return Ok(Some((node.start_byte(), node.end_byte())));
+        }
+        if let Some(name) = node.child_by_field_name("name") {
+            return Ok(Some((name.start_byte(), name.end_byte())));
+        }
+        match node.parent() {
+            Some(parent) => node = parent,
+            None => return Ok(None),
+        }
+    }
+}
+
 /// Parse health of one source file.
 #[derive(Debug, Clone)]
 pub struct ParseCheckFacts {

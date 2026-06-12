@@ -179,7 +179,7 @@ impl Tool for LspRename {
         "lsp.rename"
     }
     fn description(&self) -> &str {
-        "Rename the symbol at a hash-anchored Span's start across the workspace via the language server (rust-analyzer; Rust only for now; warms on first use). Returns server-authored changes as hash-anchored {span, new_text} entries — feed them to edits.merge, then edits.apply. Fails closed when the server is unavailable (never downgrades to text matching). Errors with stale_span if the file changed since the Span was minted."
+        "Rename the symbol a hash-anchored Span points at, across the workspace, via the language server (rust-analyzer; Rust only for now; warms on first use). Whole-item spans are fine — the binding snaps to the item's name identifier automatically. Returns server-authored changes as hash-anchored {span, new_text} entries — feed them to edits.merge, then edits.apply. Fails closed when the server is unavailable (never downgrades to text matching). Errors with stale_span if the file changed since the Span was minted."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -236,7 +236,27 @@ impl Tool for LspRename {
             Ok(d) => d,
             Err(e) => return err(format!("lsp.rename: {e}")),
         };
-        let position = byte_to_position(&source, span.byte_start);
+        // Snap to the item's name identifier: a whole-item span starts at
+        // `pub`/`fn`, which the server refuses with "No references found at
+        // position" (probe-lsp-1 burned cells on exactly this).
+        let aim = {
+            let abs = abs.clone();
+            let (start, end) = (span.byte_start, span.byte_end);
+            bro_tools::tool::call_blocking(move || {
+                let snapped = bbox_refactor::facts::name_span(&abs, start, end)
+                    .ok()
+                    .flatten()
+                    .map(|(name_start, _)| name_start)
+                    .unwrap_or(start);
+                ToolResult::Json(json!(snapped))
+            })
+            .await
+        };
+        let aim_byte = match aim {
+            ToolResult::Json(v) => v.as_u64().map(|b| b as usize).unwrap_or(span.byte_start),
+            _ => span.byte_start,
+        };
+        let position = byte_to_position(&source, aim_byte);
         let edit = match self.0.pool.rename(&doc, position, &params.new_name).await {
             Ok(e) => e,
             Err(e) => return err(format!("lsp.rename: {}", render_lsp_error(e))),
@@ -353,7 +373,7 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
             .to_string(),
         declarations: r#"type SpanChange = { span: Span; new_text: string };
 declare const lsp: {
-  /** Workspace-wide rename of the symbol at span's start. Returns hash-anchored server-authored changes for edits.merge. Fails closed if rust-analyzer is unavailable; stale_span on content drift. */
+  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Returns hash-anchored server-authored changes for edits.merge. Fails closed if rust-analyzer is unavailable; stale_span on content drift. */
   rename(args: { span: Span; newName: string }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; authority: "lsp"; language: string }>;
 };"#
             .to_string(),

@@ -142,6 +142,16 @@ pub(super) fn store_callback(
             return;
         }
     };
+    // Local addition (not vendored): a one-argument store() is almost always
+    // a read intended for load(key); the serializer's bare error for the
+    // missing value cost a probe cell to diagnose.
+    if args.length() < 2 {
+        throw_type_error(
+            scope,
+            &format!("store(key, value) takes 2 arguments — to read the stored value use load({key:?})"),
+        );
+        return;
+    }
     let value = args.get(1);
     let serialized = match v8_value_to_json(scope, value) {
         Ok(Some(value)) => value,
