@@ -10,29 +10,33 @@ pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Instance identity: `<prefix>-<8hex>-<8hex>`, where the prefix is the
+/// consumer's id prefix (e.g. `bg` for Badgey). Parsing accepts any consumer
+/// prefix; consumers enforce their own prefix via
+/// `ConsumerDescriptor::parse_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConsultantId(String);
 
 impl ConsultantId {
-    pub fn new() -> Self {
+    pub fn generate(prefix: &str) -> Self {
+        debug_assert!(
+            !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_lowercase()),
+            "consultant id prefix must be non-empty ascii lowercase"
+        );
         let raw = Uuid::new_v4().simple().to_string();
-        Self(format!("bg-{}-{}", &raw[..8], &raw[8..16]))
+        Self(format!("{prefix}-{}-{}", &raw[..8], &raw[8..16]))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
 
-impl Default for ConsultantId {
-    fn default() -> Self {
-        Self::new()
+    /// The consumer id prefix (the segment before the first `-`).
+    pub fn prefix(&self) -> &str {
+        self.0.split('-').next().unwrap_or("")
     }
 }
 
-// Error/display text below intentionally keeps the legacy "badgey" wording
-// until the consumer-descriptor phase parameterizes id prefix and wording
-// per consumer (see design/orchestration/agents/consultant-runtime.md §5).
 impl fmt::Display for ConsultantId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -45,14 +49,15 @@ impl FromStr for ConsultantId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let parts: Vec<_> = value.split('-').collect();
         if parts.len() != 3
-            || parts[0] != "bg"
+            || parts[0].is_empty()
+            || !parts[0].chars().all(|c| c.is_ascii_alphabetic())
             || parts[1].len() != 8
             || parts[2].len() != 8
             || !parts[1].chars().all(|c| c.is_ascii_hexdigit())
             || !parts[2].chars().all(|c| c.is_ascii_hexdigit())
         {
             return Err(format!(
-                "invalid badgey id '{value}', expected bg-<8hex>-<8hex>"
+                "invalid consultant id '{value}', expected <prefix>-<8hex>-<8hex>"
             ));
         }
         Ok(Self(value.to_ascii_lowercase()))
@@ -83,18 +88,6 @@ pub struct ConsultantScope {
     pub project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_brief: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProposalKind {
-    Workflow,
-    Packet,
-    Brofile,
-    Lens,
-    Agent,
-    RedispatchTask,
-    ArtifactPromotion,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,7 +129,10 @@ pub struct ProposalEvent {
 pub struct ConsultantProposal {
     pub id: String,
     pub instance_id: ConsultantId,
-    pub kind: ProposalKind,
+    /// Consumer-vocabulary proposal kind (serde snake_case string, e.g.
+    /// "packet" or "redispatch_task"). The store is vocabulary-agnostic;
+    /// consumers validate against their descriptor before writing.
+    pub kind: String,
     pub state: ProposalState,
     pub draft: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,7 +149,7 @@ impl ConsultantProposal {
     pub fn new(
         id: String,
         instance_id: ConsultantId,
-        kind: ProposalKind,
+        kind: String,
         draft: Value,
         idempotency_key: Option<String>,
     ) -> Self {
@@ -330,8 +326,8 @@ mod tests {
         let proposal = ConsultantProposal::new(
             "P-1".to_string(),
             ConsultantId::from_str("bg-3f7a91c4-91ff04cc").unwrap(),
-            ProposalKind::Agent,
-            serde_json::json!({"name": "badgey"}),
+            "agent".to_string(),
+            serde_json::json!({"name": "consultant"}),
             Some("idem-1".to_string()),
         );
         let raw = serde_json::to_string(&proposal).unwrap();

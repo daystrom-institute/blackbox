@@ -9,8 +9,12 @@
 
 pub mod commands;
 pub mod events;
+pub mod vocabulary;
+
+pub use vocabulary::descriptor;
 
 pub mod types {
+    pub use super::vocabulary::ProposalKind;
     pub use crate::orchestration::consultant::types::*;
     pub use crate::orchestration::consultant::types::{
         ConsultantId as BadgeyId, ConsultantScope as BadgeyScope,

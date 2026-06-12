@@ -302,7 +302,7 @@ impl orchestration::agents::adapter::AgentDispatchAdapter for BadgeyAgentAdapter
                     },
                     task_id,
                 },
-                resolved_brofile: Some("badgey-persona".to_string()),
+                resolved_brofile: Some(orchestration::badgey::descriptor().brofile_ref.to_string()),
                 merged_filters,
                 degraded,
             })

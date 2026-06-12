@@ -145,7 +145,8 @@ impl BlackboxServer {
             return Self::err_text(&err);
         }
         let prompt = format!(
-            "Scout mode. Use scout_id={scout_id}. Author wrapper-mediated sub-bro charters for this question and emit bg-action-spawn-subbro notes with this scout_id as needed.\n\nCharter: {}",
+            "Scout mode. Use scout_id={scout_id}. Author wrapper-mediated sub-bro charters for this question and emit {} notes with this scout_id as needed.\n\nCharter: {}",
+            orchestration::badgey::descriptor().action_note_kind("spawn-subbro"),
             p.charter
         );
         match self
@@ -800,7 +801,7 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert_eq!(
             proposals[0].kind,
-            orchestration::badgey::types::ProposalKind::Agent
+            orchestration::badgey::types::ProposalKind::Agent.as_str()
         );
         assert!(matches!(
             server
@@ -919,7 +920,7 @@ mod tests {
             .consultant_proposals
             .create(
                 &id,
-                orchestration::badgey::types::ProposalKind::Brofile,
+                orchestration::badgey::types::ProposalKind::Brofile.as_str(),
                 serde_json::json!({"source": draft_path.to_string_lossy()}),
                 None,
             )
@@ -929,7 +930,7 @@ mod tests {
             .consultant_proposals
             .create(
                 &id,
-                orchestration::badgey::types::ProposalKind::Agent,
+                orchestration::badgey::types::ProposalKind::Agent.as_str(),
                 serde_json::json!({"source": "not-used.json"}),
                 None,
             )
@@ -1270,7 +1271,7 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert_eq!(
             proposals[0].kind,
-            orchestration::badgey::types::ProposalKind::RedispatchTask
+            orchestration::badgey::types::ProposalKind::RedispatchTask.as_str()
         );
         assert_eq!(
             proposals[0].idempotency_key.as_deref(),
@@ -1298,7 +1299,7 @@ mod tests {
             .consultant_proposals
             .create(
                 &id,
-                orchestration::badgey::types::ProposalKind::RedispatchTask,
+                orchestration::badgey::types::ProposalKind::RedispatchTask.as_str(),
                 serde_json::json!({"prompt": "retry"}),
                 Some("redispatch-task-1".to_string()),
             )

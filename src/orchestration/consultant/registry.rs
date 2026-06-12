@@ -58,15 +58,13 @@ pub enum RegistryError {
     QueueRejected { id: ConsultantId, err: QueueError },
 }
 
-// Error text intentionally keeps the legacy "badgey" wording until the
-// consumer-descriptor phase parameterizes per-consumer wording.
 impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound { id } => write!(f, "badgey instance not found: {id}"),
-            Self::AlreadyExists { id } => write!(f, "badgey instance already exists: {id}"),
-            Self::Dismissed { id } => write!(f, "badgey instance dismissed: {id}"),
-            Self::QueueRejected { id, err } => write!(f, "badgey instance {id}: {err}"),
+            Self::NotFound { id } => write!(f, "consultant instance not found: {id}"),
+            Self::AlreadyExists { id } => write!(f, "consultant instance already exists: {id}"),
+            Self::Dismissed { id } => write!(f, "consultant instance dismissed: {id}"),
+            Self::QueueRejected { id, err } => write!(f, "consultant instance {id}: {err}"),
         }
     }
 }

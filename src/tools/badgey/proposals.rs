@@ -30,16 +30,17 @@ impl BlackboxServer {
             "artifact_promotion" => "artifact_promotion",
             other => return Err(format!("unknown proposal kind: {other}")),
         };
-        serde_json::from_value(Value::String(normalized.to_string()))
+        normalized
+            .parse()
             .map_err(|e| format!("invalid proposal kind {raw}: {e}"))
     }
 
     pub(crate) fn badgey_artifact_kind_for_proposal(
         &self,
-        kind: orchestration::badgey::types::ProposalKind,
+        kind: &str,
     ) -> Option<artifacts::ArtifactKind> {
         use orchestration::badgey::types::ProposalKind;
-        match kind {
+        match kind.parse::<ProposalKind>().ok()? {
             ProposalKind::Workflow => Some(artifacts::ArtifactKind::Workflow),
             ProposalKind::Packet => Some(artifacts::ArtifactKind::Packet),
             ProposalKind::Brofile | ProposalKind::Lens => Some(artifacts::ArtifactKind::Brofile),
@@ -292,13 +293,7 @@ impl BlackboxServer {
                     body.get("event")
                         .and_then(Value::as_str)
                         .is_some_and(|event| {
-                            matches!(
-                                event,
-                                "bg-action-spawn-subbro"
-                                    | "bg-action-emit-proposal"
-                                    | "bg-action-escalate-dispute"
-                                    | "bg-action-extend-budget"
-                            )
+                            orchestration::badgey::descriptor().is_action_kind(event)
                         })
                 })
                 .collect()
@@ -324,8 +319,8 @@ impl BlackboxServer {
         let event = body
             .get("event")
             .and_then(Value::as_str)
-            .unwrap_or("bg-action-invalid")
-            .to_string();
+            .map(String::from)
+            .unwrap_or_else(|| orchestration::badgey::descriptor().action_note_kind("invalid"));
         let action_id_raw = body
             .get("action_id")
             .and_then(Value::as_str)
@@ -353,7 +348,7 @@ impl BlackboxServer {
         self.badgey_action_result_note(
             instance,
             &action_id_raw,
-            "bg-action-failed",
+            &orchestration::badgey::descriptor().action_note_kind("failed"),
             payload.clone(),
         )?;
         Ok(json!({
@@ -502,7 +497,7 @@ impl BlackboxServer {
                 let proposal = self
                     .state
                     .consultant_proposals
-                    .create(&instance.id, kind, draft.clone(), idempotency_key)
+                    .create(&instance.id, kind.as_str(), draft.clone(), idempotency_key)
                     .map_err(|e| format!("creating badgey proposal: {e}"))?;
                 self.badgey_write_event(
                     instance,
@@ -546,7 +541,7 @@ impl BlackboxServer {
                 completion_from = dispatching.clone();
                 if let Err(err) = self.badgey_spawn_privileged_task(
                     &task_id,
-                    "badgey-scout-persona",
+                    orchestration::badgey::descriptor().scout_brofile_ref,
                     charter,
                     &instance.scope.project_id,
                     Some(instance.thread_of_record_id.as_str()),
@@ -612,7 +607,7 @@ impl BlackboxServer {
         self.badgey_action_result_note(
             instance,
             action_id_raw,
-            "bg-action-completed",
+            &orchestration::badgey::descriptor().action_note_kind("completed"),
             dispatch_result.clone(),
         )?;
         let mut result = dispatch_result;
@@ -765,7 +760,7 @@ impl BlackboxServer {
             .map_err(|e| format!("transitioning proposal to applying: {e}"))?;
 
         let apply_result = async {
-            if let Some(kind) = self.badgey_artifact_kind_for_proposal(applying.kind) {
+            if let Some(kind) = self.badgey_artifact_kind_for_proposal(&applying.kind) {
                 let source = applying
                     .draft
                     .get("source")
@@ -803,7 +798,7 @@ impl BlackboxServer {
                     "artifact_ref": format!("{:?}:{}@{}", kind, metadata.name, metadata.version),
                     "metadata": metadata,
                 }))
-            } else if applying.kind == ProposalKind::RedispatchTask {
+            } else if applying.kind == ProposalKind::RedispatchTask.as_str() {
                 // Accept the canonical fields plus Badgey's natural
                 // emission shape: synthesis charters describe the
                 // human-readable action under `proposal`, which is
@@ -837,7 +832,7 @@ impl BlackboxServer {
                     .map_err(|e| format!("recording redispatch task id: {e}"))?;
                 self.badgey_spawn_privileged_task(
                     &task_id,
-                    "badgey-persona",
+                    orchestration::badgey::descriptor().brofile_ref,
                     prompt,
                     &instance.scope.project_id,
                     Some(instance.thread_of_record_id.as_str()),
@@ -1086,7 +1081,7 @@ impl BlackboxServer {
             )
             .map_err(|e| format!("transitioning proposal to applying: {e}"))?;
 
-        if applying.kind == ProposalKind::RedispatchTask {
+        if applying.kind == ProposalKind::RedispatchTask.as_str() {
             let prompt = applying
                 .draft
                 .get("prompt")
@@ -1123,7 +1118,7 @@ impl BlackboxServer {
                 "proposal_id": proposal_id,
                 "project_dir": instance.scope.project_id,
                 "thread_id": instance.thread_of_record_id,
-                "brofile": "badgey-persona",
+                "brofile": orchestration::badgey::descriptor().brofile_ref,
                 "label": "badgey-redispatch",
                 "idempotency_key": applying.idempotency_key,
                 "summary": format!("dispatching task `{task_id}`..."),
@@ -1134,7 +1129,11 @@ impl BlackboxServer {
         // the proposal kind itself for direct kinds (workflow / packet /
         // brofile / lens / agent), or from draft.artifact_kind for
         // generic ArtifactPromotion proposals.
-        let artifact_kind_str = match applying.kind {
+        let parsed_kind = applying
+            .kind
+            .parse::<ProposalKind>()
+            .map_err(|e| format!("stored proposal has unparseable kind: {e}"))?;
+        let artifact_kind_str = match parsed_kind {
             ProposalKind::Workflow => "workflow",
             ProposalKind::Packet => "packet",
             ProposalKind::Brofile | ProposalKind::Lens => "brofile",

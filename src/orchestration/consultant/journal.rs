@@ -278,14 +278,14 @@ mod tests {
         let first = journal
             .record_seen(
                 action_id.clone(),
-                "bg-action-emit-proposal".to_string(),
+                "test-action-emit-proposal".to_string(),
                 serde_json::json!({"n": 1}),
             )
             .unwrap();
         let second = journal
             .record_seen(
                 action_id,
-                "bg-action-emit-proposal".to_string(),
+                "test-action-emit-proposal".to_string(),
                 serde_json::json!({"n": 2}),
             )
             .unwrap();
@@ -334,7 +334,7 @@ mod tests {
         journal
             .record_seen(
                 action_id.clone(),
-                "bg-action-emit-proposal".to_string(),
+                "test-action-emit-proposal".to_string(),
                 serde_json::json!({}),
             )
             .unwrap();
@@ -343,7 +343,7 @@ mod tests {
                 &action_id,
                 ActionJournalState::Seen,
                 ActionJournalState::Completed {
-                    result_ref: "proposal:bg-3f7a91c4-91ff04cc:P-1".to_string(),
+                    result_ref: "proposal:tc-3f7a91c4-91ff04cc:P-1".to_string(),
                 },
                 None,
             )

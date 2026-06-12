@@ -93,7 +93,7 @@ impl BlackboxServer {
                         event,
                         "scout_dispatched" | "subbro_spawned" | "scout_done" | "subbro_done"
                     )
-                    || event.starts_with("bg-action-spawn-subbro")
+                    || event.starts_with(orchestration::badgey::descriptor().action_note_kind("spawn-subbro").as_str())
             })
             .filter(|note| {
                 let body = serde_json::from_str::<Value>(&note.body).unwrap_or_else(
@@ -206,7 +206,7 @@ impl BlackboxServer {
                             .consultant_proposals
                             .create(
                                 &id,
-                                orchestration::badgey::types::ProposalKind::RedispatchTask,
+                                orchestration::badgey::types::ProposalKind::RedispatchTask.as_str(),
                                 json!({
                                     "task_id": uuid::Uuid::new_v4().to_string(),
                                     "prompt": format!(

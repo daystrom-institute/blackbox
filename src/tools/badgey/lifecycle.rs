@@ -16,8 +16,9 @@ impl BlackboxServer {
         &self,
         raw: &str,
     ) -> Result<orchestration::badgey::types::BadgeyId, String> {
-        raw.parse()
-            .map_err(|e: String| format!("error.bad_input(code=invalid_badgey_id): {e}"))
+        orchestration::badgey::descriptor()
+            .parse_id(raw)
+            .map_err(|e| format!("error.bad_input(code=invalid_badgey_id): {e}"))
     }
 
     pub(crate) fn badgey_thread_id_from_open_result(&self, result: &str) -> Result<String, String> {
@@ -138,7 +139,7 @@ impl BlackboxServer {
             brofile_filters,
             _coerce_workspace,
             brofile_context,
-        ) = self.resolve_exec_target(Some("badgey-persona"), None, Some(&scope.project_id))?;
+        ) = self.resolve_exec_target(Some(orchestration::badgey::descriptor().brofile_ref), None, Some(&scope.project_id))?;
         let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
             exec_opts,
             brofile_context.as_ref(),
@@ -155,12 +156,12 @@ impl BlackboxServer {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
             project_dir: cwd.clone(),
-            bro_name: Some("badgey-persona".to_string()),
+            bro_name: Some(orchestration::badgey::descriptor().brofile_ref.to_string()),
             thread_id: Some(thread_id.to_string()),
             work_item_id: Some(id.as_str().to_string()),
             pin_block: self.ambient_pin_block(
                 cwd.as_deref(),
-                Some("badgey-persona"),
+                Some(orchestration::badgey::descriptor().brofile_ref),
                 Some(session_id.as_str()),
                 Some(thread_id),
                 Some(id.as_str()),
@@ -254,7 +255,7 @@ impl BlackboxServer {
                     .map(|p| p.to_string_lossy().to_string())
             })
             .unwrap_or_default();
-        let id = orchestration::badgey::types::BadgeyId::new();
+        let id = orchestration::badgey::descriptor().generate_id();
         let scope = orchestration::badgey::types::BadgeyScope {
             project_id: project_id.clone(),
             initial_brief: brief.clone(),
@@ -349,7 +350,7 @@ impl BlackboxServer {
         self.badgey_write_event(
             &instance,
             orchestration::badgey::events::ThreadEvent::Exec {
-                brofile_version: "badgey-persona".to_string(),
+                brofile_version: orchestration::badgey::descriptor().brofile_ref.to_string(),
                 scope,
                 charter: brief.unwrap_or_else(|| "general consultation".to_string()),
                 provider,
@@ -364,7 +365,7 @@ impl BlackboxServer {
             "provider": provider,
             "thread_id": thread_id,
             "status": "running",
-            "resolved_brofile": "badgey-persona",
+            "resolved_brofile": orchestration::badgey::descriptor().brofile_ref,
             "merged_filters": merged_filters,
         }))
     }
@@ -452,12 +453,15 @@ impl BlackboxServer {
                     .consultant_proposals
                     .create(
                         &id,
-                        orchestration::badgey::types::ProposalKind::Brofile,
+                        orchestration::badgey::types::ProposalKind::Brofile.as_str(),
                         json!({
                             "action": "revert_brofile",
-                            "name": "badgey-persona",
+                            "name": orchestration::badgey::descriptor().brofile_ref,
                             "version": version,
-                            "source": format!("artifact:brofile:badgey-persona@{version}"),
+                            "source": format!(
+                                "artifact:brofile:{}@{version}",
+                                orchestration::badgey::descriptor().brofile_ref
+                            ),
                         }),
                         Some(format!("revert-brofile:{version}")),
                     )
@@ -466,7 +470,7 @@ impl BlackboxServer {
                     &instance,
                     orchestration::badgey::events::ThreadEvent::ProposalEmitted {
                         proposal_id: proposal.id.clone(),
-                        kind: proposal.kind,
+                        kind: orchestration::badgey::types::ProposalKind::Brofile,
                         draft_ref: format!("badgey-persona@{version}"),
                         state: proposal.state,
                     },
@@ -541,7 +545,7 @@ impl BlackboxServer {
             brofile_filters,
             _coerce_workspace,
             brofile_context,
-        ) = self.resolve_exec_target(Some("badgey-persona"), None, cwd.as_deref())?;
+        ) = self.resolve_exec_target(Some(orchestration::badgey::descriptor().brofile_ref), None, cwd.as_deref())?;
         // Resume must honor the policy the original badgey dispatch
         // was launched under, not whatever badgey-persona says today.
         // Look up the lease for this provider-session and prefer its
@@ -594,12 +598,12 @@ impl BlackboxServer {
             task_id: Some(task_id.clone()),
             session_id: Some(instance.provider_session_id.clone()),
             project_dir: cwd.clone(),
-            bro_name: Some("badgey-persona".to_string()),
+            bro_name: Some(orchestration::badgey::descriptor().brofile_ref.to_string()),
             thread_id: Some(instance.thread_of_record_id.clone()),
             work_item_id: Some(id.as_str().to_string()),
             pin_block: self.ambient_pin_block(
                 cwd.as_deref(),
-                Some("badgey-persona"),
+                Some(orchestration::badgey::descriptor().brofile_ref),
                 Some(instance.provider_session_id.as_str()),
                 Some(instance.thread_of_record_id.as_str()),
                 Some(id.as_str()),

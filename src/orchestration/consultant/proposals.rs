@@ -7,9 +7,7 @@ use fs2::FileExt;
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::types::{
-    ConsultantId, ConsultantProposal, ProposalEvent, ProposalKind, ProposalState, now_rfc3339,
-};
+use super::types::{ConsultantId, ConsultantProposal, ProposalEvent, ProposalState, now_rfc3339};
 
 #[derive(Debug)]
 pub enum ProposalStoreError {
@@ -37,14 +35,12 @@ pub enum ProposalStoreError {
     },
 }
 
-// Error text intentionally keeps the legacy "badgey" wording until the
-// consumer-descriptor phase parameterizes per-consumer wording.
 impl std::fmt::Display for ProposalStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Serde(e) => write!(f, "json error: {e}"),
-            Self::InvalidInstance(id) => write!(f, "invalid badgey instance id: {id}"),
+            Self::InvalidInstance(id) => write!(f, "invalid consultant instance id: {id}"),
             Self::InvalidProposalId(id) => write!(f, "invalid proposal id: {id}"),
             Self::NotFound {
                 instance_id,
@@ -110,7 +106,7 @@ impl ProposalStore {
     pub fn create(
         &self,
         instance_id: &ConsultantId,
-        kind: ProposalKind,
+        kind: &str,
         draft: serde_json::Value,
         idempotency_key: Option<String>,
     ) -> Result<ConsultantProposal> {
@@ -138,7 +134,7 @@ impl ProposalStore {
         let proposal = ConsultantProposal::new(
             id.clone(),
             instance_id.clone(),
-            kind,
+            kind.to_string(),
             draft,
             idempotency_key,
         );
@@ -369,10 +365,10 @@ mod tests {
         let a = instance();
         let b = ConsultantId::from_str("bg-11111111-22222222").unwrap();
         let pa = store
-            .create(&a, ProposalKind::Packet, serde_json::json!({"a": 1}), None)
+            .create(&a, "packet", serde_json::json!({"a": 1}), None)
             .unwrap();
         let pb = store
-            .create(&b, ProposalKind::Packet, serde_json::json!({"b": 1}), None)
+            .create(&b, "packet", serde_json::json!({"b": 1}), None)
             .unwrap();
         assert_eq!(pa.id, "P-1");
         assert_eq!(pb.id, "P-1");
@@ -386,7 +382,7 @@ mod tests {
         let first = store
             .create(
                 &id,
-                ProposalKind::Agent,
+                "agent",
                 serde_json::json!({"name": "a"}),
                 Some("idem".to_string()),
             )
@@ -394,7 +390,7 @@ mod tests {
         let second = store
             .create(
                 &id,
-                ProposalKind::Agent,
+                "agent",
                 serde_json::json!({"name": "a"}),
                 Some("idem".to_string()),
             )
@@ -411,7 +407,7 @@ mod tests {
         store
             .create(
                 &id,
-                ProposalKind::Agent,
+                "agent",
                 serde_json::json!({"name": "a"}),
                 Some("idem".to_string()),
             )
@@ -419,7 +415,7 @@ mod tests {
         let err = store
             .create(
                 &id,
-                ProposalKind::Agent,
+                "agent",
                 serde_json::json!({"name": "b"}),
                 Some("idem".to_string()),
             )
@@ -436,7 +432,7 @@ mod tests {
         let store = ProposalStore::new(tmp.path().to_path_buf()).unwrap();
         let id = instance();
         store
-            .create(&id, ProposalKind::Packet, serde_json::json!({"v": 1}), None)
+            .create(&id, "packet", serde_json::json!({"v": 1}), None)
             .unwrap();
         let dir = store.root().join(id.as_str());
         fs::write(
@@ -455,7 +451,7 @@ mod tests {
         let store = Arc::new(ProposalStore::new(tmp.path().to_path_buf()).unwrap());
         let id = instance();
         store
-            .create(&id, ProposalKind::Brofile, serde_json::json!({}), None)
+            .create(&id, "brofile", serde_json::json!({}), None)
             .unwrap();
 
         let a_store = store.clone();
@@ -496,10 +492,10 @@ mod tests {
         let store = ProposalStore::new(tmp.path().to_path_buf()).unwrap();
         let id = instance();
         store
-            .create(&id, ProposalKind::Packet, serde_json::json!({}), None)
+            .create(&id, "packet", serde_json::json!({}), None)
             .unwrap();
         store
-            .create(&id, ProposalKind::Agent, serde_json::json!({}), None)
+            .create(&id, "agent", serde_json::json!({}), None)
             .unwrap();
         store
             .transition(
