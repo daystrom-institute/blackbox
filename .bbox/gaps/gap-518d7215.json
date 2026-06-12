@@ -14,7 +14,9 @@
   "impact": "high",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "mcp_surface/thread-store/list-vs-resolve-inconsistency",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-12T05:53:27Z",
-  "updated_at": "2026-06-12T05:53:27Z"
+  "updated_at": "2026-06-12T17:12:14Z",
+  "resolved_at": "2026-06-12T17:12:14Z",
+  "resolution_note": "Investigated and re-scoped: the list/resolve divergence does not exist at the code level — bbox_thread_list and bbox_thread resolve/get read the same in-memory store, and no thread deletion path exists anywhere (store mutations are append/update-only; storage_gc does not touch threads), so within one daemon a listed id cannot be unresolvable moments later. The incident evidence (18 fixture threads from bbox-state-test in the listing; all 20 resolves failing including with explicit project params; threads later vanishing from the list too) is only consistent with the session's calls being served by two different daemons/stores — note the sibling gap from the same session documents that session straddling two dispatch transports. The explicit project params changed nothing because thread lookup is global by id; project never narrows it. Shipped in 7761988 (beta/blackbox-v2): not-found errors now state the global-by-id rule and carry a store-identity breadcrumb (store file path + thread count), and empty listings distinguish an empty store from filters-matched-none — so a recurrence will name the diverging store instead of presenting as an unexplainable lookup failure. Regression test: lookup_miss_and_empty_list_surface_store_identity."
 }

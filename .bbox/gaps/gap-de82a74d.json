@@ -18,7 +18,9 @@
   "dedupe_key": "mcp_surface/render/worktree-learn-render-rescope-mismatch",
   "suggested_owner": "blackbox",
   "notes": "Observed while adding a project-scoped rustfmt convention from /home/invidious/repos/transcript-search/.claude/worktrees/fleet-tui-tool-source-rendering. bbox_learn wrote .bbox/knowledge/daee9651.json in the worktree, but bbox_render rescoped the same worktree path to the registered base project for filtering and generated provider files without the new entry.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-12T04:17:10Z",
-  "updated_at": "2026-06-12T04:17:10Z"
+  "updated_at": "2026-06-12T17:11:56Z",
+  "resolved_at": "2026-06-12T17:11:56Z",
+  "resolution_note": "Fixed in 372fac2 (beta/blackbox-v2): bbox_learn/bbox_remember/bbox_decide adapters now resolve a worktree project through the shared write-scope resolver (src/tools/scope.rs, extracted from the gaps adapter) — the entry keys to the registered base so bbox_render/bbox_knowledge/inject filters match immediately, while the repo-owned .bbox/knowledge/<id>.json is redirected into the worktree checkout (transient redirect map on the Knowledge store mirroring gap notes' write_dir, with generation-purge protection for redirected ids). End-to-end regression test: tools::knowledge::tests::bbox_learn_from_worktree_keys_base_writes_worktree_and_renders reproduces the original learn-then-render asymmetry."
 }

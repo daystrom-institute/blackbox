@@ -13,7 +13,8 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/mcp-tool-dispatch/boolean-param-stringified",
+  "supersedes": "gap-c5f6d5f4",
   "resolution": "unresolved",
   "created_at": "2026-06-12T05:53:27Z",
-  "updated_at": "2026-06-12T05:53:27Z"
+  "updated_at": "2026-06-12T17:11:59Z"
 }
