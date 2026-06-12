@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use super::{ReindexConfig, project_files};
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
+use bbox_corpus_core::project_record::{
+    ProjectRecord, load_project_records, resolve_base_project_for_scope,
+};
 use bbox_edge_sidecar::edge_sidecar::Edge;
 use bro_transcript::{self as parser, ParsedEvent, ToolCallInfo, ToolCallKind};
 
@@ -16,6 +18,10 @@ pub struct ToolEdgeContext {
     projects: Vec<ProjectRecord>,
     edges_dir: PathBuf,
     emit_sidecars: bool,
+    /// Session-cwd → resolved base project id memo (gap-72fd5932). Distinct
+    /// cwds are few relative to session files, and resolution can git-probe,
+    /// so memoize per reindex pass.
+    base_project_cache: std::sync::Mutex<BTreeMap<String, Option<String>>>,
 }
 
 impl ToolEdgeContext {
@@ -26,6 +32,7 @@ impl ToolEdgeContext {
                 &config.projects_path,
             ),
             emit_sidecars,
+            base_project_cache: std::sync::Mutex::default(),
         })
     }
 
@@ -36,7 +43,28 @@ impl ToolEdgeContext {
             projects: vec![project],
             edges_dir,
             emit_sidecars: true,
+            base_project_cache: std::sync::Mutex::default(),
         }
+    }
+
+    /// Resolve a session cwd to the registered base project's id, memoized
+    /// across the pass (gap-72fd5932). `None` for empty cwds and paths no
+    /// registered project owns.
+    pub fn base_project_id_for_cwd(&self, cwd: &str) -> Option<String> {
+        if cwd.is_empty() {
+            return None;
+        }
+        let mut cache = self
+            .base_project_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = cache.get(cwd) {
+            return hit.clone();
+        }
+        let resolved = resolve_base_project_for_scope(cwd, &self.projects)
+            .map(|record| record.project_id.clone());
+        cache.insert(cwd.to_string(), resolved.clone());
+        resolved
     }
 
     pub fn emit_event_edges(
@@ -447,6 +475,7 @@ mod tests {
             projects: Vec::new(),
             edges_dir: dir.path().to_path_buf(),
             emit_sidecars: false,
+            base_project_cache: Default::default(),
         };
         let event = ParsedEvent {
             role: MessageRole::ToolUse,

@@ -63,6 +63,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
         registered_at: "2026-01-01T00:00:00Z".into(),
         is_git_repo: false,
         languages: BTreeSet::new(),
+        aliases: Default::default(),
     };
 
     let method_chunk = bbox_chunker::Chunk {

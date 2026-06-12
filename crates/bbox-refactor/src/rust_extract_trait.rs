@@ -820,6 +820,7 @@ mod tests {
             registered_at: "2026-05-07T00:00:00Z".to_string(),
             is_git_repo: false,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 

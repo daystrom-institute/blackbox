@@ -73,17 +73,33 @@ fn rescope_project_filter(
     p: &mut KnowledgeListParams,
     projects: &[crate::projects::ProjectRecord],
 ) {
-    let Some(raw) = p.project.as_deref().filter(|raw| raw.starts_with('/')) else {
+    let Some(raw) = p.project.as_deref() else {
         return;
     };
-    let Some((scope, checkout)) = crate::projects::resolve_scope_and_checkout_dir(raw, projects)
-    else {
-        return;
-    };
-    if checkout != scope {
-        p.project_alias = Some(checkout);
+    if raw.starts_with('/') {
+        // Path arm: worktree/subdir → registered base, worktree checkout
+        // recorded so entries written from inside it stay visible.
+        let Some(ctx) = crate::projects::resolve_project_context(
+            raw,
+            projects,
+            crate::projects::ResolveIntent::Read,
+        ) else {
+            return;
+        };
+        if let Some(checkout) = ctx.checkout {
+            p.project_alias = Some(checkout.checkout_dir);
+        }
+        p.project = Some(ctx.host_root);
+    } else if let Some(ctx) = crate::projects::resolve_project_context(
+        raw,
+        projects,
+        crate::projects::ResolveIntent::Read,
+    ) {
+        // Selector arm: a project_id or registered alias rewrites to the
+        // base canonical path (entries key by path). Non-matching values
+        // keep their substring-filter semantics untouched.
+        p.project = Some(ctx.host_root);
     }
-    p.project = Some(scope);
 }
 
 impl BlackboxServer {
@@ -675,6 +691,7 @@ mod tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -732,6 +749,33 @@ mod tests {
         rescope_project_filter(&mut p, &projects);
         assert_eq!(p.project.as_deref(), Some(stranger.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
+    }
+
+    #[test]
+    fn rescope_project_filter_accepts_alias_and_id_selectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let mut record = record_for(&base);
+        record.aliases = ["blackbox".to_string()].into();
+        let projects = vec![record];
+
+        // A registered alias rewrites to the base canonical path.
+        let mut p = KnowledgeListParams {
+            project: Some("blackbox".into()),
+            ..Default::default()
+        };
+        rescope_project_filter(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
+        assert_eq!(p.project_alias, None);
+
+        // A project_id selector rewrites the same way.
+        let mut p = KnowledgeListParams {
+            project: Some("feedbeef".into()),
+            ..Default::default()
+        };
+        rescope_project_filter(&mut p, &projects);
+        assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {

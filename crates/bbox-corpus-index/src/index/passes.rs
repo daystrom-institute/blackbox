@@ -321,6 +321,17 @@ pub fn index_adapter_location(
         }
     };
 
+    // Resolve the session's base project once per file (gap-72fd5932): the
+    // registered project owning the session cwd, including any worktree of
+    // it. Stamped on every doc so a base-project filter matches work from
+    // all checkouts while `project` keeps the literal cwd.
+    let base_project_id = snapshot
+        .events
+        .iter()
+        .find_map(|event| event.cwd.as_deref())
+        .or((!project_fallback.is_empty()).then_some(project_fallback))
+        .and_then(|cwd| tool_edges.base_project_id_for_cwd(cwd));
+
     for event in &snapshot.events {
         let Some(parsed) = event.to_parsed_event() else {
             continue;
@@ -340,6 +351,7 @@ pub fn index_adapter_location(
             &path_str,
             location.is_subagent,
             project_fallback,
+            base_project_id.as_deref(),
             fields,
         ) else {
             continue;
@@ -352,6 +364,7 @@ pub fn index_adapter_location(
             &path_str,
             location.is_subagent,
             project_fallback,
+            base_project_id.as_deref(),
             fields,
         ) {
             writer.add_document(tool_doc)?;

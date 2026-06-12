@@ -7,7 +7,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 pub use bbox_corpus_core::language::Language;
-pub use bbox_corpus_core::project_record::ProjectRecord;
+pub use bbox_corpus_core::project_record::{CheckoutContext, ProjectContext, ProjectRecord};
 
 use bbox_corpus_core::entity_ref;
 use bbox_stores::store_persister::StoreSnapshot;
@@ -176,6 +176,7 @@ impl ProjectRegistry {
             registered_at: util::now_iso(),
             is_git_repo,
             languages,
+            aliases: BTreeSet::new(),
         };
         self.store.projects.push(record.clone());
         self.store
@@ -322,6 +323,9 @@ impl ProjectRegistry {
         {
             return Ok(Some(idx));
         }
+        if let Some(idx) = unique_alias_index(raw, &self.store.projects) {
+            return Ok(Some(idx));
+        }
         let path = PathBuf::from(raw);
         if path.is_absolute() {
             if let Ok(canonical) = canonical_project_path(&path) {
@@ -335,6 +339,65 @@ impl ProjectRegistry {
         }
         Ok(None)
     }
+
+    /// Replace `selector`'s materialized alias set with the repo-declared
+    /// one. Fail-closed: every declared alias must be well-formed and not
+    /// claimed by another registered project, otherwise nothing mutates.
+    /// Returns whether the record changed (caller persists on `true`).
+    pub fn sync_declared_aliases(
+        &mut self,
+        selector: &str,
+        declared: &BTreeSet<String>,
+    ) -> Result<bool> {
+        let idx = self
+            .resolve_project_index(selector)?
+            .with_context(|| format!("project not registered: {selector}"))?;
+        for alias in declared {
+            if !valid_alias(alias) {
+                anyhow::bail!(
+                    "invalid project alias `{alias}`: aliases must be non-empty, \
+                     without `/` or whitespace"
+                );
+            }
+            if let Some(owner) = self
+                .store
+                .projects
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .find(|(_, project)| project.aliases.contains(alias))
+            {
+                anyhow::bail!(
+                    "project alias `{alias}` already claimed by {} ({}); \
+                     conflicting aliases fail closed",
+                    owner.1.project_id,
+                    owner.1.canonical_path
+                );
+            }
+        }
+        let record = &mut self.store.projects[idx];
+        if record.aliases == *declared {
+            return Ok(false);
+        }
+        record.aliases = declared.clone();
+        Ok(true)
+    }
+}
+
+/// An alias resolves only when exactly one registered project claims it —
+/// ambiguity fails closed (registry sync enforces uniqueness, but a
+/// hand-edited store must not resolve arbitrarily).
+fn unique_alias_index(raw: &str, projects: &[ProjectRecord]) -> Option<usize> {
+    let mut matches = projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| project.aliases.contains(raw));
+    let (idx, _) = matches.next()?;
+    matches.next().is_none().then_some(idx)
+}
+
+fn valid_alias(alias: &str) -> bool {
+    !alias.is_empty() && !alias.contains('/') && !alias.chars().any(char::is_whitespace)
 }
 
 fn load_store(path: &Path) -> Result<ProjectStore> {
@@ -382,6 +445,7 @@ pub fn managed_fleet_worktree_project(
         registered_at: "fleet-managed".to_string(),
         is_git_repo: true,
         languages: base.languages.clone(),
+        aliases: BTreeSet::new(),
     })
 }
 
@@ -490,43 +554,12 @@ fn in_tree_linked_worktree_top(path: &Path, root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a caller-supplied filesystem path to the registered project that
-/// owns it, for project-scoped RETRIEVAL (index / graph / knowledge scope
-/// resolution). Acceptance, in order:
-///
-/// 1. the path is a registered root or a descendant of one → that record.
-///    Covers plain subdirectories AND in-tree worktrees (e.g.
-///    `.claude/worktrees/<name>` under the repo) — both scope to the root
-///    project for retrieval purposes.
-/// 2. the path is inside any git worktree whose common dir matches a
-///    registered project's → that record. Covers out-of-tree worktrees —
-///    fleet (`bro-fleet/*`), agent dispatch, workflow arcs — regardless of
-///    branch name or parent directory.
-///
-/// This is intentionally broader than [`resolve_managed_fleet_worktree`]:
-/// scope resolution here is read-only (which corpus do I query?), so aliasing
-/// an arbitrary user worktree of a registered repo to its base project is
-/// harmless and exactly what a caller scoping a query wants. Write-side
-/// aliasing (gaps/threads/slices/code_nav) keeps the conservative managed
-/// gate. Returns `None` for paths no registered project owns; callers keep
-/// their existing fallback (deterministic path-hash id, raw filter, etc.).
-pub fn resolve_base_project_for_scope<'a>(
-    path: &str,
-    projects: &'a [ProjectRecord],
-) -> Option<&'a ProjectRecord> {
-    let canonical = fs::canonicalize(path).ok()?;
-    if let Some(record) = projects.iter().find(|project| {
-        let root = Path::new(&project.canonical_path);
-        canonical == root || canonical.starts_with(root)
-    }) {
-        return Some(record);
-    }
-    let common = bbox_corpus_core::git::git_common_dir(&canonical)?;
-    projects.iter().find(|project| {
-        bbox_corpus_core::git::git_common_dir(Path::new(&project.canonical_path))
-            .is_some_and(|base_common| base_common == common)
-    })
-}
+// Read-side base-project resolution lives in bbox-corpus-core (next to
+// ProjectRecord) so index ingest passes below this crate can stamp docs
+// with it; re-exported here for the daemon-side callers. The write-side
+// aliasing gates (gaps/threads/slices/code_nav) stay with the conservative
+// [`resolve_managed_fleet_worktree`] in this module.
+pub use bbox_corpus_core::project_record::resolve_base_project_for_scope;
 
 /// For surfaces that both READ project-scoped state and WRITE files into the
 /// project directory (e.g. `bbox_render` scope=project): resolve a path to
@@ -570,6 +603,110 @@ pub fn resolve_scope_and_checkout_dir(
         base.canonical_path.clone(),
         checkout_dir.to_string_lossy().into_owned(),
     ))
+}
+
+/// How a [`resolve_project_context`] caller intends to use the resolution.
+/// Preserves the deliberate read/write asymmetry of the underlying gates
+/// instead of collapsing it: retrieval may alias broadly, writes must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveIntent {
+    /// Retrieval scope ("which corpus do I query?"). Uses the broad gate
+    /// ([`resolve_base_project_for_scope`]): descendants and ANY worktree of
+    /// a registered repo alias to the base project.
+    Read,
+    /// Write-side aliasing (where gap files, threads, slice edits land).
+    /// Uses the conservative managed gate ([`resolve_managed_fleet_worktree`]):
+    /// only managed worktrees (fleet/agent dispatch, in-tree linked) alias;
+    /// anything else resolves to `None` so callers keep their fail-closed
+    /// fallback.
+    Write,
+}
+
+/// Single entry point for project-selector resolution
+/// (design/corpus/agentic-corpus/project-taxonomy-standardization.md,
+/// §Resolution Order). Accepts, in order:
+///
+/// 1. an exact `project_id` or registered canonical path;
+/// 2. a registered alias (unique claim required — ambiguity fails closed);
+/// 3. an absolute path: a registered root, a descendant, or a worktree of a
+///    registered repo, gated by `intent`.
+///
+/// Returns `None` when no registered project owns the selector; callers keep
+/// their existing legacy fallback (deterministic path-hash id, raw filter
+/// pass-through, etc.). Existing resolvers (`ProjectRegistry::resolve`,
+/// `fleet_worktree_scope_and_dir`, `resolve_scope_and_checkout_dir`) are the
+/// gates this composes; consumers should migrate to this entry point rather
+/// than growing new bespoke chains.
+///
+/// Known write-side quirk, deliberately NOT codified here: the legacy write
+/// chain (`resolve_project_write_scope`) lets a plain subdirectory of a
+/// registered root fall through to canonicalize-pass-through, keying state
+/// under the subdirectory itself. Under `Write` intent this resolver returns
+/// the base for the root/exact matches and `None` for plain subdirectories,
+/// leaving that fallback decision explicit at the call site.
+pub fn resolve_project_context(
+    raw: &str,
+    projects: &[ProjectRecord],
+    intent: ResolveIntent,
+) -> Option<ProjectContext> {
+    // 1. Exact project_id or registered canonical path.
+    if let Some(record) = projects
+        .iter()
+        .find(|project| project.project_id == raw || project.canonical_path == raw)
+    {
+        return Some(base_context(record));
+    }
+    // 2. Registered alias.
+    if let Some(idx) = unique_alias_index(raw, projects) {
+        return Some(base_context(&projects[idx]));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+    match intent {
+        ResolveIntent::Read => {
+            let base = resolve_base_project_for_scope(raw, projects)?;
+            let (_, checkout_dir) = resolve_scope_and_checkout_dir(raw, projects)?;
+            let checkout = (checkout_dir != base.canonical_path).then(|| CheckoutContext {
+                managed: resolve_managed_fleet_worktree(Some(raw), projects).is_some(),
+                checkout_dir,
+            });
+            Some(ProjectContext {
+                checkout,
+                ..base_context(base)
+            })
+        }
+        ResolveIntent::Write => {
+            // A canonicalized form of a registered root still resolves.
+            if let Ok(canonical) = fs::canonicalize(path) {
+                if let Some(record) = projects
+                    .iter()
+                    .find(|project| Path::new(&project.canonical_path) == canonical)
+                {
+                    return Some(base_context(record));
+                }
+            }
+            let (base, worktree) = resolve_managed_fleet_worktree(Some(raw), projects)?;
+            Some(ProjectContext {
+                checkout: Some(CheckoutContext {
+                    checkout_dir: worktree.to_string_lossy().into_owned(),
+                    managed: true,
+                }),
+                ..base_context(base)
+            })
+        }
+    }
+}
+
+fn base_context(record: &ProjectRecord) -> ProjectContext {
+    ProjectContext {
+        project_id: record.project_id.clone(),
+        repo_id: record.repo_id.clone(),
+        aliases: record.aliases.clone(),
+        host_root: record.canonical_path.clone(),
+        checkout: None,
+    }
 }
 
 /// Walk a project root (capped at depth 4) collecting language
@@ -1012,6 +1149,163 @@ mod tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: true,
             languages: BTreeSet::new(),
+            aliases: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn declared_aliases_sync_resolve_and_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_a = tmp.path().join("repo-a");
+        let repo_b = tmp.path().join("repo-b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        let store_path = tmp.path().join("projects.json");
+        let mut registry = ProjectRegistry::open(&store_path).unwrap();
+        let rec_a = registry.register_path(&repo_a).unwrap();
+        let rec_b = registry.register_path(&repo_b).unwrap();
+
+        // Sync materializes and reports dirty; identical re-sync is clean.
+        let declared: BTreeSet<String> = ["blackbox".to_string()].into();
+        assert!(
+            registry
+                .sync_declared_aliases(&rec_a.project_id, &declared)
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .sync_declared_aliases(&rec_a.project_id, &declared)
+                .unwrap()
+        );
+
+        // Alias resolves through the registry like an id or path.
+        let hit = registry.resolve("blackbox").unwrap().expect("alias resolves");
+        assert_eq!(hit.project_id, rec_a.project_id);
+
+        // A conflicting claim from another project fails closed, mutating
+        // nothing.
+        let err = registry
+            .sync_declared_aliases(&rec_b.project_id, &declared)
+            .unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "{err:#}");
+        assert!(
+            registry
+                .resolve(&rec_b.project_id)
+                .unwrap()
+                .unwrap()
+                .aliases
+                .is_empty()
+        );
+
+        // Malformed aliases fail closed.
+        let bad: BTreeSet<String> = ["has space".to_string()].into();
+        assert!(registry.sync_declared_aliases(&rec_b.project_id, &bad).is_err());
+
+        // Alias resolves through resolve_project_context (both intents).
+        let records = registry.list();
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let ctx = resolve_project_context("blackbox", &records, intent)
+                .expect("alias should resolve to context");
+            assert_eq!(ctx.project_id, rec_a.project_id);
+            assert!(ctx.aliases.contains("blackbox"));
+            assert!(ctx.checkout.is_none());
+        }
+
+        // An ambiguous alias (possible only via hand-edited store) fails
+        // closed at resolution.
+        let mut forged = registry.list();
+        forged[1].aliases = declared.clone();
+        assert!(unique_alias_index("blackbox", &forged).is_none());
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            assert!(resolve_project_context("blackbox", &forged, intent).is_none());
+        }
+
+        // Sync removal: an emptied declaration clears the materialized set.
+        assert!(
+            registry
+                .sync_declared_aliases(&rec_a.project_id, &BTreeSet::new())
+                .unwrap()
+        );
+        assert!(registry.resolve("blackbox").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_project_context_honors_selector_forms_and_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let base_str = base_canon.to_str().unwrap();
+        let registered = vec![record_for(&base_canon, "base-project")];
+
+        // Selector form 1: exact project_id, both intents.
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let ctx = resolve_project_context("base-project", &registered, intent)
+                .expect("project_id should resolve");
+            assert_eq!(ctx.project_id, "base-project");
+            assert_eq!(ctx.host_root, base_str);
+            assert!(ctx.checkout.is_none());
+        }
+
+        // Selector form: registered canonical path.
+        let ctx = resolve_project_context(base_str, &registered, ResolveIntent::Write)
+            .expect("canonical path should resolve");
+        assert_eq!(ctx.project_id, "base-project");
+        assert!(ctx.checkout.is_none());
+
+        // Plain subdirectory: Read aliases to base with no checkout; Write
+        // stays unresolved (the legacy pass-through stays at the call site).
+        let subdir = base_canon.join("src");
+        fs::create_dir_all(&subdir).unwrap();
+        let sub_str = subdir.to_str().unwrap();
+        let ctx = resolve_project_context(sub_str, &registered, ResolveIntent::Read)
+            .expect("subdirectory should read-resolve to base");
+        assert_eq!(ctx.project_id, "base-project");
+        assert!(ctx.checkout.is_none());
+        assert!(resolve_project_context(sub_str, &registered, ResolveIntent::Write).is_none());
+
+        // Out-of-tree worktree on an arbitrary branch: Read resolves with an
+        // unmanaged checkout; Write refuses (fail-closed aliasing gate).
+        let wt = tmp.path().join("wt-arbitrary");
+        add_worktree(&base, "arc/anything", &wt);
+        let wt_canon = wt.canonicalize().unwrap();
+        let wt_str = wt_canon.to_str().unwrap();
+        let ctx = resolve_project_context(wt_str, &registered, ResolveIntent::Read)
+            .expect("arbitrary worktree should read-resolve to base");
+        assert_eq!(ctx.project_id, "base-project");
+        assert_eq!(ctx.host_root, base_str);
+        let checkout = ctx.checkout.expect("worktree input carries checkout");
+        assert_eq!(checkout.checkout_dir, wt_str);
+        assert!(!checkout.managed);
+        assert!(resolve_project_context(wt_str, &registered, ResolveIntent::Write).is_none());
+
+        // Managed fleet worktree (bro-fleet/* branch): both intents resolve,
+        // checkout marked managed.
+        let fleet = tmp.path().join("wt-fleet");
+        add_worktree(&base, "bro-fleet/task-1", &fleet);
+        let fleet_canon = fleet.canonicalize().unwrap();
+        let fleet_str = fleet_canon.to_str().unwrap();
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let ctx = resolve_project_context(fleet_str, &registered, intent)
+                .expect("managed fleet worktree should resolve");
+            assert_eq!(ctx.project_id, "base-project");
+            assert_eq!(ctx.host_root, base_str);
+            let checkout = ctx.checkout.expect("worktree input carries checkout");
+            assert_eq!(checkout.checkout_dir, fleet_str);
+            assert!(checkout.managed);
+        }
+
+        // Unrelated directory: nothing resolves; relative input: nothing.
+        let stranger = tmp.path().join("stranger");
+        fs::create_dir_all(&stranger).unwrap();
+        let stranger_str = stranger.canonicalize().unwrap();
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            assert!(
+                resolve_project_context(stranger_str.to_str().unwrap(), &registered, intent)
+                    .is_none()
+            );
+            assert!(resolve_project_context("not-a-project", &registered, intent).is_none());
         }
     }
 
@@ -1225,6 +1519,7 @@ mod tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: true,
             languages: BTreeSet::new(),
+            aliases: Default::default(),
         }];
 
         // Managed worktree → (base scope, worktree write-dir).

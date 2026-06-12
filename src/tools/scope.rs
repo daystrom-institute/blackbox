@@ -26,13 +26,12 @@ impl BlackboxServer {
     // spawn_blocking closures only, like the store mutations it scopes.
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn resolve_project_write_scope(&self, raw: &str) -> (String, Option<String>) {
-        if let Some((base, worktree)) =
-            crate::projects::fleet_worktree_scope_and_dir(raw, &self.state.projects.read().list())
-        {
-            return (base, Some(worktree));
-        }
-        if let Ok(Some(record)) = self.state.projects.read().resolve(raw) {
-            return (record.canonical_path, None);
+        if let Some(ctx) = crate::projects::resolve_project_context(
+            raw,
+            &self.state.projects.read().list(),
+            crate::projects::ResolveIntent::Write,
+        ) {
+            return (ctx.host_root, ctx.checkout.map(|c| c.checkout_dir));
         }
         let project = std::fs::canonicalize(raw)
             .map(|p| p.to_string_lossy().to_string())
@@ -46,8 +45,13 @@ impl BlackboxServer {
     /// value). Substring filters and other non-path values pass through
     /// untouched, preserving each store's existing match semantics.
     pub(crate) fn rescope_project_filter_value(&self, raw: &str) -> Option<String> {
-        crate::projects::fleet_worktree_scope_and_dir(raw, &self.state.projects.read().list())
-            .map(|(base, _worktree)| base)
+        crate::projects::resolve_project_context(
+            raw,
+            &self.state.projects.read().list(),
+            crate::projects::ResolveIntent::Write,
+        )
+        .filter(|ctx| ctx.checkout.is_some())
+        .map(|ctx| ctx.host_root)
     }
 }
 

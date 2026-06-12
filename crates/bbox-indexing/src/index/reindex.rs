@@ -473,6 +473,7 @@ mod tests {
             "/tmp/session.jsonl",
             false,
             "",
+            None,
             fields,
         )
         .expect("normalized event is indexable");

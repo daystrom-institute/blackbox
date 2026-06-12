@@ -560,4 +560,10 @@ pub(crate) struct BlackboxServer {
     /// Session-scoped MCP tool surface selector. Set once during
     /// MCP session initialization from the `?surface` query parameter.
     pub(crate) surface: OnceLock<Arc<str>>,
+    /// Session-scoped project context for surface evaluation. Set once
+    /// during MCP session initialization from the `?project` query
+    /// parameter — resolved through the shared project resolver (alias /
+    /// id / path → base canonical path), falling back to the literal value
+    /// for parity with the bbox_mcp_surface tool (gap-310c36b6).
+    pub(crate) surface_project: OnceLock<Option<Arc<str>>>,
 }

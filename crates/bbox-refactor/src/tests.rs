@@ -19,6 +19,7 @@ mod tests {
             registered_at: "2026-05-07T00:00:00Z".to_string(),
             is_git_repo: false,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -4325,6 +4326,7 @@ mod rx_f2b_obligation_tests {
             registered_at: "2026-05-09T00:00:00Z".to_string(),
             is_git_repo: false,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -5064,6 +5066,7 @@ mod rx_f2a_capture_tests {
             registered_at: "2026-05-09T00:00:00Z".to_string(),
             is_git_repo: false,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -5510,6 +5513,7 @@ impl Cache {
                 registered_at: "2026-01-01T00:00:00Z".into(),
                 is_git_repo: false,
                 languages: Default::default(),
+                aliases: Default::default(),
             }],
         )
         .unwrap_err();
@@ -5602,6 +5606,7 @@ impl Cache {
                 registered_at: "2026-01-01T00:00:00Z".into(),
                 is_git_repo: false,
                 languages: Default::default(),
+                aliases: Default::default(),
             }],
         )
         .unwrap();
@@ -5672,6 +5677,7 @@ impl Cache {
             registered_at: "2026-05-12T00:00:00Z".to_string(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -6830,6 +6836,7 @@ mod extract_rust_crate_tests {
             registered_at: "2026-06-10T00:00:00Z".to_string(),
             is_git_repo: false,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 
@@ -7180,6 +7187,7 @@ mod extract_rust_crate_e2e {
             registered_at: "2026-06-10T00:00:00Z".to_string(),
             is_git_repo: false,
             languages: Default::default(),
+            aliases: Default::default(),
         }
     }
 

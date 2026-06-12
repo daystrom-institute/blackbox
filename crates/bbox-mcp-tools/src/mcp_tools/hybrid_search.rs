@@ -43,8 +43,9 @@ pub struct HybridSearchParams {
     #[serde(default)]
     pub query_vector: Option<Vec<f32>>,
     /// Restrict results to entities scoped to a specific project. Accepts
-    /// either an absolute project path (e.g. `/home/user/repos/my-app`) or
-    /// a project_id (8-hex). When set, only project_file entries from that
+    /// an absolute project path (e.g. `/home/user/repos/my-app`), a
+    /// project_id (8-hex), or a registered project alias (declared in the
+    /// repo's `.bbox/config.toml` `[project] aliases`). When set, only project_file entries from that
     /// project and thread entries whose stored project resolves to that id
     /// are kept; commits, knowledge, transcripts, and other project-agnostic
     /// entity types pass through unfiltered. Use this to scope queries to
@@ -455,14 +456,19 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
     resolve_project_filter_path(raw, &projects)
 }
 
-/// Path arm of [`resolve_project_filter`], parameterized over the registry
-/// list for testability. Registry-owned paths (root, descendant, or worktree
-/// of a registered repo) collapse to the registered base project_id — a
-/// worktree path must NOT fall through to the deterministic hash, which would
-/// derive a different id than the base and silently return empty results.
+/// Selector arm of [`resolve_project_filter`], parameterized over the
+/// registry list for testability. Registered selectors — alias, canonical
+/// path, or any path inside a registered checkout/worktree — collapse to the
+/// registered base project_id via the shared Read-intent resolver. A worktree
+/// path must NOT fall through to the deterministic hash, which would derive a
+/// different id than the base and silently return empty results.
 fn resolve_project_filter_path(raw: &str, projects: &[ProjectRecord]) -> Option<String> {
-    if let Some(record) = bbox_indexing::projects::resolve_base_project_for_scope(raw, projects) {
-        return Some(record.project_id.clone());
+    if let Some(ctx) = bbox_indexing::projects::resolve_project_context(
+        raw,
+        projects,
+        bbox_indexing::projects::ResolveIntent::Read,
+    ) {
+        return Some(ctx.project_id);
     }
     // Fall back to the deterministic path-derived id even when the project
     // hasn't been registered yet — useful for one-shot scoped searches.
@@ -1269,6 +1275,7 @@ mod tests {
             registered_at: "2026-01-01T00:00:00Z".into(),
             is_git_repo: true,
             languages: Default::default(),
+            aliases: Default::default(),
         }];
 
         // The registered root resolves to the registry id.
@@ -1324,5 +1331,15 @@ mod tests {
             resolve_project_filter_path(plain.to_str().unwrap(), &registered),
             Some(expected)
         );
+
+        // A registered alias resolves to the registry id.
+        let mut aliased = registered.clone();
+        aliased[0].aliases = ["blackbox".to_string()].into();
+        assert_eq!(
+            resolve_project_filter_path("blackbox", &aliased).as_deref(),
+            Some("feedbeef")
+        );
+        // An unknown non-path selector resolves to nothing.
+        assert_eq!(resolve_project_filter_path("not-an-alias", &aliased), None);
     }
 }

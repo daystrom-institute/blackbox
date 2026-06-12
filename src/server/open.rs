@@ -88,9 +88,29 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // pass flows through this actor (concurrency-model §4.3). Spawned AFTER
     // all ReindexConfig mutation — the actor clones the config at spawn.
     let index_writer = crate::index::IndexWriterActor::spawn_for(&idx);
-    let (projects_store, projects_needs_persist) =
+    let (mut projects_store, mut projects_needs_persist) =
         ProjectRegistry::open_with_backfill_status(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());
+    // Materialize repo-declared aliases (`[project] aliases` in each repo's
+    // committed `.bbox/config.toml`) into the registry. Boot cannot fail
+    // closed the way registration does, so a conflicting or invalid claim is
+    // skipped with a warning — the alias simply never materializes, and
+    // resolution fails closed by absence. Records are sorted by
+    // canonical_path, so first-claim-wins is deterministic across boots.
+    for record in projects_store.list() {
+        let declared: std::collections::BTreeSet<String> =
+            match crate::config::load_project(std::path::Path::new(&record.canonical_path)) {
+                Ok(cfg) => cfg.project.aliases.into_iter().collect(),
+                Err(e) => {
+                    tracing::warn!("project config for {}: {e:#}", record.project_id);
+                    continue;
+                }
+            };
+        match projects_store.sync_declared_aliases(&record.project_id, &declared) {
+            Ok(dirty) => projects_needs_persist |= dirty,
+            Err(e) => tracing::warn!("alias sync for {}: {e:#}", record.project_id),
+        }
+    }
 
     let mut kb = Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
