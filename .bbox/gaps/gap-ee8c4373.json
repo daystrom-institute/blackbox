@@ -14,7 +14,9 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/repo-owned-stores/worktree-redirect-restart-window",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-12T17:19:36Z",
-  "updated_at": "2026-06-12T17:19:36Z"
+  "updated_at": "2026-06-12T17:34:39Z",
+  "resolved_at": "2026-06-12T17:34:39Z",
+  "resolution_note": "Fixed on beta/blackbox-v2: the central store now retains worktree-redirected records (knowledge entries via the persisted write_redirects map on KnowledgeStore; gap notes via write_dir, now serialized central-only) until the committed file is observed under a registered base root at load — that observation drops the redirect and the next save removes the retained copy. Dead-worktree redirects stay central-only; the prior gaps-store fallback that could write the base checkout for a dead redirect is removed. Committed repo files never carry the redirect marker. Thread records were analyzed and excluded: the live thread store is host-local and survives restarts; .bbox/record files are settled-thread projections, not the store of record. Regression tests: redirected_entry_survives_reopen_and_heals_on_base_merge + dead_worktree_redirect_keeps_entry_central_and_never_writes_base (knowledge), redirected_gap_survives_reopen_and_heals_on_base_merge + dead_worktree_redirect_stays_central_and_never_writes_base (gaps)."
 }
