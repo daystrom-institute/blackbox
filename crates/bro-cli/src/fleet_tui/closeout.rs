@@ -55,14 +55,33 @@ pub(super) struct ParsedCloseout {
 }
 
 /// A worktree-local rebase conflict that has been handed back to the owning
-/// agent. Once that resumed turn goes idle, the cockpit reruns closeout as
+/// agent. Once that resumed turn completes, the cockpit reruns closeout as
 /// `adopt` for the same worktree/target; the agent never drives closeout itself.
 #[derive(Debug, Clone)]
 pub(super) struct PendingCloseoutRecovery {
     pub agent_id: String,
     pub worktree: String,
     pub target: Option<String>,
+    /// True once the resumed task has been observed RUNNING — the turn is
+    /// real. (Each resume is one task that completes at the turn boundary,
+    /// so task status is the turn signal; `turn_active` is unusable here —
+    /// daemon-backed rows derive it from an always-empty event buffer.)
     pub observed_turn_active: bool,
+}
+
+/// The publish half of the closeout handshake: the fold is mechanical, the
+/// commit message is the agent's. `/closeout publish` resumes the worktree's
+/// own agent with a compose-the-commit-message turn; once that turn
+/// completes, the cockpit reads the reply from the session transcript and
+/// runs the actual publish with it. `--message` is the explicit operator
+/// override for when the agent can't be asked.
+#[derive(Debug, Clone)]
+pub(super) struct PendingCommitMessage {
+    pub agent_id: String,
+    pub worktree: String,
+    pub target: Option<String>,
+    /// See [`PendingCloseoutRecovery::observed_turn_active`].
+    pub observed_running: bool,
 }
 
 /// One finished `/closeout` worker result, delivered from
@@ -191,16 +210,6 @@ pub(super) fn parse_closeout(arg: &str) -> Result<ParsedCloseout, String> {
         disposition.as_str(),
         "discard" | "publish" | "merge" | "adopt"
     );
-
-    // The daemon hard-rejects publish without a commit message; fail fast
-    // with the fix in hand instead of an opaque 400 round-trip.
-    if disposition == "publish" && !dry_run && message.as_deref().is_none_or(|m| m.trim().is_empty())
-    {
-        return Err(
-            "/closeout publish requires a commit message: /closeout publish --message <text…>"
-                .to_string(),
-        );
-    }
 
     Ok(ParsedCloseout {
         disposition,
@@ -397,6 +406,17 @@ pub(super) fn run_closeout(app: &mut App, arg: &str) {
             return;
         }
     };
+    // Publish handshake: no operator override → ask the worktree's agent to
+    // compose the commit message, then publish with its reply (the poll in
+    // the drain loop continues the fold once the agent's turn completes).
+    if parsed.disposition == "publish"
+        && !parsed.dry_run
+        && parsed.message.as_deref().is_none_or(|m| m.trim().is_empty())
+    {
+        start_commit_message_handshake(app, &worktree, parsed.target.clone());
+        app.clear_input();
+        return;
+    }
     let verb = if parsed.dry_run {
         "preflight"
     } else {
@@ -545,14 +565,19 @@ pub(super) fn poll_pending_closeout_recovery(app: &mut App) {
         );
         return;
     };
+    // Status IS the turn boundary: each resume is one task that completes
+    // when the turn does. (`snap.turn_active` is unusable for daemon-backed
+    // rows — it derives from an always-empty local event buffer and reads
+    // true even for terminal tasks, which left this poll armed forever.)
     let snap = app.agents[idx].task.snapshot();
-    if snap.turn_active {
+    if !snap.status.is_terminal() {
         if let Some(pending) = app.pending_closeout_recovery.as_mut() {
             pending.observed_turn_active = true;
         }
         return;
     }
-    if !pending.observed_turn_active && !snap.status.is_terminal() {
+    if !pending.observed_turn_active {
+        // Still the pre-resume terminal task (the swap hasn't landed yet).
         return;
     }
 
@@ -560,45 +585,177 @@ pub(super) fn poll_pending_closeout_recovery(app: &mut App) {
     spawn_adopt_retry(app, pending.worktree, pending.target);
 }
 
-fn spawn_adopt_retry(app: &mut App, worktree: String, target: Option<String>) {
-    // The retry is a real adopt fold, so it must carry the same project hooks /
-    // branch prefixes as the original command. fleet.json was already validated
-    // by the initial /closeout, so resolve best-effort here (ignore a late parse
-    // error rather than stranding the recovery).
-    let project = resolve_project_closeout(&worktree).ok().flatten();
-    let req = bro_fleet_client::CloseoutRequest {
-        worktree: worktree.clone(),
-        disposition: "adopt".to_string(),
-        confirm: true,
-        target: target
-            .clone()
-            .or_else(|| project.as_ref().and_then(|p| p.target.clone())),
-        commit_message: None,
-        paths: Vec::new(),
-        allow_branch_prefixes: project.as_ref().and_then(|p| p.allow_branch_prefixes.clone()),
-        // The post-rebase-reconciliation retry is a real adopt run, not
-        // a dry-run; the daemon's phased driver runs the full sequence.
-        dry_run: false,
-        closeout_hooks: project.as_ref().and_then(resolve_closeout_hooks),
+/// Resume the worktree's agent with a compose-the-commit-message turn and arm
+/// the pending state the drain loop polls. The agent supplies the judgment
+/// half of the publish handshake; the fold itself stays cockpit-owned.
+fn start_commit_message_handshake(app: &mut App, worktree: &str, target: Option<String>) {
+    if app.pending_commit_message.is_some() {
+        app.push_cockpit_line(
+            "/closeout publish: a commit-message handshake is already in flight",
+        );
+        return;
+    }
+    let Some(idx) = agent_index_for_worktree(app, worktree) else {
+        app.push_cockpit_line(format!(
+            "/closeout publish: no owning fleet agent for {worktree}; rerun with --message <text…> to supply the commit message yourself"
+        ));
+        return;
     };
-    let orch = app.orch.clone();
-    let tx = app.closeout_tx.clone();
+    let provider = app.agents[idx].provider;
+    if !provider_supports_bidi(provider) {
+        app.push_cockpit_line(format!(
+            "/closeout publish: {provider} cannot be resumed for a commit message; rerun with --message <text…>"
+        ));
+        return;
+    }
+    let agent_id = app.agents[idx].task.id();
+    let name = app.agents[idx].name.clone();
+    app.pending_commit_message = Some(PendingCommitMessage {
+        agent_id,
+        worktree: worktree.to_string(),
+        target,
+        observed_running: false,
+    });
+    app.push_cockpit_line(format!(
+        "/closeout publish: asking {name} to compose the commit message…"
+    ));
+    let prompt = commit_message_prompt(worktree);
+    resume_agent(app, idx, prompt);
+}
+
+fn commit_message_prompt(worktree: &str) -> String {
+    format!(
+        "Your worktree ({worktree}) is being published back to the target branch. \
+         Compose the git commit message for the work you did here. \
+         Reply with ONLY the commit message: a subject line (max 72 chars), then \
+         optionally a blank line and a body. No code fences, no commentary, no sign-off."
+    )
+}
+
+pub(super) fn poll_pending_commit_message(app: &mut App) {
+    let Some(pending) = app.pending_commit_message.clone() else {
+        return;
+    };
+    if app.resuming.contains(&pending.agent_id) {
+        return;
+    }
+    let Some(idx) = app
+        .agents
+        .iter()
+        .position(|agent| agent.task.id() == pending.agent_id)
+    else {
+        app.pending_commit_message = None;
+        app.push_cockpit_line(
+            "/closeout publish stopped: owning agent is no longer in the roster",
+        );
+        return;
+    };
+    let snap = app.agents[idx].task.snapshot();
+    if !snap.status.is_terminal() {
+        if let Some(pending) = app.pending_commit_message.as_mut() {
+            pending.observed_running = true;
+        }
+        return;
+    }
+    if !pending.observed_running {
+        return;
+    }
+
+    app.pending_commit_message = None;
+    // Read the agent's reply from the session transcript file — the roster's
+    // last-message snippet is capped at 200 chars and would truncate bodies.
+    let message = snap
+        .transcript_path
+        .as_deref()
+        .and_then(last_assistant_reply)
+        .or(snap.last_assistant_message)
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let Some(message) = message else {
+        app.push_cockpit_line(
+            "/closeout publish: agent returned no commit message; rerun with --message <text…>",
+        );
+        return;
+    };
+    let subject = message.lines().next().unwrap_or("").to_string();
+    app.push_cockpit_line(format!("/closeout publish with: {subject}"));
+    spawn_closeout_followup(
+        app,
+        "publish",
+        pending.worktree,
+        pending.target,
+        Some(message),
+    );
+}
+
+/// Final assistant text of the session's last turn, read from the event log.
+/// Unwraps a whole-message code fence if the model ignored the no-fences
+/// instruction.
+fn last_assistant_reply(path: &str) -> Option<String> {
+    let tail = super::transcript_tail::TranscriptFileTail::attach(path);
+    let text = tail.items().iter().rev().find_map(|item| match item {
+        bro_fleet_client::TranscriptItem::AssistantText(t) => Some(t.clone()),
+        _ => None,
+    })?;
+    let trimmed = text.trim();
+    let unfenced = trimmed
+        .strip_prefix("```")
+        .and_then(|rest| rest.split_once('\n'))
+        .map(|(_, body)| body.trim_end_matches('`').trim())
+        .filter(|_| trimmed.ends_with("```"));
+    Some(unfenced.unwrap_or(trimmed).to_string())
+}
+
+fn spawn_adopt_retry(app: &mut App, worktree: String, target: Option<String>) {
     app.set_status(
         format!("/closeout adopt retry after rebase reconciliation on {worktree}…"),
         Duration::from_secs(4),
     );
+    spawn_closeout_followup(app, "adopt", worktree, target, None);
+}
+
+/// Run a real (non-dry-run) fold as the continuation of an agent handshake —
+/// the post-reconciliation adopt retry, or publish carrying the agent-composed
+/// commit message. Carries the same project hooks / branch prefixes as the
+/// original command; fleet.json was already validated by the initial
+/// /closeout, so resolve best-effort here (ignore a late parse error rather
+/// than stranding the continuation).
+fn spawn_closeout_followup(
+    app: &mut App,
+    disposition: &str,
+    worktree: String,
+    target: Option<String>,
+    commit_message: Option<String>,
+) {
+    let project = resolve_project_closeout(&worktree).ok().flatten();
+    let req = bro_fleet_client::CloseoutRequest {
+        worktree: worktree.clone(),
+        disposition: disposition.to_string(),
+        confirm: true,
+        target: target
+            .clone()
+            .or_else(|| project.as_ref().and_then(|p| p.target.clone())),
+        commit_message,
+        paths: Vec::new(),
+        allow_branch_prefixes: project.as_ref().and_then(|p| p.allow_branch_prefixes.clone()),
+        dry_run: false,
+        closeout_hooks: project.as_ref().and_then(resolve_closeout_hooks),
+    };
+    let disposition = disposition.to_string();
+    let orch = app.orch.clone();
+    let tx = app.closeout_tx.clone();
     app.rt.spawn(async move {
         let result = orch.closeout(&req).map_err(|e| format!("{e:#}"));
         let msg = match result {
             Ok(outcome) => CloseoutMsg::Outcome {
-                sent_disposition: "adopt".to_string(),
+                sent_disposition: disposition.clone(),
                 dry_run: false,
                 worktree,
                 target,
                 outcome,
             },
             Err(error) => CloseoutMsg::Failed {
-                disposition: "adopt".to_string(),
+                disposition,
                 dry_run: false,
                 error,
             },
@@ -643,14 +800,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_closeout_publish_requires_message() {
-        // Bare publish can never succeed (the daemon hard-rejects an empty
-        // commit_message), so the parser fails fast with the fix in hand
-        // instead of an opaque 400 round-trip.
-        let err = parse_closeout("publish").unwrap_err();
-        assert!(
-            err.contains("--message"),
-            "error must name the missing flag: {err}"
+    fn parse_closeout_bare_publish_is_the_handshake() {
+        // Bare publish is VALID: run_closeout starts the commit-message
+        // handshake (ask the worktree's agent, publish with its reply).
+        // --message is only the explicit operator override.
+        let p = parsed("publish");
+        assert_eq!(p.disposition, "publish");
+        assert!(!p.dry_run);
+        assert!(p.confirm, "publish is mutating");
+        assert!(p.message.is_none(), "no override → agent supplies the message");
+    }
+
+    #[test]
+    fn last_assistant_reply_reads_final_turn_and_unwraps_fences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.events.jsonl");
+        let line = |text: &str| {
+            serde_json::json!({
+                "ts": "2026-06-11T00:00:00.000Z",
+                "event": {
+                    "type": "assistant",
+                    "message": { "role": "assistant",
+                                 "content": [{ "type": "text", "text": text }] },
+                },
+            })
+            .to_string()
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}
+{}
+",
+                line("working on it"),
+                line("fix(fleet): fold the worktree
+
+body line")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            last_assistant_reply(path.to_str().unwrap()).as_deref(),
+            Some("fix(fleet): fold the worktree
+
+body line"),
+            "must read the LAST assistant text"
+        );
+
+        std::fs::write(
+            &path,
+            format!("{}
+", line("```
+feat: fenced despite instructions
+```")),
+        )
+        .unwrap();
+        assert_eq!(
+            last_assistant_reply(path.to_str().unwrap()).as_deref(),
+            Some("feat: fenced despite instructions"),
+            "whole-message fences are unwrapped"
         );
     }
 

@@ -534,6 +534,10 @@ struct App {
     /// agent. When the agent turn settles, closeout resumes as adopt/merge
     /// from the structured driver path, never as a second publish.
     pending_closeout_recovery: Option<PendingCloseoutRecovery>,
+    /// Publish handshake in flight: the worktree's agent has been asked to
+    /// compose the commit message; when its turn completes, the cockpit runs
+    /// the actual publish with the reply.
+    pending_commit_message: Option<PendingCommitMessage>,
     /// Local clocks for the focused executor/classifier activity strip.
     activity_clocks: HashMap<String, ActivityClock>,
     activity_frame: usize,
@@ -665,6 +669,7 @@ impl App {
             closeout_rx,
             pending_cockpit_lines: Vec::new(),
             pending_closeout_recovery: None,
+            pending_commit_message: None,
             activity_clocks: HashMap::new(),
             activity_frame: 0,
             composer_history_path: history_path(&bro_home()),
@@ -2177,6 +2182,7 @@ fn drain_tui_events(app: &mut App, signals: &mpsc::Receiver<TailEvent>) {
         install_closeout(app, msg);
     }
     poll_pending_closeout_recovery(app);
+    poll_pending_commit_message(app);
     app.maybe_clear_status();
     app.activity_frame = app.activity_frame.wrapping_add(1);
 }
@@ -3782,6 +3788,28 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
             app.set_input(outcome.text);
         }
         app.push_cockpit_line(format!("resume failed: {err}"));
+        // A handshake waiting on this resume would otherwise fire against
+        // the old terminal task's stale last message — abort it loudly.
+        if app
+            .pending_commit_message
+            .as_ref()
+            .is_some_and(|p| p.agent_id == outcome.agent_id)
+        {
+            app.pending_commit_message = None;
+            app.push_cockpit_line(
+                "/closeout publish aborted: could not resume the agent for a commit message",
+            );
+        }
+        if app
+            .pending_closeout_recovery
+            .as_ref()
+            .is_some_and(|p| p.agent_id == outcome.agent_id)
+        {
+            app.pending_closeout_recovery = None;
+            app.push_cockpit_line(
+                "/closeout recovery aborted: could not resume the agent for reconciliation",
+            );
+        }
         return;
     }
     let Some(idx) = app
@@ -3809,6 +3837,11 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
         app.roster_anchor_id = Some(new_id.clone());
     }
     if let Some(pending) = app.pending_closeout_recovery.as_mut()
+        && pending.agent_id == outcome.agent_id
+    {
+        pending.agent_id = new_id.clone();
+    }
+    if let Some(pending) = app.pending_commit_message.as_mut()
         && pending.agent_id == outcome.agent_id
     {
         pending.agent_id = new_id.clone();
