@@ -64,6 +64,7 @@ impl BlackboxServer {
                 + crate::tools::system_events::router()
                 + crate::tools::macros::router(),
             surface: std::sync::OnceLock::new(),
+            surface_project: std::sync::OnceLock::new(),
         }
     }
 }

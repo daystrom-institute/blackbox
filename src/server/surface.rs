@@ -409,15 +409,21 @@ pub(crate) fn cached_surface_entry(
 /// Extract the `surface` query parameter from a URI query string.
 /// Returns `"default"` if no `surface=` parameter is present.
 pub fn extract_surface_from_uri(query: Option<&str>) -> &str {
-    let Some(q) = query else { return "default" };
+    extract_query_param(query, "surface").unwrap_or("default")
+}
+
+/// First non-empty value of `key` in a raw URI query string. Shared by the
+/// wire head's `?surface=` and `?project=` extraction (gap-310c36b6).
+pub fn extract_query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    let q = query?;
     for pair in q.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            if k == "surface" && !v.is_empty() {
-                return v;
+            if k == key && !v.is_empty() {
+                return Some(v);
             }
         }
     }
-    "default"
+    None
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1076,6 +1082,16 @@ mod tests {
     #[test]
     fn extract_surface_no_query_returns_default() {
         assert_eq!(extract_surface_from_uri(None), "default");
+    }
+
+    #[test]
+    fn extract_query_param_finds_project_alongside_surface() {
+        let q = Some("surface=workflow&project=blackbox");
+        assert_eq!(extract_query_param(q, "project"), Some("blackbox"));
+        assert_eq!(extract_surface_from_uri(q), "workflow");
+        assert_eq!(extract_query_param(q, "missing"), None);
+        // Empty values do not count as set.
+        assert_eq!(extract_query_param(Some("project="), "project"), None);
     }
 
     #[test]

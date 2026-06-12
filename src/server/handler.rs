@@ -33,24 +33,39 @@ impl BlackboxServer {
             .unwrap_or_else(|| "default".to_string())
     }
 
+    /// Session project context for surface evaluation, set at `initialize`
+    /// from the `?project` query parameter (gap-310c36b6). `None` for
+    /// sessions that did not select a project.
+    fn session_surface_project(&self) -> Option<String> {
+        self.surface_project
+            .get()
+            .and_then(|p| p.as_ref().map(|s| s.as_ref().to_string()))
+    }
+
     /// Surface decision for this session via the generation-validated cache.
     /// The hit path is two short lock reads; a rebuild (first request after
     /// a packet mutation) re-reads the packet store, so it runs on the
     /// blocking pool.
-    async fn surface_entry(&self, surface: &str) -> Arc<SurfaceCacheEntry> {
+    async fn surface_entry(&self, surface: &str, project: Option<&str>) -> Arc<SurfaceCacheEntry> {
         let generation = self.state.packets.read().generation();
         if let Some(hit) = self
             .state
             .surface_decisions
-            .lookup(surface, None, generation)
+            .lookup(surface, project, generation)
         {
             return hit;
         }
         let server = self.clone();
         let surface_owned = surface.to_string();
+        let project_owned = project.map(str::to_string);
         match tokio::task::spawn_blocking(move || {
             let universe = server.tool_universe();
-            server::surface::cached_surface_entry(&server.state, &surface_owned, None, || universe)
+            server::surface::cached_surface_entry(
+                &server.state,
+                &surface_owned,
+                project_owned.as_deref(),
+                || universe,
+            )
         })
         .await
         {
@@ -59,16 +74,16 @@ impl BlackboxServer {
                 // Only reachable if the rebuild closure panicked; recompute
                 // inline rather than poisoning the session.
                 tracing::warn!(error = %e, "surface decision rebuild panicked; recomputing inline");
-                self.surface_entry_sync(surface)
+                self.surface_entry_sync(surface, project)
             }
         }
     }
 
     /// Synchronous variant for trait methods that cannot await. The miss
     /// path blocks on the packet store scan.
-    fn surface_entry_sync(&self, surface: &str) -> Arc<SurfaceCacheEntry> {
+    fn surface_entry_sync(&self, surface: &str, project: Option<&str>) -> Arc<SurfaceCacheEntry> {
         let universe = self.tool_universe();
-        server::surface::cached_surface_entry(&self.state, surface, None, || universe)
+        server::surface::cached_surface_entry(&self.state, surface, project, || universe)
     }
 }
 
@@ -84,12 +99,42 @@ impl ServerHandler for BlackboxServer {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        let surface_str = if let Some(parts) = context.extensions.get::<http::request::Parts>() {
-            server::surface::extract_surface_from_uri(parts.uri.query())
-        } else {
-            "default"
+        let (surface_str, project_raw) =
+            if let Some(parts) = context.extensions.get::<http::request::Parts>() {
+                (
+                    server::surface::extract_surface_from_uri(parts.uri.query()),
+                    server::surface::extract_query_param(parts.uri.query(), "project")
+                        .map(str::to_string),
+                )
+            } else {
+                ("default", None)
+            };
+        // Resolve the project selector (alias / id / path) to the base
+        // canonical path packets are scoped by, falling back to the literal
+        // value for parity with bbox_mcp_surface. Blocking fs (canonicalize
+        // / git probes) → blocking pool.
+        let project = match project_raw {
+            Some(raw) => {
+                let server = self.clone();
+                let resolved = tokio::task::spawn_blocking(move || {
+                    let records = server.state.projects.read().list();
+                    crate::projects::resolve_project_context(
+                        &raw,
+                        &records,
+                        crate::projects::ResolveIntent::Read,
+                    )
+                    .map(|ctx| ctx.host_root)
+                    .unwrap_or(raw)
+                })
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("project resolution failed: {e}"), None)
+                })?;
+                Some(resolved)
+            }
+            None => None,
         };
-        let entry = self.surface_entry(surface_str).await;
+        let entry = self.surface_entry(surface_str, project.as_deref()).await;
         if let server::surface::ToolSurfaceVerdict::Deny { reason } = &entry.decision.verdict {
             let reason = reason.as_deref().unwrap_or("surface denied");
             return Err(ErrorData::internal_error(
@@ -98,6 +143,7 @@ impl ServerHandler for BlackboxServer {
             ));
         }
         let _ = self.surface.set(Arc::from(surface_str));
+        let _ = self.surface_project.set(project.map(Arc::from));
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }
@@ -105,7 +151,10 @@ impl ServerHandler for BlackboxServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        let entry = self.surface_entry_sync(&self.session_surface());
+        let entry = self.surface_entry_sync(
+            &self.session_surface(),
+            self.session_surface_project().as_deref(),
+        );
         if !entry.visible.contains(name) {
             return None;
         }
@@ -117,7 +166,12 @@ impl ServerHandler for BlackboxServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let entry = self.surface_entry(&self.session_surface()).await;
+        let entry = self
+            .surface_entry(
+                &self.session_surface(),
+                self.session_surface_project().as_deref(),
+            )
+            .await;
         let tools = self
             .tool_router
             .list_all()
@@ -136,7 +190,9 @@ impl ServerHandler for BlackboxServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let surface = self.session_surface();
-        let entry = self.surface_entry(&surface).await;
+        let entry = self
+            .surface_entry(&surface, self.session_surface_project().as_deref())
+            .await;
         if !entry.visible.contains(request.name.as_ref()) {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
