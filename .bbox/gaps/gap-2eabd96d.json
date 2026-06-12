@@ -16,7 +16,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/hnsw/reverse-edge-prune-orphaning",
   "supersedes": "gap-e2cb1ff8",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-12T21:23:53Z",
-  "updated_at": "2026-06-12T21:24:00Z"
+  "updated_at": "2026-06-12T22:37:31Z",
+  "resolved_at": "2026-06-12T22:37:31Z",
+  "resolution_note": "Fix shipped (commit b236f50) and both prod partitions rebuilt through it. add_reverse_edge now shrinks saturated inbound lists with the select_neighbors diversity heuristic (SHRINK-CONNECTIONS; the distance backfill doubles as keep-pruned-connections). Synthetic repro: 5,685/20,000 disconnected + 35% self-recall miss → 0 disconnected / 99.7% self-recall on both push and bulk paths. Live rebuilds (rebuild_hnsw workflow op → Partition::compact): Linux host 66,621/399,613 (16.7%) → 5,516/399,136 (1.38%); Mac mini 6,417/95,973 (6.7%) → 287/95,979 (0.30%). Residual disconnection is exact-duplicate degeneracy — identical chunks embedded under different entity ids tie all pairwise distances at zero, so the diversity rule cannot discriminate; orphaning there is mostly benign (the surviving twin answers the query). Full elimination would need a post-build orphan-reconnect pass — file separately if the residual ever matters. Diagnostics added alongside (HnswMetrics.zero_in_degree_nodes, self_recall_probe) attributed the disconnection exactly (zero_in == disconnected) on every measurement. Regression test: large_near_duplicate_clusters_stay_connected_under_push_order fails at 167/1200 on the old pruning, passes <1% + self-recall >=0.98 with the fix."
 }
