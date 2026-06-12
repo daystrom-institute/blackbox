@@ -24,8 +24,18 @@ impl BlackboxServer {
         thread_id: Option<&str>,
         work_item_id: Option<&str>,
     ) -> Option<String> {
+        // A worktree dispatch cwd resolves to its registered base — the
+        // durable pin scope — while the literal cwd stays matchable as an
+        // alias so pins keyed to the worktree path (pre-rescope writes)
+        // keep injecting for the same work.
+        let resolved = project_dir.map(|raw| self.resolve_project_write_scope(raw).0);
+        let alias = match (project_dir, resolved.as_deref()) {
+            (Some(raw), Some(scope)) if raw != scope => Some(raw),
+            _ => None,
+        };
         self.state.pins.read().render_for_ambient(&AmbientPinQuery {
-            project: project_dir,
+            project: resolved.as_deref().or(project_dir),
+            project_alias: alias,
             bro: bro_name,
             session_id,
             thread_id,

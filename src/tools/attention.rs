@@ -20,7 +20,30 @@ impl BlackboxServer {
     )]
     pub(crate) async fn bbox_pin(&self, Parameters(p): Parameters<PinParams>) -> CallToolResult {
         let start = std::time::Instant::now();
-        let text = match self.state.pins.write().pin(&p) {
+        let action = p.action.clone();
+        let server = self.clone();
+        // Project resolution does fs/git probes — keep it (and the store
+        // mutation behind it) off the tokio workers.
+        let pin_result = tokio::task::spawn_blocking(move || {
+            let mut p = p;
+            // Durable pin scope is the registered base project: a worktree
+            // caller's path is resolved so the pin injects for every dispatch
+            // of the same project, not just the ephemeral worktree cwd. On
+            // list, the literal path stays matchable as an alias so pins
+            // keyed pre-rescope remain visible.
+            if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
+                let (scope, _write_dir) = server.resolve_project_write_scope(&raw);
+                if scope != raw {
+                    p.project_alias = Some(raw);
+                }
+                p.project = Some(scope);
+            }
+            server.state.pins.write().pin(&p)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("pin task failed: {e}"))
+        .and_then(std::convert::identity);
+        let text = match pin_result {
             Ok(text) => text,
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -29,7 +52,7 @@ impl BlackboxServer {
             }
         };
 
-        if p.action != "list" {
+        if action != "list" {
             if let Err(e) = self.state.persist_pins_durable().await {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_pin", elapsed_ms = ms, error = %e, "err");
@@ -97,6 +120,100 @@ impl BlackboxServer {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::BlackboxServer;
+    use crate::server::state::SharedState;
+    use rmcp::handler::server::wrapper::Parameters;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A pin set from inside an in-tree linked worktree must key to the
+    /// registered BASE project (the durable scope) and inject for dispatches
+    /// rooted in the base AND in the worktree — exact-match pin scoping was
+    /// the sharpest silent failure of the worktree corpus-ops class.
+    #[tokio::test]
+    async fn bbox_pin_from_worktree_keys_base_and_injects_for_both_cwds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        run_git(&base, &["init", "-b", "main"]);
+        run_git(&base, &["config", "user.email", "t@example.com"]);
+        run_git(&base, &["config", "user.name", "T"]);
+        std::fs::write(base.join("README.md"), "base").unwrap();
+        run_git(&base, &["add", "."]);
+        run_git(&base, &["commit", "-m", "init"]);
+        let base_canon = base.canonicalize().unwrap();
+
+        let worktree = base.join(".claude").join("worktrees").join("wt");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        run_git(
+            &base,
+            &["worktree", "add", "-b", "arc/pin", worktree.to_str().unwrap(), "HEAD"],
+        );
+        let wt = worktree
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let base_str = base_canon.to_string_lossy().into_owned();
+
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
+        server
+            .state
+            .projects
+            .write()
+            .register_path(&base_canon)
+            .unwrap();
+
+        let set = server
+            .bbox_pin(Parameters(crate::pins::PinParams {
+                action: "set".into(),
+                content: Some("WORKTREE_PIN_MARKER guidance".into()),
+                title: Some("arc pin".into()),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                project: Some(wt.clone()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(set.is_error, Some(true), "pin set failed: {set:?}");
+
+        // Injects for a dispatch rooted at the base…
+        let from_base = server
+            .ambient_pin_block(Some(&base_str), Some("executor"), None, None, None)
+            .expect("base-rooted dispatch should receive the pin");
+        assert!(from_base.contains("WORKTREE_PIN_MARKER"));
+
+        // …and for a dispatch rooted in the worktree (cwd resolves to base).
+        let from_worktree = server
+            .ambient_pin_block(Some(&wt), Some("executor"), None, None, None)
+            .expect("worktree-rooted dispatch should receive the pin");
+        assert!(from_worktree.contains("WORKTREE_PIN_MARKER"));
+
+        // A different project still doesn't receive it.
+        assert!(
+            server
+                .ambient_pin_block(Some("/repo/other"), Some("executor"), None, None, None)
+                .is_none()
+        );
     }
 }
 

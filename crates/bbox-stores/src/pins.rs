@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::store_persister::StoreSnapshot;
 use bbox_util::util;
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PinParams {
     /// set, list, or delete
     pub action: String,
@@ -34,6 +34,13 @@ pub struct PinParams {
     /// ISO 8601 expiry
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// Internal, not part of the MCP schema: an additional project path the
+    /// `list` project filter also matches. Set by the daemon adapter when
+    /// `project` was a worktree path resolved to its registered base, so pins
+    /// keyed to the literal worktree path (pre-rescope writes) stay visible.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_alias: Option<String>,
 }
 
 #[derive(
@@ -92,6 +99,10 @@ impl PinStore {
 #[derive(Debug, Clone, Default)]
 pub struct AmbientPinQuery<'a> {
     pub project: Option<&'a str>,
+    /// Additional project path a project-restricted pin may match: the
+    /// dispatch's literal worktree cwd when `project` was resolved to its
+    /// registered base, so pins keyed either way inject for the same work.
+    pub project_alias: Option<&'a str>,
     pub bro: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub thread_id: Option<&'a str>,
@@ -244,7 +255,10 @@ impl Pins {
                 None => true,
             })
             .filter(|pin| match p.project.as_deref() {
-                Some(project) => pin.project.as_deref() == Some(project),
+                Some(project) => {
+                    pin.project.as_deref() == Some(project)
+                        || (pin.project.is_some() && pin.project == p.project_alias)
+                }
                 None => true,
             })
             .collect();
@@ -290,7 +304,7 @@ impl Pins {
             .iter()
             .filter(|pin| !Self::is_expired(pin))
             .filter(|pin| match pin.project.as_deref() {
-                Some(project) => q.project == Some(project),
+                Some(project) => q.project == Some(project) || q.project_alias == Some(project),
                 None => true,
             })
             .filter(|pin| match pin.scope {
@@ -388,6 +402,7 @@ mod tests {
                 target: Some("executor".into()),
                 project: Some("/repo/x".into()),
                 expires_at: None,
+                project_alias: None,
             })
             .unwrap();
         assert!(out.contains("Created pin"));
@@ -397,6 +412,7 @@ mod tests {
         let rendered = reopened
             .render_for_ambient(&AmbientPinQuery {
                 project: Some("/repo/x"),
+                project_alias: None,
                 bro: Some("executor"),
                 session_id: None,
                 thread_id: None,
@@ -427,6 +443,7 @@ mod tests {
                 target: Some(target.into()),
                 project: Some("/repo/x".into()),
                 expires_at: None,
+                project_alias: None,
             })
             .unwrap();
         }
@@ -434,6 +451,7 @@ mod tests {
         let rendered = pins
             .render_for_ambient(&AmbientPinQuery {
                 project: Some("/repo/x"),
+                project_alias: None,
                 bro: Some("executor"),
                 session_id: Some("sess-1"),
                 thread_id: Some("thread-abc12345"),
@@ -463,11 +481,13 @@ mod tests {
             target: Some("executor".into()),
             project: Some("/repo/x".into()),
             expires_at: None,
+            project_alias: None,
         })
         .unwrap();
 
         let leaked = pins.render_for_ambient(&AmbientPinQuery {
             project: Some("/repo/y"),
+            project_alias: None,
             bro: Some("executor"),
             session_id: None,
             thread_id: None,
@@ -480,6 +500,7 @@ mod tests {
 
         let no_project_query = pins.render_for_ambient(&AmbientPinQuery {
             project: None,
+            project_alias: None,
             bro: Some("executor"),
             session_id: None,
             thread_id: None,
@@ -493,6 +514,7 @@ mod tests {
         let matching = pins
             .render_for_ambient(&AmbientPinQuery {
                 project: Some("/repo/x"),
+                project_alias: None,
                 bro: Some("executor"),
                 session_id: None,
                 thread_id: None,
@@ -517,6 +539,7 @@ mod tests {
             target: Some("executor".into()),
             project: None,
             expires_at: None,
+            project_alias: None,
         })
         .unwrap();
 
@@ -524,6 +547,7 @@ mod tests {
             let rendered = pins
                 .render_for_ambient(&AmbientPinQuery {
                     project,
+                    project_alias: None,
                     bro: Some("executor"),
                     session_id: None,
                     thread_id: None,
@@ -532,6 +556,66 @@ mod tests {
                 .unwrap_or_else(|| panic!("project-agnostic pin should match project={project:?}"));
             assert!(rendered.contains("cross-project arc note"));
         }
+    }
+
+    /// A pin keyed to a literal worktree path (pre-rescope write) still
+    /// injects when the dispatch passes the worktree cwd as the ALIAS next to
+    /// the resolved base scope — and the list project filter honors the same
+    /// alias. Guards both halves of the worktree→base aliasing contract.
+    #[test]
+    fn project_alias_matches_worktree_keyed_pins() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::open(&path).unwrap();
+
+        pins.pin(&PinParams {
+            action: "set".into(),
+            content: Some("legacy worktree-keyed guidance".into()),
+            title: Some("legacy".into()),
+            scope: Some("bro".into()),
+            target: Some("executor".into()),
+            project: Some("/state/fleet/worktrees/wt-1".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Base-scoped query alone misses it (out-of-tree path, no overlap)…
+        let miss = pins.render_for_ambient(&AmbientPinQuery {
+            project: Some("/registry/base"),
+            bro: Some("executor"),
+            ..Default::default()
+        });
+        assert!(miss.is_none());
+
+        // …but the dispatch's literal worktree cwd as alias bridges it.
+        let hit = pins
+            .render_for_ambient(&AmbientPinQuery {
+                project: Some("/registry/base"),
+                project_alias: Some("/state/fleet/worktrees/wt-1"),
+                bro: Some("executor"),
+                ..Default::default()
+            })
+            .expect("alias should match the worktree-keyed pin");
+        assert!(hit.contains("legacy worktree-keyed guidance"));
+
+        // The list project filter honors the same alias.
+        let listed = pins
+            .pin(&PinParams {
+                action: "list".into(),
+                project: Some("/registry/base".into()),
+                project_alias: Some("/state/fleet/worktrees/wt-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(listed.contains("legacy"));
+        let listed_without_alias = pins
+            .pin(&PinParams {
+                action: "list".into(),
+                project: Some("/registry/base".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(listed_without_alias, "0 pins");
     }
 
     #[test]
@@ -551,6 +635,7 @@ mod tests {
                 target: Some("executor".into()),
                 project: Some("/repo/x".into()),
                 expires_at: None,
+                project_alias: None,
             })
             .unwrap();
         }
@@ -558,6 +643,7 @@ mod tests {
         let rendered = pins
             .render_for_ambient(&AmbientPinQuery {
                 project: Some("/repo/x"),
+                project_alias: None,
                 bro: Some("executor"),
                 session_id: None,
                 thread_id: None,

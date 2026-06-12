@@ -989,13 +989,12 @@ mod tests {
             .write()
             .pin(&pins::PinParams {
                 action: "set".into(),
-                id: None,
                 content: Some("project pin".into()),
                 title: Some("project pin".into()),
                 scope: Some("session".into()),
                 target: Some("sid".into()),
                 project: Some(old_project.clone()),
-                expires_at: None,
+                ..Default::default()
             })
             .unwrap();
 
