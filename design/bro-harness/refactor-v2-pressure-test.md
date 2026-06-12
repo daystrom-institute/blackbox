@@ -398,6 +398,16 @@ prepare-time ceremony, no four-tier taxonomy. Two rungs:
   bindings unless discovery measurably hurts in probes — list/describe
   economics can ride `glob` + doc-comments first.
 
+  *Pilot validated (probe-recipe-1, 2026-06-12):* an agent given only "this
+  repo carries recipes/" listed the directory, read
+  `rust-rename-symbol.js`, judged the doc-comment contract "trustworthy on
+  its own", revived the function expression via eval, executed it
+  (cross-file rename, cargo check green) — 7 turns, zero errored cells, the
+  cleanest probe of the series. Its retro explicitly rejected index files
+  and a `recipes.list` binding as premature at this scale, confirming the
+  deferral; the only note was underusing `store(key, fn)`/`load` for
+  revival (re-embedded the source in eval twice) — discipline, not surface.
+
 **Refactor atoms demote.** v2 §7 made "a canned atom" the external
 interface; under the recipe tier that wrapper is redundant indirection: the
 recipe already carries the typed contract, and `bro_exec` already carries
