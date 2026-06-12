@@ -1177,6 +1177,7 @@ mod tests {
         let path = dir.path().join("knowledge.json");
         let store = KnowledgeStore {
             version: 1,
+            write_redirects: Default::default(),
             entries: vec![KnowledgeEntry {
                 id: "vector-only".into(),
                 title: "Vector only".into(),

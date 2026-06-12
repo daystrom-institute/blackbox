@@ -279,6 +279,7 @@ mod tests {
             &kb_path,
             serde_json::to_string(&KnowledgeStore {
                 version: 1,
+                write_redirects: Default::default(),
                 entries: vec![],
             })
             .unwrap(),

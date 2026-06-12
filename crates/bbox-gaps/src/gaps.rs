@@ -176,10 +176,14 @@ pub struct GapNote {
     //    scope, exactly like knowledge entries omit `project`). ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// Internal committed-file write target. Used when a managed fleet worktree
-    /// should carry the repo-owned gap file while `project` remains the durable
-    /// base scope. Never serialized into committed gap records.
-    #[serde(skip)]
+    /// Committed-file write target. Used when a managed fleet worktree
+    /// should carry the repo-owned gap file while `project` remains the
+    /// durable base scope. Persisted in the CENTRAL store only — so a
+    /// redirected gap survives a daemon restart before its worktree branch
+    /// merges (gap-ee8c4373) — and always cleared from committed gap records
+    /// (`persist_repo_gap_entries` / `load_repo_gap_entries`): on-disk
+    /// location encodes the carrier, exactly like `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -612,6 +616,11 @@ fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
             }
         };
         entry.project = Some(project.clone());
+        // Committed records never carry a write redirect — the file's
+        // location IS the carrier. Clearing here also makes loading a base
+        // root's file the merge-observation signal that drops a retained
+        // redirect (the load overwrites the central copy by id).
+        entry.write_dir = None;
         if entry.updated_at.is_empty() {
             entry.updated_at = entry.created_at.clone();
         }
@@ -687,6 +696,7 @@ fn persist_repo_gap_entries(
     for entry in entries {
         let mut on_disk = (*entry).clone();
         on_disk.project = None;
+        on_disk.write_dir = None;
         let path = dir.join(format!("{}.json", entry.id));
         let new_bytes = serde_json::to_vec_pretty(&on_disk)?;
         if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
@@ -781,22 +791,35 @@ impl GapStore {
         for g in &self.data.gaps {
             match g.project.as_deref() {
                 Some(dir) if !dir.is_empty() => {
-                    let write_dir = g.write_dir.as_deref().unwrap_or(dir);
-                    if project_is_repo_owned(Path::new(write_dir)) {
-                        by_project
-                            .entry(PathBuf::from(write_dir))
-                            .or_default()
-                            .push(g);
-                        if write_dir != dir {
+                    match g.write_dir.as_deref().filter(|d| !d.is_empty() && *d != dir) {
+                        // Redirected gap: the worktree file carries it, but
+                        // that file is invisible to reload until the branch
+                        // merges into a registered base root — so central
+                        // RETAINS the gap (write_dir included) across daemon
+                        // restarts (gap-ee8c4373). Loading the base root's
+                        // committed file later overwrites the retained copy
+                        // (write_dir cleared at load) and the next save
+                        // drops it from central.
+                        Some(write_dir) if project_is_repo_owned(Path::new(write_dir)) => {
+                            by_project
+                                .entry(PathBuf::from(write_dir))
+                                .or_default()
+                                .push(g);
                             redirected
                                 .entry(PathBuf::from(dir))
                                 .or_default()
                                 .insert(g.id.as_str());
+                            central.gaps.push(g.clone());
                         }
-                    } else if project_is_repo_owned(Path::new(dir)) {
-                        by_project.entry(PathBuf::from(dir)).or_default().push(g);
-                    } else {
-                        central.gaps.push(g.clone());
+                        // Redirect target gone (worktree removed before
+                        // merging): central-only. Never fall back to writing
+                        // the base checkout — the daemon does not update the
+                        // base on a branch's behalf.
+                        Some(_) => central.gaps.push(g.clone()),
+                        None if project_is_repo_owned(Path::new(dir)) => {
+                            by_project.entry(PathBuf::from(dir)).or_default().push(g);
+                        }
+                        None => central.gaps.push(g.clone()),
                     }
                 }
                 _ => central.gaps.push(g.clone()),
@@ -1648,6 +1671,100 @@ mod tests {
             fs::read_to_string(&base_file).unwrap(),
             base_before,
             "base checkout copy must be byte-for-byte untouched"
+        );
+    }
+
+    /// A redirected gap survives a daemon restart via central retention
+    /// (gap-ee8c4373): the worktree file is invisible to reload until the
+    /// branch merges, so central keeps the gap (write_dir included). Once
+    /// the base root's committed file appears, the load overwrites the
+    /// retained copy (write_dir cleared) and the next save drops it from
+    /// central.
+    #[test]
+    fn redirected_gap_survives_reopen_and_heals_on_base_merge() {
+        let base_dir = tempdir().unwrap();
+        let root = base_dir.path().canonicalize().unwrap();
+        let wt_dir = tempdir().unwrap();
+        let wt = wt_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
+        fs::create_dir_all(wt.join(".bbox/gaps")).unwrap();
+        let central = tempdir().unwrap();
+        let store_path = central.path().join("gaps.json");
+
+        let mut store = GapStore::open(&store_path).unwrap();
+        store.set_project_roots(vec![root.clone()]).unwrap();
+        let mut p = project_params("survivor", "tooling/test-domain/survivor", &root);
+        p.write_dir = Some(wt.to_string_lossy().into_owned());
+        let (id, created) = store.file(&p).unwrap();
+        assert!(created);
+        let wt_file = wt.join(".bbox/gaps").join(format!("{id}.json"));
+        let base_file = root.join(".bbox/gaps").join(format!("{id}.json"));
+        assert!(wt_file.exists(), "worktree carries the redirected gap");
+        assert!(!base_file.exists(), "base checkout must stay untouched");
+        drop(store);
+
+        // Daemon restart before the merge: the gap must still be there.
+        let mut store = GapStore::open(&store_path).unwrap();
+        store.set_project_roots(vec![root.clone()]).unwrap();
+        let g = store
+            .data
+            .gaps
+            .iter()
+            .find(|g| g.id == id)
+            .expect("redirected gap retained in central across reopen");
+        assert_eq!(g.write_dir.as_deref(), Some(wt.to_str().unwrap()));
+        assert_eq!(g.project.as_deref(), Some(root.to_str().unwrap()));
+
+        // Merge lands: base root now carries the committed file.
+        fs::copy(&wt_file, &base_file).unwrap();
+        store.reload().unwrap();
+        let g = store.data.gaps.iter().find(|g| g.id == id).unwrap();
+        assert!(
+            g.write_dir.is_none(),
+            "observing the base file must drop the redirect"
+        );
+        store.save().unwrap();
+        let central_raw = fs::read_to_string(&store_path).unwrap();
+        assert!(
+            !central_raw.contains(&id),
+            "merged gap must leave the central store"
+        );
+        assert!(base_file.exists());
+    }
+
+    /// A redirect whose worktree disappeared before merging keeps the gap
+    /// central-only: the daemon never falls back to writing the base
+    /// checkout on a branch's behalf.
+    #[test]
+    fn dead_worktree_redirect_stays_central_and_never_writes_base() {
+        let base_dir = tempdir().unwrap();
+        let root = base_dir.path().canonicalize().unwrap();
+        let wt_dir = tempdir().unwrap();
+        let wt = wt_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
+        fs::create_dir_all(wt.join(".bbox/gaps")).unwrap();
+        let central = tempdir().unwrap();
+        let store_path = central.path().join("gaps.json");
+
+        let mut store = GapStore::open(&store_path).unwrap();
+        store.set_project_roots(vec![root.clone()]).unwrap();
+        let mut p = project_params("orphaned", "tooling/test-domain/orphaned", &root);
+        p.write_dir = Some(wt.to_string_lossy().into_owned());
+        let (id, _) = store.file(&p).unwrap();
+
+        // Worktree removed before the branch merged.
+        drop(wt_dir);
+        store.save().unwrap();
+
+        let base_file = root.join(".bbox/gaps").join(format!("{id}.json"));
+        assert!(
+            !base_file.exists(),
+            "dead-worktree redirect must not fall back to a base-checkout write"
+        );
+        let central_raw = fs::read_to_string(&store_path).unwrap();
+        assert!(
+            central_raw.contains(&id),
+            "dead-worktree redirect must stay central-retained"
         );
     }
 

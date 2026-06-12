@@ -10,6 +10,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Worktree-redirected repo-owned records (knowledge entries and gap notes)
+  now survive a daemon restart that happens before their worktree branch
+  merges: the central store retains the record (with its redirect marker)
+  until the committed file is observed under a registered base root, then
+  drops it. A redirect whose worktree disappeared stays central-only — the
+  daemon never falls back to writing the base checkout on a branch's
+  behalf. Committed repo files never carry the redirect marker.
 - Corpus ops from inside a worktree now key durable state to the registered
   base project. `bbox_learn` / `bbox_remember` / `bbox_decide` resolve a
   worktree `project` to the base scope and redirect the repo-owned
