@@ -23,6 +23,7 @@ An agent artifact carries:
 | `prompt_template` | Template with `{{args.field}}` expansion |
 | `dispatch_adapter` | Optional custom dispatch path (e.g. `badgey`) |
 | `cost_class` | `cheap` / `standard` / `expensive` |
+| `allow_recursion` | Declares a fan-out orchestrator: dispatch keeps the recursive `bro_*` tools available and injects the orchestrator directive. Reviewed at install; there is deliberately no per-call override on `bro_agent_dispatch` (ad-hoc recursive dispatch is `bro_exec`'s `allow_recursion`) |
 | `provenance_kind` | `bootstrap` / `learned` / `installed` |
 
 ## Installing agents

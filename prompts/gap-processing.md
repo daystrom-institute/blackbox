@@ -26,13 +26,15 @@ actionable, priority-ordered.
      Sieve     (actor=orchestrator, codex gpt-5.5)   merge verdicts → group/sort → vars.sieve
 ```
 
-> **Why a workflow, not a recursive bro.** A dispatched bro cannot reach
-> `bro_exec` (only `bro_agent_dispatch`, which hardcodes `allow_recursion=false`),
-> so the original "orchestrator bro fans out validator sub-bros" design dead-ends
-> on this build (confirmed live — see `gap-a5e152fb`). The workflow runtime owns
-> the `foreach` fan-out instead, sidestepping the dispatch limitation entirely and
-> giving deterministic state, schema-enforced validator output, and runtime
-> provenance. Heavy prose still lives in `prompts/agents/` so it stays tweakable.
+> **Why a workflow, not a recursive bro.** The workflow runtime owns the
+> `foreach` fan-out, giving deterministic state, schema-enforced validator
+> output, and runtime provenance. Heavy prose still lives in `prompts/agents/`
+> so it stays tweakable. (The dispatch limitation that originally forced this
+> shape — `bro_agent_dispatch` hardcoding `allow_recursion=false` — is resolved:
+> an agent manifest can declare `allow_recursion: true`, and
+> `bro_exec(bro="<brofile>", allow_recursion=true)` resolves standalone brofiles
+> by name, test-pinned. See `gap-a5e152fb`. The workflow remains the right shape
+> here for determinism, not as a workaround.)
 
 ## Preconditions
 

@@ -48,6 +48,16 @@ pub struct AgentManifest {
     #[serde(default = "default_cost_class")]
     pub cost_class: AgentCostClass,
 
+    /// Declares this agent a fan-out orchestrator: dispatch-by-name keeps the
+    /// recursive `bro_*` orchestration/control tools available (skips the
+    /// mechanical recursion guard) and injects the standing orchestrator
+    /// directive. A role property of the agent's design, reviewed at install —
+    /// not a per-call caller decision (`bro_agent_dispatch` deliberately has
+    /// no override param; ad-hoc recursive dispatch is `bro_exec`'s
+    /// `allow_recursion`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_recursion: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<crate::orchestration::allocator::RuntimeRequest>,
 
@@ -309,6 +319,7 @@ impl Default for AgentManifest {
             outputs: None,
             composition: None,
             cost_class: default_cost_class(),
+            allow_recursion: false,
             runtime: None,
             dispatch_adapter: None,
             provenance: None,
@@ -383,6 +394,7 @@ mod tests {
                 fan_out_aggregator: Some("vote-majority".into()),
             }),
             cost_class: AgentCostClass::Normal,
+            allow_recursion: true,
             runtime: None,
             dispatch_adapter: None,
             provenance: Some(AgentProvenance::HandAuthored {
@@ -394,6 +406,24 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         let parsed: AgentManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn agent_manifest_allow_recursion_defaults_false_and_skips_when_false() {
+        // Absent in JSON → false (back-compat with every installed agent).
+        let parsed: AgentManifest =
+            serde_json::from_value(serde_json::json!({"description": "Test agent manifest."}))
+                .unwrap();
+        assert!(!parsed.allow_recursion);
+        // False is elided from the artifact wire form; true is explicit.
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert!(json.get("allow_recursion").is_none());
+        let orchestrator = AgentManifest {
+            allow_recursion: true,
+            ..AgentManifest::default()
+        };
+        let json = serde_json::to_value(&orchestrator).unwrap();
+        assert_eq!(json["allow_recursion"], true);
     }
 
     #[test]

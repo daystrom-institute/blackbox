@@ -935,7 +935,10 @@ impl BlackboxServer {
                 cwd,
                 brofile_filters: Some(brofile_filters),
                 coerce_workspace,
-                allow_recursion: false,
+                // Manifest-declared orchestrator role (gap-a5e152fb): the
+                // recursion grant is catalog data reviewed at install, not a
+                // per-call param.
+                allow_recursion: manifest.allow_recursion,
                 allow_tools: None,
                 disallow_tools: None,
                 tool_placement: None,

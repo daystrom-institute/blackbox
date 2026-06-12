@@ -2507,6 +2507,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_exec_target_standalone_brofile_fallback() {
+        // gap-a5e152fb verification: `bro_exec(bro="<name>")` falls through
+        // the live-team selector to a saved brofile template by name — the
+        // launch path for ad-hoc recursion-enabled dispatch
+        // (`allow_recursion` rides ExecParams on this same path).
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let bf: orchestration::brofile::Brofile = serde_json::from_value(serde_json::json!({
+            "name": "orc-fallback",
+            "provider": "glm",
+            "model": "glm-4.7",
+        }))
+        .unwrap();
+        orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None)
+            .unwrap();
+
+        let (provider, _lens, opts, _env, _cwd, _filters, coerce, _ctx) = server
+            .resolve_exec_target(Some("orc-fallback"), None, None)
+            .expect("standalone brofile resolves by name");
+        assert_eq!(provider, Provider::Glm);
+        assert_eq!(
+            opts.and_then(|o| o.model),
+            Some("glm-4.7".to_string()),
+            "brofile model carries into exec opts"
+        );
+        assert!(!coerce);
+
+        let err = server
+            .resolve_exec_target(Some("no-such-bro"), None, None)
+            .unwrap_err();
+        assert!(err.contains("Unknown bro or brofile"), "got: {err}");
+    }
+
+    #[test]
     fn prune_task_ids_drops_only_listed_terminal_tasks() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
