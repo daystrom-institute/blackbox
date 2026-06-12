@@ -7,14 +7,18 @@
   "missing_primitive": "resolved base-project field on transcript/tool-call index docs (ingest-time worktree→base resolution + reindex backfill)",
   "fallback_used": "Query with substring fragments that match both path shapes (e.g. the repo directory name), or query per-worktree-path and merge manually.",
   "evidence": [
+    "crates/bbox-corpus-index/src/transcripts/projection.rs:55 (transcript doc project = literal cwd)",
+    "crates/bbox-corpus-index/src/transcripts/projection.rs:117 (tool-call doc, same)",
     "crates/bbox-corpus-index/src/index/search.rs:1178 (substring project filter on recorded cwd)",
     "src/tools/workspace.rs:346 (work_tool_calls project filter, same semantics)",
-    "crates/bbox-indexing/src/projects.rs:513 (resolve_base_project_for_scope — the ingest-time resolver to reuse)"
+    "crates/bbox-indexing/src/projects.rs:513 (resolve_base_project_for_scope — the ingest-time resolver to reuse)",
+    "design/corpus/agentic-corpus/project-taxonomy-standardization.md (taxonomy this fix must follow: project_id is the durable identity; resolution order; workspace maps for contained cwds)"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/transcript-index/worktree-session-base-project-keying",
+  "notes": "Intersects design/corpus/agentic-corpus/project-taxonomy-standardization.md (proposed): the fix MUST follow that taxonomy — stamp the durable project_id (not another path-shaped key) on transcript/tool-call docs at ingest, and resolve filter values per the doc's resolution order (project_id → alias → host path → workspace alias → cwd as legacy fallback), ideally via the shared resolver that design introduces (src/tools/scope.rs is the store-surface seed of it). Two inputs that design owns: (a) session workspace maps are the only way to key contained-execution cwds like /work/... — until they exist those records stay unkeyed, same bucket as deleted worktrees; (b) project aliases (\"blackbox\") should be accepted by the search filter once the resolver lands. Coordinate before implementing so the ingest keying and the ProjectContext resolver land compatibly.",
   "resolution": "unresolved",
   "created_at": "2026-06-12T17:21:00Z",
-  "updated_at": "2026-06-12T17:21:00Z"
+  "updated_at": "2026-06-12T17:57:09Z"
 }
