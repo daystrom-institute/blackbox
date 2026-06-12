@@ -335,14 +335,74 @@ library scripts or atoms, not new bindings.
 **Gates.** Tree-sitter-backed transforms port now (the java modules are
 daemon-independent; grammar via bbox-chunker). `rename_java_symbol` /
 `java_lsp_organize_imports` wait on `bro-lsp` growing jdtls (v2 §7's named
-gate). Atoms remain the external interface for MCP-only consumers — a
-canned atom whose implementation dispatches the cell path, never a vestigial
-MCP projection.
+gate). External/MCP-only consumers: see §6.6 — the atom tier is demoted;
+dispatch-a-worker-with-a-recipe is the interface.
 
 **Pilot.** One real, used transform first — `java_jooq_extract_repository`
 or `extract_java_class` — ported as a transform binding with the compact
 index + describe, probed on a Java fixture with the standard loop, before
 committing to the sweep.
+
+## 6.6 Macros fold down into recipes; the refactor-atom tier demotes
+
+**What `macro_*` is.** The macro synthesis layer
+(`design/refactor-tools/unified-code-synthesis-model.md`, lifecycle:
+partial; `crates/bbox-macros`, ~800KB incl. a 163K planner) is a
+**declarative recipe language**: `MacroDefinition` = versioned id +
+`inputs_schema` + probe slots + a fixed operation list (Probe/Emit/Rewrite
+via a JavaPoet-grade Java sidecar) + refusal predicates + validations +
+RX-V1 authority gates, with a bounded expression DSL (`expr.rs`: dotted-path
+context, predicates, `${path}` interpolation) gluing the steps. It is v2
+§1's diagnosis recurring one level up from `bbox_refactor_run`: probes are
+variables, the expr DSL is JS-badly, refusals are if-statements, the
+plan/apply two-phase is the choke point — **a programming language built
+because the real one didn't exist yet**. The corroborating signal: the
+shipped registry is EMPTY on the prod host — the machinery landed, the
+catalog never populated.
+
+**The fold-down mapping:**
+
+| Macro layer piece | Isolate successor |
+|---|---|
+| Probe slots → named context | `code.*`/`lsp.*` calls into JS variables |
+| `expr` predicate/interpolation DSL | plain JavaScript |
+| Refusal rules | early returns + the apply bounce |
+| Emit/Rewrite operations (Java sidecar) | **survives**: transform/emit bindings (§6.5 authorities returning changes) |
+| plan → apply two-phase | EditSet build → `edits.apply` (detections, no confirm) |
+| `MacroSemanticStatus` (`template_only`/`mixed`) | the ledger vocabulary; `template_only` upgrades to `syntax_only` at the choke point because tree-sitter validation always runs on written files |
+| Registry + version + `inputs_schema` + effects + authority gates | the **recipe contract** (below) |
+| `macro_*` MCP surface (8 tools) | retires at parity with the rest of the kill list |
+
+**Recipes — the named-artifact tier that replaces both macros and refactor
+atoms.** A recipe is a named, versioned **JS cell program** plus contract
+metadata (inputs schema, required namespaces, effect tags, authority gates —
+exactly what `MacroDefinition` got right, minus the operations DSL).
+Storage is repo-owned files (they travel with the checkout and are readable
+harness-natively — zero daemon reach-back, decision af3c4783). Invocation
+starts as **retrieval, not runtime**: `recipes.list()` / `recipes.get(id)`
+bindings return source + contract and the model adapts the program into its
+cell — zero runtime changes (the cell-dsl §8 tenant test), trust by review
+and versioning (cell-dsl §7), reproducibility traded honestly (v2 §5).
+Graduate to host-import execution (`await import("recipe:...")` — the
+`dynamic_import_callback` hook already exists in the runtime) only if
+probes show adaptation drift that retrieval can't hold.
+
+**Refactor atoms demote.** v2 §7 made "a canned atom" the external
+interface; under the recipe tier that wrapper is redundant indirection: the
+recipe already carries the typed contract, and `bro_exec` already carries
+dispatch — an MCP-only consumer (or a workflow step) dispatches a harness
+worker with a recipe reference. The promotion ladder for refactor work
+flattens to **improvised cell → recipe**; an atom is minted only if some
+external consumer genuinely earns a standing typed contract, never as the
+default end state. (Direction set in discussion 2026-06-12; supersedes the
+"canned atom" wording in v2 §7 and the third rung of cell-dsl §7's ladder
+for the refactor domain — revise those when promoting past proposed.)
+
+**Salvage list for bbox-macros:** the Java sidecar emission backend and the
+probe→code-nav bindings are real; the planner, registry, expr DSL, and the
+`macro_*` adapters dissolve. `unified-code-synthesis-model.md` is
+superseded-in-part by this section. Same strangler discipline as
+everything else: nothing retires until the recipe path holds under probes.
 
 ## 7. Validation: live probes + tailored retro
 
