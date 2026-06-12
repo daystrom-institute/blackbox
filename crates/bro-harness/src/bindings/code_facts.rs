@@ -383,10 +383,22 @@ impl Tool for CodeQuery {
                 };
             }
             // Batch: flat captures (spans name their file), per-file roll-up.
+            // Aggregate-capped: a broad query over a whole repo would
+            // otherwise flatten to a multi-MB array that OOMs the isolate
+            // (probe-dash-1, ~1,700 files). Once the flat array reaches the
+            // ceiling, stop accumulating, mark truncated, and report how far
+            // the scan got so the caller can narrow.
             let mut all_captures: Vec<Value> = Vec::new();
             let mut file_summaries: Vec<Value> = Vec::new();
             let mut truncated = false;
+            let mut files_scanned = 0usize;
+            let total_files = resolved.len();
             for (file, path) in &resolved {
+                if all_captures.len() >= facts::MAX_AGGREGATE_QUERY_CAPTURES {
+                    truncated = true;
+                    break;
+                }
+                files_scanned += 1;
                 match facts::file_query(path, &query, None) {
                     Ok(found) => {
                         truncated |= found.captures.len() >= facts::MAX_QUERY_CAPTURES;
@@ -407,18 +419,30 @@ impl Tool for CodeQuery {
             // Every file erroring is one upstream mistake (usually a
             // malformed query) — fail the call so the cell sees it once,
             // instead of an empty-but-plausible captures array.
-            if file_summaries.iter().all(|f| f.get("error").is_some()) {
+            if !file_summaries.is_empty() && file_summaries.iter().all(|f| f.get("error").is_some()) {
                 let first = file_summaries[0]["error"].as_str().unwrap_or("unknown");
                 return err(format!(
                     "code.query: all {} file(s) failed; first error: {first}",
                     file_summaries.len()
                 ));
             }
-            ToolResult::Json(json!({
+            let mut payload = json!({
                 "captures": all_captures,
                 "files": file_summaries,
                 "truncated": truncated,
-            }))
+            });
+            if truncated && files_scanned < total_files {
+                // Aggregate ceiling hit before the file set was exhausted —
+                // tell the caller exactly how to bound the next call.
+                payload["aggregate_capped"] = json!(true);
+                payload["files_scanned"] = json!(files_scanned);
+                payload["files_total"] = json!(total_files);
+                payload["hint"] = json!(format!(
+                    "stopped at {} captures across {files_scanned}/{total_files} files (aggregate cap). Narrow the query (more specific node/predicate) or the file set (a subdir via code.files({{dir}})), then re-run.",
+                    all_captures.len()
+                ));
+            }
+            ToolResult::Json(payload)
         })
         .await
     }
@@ -666,8 +690,8 @@ declare const code: {
   files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
   /** Inventory top-level syntax items. visibility is "pub"/"public"/... or undefined = private. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
   items(args: { file: string } | { files: string[] }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
-  /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. */
-  query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean }>;
+  /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. The batch is aggregate-capped (~20k captures): a broad query over a large repo sets aggregate_capped + files_scanned/files_total + hint — narrow the query or the file set and re-run rather than widening blindly. */
+  query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean; aggregate_capped?: boolean; files_scanned?: number; files_total?: number; hint?: string }>;
   /** Read the exact text of a Span; errors with stale_span on content drift. */
   read(args: { span: Span }): Promise<{ text: string; span: Span }>;
   /** Signature of the function item at/enclosing a Span (Rust only for now): name, visibility (null = private), params, return_type (null = unit), generics, is_async. Returned span covers the whole function item. Errors with stale_span on drift. */
@@ -953,6 +977,41 @@ mod tests {
             )
             .await;
         assert!(matches!(broken, ToolResult::Error(ref e) if e.contains("all 2 file(s) failed")), "{broken:?}");
+    }
+
+    #[tokio::test]
+    async fn query_batch_aggregate_caps_to_protect_isolate_heap() {
+        // probe-dash-1: a broad query over a large file set flattened to a
+        // multi-MB array and OOM'd the V8 isolate. The aggregate cap bounds
+        // the payload and tells the caller how to narrow.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Many files, each with several identifier captures, so the flat
+        // array crosses MAX_AGGREGATE_QUERY_CAPTURES well before the file
+        // set is exhausted.
+        let per_file = "pub fn a(){} pub fn b(){} pub fn c(){} pub fn d(){} pub fn e(){}\n";
+        let n_files = (bbox_refactor::facts::MAX_AGGREGATE_QUERY_CAPTURES / 5) + 200;
+        let mut files = Vec::with_capacity(n_files);
+        for i in 0..n_files {
+            let name = format!("f{i}.rs");
+            std::fs::write(root.join(&name), per_file).unwrap();
+            files.push(name);
+        }
+        let out = json_of(
+            CodeQuery
+                .call(
+                    json!({ "files": files, "query": "(function_item name: (identifier) @fn)" }),
+                    &cx_in(&root),
+                )
+                .await,
+        );
+        let cap = bbox_refactor::facts::MAX_AGGREGATE_QUERY_CAPTURES;
+        let n = out["captures"].as_array().unwrap().len();
+        assert!(n <= cap + 5, "captures {n} exceeded aggregate cap {cap}");
+        assert!(n >= cap, "expected the cap to actually bite, got {n}");
+        assert_eq!(out["aggregate_capped"], true, "{}", out["hint"]);
+        assert!(out["files_scanned"].as_u64().unwrap() < n_files as u64);
+        assert!(out["hint"].as_str().unwrap().contains("Narrow"));
     }
 
     #[tokio::test]

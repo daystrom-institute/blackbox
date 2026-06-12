@@ -491,6 +491,80 @@ probe→code-nav bindings are real; the planner, registry, expr DSL, and the
 superseded-in-part by this section. Same strangler discipline as
 everything else: nothing retires until the recipe path holds under probes.
 
+## 6.7 Two tiers: facts (surgical, bounded) vs analysis (reduce Rust-side)
+
+The Java decomposition campaign (probe-dash-1/2 against a ~3,700-line
+Vaadin view god class, 2026-06-12) forced a distinction §5 named but never sharpened:
+**`code.*` facts and `analysis.*` are different tiers with different
+payload contracts, and conflating them breaks at god-class scale.**
+
+The failure that taught it: a god-class decomposition needs the *cohesion
+structure* — which methods belong together. Driven through `code.*` facts
+it fails two ways, both observed:
+
+- **Sweep and die.** `code.query({files: <all ~1,700>})` to count where each
+  field is referenced flattened to a multi-MB capture array that OOM'd the
+  V8 isolate (~1.5 GB default heap; values-not-refs means big values live in
+  the isolate — §2). Fixed with an aggregate cap (`MAX_AGGREGATE_QUERY_CAPTURES`),
+  but the cap is a *guardrail*, not the answer: it truncates, and truncation
+  is bounded-loss.
+- **Avoid the sweep and grind.** The next probe stayed under the cap by doing
+  ~50 targeted `code.query`/`code.read` cells, reconstructing the
+  field-touch/call graph in JS by hand. It got the *right* answer (a clean
+  7-method seam, avoided the forwarded-field trap, compiled green) — at
+  52 cells, 50 of them analysis.
+
+Same missing capability, two faces. The resolution is the tier split:
+
+| | **facts (`code.*`)** | **analysis (`analysis.*`)** |
+|---|---|---|
+| Answers | "where is X?" (for editing) | "what is the structure of X?" (a question) |
+| Returns | hash-anchored Spans | a small reduced structure |
+| Reduction | none — raw nodes | **Rust-side**; raw intermediate never enters the isolate |
+| Payload | aggregate-capped (never sweep a repo for raw spans) | bounded by construction (the answer is small) |
+| Example | `code.query` captures | `analysis.cohesionClusters` → cluster graph |
+
+Crucially the analysis tier is **still values-not-refs** (§2): the returned
+value is the reduced answer, computed where the data already lives. The
+platform principle was never "rebuild every Rust computation in JS from raw
+facts" — it was "compose bounded values." Treating `code.query`
+raw-capture composition as a substitute for a reduction binding was the
+error. The cap stays as the facts-tier guardrail (its hint can point at
+`analysis.*` once richer reductions land); the heap stays at V8 default
+(raising it only defers the same OOM on a bigger repo — operator call,
+2026-06-12: "give the agents better tools and prose, not a bigger heap").
+
+**First analysis binding (shipped):** `analysis.cohesionClusters(file)` —
+the v1 `extract_java_class_cohesive_clusters` planner ported as a binding
+(thin adapter over `bbox_refactor::plan`, the `java.extractClass` pattern).
+Returns the reduced cluster graph: per-cluster `{name_hint, item_names,
+move_fields, score, expected_wiring}` + `cross_cluster_calls`, each cluster
+ready to feed `java.extractClass`. One fix the port forced: the v1 walker
+counts the **constructor** as a method, and a constructor assigns ~every
+field, so its `method_to_field` edges transitively merge all concerns into
+one cluster — fatal on the exact god classes this targets. Constructors are
+never extracted to a delegate, so the clustering now drops them
+(`cohesive_clusters.rs`); strictly correct for cohesion, benefits the
+retiring MCP path too.
+
+**Honest limitation (carried open).** On the real view god class the
+binding returns 5 clusters but the dominant one is a 56-method megablob
+(transitive field-sharing collapses concerns whenever a single *connector*
+field — a shared container, a `getFreshData`-style dispatcher — bridges
+them). It still beats 50 cells of grind (the agent gets scored, wired,
+extract-ready seams including a clean 9-method `on*`-handler cluster), but
+transitive closure is too coarse for deeply-tangled classes. The refinement
+— connector-aware clustering (down-weight or cut high-fan-out bridge
+fields/methods before partitioning), better `name_hint` inference — is a
+real analysis-quality project, filed as a gap, not blocking the tier.
+
+This is the third tenant shape after the refactor algebra and the transform
+toolbox: a domain joins `analysis.*` by shipping one reduce-Rust-side
+binding + a compact `analysis.describe` contract, zero runtime changes
+(cell-dsl §8). Candidate siblings: `analysis.dependencyGraph`
+(`java_class_dependency_analysis`), `analysis.references` (the count-mode
+gap-31dc1375 wanted), `analysis.captures` (§5's extract-class support).
+
 ## 7. Validation: live probes + tailored retro
 
 Patterns earn their place by probe, not by this doc:

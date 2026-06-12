@@ -92,6 +92,21 @@ pub(crate) fn plan_extract_java_class_cohesive_clusters(p: &RefactorPlanParams) 
         })
         .unwrap_or_default();
 
+    // Exclude constructors from the clustering signal. A constructor
+    // (name == class name) assigns essentially every field, so its
+    // method_to_field edges connect all fields transitively and collapse
+    // every concern into one cluster — fatal on exactly the god classes
+    // this analysis targets (a 30-field view-class ctor merges
+    // everything). Constructors are never extracted to a delegate anyway,
+    // so dropping them from the graph is strictly correct for cohesion.
+    let methods: Vec<String> = methods.into_iter().filter(|m| *m != class_name).collect();
+    let m2f_pairs: Vec<(String, String)> =
+        m2f_pairs.into_iter().filter(|(m, _)| *m != class_name).collect();
+    let m2m_pairs: Vec<(String, String)> = m2m_pairs
+        .into_iter()
+        .filter(|(from, to)| *from != class_name && *to != class_name)
+        .collect();
+
     let clustering = cluster_methods(&methods, &fields, &m2f_pairs, &m2m_pairs);
     let cross_cluster_calls = compute_cross_cluster_calls(&m2m_pairs, &clustering);
 

@@ -121,6 +121,15 @@ pub struct FileQueryFacts {
 /// query (e.g. `(identifier) @x` over a generated file) stays bounded.
 pub const MAX_QUERY_CAPTURES: usize = 5_000;
 
+/// Aggregate ceiling on captures returned by ONE multi-file `code.query`
+/// fan-out. The per-file [`MAX_QUERY_CAPTURES`] does not bound a batch over a
+/// whole repo: a broad query across a large repo (~1,700 files, probe-dash-1)
+/// flattened to a multi-MB JSON array that OOM'd the V8 isolate parsing the
+/// tool result. Values-not-refs (cell-dsl §2) means big values live in the
+/// isolate heap, so the binding must cap the payload it hands back — the
+/// caller narrows the query or the file set and re-runs.
+pub const MAX_AGGREGATE_QUERY_CAPTURES: usize = 20_000;
+
 /// Run a tree-sitter query over `path`, optionally restricted to matches
 /// intersecting the `within` byte range.
 pub fn file_query(

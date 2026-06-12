@@ -854,10 +854,21 @@ fn first_constructor_node<'a>(class_node: Node<'a>, source: &str) -> Option<Node
 }
 
 fn constructor_body_insert_position(constructor: Node<'_>, source: &str) -> usize {
-    constructor
-        .child_by_field_name("body")
-        .map(|body| body.start_byte() + 1)
-        .unwrap_or_else(|| find_open_brace_position(constructor, source) + 1)
+    match constructor.child_by_field_name("body") {
+        Some(body) => {
+            // An explicit constructor invocation (`super(...)` / `this(...)`)
+            // must remain the body's first statement (JLS 8.8.7); inserting
+            // before it produces an error node and the apply bounces
+            // (probe-pg-2: a constructor whose first statement is `super();`).
+            let mut cursor = body.walk();
+            let first_stmt = body.named_children(&mut cursor).next();
+            match first_stmt {
+                Some(stmt) if stmt.kind() == "explicit_constructor_invocation" => stmt.end_byte(),
+                _ => body.start_byte() + 1,
+            }
+        }
+        None => find_open_brace_position(constructor, source) + 1,
+    }
 }
 
 /// Gap 8: state carried between the wiring-insert decision and the

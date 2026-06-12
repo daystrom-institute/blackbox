@@ -64,6 +64,10 @@ struct ExtractClassParams {
     /// "own_construction" (default) | "external_injection" | "none".
     #[serde(default)]
     wiring: Option<String>,
+    /// Keep thin delegating wrappers on the source for the moved methods, so
+    /// external callers keep compiling (v1 `source_delegate_wrappers`).
+    #[serde(default, alias = "keepPublicApi")]
+    wrappers: Option<bool>,
 }
 
 #[async_trait]
@@ -84,7 +88,8 @@ impl Tool for JavaExtractClass {
                 "methods": { "type": "array", "items": { "type": "string" }, "description": "Method names to move to the new class." },
                 "moveFields": { "type": "array", "items": { "type": "string" }, "description": "Field names to move with the methods (mutable fields written by extracted code MUST be listed here)." },
                 "className": { "type": "string", "description": "Name for the new class (default: derived from target filename)." },
-                "wiring": { "type": "string", "enum": ["own_construction", "external_injection", "none"], "description": "How the source obtains the delegate (default own_construction: private final field + ctor construction)." }
+                "wiring": { "type": "string", "enum": ["own_construction", "external_injection", "none"], "description": "How the source obtains the delegate (default own_construction: private final field + ctor construction)." },
+                "wrappers": { "type": "boolean", "description": "Keep thin delegating wrappers for the moved methods on the source class, preserving its public API. Pass true whenever callers OUTSIDE this file use the moved methods." }
             },
             "required": ["file", "target", "delegateField", "methods"]
         })
@@ -126,6 +131,9 @@ impl Tool for JavaExtractClass {
             if let Some(wiring) = &params.wiring {
                 plan_input["wiring_mode"] = json!({ "strategy": wiring });
             }
+            if let Some(wrappers) = params.wrappers {
+                plan_input["source_delegate_wrappers"] = json!(wrappers);
+            }
             let plan_params: bbox_refactor::RefactorPlanParams =
                 match serde_json::from_value(plan_input) {
                     Ok(p) => p,
@@ -135,7 +143,18 @@ impl Tool for JavaExtractClass {
             // no writes. Refusals surface as operator-actionable errors.
             let plan_json = match bbox_refactor::plan(&plan_params) {
                 Ok(s) => s,
-                Err(e) => return err(format!("java.extractClass: {e:#}")),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    // probe-pg-1: a re-call after a successful apply hits the
+                    // planner's target-exists refusal; without a hint the
+                    // agent shell-deletes the created file and loops.
+                    let hint = if msg.contains("missing or empty target") {
+                        " — if a prior cell already applied this extraction, the work is DONE (verify with code.items on the source file); re-calling the transform is only valid against a clean target. store() the transform result when you need it in later cells."
+                    } else {
+                        ""
+                    };
+                    return err(format!("java.extractClass: {msg}{hint}"));
+                }
             };
             let plan: bbox_refactor::RefactorPlan = match serde_json::from_str(&plan_json) {
                 Ok(p) => p,
@@ -259,6 +278,11 @@ PARAMS
                           own_construction: private final field + `new <Class>(...)` in the source ctor
                           external_injection: field only, a DI container populates it
                           none: no source-side wiring at all
+  wrappers?: boolean      keep thin delegating wrappers for the moved methods on the source class,
+                          preserving its public API. SURVEY CALLERS FIRST: if any file outside the
+                          source calls a moved method, pass wrappers: true or their compile breaks.
+                          Caller survey is one call: code.query({ files: (await code.files({ language: "java" })).files.map(f => f.file),
+                          query: "(method_invocation name: (identifier) @call)" }) then filter @call by method name.
 
 RETURNS { title, changes, creates, findings, fixme_count, provenance }
   changes:  hash-anchored {span, new_text}[] → edits.merge
@@ -277,13 +301,18 @@ RETURNS { title, changes, creates, findings, fixme_count, provenance }
 ERRORS (operator-actionable, fix and re-call)
   mutable_capture_with_write: extracted code writes mutable source field(s) — add them to moveFields
   invalid selection: a named method/field does not exist in the source class
+  target file exists: a prior cell already applied this extraction — the work is done; verify with
+                      code.items instead of re-calling. The transform is NOT idempotent over its own output.
 
-RECIPE
-  const r = await java.extractClass({ file, target, delegateField: "pricing", methods: ["price", "discount"] });
+RECIPE (one cell; locals do NOT survive across cells — store() anything you need later)
+  const r = await java.extractClass({ file, target, delegateField: "pricing",
+                                      methods: ["price", "discount"], wrappers: true });
+  store("xc", { findings: r.findings, files: r.creates.map(c => c.path) });  // survives cell death
   const es = await edits.begin();
   for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
   await edits.merge({ es, changes: r.changes });
-  const applied = await edits.apply({ es });   // tree-sitter validates both files; bounces roll back"#;
+  const applied = await edits.apply({ es });   // tree-sitter validates both files; bounces roll back
+  // then compile-gate via shell (e.g. ./gradlew :module:compileJava) and report"#;
 
 #[async_trait]
 impl Tool for JavaDescribe {
@@ -345,8 +374,8 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
-  /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Refusals are errors naming the exact fix. */
-  extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none" }): Promise<JavaTransformResult>;
+  /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). Refusals are errors naming the exact fix. */
+  extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean }): Promise<JavaTransformResult>;
 };"#
             .to_string(),
     }
@@ -463,6 +492,44 @@ public class OrderService {
     }
 
     #[tokio::test]
+    async fn wrappers_keep_delegating_stubs_on_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/OrderService.java"), FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let r = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/OrderService.java",
+                        "target": "src/OrderPricing.java",
+                        "delegateField": "pricing",
+                        "methods": ["price", "discount"],
+                        "wrappers": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        // With wrappers, the source-side changes REPLACE method bodies with
+        // delegating stubs rather than deleting the methods: the public API
+        // survives for external callers (probe-pg-1's discovered need).
+        let source_changes: String = r["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["span"]["file"] == "src/OrderService.java")
+            .map(|c| c["new_text"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            source_changes.contains("pricing.price(") || source_changes.contains("return pricing."),
+            "expected delegating wrapper bodies in source changes: {source_changes}"
+        );
+    }
+
+    #[tokio::test]
     async fn mutable_capture_with_write_is_an_actionable_error() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -550,6 +617,117 @@ public class OrderService {
         let target = std::fs::read_to_string(root.join("src/com/acme/OrderPricing.java")).unwrap();
         assert!(target.contains("class OrderPricing"), "{target}");
         assert!(target.contains("public double price"), "{target}");
+    }
+
+    // probe-pg-2 reported wrapper insertion landing after the class closing
+    // brace on a class whose tail is a nested record (a real-world shape).
+    // Reproduction fixture: ctor + moved methods + trailing method +
+    // nested record at the end of the class body.
+    const NESTED_TAIL_FIXTURE: &str = r#"package com.acme;
+
+import java.util.List;
+
+public class AggregationAdmin {
+    private final double rate;
+
+    public AggregationAdmin(double rate) {
+        super();
+        this.rate = rate;
+    }
+
+    public void saveThings(final long id, final List<String> things) {
+        System.out.println("save " + id + things.size() * rate);
+    }
+
+    public void removeThings(final long id) {
+        System.out.println("remove " + id);
+    }
+
+    public List<String> fetchOther(final long id) {
+        return List.of(Long.toString(id));
+    }
+
+    public record TagData(
+            long id,
+            String name) {
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn wrappers_stay_inside_class_with_nested_record_tail() {
+        use super::super::edit_algebra::{
+            EditStore, EditsApply, EditsBegin, EditsCreateFile, EditsMerge,
+        };
+        use super::super::ledger::ProvenanceLedger;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/AggregationAdmin.java"), NESTED_TAIL_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let r = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/AggregationAdmin.java",
+                        "target": "src/AggregationWriter.java",
+                        "delegateField": "writer",
+                        "methods": ["saveThings", "removeThings"],
+                        "wrappers": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let store = Arc::new(EditStore::default());
+        let ledger = Arc::new(ProvenanceLedger::default());
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        for create in r["creates"].as_array().unwrap() {
+            json_of(
+                EditsCreateFile(store.clone())
+                    .call(
+                        json!({ "es": es, "path": create["path"], "content": create["content"] }),
+                        &cx,
+                    )
+                    .await,
+            );
+        }
+        json_of(
+            EditsMerge(store.clone(), ledger)
+                .call(json!({ "es": es, "changes": r["changes"] }), &cx)
+                .await,
+        );
+        let applied = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(applied["applied"], true, "{applied}");
+
+        let source = std::fs::read_to_string(root.join("src/AggregationAdmin.java")).unwrap();
+        // Wrappers delegate on the source...
+        assert!(source.contains("writer.saveThings("), "{source}");
+        // ...and live INSIDE the class body: nothing but whitespace may follow
+        // the final closing brace.
+        let last_brace = source.rfind('}').unwrap();
+        assert!(
+            source[last_brace + 1..].trim().is_empty(),
+            "content after final brace: {:?}",
+            &source[last_brace + 1..]
+        );
+        // The class still parses with the record intact and no stray braces:
+        // brace balance must be zero.
+        let balance: i64 = source
+            .chars()
+            .map(|c| match c {
+                '{' => 1,
+                '}' => -1,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(balance, 0, "unbalanced braces:\n{source}");
     }
 
     #[tokio::test]
