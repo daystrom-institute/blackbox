@@ -53,6 +53,12 @@ pub struct HybridSearchParams {
     /// vocabulary like "voyage" or "embed").
     #[serde(default)]
     pub project: Option<String>,
+    /// Operator-probe override for the combined rerank multiplier cap
+    /// (default 1.5, clamped to [1.0, 4.0]). Exists so eval sweeps can
+    /// measure ranking quality per candidate cap (gap-39b3ce16 protocol in
+    /// bbox_corpus_core::search::metrics); not intended for normal callers.
+    #[serde(default)]
+    pub rerank_cap: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,11 +250,15 @@ pub fn hybrid_search_typed(
         &mut loaded_properties,
     )?;
     let now = Utc::now();
+    let rerank_cap = p
+        .rerank_cap
+        .unwrap_or(rerank::DEFAULT_COMBINED_CAP)
+        .clamp(1.0, 4.0);
     let mut results = fused
         .into_iter()
         .map(|hit| {
             let feature = features.get(&hit.entity_id).cloned().unwrap_or_default();
-            let score = rerank::apply_rerank(hit.score, &feature, now);
+            let score = rerank::apply_rerank_with_cap(hit.score, &feature, now, rerank_cap);
             let bm25 = bm25_hits
                 .iter()
                 .find(|bm25| bm25.entity_id == hit.entity_id);

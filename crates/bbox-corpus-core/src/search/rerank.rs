@@ -57,11 +57,27 @@ pub fn temporal_decay(features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
     (base + recall_boost + recency_boost).clamp(0.50, 1.25)
 }
 
+/// Default ceiling on the combined type x temporal multiplier. Untuned
+/// (gap-39b3ce16): sweep candidate caps through `apply_rerank_with_cap`
+/// against the eval-suite ranking metrics before trusting this number.
+pub const DEFAULT_COMBINED_CAP: f32 = 1.50;
+
 pub fn apply_rerank(base_score: f32, features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
+    apply_rerank_with_cap(base_score, features, now, DEFAULT_COMBINED_CAP)
+}
+
+/// `apply_rerank` with an explicit combined-multiplier cap, for eval sweeps.
+pub fn apply_rerank_with_cap(
+    base_score: f32,
+    features: &RerankFeatures,
+    now: DateTime<Utc>,
+    cap: f32,
+) -> f32 {
     let uncapped = base_score * type_multiplier(features) * temporal_decay(features, now);
     // Keep independent type and temporal boosts from compounding into a
-    // runaway promotion; one result can gain at most 50% over its base RRF rank.
-    uncapped.min(base_score * 1.50)
+    // runaway promotion; one result can gain at most (cap - 1) over its
+    // base RRF rank.
+    uncapped.min(base_score * cap)
 }
 
 fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
