@@ -1,0 +1,19 @@
+{
+  "id": "gap-451335b6",
+  "title": "MCP boolean (and sequence) params are stringified by the chat harness dispatcher; only the `exec` sandbox preserves native JSON types",
+  "gap_kind": "tooling",
+  "domain": "mcp_tool_dispatch",
+  "wanted_capability": "Chat-harness MCP tool dispatch should preserve JSON argument types (booleans, numbers, nulls, arrays, objects) when serializing tool call arguments, OR every bbox tool with a boolean or array-typed param should accept both JSON `true`/`false` and the strings \"true\"/\"false\" (and JSON-encoded sequences) so call sites work regardless of dispatch path. Today the chat surface silently turns every boolean into the string \"true\"/\"false\" and every array into a JSON-encoded string before the daemon sees the argument, which fails the deserialize step with no signal at the call site beyond the raw \"invalid type\" error.",
+  "fallback_used": "Wrapped the failing tool call in an `exec` cell so the JS value is serialized as a native JSON boolean/array, not the string \"true\" or a JSON-encoded array string. This is the same pattern used to file this very gap note (the first attempt failed with the identical string/sequence deserialize error).",
+  "evidence": [
+    "session:7be994da-030f-4eb3-a0c7-65a8d9121e49 - direct chat-dispatcher call to mcp__blackbox__bbox_thread_list(include_resolved: true) returned: \"failed to deserialize parameters: invalid type: string 'true', expected a boolean\".",
+    "Same call issued from inside an `exec` JavaScript cell with the native JS boolean `true` succeeded.",
+    "First attempt to file bbox_gap with evidence: [\"...\"] was sent as evidence: \"[\\\"...\\\"]\" and produced \"invalid type: string [...], expected a sequence\"."
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/mcp-tool-dispatch/boolean-param-stringified",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T05:53:27Z",
+  "updated_at": "2026-06-12T05:53:27Z"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "gap-518d7215",
+  "title": "bbox_thread resolve/get returns \"Thread not found\" for IDs that bbox_thread_list just returned",
+  "gap_kind": "mcp_surface",
+  "domain": "thread_store",
+  "wanted_capability": "bbox_thread resolve/get should resolve any thread id returned by bbox_thread_list under the same project filter that produced the list; the list endpoint and the resolve/get endpoint must agree on project scoping and lookup keys. Today the list returns thread ids from projects the resolve endpoint cannot find, and explicit `project` parameters on resolve do not bridge the gap. There is no diagnostic that tells the caller why the ids do not resolve (no project key, scope filter, or hash mismatch is surfaced), so callers cannot tell whether the threads were concurrently removed, indexed under a different project key, or never reachable to begin with.",
+  "fallback_used": "None on the surface - the threads vanished from the store on a follow-up listing, so the bulk resolve was completed (by an unknown mechanism) but the operator-visible \"close out 20 threads\" request could not be confirmed from the dispatch surface alone. No way to recover or audit what actually closed them.",
+  "evidence": [
+    "session:7be994da-030f-4eb3-a0c7-65a8d9121e49 - bbox_thread_list (include_resolved: true) returned 25 threads, of which 20 were in unresolved states across the blackbox and bbox-state-test projects (18 fixture threads thread-1c0ed2d1..thread-1c0edf19 in bbox-state-test, plus thread-7f01324e and thread-2c35c7b6 in blackbox).",
+    "All 20 bbox_thread(action=resolve) calls returned \"Error: Thread not found: <id> (expected `thread-<8hex>`, e.g. `thread-7f01324e`)\" - both with no project param and with explicit project path (/Users/invidious/repos/blackbox, /Users/invidious/repos/bbox-state-test).",
+    "bbox_thread(action=get) on thread-7f01324e with the explicit project path also returned \"Error: Thread not found\".",
+    "The threads later disappeared from bbox_thread_list as well, suggesting either concurrent cleanup by another agent (AGENTS.md notes that .bbox state mutates mid-session from peer agents) or a list/resolve lookup divergence at the daemon level."
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "mcp_surface/thread-store/list-vs-resolve-inconsistency",
+  "resolution": "unresolved",
+  "created_at": "2026-06-12T05:53:27Z",
+  "updated_at": "2026-06-12T05:53:27Z"
+}
