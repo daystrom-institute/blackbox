@@ -13,7 +13,9 @@
   "blocking_level": "none",
   "dedupe_key": "eval_coverage/rerank/empirical-tuning",
   "notes": "Measurement substrate shipped on beta/blackbox-v2: bbox_corpus_core::search::metrics (MRR, recall@k, aggregate report), apply_rerank_with_cap + DEFAULT_COMBINED_CAP, and an operator-probe rerank_cap param on bbox_hybrid_search (clamped [1.0,4.0]). Remaining work to close: run the live sweep — per candidate cap in ~{1.0,1.25,1.5,1.75,2.0,2.5}, run the 30 eval-suite queries (eval/check.rs MANIFEST_SOURCES) through bbox_hybrid_search with rerank_cap set and limit=50 against the populated corpus, aggregate ranked entity_ids vs expected_entity_refs with metrics::aggregate, pick the cap by MRR/recall@10, and bake it into DEFAULT_COMBINED_CAP. Needs a daemon running this build. NOTE: the recall_boost dead-signal bug (rerank.rs ln_1p(1+count) saturation) was fixed in the same batch — sweep results predate-invalid any earlier intuition about the temporal lane.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:05:35Z",
-  "updated_at": "2026-06-12T19:37:07Z"
+  "updated_at": "2026-06-12T21:09:31Z",
+  "resolved_at": "2026-06-12T21:09:31Z",
+  "resolution_note": "Tuned empirically and baked in. Sweep: caps {1.0,1.25,1.5,1.75,2.0,2.5} × 30 eval queries via the bbox_hybrid_search rerank_cap operator probe against the live rebuilt corpus, scored with bbox_corpus_core::search::metrics (MRR, recall@k). MRR monotonic 0.066→0.175 up to 1.75, exact plateau after (1.75=2.0=2.5); recall@1 0→0.133. Mechanism understood, not just measured: max legitimate boost product is UserConfirmed 1.35 × temporal clamp 1.25 = 1.6875, so the old 1.5 cap truncated real knowledge promotions (every sweep mover was a decision-class query) and any cap ≥1.6875 never binds. DEFAULT_COMBINED_CAP is now 1.75 — smallest plateau value, frees current signals, backstops future boost stacking. Prerequisite fixed in the same arc: the recall_boost saturation bug (ln_1p(1+count) ≥ cap at count=0) which had deadened the temporal lane. Note: flat 0.20 recall ceiling across ALL caps is eval expected-ref drift — that's gap-b44fe7ac (refresh script), not ranking. Sweep script preserved the protocol documented in search::metrics module header."
 }
