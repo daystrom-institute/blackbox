@@ -187,7 +187,14 @@ These are the load-bearing risks; each phase below must hold them.
 - **Phase 3 — atom/workflow-native surface.** Consultant atom backend,
   workflow ops for split apply, generic `consultant_*` MCP tools; `badgey_*`
   become shims; `system-defaults/badgey/` arcs re-pointed or made
-  consumer-agnostic. Concerns 5/8/10 live here.
+  consumer-agnostic. Concerns 5/8/10 live here. *(Done: `consultant_*`
+  proposal tools + consumer registry (`ef0a69d`); turn-loop runtime split —
+  descriptor-parameterized `consultant_{exec,resume}_internal`, events moved
+  runtime-side, wrapper-command/post-processor explicitly consumer-gated
+  (`33d0d32`); `AtomImplementation::Consultant` invoke-per-turn backend +
+  `badgey-consult` atom (`87e8d73`). Generic exec/resume MCP tools were
+  deliberately NOT added: the atom backend is the consumer-agnostic turn
+  surface; dedicated tools would duplicate it.)*
 - **Phase 4 — state migration + retirement.** Migrate
   `state_dir/badgey/` → `state_dir/consultant/badgey/` (or adopt legacy-path
   read for the Badgey consumer permanently), deprecate shims, update
