@@ -373,19 +373,30 @@ catalog never populated.
 | Registry + version + `inputs_schema` + effects + authority gates | the **recipe contract** (below) |
 | `macro_*` MCP surface (8 tools) | retires at parity with the rest of the kill list |
 
-**Recipes — the named-artifact tier that replaces both macros and refactor
-atoms.** A recipe is a named, versioned **JS cell program** plus contract
-metadata (inputs schema, required namespaces, effect tags, authority gates —
-exactly what `MacroDefinition` got right, minus the operations DSL).
-Storage is repo-owned files (they travel with the checkout and are readable
-harness-natively — zero daemon reach-back, decision af3c4783). Invocation
-starts as **retrieval, not runtime**: `recipes.list()` / `recipes.get(id)`
-bindings return source + contract and the model adapts the program into its
-cell — zero runtime changes (the cell-dsl §8 tenant test), trust by review
-and versioning (cell-dsl §7), reproducibility traded honestly (v2 §5).
-Graduate to host-import execution (`await import("recipe:...")` — the
-`dynamic_import_callback` hook already exists in the runtime) only if
-probes show adaptation drift that retrieval can't hold.
+**The function store — the lighter successor (operator direction
+2026-06-12: "store()/load() for lambdas").** Salvages the load-bearing two
+ideas of the retired `narf-capability-library.md` (§2's session tier, §4's
+recall-by-name with source staying out of model context) and drops the rest
+— no decay scoring, no lifecycle states, no capability negotiation, no
+prepare-time ceremony, no four-tier taxonomy. Two rungs:
+
+- **Session rung — `store(key, fn)` / `load(key)` learn functions.** The
+  existing KV accepts a function value: the host persists its SOURCE
+  (`Function.prototype.toString`), and `load` revives it into a callable.
+  Zero new vocabulary — the idiom agents already know, extended to code.
+  The one real constraint is documented, not engineered: functions must be
+  **self-contained** (captured closure variables do not survive source
+  round-trip). Source crosses into the isolate on load but never into model
+  context — NARF §4's context economics, kept.
+- **Durable rung — a plain `recipes/` directory.** A recipe is a
+  self-contained JS function file with a doc-comment contract (inputs,
+  required namespaces, effects, authority gates — what `MacroDefinition`
+  got right, as prose). Git is the registry; review is the trust; the
+  version is the commit. Promotion is mundane: a proven stored function is
+  written to the file (by the cell through the choke point, or by the
+  operator); recall is `file_read` + the same revive. No `recipes.*`
+  bindings unless discovery measurably hurts in probes — list/describe
+  economics can ride `glob` + doc-comments first.
 
 **Refactor atoms demote.** v2 §7 made "a canned atom" the external
 interface; under the recipe tier that wrapper is redundant indirection: the

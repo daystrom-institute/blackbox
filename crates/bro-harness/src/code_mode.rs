@@ -605,6 +605,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn function_store_round_trips_callables_across_cells() {
+        // The function store: store(key, fn) persists source, load(key)
+        // revives a callable in a later (fresh) isolate.
+        let exec = exec_with(vec![Arc::new(Echo) as Arc<dyn Tool>]);
+        let _ = exec
+            .call(
+                json!({ "source": "store('helpers.double', (n) => n * 2);" }),
+                &test_cx(),
+            )
+            .await;
+        let result = exec
+            .call(
+                json!({ "source": "const double = load('helpers.double'); text(String(double(21)));" }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Text(t) => assert!(t.contains("42"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revived_function_with_lost_closure_fails_loudly_at_call() {
+        // The self-contained constraint is enforced by reality, not a rule:
+        // a captured variable is gone after source round-trip, and calling
+        // the revived function throws ReferenceError.
+        let exec = exec_with(vec![Arc::new(Echo) as Arc<dyn Tool>]);
+        let _ = exec
+            .call(
+                json!({ "source": "const factor = 3; store('helpers.scaled', (n) => n * factor);" }),
+                &test_cx(),
+            )
+            .await;
+        let result = exec
+            .call(
+                json!({ "source": "const scaled = load('helpers.scaled'); text(String(scaled(2)));" }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Error(e) => assert!(e.contains("factor is not defined"), "got: {e}"),
+            other => panic!("expected ReferenceError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn notify_payloads_ride_the_exec_result() {
         // notify() is buffered and delivered as a `[notifications]` section of
         // the exec result, not silently logged.
