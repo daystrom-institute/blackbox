@@ -15,6 +15,7 @@
 
 pub mod code_facts;
 pub mod edit_algebra;
+pub mod lsp_facts;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
     tools.extend(edit_algebra::tools(Arc::new(
         edit_algebra::EditStore::default(),
     )));
+    tools.extend(lsp_facts::tools(Arc::new(lsp_facts::LspState::default())));
     tools
 }
 
@@ -44,5 +46,6 @@ pub fn namespace_descriptions() -> BTreeMap<String, ToolNamespaceDescription> {
     BTreeMap::from([
         ("code".to_string(), code_facts::namespace_description()),
         ("edits".to_string(), edit_algebra::namespace_description()),
+        ("lsp".to_string(), lsp_facts::namespace_description()),
     ])
 }

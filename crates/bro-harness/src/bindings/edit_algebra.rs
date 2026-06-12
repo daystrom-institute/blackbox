@@ -357,6 +357,82 @@ impl Tool for EditsCreateFile {
     }
 }
 
+/// `edits.merge` — fold span-shaped changes (e.g. lsp.rename output) into
+/// an EditSet: server-authored and cell-authored edits compose into ONE
+/// artifact (refactor-tools-v2 §3.2).
+pub struct EditsMerge(pub Arc<EditStore>);
+
+#[derive(Deserialize)]
+struct MergeParams {
+    es: String,
+    changes: Vec<MergeChange>,
+}
+
+#[derive(Deserialize)]
+struct MergeChange {
+    span: Span,
+    new_text: String,
+}
+
+#[async_trait]
+impl Tool for EditsMerge {
+    fn name(&self) -> &str {
+        "edits.merge"
+    }
+    fn description(&self) -> &str {
+        "Fold span-shaped changes — e.g. the `changes` array from lsp.rename — into an EditSet (pure; builds, never writes). Each change is {span, new_text}; spans stay hash-pinned per file."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "es": { "type": "string", "description": "EditSet id from edits.begin." },
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "span": super::code_facts::span_schema_pub(),
+                            "new_text": { "type": "string" }
+                        },
+                        "required": ["span", "new_text"]
+                    }
+                }
+            },
+            "required": ["es", "changes"]
+        })
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("edits".to_string(), "merge".to_string()))
+    }
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let params: MergeParams = match decode(
+            "edits.merge",
+            "{ es: string, changes: { span: Span, new_text: string }[] }",
+            input,
+        ) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if params.changes.is_empty() {
+            return err("edits.merge: `changes` must be non-empty");
+        }
+        let mut total = 0usize;
+        for change in &params.changes {
+            let edit = TextEdit {
+                byte_start: change.span.byte_start,
+                byte_end: change.span.byte_end,
+                replacement: change.new_text.clone(),
+            };
+            match push_span_edit(&self.0, &params.es, &change.span, edit) {
+                Ok(_) => total += 1,
+                Err(e) => return err(format!("edits.merge: {e}")),
+            }
+        }
+        ToolResult::Json(json!({ "es": params.es, "merged": total }))
+    }
+}
+
 /// One structured bounce finding — span + classification + repair hint, so a
 /// repair cell acts without re-running discovery (v2 §4).
 fn finding(kind: &str, file: &str, detail: String, hint: &str) -> Value {
@@ -680,6 +756,7 @@ pub fn tools(store: Arc<EditStore>) -> Vec<Arc<dyn Tool>> {
         Arc::new(EditsInsertBefore(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsDelete(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsCreateFile(Arc::clone(&store))) as Arc<dyn Tool>,
+        Arc::new(EditsMerge(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsApply(store)) as Arc<dyn Tool>,
     ]
 }
@@ -958,7 +1035,7 @@ mod tests {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "edits".to_string(),
-        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, invalid_edits, create_exists, parse_error_after_apply, write_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is syntax_only for cell-authored edits."
+        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, invalid_edits, create_exists, parse_error_after_apply, write_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is syntax_only for cell-authored edits."
             .to_string(),
         declarations: r#"type Finding = { kind: "stale_span" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed"; file: string; detail: string; resolution_hint: string };
 type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; content_sha256: string }[]; semantic_status: "syntax_only"; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation — mint fresh Spans from it without re-calling code.items
@@ -976,6 +1053,8 @@ declare const edits: {
   delete(args: { es: string; span: Span }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue creation of a new file (pure; never writes; bounces if it exists at apply). */
   createFile(args: { es: string; path: string; content: string }): Promise<{ es: string; creates: number }>;
+  /** Fold span-shaped changes (e.g. lsp.rename().changes) into the set — server-authored edits join the same artifact (pure; never writes). */
+  merge(args: { es: string; changes: { span: Span; new_text: string }[] }): Promise<{ es: string; merged: number }>;
   /** THE choke point: apply the EditSet. Clean → Applied (EditSet consumed). Detected condition → Bounced with findings (EditSet retained for repair; writes rolled back). */
   apply(args: { es: string; validations?: "tree_sitter_no_errors"[] }): Promise<Applied | Bounced>;
 };"#

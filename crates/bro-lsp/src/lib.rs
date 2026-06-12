@@ -355,6 +355,66 @@ impl SessionPool {
         }
     }
 
+    /// `textDocument/rename` → the server-authored [`lsp_types::WorkspaceEdit`].
+    ///
+    /// Retries while the server is still warming (rust-analyzer answers
+    /// `ContentModified` (-32801) or retrigger-flagged `ServerCancelled`
+    /// (-32802) until the workspace is indexed), bounded by the configured
+    /// request timeout. Fails closed on an unavailable server — callers
+    /// (RX-V3) must never downgrade to a syntax-only approximation.
+    pub async fn rename(
+        &self,
+        doc: &OpenDocument,
+        position: lsp_types::Position,
+        new_name: impl Into<String>,
+    ) -> Result<lsp_types::WorkspaceEdit> {
+        let session = self.session(doc.root.clone(), doc.language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        if !session.documents.contains_key(&doc.uri) {
+            return Err(Error::DocumentNotOpen {
+                uri: doc.uri.clone(),
+            });
+        }
+        let params = lsp_types::RenameParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc.uri.clone(),
+                },
+                position,
+            },
+            new_name: new_name.into(),
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        };
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::Rename>(&params)
+                .await
+            {
+                Ok(Some(edit)) => return Ok(edit),
+                Ok(None) => {
+                    return Err(Error::Server {
+                        method: <lsp_types::request::Rename as Request>::METHOD.to_string(),
+                        error: serde_json::json!({
+                            "message": "server returned no rename edits (symbol not renameable at this position)"
+                        }),
+                    });
+                }
+                Err(Error::Server { method, error })
+                    if method == <lsp_types::request::Rename as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     pub async fn shutdown_all(&self) {
         let mut sessions = self.inner.sessions.lock().await;
         let drained = sessions
@@ -663,6 +723,14 @@ fn response_or_error(method: &str, value: Value) -> Result<Value> {
         });
     }
     Ok(value)
+}
+
+/// Whether a request error means "the server is still warming — try again":
+/// `ContentModified` (-32801, rust-analyzer while indexing) or a
+/// retrigger-flagged `ServerCancelled` (-32802).
+fn should_retry_while_warming(error: &Value) -> bool {
+    error.get("code").and_then(Value::as_i64) == Some(-32801)
+        || should_retrigger_diagnostic_request(error)
 }
 
 fn should_retrigger_diagnostic_request(error: &Value) -> bool {
