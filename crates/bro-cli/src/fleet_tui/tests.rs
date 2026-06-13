@@ -983,10 +983,10 @@ fn selector_mind_change_drill_back_no_commit() {
 }
 
 #[test]
-fn single_agent_steer_title_names_target_agent() {
-    let title = Line::from(single_agent_steer_title_spans("review api"));
+fn single_agent_name_title_names_target_agent_without_steer_prefix() {
+    let title = Line::from(single_agent_name_title_spans("review api"));
 
-    assert_eq!(line_text(&title), " steer review api ");
+    assert_eq!(line_text(&title), " review api ");
 }
 
 #[test]

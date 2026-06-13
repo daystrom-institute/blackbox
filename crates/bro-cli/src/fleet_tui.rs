@@ -2405,8 +2405,8 @@ where
                 .rename_target
                 .is_none()
                 .then(|| single_agent_composer_top_titles(app, &views, &order));
-            let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
-            draw_composer_inline(f, composer_area, app, top_titles, bottom_title);
+            let bottom_titles = single_agent_composer_bottom_titles(app, &views, &order);
+            draw_composer_inline(f, composer_area, app, top_titles, bottom_titles);
             // Overlays — the inline view must render these itself (the
             // alt-screen `draw()` path is not in play while zoomed): the
             // slash-completion menu anchored above the composer, and the
@@ -4885,7 +4885,7 @@ fn selected_activity_spans(
 ) -> Vec<Span<'static>> {
     let Some(idx) = app.selected_agent() else {
         return vec![Span::styled(
-            "  ○ Agent idle   ·   ○ Classifier off  ",
+            "  ○ Agent idle  ",
             Style::default().fg(Color::DarkGray),
         )];
     };
@@ -4930,12 +4930,11 @@ fn selected_activity_spans(
         app.activity_frame,
     ));
 
-    spans.push(Span::styled(
-        "   ·   ",
-        Style::default().fg(Color::DarkGray),
-    ));
-
     if let Some(classifier) = classifier {
+        spans.push(Span::styled(
+            "   ·   ",
+            Style::default().fg(Color::DarkGray),
+        ));
         let classifier_id = classifier.id();
         let snap = classifier.snapshot();
         let state = fleet_state_from_snapshot(
@@ -4967,11 +4966,6 @@ fn selected_activity_spans(
             &classifier_clock,
             now,
             app.activity_frame,
-        ));
-    } else {
-        spans.push(Span::styled(
-            "○ Classifier off",
-            Style::default().fg(Color::DarkGray),
         ));
     }
 
@@ -5075,15 +5069,8 @@ fn single_agent_composer_top_titles(
     views: &[AgentView],
     order: &[usize],
 ) -> Vec<Line<'static>> {
+    let mut titles = vec![Line::from(selected_activity_spans(app, views, order))];
     let selected_idx = app.selected_agent();
-    let mut activity = selected_activity_spans(app, views, order);
-    let mut title_spans = Vec::new();
-    if let Some(idx) = selected_idx {
-        title_spans.extend(single_agent_steer_title_spans(&app.agents[idx].name));
-        title_spans.push(Span::styled("──", Style::default().fg(Color::DarkGray)));
-    }
-    title_spans.append(&mut activity);
-    let mut titles = vec![Line::from(title_spans)];
     if let Some(idx) = selected_idx {
         let a = &app.agents[idx];
         let v = &views[idx];
@@ -5098,13 +5085,26 @@ fn single_agent_composer_top_titles(
     titles
 }
 
-fn single_agent_steer_title_spans(agent_name: &str) -> Vec<Span<'static>> {
+fn single_agent_name_title_spans(agent_name: &str) -> Vec<Span<'static>> {
     vec![Span::styled(
-        format!(" steer {agent_name} "),
+        format!(" {agent_name} "),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]
+}
+
+fn single_agent_composer_bottom_titles(
+    app: &App,
+    views: &[AgentView],
+    order: &[usize],
+) -> Option<Vec<Line<'static>>> {
+    let mut titles = vec![Line::from(single_agent_status_spans(app, views, order))];
+    if let Some(idx) = app.selected_agent() {
+        let name = truncate(&app.agents[idx].name, 30);
+        titles.push(Line::from(single_agent_name_title_spans(&name)).right_aligned());
+    }
+    Some(titles)
 }
 
 fn single_agent_status_spans(
@@ -5125,9 +5125,8 @@ fn single_agent_status_spans(
             .or(views[idx].cwd.as_deref())
             .map(path_name)
             .unwrap_or_else(|| "project".to_string());
-        // No prompt/name excerpt here: the composer's TOP title already
-        // shows `steer <name>`, and the name defaults to the first-turn
-        // excerpt until renamed — rendering both was pure duplication.
+        // No prompt/name excerpt here: the bottom-right title carries the
+        // session name, which defaults to the first-turn excerpt until renamed.
         spans.push(Span::styled(format!(" {project} "), byline));
         spans.push(Span::styled("──", dim));
     }

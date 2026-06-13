@@ -23,8 +23,8 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
             .rename_target
             .is_none()
             .then(|| single_agent_composer_top_titles(app, &views, &order));
-        let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
-        draw_composer(f, chunks[1], app, top_titles, bottom_title);
+        let bottom_titles = single_agent_composer_bottom_titles(app, &views, &order);
+        draw_composer(f, chunks[1], app, top_titles, bottom_titles);
         if slash_active(app) && !app.help_visible {
             draw_slash_menu(f, chunks[1], app);
         }
@@ -32,8 +32,8 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
         draw_config_body(f, chunks[0], app);
-        let bottom_title = Some(Line::from(roster_status_spans(app, &views, &order)));
-        draw_composer(f, chunks[1], app, None, bottom_title);
+        let bottom_titles = Some(vec![Line::from(roster_status_spans(app, &views, &order))]);
+        draw_composer(f, chunks[1], app, None, bottom_titles);
     } else {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
@@ -43,8 +43,12 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
             .rename_target
             .is_none()
             .then(|| roster_composer_top_titles(app));
-        let bottom_title = Some(Line::from(roster_status_spans(app, &views, &roster_order)));
-        draw_composer(f, chunks[1], app, top_titles, bottom_title);
+        let bottom_titles = Some(vec![Line::from(roster_status_spans(
+            app,
+            &views,
+            &roster_order,
+        ))]);
+        draw_composer(f, chunks[1], app, top_titles, bottom_titles);
         if slash_active(app) && !app.help_visible {
             draw_slash_menu(f, chunks[1], app);
         } else if project_active(app) {
@@ -866,9 +870,9 @@ pub(super) fn draw_composer(
     area: Rect,
     app: &App,
     top_titles: Option<Vec<Line<'static>>>,
-    bottom_title: Option<Line<'static>>,
+    bottom_titles: Option<Vec<Line<'static>>>,
 ) {
-    let (block, padded) = composer_block_and_padded_area(area, app, top_titles, bottom_title);
+    let (block, padded) = composer_block_and_padded_area(area, app, top_titles, bottom_titles);
     f.render_widget(block, area);
     let (buf, scroll_y) = composer_buffer_and_scroll(app, padded);
     f.render_widget(
@@ -884,9 +888,9 @@ pub(super) fn draw_composer_inline(
     area: Rect,
     app: &App,
     top_titles: Option<Vec<Line<'static>>>,
-    bottom_title: Option<Line<'static>>,
+    bottom_titles: Option<Vec<Line<'static>>>,
 ) {
-    let (block, padded) = composer_block_and_padded_area(area, app, top_titles, bottom_title);
+    let (block, padded) = composer_block_and_padded_area(area, app, top_titles, bottom_titles);
     f.render_widget_ref(block, area);
     let (buf, scroll_y) = composer_buffer_and_scroll(app, padded);
     let para = Paragraph::new(buf)
@@ -899,7 +903,7 @@ fn composer_block_and_padded_area(
     area: Rect,
     app: &App,
     top_titles: Option<Vec<Line<'static>>>,
-    bottom_title: Option<Line<'static>>,
+    bottom_titles: Option<Vec<Line<'static>>>,
 ) -> (Block<'static>, Rect) {
     let (title, color) = if app.rename_target.is_some() {
         (" rename (Enter=save · Esc=cancel) ", Color::Magenta)
@@ -926,8 +930,10 @@ fn composer_block_and_padded_area(
     } else if !title.is_empty() {
         block = block.title(Span::styled(title, Style::default().fg(color)));
     }
-    if let Some(bottom_title) = bottom_title {
-        block = block.title_bottom(bottom_title);
+    if let Some(bottom_titles) = bottom_titles {
+        for bottom_title in bottom_titles {
+            block = block.title_bottom(bottom_title);
+        }
     }
     let inner = block.inner(area);
     let padded = Rect {
