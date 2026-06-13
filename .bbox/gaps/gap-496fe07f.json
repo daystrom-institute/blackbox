@@ -14,8 +14,9 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/corpus-index/symbol-entities-unsearchable",
+  "notes": "PARTIAL (commit 08b49f4a, worktree-search-arc-residuals): inspect/find_paths/bundle_evidence/ref_size/blame now resolve edge-projected symbol vertices — ProviderContext carries an optional edge-index ref and the symbol/symbol_v2 providers fall back to edge-participation existence (source=edge_projection), keeping not_found for refs nothing points at. REMAINING: symbols still absent from hybrid_search (no entity docs in the search index) — exact-symbol eval queries cannot pass via the search-only strategy. Fix requires a corpus-design decision: emit ~110k symbol entity docs (index size + delete lifecycle) vs. a search-time symbol lane over the edge sidecar.",
   "resolution": "unresolved",
   "thread_id": "thread-098387b3",
   "created_at": "2026-06-12T23:43:18Z",
-  "updated_at": "2026-06-12T23:43:18Z"
+  "updated_at": "2026-06-13T00:01:18Z"
 }
