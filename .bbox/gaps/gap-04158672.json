@@ -5,21 +5,22 @@
   "domain": "bro-harness-shell",
   "wanted_capability": "When shell output exceeds inline limits, the harness should preserve a bounded diagnostic tail and exit status without requiring agents to chase dump files that reference other dumps.",
   "missing_primitive": "Robust shell output capture/dump tail for large compile output",
-  "fallback_used": "Use blocking shell mode with a bounded output cap. For very noisy Gradle output, recipe now allows an exit-preserving filtered command via `bash -o pipefail` and a non-short-circuiting filter; host-side verification still reruns the unfiltered gate when needed.",
+  "fallback_used": "Use shell_run/shell_poll/shell_kill `output_filter` for known noisy command streams; fall back to bounded output caps or recipe-specific command filters only when the needed diagnostic line shape is not yet known.",
   "evidence": [
     "probe:large-ui-section-extract-deepseek-v4-pro-2",
     "probe:large-ui-section-extract-deepseek-v4-pro-4",
-    "scratch/tool-tuning/2026-06-13-large-ui-section-extract-deepseek-v4-pro.md"
+    "scratch/tool-tuning/2026-06-13-large-ui-section-extract-deepseek-v4-pro.md",
+    "file:crates/bro-tools/src/shell.rs"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness-shell/circular-output-dumps",
   "suggested_owner": "blackbox",
-  "notes": "Genericized from private Java refactor probes. Probe 4 confirmed the tension: the bare compile preserved exit status but dumped large generated-code noise; the agent then used a piped/head command to reduce output, violating protocol. Recipe was updated to allow only exit-preserving filters and prohibit head/tail short-circuit filters. Underlying missing primitive remains a shell_run post-capture filter/summary that preserves the primary command exit status without shell-pipe discipline.",
+  "notes": "Genericized from private Java refactor probes. Probe 4 confirmed the tension: the bare compile preserved exit status but dumped large generated-code noise; the agent then used a piped/head command to reduce output, violating protocol. Implemented a host-side `output_filter` on shell_run/shell_poll/shell_kill that keeps matching stdout/stderr lines after capture, preserves the primary command exit_code, persists across polls, and can be explicitly cleared with an empty filter. Remaining unresolved scope: automatic bounded diagnostic tail / recovery for output lost at the in-memory buffer cap is still not solved.",
   "resolution": "unresolved",
   "task_id": "3495eb89-27d4-4c18-a1a0-27e79133821a",
   "session_id": "39b336cc-514f-4118-a7f3-d23e62f2147c",
   "provider": "deepseek",
   "created_at": "2026-06-13T21:07:37Z",
-  "updated_at": "2026-06-13T21:48:43Z"
+  "updated_at": "2026-06-13T22:09:31Z"
 }
