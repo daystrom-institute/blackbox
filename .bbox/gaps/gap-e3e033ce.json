@@ -1,0 +1,21 @@
+{
+  "id": "gap-e3e033ce",
+  "title": "Provider-rejected embed payloads poison their batch and strand items through every backfill",
+  "gap_kind": "tooling",
+  "domain": "embed/poison-payload-handling",
+  "wanted_capability": "Per-item poison handling in the embed queue. Surfaced 2026-06-13 by the new backfill/stall visibility (gap-b9d39c10 follow-on): the code route's last ~0.7% residue (595 items) turns out to be payloads Voyage rejects with HTTP 400 (\"request body is not valid JSON, or some arguments were not specified properly\") — the whole 52-item batch drops after 3 retries, taking innocent items with it, the route flips unavailable, and the same items re-fail every nightly backfill (bounded churn, never converges). Wanted: (a) on a 4xx batch rejection, bisect/retry per-item so one bad payload doesn't drop 51 good ones; (b) persist a poison list (entity_id+chunk_hash) that enqueue skips and bbox_embed_status reports as a distinct count, so coverage can honestly converge to \"1.0 minus N poisoned\"; (c) diagnose the actual payload defect (likely oversized chunk or content the request builder mis-serializes) and sanitize/split at chunk time.",
+  "fallback_used": "None needed immediately — route availability recovers on the next successful batch; the 595 items stay unembedded and re-churn nightly.",
+  "evidence": [
+    "bbox_embed_status 2026-06-13: code available=false retried_count=6 last_error=HTTP 400 batch_size=52",
+    "code coverage plateau 0.9933 (87603/88198) across manual refill + backfill",
+    "thread-cb8f3b2d",
+    "gap-b9d39c10"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/embed/poison-payload-batch-drop",
+  "resolution": "unresolved",
+  "thread_id": "thread-cb8f3b2d",
+  "created_at": "2026-06-13T01:39:11Z",
+  "updated_at": "2026-06-13T01:39:11Z"
+}
