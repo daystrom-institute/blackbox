@@ -5375,12 +5375,19 @@ fn reconcile_pending_user_turns<'a>(
 ) -> Vec<String> {
     let accepted: Vec<&str> = accepted.into_iter().collect();
     for seen in accepted.iter().skip(*seen_user_steers) {
-        if pending.front().is_some_and(|pending| pending == *seen) {
+        if pending
+            .front()
+            .is_some_and(|pending| user_turns_match(pending, seen))
+        {
             pending.pop_front();
         }
     }
     *seen_user_steers = accepted.len();
     pending.iter().cloned().collect()
+}
+
+fn user_turns_match(pending: &str, accepted: &str) -> bool {
+    pending.trim_matches('\n') == accepted.trim_matches('\n')
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

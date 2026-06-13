@@ -1552,6 +1552,44 @@ fn queued_turn_reconcile_clears_new_echoes_fifo() {
 }
 
 #[test]
+fn queued_turn_reconcile_clears_newline_framed_echo() {
+    let mut pending = VecDeque::from(["next turn".to_string()]);
+    let mut seen = 0;
+    let queued = reconcile_pending_user_turns(&mut pending, &mut seen, ["next turn\n"]);
+    assert!(queued.is_empty());
+    assert_eq!(seen, 1);
+}
+
+#[test]
+fn queued_turn_echo_does_not_render_duplicate_waiting_marker() {
+    let mut pending = VecDeque::from(["next turn".to_string()]);
+    let mut seen = 0;
+    let items = vec![TranscriptItem::UserSteer("next turn\n".into())];
+    let queued = reconcile_pending_user_turns(&mut pending, &mut seen, user_steers(&items));
+    let queued_refs: Vec<&str> = queued.iter().map(String::as_str).collect();
+
+    let rendered: Vec<String> = render_transcript(&items, "", &queued_refs, 100)
+        .iter()
+        .map(line_text)
+        .collect();
+
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|line| line.contains("next turn"))
+            .count(),
+        1,
+        "{rendered:?}"
+    );
+    assert!(
+        !rendered
+            .iter()
+            .any(|line| line.contains("queued to stdin; waiting for harness echo")),
+        "{rendered:?}"
+    );
+}
+
+#[test]
 fn prompt_slug_is_stable_and_path_safe() {
     assert_eq!(prompt_slug("Fix TUI/harness gaps!"), "fix-tui-harness-gaps");
     assert_eq!(prompt_slug("!!!"), "task");
