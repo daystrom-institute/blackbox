@@ -1,0 +1,21 @@
+{
+  "id": "gap-5e3e3dff",
+  "title": "Contextual recall guidance can overfire during procedural state-surface work",
+  "gap_kind": "docs_runbook",
+  "domain": "contextual-recall",
+  "wanted_capability": "The rendered contextual-recall guidance should distinguish durable-knowledge questions from procedural work that is already operating on the right live state surface. When a task is explicitly filing gap notes, deduping gaps, opening threads, or committing repo-owned gap files, the guidance should not pressure an extra bbox_knowledge call unless a specific prior convention/runbook could materially change the operation.",
+  "missing_primitive": "clear exception/decision rule in contextual-recall rendered guidance for procedural gap/thread tasks",
+  "fallback_used": "Used bbox_gaps and bbox_thread as the authoritative live state surfaces, and treated the extra bbox_knowledge recall check as optional/noisy in hindsight.",
+  "evidence": [
+    "task:158f10bd-c8da-4519-b42f-d5638e91def2",
+    "session:2734a66d-dcea-43d5-8014-4d46b2aa54cf",
+    "thread:thread-b1d5d7de"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/contextual-recall/overfires-on-procedural-state-work",
+  "notes": "During a harness/tool shakedown, the agent interpreted the contextual-recall reminder as a nudge to call bbox_knowledge while already doing procedural gap/thread work. The call did not materially change the operation and emitted a large system-memory sidecar, reinforcing the separate bbox_knowledge output-spill gap. The guidance says bbox_knowledge is not the surface for active threads, but the task shape boundary remains easy to misread.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T16:27:23Z",
+  "updated_at": "2026-06-13T16:27:23Z"
+}

@@ -1,0 +1,22 @@
+{
+  "id": "gap-0c902d6d",
+  "title": "content_search broad-but-plausible queries can spill oversized dumps without enough narrowing guidance",
+  "gap_kind": "tooling",
+  "domain": "content_search",
+  "wanted_capability": "For broad repository searches, content_search should provide a compact top-results response with clear truncation/refinement guidance before writing a large harness dump. It should make it obvious when the query matched too broadly, suggest narrower path/glob/pattern options, and avoid making a normal exploratory search feel like an output explosion.",
+  "missing_primitive": "progressive disclosure and refinement hints for broad content_search results",
+  "fallback_used": "Switched from broad content_search to glob + smart_read + code.items + bounded file_read once the broad result proved noisy.",
+  "evidence": [
+    "task:ccf3ad5d-24fc-43db-9241-b2b0294adc62",
+    "task:158f10bd-c8da-4519-b42f-d5638e91def2",
+    "tool:content_search pattern='standalone|single-agent|SingleAgent|bro agent|zoom|roster' path='src'",
+    "tool:content_search pattern='SingleAgent|standalone|roster_anchor|zoom|AgentView|render_single|single_agent|detail' path='crates/bro-cli/src/fleet_tui.rs'"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/content_search/broad-query-dump-spill",
+  "notes": "The agent made one genuine path mistake by searching src before crates/bro-cli, but subsequent broad searches were plausible during code orientation. The tool's dump behavior amplified those exploratory searches instead of nudging toward structured/bounded reads like smart_read or code.items.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T16:25:39Z",
+  "updated_at": "2026-06-13T16:25:39Z"
+}

@@ -1,0 +1,21 @@
+{
+  "id": "gap-c1c1b304",
+  "title": "bbox_knowledge common project query can spill oversized mixed output",
+  "gap_kind": "mcp_surface",
+  "domain": "bbox_knowledge",
+  "wanted_capability": "For ordinary recall-check queries, bbox_knowledge should return a compact agent-facing result by default: top durable hits first, bounded system-memory/artifact sidecars, explicit truncation metadata, and an obvious way to request full payloads. Common short project queries should not readily produce harness dump spillover unless the caller opted into verbose sidecar content.",
+  "missing_primitive": "compact/default-bounded bbox_knowledge response mode",
+  "fallback_used": "Used the top hit from the oversized response, ignored dumped sidecar payloads, then switched to direct code navigation and bounded file reads.",
+  "evidence": [
+    "task:f277922e-1088-4597-8439-cd1d771f3643",
+    "previous-task:ccf3ad5d-24fc-43db-9241-b2b0294adc62",
+    "tool:mcp__blackbox__bbox_knowledge query='bro fleet zoomed roster single-agent view UI'"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/bbox_knowledge/common-query-output-spill",
+  "notes": "The agent followed rendered guidance reasonably: early recall check via bbox_knowledge using a short phrase from the user's request. The misleading part is the tool's default output composition: a normal query produced a large mixed response with system-memory sidecars and a harness dump notice, making the agent look noisy even though the action was policy-conformant.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T16:22:31Z",
+  "updated_at": "2026-06-13T16:22:31Z"
+}

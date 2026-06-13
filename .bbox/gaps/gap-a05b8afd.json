@@ -1,0 +1,21 @@
+{
+  "id": "gap-a05b8afd",
+  "title": "tool_search exposes a large repeated tool catalog after targeted loads",
+  "gap_kind": "mcp_surface",
+  "domain": "tool_search",
+  "wanted_capability": "After a targeted tool_search load, the agent-facing response should stay compact: loaded tool names and schemas for the requested tools, plus a small summary of remaining available tools. The full additional-tool catalog should be hidden behind an explicit request or one-time disclosure, not repeatedly injected into subsequent context where it obscures the actual work.",
+  "missing_primitive": "compact targeted tool_search response without repeated full catalog sidecar",
+  "fallback_used": "Ignored the repeated available-tool catalog and focused on the loaded tool schemas.",
+  "evidence": [
+    "task:158f10bd-c8da-4519-b42f-d5638e91def2",
+    "session:2734a66d-dcea-43d5-8014-4d46b2aa54cf",
+    "tool:tool_search query='select:mcp__blackbox__bbox_gaps,mcp__blackbox__bbox_gap,mcp__blackbox__bbox_thread,mcp__blackbox__bbox_thread_list,mcp__blackbox__bro_report'"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/tool_search/persistent-tool-catalog-noise",
+  "notes": "In this harness shakedown, a targeted select load correctly loaded the requested tools, but the surrounding developer-side catalog remained very large and repeated. This makes a policy-conformant tool load look noisy and consumes attention/context with unrelated surfaces.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T16:25:08Z",
+  "updated_at": "2026-06-13T16:25:08Z"
+}
