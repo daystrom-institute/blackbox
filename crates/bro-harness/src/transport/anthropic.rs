@@ -227,6 +227,9 @@ struct SseBlock {
     tool_name: String,
     /// Accumulated `input_json_delta.partial_json` (tool_use + server_tool_use).
     tool_json: String,
+    /// Full tool input object from `content_block_start`, used by compatible
+    /// providers that do not stream `input_json_delta` for tiny tool calls.
+    tool_input_start: Option<Value>,
     /// Accumulated `signature_delta.signature` for a `thinking` block. Persisted
     /// into the replayed assistant turn so a thinking-native model (e.g.
     /// MiniMax-M3) sees the prior turn's thinking block on a continuation —
@@ -316,6 +319,9 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
                 "tool_use" | "server_tool_use" => {
                     b.tool_id = cb["id"].as_str().unwrap_or("").to_string();
                     b.tool_name = cb["name"].as_str().unwrap_or("").to_string();
+                    if let Some(input) = cb.get("input").filter(|v| !v.is_null()) {
+                        b.tool_input_start = Some(input.clone());
+                    }
                 }
                 "text" | "thinking" => {}
                 // Server-produced result block (e.g. `tool_result` /
@@ -390,13 +396,18 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
 /// server tool (e.g. web_search with a small `max_uses`) pauses zero or one times.
 const MAX_PAUSE_RESUMES: u32 = 8;
 
-fn parse_tool_input(tool_json: &str) -> Value {
-    serde_json::from_str(if tool_json.is_empty() {
-        "{}"
-    } else {
-        tool_json
+fn parse_tool_input(block: &SseBlock) -> Result<Value> {
+    if block.tool_json.is_empty() {
+        return Ok(block.tool_input_start.clone().unwrap_or_else(|| json!({})));
+    }
+    serde_json::from_str(&block.tool_json).with_context(|| {
+        format!(
+            "invalid JSON streamed for tool input (tool={}, id={}, bytes={})",
+            block.tool_name,
+            block.tool_id,
+            block.tool_json.len()
+        )
     })
-    .unwrap_or_else(|_| json!({}))
 }
 
 /// Reconstruct one assistant segment from the SSE accumulators: the `content`
@@ -409,7 +420,9 @@ fn parse_tool_input(tool_json: &str) -> Value {
 /// its `signature_delta` when the stream provided one) so a thinking-native
 /// model sees the prior turn's reasoning on a continuation; `thinking_out` is
 /// the same text surfaced separately for display.
-fn reconstruct_segment(blocks: &[SseBlock]) -> (Vec<Value>, String, String, Vec<super::ToolCall>) {
+fn reconstruct_segment(
+    blocks: &[SseBlock],
+) -> Result<(Vec<Value>, String, String, Vec<super::ToolCall>)> {
     let mut content: Vec<Value> = Vec::new();
     let mut text_out = String::new();
     let mut thinking_out = String::new();
@@ -435,7 +448,7 @@ fn reconstruct_segment(blocks: &[SseBlock]) -> (Vec<Value>, String, String, Vec<
                 thinking_out.push_str(&b.text);
             }
             "tool_use" => {
-                let args = parse_tool_input(&b.tool_json);
+                let args = parse_tool_input(b)?;
                 content.push(json!({
                     "type": "tool_use", "id": b.tool_id, "name": b.tool_name, "input": args.clone(),
                 }));
@@ -451,7 +464,7 @@ fn reconstruct_segment(blocks: &[SseBlock]) -> (Vec<Value>, String, String, Vec<
                     "type": "server_tool_use",
                     "id": b.tool_id,
                     "name": b.tool_name,
-                    "input": parse_tool_input(&b.tool_json),
+                    "input": parse_tool_input(b)?,
                 }));
             }
             _ => {
@@ -462,7 +475,7 @@ fn reconstruct_segment(blocks: &[SseBlock]) -> (Vec<Value>, String, String, Vec<
             }
         }
     }
-    (content, text_out, thinking_out, tool_calls)
+    Ok((content, text_out, thinking_out, tool_calls))
 }
 
 fn render_transcript(messages: &[Value], tool_cap: usize) -> String {
@@ -713,7 +726,7 @@ impl Transport for AnthropicTransport {
 
             // Reconstruct this segment and merge it into the single assistant
             // message that represents the (possibly multi-segment) turn.
-            let (content, text, thinking, tool_calls) = reconstruct_segment(&blocks);
+            let (content, text, thinking, tool_calls) = reconstruct_segment(&blocks)?;
 
             // Spurious empty stop: some Anthropic-compatible endpoints (observed:
             // MiniMax-M3 — ~12% on history turns whose prior assistant message has
@@ -1468,6 +1481,89 @@ mod tests {
         assert_eq!(blocks[2].tool_json, "{\"path\":\"a\"}");
     }
 
+    #[test]
+    fn reconstruct_segment_rejects_invalid_streamed_tool_json() {
+        let blocks = vec![SseBlock {
+            kind: "tool_use".into(),
+            tool_id: "toolu_1".into(),
+            tool_name: "final_result".into(),
+            tool_json: r#"{"compile_after_cleanup": exit 0 (BUILD SUCCESSFUL)}"#.into(),
+            ..Default::default()
+        }];
+
+        let err = reconstruct_segment(&blocks).expect_err("invalid tool JSON must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid JSON streamed for tool input"));
+        assert!(msg.contains("tool=final_result"));
+        assert!(msg.contains("id=toolu_1"));
+        assert!(
+            !msg.contains("BUILD SUCCESSFUL"),
+            "raw tool JSON must not be echoed into the error"
+        );
+    }
+
+    #[test]
+    fn reconstruct_segment_uses_start_block_tool_input_when_no_delta_streams() {
+        let mut blocks: Vec<SseBlock> = Vec::new();
+        let mut usage = Usage::default();
+        let mut stop = StopReason::Done;
+        fold_sse(
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_2",
+                    "name": "read_file",
+                    "input": {"path": "src/lib.rs"}
+                }
+            }),
+            &mut blocks,
+            &mut usage,
+            &mut stop,
+        );
+
+        let (content, _text, _thinking, tool_calls) = reconstruct_segment(&blocks).unwrap();
+        assert_eq!(content[0]["input"]["path"], "src/lib.rs");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].args["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn streamed_tool_json_overrides_empty_start_block_input() {
+        let mut blocks: Vec<SseBlock> = Vec::new();
+        let mut usage = Usage::default();
+        let mut stop = StopReason::Done;
+        let evs = [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"call_1","name":"web_search","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"search_query\":\"rust\"}"}}),
+        ];
+        for ev in &evs {
+            fold_sse(ev, &mut blocks, &mut usage, &mut stop);
+        }
+
+        let (content, _text, _thinking, tool_calls) = reconstruct_segment(&blocks).unwrap();
+        assert_eq!(content[0]["type"], "server_tool_use");
+        assert_eq!(content[0]["input"]["search_query"], "rust");
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn reconstruct_segment_preserves_thinking_signature_for_minimax_replay() {
+        let blocks = vec![SseBlock {
+            kind: "thinking".into(),
+            text: "reasoned".into(),
+            signature: "sig-123".into(),
+            ..Default::default()
+        }];
+
+        let (content, _text, thinking, tool_calls) = reconstruct_segment(&blocks).unwrap();
+        assert_eq!(thinking, "reasoned");
+        assert!(tool_calls.is_empty());
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "sig-123");
+    }
+
     /// GLM (z.ai) shape: real Anthropic puts input tokens in
     /// `message_start.message.usage.input_tokens`; GLM observed in production
     /// sometimes reports `input_tokens: 0` in `message_start` and only carries
@@ -1924,7 +2020,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (content, text, _thinking, tool_calls) = reconstruct_segment(&blocks);
+        let (content, text, _thinking, tool_calls) = reconstruct_segment(&blocks).unwrap();
         // Server blocks are preserved verbatim into the replay content...
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "server_tool_use");
