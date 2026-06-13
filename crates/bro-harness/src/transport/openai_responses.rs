@@ -136,12 +136,16 @@ impl OpenAiResponsesTransport {
                 anyhow::bail!(responses_common::classify_http_error(status, &sse));
             }
 
+            let request_id = resp
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let mut stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             let mut accum = String::new();
+            let mut trace = responses_common::ResponsesStreamTrace::new(request_id);
             let mut text_started = false;
-            let mut emitted_text = false;
-            let mut terminal_seen = false;
             let mut fault: Option<anyhow::Error> = None;
 
             'consume: loop {
@@ -162,6 +166,7 @@ impl OpenAiResponsesTransport {
                         break 'consume;
                     }
                 };
+                trace.observe_chunk(chunk.len());
                 buf.extend_from_slice(&chunk);
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let raw: Vec<u8> = buf.drain(..=pos).collect();
@@ -178,6 +183,7 @@ impl OpenAiResponsesTransport {
                     let Ok(ev) = serde_json::from_str::<Value>(data) else {
                         continue;
                     };
+                    trace.observe_event(&ev);
                     match ev["type"].as_str().unwrap_or("") {
                         "response.output_text.delta" => {
                             if let Some(t) = ev["delta"].as_str()
@@ -196,7 +202,7 @@ impl OpenAiResponsesTransport {
                                     "index": 0,
                                     "delta": {"type": "text_delta", "text": t},
                                 }));
-                                emitted_text = true;
+                                trace.mark_emitted_text();
                             }
                         }
                         "response.reasoning_summary_text.delta"
@@ -215,35 +221,40 @@ impl OpenAiResponsesTransport {
                         | "response.incomplete"
                         | "response.failed"
                         | "error" => {
-                            terminal_seen = true;
+                            trace.mark_terminal_seen();
                         }
                         _ => {}
                     }
                 }
             }
 
-            if fault.is_none() && !terminal_seen {
+            if fault.is_none() && !trace.terminal_seen() {
                 fault = Some(anyhow::anyhow!(
                     "responses stream closed before a terminal event (response.completed/incomplete/failed)"
                 ));
             }
 
             if let Some(err) = fault {
-                if !emitted_text && attempt <= max {
+                let max_attempts = max.saturating_add(1);
+                let diagnostics = trace.fault_context("responses HTTP-SSE", attempt, max_attempts);
+                if !trace.emitted_text() && attempt <= max {
                     let wait = super::http::backoff(attempt);
                     tracing::warn!(
                         attempt,
                         error = %err,
+                        diagnostics = %diagnostics,
                         wait_ms = wait.as_millis() as u64,
                         "responses stream fault before output; re-sending request"
                     );
                     tokio::time::sleep(wait).await;
                     continue 'attempt;
                 }
-                return Err(err.context(if emitted_text {
-                    "responses stream fault after partial output; not retried (would duplicate)"
+                return Err(err.context(if trace.emitted_text() {
+                    format!(
+                        "responses stream fault after partial output; not retried (would duplicate); {diagnostics}"
+                    )
                 } else {
-                    "responses stream retries exhausted"
+                    format!("responses stream retries exhausted; {diagnostics}")
                 }));
             }
 

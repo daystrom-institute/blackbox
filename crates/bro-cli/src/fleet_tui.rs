@@ -103,7 +103,9 @@ enum FleetState {
     Idle,
     /// Turn in flight (events streaming, no result/end_turn).
     Active,
-    /// Process not live but session resumable (stop / crash / cockpit orphan).
+    /// Process exited with an error. Distinct from operator interruption.
+    Failed,
+    /// Process not live because the operator interrupted/cancelled it.
     Interrupted,
     /// Work has been folded down or the process completed; kept for history.
     Finished,
@@ -111,11 +113,12 @@ enum FleetState {
 
 impl FleetState {
     /// Attention order, top of the roster first.
-    const BUCKETS: [FleetState; 6] = [
+    const BUCKETS: [FleetState; 7] = [
         FleetState::Alerting,
         FleetState::Waiting,
         FleetState::Active,
         FleetState::Idle,
+        FleetState::Failed,
         FleetState::Interrupted,
         FleetState::Finished,
     ];
@@ -126,6 +129,7 @@ impl FleetState {
             FleetState::Waiting => "Waiting",
             FleetState::Idle => "Idle",
             FleetState::Active => "Active",
+            FleetState::Failed => "Failed",
             FleetState::Interrupted => "Interrupted",
             FleetState::Finished => "Finished",
         }
@@ -138,6 +142,7 @@ impl FleetState {
             FleetState::Idle => ("○", Color::Gray),
             FleetState::Waiting => ("?", Color::Yellow),
             FleetState::Alerting => ("!", Color::Red),
+            FleetState::Failed => ("×", Color::Red),
             FleetState::Interrupted => ("↻", Color::LightYellow),
             FleetState::Finished => ("✓", Color::DarkGray),
         }
@@ -205,7 +210,9 @@ impl Agent {
             snap.worktree_finished,
             snap.last_event_at_ms,
         );
-        let stderr_tail = if matches!(state, FleetState::Interrupted) && !snap.stderr.is_empty() {
+        let stderr_tail = if matches!(state, FleetState::Failed | FleetState::Interrupted)
+            && !snap.stderr.is_empty()
+        {
             Some(last_line(&snap.stderr))
         } else {
             None
@@ -253,7 +260,8 @@ fn fleet_state_from_snapshot(
         TaskStatus::Running | TaskStatus::Pending => FleetState::Idle,
         TaskStatus::Completed => FleetState::Finished,
         TaskStatus::Failed | TaskStatus::Cancelled if stale_finished => FleetState::Finished,
-        TaskStatus::Failed | TaskStatus::Cancelled => FleetState::Interrupted,
+        TaskStatus::Failed => FleetState::Failed,
+        TaskStatus::Cancelled => FleetState::Interrupted,
     }
 }
 
@@ -1466,6 +1474,25 @@ fn origin_tabs_partition_roster_rows() {
     assert_eq!(
         ordered_roster_indices(&views, &origins, RosterTab::DispatchedAgents),
         vec![2, 1]
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn failed_and_cancelled_tasks_have_distinct_fleet_states() {
+    assert_eq!(
+        fleet_state_from_snapshot(TaskStatus::Failed, false, false, false, Some(now_ms_ui())),
+        FleetState::Failed
+    );
+    assert_eq!(
+        fleet_state_from_snapshot(
+            TaskStatus::Cancelled,
+            false,
+            false,
+            false,
+            Some(now_ms_ui())
+        ),
+        FleetState::Interrupted
     );
 }
 
@@ -5286,6 +5313,8 @@ fn activity_segment(
             "? {label} waiting {}",
             since_compact(last_activity_ms, now_ms).unwrap_or_default()
         )
+    } else if state == FleetState::Failed {
+        format!("× {label} failed")
     } else if state == FleetState::Interrupted {
         format!("↻ {label} interrupted")
     } else if state == FleetState::Finished {
@@ -5305,6 +5334,40 @@ fn activity_segment(
         )
     };
     vec![Span::styled(text, style)]
+}
+
+#[cfg(test)]
+#[test]
+fn activity_segment_distinguishes_failed_from_interrupted() {
+    let clock = ActivityClock::default();
+    let failed = activity_segment(
+        "Agent activity",
+        ActivityRole::Agent,
+        FleetState::Failed,
+        false,
+        false,
+        None,
+        &clock,
+        1_000,
+        0,
+    );
+    let interrupted = activity_segment(
+        "Agent activity",
+        ActivityRole::Agent,
+        FleetState::Interrupted,
+        false,
+        false,
+        None,
+        &clock,
+        1_000,
+        0,
+    );
+
+    assert_eq!(failed[0].content.as_ref(), "× Agent activity failed");
+    assert_eq!(
+        interrupted[0].content.as_ref(),
+        "↻ Agent activity interrupted"
+    );
 }
 
 fn activity_spinner(role: ActivityRole, frame: usize) -> &'static str {

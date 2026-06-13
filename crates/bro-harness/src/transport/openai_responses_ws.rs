@@ -21,7 +21,7 @@
 //! result so the caller knows whether to propagate (API error) or fall back to
 //! HTTP (transport failure).
 
-use super::responses_common::ResponsesState;
+use super::responses_common::{ResponsesState, ResponsesStreamTrace};
 use super::{TurnOpts, TurnOutput};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -33,6 +33,8 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
 /// The WebSocket Responses beta opt-in (codex `RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE`).
 const WS_BETA: &str = "responses_websockets=2026-02-06";
+const PREVIOUS_RESPONSE_NOT_FOUND: &str = "previous_response_not_found";
+const WEBSOCKET_CONNECTION_LIMIT_REACHED: &str = "websocket_connection_limit_reached";
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -133,6 +135,10 @@ impl WsChannel {
     /// know the server's retained state).
     fn reset(&mut self) {
         self.conn = None;
+        self.clear_incremental_baseline();
+    }
+
+    fn clear_incremental_baseline(&mut self) {
         self.last_response_id = None;
         self.last_full_input = None;
         self.last_items_added.clear();
@@ -244,10 +250,11 @@ impl WsChannel {
 
             // Consume one event per text frame.
             let mut accum = String::new();
+            let mut trace = ResponsesStreamTrace::new(None);
             let mut text_started = false;
-            let mut emitted_text = false;
-            let mut terminal_seen = false;
             let mut response_id: Option<String> = None;
+            let mut stale_previous_response = false;
+            let mut connection_limit_reached = false;
             let mut fault: Option<anyhow::Error> = None;
             let ws = self.conn.as_mut().expect("conn ensured");
 
@@ -271,12 +278,20 @@ impl WsChannel {
                 };
                 match msg {
                     Message::Text(text) => {
+                        trace.observe_chunk(text.len());
                         accum.push_str("data: ");
                         accum.push_str(&text);
                         accum.push('\n');
                         let Ok(ev) = serde_json::from_str::<Value>(&text) else {
                             continue;
                         };
+                        trace.observe_event(&ev);
+                        if is_ws_error_code(&ev, PREVIOUS_RESPONSE_NOT_FOUND) {
+                            stale_previous_response = true;
+                        }
+                        if is_ws_error_code(&ev, WEBSOCKET_CONNECTION_LIMIT_REACHED) {
+                            connection_limit_reached = true;
+                        }
                         match ev["type"].as_str().unwrap_or("") {
                             "response.output_text.delta" => {
                                 if let Some(t) = ev["delta"].as_str()
@@ -295,7 +310,7 @@ impl WsChannel {
                                         "index": 0,
                                         "delta": {"type": "text_delta", "text": t},
                                     }));
-                                    emitted_text = true;
+                                    trace.mark_emitted_text();
                                 }
                             }
                             "response.reasoning_summary_text.delta"
@@ -312,11 +327,11 @@ impl WsChannel {
                             }
                             "response.completed" | "response.incomplete" => {
                                 response_id = ev["response"]["id"].as_str().map(str::to_string);
-                                terminal_seen = true;
+                                trace.mark_terminal_seen();
                                 break 'consume;
                             }
                             "response.failed" | "error" => {
-                                terminal_seen = true;
+                                trace.mark_terminal_seen();
                                 break 'consume;
                             }
                             _ => {}
@@ -338,7 +353,7 @@ impl WsChannel {
                 }
             }
 
-            if fault.is_none() && !terminal_seen {
+            if fault.is_none() && !trace.terminal_seen() {
                 fault = Some(anyhow::anyhow!(
                     "websocket stream closed before a terminal event"
                 ));
@@ -346,15 +361,36 @@ impl WsChannel {
 
             if let Some(err) = fault {
                 self.reset();
-                if !emitted_text && attempt < 2 {
-                    tracing::warn!(error = %err, "ws stream fault before output; re-dialing");
+                let diagnostics = trace.fault_context("responses WebSocket", attempt, 2);
+                if !trace.emitted_text() && attempt < 2 {
+                    tracing::warn!(
+                        error = %err,
+                        diagnostics = %diagnostics,
+                        "ws stream fault before output; re-dialing"
+                    );
                     continue;
                 }
-                return WsOutcome::Transport(err.context(if emitted_text {
-                    "websocket stream fault after partial output"
+                return WsOutcome::Transport(err.context(if trace.emitted_text() {
+                    format!("websocket stream fault after partial output; {diagnostics}")
                 } else {
-                    "websocket stream unusable"
+                    format!("websocket stream unusable; {diagnostics}")
                 }));
+            }
+
+            if connection_limit_reached {
+                self.reset();
+                return WsOutcome::Transport(anyhow::anyhow!(
+                    "Responses WebSocket connection limit reached; falling back to HTTP-SSE"
+                ));
+            }
+
+            if stale_previous_response && prev_id.is_some() && attempt < 2 {
+                tracing::warn!(
+                    diagnostics = %trace.fault_context("responses WebSocket", attempt, 2),
+                    "Responses WebSocket previous_response_id was stale; retrying with full input"
+                );
+                self.clear_incremental_baseline();
+                continue;
             }
 
             // Terminal event seen → authoritative parse. A `response.failed` is an
@@ -382,6 +418,14 @@ fn nonfields_of(body: &Value) -> Value {
         obj.remove("input");
     }
     v
+}
+
+fn is_ws_error_code(ev: &Value, code: &str) -> bool {
+    match ev["type"].as_str() {
+        Some("error") => ev["error"]["code"].as_str().or_else(|| ev["code"].as_str()) == Some(code),
+        Some("response.failed") => ev["response"]["error"]["code"].as_str() == Some(code),
+        _ => false,
+    }
 }
 
 /// rustls 0.23 needs a process-default crypto provider before a `ClientConfig`
@@ -450,6 +494,33 @@ mod tests {
         assert!(nf.get("input").is_none());
         assert_eq!(nf["model"], "m");
         assert_eq!(nf["store"], false);
+    }
+
+    #[test]
+    fn detects_websocket_protocol_error_codes() {
+        assert!(is_ws_error_code(
+            &json!({
+                "type": "error",
+                "error": {"code": "previous_response_not_found"}
+            }),
+            PREVIOUS_RESPONSE_NOT_FOUND
+        ));
+        assert!(is_ws_error_code(
+            &json!({
+                "type": "response.failed",
+                "response": {
+                    "error": {"code": "websocket_connection_limit_reached"}
+                }
+            }),
+            WEBSOCKET_CONNECTION_LIMIT_REACHED
+        ));
+        assert!(!is_ws_error_code(
+            &json!({
+                "type": "response.output_text.delta",
+                "delta": "hi"
+            }),
+            PREVIOUS_RESPONSE_NOT_FOUND
+        ));
     }
 
     struct NoSink;

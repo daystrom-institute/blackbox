@@ -829,6 +829,74 @@ pub(super) fn classify_http_error(status: reqwest::StatusCode, body: &str) -> St
     }
 }
 
+/// Diagnostic breadcrumb for a single Responses stream attempt.
+///
+/// Keep this transport-neutral: HTTP-SSE and WebSocket both consume the same
+/// typed event payloads, so a fault should carry the same shape regardless of
+/// framing.
+#[derive(Debug, Default, Clone)]
+pub(super) struct ResponsesStreamTrace {
+    request_id: Option<String>,
+    response_id: Option<String>,
+    last_event_type: Option<String>,
+    event_count: u64,
+    bytes_consumed: u64,
+    emitted_text: bool,
+    terminal_seen: bool,
+}
+
+impl ResponsesStreamTrace {
+    pub(super) fn new(request_id: Option<String>) -> Self {
+        Self {
+            request_id,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn observe_chunk(&mut self, len: usize) {
+        self.bytes_consumed = self.bytes_consumed.saturating_add(len as u64);
+    }
+
+    pub(super) fn observe_event(&mut self, ev: &Value) {
+        self.event_count = self.event_count.saturating_add(1);
+        if let Some(kind) = ev["type"].as_str() {
+            self.last_event_type = Some(kind.to_string());
+        }
+        if let Some(id) = ev["response"]["id"].as_str() {
+            self.response_id = Some(id.to_string());
+        }
+    }
+
+    pub(super) fn mark_emitted_text(&mut self) {
+        self.emitted_text = true;
+    }
+
+    pub(super) fn mark_terminal_seen(&mut self) {
+        self.terminal_seen = true;
+    }
+
+    pub(super) fn terminal_seen(&self) -> bool {
+        self.terminal_seen
+    }
+
+    pub(super) fn emitted_text(&self) -> bool {
+        self.emitted_text
+    }
+
+    pub(super) fn fault_context(&self, transport: &str, attempt: u32, max_attempts: u32) -> String {
+        format!(
+            "{transport} stream fault diagnostics: request_id={}, response_id={}, last_event={}#{}, attempt={attempt}/{max_attempts}, bytes_consumed={}, emitted_text={}, terminal_seen={}",
+            self.request_id.as_deref().unwrap_or("unknown"),
+            self.response_id.as_deref().unwrap_or("unknown"),
+            self.last_event_type.as_deref().unwrap_or("none"),
+            self.event_count,
+            self.bytes_consumed,
+            self.emitted_text,
+            self.terminal_seen,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,6 +1147,27 @@ mod tests {
                 .any(|item| item["type"] == "function_call_output" && item["call_id"] == "matched")
         );
         assert!(!input.iter().any(|item| item["call_id"] == "orphan"));
+    }
+
+    #[test]
+    fn stream_trace_formats_fault_diagnostics() {
+        let mut trace = ResponsesStreamTrace::new(Some("req_123".into()));
+        trace.observe_chunk(12);
+        trace.observe_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_456"}
+        }));
+        trace.mark_emitted_text();
+
+        let text = trace.fault_context("responses HTTP-SSE", 2, 4);
+
+        assert!(text.contains("request_id=req_123"));
+        assert!(text.contains("response_id=resp_456"));
+        assert!(text.contains("last_event=response.created#1"));
+        assert!(text.contains("attempt=2/4"));
+        assert!(text.contains("bytes_consumed=12"));
+        assert!(text.contains("emitted_text=true"));
+        assert!(text.contains("terminal_seen=false"));
     }
 
     #[test]

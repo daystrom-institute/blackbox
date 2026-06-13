@@ -6937,10 +6937,10 @@ mod tests {
     #[test]
     fn milestone_directive_fires_for_every_provider() {
         // The reporting nudge is unconditional — every provider, regardless
-        // of allow_recursion / coerce_workspace / contract state — declared
-        // per-turn (the empirical claim: session-start reporting guidance
-        // decays at depth on weaker models) and needs_scope (its bro_report
-        // correlation rides the scope keys).
+        // of allow_recursion / coerce_workspace / contract state — and
+        // needs_scope (its bro_report correlation rides the scope keys).
+        // Cadence is standing: per-turn reinforcement was too noisy on
+        // Codex/Brodex because it appears after ordinary tool calls.
         for p in [
             providers::Provider::Glm,
             providers::Provider::Deepseek,
@@ -6958,7 +6958,7 @@ mod tests {
                 milestone.text.contains("bro_report"),
                 "bro_report reference missing for provider {p:?}"
             );
-            assert_eq!(milestone.cadence, bro_protocol::DirectiveCadence::PerTurn);
+            assert_eq!(milestone.cadence, bro_protocol::DirectiveCadence::Standing);
             assert!(milestone.needs_scope);
         }
     }
