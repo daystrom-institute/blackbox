@@ -33,7 +33,27 @@ explicit design.
   pass — don't chase it with pruning tweaks.
 - `self_recall_probe` is the recall diagnostic (O(sample × search)). It must
   never run on the `metrics()` path — metrics are computed per search
-  response.
+  response. Operationally it is exposed via `bbox_embed_status`
+  `recall_probe_route`, through `VectorStore::self_recall_probe` which uses
+  `try_read` — a probe during a rebuild errors "busy" instead of hanging.
+
+## Connectivity guard (gap-1168b0bd)
+
+- **The connectivity gate lives in the WORKFLOW compaction lane only**
+  (embed-compaction-arc: quiesce → rebuild → swap; packet
+  `embed/compaction-policy` v2 compacts >5% / notifies >2%). It is
+  deliberately NOT in `spawn_periodic_compactor`'s 5-minute tick: a
+  connectivity-triggered rebuild holds the partition write lock for the
+  full rebuild and must never fire unquiesced. Don't "fix" the asymmetry.
+- Thresholds: `COMPACT_CONNECTIVITY_RATIO` 0.05 / `NOTIFY_CONNECTIVITY_RATIO`
+  0.02, calibrated from the gap-2eabd96d incident (16.7% at detection,
+  ~1.4% post-rebuild residual, ≤0.3% healthy). `connectivity_breach`
+  applies the `MIN_CONNECTIVITY_GUARD_NODES` (1,000) floor — tiny-graph
+  ratios are noise; callers must not bypass it.
+- **Surfaces that must never stall behind a rebuild read
+  `metrics_nonblocking()`** (try_read per partition, busy partitions
+  omitted) — the inbox attention layer does. Plain `metrics()` blocks
+  behind a write-lock hold for the rebuild's full duration.
 
 ## Rebuild and persistence semantics
 
