@@ -355,13 +355,14 @@ Retro findings:
   Clean seams should inspect `dependency_projection` in that cell and stop
   before apply if non-injectable captures appear; risky seams should use
   `previewOnly` first.
-- The field-classification surface still has a constructor-injection blind spot
-  on this production shape even though `java.extractClass` itself auto-selected
-  external injection correctly.
-- Cohesion output included one proposed moved field that did not exist in the
-  source. Recipes should validate `move_fields` against source declarations
-  before passing them to a transform; longer-term, the analysis should flag
-  phantom fields.
+- The retro initially called out a field-classification constructor-injection
+  blind spot, but transcript inspection narrowed that: constructor-param
+  dependencies were classified correctly; the false values were static constants
+  and mutable view state.
+- The retro also claimed one proposed moved field did not exist in the source,
+  but transcript inspection did not reproduce that in the current cohesion
+  result. Keep the cheap recipe guard that validates `move_fields` against
+  source declarations, but do not treat this as a confirmed code gap yet.
 - Cleanup removed only the constructor params that were truly dead; fields that
   remain referenced by the source correctly stayed. The recipe should teach
   that only a subset of moved fields is expected to disappear from the source
@@ -378,9 +379,8 @@ Recipe/prompt changes made after Probe 5:
 
 Remaining code construct candidates:
 
-- Constructor-injection linkage for field classification on all production
-  shapes.
-- Phantom-field detection in cohesion results before they feed transforms.
+- Phantom-field detection in cohesion results, only if a future transcript
+  reproduces the retro's unconfirmed claim.
 - Optional compact-summary mode for cohesion clusters.
 - Cleanup reports explaining why constructor params were kept, not only what
   was removed.
