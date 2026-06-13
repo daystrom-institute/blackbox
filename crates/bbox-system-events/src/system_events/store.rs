@@ -26,6 +26,15 @@ pub struct EventCompactionReport {
     pub after: usize,
     pub dropped_by_age: usize,
     pub dropped_by_count: usize,
+    /// Malformed journal lines moved to corrupt.jsonl during this pass.
+    pub malformed_quarantined: usize,
+}
+
+#[derive(Debug, Default)]
+struct LoadedJournal {
+    envelopes: Vec<JournalEnvelope>,
+    /// (1-based line number, raw line) for lines that failed to parse.
+    malformed: Vec<(usize, String)>,
 }
 
 impl EventStore {
@@ -51,9 +60,9 @@ impl EventStore {
         // Sweep orphan `current.tmp` left by a crashed compaction. The
         // complete `current.jsonl` is authoritative on reopen.
         store.remove_stale_tmp();
-        if let Ok(envelopes) = store.load_all_from_disk() {
+        if let Ok(loaded) = store.load_from_disk() {
             let mut idx = store.index.lock().unwrap();
-            for env in envelopes {
+            for env in loaded.envelopes {
                 idx.insert(env.event.id.clone(), env.event);
             }
         }
@@ -74,9 +83,16 @@ impl EventStore {
             .append(true)
             .open(&path)
             .with_context(|| format!("opening journal file {}", path.display()))?;
-        serde_json::to_writer(&mut file, envelope)
+        // One buffered record, one write syscall. `serde_json::to_writer`
+        // on an unbuffered File issues many small writes; with O_APPEND a
+        // concurrent writer outside this process mutex can splice its
+        // record between them mid-string — the line-10902 corruption shape
+        // (an entire foreign event inside another record's string).
+        let mut record = serde_json::to_vec(envelope)
+            .with_context(|| format!("serializing event for {}", path.display()))?;
+        record.push(b'\n');
+        file.write_all(&record)
             .with_context(|| format!("writing event to {}", path.display()))?;
-        writeln!(file)?;
         file.sync_all()?;
         self.index
             .lock()
@@ -87,18 +103,23 @@ impl EventStore {
 
     pub fn load_all(&self) -> Result<Vec<JournalEnvelope>> {
         let _guard = self.lock.lock().unwrap();
-        self.load_all_from_disk()
+        Ok(self.load_from_disk()?.envelopes)
     }
 
-    fn load_all_from_disk(&self) -> Result<Vec<JournalEnvelope>> {
+    /// Lenient journal read: malformed lines are collected, not fatal.
+    /// One spliced record must never empty the boot index or wedge
+    /// compaction forever (the pre-fix failure mode: `load` errored, the
+    /// index silently started empty, and compaction could never run again
+    /// while the journal grew unbounded).
+    fn load_from_disk(&self) -> Result<LoadedJournal> {
         let path = self.current_path();
+        let mut loaded = LoadedJournal::default();
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(loaded);
         }
         let file = File::open(&path)
             .with_context(|| format!("opening journal file {}", path.display()))?;
         let reader = BufReader::new(file);
-        let mut envelopes = Vec::new();
         for (i, line) in reader.lines().enumerate() {
             let line =
                 line.with_context(|| format!("reading line {} from {}", i + 1, path.display()))?;
@@ -106,11 +127,20 @@ impl EventStore {
             if trimmed.is_empty() {
                 continue;
             }
-            let envelope: JournalEnvelope = serde_json::from_str(trimmed)
-                .with_context(|| format!("parsing line {} from {}", i + 1, path.display()))?;
-            envelopes.push(envelope);
+            match serde_json::from_str::<JournalEnvelope>(trimmed) {
+                Ok(envelope) => loaded.envelopes.push(envelope),
+                Err(err) => {
+                    tracing::warn!(
+                        line = i + 1,
+                        path = %path.display(),
+                        error = %err,
+                        "skipping malformed system-event journal line"
+                    );
+                    loaded.malformed.push((i + 1, line));
+                }
+            }
         }
-        Ok(envelopes)
+        Ok(loaded)
     }
 
     fn tmp_path(&self) -> PathBuf {
@@ -137,10 +167,18 @@ impl EventStore {
 
         self.remove_stale_tmp();
 
-        let envelopes = self.load_all_from_disk()?;
+        let loaded = self.load_from_disk()?;
+        // Quarantine malformed lines into corrupt.jsonl (append, raw) so a
+        // splice is never silently destroyed, then let the rewrite below
+        // scrub them out of the live journal.
+        if !loaded.malformed.is_empty() {
+            self.quarantine_malformed(&loaded.malformed)?;
+        }
+        let envelopes = loaded.envelopes;
         let before = envelopes.len();
         let mut report = EventCompactionReport {
             before,
+            malformed_quarantined: loaded.malformed.len(),
             ..Default::default()
         };
 
@@ -168,7 +206,10 @@ impl EventStore {
         }
         report.after = kept.len();
 
-        if report.dropped_by_age == 0 && report.dropped_by_count == 0 {
+        if report.dropped_by_age == 0
+            && report.dropped_by_count == 0
+            && report.malformed_quarantined == 0
+        {
             return Ok(report);
         }
 
@@ -180,6 +221,28 @@ impl EventStore {
             idx.insert(env.event.id.clone(), env.event.clone());
         }
         Ok(report)
+    }
+
+    fn quarantine_malformed(&self, malformed: &[(usize, String)]) -> Result<()> {
+        let path = self.root.join("corrupt.jsonl");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening quarantine file {}", path.display()))?;
+        let mut buf = Vec::new();
+        for (line_no, raw) in malformed {
+            tracing::warn!(
+                line = line_no,
+                path = %path.display(),
+                "quarantining malformed system-event journal line"
+            );
+            buf.extend_from_slice(raw.as_bytes());
+            buf.push(b'\n');
+        }
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        Ok(())
     }
 
     fn rewrite_locked(&self, envelopes: &[JournalEnvelope]) -> Result<()> {
@@ -281,6 +344,109 @@ mod tests {
         assert_eq!(loaded[0].event.producer, "alpha");
         assert_eq!(loaded[1].event.producer, "beta");
         assert_eq!(loaded[2].event.producer, "gamma");
+    }
+
+    /// A spliced/corrupt line (the line-10902 incident shape) must not
+    /// empty the load, must not wedge compaction, and must be quarantined
+    /// to corrupt.jsonl + scrubbed from the live journal by compaction.
+    #[test]
+    fn corrupt_journal_line_is_tolerated_and_compaction_scrubs_it() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new_at(dir.path().to_path_buf());
+        store
+            .append(&JournalEnvelope::wrap(test_event("alpha")))
+            .unwrap();
+        store
+            .append(&JournalEnvelope::wrap(test_event("beta")))
+            .unwrap();
+        // Splice a half-record + foreign record into the middle, like an
+        // interleaved cross-process append.
+        let path = dir.path().join("current.jsonl");
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        lines.insert(
+            1,
+            r#"{"schema":"system-event/v1","event":{"id":"evt-x","payload":"trunc{"schema":"system-event/v1"}"#
+                .to_string(),
+        );
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        // Lenient load: both healthy events survive.
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        // Reopen: the boot index must include healthy events despite the
+        // corrupt line (pre-fix it silently started empty).
+        let reopened = EventStore::new_at(dir.path().to_path_buf());
+        assert_eq!(reopened.load_all().unwrap().len(), 2);
+
+        // Compaction quarantines + scrubs even when nothing ages out.
+        let report = reopened.compact_with_now("2030-01-01T00:00:00Z").unwrap();
+        // (far-future now drops both by age; what matters here is the scrub)
+        assert_eq!(report.malformed_quarantined, 1);
+        let journal = std::fs::read_to_string(&path).unwrap();
+        assert!(!journal.contains("evt-x"));
+        let quarantine = std::fs::read_to_string(dir.path().join("corrupt.jsonl")).unwrap();
+        assert!(quarantine.contains("evt-x"));
+    }
+
+    /// Same scrub path when retention drops nothing: the malformed line
+    /// alone must force the rewrite.
+    #[test]
+    fn compaction_scrubs_corrupt_line_when_nothing_ages_out() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new_at(dir.path().to_path_buf());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .append(&JournalEnvelope::wrap(event_at("alpha", &now)))
+            .unwrap();
+        let path = dir.path().join("current.jsonl");
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("not-json-at-all\n");
+        std::fs::write(&path, content).unwrap();
+
+        let report = store.compact_with_now(&now).unwrap();
+        assert_eq!(report.malformed_quarantined, 1);
+        assert_eq!(report.dropped_by_age, 0);
+        assert_eq!(report.dropped_by_count, 0);
+        assert_eq!(report.after, 1);
+        let journal = std::fs::read_to_string(&path).unwrap();
+        assert!(!journal.contains("not-json-at-all"));
+        assert_eq!(store.load_all().unwrap().len(), 1);
+        let quarantine = std::fs::read_to_string(dir.path().join("corrupt.jsonl")).unwrap();
+        assert!(quarantine.contains("not-json-at-all"));
+    }
+
+    /// Appends are single-buffer single-write: every journal line is
+    /// independently parseable even under heavy concurrent appending.
+    #[test]
+    fn concurrent_appends_keep_every_line_parseable() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(EventStore::new_at(dir.path().to_path_buf()));
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let store = store.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..25 {
+                    store
+                        .append(&JournalEnvelope::wrap(test_event(&format!("p{t}-{i}"))))
+                        .unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let content = std::fs::read_to_string(dir.path().join("current.jsonl")).unwrap();
+        let mut parsed = 0;
+        for line in content.lines() {
+            serde_json::from_str::<JournalEnvelope>(line).unwrap();
+            parsed += 1;
+        }
+        assert_eq!(parsed, 200);
     }
 
     #[test]
