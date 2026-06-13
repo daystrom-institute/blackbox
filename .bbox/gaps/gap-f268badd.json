@@ -1,0 +1,20 @@
+{
+  "id": "gap-f268badd",
+  "title": "Maintenance crons never installed — daily-compaction-arc + embed-compaction-arc exist but nothing schedules them",
+  "gap_kind": "tooling",
+  "domain": "operations/maintenance-scheduling",
+  "wanted_capability": "The maintenance arcs actually running on prod. bro_cron_list returned [] on 2026-06-13 while daily-compaction-arc (storage GC + vector compaction) and the embed-compaction cron-routing packet sat installed-but-unscheduled — so storage GC and the nightly embed compaction have NEVER run automatically. Consequence already paid: 100.6 GB of inactive workspace snapshots (223 per-commit snapshots for d723917f alone) and the gap-1168b0bd/journal-compaction class of silent-for-weeks failures. Wanted: (a) install the maintenance crons as part of bootstrap/deploy (system-defaults install should not leave arcs schedule-less), (b) a doctor/inbox check that flags installed maintenance workflows with no cron pointing at them — \"maintenance exists but is unscheduled\" must be visible, not discovered via a 118 GB du.",
+  "fallback_used": "Manual bbox_storage_gc (reclaimed 90.7 GB, 2026-06-13) and manual workflow runs.",
+  "evidence": [
+    "bro_cron_list => {crons: []} on prod 2026-06-13",
+    "system-defaults/maintenance/workflows/daily-compaction-arc.json StorageGc node",
+    "edges dir 117G -> 32G after manual GC",
+    "thread-098387b3"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/operations/maintenance-crons-not-installed",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T00:33:33Z",
+  "updated_at": "2026-06-13T00:33:33Z"
+}

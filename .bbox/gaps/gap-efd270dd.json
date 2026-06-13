@@ -1,0 +1,20 @@
+{
+  "id": "gap-efd270dd",
+  "title": "Workspace snapshot retention is age-based with no count/byte budget — ~100 GB steady state at multi-agent commit rate",
+  "gap_kind": "tooling",
+  "domain": "storage/snapshot-retention",
+  "wanted_capability": "A bounded retention policy for materialized workspace snapshots. Every commit materializes a new head-&lt;sha&gt; snapshot (up to 1.6 GB each for d723917f); retention is max_snapshot_age_days (default 14) plus small per-repo/per-workspace recent floors, with no count or byte budget. At this repo's commit rate (~16 snapshots/day across agents) the steady state is ~100 GB even WITH daily GC running — and the daily-compaction-arc's StorageGc node doesn't pass max_snapshot_age_days at all, so it inherits the 14-day default. Wanted: (a) count-cap and/or byte-budget retention per workspace (e.g. keep N newest + total bytes ceiling), (b) the arc's StorageGc args tightened accordingly, (c) consider not materializing a full snapshot per commit (delta or ref-count against the previous head) since consecutive snapshots are near-identical.",
+  "fallback_used": "Manual bbox_storage_gc with max_snapshot_age_days=0 (90.7 GB / 209 files reclaimed; 25-file recent floor retained).",
+  "evidence": [
+    "edges/materialized/workspace/d723917f/snapshots: 223 snapshots, 93 GB before cleanup",
+    "src/tools/storage_gc.rs default_snapshot_max_age_days = 14",
+    "system-defaults/maintenance/workflows/daily-compaction-arc.json StorageGc args omit max_snapshot_age_days",
+    "thread-098387b3"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/storage/snapshot-retention-unbounded",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T00:33:42Z",
+  "updated_at": "2026-06-13T00:33:42Z"
+}
