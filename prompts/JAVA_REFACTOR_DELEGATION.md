@@ -70,23 +70,47 @@ god class":
 2. Survey callers with
    `analysis.references({ symbols: seam.item_names, kinds: ["method_invocation"] })`;
    if anything outside the file calls a moved method, pass `wrappers: true`.
-3. `java.extractClass({ ... })` — **leave `wiring` unset**. It auto-selects:
+3. Decide whether this is a clean seam or a risky seam. Risky means unclear
+   captured dependencies, mutable state ownership, callback/source-instance
+   topology, or a payload you want to inspect before carrying through the
+   isolate. For risky seams, call `java.extractClass({ ..., previewOnly: true })`
+   first and inspect `dependency_projection`; re-call without `previewOnly` only
+   if it is safe. Clean seams skip preview.
+4. `java.extractClass({ ... })` — **leave `wiring` unset**. It auto-selects:
    a Guice/DI-managed source (uses `@Inject`) gets `external_injection`, so the
    delegate is a container-constructed `@Inject` bean and stays interceptable by
    Guice AOP. (`own_construction` `new`s up the delegate — invisible to Guice
    method interception. Only force it when AOP is irrelevant, e.g. AspectJ
    weaving or a non-DI source.)
-4. Inspect `dependency_projection`. A clean service seam should have
-   injectable/provider captures or no captures. If it flags non-injectable
-   constructor params, choose a cleaner seam, move the field, or make the
-   binding decision explicit before applying.
-5. `edits.begin → createFile(s) → merge(changes) → apply`.
+5. For the real mutation, keep `java.extractClass → edits.begin →
+   createFile(s) → merge(changes) → edits.apply` in **one exec cell** with a
+   local `result` variable. Do not split the heavy edit payload across cells
+   with `store()`/`load()`. If the real call's `dependency_projection` contains
+   non-injectable params, the same cell should stop before `edits.apply` and
+   report the projection. A clean service seam should have injectable/provider
+   captures or no captures.
 6. **Compile-gate** with the project's incremental build (the post-apply truth
    that tree-sitter validation cannot give you).
 7. `java.removeUnusedConstructorParams({ file })` → merge/apply → re-compile.
    Run it **after** the extract is applied — the orphaned `this.dep = dep` must
    already be gone for the param to read as unused. This fully *moves* the
    injection point rather than leaving dead `@Inject` params on the source.
+
+The load-bearing mutation cell shape:
+
+```ts
+const result = await java.extractClass(args);
+const projection = result.dependency_projection;
+if (projection.non_injectable_params?.length) {
+  text(JSON.stringify({ stopped: true, dependency_projection: projection }, null, 2));
+  throw new Error("stopped before apply: non-injectable captured dependency");
+}
+const es = await edits.begin();
+for (const c of result.creates) await edits.createFile({ es, path: c.path, content: c.content });
+await edits.merge({ es, changes: result.changes });
+const applied = await edits.apply({ es });
+text(JSON.stringify({ applied, dependency_projection: projection, fixme_count: result.fixme_count }, null, 2));
+```
 
 ## Briefing the dispatched agent
 
@@ -105,10 +129,10 @@ A good brief is a **task with guardrails**, not a script. Tell it:
   large edit payload. Do not add a mandatory preview tax to clean service-only
   seams; the normal call already returns `dependency_projection`.
 - The exact **compile-gate command** for the project.
-- Prefer `shell_run`'s host-side `output_filter` for noisy compile gates. It
-  preserves the primary command exit status because filtering happens after
-  capture. Report the unfiltered command as the gate even when you filter the
-  rendered output.
+- For noisy compile gates, give the agent the `shell_run` call with host-side
+  `output_filter` as the primary invocation shape. It preserves the primary
+  command exit status because filtering happens after capture. Report the
+  unfiltered command as the gate even when rendered output is filtered.
 - That transforms are **not idempotent** — a target-exists refusal after a
   successful apply means that step is DONE, not a retry (without this, agents
   shell-delete the created file and loop).
@@ -160,6 +184,10 @@ A good brief is a **task with guardrails**, not a script. Tell it:
 - **Do not pipe the build through `head`/`tail`/short-circuiting filters.** Use
   `shell_run({ output_filter })` when the build is noisy, or run the bare gate.
   The returned `exit_code` must be the build's exit code, not a filter's.
+- **Steers are recipe deltas.** If you have to steer a running probe, treat the
+  steer as evidence that the recipe/prompt is under-specified. Before the next
+  rerun, refine the prompt text or add a recipe comment so future agents start
+  on the corrected path.
 
 ## Your verify loop (don't trust the self-report)
 

@@ -314,3 +314,73 @@ Probe 5 should rerun the same unit against the same provider and measure:
 - whether `dependency_projection` changes the bro's pre-apply reasoning;
 - whether `previewOnly` is used only if the bro identifies real seam risk;
 - whether cells/tool calls drop or at least stop shifting into workaround code.
+
+## Probe 5 After Projection/Preview/Output Filter
+
+Probe 5 reran the same large UI section extraction against the same provider
+after implementing the three construct candidates and updating the private
+recipe branch.
+
+Actual pre-retro tool-use count:
+
+- 36 total outer tool uses
+- 10 `exec`
+- 13 `file_read`
+- 7 `content_search`
+- 3 `shell_run`
+- 2 Blackbox refactor-status reads
+- 1 `smart_read`
+
+Outcome:
+
+- Extract applied and cleanup applied.
+- Independent host compile passed after setting the same `JAVA_HOME` used by
+  the harness shell env.
+- `dependency_projection` reported `external_injection`, 17 target constructor
+  params, and no non-injectable params. It confirmed the seam rather than
+  changing the decision.
+- `previewOnly` was correctly skipped because the seam was clean.
+- `output_filter` preserved `exit_code: 0` and reduced the compile signal to
+  task/status/warning lines. The bro first ran an unfiltered compile, got a
+  large generated-code log, then reran filtered; the recipe should make the
+  filtered invocation the default for known-noisy gates.
+
+Retro findings:
+
+- The live steer was necessary because the prompt said the same-cell rule in a
+  mutation-rules block, while the numbered flow still read like separate
+  extract/apply steps. Future steers should be promoted into recipe text before
+  the next rerun.
+- `java.extractClass` and `edits.apply` need to be shown as one copyable cell.
+  Clean seams should inspect `dependency_projection` in that cell and stop
+  before apply if non-injectable captures appear; risky seams should use
+  `previewOnly` first.
+- The field-classification surface still has a constructor-injection blind spot
+  on this production shape even though `java.extractClass` itself auto-selected
+  external injection correctly.
+- Cohesion output included one proposed moved field that did not exist in the
+  source. Recipes should validate `move_fields` against source declarations
+  before passing them to a transform; longer-term, the analysis should flag
+  phantom fields.
+- Cleanup removed only the constructor params that were truly dead; fields that
+  remain referenced by the source correctly stayed. The recipe should teach
+  that only a subset of moved fields is expected to disappear from the source
+  constructor.
+
+Recipe/prompt changes made after Probe 5:
+
+- Promoted the live steer into protocol: every steer is provisional recipe
+  feedback and should be folded into prompt/recipe text before the next probe.
+- Added an explicit `extractClass → edits.apply` single-cell skeleton with a
+  `dependency_projection` guard.
+- Made filtered compile invocation the default for known-noisy gates.
+- Added `move_fields` declaration validation and cleanup-expectation notes.
+
+Remaining code construct candidates:
+
+- Constructor-injection linkage for field classification on all production
+  shapes.
+- Phantom-field detection in cohesion results before they feed transforms.
+- Optional compact-summary mode for cohesion clusters.
+- Cleanup reports explaining why constructor params were kept, not only what
+  was removed.
