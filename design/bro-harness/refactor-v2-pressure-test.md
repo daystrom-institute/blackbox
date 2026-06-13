@@ -561,9 +561,22 @@ real analysis-quality project, filed as a gap, not blocking the tier.
 This is the third tenant shape after the refactor algebra and the transform
 toolbox: a domain joins `analysis.*` by shipping one reduce-Rust-side
 binding + a compact `analysis.describe` contract, zero runtime changes
-(cell-dsl §8). Candidate siblings: `analysis.dependencyGraph`
-(`java_class_dependency_analysis`), `analysis.references` (the count-mode
-gap-31dc1375 wanted), `analysis.captures` (§5's extract-class support).
+(cell-dsl §8).
+
+**Second analysis binding (shipped):** `analysis.references({symbols,kinds?,declaringClass?})`
+— the count-mode answer gap-31dc1375 wanted. It ports
+`find_java_usages(summary_only=true)` as a bounded reference-count reduction:
+per-symbol counts, workspace-relative files, production/test split, and
+capped examples, deliberately no full `usages` array and no hash-anchored
+spans. Use it for caller surveys (`wrappers:true` decisions), cheap blast
+radius, and forwarded-field checks; re-derive `code.*` spans only when the
+next step edits. Probe-validated read-only against a large Java practice repo:
+the agent discovered the contract via `analysis.describe`, selected symbols,
+confirmed compact counts/files/examples, and made no edits.
+
+Candidate siblings: `analysis.dependencyGraph`
+(`java_class_dependency_analysis`), `analysis.captures` (§5's extract-class
+support).
 
 ## 7. Validation: live probes + tailored retro
 

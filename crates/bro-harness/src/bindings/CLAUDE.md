@@ -43,6 +43,12 @@ platform contract from `design/bro-harness/code-mode-cell-dsl.md`.
   belong HERE — never reconstructed in JS from `code.query` captures
   (that path OOMs on a sweep, or burns ~50 cells doing the reduction by
   hand). Two-tier rationale: pressure-test §6.7.
+- **`analysis.references` is the count-mode answer for Java usage surveys.**
+  Use it when the agent needs per-symbol reference counts, file lists, and
+  a few examples to choose `wrappers`, estimate blast radius, or distinguish
+  real concern-private state from forwarded fields. It deliberately returns
+  no full `usages` array and no hash-anchored spans; if the next step needs
+  edit addresses, re-derive them with `code.*`.
 
 ## Porting a v1 planner as a binding (the `lsp.rename` shape, generalized)
 
@@ -67,8 +73,9 @@ Footguns that bit:
   exec-prompt bloat). Do not inline N signatures into the description.
 - **Extract-to-delegate transforms preserve the public API on demand.**
   `java.extractClass`'s `wrappers` leaves delegating stubs on the source so
-  external callers compile unchanged. Survey callers first (the one-call
-  `code.files` → `code.query({files})`); the transform can't know whether
+  external callers compile unchanged. Survey callers first with
+  `analysis.references({symbols: seam.item_names, kinds:["method_invocation"]})`;
+  the transform can't know whether
   anything off-file uses a moved method.
 - **DI policy lives in the binding, never the engine.** `bbox_refactor`'s
   extract synthesis is framework-neutral by charter; the binding is the layer

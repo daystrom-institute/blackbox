@@ -62,7 +62,7 @@
 //! when rewriting `OldName` → `NewName` across the project.
 
 use super::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
     let project_dir_str = p
@@ -128,11 +128,20 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         .collect::<HashSet<_>>()
         .len();
     let mut usage_summary_by_name: BTreeMap<String, usize> = BTreeMap::new();
+    let mut usage_files_by_name: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for usage in &usages {
         *usage_summary_by_name
             .entry(usage.matched_name.clone())
             .or_insert(0) += 1;
+        usage_files_by_name
+            .entry(usage.matched_name.clone())
+            .or_default()
+            .insert(usage.path.clone());
     }
+    let usage_files_by_name: BTreeMap<String, Vec<String>> = usage_files_by_name
+        .into_iter()
+        .map(|(name, files)| (name, files.into_iter().collect()))
+        .collect();
     let usage_examples_by_name = top_usage_examples_by_name(&usages, 5);
     let title = format!(
         "find {} symbol(s) across {}",
@@ -155,6 +164,7 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         "total_usages": usage_count,
         "unique_call_files": unique_call_files,
         "usage_summary_by_name": usage_summary_by_name.clone(),
+        "usage_files_by_name": usage_files_by_name.clone(),
         "production_sites": production_sites,
         "test_sites": test_sites,
     });
@@ -191,6 +201,7 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
             "total_usages": usage_count,
             "unique_call_files": unique_call_files,
             "usage_summary_by_name": usage_summary_by_name,
+            "usage_files_by_name": usage_files_by_name,
         });
         if summary_only {
             summary["usage_examples_by_name"] = serde_json::to_value(usage_examples_by_name)?;
@@ -1030,6 +1041,15 @@ mod tests {
         let examples = v["usage_examples_by_name"]["Symbol"].as_array().unwrap();
         assert_eq!(examples.len(), 5);
         assert_eq!(v["usage_summary_by_name"]["Symbol"].as_u64().unwrap(), 6);
+        let files = v["usage_files_by_name"]["Symbol"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(
+            files[0]
+                .as_str()
+                .unwrap()
+                .ends_with("src/main/java/com/example/A.java"),
+            "{files:?}"
+        );
     }
 
     // Gate: refuses when project_dir is missing.

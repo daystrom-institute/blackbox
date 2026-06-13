@@ -13,8 +13,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/symbol-reference-counts",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-370679a5",
   "created_at": "2026-06-12T22:49:59Z",
-  "updated_at": "2026-06-12T22:49:59Z"
+  "updated_at": "2026-06-13T16:12:55Z",
+  "resolved_at": "2026-06-13T16:12:55Z",
+  "resolution_note": "Addressed by the harness-native `analysis.references` binding plus substrate summary fields. `find_java_usages(summary_only=true)` now includes `usage_files_by_name`, and `analysis.references({symbols,kinds?,declaringClass?})` projects bounded counts/files/top-5 examples with workspace-relative paths and no full `usages` payload. Live read-only probe against a large Java practice repo: agent discovered via `analysis.describe`, used `analysis.references`, confirmed compact counts/files/examples, no full usages array, and no edits."
 }

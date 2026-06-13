@@ -38,6 +38,11 @@ restate them:
   field will not fuse distinct concerns) and returns each cluster extract-ready
   with `{ item_names, move_fields, name_hint, score, expected_wiring }`. This
   replaces the agent reconstructing cohesion by hand. `analysis.describe`.
+- **`analysis.references({ symbols, kinds? })`** — the caller/reference survey.
+  Returns compact per-symbol counts, workspace-relative files, production/test
+  split, and capped examples without materializing full capture payloads. Use it
+  before extraction to decide whether `wrappers: true` is needed, and for cheap
+  blast-radius checks. `analysis.describe`.
 - **`java.extractClass({ file, target, delegateField, methods, moveFields?,
   wrappers? })`** — moves methods + fields into a new delegate class, synthesizes
   both sides, returns `{ changes, creates, findings }` for the edits algebra.
@@ -60,8 +65,9 @@ god class":
 
 1. `analysis.cohesionClusters({ file })` → pick the **cleanest real seam**:
    high `score`, more than one method, `expected_wiring === "delegate"`.
-2. Survey callers with `code.files` → `code.query({ files })`; if anything
-   outside the file calls a moved method, pass `wrappers: true`.
+2. Survey callers with
+   `analysis.references({ symbols: seam.item_names, kinds: ["method_invocation"] })`;
+   if anything outside the file calls a moved method, pass `wrappers: true`.
 3. `java.extractClass({ ... })` — **leave `wiring` unset**. It auto-selects:
    a Guice/DI-managed source (uses `@Inject`) gets `external_injection`, so the
    delegate is a container-constructed `@Inject` bean and stays interceptable by
