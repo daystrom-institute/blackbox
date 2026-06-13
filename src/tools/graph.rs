@@ -315,14 +315,16 @@ mod tests {
         };
 
         let found = inspect(symbol.to_string()).await;
-        assert_eq!(found["status"], "ok", "edge-backed symbol must inspect: {found}");
+        assert_eq!(
+            found["status"], "ok",
+            "edge-backed symbol must inspect: {found}"
+        );
         assert_eq!(found["properties"]["qualified_name"], "KnowledgeStore");
         assert_eq!(found["properties"]["source"], "edge_projection");
 
-        let orphan = inspect(
-            "symbol:d723917f:KnowledgeStore:cccccccccccccccccccccccccccccccc".to_string(),
-        )
-        .await;
+        let orphan =
+            inspect("symbol:d723917f:KnowledgeStore:cccccccccccccccccccccccccccccccc".to_string())
+                .await;
         assert_eq!(
             orphan["status"], "error.not_found",
             "edge-less symbol ref must stay not_found: {orphan}"

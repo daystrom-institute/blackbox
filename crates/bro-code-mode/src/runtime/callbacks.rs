@@ -148,7 +148,9 @@ pub(super) fn store_callback(
     if args.length() < 2 {
         throw_type_error(
             scope,
-            &format!("store(key, value) takes 2 arguments — to read the stored value use load({key:?})"),
+            &format!(
+                "store(key, value) takes 2 arguments — to read the stored value use load({key:?})"
+            ),
         );
         return;
     }
@@ -160,7 +162,10 @@ pub(super) fn store_callback(
     // every other stored value.
     let serialized = if value.is_function() {
         let Some(source) = value.to_string(scope) else {
-            throw_type_error(scope, &format!("Unable to capture source of function {key:?}."));
+            throw_type_error(
+                scope,
+                &format!("Unable to capture source of function {key:?}."),
+            );
             return;
         };
         serde_json::json!({ FN_SOURCE_KEY: source.to_rust_string_lossy(scope) })
@@ -170,7 +175,9 @@ pub(super) fn store_callback(
             Ok(None) => {
                 throw_type_error(
                     scope,
-                    &format!("Unable to store {key:?}. Only plain serializable objects can be stored."),
+                    &format!(
+                        "Unable to store {key:?}. Only plain serializable objects can be stored."
+                    ),
                 );
                 return;
             }
@@ -215,10 +222,7 @@ pub(super) fn load_callback(
     // context — which is also what enforces the self-contained constraint: a
     // revived function referencing lost closure variables throws
     // ReferenceError at call time, loudly.
-    if let Some(source) = value
-        .get(FN_SOURCE_KEY)
-        .and_then(serde_json::Value::as_str)
-    {
+    if let Some(source) = value.get(FN_SOURCE_KEY).and_then(serde_json::Value::as_str) {
         let wrapped = format!("({source})");
         let Some(code) = v8::String::new(scope, &wrapped) else {
             throw_type_error(scope, "failed to allocate stored function source");
@@ -230,7 +234,9 @@ pub(super) fn load_callback(
         let Some(revived) = compiled else {
             throw_type_error(
                 scope,
-                &format!("stored function {key:?} failed to compile from source — it must be a self-contained function expression"),
+                &format!(
+                    "stored function {key:?} failed to compile from source — it must be a self-contained function expression"
+                ),
             );
             return;
         };

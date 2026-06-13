@@ -130,4 +130,3 @@ pub(crate) fn init_system_memory_for_tests() {
         .join("memories");
     system_memory::init_for_tests_from(&defaults);
 }
-

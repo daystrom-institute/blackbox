@@ -104,8 +104,8 @@ mod tests {
     #[test]
     fn aggregate_means_over_contributing_queries_only() {
         let per_query = vec![
-            (vec!["a", "b"], vec!["a"]),        // rr 1.0, recall@1 1.0
-            (vec!["x", "a"], vec!["a"]),        // rr 0.5, recall@1 0.0
+            (vec!["a", "b"], vec!["a"]),          // rr 1.0, recall@1 1.0
+            (vec!["x", "a"], vec!["a"]),          // rr 0.5, recall@1 0.0
             (vec!["x", "y"], Vec::<&str>::new()), // skipped
         ];
         let report = aggregate(&per_query, &[1, 2]);

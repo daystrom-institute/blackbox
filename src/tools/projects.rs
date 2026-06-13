@@ -174,9 +174,9 @@ impl BlackboxServer {
             let mut projects = self.state.projects.write();
             projects.register_path(&p.path).and_then(|record| {
                 projects.sync_declared_aliases(&record.project_id, &declared_aliases)?;
-                projects
-                    .resolve(&record.project_id)?
-                    .with_context(|| format!("project vanished mid-register: {}", record.project_id))
+                projects.resolve(&record.project_id)?.with_context(|| {
+                    format!("project vanished mid-register: {}", record.project_id)
+                })
             })
         };
         let record = match res {

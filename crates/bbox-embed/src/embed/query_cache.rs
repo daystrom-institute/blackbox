@@ -106,9 +106,7 @@ fn embed_query_cached_with(
 fn embed_single_blocking(provider: &dyn EmbeddingProvider, query: &str) -> Result<Vec<f32>> {
     let texts = vec![query.to_string()];
     let vectors = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts)))
-        }
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts))),
         Err(_) => {
             let runtime = tokio::runtime::Runtime::new().context("creating embedding runtime")?;
             runtime.block_on(provider.embed_batch(&texts))

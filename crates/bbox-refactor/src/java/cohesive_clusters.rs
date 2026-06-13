@@ -114,8 +114,10 @@ pub(crate) fn plan_extract_java_class_cohesive_clusters(p: &RefactorPlanParams) 
     // everything). Constructors are never extracted to a delegate anyway,
     // so dropping them from the graph is strictly correct for cohesion.
     let methods: Vec<String> = methods.into_iter().filter(|m| *m != class_name).collect();
-    let m2f_pairs: Vec<(String, String)> =
-        m2f_pairs.into_iter().filter(|(m, _)| *m != class_name).collect();
+    let m2f_pairs: Vec<(String, String)> = m2f_pairs
+        .into_iter()
+        .filter(|(m, _)| *m != class_name)
+        .collect();
     let m2m_pairs: Vec<(String, String)> = m2m_pairs
         .into_iter()
         .filter(|(from, to)| *from != class_name && *to != class_name)
@@ -282,7 +284,9 @@ fn cluster_methods(
                 *tally.entry(other).or_default() += 1;
             }
         }
-        if let Some((target, _)) = tally.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+        if let Some((target, _)) = tally
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
         {
             comm.insert(m.clone(), target);
         }
@@ -903,8 +907,9 @@ mod tests {
                         .iter()
                         .any(|n| n == method)
                 })
-                .unwrap_or_else(|| panic!("method {method} not placed in any cluster: {clusters:?}"))
-                ["id"]
+                .unwrap_or_else(|| {
+                    panic!("method {method} not placed in any cluster: {clusters:?}")
+                })["id"]
                 .as_str()
                 .unwrap()
                 .to_string()

@@ -2520,8 +2520,7 @@ mod tests {
             "model": "glm-4.7",
         }))
         .unwrap();
-        orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None)
-            .unwrap();
+        orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None).unwrap();
 
         let (provider, _lens, opts, _env, _cwd, _filters, coerce, _ctx) = server
             .resolve_exec_target(Some("orc-fallback"), None, None)

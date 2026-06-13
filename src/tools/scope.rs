@@ -99,7 +99,14 @@ mod tests {
         std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
         run_git(
             &base,
-            &["worktree", "add", "-b", "arc/scope", worktree.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "arc/scope",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let wt = worktree
             .canonicalize()

@@ -384,13 +384,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     let constructor_text = if ctor_params.is_empty() {
         String::new()
     } else {
-        let raw = java_constructor_decl(
-            &target_class_name,
-            "public",
-            &ctor_params,
-            true,
-            None,
-        )?;
+        let raw = java_constructor_decl(&target_class_name, "public", &ctor_params, true, None)?;
         // External-injection wiring may decorate the generated target
         // constructor with caller-supplied annotations (e.g. `@Inject`) so an
         // external owner constructs it. The annotation lines go immediately

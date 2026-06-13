@@ -347,7 +347,11 @@ impl Tool for EditsCreateFile {
         Some(("edits".to_string(), "createFile".to_string()))
     }
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let params: CreateFileParams = match decode("edits.createFile", "{ es: string, path: string, content: string }", input) {
+        let params: CreateFileParams = match decode(
+            "edits.createFile",
+            "{ es: string, path: string, content: string }",
+            input,
+        ) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -514,7 +518,11 @@ impl Tool for EditsApply {
         Some(("edits".to_string(), "apply".to_string()))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let params: ApplyParams = match decode("edits.apply", "{ es: string, validations?: string[] }", input) {
+        let params: ApplyParams = match decode(
+            "edits.apply",
+            "{ es: string, validations?: string[] }",
+            input,
+        ) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -568,7 +576,9 @@ impl Tool for EditsApply {
         let mut resolved_creates: Vec<(String, PathBuf, String)> = Vec::new();
         for create in &set.creates {
             match bro_tools::workspace::resolve_in_root(&cx.root, &create.path) {
-                Ok(path) => resolved_creates.push((create.path.clone(), path, create.content.clone())),
+                Ok(path) => {
+                    resolved_creates.push((create.path.clone(), path, create.content.clone()))
+                }
                 Err(e) => return err(format!("edits.apply: {}: {e}", create.path)),
             }
         }
@@ -956,10 +966,7 @@ mod tests {
         // span as a JSON-encoded string.
         let span_str = serde_json::to_string(&beta["span"]).unwrap();
         let result = EditsDelete(store)
-            .call(
-                json!({ "es": { "es": es }, "span": span_str }),
-                &cx,
-            )
+            .call(json!({ "es": { "es": es }, "span": span_str }), &cx)
             .await;
         let out = json_of(result);
         assert_eq!(out["edit_count"], 1, "{out}");
@@ -978,7 +985,10 @@ mod tests {
             .to_string();
         json_of(
             EditsReplace(store.clone())
-                .call(json!({ "es": es, "span": beta["span"], "text": "fn x() {}" }), &cx)
+                .call(
+                    json!({ "es": es, "span": beta["span"], "text": "fn x() {}" }),
+                    &cx,
+                )
                 .await,
         );
         std::fs::write(root.join("probe.rs"), "pub fn drifted() {}\n").unwrap();
@@ -1040,10 +1050,17 @@ mod tests {
             .to_string();
         json_of(
             EditsCreateFile(store.clone())
-                .call(json!({ "es": es, "path": "newmod.rs", "content": "pub fn fresh() {}\n" }), &cx)
+                .call(
+                    json!({ "es": es, "path": "newmod.rs", "content": "pub fn fresh() {}\n" }),
+                    &cx,
+                )
                 .await,
         );
-        let result = json_of(EditsApply(store.clone()).call(json!({ "es": es }), &cx).await);
+        let result = json_of(
+            EditsApply(store.clone())
+                .call(json!({ "es": es }), &cx)
+                .await,
+        );
         assert_eq!(result["applied"], true, "{result}");
         assert!(root.join("newmod.rs").exists());
 
@@ -1053,7 +1070,10 @@ mod tests {
             .to_string();
         json_of(
             EditsCreateFile(store.clone())
-                .call(json!({ "es": es2, "path": "newmod.rs", "content": "x" }), &cx)
+                .call(
+                    json!({ "es": es2, "path": "newmod.rs", "content": "x" }),
+                    &cx,
+                )
                 .await,
         );
         let result = json_of(EditsApply(store).call(json!({ "es": es2 }), &cx).await);
@@ -1078,7 +1098,8 @@ mod tests {
                 .await,
         );
         let mut forged = beta["span"].clone();
-        forged["content_sha256"] = json!("0000000000000000000000000000000000000000000000000000000000000000");
+        forged["content_sha256"] =
+            json!("0000000000000000000000000000000000000000000000000000000000000000");
         let result = EditsDelete(store)
             .call(json!({ "es": es, "span": forged }), &cx)
             .await;
@@ -1223,7 +1244,10 @@ mod tests {
             .to_string();
         json_of(
             EditsCreateFile(store.clone())
-                .call(json!({ "es": es, "path": "fresh.rs", "content": "pub fn fresh() {}\n" }), &cx)
+                .call(
+                    json!({ "es": es, "path": "fresh.rs", "content": "pub fn fresh() {}\n" }),
+                    &cx,
+                )
                 .await,
         );
         let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);

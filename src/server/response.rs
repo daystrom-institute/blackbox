@@ -308,7 +308,8 @@ mod tests {
         std::fs::create_dir_all(&dump_dir).unwrap();
         let stale = dump_dir.join("resp-0-deadbeef.txt");
         std::fs::write(&stale, b"old").unwrap();
-        let old_mtime = SystemTime::now() - BlackboxServer::DUMP_RETENTION - Duration::from_secs(60);
+        let old_mtime =
+            SystemTime::now() - BlackboxServer::DUMP_RETENTION - Duration::from_secs(60);
         let f = std::fs::File::open(&stale).unwrap();
         f.set_modified(old_mtime).unwrap();
 

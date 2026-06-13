@@ -1820,11 +1820,13 @@ mod tests {
     #[test]
     fn connectivity_breach_requires_threshold_and_size_floor() {
         // Over threshold, over the size floor: breach.
-        assert!(metrics_with_connectivity(10_000, 600)
-            .connectivity_breach(COMPACT_CONNECTIVITY_RATIO));
+        assert!(
+            metrics_with_connectivity(10_000, 600).connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
+        );
         // Under threshold: no breach.
-        assert!(!metrics_with_connectivity(10_000, 100)
-            .connectivity_breach(COMPACT_CONNECTIVITY_RATIO));
+        assert!(
+            !metrics_with_connectivity(10_000, 100).connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
+        );
         // Tiny partition: ratio is noise, never a breach regardless of value.
         assert!(!metrics_with_connectivity(50, 10).connectivity_breach(COMPACT_CONNECTIVITY_RATIO));
     }
@@ -1855,12 +1857,8 @@ mod tests {
     fn metrics_nonblocking_skips_write_locked_partitions() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
-        store
-            .upsert("route-a", "a", "h1", vec![1.0, 0.0])
-            .unwrap();
-        store
-            .upsert("route-b", "b", "h2", vec![0.0, 1.0])
-            .unwrap();
+        store.upsert("route-a", "a", "h1", vec![1.0, 0.0]).unwrap();
+        store.upsert("route-b", "b", "h2", vec![0.0, 1.0]).unwrap();
 
         let partition_a = store.partition("route-a").unwrap();
         let _write_hold = partition_a.write();

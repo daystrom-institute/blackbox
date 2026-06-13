@@ -755,7 +755,8 @@ mod tests {
         let callable = vec![Arc::new(NamespacedEcho) as Arc<dyn Tool>];
         let empty_seam: Arc<dyn ToolCapability> =
             Arc::new(crate::capabilities::HostTools::new(Vec::new(), test_cx()));
-        let exec = code_mode_tools(&callable, empty_seam, CodeMode::Only, &BTreeMap::new()).remove(0);
+        let exec =
+            code_mode_tools(&callable, empty_seam, CodeMode::Only, &BTreeMap::new()).remove(0);
         let result = exec
             .call(json!({ "source": "await ns.echo({ a: 1 });" }), &test_cx())
             .await;
@@ -902,7 +903,8 @@ text(`${r.applied}:${r.semantic_status}:${r.validations[0].status}`);
         let callable = vec![Arc::new(Echo) as Arc<dyn Tool>];
         let empty_seam: Arc<dyn ToolCapability> =
             Arc::new(crate::capabilities::HostTools::new(Vec::new(), test_cx()));
-        let exec = code_mode_tools(&callable, empty_seam, CodeMode::Only, &BTreeMap::new()).remove(0);
+        let exec =
+            code_mode_tools(&callable, empty_seam, CodeMode::Only, &BTreeMap::new()).remove(0);
         let result = exec
             .call(
                 json!({ "source": "await tools.echo({ a: 1 });" }),

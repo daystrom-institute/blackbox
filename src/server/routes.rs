@@ -1482,12 +1482,8 @@ pub(crate) async fn install_artifact_value(
             // Same fail-loud-at-install posture as agent installs: member
             // brofiles must already exist (install brofiles before teams).
             for member in &tp.members {
-                if orchestration::brofile::resolve_brofile(
-                    &member.brofile,
-                    &state.store_dir,
-                    None,
-                )
-                .is_none()
+                if orchestration::brofile::resolve_brofile(&member.brofile, &state.store_dir, None)
+                    .is_none()
                 {
                     anyhow::bail!(
                         "team artifact '{}': member brofile not found: {} \

@@ -791,7 +791,11 @@ impl GapStore {
         for g in &self.data.gaps {
             match g.project.as_deref() {
                 Some(dir) if !dir.is_empty() => {
-                    match g.write_dir.as_deref().filter(|d| !d.is_empty() && *d != dir) {
+                    match g
+                        .write_dir
+                        .as_deref()
+                        .filter(|d| !d.is_empty() && *d != dir)
+                    {
                         // Redirected gap: the worktree file carries it, but
                         // that file is invisible to reload until the branch
                         // merges into a registered base root — so central

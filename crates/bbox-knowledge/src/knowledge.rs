@@ -21,8 +21,7 @@ use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
 // with the domain methods that consume them means adding a field is a
 // one-file change.
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct LearnParams {
     /// The instruction, fact, or preference
     pub content: String,
@@ -62,8 +61,7 @@ pub struct LearnParams {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct RememberParams {
     /// The fact, observation, or note
     pub content: String,
@@ -196,8 +194,7 @@ pub struct BootstrapParams {
     pub project: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct DecideParams {
     /// The decision itself — the commitment being made
     pub content: String,
@@ -1109,7 +1106,10 @@ impl Knowledge {
                         .insert(e.id.as_str());
                 }
             }
-            by_carrier.entry(PathBuf::from(carrier)).or_default().push(e);
+            by_carrier
+                .entry(PathBuf::from(carrier))
+                .or_default()
+                .push(e);
         }
         // Purge only for projects whose repo entries we actually loaded (root is
         // tracked) — otherwise our in-memory set is not authoritative and
@@ -3275,7 +3275,9 @@ mod tests {
             central.write_redirects.get(&id).map(String::as_str),
             Some(wt_root.to_str().unwrap())
         );
-        let rider = kb.repo_record_rider(&id).expect("rider for repo-owned entry");
+        let rider = kb
+            .repo_record_rider(&id)
+            .expect("rider for repo-owned entry");
         assert!(
             rider.contains(&format!("{id}.json")),
             "rider should reference the committed entry file: {rider}"
@@ -3422,13 +3424,22 @@ mod tests {
             .unwrap()
             .id;
         let redirected = kb
-            .learn_result(&base_params("authored in base, edited from worktree"), false)
+            .learn_result(
+                &base_params("authored in base, edited from worktree"),
+                false,
+            )
             .unwrap()
             .id;
-        assert!(repo_kb_dir(&base_root).join(format!("{kept}.json")).exists());
-        assert!(repo_kb_dir(&base_root)
-            .join(format!("{redirected}.json"))
-            .exists());
+        assert!(
+            repo_kb_dir(&base_root)
+                .join(format!("{kept}.json"))
+                .exists()
+        );
+        assert!(
+            repo_kb_dir(&base_root)
+                .join(format!("{redirected}.json"))
+                .exists()
+        );
 
         // Edit the second entry from the worktree: rewrite goes to the
         // worktree; the base copy (older generation, owned by the branch)
@@ -3444,16 +3455,22 @@ mod tests {
         )
         .expect("redirected update should succeed");
 
-        assert!(repo_kb_dir(&wt_root)
-            .join(format!("{redirected}.json"))
-            .exists());
+        assert!(
+            repo_kb_dir(&wt_root)
+                .join(format!("{redirected}.json"))
+                .exists()
+        );
         assert!(
             repo_kb_dir(&base_root)
                 .join(format!("{redirected}.json"))
                 .exists(),
             "base committed file must survive the purge while redirected"
         );
-        assert!(repo_kb_dir(&base_root).join(format!("{kept}.json")).exists());
+        assert!(
+            repo_kb_dir(&base_root)
+                .join(format!("{kept}.json"))
+                .exists()
+        );
 
         // Reload drops the transient redirect; the base file (still committed)
         // carries the pre-edit generation again.

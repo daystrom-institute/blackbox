@@ -1179,7 +1179,10 @@ mod tests {
         );
 
         // Alias resolves through the registry like an id or path.
-        let hit = registry.resolve("blackbox").unwrap().expect("alias resolves");
+        let hit = registry
+            .resolve("blackbox")
+            .unwrap()
+            .expect("alias resolves");
         assert_eq!(hit.project_id, rec_a.project_id);
 
         // A conflicting claim from another project fails closed, mutating
@@ -1199,7 +1202,11 @@ mod tests {
 
         // Malformed aliases fail closed.
         let bad: BTreeSet<String> = ["has space".to_string()].into();
-        assert!(registry.sync_declared_aliases(&rec_b.project_id, &bad).is_err());
+        assert!(
+            registry
+                .sync_declared_aliases(&rec_b.project_id, &bad)
+                .is_err()
+        );
 
         // Alias resolves through resolve_project_context (both intents).
         let records = registry.list();

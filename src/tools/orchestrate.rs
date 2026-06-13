@@ -11,9 +11,10 @@ use crate::server::workflow_capabilities::validate_workflow_capabilities;
 use crate::system_memory;
 use crate::tools::bro_helpers::extract_and_compile_workflow;
 use crate::tools::bro_runtime_params::{
-    ArcCancelParams, ArcResultParams, ArcSignalParams, ArcStatusParams, CronInstallParams, CronUpcomingParams,
-    OrchestrateAuthorParams, OrchestrateRunParams, PollerInstallParams, SignalsParams,
-    WebhookDeliveriesParams, WebhookInstallParams, WebhookReplayParams, WorkflowInstallParams,
+    ArcCancelParams, ArcResultParams, ArcSignalParams, ArcStatusParams, CronInstallParams,
+    CronUpcomingParams, OrchestrateAuthorParams, OrchestrateRunParams, PollerInstallParams,
+    SignalsParams, WebhookDeliveriesParams, WebhookInstallParams, WebhookReplayParams,
+    WorkflowInstallParams,
 };
 use crate::webhooks;
 use crate::workflow;
@@ -414,9 +415,8 @@ Constraints:\n\
             return Self::ok_json(&out);
         }
         let Some(msg) = inner.last_assistant_message.as_deref() else {
-            out["hint"] = Value::String(
-                "task terminal but no result envelope was captured".to_string(),
-            );
+            out["hint"] =
+                Value::String("task terminal but no result envelope was captured".to_string());
             return Self::ok_json(&out);
         };
         let Ok(parsed) = serde_json::from_str::<Value>(msg) else {
@@ -425,7 +425,10 @@ Constraints:\n\
             return Self::ok_json(&out);
         };
         out["workflowStatus"] = parsed.get("status").cloned().unwrap_or(Value::Null);
-        out["structuredExit"] = parsed.get("structured_exit").cloned().unwrap_or(Value::Null);
+        out["structuredExit"] = parsed
+            .get("structured_exit")
+            .cloned()
+            .unwrap_or(Value::Null);
         if let Some(thread) = parsed.get("arc_thread_id") {
             out["arcThreadId"] = thread.clone();
         }

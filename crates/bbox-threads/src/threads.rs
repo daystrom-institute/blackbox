@@ -1052,7 +1052,10 @@ impl Threads {
             // excluded everything or this store simply isn't the one that
             // holds their threads (gap-518d7215).
             return Ok(if self.store.threads.is_empty() {
-                format!("No threads found (store {} is empty).", self.store_path.display())
+                format!(
+                    "No threads found (store {} is empty).",
+                    self.store_path.display()
+                )
             } else {
                 format!(
                     "No threads found ({}; filters matched none).",

@@ -77,9 +77,7 @@ pub(super) fn exec_compact_vector_partitions(
             if !deleted_due && !connectivity_due {
                 return None;
             }
-            let severity = metrics
-                .deleted_ratio
-                .max(metrics.connectivity_risk_ratio());
+            let severity = metrics.deleted_ratio.max(metrics.connectivity_risk_ratio());
             Some((route, severity, metrics))
         })
         .collect::<Vec<_>>();

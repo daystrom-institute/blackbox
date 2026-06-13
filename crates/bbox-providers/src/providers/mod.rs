@@ -125,10 +125,7 @@ impl<'a> ProviderContext<'a> {
         }
     }
 
-    pub fn with_edge_index(
-        mut self,
-        edges: &'a bbox_edge_index::edge_index::EdgeIndex,
-    ) -> Self {
+    pub fn with_edge_index(mut self, edges: &'a bbox_edge_index::edge_index::EdgeIndex) -> Self {
         self.edges = Some(edges);
         self
     }

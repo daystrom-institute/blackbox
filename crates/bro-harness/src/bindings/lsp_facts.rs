@@ -108,7 +108,9 @@ fn position_to_byte(source: &str, pos: lsp_types::Position) -> Result<usize, Str
         utf16 += ch.len_utf16() as u32;
     }
     if utf16 >= pos.character {
-        Ok(source.len().min(offset + source[offset..].find('\n').unwrap_or(source.len() - offset)))
+        Ok(source
+            .len()
+            .min(offset + source[offset..].find('\n').unwrap_or(source.len() - offset)))
     } else {
         Err(format!(
             "position {}:{} out of range",
@@ -160,7 +162,9 @@ impl LspState {
 
 fn render_lsp_error(e: bro_lsp::Error) -> String {
     if e.is_lsp_unavailable() {
-        format!("lsp_unavailable: {e} — refusing to proceed (RX-V3: no syntax-only downgrade); install/configure rust-analyzer or use code.*/edits.* with explicit spans")
+        format!(
+            "lsp_unavailable: {e} — refusing to proceed (RX-V3: no syntax-only downgrade); install/configure rust-analyzer or use code.*/edits.* with explicit spans"
+        )
     } else {
         format!("{e}")
     }
@@ -358,10 +362,8 @@ impl Tool for LspRename {
             AuthorityTier::LspVerified,
             changes.iter().map(|(span, text)| (span, text.as_str())),
         );
-        let files: std::collections::BTreeSet<&str> = changes
-            .iter()
-            .map(|(span, _)| span.file.as_str())
-            .collect();
+        let files: std::collections::BTreeSet<&str> =
+            changes.iter().map(|(span, _)| span.file.as_str()).collect();
         ToolResult::Json(json!({
             "changes": changes
                 .iter()

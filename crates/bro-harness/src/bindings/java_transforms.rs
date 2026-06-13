@@ -907,8 +907,14 @@ public class OrderService {
         assert_eq!(applied["applied"], true, "{applied}");
         // Both files written, tree-sitter validated, delegate wired.
         let source = std::fs::read_to_string(root.join("src/com/acme/OrderService.java")).unwrap();
-        assert!(source.contains("private final OrderPricing pricing;"), "{source}");
-        assert!(source.contains("this.pricing = new OrderPricing(taxRate);"), "{source}");
+        assert!(
+            source.contains("private final OrderPricing pricing;"),
+            "{source}"
+        );
+        assert!(
+            source.contains("this.pricing = new OrderPricing(taxRate);"),
+            "{source}"
+        );
         assert!(!source.contains("public double price"), "{source}");
         let target = std::fs::read_to_string(root.join("src/com/acme/OrderPricing.java")).unwrap();
         assert!(target.contains("class OrderPricing"), "{target}");
@@ -1106,7 +1112,10 @@ public class AggregationAdmin {
         assert_eq!(result["ctor_is_inject"], false, "{result}");
         assert!(result["changes"].as_array().unwrap().is_empty(), "{result}");
         assert!(
-            result["note"].as_str().unwrap().contains("no @Inject constructor"),
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("no @Inject constructor"),
             "{result}"
         );
     }

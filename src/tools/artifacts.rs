@@ -330,8 +330,7 @@ mod tests {
         );
         assert_eq!(team.members.len(), 1, "live roster untouched by upgrade");
         // The refreshed teamplate IS picked up for future creates.
-        let tp =
-            orchestration::team::resolve_teamplate("tm-durable", &store_dir, None).unwrap();
+        let tp = orchestration::team::resolve_teamplate("tm-durable", &store_dir, None).unwrap();
         assert_eq!(tp.members[0].count, 3);
     }
 

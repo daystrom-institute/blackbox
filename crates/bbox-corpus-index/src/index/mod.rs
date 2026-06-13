@@ -977,7 +977,11 @@ mod tests {
         };
         // Out-of-tree worktree session: literal cwd shares no substring
         // with the base path, only the stamp links it.
-        add_doc("wt-session", "/state/fleet/worktrees/task-9", Some("feedbeef"));
+        add_doc(
+            "wt-session",
+            "/state/fleet/worktrees/task-9",
+            Some("feedbeef"),
+        );
         add_doc("base-session", "/tmp/registered-base", Some("feedbeef"));
         add_doc("other-session", "/somewhere/else", None);
         writer.commit().unwrap();
