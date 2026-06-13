@@ -315,6 +315,13 @@ struct DeferredEntry {
     schema: Value,
 }
 
+#[derive(serde::Deserialize)]
+struct ToolSearchInput {
+    query: String,
+    #[serde(default)]
+    include_schemas: bool,
+}
+
 struct ToolSearchTool {
     catalog: Arc<Vec<DeferredEntry>>,
     activated: Arc<Mutex<HashSet<String>>>,
@@ -326,7 +333,7 @@ impl Tool for ToolSearchTool {
         TOOL_SEARCH
     }
     fn description(&self) -> &str {
-        "Search for and load additional tools not in the always-available set. Pass a keyword query (e.g. \"slice edit\") or `select:name1,name2` for exact names. Returns the matching tool schemas and makes them callable on subsequent turns."
+        "Search for and load additional tools not in the always-available set. Pass a keyword query (e.g. \"slice edit\") or `select:name1,name2` for exact names. Returns compact match metadata by default and makes matches callable on subsequent turns; set include_schemas=true only when you need schema details in the tool result itself."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -335,13 +342,21 @@ impl Tool for ToolSearchTool {
                 "query": {
                     "type": "string",
                     "description": "Keyword query, or `select:nameA,nameB` to load exact tool names."
+                },
+                "include_schemas": {
+                    "type": "boolean",
+                    "description": "When true, include full input schemas in this result. Default false; loaded tools are callable with schemas on the next turn either way."
                 }
             },
             "required": ["query"]
         })
     }
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let query = input["query"].as_str().unwrap_or("").trim().to_string();
+        let args: ToolSearchInput = match serde_json::from_value(input) {
+            Ok(args) => args,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        let query = args.query.trim().to_string();
         if query.is_empty() {
             return ToolResult::Error("query is required".into());
         }
@@ -379,16 +394,28 @@ impl Tool for ToolSearchTool {
         let mut loaded = Vec::new();
         for e in &matches {
             activated.insert(e.name.clone());
-            loaded.push(json!({
+            let mut item = json!({
                 "name": e.name,
                 "description": e.description,
-                "input_schema": e.schema,
-            }));
+            });
+            if args.include_schemas {
+                item["input_schema"] = e.schema.clone();
+            }
+            loaded.push(item);
         }
+        let remaining_count = self
+            .catalog
+            .iter()
+            .filter(|e| !activated.contains(e.name.as_str()))
+            .count();
         ToolResult::Json(json!({
             "loaded": matches.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
             "tools": loaded,
-            "note": "These tools are now callable.",
+            "remaining": {
+                "count": remaining_count,
+                "hint": "Use tool_search with sharper keywords or select:name1,name2 for additional tools. Pass include_schemas=true only when the compact metadata is insufficient."
+            },
+            "note": "These tools are now callable on subsequent turns; their schemas will be present in the tool list.",
         }))
     }
 }
@@ -676,6 +703,49 @@ mod tests {
             !all_known(&gone).contains(&TOOL_SEARCH.to_string()),
             "explicit deny must remove tool_search"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_search_compact_by_default_and_schema_opt_in() {
+        let reg = Registry::new(
+            vec![],
+            vec![mk("bbox_stats", "corpus stats")],
+            &PinPolicy { patterns: vec![] },
+            &ToolFilter::default(),
+        );
+        let cx = test_cx(bro_tools::ToolArgDefaults::default());
+
+        let compact = reg
+            .dispatch("tool_search", json!({"query":"stats"}), &cx)
+            .await;
+        match compact {
+            ToolResult::Json(v) => {
+                assert_eq!(v["loaded"], json!(["bbox_stats"]));
+                assert!(v["tools"][0]["input_schema"].is_null(), "{v}");
+                assert_eq!(v["remaining"]["count"], json!(0));
+            }
+            other => panic!("expected json, got {other:?}"),
+        }
+
+        let reg = Registry::new(
+            vec![],
+            vec![mk("bbox_stats", "corpus stats")],
+            &PinPolicy { patterns: vec![] },
+            &ToolFilter::default(),
+        );
+        let verbose = reg
+            .dispatch(
+                "tool_search",
+                json!({"query":"stats","include_schemas":true}),
+                &cx,
+            )
+            .await;
+        match verbose {
+            ToolResult::Json(v) => {
+                assert!(v["tools"][0]["input_schema"].is_object(), "{v}");
+            }
+            other => panic!("expected json, got {other:?}"),
+        }
     }
 
     #[test]

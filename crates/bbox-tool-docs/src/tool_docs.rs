@@ -1214,7 +1214,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Workflows,
         summary: "Read a completed workflow arc's structured result without the event-log bulk: `structuredExit` (vars._structured_exit), final `vars` (optionally filtered by `keys`), `arcThreadId`, and `actorSessions`. Accepts the arcId from bro_orchestrate_run or the workflow task id. `include_node_outputs=true` adds per-node prose. Covers task-backed arcs (bro_orchestrate_run); webhook/SSE-ingress arcs are not task-backed.",
         when_to_use: "Use after a workflow finishes to consume its output — the replacement for parsing bro_wait's escaped result envelope. `keys` narrows to the vars you actually need (e.g. keys=[\"sieve\"]). Running arcs return {status: running}; pair with bro_arc_status for live position and bbox_notes(thread_id=<arc_thread_id>) for the audit trail.",
-        example: Some(r#"bro_arc_result(arc_id="arc-c60058fe9116dad8465043a39987a76c", keys=["sieve"])"#),
+        example: Some(
+            r#"bro_arc_result(arc_id="arc-c60058fe9116dad8465043a39987a76c", keys=["sieve"])"#,
+        ),
     },
     ToolDoc {
         name: "bro_webhook_replay",
@@ -1918,6 +1920,7 @@ pub fn render_markdown() -> String {
     out.push_str("## CORE RULE: contextual recall fallback\n\n");
     out.push_str("**When the opening sequence above doesn't fit (fast lookup of stored rules, no graph walk needed), query `bbox_knowledge` directly before committing to an approach.** This is a recall check, not a ritual call for every tiny command.\n\n");
     out.push_str("Use it for prior decisions, project conventions, rendered rules, remembered facts, system runbooks (sm-* IDs), and packet discovery. It is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes` / `bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`).\n\n");
+    out.push_str("Do not add a `bbox_knowledge` call just because you are doing procedural state work on an already-authoritative live surface: deduping or resolving gaps with `bbox_gaps`/`bbox_gap*`, opening or continuing threads with `bbox_thread*`, triaging notes/inbox, or committing repo-owned state files. Use the live surface directly unless a specific durable convention, decision, or runbook could materially change the operation.\n\n");
     out.push_str("The signature failure mode: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. Avoid that on work involving repo conventions, prior decisions, active runbooks, durable user preferences, bro/orchestration behavior, or anything where durable project memory could plausibly override defaults.\n\n");
     out.push_str("Prefer a short phrase from the user's request over a single generic keyword. If the first query is empty or too broad, try one sharper phrase or escalate to `bbox_hybrid_search` (vector lane catches paraphrases). Then proceed with the opening sequence above or normal implementation work using the retrieved context.\n\n");
     out.push_str(

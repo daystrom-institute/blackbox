@@ -1,5 +1,13 @@
 # bro-tools — harness tool surface + fleet worktree closeout driver
 
+## Workspace search output shape
+
+- `content_search` is exploratory by default, not an exhaustive dump. Keep the
+  default result cap and byte cap small enough for an agent turn, and append
+  refinement hints when truncating. Integrity comes from honest truncation
+  metadata plus `max_results` opt-in, not from silently returning every matching
+  line (gap-0c902d6d).
+
 ## Closeout phased driver (`fleet_worktree.rs`)
 
 - The driver does the MECHANICAL fold: preflight → stage/commit → ff-base →

@@ -20,6 +20,12 @@
   past the MCP response cap needs producer-side shaping (pagination,
   projection, accessors) — the lossless spill envelope is a failure
   signal, not a feature to lean on.
+- `bbox_knowledge`'s mixed response is deliberately progressive: durable
+  knowledge gets the primary top-N, while rule-packet and system-memory matches
+  are bounded sidecars with explicit expansion breadcrumbs. Do not "fix" recall
+  spill by changing match/rank semantics unless relevance is actually wrong;
+  producer-side shape belongs in limits, signposts, and exact/list follow-ups
+  (gap-c1c1b304).
 - Store-mutating tools observe multi-tenancy: the daemon serves several
   concurrent agents and worktrees; durable writes key to the BASE project so
   every checkout sees them, while repo-owned files land in the writer's

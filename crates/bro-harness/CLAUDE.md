@@ -33,6 +33,15 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
   resume reconstructs from the session file. Anything that must survive a
   resume belongs in persisted session state, not loop locals.
 
+## Deferred tool surface
+
+- `tool_search` is activation, not a schema dump. Default results stay compact
+  (names/descriptions + remaining count); the next turn's wire tool list is the
+  schema authority. Use explicit `include_schemas=true` only for callers that
+  need schema details inside the search result itself. The ambient manifest is a
+  bounded preview, not the full catalog — widening it reintroduces
+  gap-a05b8afd's context noise.
+
 ## Boundary invariants (compiler-enforced; don't negotiate)
 
 - bro-harness never depends on `blackbox`. Daemon capabilities arrive only

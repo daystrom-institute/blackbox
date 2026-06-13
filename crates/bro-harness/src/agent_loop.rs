@@ -2184,12 +2184,21 @@ fn compose_system(
     if !manifest.is_empty() {
         ambient.push_str(&format!(
             "## Additional tools ({} available, not yet loaded)\n\
-             Call `tool_search(\"<keywords>\")` (or `tool_search(\"select:name1,name2\")`) to load \
-             any of these before using them:\n",
+             Call `tool_search(\"<keywords>\")` to search/load by purpose, or \
+             `tool_search(\"select:name1,name2\")` if you already know exact names. \
+             `tool_search` returns compact match metadata by default; pass \
+             `include_schemas=true` only when the compact result is insufficient.\n",
             manifest.len()
         ));
-        for (name, desc) in manifest {
+        let preview_len = manifest.len().min(12);
+        for (name, desc) in manifest.iter().take(preview_len) {
             ambient.push_str(&format!("- {name}: {desc}\n"));
+        }
+        if manifest.len() > preview_len {
+            ambient.push_str(&format!(
+                "- … {} more hidden; use `tool_search` keywords to discover/load them.\n",
+                manifest.len() - preview_len
+            ));
         }
     }
 

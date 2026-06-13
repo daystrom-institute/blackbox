@@ -1045,7 +1045,7 @@ struct ContentSearchInput {
     path: Option<String>,
     /// Optional glob to restrict files by name (e.g. "*.rs").
     glob: Option<String>,
-    /// Max results to return (default 200). Counts matching lines in `content`
+    /// Max results to return (default 80). Counts matching lines in `content`
     /// mode, matching files in `files`/`count` mode.
     max_results: Option<usize>,
     /// Output shape: `content` (relpath:line:text), `files` (matching paths),
@@ -1062,13 +1062,38 @@ struct ContentSearchInput {
 
 pub struct ContentSearch;
 
+const CONTENT_SEARCH_DEFAULT_MAX_RESULTS: usize = 80;
+const CONTENT_SEARCH_HARD_MAX_RESULTS: usize = 5000;
+const CONTENT_SEARCH_OUTPUT_BYTE_CAP: usize = 24_000;
+
+fn push_search_line(hits: &mut Vec<String>, output_bytes: &mut usize, line: String) -> bool {
+    let next = *output_bytes + line.len() + usize::from(!hits.is_empty());
+    if next > CONTENT_SEARCH_OUTPUT_BYTE_CAP {
+        hits.push(format!(
+            "[truncated near {CONTENT_SEARCH_OUTPUT_BYTE_CAP} bytes of output]"
+        ));
+        return false;
+    }
+    *output_bytes = next;
+    hits.push(line);
+    true
+}
+
+fn content_search_refinement_hint(args: &ContentSearchInput, cap: usize) -> String {
+    let path_hint = args.path.as_deref().unwrap_or("<subdir>");
+    let glob_hint = args.glob.as_deref().unwrap_or("*.rs");
+    format!(
+        "[refine: narrow path=\"{path_hint}\" and glob=\"{glob_hint}\", use mode=\"files\" or mode=\"count\" to size the hit set first, lower max_results for a compact sample, or raise max_results up to {CONTENT_SEARCH_HARD_MAX_RESULTS} for a deliberate exhaustive search; current result cap {cap}, byte cap {CONTENT_SEARCH_OUTPUT_BYTE_CAP}]"
+    )
+}
+
 #[async_trait]
 impl Tool for ContentSearch {
     fn name(&self) -> &str {
         "content_search"
     }
     fn description(&self) -> &str {
-        "Search file contents by regex across the worktree (respects .gitignore). Returns relpath:line:text. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, and case_insensitive."
+        "Search file contents by regex across the worktree (respects .gitignore). Returns compact relpath:line:text results by default, capped with explicit truncation/refinement hints. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, case_insensitive, and max_results."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ContentSearchInput>()
@@ -1107,10 +1132,15 @@ impl Tool for ContentSearch {
                 Err(e) => return ToolResult::Error(e.to_string()),
             };
             let root = effective_root(&cx.root);
-            let cap = args.max_results.unwrap_or(200).min(5000);
+            let cap = args
+                .max_results
+                .unwrap_or(CONTENT_SEARCH_DEFAULT_MAX_RESULTS)
+                .min(CONTENT_SEARCH_HARD_MAX_RESULTS);
             let ctx = args.context_lines.unwrap_or(0).min(50);
 
             let mut hits: Vec<String> = Vec::new();
+            let mut output_bytes = 0usize;
+            let mut truncated = false;
             // `files`/`count` modes count files; `content` counts lines.
             let mut total_matches = 0usize;
             let mut matched_files = 0usize;
@@ -1134,9 +1164,13 @@ impl Tool for ContentSearch {
                 match args.mode {
                     SearchMode::Files => {
                         if lines.iter().any(|l| re.is_match(l)) {
-                            hits.push(rel);
+                            if !push_search_line(&mut hits, &mut output_bytes, rel) {
+                                truncated = true;
+                                break 'walk;
+                            }
                             if hits.len() >= cap {
                                 hits.push(format!("[truncated at {cap} files]"));
+                                truncated = true;
                                 break 'walk;
                             }
                         }
@@ -1146,9 +1180,14 @@ impl Tool for ContentSearch {
                         if n > 0 {
                             total_matches += n;
                             matched_files += 1;
-                            hits.push(format!("{rel}:{n}"));
+                            if !push_search_line(&mut hits, &mut output_bytes, format!("{rel}:{n}"))
+                            {
+                                truncated = true;
+                                break 'walk;
+                            }
                             if hits.len() >= cap {
                                 hits.push(format!("[truncated at {cap} files]"));
+                                truncated = true;
                                 break 'walk;
                             }
                         }
@@ -1162,15 +1201,34 @@ impl Tool for ContentSearch {
                                     for (j, ctx_line) in lines[lo..=hi].iter().enumerate() {
                                         let n = lo + j + 1;
                                         let sep = if lo + j == i { ':' } else { '-' };
-                                        hits.push(format!("{rel}:{n}{sep}{ctx_line}"));
+                                        if !push_search_line(
+                                            &mut hits,
+                                            &mut output_bytes,
+                                            format!("{rel}:{n}{sep}{ctx_line}"),
+                                        ) {
+                                            truncated = true;
+                                            break 'walk;
+                                        }
                                     }
-                                    hits.push("--".into());
+                                    if !push_search_line(&mut hits, &mut output_bytes, "--".into())
+                                    {
+                                        truncated = true;
+                                        break 'walk;
+                                    }
                                 } else {
-                                    hits.push(format!("{rel}:{}:{}", i + 1, line));
+                                    if !push_search_line(
+                                        &mut hits,
+                                        &mut output_bytes,
+                                        format!("{rel}:{}:{}", i + 1, line),
+                                    ) {
+                                        truncated = true;
+                                        break 'walk;
+                                    }
                                 }
                                 total_matches += 1;
                                 if total_matches >= cap {
                                     hits.push(format!("[truncated at {cap} matches]"));
+                                    truncated = true;
                                     break 'walk;
                                 }
                             }
@@ -1186,6 +1244,9 @@ impl Tool for ContentSearch {
                 hits.push(format!(
                     "[total: {total_matches} matches across {matched_files} files]"
                 ));
+            }
+            if truncated {
+                hits.push(content_search_refinement_hint(&args, cap));
             }
             let output = hits.join("\n");
             ToolResult::Text(output)
@@ -1921,6 +1982,29 @@ mod tests {
             .await;
         match r {
             ToolResult::Text(t) => assert_eq!(t, "no matches", "case-sensitive default: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn content_search_truncation_includes_refinement_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "hit one\nhit two\nhit three\nhit four\n",
+        )
+        .unwrap();
+        let cx = cx_at(dir.path());
+
+        let r = ContentSearch
+            .call(json!({"pattern":"hit","max_results":2}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                assert!(t.contains("[truncated at 2 matches]"), "got: {t}");
+                assert!(t.contains("[refine:"), "got: {t}");
+                assert!(t.contains("mode=\"files\""), "got: {t}");
+            }
             other => panic!("expected text, got {other:?}"),
         }
     }

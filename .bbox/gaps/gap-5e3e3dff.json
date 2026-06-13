@@ -15,7 +15,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "docs_runbook/contextual-recall/overfires-on-procedural-state-work",
   "notes": "During a harness/tool shakedown, the agent interpreted the contextual-recall reminder as a nudge to call bbox_knowledge while already doing procedural gap/thread work. The call did not materially change the operation and emitted a large system-memory sidecar, reinforcing the separate bbox_knowledge output-spill gap. The guidance says bbox_knowledge is not the surface for active threads, but the task shape boundary remains easy to misread.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-13T16:27:23Z",
-  "updated_at": "2026-06-13T16:27:23Z"
+  "updated_at": "2026-06-13T16:51:14Z",
+  "resolved_at": "2026-06-13T16:51:14Z",
+  "resolution_note": "Addressed on branch codex/harness-tool-surface-shakedown. Rendered contextual-recall guidance now explicitly exempts procedural work already operating on authoritative live state surfaces such as bbox_gaps/bbox_gap*, bbox_thread*, notes/inbox, and repo-owned state file commits unless a specific durable convention/decision/runbook could materially change the operation."
 }

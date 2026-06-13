@@ -274,6 +274,7 @@ pub fn format_for_listing(memory: &SystemMemory) -> String {
 
 /// Max bytes of the one-line content preview shown in a signpost.
 const SIGNPOST_PREVIEW_BYTES: usize = 160;
+const SIGNPOST_TAG_LIMIT: usize = 8;
 
 /// Render one memory as a compact signpost: id + title, tag line, a one-line
 /// content preview, and a retrieval breadcrumb pointing at the qualified-id
@@ -290,7 +291,16 @@ pub fn format_for_signpost(memory: &SystemMemory) -> String {
     out.push_str(&format!("[system] {} — {}\n", memory.id, memory.title));
     out.push_str(&format!("  ref: system_memory:{}\n", memory.id));
     if !memory.tags.is_empty() {
-        out.push_str(&format!("  tags: {}\n", memory.tags.join(", ")));
+        let mut tags = memory
+            .tags
+            .iter()
+            .take(SIGNPOST_TAG_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        if memory.tags.len() > SIGNPOST_TAG_LIMIT {
+            tags.push(format!("+{} more", memory.tags.len() - SIGNPOST_TAG_LIMIT));
+        }
+        out.push_str(&format!("  tags: {}\n", tags.join(", ")));
     }
     if let Some(preview) = signpost_preview(&memory.content) {
         out.push_str(&format!("  {preview}\n"));
@@ -704,6 +714,10 @@ mod tests {
         // Header + bundleable ref + breadcrumb present.
         assert!(out.starts_with("[system] sm-refactor"));
         assert!(out.contains("ref: system_memory:sm-refactor"));
+        assert!(
+            out.contains("+") || memory.tags.len() <= SIGNPOST_TAG_LIMIT,
+            "long tag lists should be summarized in signposts: {out}"
+        );
         assert!(
             out.contains("→ full runbook: bbox_knowledge(query=\"sm-refactor\")"),
             "signpost must point at the exact-id retrieval path: {out}"

@@ -14,6 +14,9 @@ use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 use serde_json::json;
 
+const DEFAULT_PACKET_SIDECAR_LIMIT: usize = 8;
+const DEFAULT_SYSTEM_MEMORY_SIDECAR_LIMIT: usize = 6;
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::knowledge_tools()
 }
@@ -387,7 +390,11 @@ impl BlackboxServer {
                     combined.push('\n');
                 }
                 combined.push_str("\n── Rule-packets ───────────────────────────────\n");
-                let limit = p.limit.unwrap_or(50).min(500) as usize;
+                let limit = p
+                    .limit
+                    .map(|limit| limit as usize)
+                    .unwrap_or(DEFAULT_PACKET_SIDECAR_LIMIT)
+                    .min(25);
                 for pkt in matching_packets.iter().take(limit) {
                     let histogram: Vec<String> = pkt
                         .rules
@@ -407,6 +414,12 @@ impl BlackboxServer {
                         pkt.rules.len(),
                         histogram.join(", "),
                         pkt.created_at,
+                    ));
+                }
+                if matching_packets.len() > limit {
+                    combined.push_str(&format!(
+                        "  [truncated rule-packets: showing {limit} of {}; use bbox_packet_list for structured filters]\n",
+                        matching_packets.len()
                     ));
                 }
                 combined.push_str(
@@ -429,9 +442,20 @@ impl BlackboxServer {
                     combined.push('\n');
                 }
                 combined.push_str("\n── System memories ──────────────────────────\n");
-                for m in memories {
+                let limit = p
+                    .limit
+                    .map(|limit| limit as usize)
+                    .unwrap_or(DEFAULT_SYSTEM_MEMORY_SIDECAR_LIMIT)
+                    .min(12);
+                for m in memories.iter().take(limit) {
                     combined.push_str(&system_memory::format_for_signpost(m));
                     combined.push('\n');
+                }
+                if memories.len() > limit {
+                    combined.push_str(&format!(
+                        "  [truncated system memories: showing {limit} of {}; query category=\"system_memory\" or an exact sm-* id for more]\n",
+                        memories.len()
+                    ));
                 }
                 combined.push_str(
                     "  (signposts only — query an exact sm-* id for the full runbook body)\n",
@@ -821,7 +845,14 @@ mod tests {
         std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
         run_git(
             &base,
-            &["worktree", "add", "-b", "arc/kb", worktree.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "arc/kb",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let wt_canon = worktree.canonicalize().unwrap();
         let wt = wt_canon.to_string_lossy().into_owned();

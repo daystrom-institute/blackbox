@@ -1800,7 +1800,10 @@ impl Knowledge {
             (KnowledgeQueryMode::Substring, Some(_)) => None,
             (KnowledgeQueryMode::Smart, Some(raw)) => parse_query(raw),
         };
-        let limit = p.limit.unwrap_or(50) as usize;
+        let limit = p
+            .limit
+            .map(|limit| limit as usize)
+            .unwrap_or(DEFAULT_KNOWLEDGE_LIST_LIMIT);
 
         let mut results: Vec<(&KnowledgeEntry, QueryMatch)> = self
             .store
@@ -1898,6 +1901,7 @@ impl Knowledge {
                 .then_with(|| a_entry.weight.cmp(&b_entry.weight))
                 .then_with(|| a_entry.title.cmp(&b_entry.title))
         });
+        let total_results = results.len();
         results.truncate(limit);
 
         if results.is_empty() {
@@ -1946,11 +1950,18 @@ impl Knowledge {
             })
             .collect();
 
-        Ok(format!(
-            "{} entries:\n\n{}",
-            results.len(),
-            lines.join("\n\n")
-        ))
+        let mut out = format!("{} entries", results.len());
+        if total_results > results.len() {
+            out.push_str(&format!(
+                " (showing {} of {}; pass limit={} or a sharper query to expand)",
+                results.len(),
+                total_results,
+                total_results.min(500)
+            ));
+        }
+        out.push_str(":\n\n");
+        out.push_str(&lines.join("\n\n"));
+        Ok(out)
     }
 
     pub fn record_recall(&mut self, returned_ids: &[String]) -> Result<()> {
@@ -2499,6 +2510,7 @@ impl Knowledge {
 // ── Helpers ────────────────────────────────────────────────────────
 
 const KNOWLEDGE_EXCERPT_BYTES: usize = 120;
+const DEFAULT_KNOWLEDGE_LIST_LIMIT: usize = 12;
 
 /// Derive a short display title from entry content: first ~60 chars,
 /// truncated at a UTF-8 boundary, with an ellipsis when we had to cut.
@@ -3048,6 +3060,38 @@ mod tests {
         assert!(out.contains("matched_by="));
         assert!(out.contains("title:glob"));
         assert!(out.contains("content:disallow"));
+    }
+
+    #[test]
+    fn list_default_limit_reports_truncation_metadata() {
+        let (_tmp, mut kb) = mk_kb();
+        for i in 0..(DEFAULT_KNOWLEDGE_LIST_LIMIT + 3) {
+            push_entry(
+                &mut kb,
+                &format!("entry{i:04}"),
+                &format!("Fleet UI note {i:04}"),
+                "fleet ui broad recall hit",
+            );
+        }
+
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/tmp/proj".into()),
+                query: Some("fleet ui".into()),
+                ..Default::default()
+            })
+            .expect("list should succeed");
+
+        assert!(
+            out.starts_with(&format!(
+                "{} entries (showing {} of {};",
+                DEFAULT_KNOWLEDGE_LIST_LIMIT,
+                DEFAULT_KNOWLEDGE_LIST_LIMIT,
+                DEFAULT_KNOWLEDGE_LIST_LIMIT + 3
+            )),
+            "got: {out}"
+        );
+        assert!(out.contains("pass limit="), "got: {out}");
     }
 
     #[test]
