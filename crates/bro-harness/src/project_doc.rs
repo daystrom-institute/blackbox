@@ -15,25 +15,24 @@
 //!
 //! Three-state `--system-prompt` semantics (resolved in `agent_loop::build`):
 //!   * non-empty string  ⇒ explicit override; this discovery is skipped.
-//!   * empty string `""`  ⇒ explicit suppress (no overlay) — mirrors Codex
-//!     `project_doc_max_bytes=0` + the AGENTS-omitting `CODEX_HOME` overlay.
+//!   * empty string `""`  ⇒ explicit suppress (no overlay).
 //!   * absent (`None`)    ⇒ not overridden ⇒ this Codex-style overlay.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Codex's default `project_doc_max_bytes`. Caps the *project* doc chain only;
-/// the global `$CODEX_HOME` instructions are uncapped, matching Codex.
-const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
+/// Large-overlay warning threshold. This never truncates instructions; it only
+/// catches unexpectedly huge project-doc chains. The default must stay above
+/// this repo's standard AGENTS/PROJECT/BLACKBOX/RTK hierarchy.
+const DEFAULT_PROJECT_DOC_WARN_BYTES: usize = 256 * 1024;
 const MAX_INCLUDE_DEPTH: usize = 8;
 const AGENTS_FILE: &str = "AGENTS.md";
 const AGENTS_OVERRIDE_FILE: &str = "AGENTS.override.md";
 
-fn project_doc_max_bytes() -> usize {
-    std::env::var("BRO_HARNESS_PROJECT_DOC_MAX_BYTES")
-        .ok()
+fn project_doc_warn_bytes() -> usize {
+    crate::transport::session_var("BRO_HARNESS_PROJECT_DOC_WARN_BYTES")
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_PROJECT_DOC_MAX_BYTES)
+        .unwrap_or(DEFAULT_PROJECT_DOC_WARN_BYTES)
 }
 
 fn project_doc_files() -> Vec<String> {
@@ -228,28 +227,27 @@ fn read_doc_tree(
     sections
 }
 
-fn truncate_on_char_boundary(s: &mut String, cap: usize) {
-    if s.len() <= cap {
-        return;
-    }
-    let mut end = cap;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
-}
-
 /// Assemble the Codex-equivalent overlay from the process cwd + `$CODEX_HOME`.
 /// Returns `None` when no AGENTS docs exist, in which case the caller sends no
 /// system prompt (identical to the prior provider-defaults behavior).
 pub(crate) fn discover(cwd: &Path) -> Option<String> {
     let project_doc_files = project_doc_files();
-    assemble(cwd, codex_home().as_deref(), &project_doc_files)
+    assemble(
+        cwd,
+        codex_home().as_deref(),
+        &project_doc_files,
+        project_doc_warn_bytes(),
+    )
 }
 
 /// Pure assembly seam: explicit `cwd` and `codex_home` make this testable
 /// without touching process-global env/cwd.
-fn assemble(cwd: &Path, codex_home: Option<&Path>, project_doc_files: &[String]) -> Option<String> {
+fn assemble(
+    cwd: &Path,
+    codex_home: Option<&Path>,
+    project_doc_files: &[String],
+    project_doc_warn_bytes: usize,
+) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     let mut loaded: Vec<String> = Vec::new();
     let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
@@ -262,20 +260,19 @@ fn assemble(cwd: &Path, codex_home: Option<&Path>, project_doc_files: &[String])
         }
     }
 
-    // Project scope: repo AGENTS.md, git root → cwd; the joined chain is capped
-    // per Codex `project_doc_max_bytes`.
+    // Project scope: repo AGENTS.md, git root → cwd. Never truncate
+    // instructions here; a large overlay is the operator's context decision.
     let mut project: Vec<String> = Vec::new();
     for p in project_agents_paths(cwd, project_doc_files) {
         project.extend(read_doc_tree(&p, &mut loaded_paths, &mut loaded, 0));
     }
     if !project.is_empty() {
-        let mut joined = project.join("\n\n");
-        let cap = project_doc_max_bytes();
-        if joined.len() > cap {
-            truncate_on_char_boundary(&mut joined, cap);
+        let joined = project.join("\n\n");
+        if project_doc_warn_bytes > 0 && joined.len() > project_doc_warn_bytes {
             tracing::warn!(
-                cap,
-                "project AGENTS.md overlay truncated to BRO_HARNESS_PROJECT_DOC_MAX_BYTES"
+                bytes = joined.len(),
+                warn_bytes = project_doc_warn_bytes,
+                "project AGENTS.md overlay exceeds BRO_HARNESS_PROJECT_DOC_WARN_BYTES"
             );
         }
         sections.push(joined);
@@ -321,13 +318,26 @@ mod tests {
         vec![AGENTS_FILE.to_string()]
     }
 
+    fn assemble_default(
+        cwd: &Path,
+        codex_home: Option<&Path>,
+        project_doc_files: &[String],
+    ) -> Option<String> {
+        assemble(
+            cwd,
+            codex_home,
+            project_doc_files,
+            DEFAULT_PROJECT_DOC_WARN_BYTES,
+        )
+    }
+
     #[test]
     fn none_when_no_docs() {
         let root = scratch();
         write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
         let cwd = root.join("crate").join("sub");
         fs::create_dir_all(&cwd).unwrap();
-        assert!(assemble(&cwd, None, &default_docs()).is_none());
+        assert!(assemble_default(&cwd, None, &default_docs()).is_none());
         fs::remove_dir_all(&root).ok();
     }
 
@@ -339,7 +349,7 @@ mod tests {
         let cwd = root.join("crate").join("sub");
         write(&cwd.join(AGENTS_FILE), "LEAF-DOC");
 
-        let out = assemble(&cwd, None, &default_docs()).expect("docs present");
+        let out = assemble_default(&cwd, None, &default_docs()).expect("docs present");
         let root_at = out.find("ROOT-DOC").unwrap();
         let leaf_at = out.find("LEAF-DOC").unwrap();
         assert!(root_at < leaf_at, "git-root doc must precede cwd doc");
@@ -354,7 +364,7 @@ mod tests {
         let cwd = root.join("child");
         write(&cwd.join(AGENTS_FILE), "CHILD-DOC");
 
-        let out = assemble(&cwd, None, &default_docs()).expect("cwd doc present");
+        let out = assemble_default(&cwd, None, &default_docs()).expect("cwd doc present");
         assert!(out.contains("CHILD-DOC"));
         assert!(
             !out.contains("PARENT-DOC"),
@@ -373,7 +383,7 @@ mod tests {
         write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
         write(&root.join(AGENTS_FILE), "PROJECT-DOC");
 
-        let out = assemble(&root, Some(&home), &default_docs()).expect("docs present");
+        let out = assemble_default(&root, Some(&home), &default_docs()).expect("docs present");
         let g = out.find("GLOBAL-DOC").unwrap();
         let o = out.find("OVERRIDE-DOC").unwrap();
         let p = out.find("PROJECT-DOC").unwrap();
@@ -394,7 +404,7 @@ mod tests {
         write(&root.join("docs").join("EXTRA.md"), "EXTRA-DOC");
         write(&root.join("docs").join("NESTED.md"), "NESTED-DOC");
 
-        let out = assemble(&root, None, &default_docs()).expect("docs present");
+        let out = assemble_default(&root, None, &default_docs()).expect("docs present");
         let root_at = out.find("ROOT-DOC").unwrap();
         let project_at = out.find("PROJECT-DOC").unwrap();
         let extra_at = out.find("EXTRA-DOC").unwrap();
@@ -425,7 +435,7 @@ mod tests {
             ),
         );
 
-        let out = assemble(&root, None, &default_docs()).expect("docs present");
+        let out = assemble_default(&root, None, &default_docs()).expect("docs present");
         assert!(out.contains("BLACKBOX-DOC"));
         assert_eq!(out.matches("BLACKBOX-DOC").count(), 1);
         assert!(!out.contains("SECRET"));
@@ -441,10 +451,25 @@ mod tests {
         write(&root.join("AGENTS_BETA.md"), "BETA-DOC");
 
         let docs = vec!["AGENTS_BETA.md".to_string()];
-        let out = assemble(&root, None, &docs).expect("docs present");
+        let out = assemble_default(&root, None, &docs).expect("docs present");
         assert!(out.contains("selected: AGENTS_BETA.md"));
         assert!(out.contains("BETA-DOC"));
         assert!(!out.contains("NORMAL-DOC"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn project_docs_over_warning_threshold_are_not_truncated() {
+        let root = scratch();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        let body = "LONG-DOC-".repeat(16);
+        write(&root.join(AGENTS_FILE), &body);
+
+        let out = assemble(&root, None, &default_docs(), 8).expect("docs present");
+        assert!(
+            out.contains(&body),
+            "warning threshold must not mutate project instructions"
+        );
         fs::remove_dir_all(&root).ok();
     }
 }
