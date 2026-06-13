@@ -123,10 +123,13 @@ const COHESION_CONTRACT: &str = r#"analysis.cohesionClusters — find the cohesi
 
 WHAT IT DOES
   Builds the method↔field co-touch graph and the method↔method call graph for the
-  FIRST class in the file, partitions methods into clusters (two methods cluster iff
-  they share a field, transitively), and returns the reduced graph. This is the
-  Rust-side answer to "what are the real seams" — do NOT reconstruct it from
-  code.query captures (that path OOMs on a sweep or burns ~50 cells by hand).
+  FIRST class in the file, partitions methods by modularity community detection
+  over an inverse-field-frequency-weighted graph, and returns the reduced graph.
+  Connector-aware: a high-fan-out field touched by many methods (a shared UI
+  container, a refresh dispatcher) is down-weighted so it cannot fuse distinct
+  concerns into one megacluster — concern-private fields dominate the partition.
+  This is the Rust-side answer to "what are the real seams" — do NOT reconstruct it
+  from code.query captures (that path OOMs on a sweep or burns ~50 cells by hand).
 
 PARAMS
   file: string   workspace-relative .java file

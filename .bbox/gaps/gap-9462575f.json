@@ -1,0 +1,21 @@
+{
+  "id": "gap-9462575f",
+  "title": "java.extractClass does not wire moved final/injected fields into the extracted class's constructor",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools",
+  "wanted_capability": "When java.extractClass moves fields that are `final` (very common for Guice/DI-injected dependency fields), the extracted class's generated constructor must initialize them — accept them as constructor parameters and assign them — and the source-side `new ExtractedClass(...)` construction must thread the source's own references through. Today own_construction wiring only handles CAPTURED fields (read-but-not-moved → ctor params); MOVED final fields are emitted as field declarations with no initializer, so the extracted class does not compile until an operator hand-writes the constructor params, the assignments, and fixes the construction call. The transform already knows the full move_fields set and their declarations, so it has everything needed to synthesize this wiring.",
+  "missing_primitive": "extractClass own_construction synthesis for moved `final` (and DI-injected) fields: constructor params + assignments on the extracted class, and pass-through args at the source-side `new Extracted(...)` site.",
+  "fallback_used": "The probe agent hand-repaired it across ~28 of 36 exec cells: added constructor params + assignments for the 12 moved final/injected fields, fixed the source-side construction call, removed orphaned source-side assignments, and chased a pre-existing source typo through repeated slow compile gates.",
+  "evidence": [
+    "probe-cohesion-1 (glm-5.1, code_mode=only) against a ~3,700-line Vaadin view: cohesionClusters surfaced a clean delegate seam (7 methods / 17 fields, score 0.952) and the extract APPLIED correctly in ~7 cells, but 12 moved fields were final/injected and the synthesized ctor left them uninitialized -> 28 cells of manual ctor wiring before the build went green",
+    "crates/bbox-refactor/src/java.rs (extractClass synthesis)",
+    "gap-2a3f03e5 (connector-aware clustering, which made seam-finding cheap and exposed this as the new dominant cost)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/extract-class-moved-final-field-ctor-wiring",
+  "notes": "Newly dominant cost in the god-class decomposition loop now that seam-finding (gap-2a3f03e5) is solved. Design question for the fix: a moved DI-injected final field can either be (a) threaded as a constructor param from the source (source holds the injected ref and passes it in — matches own_construction) or (b) re-annotated for injection on the extracted class if it becomes a DI component. (a) is the safe default and what the probe agent did by hand.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T00:05:22Z",
+  "updated_at": "2026-06-13T00:05:22Z"
+}

@@ -46,9 +46,13 @@ the cell choke point reuses it.
   one cluster — fatal on the god classes `cohesive_clusters` exists to split.
   It now drops methods whose name == the class name before partitioning. Any
   new reduction over the method/field graph must decide whether constructors
-  are signal; for cohesion they are not. (Coarse transitive-closure
-  clustering still collapses on a single bridge field — the connector-aware
-  refinement is gap-2a3f03e5.)
+  are signal; for cohesion they are not. (Connector-aware refinement landed,
+  gap-2a3f03e5: partitioning is no longer transitive closure but modularity
+  community detection over an inverse-field-frequency-weighted graph — a
+  field's per-pair weight is `1/(deg-1)`, so a high-fan-out bridge field
+  contributes diffuse weak edges and can no longer fuse distinct concerns.
+  Determinism preserved: sorted node visitation + incumbent-then-smallest-id
+  tie-break. `MODULARITY_RESOLUTION` is the future finer-seam knob.)
 - **Constructor-body inserts obey the `super()`/`this()` first-statement rule
   (JLS 8.8.7).** `constructor_body_insert_position` anchors AFTER a leading
   `explicit_constructor_invocation` when present; inserting delegate-wiring

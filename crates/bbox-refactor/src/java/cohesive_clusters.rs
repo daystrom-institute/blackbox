@@ -15,14 +15,28 @@
 //! same inputs → same outputs and surfaces uncertainty as singleton clusters
 //! rather than aggressive merges that hide cross-cluster coupling.
 //!
-//! Clustering signal: field co-touch dominates. Two methods sit in the same
-//! cluster iff they share at least one field (read OR write) in the
-//! `method_to_field` edge set, transitively. Method-to-method call edges are
-//! NOT used to merge clusters — they appear in the response as
-//! `cross_cluster_calls` so the operator can see the coupling before deciding
-//! to split. Methods that touch zero class fields are attached to whichever
-//! cluster they call most, falling back to a singleton "cluster" so the
-//! operator decides where they belong.
+//! Clustering signal: field co-touch dominates, weighted by *inverse field
+//! frequency*. Two methods are linked by the fields they share, but a field's
+//! per-pair contribution is `1/(deg-1)` where `deg` is how many methods touch
+//! it: a field touched by exactly two methods is a strong (weight 1.0) link;
+//! a high-fan-out *connector* field (a shared UI container, a refresh
+//! dispatcher) touched by 40 methods contributes only `1/39` to each of its
+//! pairs — diffuse weak edges that no longer fuse otherwise-distinct concerns.
+//! Methods are then partitioned by **modularity community detection**
+//! (Louvain local-moving) over that weighted graph, not transitive closure.
+//! This is the connector-aware refinement (gap-2a3f03e5): plain transitive
+//! field-sharing collapses a tangled god class into one megacluster the moment
+//! a single bridge field touches every concern; modularity keeps concerns
+//! whose strong intra-edges dominate the weak connector edges apart.
+//!
+//! Method-to-method call edges are NOT used to merge clusters — they appear in
+//! the response as `cross_cluster_calls` so the operator can see the coupling
+//! before deciding to split. Methods that touch zero class fields are attached
+//! to whichever cluster they call most, falling back to a singleton "cluster"
+//! so the operator decides where they belong. Determinism is preserved
+//! end-to-end: nodes are visited in sorted order, gain ties prefer the
+//! incumbent community then the smallest community id, so the same inputs
+//! always yield the same partition.
 
 use super::*;
 
@@ -172,6 +186,17 @@ struct ClusteringResult {
     membership: BTreeMap<String, String>,
 }
 
+/// Resolution parameter for the modularity objective. 1.0 is standard
+/// Newman-Girvan modularity; higher values bias toward more, smaller
+/// communities (finer seams). Kept at the classic default — the
+/// inverse-field-frequency weighting already does the connector down-weighting,
+/// so resolution is left as the obvious future tuning knob, not a band-aid.
+const MODULARITY_RESOLUTION: f64 = 1.0;
+
+/// Minimum strict modularity gain required to move a node out of its incumbent
+/// community. Guards against float noise driving non-deterministic churn.
+const MOVE_EPSILON: f64 = 1e-9;
+
 fn cluster_methods(
     methods: &[String],
     fields: &[String],
@@ -190,80 +215,86 @@ fn cluster_methods(
             .insert(f.clone());
     }
 
-    // Union-find on methods that share at least one touched field.
-    let mut parent: BTreeMap<String, String> =
-        methods.iter().map(|m| (m.clone(), m.clone())).collect();
+    // field -> the methods that touch it (its degree). Constructors are
+    // already filtered out by the caller, so degree reflects real concerns.
+    let mut field_methods: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for field in fields {
-        let touching: Vec<&String> = method_fields
+        let mut touching: Vec<String> = method_fields
             .iter()
             .filter(|(_, fs)| fs.contains(field))
-            .map(|(m, _)| m)
+            .map(|(m, _)| m.clone())
             .collect();
-        if touching.len() < 2 {
-            continue;
-        }
-        let anchor = touching[0].clone();
-        for other in touching.iter().skip(1) {
-            union(&mut parent, &anchor, other);
+        touching.sort();
+        if touching.len() >= 2 {
+            field_methods.insert(field.clone(), touching);
         }
     }
 
-    // Methods that touch no fields are still singletons at this point. For
-    // each, prefer to attach to the cluster of the methods it CALLS — those
-    // method bodies likely belong together. Falls back to the cluster of
-    // callers if the singleton has no outbound calls.
-    let initial_roots: BTreeMap<String, String> = methods
-        .iter()
-        .map(|m| (m.clone(), find(&mut parent, m)))
-        .collect();
-    for m in methods {
-        if !method_fields.get(m).map(|f| f.is_empty()).unwrap_or(true) {
-            continue;
+    // Inverse-field-frequency weighted method↔method affinity. A field of
+    // degree `d` contributes `1/(d-1)` to each of its C(d,2) method pairs:
+    // a degree-2 field is a full-strength link, a high-degree connector field
+    // is spread thin across many pairs and cannot fuse concerns on its own.
+    let mut affinity: BTreeMap<(String, String), f64> = BTreeMap::new();
+    for touching in field_methods.values() {
+        let d = touching.len();
+        let contrib = 1.0 / (d as f64 - 1.0);
+        for i in 0..touching.len() {
+            for j in (i + 1)..touching.len() {
+                let key = ordered_pair(&touching[i], &touching[j]);
+                *affinity.entry(key).or_default() += contrib;
+            }
         }
-        // Singleton root?
-        let root = find(&mut parent, m);
-        let same_root_count = methods
-            .iter()
-            .filter(|n| find(&mut parent, n) == root)
-            .count();
-        if same_root_count > 1 {
-            continue;
-        }
+    }
 
-        // Count call edges to other clusters' roots.
-        let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+    // Partition by modularity community detection over the weighted graph.
+    let membership_idx = louvain_local_moving(methods, &affinity);
+
+    // Methods that touch ZERO fields are pure helpers with no field-affinity
+    // edge; modularity leaves them as singletons. Attach each to the community
+    // it calls into (or is called from) most — those bodies likely belong
+    // together. This preserves the v1 call-attach post-pass semantics; it fires
+    // only for genuinely field-less methods (a method touching a single
+    // private field stays its own seam, as before).
+    let mut comm = membership_idx;
+    let initial_comm = comm.clone();
+    for m in methods {
+        let field_less = method_fields.get(m).map(|f| f.is_empty()).unwrap_or(true);
+        if !field_less {
+            continue;
+        }
+        let own = initial_comm[m];
+        // Singleton check against the post-modularity partition.
+        let own_count = comm.values().filter(|c| **c == own).count();
+        if own_count > 1 {
+            continue;
+        }
+        let mut tally: BTreeMap<usize, usize> = BTreeMap::new();
         for (from, to) in m2m_pairs {
-            if from == m {
-                if let Some(other_root) = initial_roots.get(to) {
-                    if other_root != &root {
-                        *tally.entry(other_root.clone()).or_default() += 1;
-                    }
-                }
-            }
-            if to == m {
-                if let Some(other_root) = initial_roots.get(from) {
-                    if other_root != &root {
-                        *tally.entry(other_root.clone()).or_default() += 1;
-                    }
-                }
+            // The community on the OTHER end of a call edge touching `m`.
+            let other = if from == m {
+                initial_comm.get(to).copied()
+            } else if to == m {
+                initial_comm.get(from).copied()
+            } else {
+                None
+            };
+            if let Some(other) = other.filter(|o| *o != own) {
+                *tally.entry(other).or_default() += 1;
             }
         }
-        if let Some((target_root, _)) = tally
-            .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)))
+        if let Some((target, _)) = tally.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
         {
-            union(&mut parent, &target_root, m);
+            comm.insert(m.clone(), target);
         }
     }
 
-    // Group methods by final root.
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Group methods by final community.
+    let mut groups: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     for m in methods {
-        let root = find(&mut parent, m);
-        groups.entry(root).or_default().push(m.clone());
+        groups.entry(comm[m]).or_default().push(m.clone());
     }
 
-    // Stable ordering: by smallest line / lexicographic first-method.
+    // Stable ordering: lexicographic first-method.
     let mut group_vec: Vec<Vec<String>> = groups.into_values().collect();
     for g in group_vec.iter_mut() {
         g.sort();
@@ -278,7 +309,6 @@ fn cluster_methods(
         for m in item_names {
             membership.insert(m.clone(), id.clone());
         }
-        let name_hint = infer_name_hint(item_names);
         // move_fields = fields touched only by methods in this cluster.
         let in_cluster: BTreeSet<&String> = item_names.iter().collect();
         let mut move_fields = Vec::new();
@@ -299,6 +329,7 @@ fn cluster_methods(
             }
         }
         move_fields.sort();
+        let name_hint = infer_name_hint(item_names, &move_fields);
         clusters.push(Cluster {
             id,
             name_hint,
@@ -313,55 +344,178 @@ fn cluster_methods(
     }
 }
 
-// ──────────────────────────── helpers ────────────────────────────
+// ──────────────────────────── modularity ────────────────────────────
 
-fn find(parent: &mut BTreeMap<String, String>, item: &str) -> String {
-    let current = parent
-        .get(item)
-        .cloned()
-        .unwrap_or_else(|| item.to_string());
-    if current == item {
-        return current;
-    }
-    let root = find(parent, &current);
-    parent.insert(item.to_string(), root.clone());
-    root
-}
-
-fn union(parent: &mut BTreeMap<String, String>, a: &str, b: &str) {
-    let root_a = find(parent, a);
-    let root_b = find(parent, b);
-    if root_a != root_b {
-        // Deterministic: lexicographically smaller name wins as root.
-        let (winner, loser) = if root_a <= root_b {
-            (root_a, root_b)
-        } else {
-            (root_b, root_a)
-        };
-        parent.insert(loser, winner);
+fn ordered_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
     }
 }
 
-/// Infer a class-name hint from the first camelCase token of each method.
-/// Picks the most common token; ties broken lexicographically. Returns the
-/// raw token (e.g. `bill`, `search`) — operator capitalizes / pluralizes
-/// when accepting.
-fn infer_name_hint(method_names: &[String]) -> String {
-    if method_names.is_empty() {
-        return String::new();
-    }
-    let tokens: Vec<String> = method_names
+/// One level of Louvain modularity optimization (local-moving phase) over the
+/// weighted method-affinity graph. Returns `method -> community index`.
+///
+/// Single-level local moving is sufficient at class scale (tens of methods):
+/// each node starts in its own community and is repeatedly moved to the
+/// neighboring community that maximizes the modularity gain, until a full pass
+/// makes no move. Determinism: nodes are visited in the order of `methods`
+/// (the caller sorts upstream), candidate communities are evaluated in sorted
+/// id order, and a move requires a strictly positive gain over staying — so
+/// isolated nodes (degree 0) never drift and ties never flip-flop.
+fn louvain_local_moving(
+    methods: &[String],
+    affinity: &BTreeMap<(String, String), f64>,
+) -> BTreeMap<String, usize> {
+    // Seed: community index = position in `methods`.
+    let index_of: BTreeMap<&str, usize> = methods
         .iter()
-        .map(|n| first_camel_token(n.as_str()))
+        .enumerate()
+        .map(|(i, m)| (m.as_str(), i))
         .collect();
+
+    // Weighted adjacency + node degree (k_i) + total edge weight (m).
+    let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); methods.len()];
+    let mut degree: Vec<f64> = vec![0.0; methods.len()];
+    let mut total_weight = 0.0_f64;
+    for ((a, b), w) in affinity {
+        let (ia, ib) = match (index_of.get(a.as_str()), index_of.get(b.as_str())) {
+            (Some(ia), Some(ib)) => (*ia, *ib),
+            _ => continue,
+        };
+        adj[ia].push((ib, *w));
+        adj[ib].push((ia, *w));
+        degree[ia] += *w;
+        degree[ib] += *w;
+        total_weight += *w;
+    }
+
+    let mut community: Vec<usize> = (0..methods.len()).collect();
+    // sigma_tot[c] = sum of degrees of nodes currently in community c.
+    let mut sigma_tot: BTreeMap<usize, f64> = BTreeMap::new();
+    for (i, d) in degree.iter().enumerate() {
+        *sigma_tot.entry(i).or_default() += *d;
+    }
+
+    if total_weight <= 0.0 {
+        // No edges at all → every method is its own seam.
+        return methods
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.clone(), i))
+            .collect();
+    }
+    let two_m = 2.0 * total_weight;
+
+    let mut improved = true;
+    let mut passes = 0;
+    // Convergence is monotone in modularity; the bound is a deterministic
+    // backstop against float-driven cycling on pathological inputs.
+    let max_passes = 50;
+    while improved && passes < max_passes {
+        improved = false;
+        passes += 1;
+        for i in 0..methods.len() {
+            let own = community[i];
+            let k_i = degree[i];
+
+            // Weight from i into each neighboring community.
+            let mut k_in: BTreeMap<usize, f64> = BTreeMap::new();
+            for (j, w) in &adj[i] {
+                *k_in.entry(community[*j]).or_default() += *w;
+            }
+
+            // Remove i from its community before scoring candidates.
+            *sigma_tot.entry(own).or_default() -= k_i;
+
+            // Gain of placing i into community c (relative to i isolated):
+            //   ΔQ(c) = k_in(c) - γ · sigma_tot[c] · k_i / (2m)
+            let gain = |c: usize| -> f64 {
+                let k_in_c = k_in.get(&c).copied().unwrap_or(0.0);
+                let sig = sigma_tot.get(&c).copied().unwrap_or(0.0);
+                k_in_c - MODULARITY_RESOLUTION * sig * k_i / two_m
+            };
+
+            let own_gain = gain(own);
+            let mut best = own;
+            let mut best_gain = own_gain;
+            // Candidates: communities reachable through an incident edge.
+            // Sorted iteration over the BTreeMap keys keeps ties deterministic.
+            for c in k_in.keys() {
+                let g = gain(*c);
+                if g > best_gain + MOVE_EPSILON {
+                    best_gain = g;
+                    best = *c;
+                }
+            }
+
+            // Re-add i to the chosen community.
+            *sigma_tot.entry(best).or_default() += k_i;
+            if best != own {
+                community[i] = best;
+                improved = true;
+            }
+        }
+    }
+
+    methods
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.clone(), community[i]))
+        .collect()
+}
+
+/// Generic verb prefixes that name an *action*, not a *concern*. A cluster of
+/// `onFoo`/`onBar` handlers or `getX`/`setX` accessors whose dominant token is
+/// one of these gets a worse-than-useless hint ("on", "get"); we prefer the
+/// concern carried by the cluster's fields instead.
+const GENERIC_TOKENS: &[&str] = &[
+    "on", "get", "set", "is", "has", "do", "handle", "update", "refresh", "init", "create",
+    "build", "add", "remove",
+];
+
+/// Infer a class-name hint for a cluster. Primary signal is the most common
+/// non-generic first camelCase token across the cluster's methods (e.g.
+/// `bill`, `search`). When that signal is absent — every method shares a
+/// generic action verb like `on`/`get`, or methods share no token at all — the
+/// hint falls back to the dominant move_field's leading token, which names the
+/// *concern* the methods operate on rather than the action they perform. Ties
+/// break lexicographically; the raw token is returned (operator capitalizes /
+/// pluralizes when accepting).
+fn infer_name_hint(method_names: &[String], move_fields: &[String]) -> String {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for t in &tokens {
+    let mut generic_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for n in method_names {
+        let t = first_camel_token(n.as_str());
         if t.is_empty() {
             continue;
         }
-        *counts.entry(t.clone()).or_default() += 1;
+        if GENERIC_TOKENS.contains(&t.as_str()) {
+            *generic_counts.entry(t).or_default() += 1;
+        } else {
+            *counts.entry(t).or_default() += 1;
+        }
     }
-    counts
+
+    let best_concept = counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(t, _)| t);
+    if let Some(t) = best_concept {
+        return t;
+    }
+
+    // No concrete method-name concern. Fall back to the field the cluster owns.
+    if let Some(field) = move_fields.first() {
+        let t = first_camel_token(field.as_str());
+        if !t.is_empty() {
+            return t;
+        }
+    }
+
+    // Last resort: the dominant generic verb (better than empty).
+    generic_counts
         .into_iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
         .map(|(t, _)| t)
@@ -700,5 +854,125 @@ mod tests {
         assert!(v["validations"].as_array().unwrap().is_empty());
         assert_eq!(v["class"]["name"], "Tiny");
         assert_eq!(v["class"]["package"], "com.example");
+    }
+
+    // The connector-aware regression (gap-2a3f03e5). Two genuine concerns —
+    // pricing (rate/base) and inventory (quantity/threshold) — are bridged by a
+    // single high-fan-out `container` field that EVERY method touches (a shared
+    // UI panel / dispatcher, the exact god-class shape). Plain transitive
+    // field-sharing unions all six methods through `container` into ONE
+    // megacluster. Inverse-field-frequency weighting + modularity must keep the
+    // two concerns apart: `container` (degree 6) contributes only 1/5 per pair,
+    // while the concern-private fields (degree 2-3) are full-strength links.
+    #[test]
+    fn connector_field_does_not_merge_distinct_concerns() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("ReportPanel.java");
+        fs::write(
+            &source,
+            "package com.acme;\n\
+             public class ReportPanel {\n\
+            \x20   private final Panel container;\n\
+            \x20   private double rate;\n\
+            \x20   private double base;\n\
+            \x20   private int quantity;\n\
+            \x20   private int threshold;\n\
+            \x20   public ReportPanel(Panel c) { this.container = c; }\n\
+            \x20   public double priceBase() { container.show(); return base * rate; }\n\
+            \x20   public double priceDiscount() { container.show(); return base * rate * 0.9; }\n\
+            \x20   public void priceReset() { container.show(); base = 0; rate = 0; }\n\
+            \x20   public void stockAdd(int n) { container.show(); quantity += n; }\n\
+            \x20   public boolean stockLow() { container.show(); return quantity < threshold; }\n\
+            \x20   public void stockReset() { container.show(); quantity = 0; threshold = 0; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let response = plan_extract_java_class_cohesive_clusters(&make_params(&source))
+            .expect("plan should succeed");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let clusters = v["suggested_clusters"].as_array().unwrap();
+
+        let cluster_of = |method: &str| -> String {
+            clusters
+                .iter()
+                .find(|c| {
+                    c["item_names"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|n| n == method)
+                })
+                .unwrap_or_else(|| panic!("method {method} not placed in any cluster: {clusters:?}"))
+                ["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // The connector did NOT merge the two concerns.
+        assert_ne!(
+            cluster_of("priceBase"),
+            cluster_of("stockLow"),
+            "pricing and inventory must not collapse through the connector field: {clusters:?}"
+        );
+
+        // Pricing cohesion held: all three pricing methods land together.
+        let pricing = cluster_of("priceBase");
+        assert_eq!(cluster_of("priceDiscount"), pricing, "{clusters:?}");
+        assert_eq!(cluster_of("priceReset"), pricing, "{clusters:?}");
+
+        // The high-fan-out connector field is touched across clusters, so it is
+        // NOT moveable — it must appear in no cluster's move_fields and stay in
+        // the source class.
+        for c in clusters {
+            let move_fields: Vec<&str> = c["move_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap())
+                .collect();
+            assert!(
+                !move_fields.contains(&"container"),
+                "connector field `container` must not be moved: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_hint_falls_back_to_field_for_generic_handler_cluster() {
+        // A cluster of `on*` event handlers all sharing a `selection` field:
+        // the dominant method token is the generic verb "on" — useless as a
+        // class name — so the hint should fall back to the field concern.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Handlers.java");
+        fs::write(
+            &source,
+            "package com.acme;\n\
+             public class Handlers {\n\
+            \x20   private String selection;\n\
+            \x20   public void onClick() { selection = \"a\"; }\n\
+            \x20   public void onHover() { selection = \"b\"; }\n\
+            \x20   public String onRead() { return selection; }\n\
+             }\n",
+        )
+        .unwrap();
+        let response = plan_extract_java_class_cohesive_clusters(&make_params(&source)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let clusters = v["suggested_clusters"].as_array().unwrap();
+        let handler = clusters
+            .iter()
+            .find(|c| {
+                c["item_names"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == "onClick")
+            })
+            .expect("handler cluster present");
+        assert_eq!(
+            handler["name_hint"], "selection",
+            "generic on* token should fall back to the `selection` field concern: {handler:?}"
+        );
     }
 }

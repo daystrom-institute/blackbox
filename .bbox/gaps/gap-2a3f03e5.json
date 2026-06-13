@@ -14,8 +14,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/connector-aware-cohesion-clustering",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-370679a5",
   "created_at": "2026-06-12T23:06:59Z",
-  "updated_at": "2026-06-12T23:06:59Z"
+  "updated_at": "2026-06-13T00:05:40Z",
+  "resolved_at": "2026-06-13T00:05:40Z",
+  "resolution_note": "Connector-aware clustering landed: cohesive_clusters.rs now partitions by inverse-field-frequency-weighted modularity (Louvain local-moving) instead of transitive field-sharing union-find. A field's per-pair weight is 1/(deg-1), so a high-fan-out connector field contributes diffuse weak edges and can no longer fuse distinct concerns. name_hint falls back to the dominant field concern for generic-verb (on*/get*) clusters. Determinism preserved (sorted visitation + incumbent-then-smallest-id tie-break); constructor exclusion + zero-field call-attach post-pass retained. Probe-validated (probe-cohesion-1, glm-5.1) on a ~3,700-line Vaadin view: the prior 56-method megablob decomposed into 11 clusters (largest 14), the agent took a clean delegate seam (7 methods, score 0.952) straight from the cluster graph and applied the extract in ~7 cells (vs probe-dash-2's ~50 cells reconstructing cohesion by hand). Exposed the next bottleneck as gap-9462575f (extractClass moved-final-field ctor wiring). Gate: 3948 nextest --workspace passed (2 new tests incl. connector-field regression), clippy clean on the file, lint-concurrency ok."
 }
