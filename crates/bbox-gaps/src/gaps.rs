@@ -698,7 +698,7 @@ fn persist_repo_gap_entries(
         on_disk.project = None;
         on_disk.write_dir = None;
         let path = dir.join(format!("{}.json", entry.id));
-        let new_bytes = serde_json::to_vec_pretty(&on_disk)?;
+        let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
         if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
             continue;
         }
@@ -1527,6 +1527,16 @@ mod tests {
             foreign.exists(),
             "project-scoped save must not purge the peer-committed gap file"
         );
+        let fresh = fs::read_dir(&gaps_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().and_then(|name| name.to_str()) != Some("gap-deadbeef.json")
+            })
+            .expect("fresh project gap file should be written");
+        let fresh_text = fs::read_to_string(fresh).unwrap();
+        assert!(fresh_text.ends_with('\n'));
+        assert!(!fresh_text.ends_with("\n\n"));
     }
 
     /// A repo gap file the store cannot parse must never be deleted by the

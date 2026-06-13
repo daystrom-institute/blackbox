@@ -753,7 +753,7 @@ fn persist_repo_kb_stats(
     if !gitignore.exists() {
         let _ = fs::write(&gitignore, "*\n!.gitignore\n");
     }
-    let new_bytes = serde_json::to_vec_pretty(stats)?;
+    let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(stats)?;
     if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
         return Ok(());
     }
@@ -926,7 +926,7 @@ fn persist_repo_kb_entries(
         // Skip the write when the committed content is byte-identical, so a
         // recall-only bump (which changed nothing durable) does not rewrite the
         // file, churn git, or trip the `.bbox/knowledge/` watcher.
-        let new_bytes = serde_json::to_vec_pretty(&on_disk)?;
+        let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
         if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
             continue;
         }
@@ -4173,6 +4173,8 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // Committed file holds durable content only — no recall telemetry.
         let committed_path = repo_kb_dir(&repo_root).join("recl0001.json");
         let committed = fs::read_to_string(&committed_path).unwrap();
+        assert!(committed.ends_with('\n'));
+        assert!(!committed.ends_with("\n\n"));
         assert!(
             !committed.contains("last_recalled"),
             "committed file must omit last_recalled: {committed}"
@@ -4192,6 +4194,8 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             "local/.gitignore must be created so the sidecar is never committed"
         );
         let sidecar = fs::read_to_string(repo_kb_stats_path(&repo_root)).unwrap();
+        assert!(sidecar.ends_with('\n'));
+        assert!(!sidecar.ends_with("\n\n"));
         assert!(sidecar.contains("recl0001") && sidecar.contains("\"recall_count\": 7"));
 
         // A recall-only bump must NOT rewrite the committed file (no git churn,

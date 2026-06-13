@@ -1,0 +1,23 @@
+{
+  "id": "gap-0fe50b36",
+  "title": "Responses stream faults lack diagnostic context and get rendered as interrupted",
+  "gap_kind": "tooling",
+  "domain": "bro-harness",
+  "wanted_capability": "When a Responses HTTP-SSE stream dies after partial output, preserve enough context to diagnose it: upstream request id if available, response id if seen, last SSE event type/sequence, attempt count, bytes/events consumed, emitted_text/terminal_seen, and surface a fleet activity label distinct from user interruption.",
+  "missing_primitive": "structured Responses stream fault diagnostics",
+  "fallback_used": "Manually inspected harness session JSONL and transport source; current UI only exposed an ambiguous 'activity interrupted' label.",
+  "evidence": [
+    "crates/bro-harness/src/transport/openai_responses.rs:128",
+    "crates/bro-harness/src/transport/openai_responses.rs:231",
+    "crates/bro-harness/src/transport/responses_common.rs:445",
+    "crates/bro-cli/src/fleet_tui.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness/responses-stream-fault-diagnostics",
+  "resolution": "unresolved",
+  "task_id": "fa231bdf-3015-4be8-bf22-521f7cd3d1cc",
+  "session_id": "b41454ca-cc60-4b61-a1b5-875ab1dc06db",
+  "created_at": "2026-06-13T22:55:11Z",
+  "updated_at": "2026-06-13T22:55:11Z"
+}

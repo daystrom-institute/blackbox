@@ -45,9 +45,11 @@ pub fn atomic_write_json_locked<T: serde::Serialize>(store_path: &Path, value: &
     }
 
     {
-        let f = fs::File::create(&tmp_path)
+        let mut f = fs::File::create(&tmp_path)
             .with_context(|| format!("failed to create temp file {}", tmp_path.display()))?;
-        serde_json::to_writer_pretty(&f, value)
+        let bytes = to_vec_pretty_newline(value)?;
+        use std::io::Write;
+        f.write_all(&bytes)
             .with_context(|| format!("failed to serialize JSON to {}", tmp_path.display()))?;
         f.sync_all()?;
     }
@@ -61,6 +63,15 @@ pub fn atomic_write_json_locked<T: serde::Serialize>(store_path: &Path, value: &
     })?;
 
     Ok(())
+}
+
+/// Pretty JSON bytes with the repo convention of exactly one trailing newline.
+pub fn to_vec_pretty_newline<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -82,6 +93,18 @@ mod tests {
         atomic_write_json_locked(&store_path, &serde_json::json!({})).unwrap();
         let n3 = NONCE.load(Ordering::SeqCst);
         assert!(n3 > n2);
+    }
+
+    #[test]
+    fn json_store_writes_trailing_newline() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("store.json");
+
+        atomic_write_json_locked(&store_path, &serde_json::json!({"a": 1})).unwrap();
+
+        let text = fs::read_to_string(&store_path).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(!text.ends_with("\n\n"));
     }
 
     #[test]
