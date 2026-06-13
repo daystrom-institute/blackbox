@@ -105,6 +105,70 @@ fn moved_field_ctor_assignments(
     out
 }
 
+fn normalize_deletion_ranges(source: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut expanded = ranges
+        .into_iter()
+        .map(|(start, end)| (start, include_trailing_blank_lines(source, end)))
+        .collect::<Vec<_>>();
+    expanded.sort_by_key(|(start, _)| *start);
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in expanded {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn include_trailing_blank_lines(source: &str, byte_end: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut cursor = byte_end.min(bytes.len());
+    while cursor < bytes.len() {
+        let line_start = cursor;
+        let mut line_end = line_start;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        if !source[line_start..line_end].trim().is_empty() {
+            break;
+        }
+        cursor = if line_end < bytes.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+    }
+    cursor
+}
+
+fn render_java_field_declaration(
+    annotations: &[String],
+    modifiers: &[String],
+    type_name: &str,
+    field_name: &str,
+) -> String {
+    let mut decl = String::new();
+    for annotation in annotations {
+        decl.push_str("\n    ");
+        decl.push_str(annotation.trim());
+    }
+    decl.push_str("\n    ");
+    for modifier in modifiers {
+        decl.push_str(modifier.trim());
+        decl.push(' ');
+    }
+    decl.push_str(type_name);
+    decl.push(' ');
+    decl.push_str(field_name);
+    decl.push(';');
+    decl
+}
+
 pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let target_path = p
@@ -1328,20 +1392,23 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     }
 
     let mut source_edits = Vec::new();
-    let removed_ranges = selected_methods
-        .iter()
-        .map(|method| (method.item.leading_trivia_start, method.item.byte_end))
-        .chain(
-            selected_fields
-                .iter()
-                .map(|field| (field.item.leading_trivia_start, field.item.byte_end)),
-        )
-        .chain(
-            moved_constant_fields
-                .iter()
-                .map(|field| (field.item.leading_trivia_start, field.item.byte_end)),
-        )
-        .collect::<Vec<_>>();
+    let removed_ranges = normalize_deletion_ranges(
+        &parsed.source,
+        selected_methods
+            .iter()
+            .map(|method| (method.item.leading_trivia_start, method.item.byte_end))
+            .chain(
+                selected_fields
+                    .iter()
+                    .map(|field| (field.item.leading_trivia_start, field.item.byte_end)),
+            )
+            .chain(
+                moved_constant_fields
+                    .iter()
+                    .map(|field| (field.item.leading_trivia_start, field.item.byte_end)),
+            )
+            .collect::<Vec<_>>(),
+    );
     for (start, end) in &removed_ranges {
         source_edits.push(TextEdit {
             byte_start: *start,
@@ -1430,19 +1497,12 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     //   external owner populates it after construction).
     // - none: skip the delegate field decl entirely. Operator wires by hand.
     let delegate_decl = match wiring_strategy.as_str() {
-        "external_injection" => {
-            let mut decl = String::from("\n    ");
-            for ann in &delegate_field_annotations {
-                decl.push_str(ann);
-                decl.push(' ');
-            }
-            for modifier in &delegate_field_modifiers {
-                decl.push_str(modifier);
-                decl.push(' ');
-            }
-            decl.push_str(&format!("{target_class_name} {delegate_field};"));
-            decl
-        }
+        "external_injection" => render_java_field_declaration(
+            &delegate_field_annotations,
+            &delegate_field_modifiers,
+            &target_class_name,
+            delegate_field,
+        ),
         "none" => String::new(),
         _ => format!("\n    private final {target_class_name} {delegate_field};"),
     };

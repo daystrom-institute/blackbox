@@ -1380,24 +1380,23 @@ fn java_organize_imports_keeps_explicit_from_uncovered_package() {
     }
 }
 
-// Gap 28: `import static …` lines are NEVER dropped, even if a TYPE
-// wildcard exists for the same package — static imports bring members,
-// type wildcards do not cover them.
+// Gap 28: static wildcard imports are kept even if a TYPE wildcard exists for
+// the same package — static wildcards bring members, type wildcards do not cover
+// them. Single-member static imports are still pruned when their member is
+// absent from the source AST.
 #[test]
-fn java_organize_imports_keeps_static_imports_under_type_wildcard() {
+fn java_organize_imports_keeps_static_wildcard_and_prunes_unused_static_member() {
     let dir = tempfile::tempdir().unwrap();
     let admin_dir = dir.path().join("src/main/java/com/x/admin");
     let ui_dir = dir.path().join("src/main/java/com/x/ui");
     fs::create_dir_all(&admin_dir).unwrap();
     fs::create_dir_all(&ui_dir).unwrap();
-    // Static import lines refer to static members; the heuristic never
-    // touches them. Use a synthetic name; existing-import filter
-    // accepts `import static …` verbatim regardless of resolution.
     let source = ui_dir.join("View.java");
     fs::write(
         &source,
         "package com.x.ui;\n\
              import com.x.admin.*;\n\
+             import static com.x.admin.MeterAdmin.*;\n\
              import static com.x.admin.MeterAdmin.SOME_CONST;\n\
              public class View {\n\
             \x20   void keep() {}\n\
@@ -1413,8 +1412,12 @@ fn java_organize_imports_keeps_static_imports_under_type_wildcard() {
         if let Some(edit) = file_edit.edits.first() {
             let r = &edit.replacement;
             assert!(
-                r.contains("import static com.x.admin.MeterAdmin.SOME_CONST;"),
-                "static import must never be dropped: {r}"
+                r.contains("import static com.x.admin.MeterAdmin.*;"),
+                "static wildcard import must be kept: {r}"
+            );
+            assert!(
+                !r.contains("import static com.x.admin.MeterAdmin.SOME_CONST;"),
+                "unused single-member static import must be dropped: {r}"
             );
         }
     }
@@ -2346,8 +2349,8 @@ fn manual_wiring_spec() -> crate::WiringSpec {
     }
 }
 
-// external_injection (guice field-inject) emits `@Inject private Target
-// delegate;` on source, skips ctor wiring entirely.
+// external_injection (guice field-inject) emits a source-side delegate field
+// with annotations on their own lines, and skips ctor wiring entirely.
 #[test]
 fn g7_wiring_mode_guice_field_inject_emits_inject_decl_skips_ctor_wiring() {
     let dir = tempfile::tempdir().unwrap();
@@ -2378,7 +2381,7 @@ fn g7_wiring_mode_guice_field_inject_emits_inject_decl_skips_ctor_wiring() {
         serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
     let rewritten = apply_source_edits(&plan, &source);
     assert!(
-        rewritten.contains("@Inject private Service service;"),
+        rewritten.contains("@Inject\n    private Service service;"),
         "@Inject delegate decl must appear: {rewritten}"
     );
     // No ctor wiring assignment.
@@ -5256,9 +5259,10 @@ fn extract_java_class_captures_method_reference_field_qualifier() {
 
 #[test]
 fn extract_java_class_prunes_unused_target_imports() {
-    // Source imports two project-local types `B` and `C`; the extracted
+    // Source imports two project-local types `B` and `C`, plus one static
+    // member used only by a source method that stays behind. The extracted
     // method body only references `B`. After extract_java_class, the
-    // target's import block must include `B` and exclude `C` —
+    // target's import block must include `B` and exclude `C` and the static import —
     // composite plan runs heuristic_java_organize_imports_text on the
     // generated target text.
     let dir = tempfile::tempdir().unwrap();
@@ -5274,16 +5278,23 @@ fn extract_java_class_prunes_unused_target_imports() {
         "package a;\npublic class C { public void unused() {} }\n",
     )
     .unwrap();
+    fs::write(
+        pkg.join("Constants.java"),
+        "package a;\npublic class Constants { public static final int SAVE_ONLY = 1; }\n",
+    )
+    .unwrap();
     let source = pkg.join("Source.java");
     fs::write(
         &source,
         "package a;\n\
              import a.B;\n\
              import a.C;\n\
+             import static a.Constants.SAVE_ONLY;\n\
              \n\
              public class Source {\n\
             \x20   void useB() { B b = new B(); b.touch(); }\n\
             \x20   void useC() { new C().unused(); }\n\
+            \x20   void save() { System.out.println(SAVE_ONLY); }\n\
              }\n",
     )
     .unwrap();
@@ -5309,6 +5320,64 @@ fn extract_java_class_prunes_unused_target_imports() {
     assert!(
         !replacement.contains("import a.C;"),
         "expected `import a.C;` to be pruned from target: {replacement}"
+    );
+    assert!(
+        !replacement.contains("import static a.Constants.SAVE_ONLY;"),
+        "expected unused static import to be pruned from target: {replacement}"
+    );
+}
+
+#[test]
+fn extract_java_class_cleans_query_object_source_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Queries.java");
+    fs::write(
+        &source,
+        "package a;\n\
+             import javax.inject.Inject;\n\
+             import jakarta.inject.Provider;\n\
+             import java.util.List;\n\
+             import static a.Seq.SEQ;\n\
+             public class Admin {\n\
+            \x20   @Inject private Provider<Ctx> dslContextProvider;\n\
+\n\
+            \x20   public Rec load(long id) { return dslContextProvider.get().load(id); }\n\
+\n\
+            \x20   public List<Rec> listAll() { return dslContextProvider.get().list(); }\n\
+\n\
+            \x20   public void save(Rec record) { dslContextProvider.get().save(SEQ, record); }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Queries".to_string());
+    params.delegate_field = Some("queries".to_string());
+    params.item_names = Some(vec!["load".to_string(), "listAll".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+    params.source_delegate_wrappers = Some(true);
+    params.wiring_mode = Some(guice_external_injection_spec());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        rewritten.contains("@Inject\n    private Queries queries;"),
+        "delegate field annotation should be multiline: {rewritten}"
+    );
+    assert!(
+        !rewritten.contains("dslContextProvider;\n\n\n"),
+        "method deletion should not leave a wide blank gap: {rewritten}"
+    );
+
+    let target_text = &plan.edits[1].edits[0].replacement;
+    assert!(
+        !target_text.contains("import static a.Seq.SEQ;"),
+        "target must prune static import used only by source method: {target_text}"
     );
 }
 
@@ -6300,7 +6369,7 @@ fn g7_fu_inject_import_dedup_by_simple_name() {
         "javax.inject.Inject must NOT appear when com.google.inject.Inject already present: {rewritten}"
     );
     assert!(
-        rewritten.contains("@Inject private Service service;"),
+        rewritten.contains("@Inject\n    private Service service;"),
         "delegate field must use @Inject: {rewritten}"
     );
 }

@@ -92,8 +92,8 @@ fn target_content(plan: &MacroPlan, target: &Path) -> String {
 }
 
 // The macro delegates with external_injection and emits the Guice-shaped
-// wiring: `@Inject private <Target> <field>;` on the source (no ctor wiring),
-// and an `@Inject` constructor + javax.inject.Inject import on the target.
+// wiring: `@Inject` + `<Target> <field>;` on the source (no ctor wiring), and
+// an `@Inject` constructor + javax.inject.Inject import on the target.
 #[test]
 fn guice_macro_emits_field_injection_wiring() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,7 +124,7 @@ fn guice_macro_emits_field_injection_wiring() {
 
     let src_edits = source_edit_replacements(&plan, &source);
     assert!(
-        src_edits.contains("@Inject private Service service;"),
+        src_edits.contains("@Inject\n    private Service service;"),
         "source delegate field must be @Inject field-injected: {src_edits}"
     );
     assert!(
@@ -182,7 +182,7 @@ fn guice_macro_plans_even_when_source_has_no_inject_fields() {
     );
     let src_edits = source_edit_replacements(&plan, &source);
     assert!(
-        src_edits.contains("@Inject private Service service;"),
+        src_edits.contains("@Inject\n    private Service service;"),
         "external injection is applied unconditionally (operator's choice): {src_edits}"
     );
 }

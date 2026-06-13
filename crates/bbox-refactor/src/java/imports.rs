@@ -203,6 +203,18 @@ pub(super) fn java_import_simple_name(import_line: &str) -> Option<String> {
     body.rsplit('.').next().map(str::to_string)
 }
 
+pub(super) fn java_import_static_member_simple_name(import_line: &str) -> Option<String> {
+    let body = import_line
+        .trim()
+        .strip_prefix("import static ")?
+        .trim_end_matches(';')
+        .trim();
+    if body.ends_with(".*") {
+        return None;
+    }
+    body.rsplit('.').next().map(str::to_string)
+}
+
 pub(super) fn java_builtin_type(name: &str) -> bool {
     matches!(
         name,
@@ -335,6 +347,25 @@ pub(super) fn collect_java_type_references(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_java_type_references(child, source, out);
+    }
+}
+
+pub(super) fn collect_java_static_member_references(
+    node: Node<'_>,
+    source: &str,
+    out: &mut HashSet<String>,
+) {
+    if node.kind() == "import_declaration" {
+        return;
+    }
+    if matches!(node.kind(), "identifier" | "field_identifier") {
+        if let Ok(text) = node.utf8_text(source.as_bytes()) {
+            out.insert(text.to_string());
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_java_static_member_references(child, source, out);
     }
 }
 
@@ -492,11 +523,12 @@ pub(super) fn heuristic_java_organize_imports(
 /// files before they hit disk — no LSP roundtrip, no temporary file.
 ///
 /// Matches the same rules as `heuristic_java_organize_imports`: keeps
-/// `import static …` and wildcard imports verbatim, prunes regular imports
-/// whose simple name does not appear in `type_identifier` references in the
-/// AST, adds project-local imports for unresolved simple names, and skips
-/// inner-class simple names (gap 16). On parse failure or when no rewrite is
-/// needed the input string is returned unchanged.
+/// wildcard imports verbatim, prunes regular imports whose simple name does not
+/// appear in `type_identifier` references in the AST, prunes single-member
+/// static imports whose member name is absent from the AST, adds project-local
+/// imports for unresolved simple names, and skips inner-class simple names (gap
+/// 16). On parse failure or when no rewrite is needed the input string is
+/// returned unchanged.
 pub(super) fn heuristic_java_organize_imports_text(
     project_dir: &Path,
     source: &str,
@@ -525,13 +557,22 @@ pub(super) fn compute_java_organize_imports_edit(
 ) -> Result<Option<(usize, usize, String)>> {
     let mut used_types = HashSet::new();
     collect_java_type_references(tree.root_node(), source, &mut used_types);
+    let mut used_static_members = HashSet::new();
+    collect_java_static_member_references(tree.root_node(), source, &mut used_static_members);
     let current_package = extract_java_package(source);
     let existing_imports = extract_java_imports(source);
     let mut imports = existing_imports
         .iter()
         .filter(|line| {
             let trimmed = line.trim();
-            if trimmed.starts_with("import static ") || trimmed.ends_with(".*;") {
+            if trimmed.starts_with("import static ") {
+                if trimmed.ends_with(".*;") {
+                    return true;
+                }
+                return java_import_static_member_simple_name(trimmed)
+                    .is_some_and(|simple| used_static_members.contains(simple.as_str()));
+            }
+            if trimmed.ends_with(".*;") {
                 return true;
             }
             java_import_simple_name(trimmed)
@@ -576,10 +617,10 @@ pub(super) fn compute_java_organize_imports_edit(
 
     // Gap 28: drop explicit single-type imports already covered by a
     // wildcard import for the same package. The wildcard provides them, so
-    // listing them again is redundant. `import static …` lines are NEVER
-    // dropped (they bring members, not types — wildcards on types do not
-    // cover them) and explicit imports from packages without a matching
-    // wildcard are left alone.
+    // listing them again is redundant. `import static …` lines that survived
+    // the member-usage filter above are NEVER dropped here (they bring members,
+    // not types — wildcards on types do not cover them) and explicit imports
+    // from packages without a matching wildcard are left alone.
     let wildcard_packages: HashSet<String> = imports
         .iter()
         .filter_map(|line| {
