@@ -135,8 +135,13 @@ pub fn analyze_unused_constructor_params(path: &Path) -> Result<UnusedCtorParams
         });
     }
 
-    let replacement = format!("({})", kept_text.join(", "));
-    let edit = Some((params_node.start_byte(), params_node.end_byte(), replacement));
+    let params_text = &parsed.source[params_node.start_byte()..params_node.end_byte()];
+    let replacement = render_parameter_list_replacement(params_text, &kept_text);
+    let edit = Some((
+        params_node.start_byte(),
+        params_node.end_byte(),
+        replacement,
+    ));
     Ok(UnusedCtorParamsPlan {
         ctor_is_inject: true,
         source_sha256,
@@ -196,7 +201,9 @@ fn count_identifier_refs(node: Node<'_>, source: &str, name: &str) -> usize {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         if n.kind() == "identifier"
-            && n.utf8_text(source.as_bytes()).map(|t| t == name).unwrap_or(false)
+            && n.utf8_text(source.as_bytes())
+                .map(|t| t == name)
+                .unwrap_or(false)
         {
             count += 1;
         }
@@ -205,6 +212,67 @@ fn count_identifier_refs(node: Node<'_>, source: &str, name: &str) -> usize {
         }
     }
     count
+}
+
+fn render_parameter_list_replacement(params_text: &str, kept_text: &[String]) -> String {
+    if kept_text.is_empty() {
+        return "()".to_string();
+    }
+    if !params_text.contains('\n') {
+        return format!("({})", kept_text.join(", "));
+    }
+
+    let param_indent = detect_continuation_indent(params_text);
+    let closing_on_own_line = params_text
+        .lines()
+        .last()
+        .map(|line| line.trim() == ")")
+        .unwrap_or(false);
+    let closing_indent = if closing_on_own_line {
+        params_text
+            .lines()
+            .last()
+            .map(leading_whitespace)
+            .unwrap_or("")
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    let mut replacement = String::from("(");
+    for (idx, param) in kept_text.iter().enumerate() {
+        replacement.push('\n');
+        replacement.push_str(&param_indent);
+        replacement.push_str(param.trim());
+        if idx + 1 < kept_text.len() {
+            replacement.push(',');
+        }
+    }
+    if closing_on_own_line {
+        replacement.push('\n');
+        replacement.push_str(&closing_indent);
+    }
+    replacement.push(')');
+    replacement
+}
+
+fn detect_continuation_indent(params_text: &str) -> String {
+    for line in params_text.lines().skip(1) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with(')') {
+            continue;
+        }
+        return leading_whitespace(line).to_string();
+    }
+    "        ".to_string()
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    let end = line
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
+        .unwrap_or(line.len());
+    &line[..end]
 }
 
 #[cfg(test)]
@@ -253,7 +321,35 @@ mod tests {
         );
         assert!(!plan.ctor_is_inject);
         assert!(plan.edit.is_none());
-        assert!(plan.note.as_deref().unwrap().contains("no @Inject constructor"));
+        assert!(
+            plan.note
+                .as_deref()
+                .unwrap()
+                .contains("no @Inject constructor")
+        );
+    }
+
+    #[test]
+    fn preserves_multiline_parameter_list_shape() {
+        let plan = analyze(
+            "package com.acme;\n\
+             import com.google.inject.Inject;\n\
+             class S {\n\
+            \x20   @Inject\n\
+            \x20   S(\n\
+            \x20       Repo repo,\n\
+            \x20       Audit audit,\n\
+            \x20       Clock clock) {\n\
+            \x20       audit.record(clock.now());\n\
+            \x20   }\n\
+             }\n",
+        );
+
+        let (_, _, replacement) = plan.edit.expect("edit produced");
+        assert_eq!(
+            replacement, "(\n        Audit audit,\n        Clock clock)",
+            "multiline constructor parameter lists must not collapse"
+        );
     }
 
     #[test]
