@@ -169,7 +169,11 @@ RECIPE (god-class decomposition)
     // so the delegate stays container-managed and AOP-interceptable. Only set
     // wiring explicitly to force own_construction (a plain `new`-ed delegate).
   });
-  // then edits.createFile/merge/apply + compile-gate, as java.describe shows"#;
+  // edits.createFile/merge/apply, then compile-gate, as java.describe shows.
+  // FINALLY, when the source is DI-managed (external_injection was used), the
+  // moved deps are left as dead @Inject params on the source ctor — compose
+  // java.removeUnusedConstructorParams({ file }) → edits.merge/apply to drop
+  // them and fully move the injection point (run it AFTER the extract apply)."#;
 
 #[async_trait]
 impl Tool for AnalysisDescribe {

@@ -416,10 +416,135 @@ impl Tool for JavaDescribe {
             .unwrap_or_default();
         match transform {
             "extractClass" => ToolResult::Json(json!({ "contract": EXTRACT_CLASS_CONTRACT })),
+            "removeUnusedConstructorParams" => {
+                ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
+            }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass)"
+                "java.describe: unknown transform `{other}` (available: extractClass, removeUnusedConstructorParams)"
             )),
         }
+    }
+}
+
+const REMOVE_UNUSED_PARAMS_CONTRACT: &str = r#"java.removeUnusedConstructorParams — drop dead @Inject constructor parameters (move the injection point).
+
+WHAT IT DOES
+  Finds parameters of the first class's @Inject constructor that have ZERO references
+  in the constructor body, and returns ONE change replacing the parameter list with
+  the kept params. This is the cleanup that fully MOVES the injection point: after
+  extractClass relocates a dependency's field + usage to a delegate, the dependency's
+  ctor parameter is left dead on the source — this drops it.
+
+WHY @Inject only
+  A parameter is scoped to the ctor body, so "unused" is decided locally (no whole-class
+  scan). Dropping a param is safe ONLY for a container-constructed (@Inject) ctor — it has
+  no manual `new Source(...)` callers to break. A non-@Inject ctor is refused with a note.
+
+ORDERING (important)
+  Run this AFTER you have APPLIED the extract. The orphaned `this.dep = dep` assignment
+  must already be gone, otherwise the param still reads as referenced and is kept. The
+  composition is: extractClass → edits.apply → removeUnusedConstructorParams → edits.apply.
+
+PARAMS  { file: string }   workspace-relative .java file
+RETURNS { changes, ctor_is_inject, removed: string[], kept: string[], findings, note, provenance }
+  changes: [] when nothing is removable (see note); otherwise one span→new_text → edits.merge
+  removed/kept: parameter names; findings: { finding:"removed_param", name, type } each
+  note: present when no edit (e.g. "no @Inject constructor", "no unused constructor parameters")
+
+RECIPE
+  // after the extract has been applied to `file`:
+  const r = await java.removeUnusedConstructorParams({ file });
+  if (r.changes.length) {
+    const es = await edits.begin();
+    await edits.merge({ es, changes: r.changes });
+    await edits.apply({ es });
+  } else { text(r.note); }"#;
+
+/// `java.removeUnusedConstructorParams` — drop `@Inject` constructor parameters
+/// left dead by a structural move (the injection-point cleanup that composes
+/// after extractClass). Returns hash-anchored `{changes}` for the edits algebra.
+pub struct JavaRemoveUnusedCtorParams;
+
+#[derive(Deserialize)]
+struct RemoveUnusedParams {
+    file: String,
+}
+
+#[async_trait]
+impl Tool for JavaRemoveUnusedCtorParams {
+    fn name(&self) -> &str {
+        "java.removeUnusedConstructorParams"
+    }
+    fn description(&self) -> &str {
+        "Drop constructor parameters that are no longer referenced in the @Inject constructor body — the cleanup that fully MOVES the injection point after an extract strands a dependency's parameter. Returns one hash-anchored change replacing the parameter list (→ edits.merge); never writes. Only an @Inject (container-constructed) ctor is eligible — a manually-called ctor's `new` callers would break, so it refuses with a note. Run it AFTER applying the extract (the orphaned `this.dep = dep` must already be gone for the param to read as unused)."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative Java file whose first class's @Inject constructor to prune." }
+            },
+            "required": ["file"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some((
+            "java".to_string(),
+            "removeUnusedConstructorParams".to_string(),
+        ))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: RemoveUnusedParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.removeUnusedConstructorParams: bad input — expected {{ file: string }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let abs = root.join(&params.file);
+            let plan = match bbox_refactor::analyze_unused_constructor_params(&abs) {
+                Ok(p) => p,
+                Err(e) => return err(format!("java.removeUnusedConstructorParams: {e:#}")),
+            };
+            let mut changes: Vec<Value> = Vec::new();
+            if let Some((byte_start, byte_end, replacement)) = &plan.edit {
+                changes.push(json!({
+                    "span": {
+                        "file": params.file,
+                        "byte_start": byte_start,
+                        "byte_end": byte_end,
+                        "content_sha256": plan.source_sha256,
+                    },
+                    "new_text": replacement,
+                }));
+            }
+            let findings: Vec<Value> = plan
+                .removed
+                .iter()
+                .map(|(name, type_name)| {
+                    json!({ "finding": "removed_param", "name": name, "type": type_name })
+                })
+                .collect();
+            ToolResult::Json(json!({
+                "changes": changes,
+                "ctor_is_inject": plan.ctor_is_inject,
+                "removed": plan.removed.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "kept": plan.kept,
+                "findings": findings,
+                "note": plan.note,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
     }
 }
 
@@ -427,6 +552,7 @@ impl Tool for JavaDescribe {
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(JavaExtractClass) as Arc<dyn Tool>,
+        Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaDescribe) as Arc<dyn Tool>,
     ]
 }
@@ -437,14 +563,16 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); composes after extractClass+apply."
             .to_string(),
         declarations: r#"type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; fixme_count: number; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
-  /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). Refusals are errors naming the exact fix. */
+  /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean }): Promise<JavaTransformResult>;
+  /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
+  removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
 };"#
             .to_string(),
     }
@@ -917,6 +1045,69 @@ public class AggregationAdmin {
         assert!(
             matches!(unknown, ToolResult::Error(ref e) if e.contains("available: extractClass")),
             "{unknown:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_unused_constructor_params_drops_dead_inject_param() {
+        // Post-extract shape: `repo` is no longer used in the @Inject ctor body
+        // (its field + assignment moved to a delegate); `log` is still used.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/S.java"),
+            "package com.acme;\n\
+             import com.google.inject.Inject;\n\
+             class S {\n\
+            \x20   private final Logger log;\n\
+            \x20   @Inject\n\
+            \x20   S(Repo repo, Logger log) { this.log = log; }\n\
+            \x20   void use() { log.info(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaRemoveUnusedCtorParams
+                .call(json!({ "file": "src/com/acme/S.java" }), &cx)
+                .await,
+        );
+        assert_eq!(result["ctor_is_inject"], true, "{result}");
+        assert_eq!(result["removed"], json!(["repo"]), "{result}");
+        assert_eq!(result["kept"], json!(["log"]), "{result}");
+        let changes = result["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "one param-list change: {result}");
+        assert_eq!(changes[0]["new_text"], "(Logger log)", "{result}");
+        // Hash-anchored to the analyzed source.
+        assert!(
+            changes[0]["span"]["content_sha256"].as_str().unwrap().len() == 64,
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_unused_constructor_params_refuses_non_inject() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/S.java"),
+            "package com.acme;\nclass S {\n    S(Repo repo) { }\n}\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+        let result = json_of(
+            JavaRemoveUnusedCtorParams
+                .call(json!({ "file": "src/com/acme/S.java" }), &cx)
+                .await,
+        );
+        assert_eq!(result["ctor_is_inject"], false, "{result}");
+        assert!(result["changes"].as_array().unwrap().is_empty(), "{result}");
+        assert!(
+            result["note"].as_str().unwrap().contains("no @Inject constructor"),
+            "{result}"
         );
     }
 }

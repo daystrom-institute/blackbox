@@ -32,6 +32,7 @@ pub mod facts;
 mod rust;
 use rust::*;
 mod java;
+pub use java::{UnusedCtorParamsPlan, analyze_unused_constructor_params};
 use java::*;
 pub(crate) mod csharp;
 pub(crate) mod csharp_sidecar;

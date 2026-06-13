@@ -3970,6 +3970,8 @@ mod concurrency_audit;
 pub(crate) use concurrency_audit::plan_java_concurrency_antipattern_audit;
 mod constructor_param_clusters;
 pub(crate) use constructor_param_clusters::plan_cluster_inject_params_java;
+mod prune_ctor_params;
+pub use prune_ctor_params::{UnusedCtorParamsPlan, analyze_unused_constructor_params};
 mod imports;
 mod public_api_guard;
 use imports::*;
