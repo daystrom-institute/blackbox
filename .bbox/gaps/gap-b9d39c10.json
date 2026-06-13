@@ -12,7 +12,9 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/embed/backfill-residue-never-enqueued",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-13T00:33:55Z",
-  "updated_at": "2026-06-13T00:33:55Z"
+  "updated_at": "2026-06-13T01:29:12Z",
+  "resolved_at": "2026-06-13T01:29:12Z",
+  "resolution_note": "Root cause (a): there was NO backfill path — items enqueue only at creation/modification, so anything predating a route (git_message shipped after the commits were indexed) or dropped after retry exhaustion stranded forever; health=ok meant only \"no errors\". Fixes (commit 08ad4938, worktree storage-maintenance-leaks): (b) bbox_embed_status reports health=stalled + actionable health_reason when an available route has coverage <0.98 with an idle queue (error-driven unavailable still wins; busy queue stays ok); (c) transcripts route carries explicit coverage_state (\"guarded: …\") instead of null; (a-fix) bbox_reembed route=\"backfill\" sweeps all non-transcript routes idempotently and embed-compaction-arc v3 (installed on prod) runs it nightly at 03:30 UTC. Prod remediated live via per-route reembeds: git_message 0.0→1.0 (46/46), knowledge→1.0, agent_manifest→1.0, notes/code queues draining. Old daemon warns on the unknown backfill route until next deploy; manual refills cover the interim."
 }
