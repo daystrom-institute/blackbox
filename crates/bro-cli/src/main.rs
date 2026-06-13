@@ -95,8 +95,8 @@ struct AgentArgs {
     /// Provider effort/thinking level. Defaults to the provider catalog default.
     #[arg(long)]
     effort: Option<String>,
-    /// Resume an existing provider session id instead of starting a fresh one.
-    #[arg(long, value_name = "SESSION_ID")]
+    /// Resume an existing provider session id or `/rename`d session name.
+    #[arg(long, value_name = "SESSION_ID_OR_NAME")]
     resume: Option<String>,
     /// Optional first prompt / resume turn. If omitted, the TUI opens empty and
     /// dispatches or resumes when you submit the first composer line.

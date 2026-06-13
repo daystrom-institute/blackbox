@@ -92,6 +92,145 @@ fn render_demo_to_ansi() {
     eprintln!("wrote /tmp/fleet_render_demo.ansi ({} lines)", lines.len());
 }
 
+#[test]
+fn render_transcript_can_hide_thinking_blocks() {
+    let items = vec![
+        TranscriptItem::UserSteer("do the work".into()),
+        TranscriptItem::Thinking("private notes\nmore private notes".into()),
+        TranscriptItem::AssistantText("done".into()),
+    ];
+
+    let rendered: Vec<String> = render_transcript_with_options(
+        &items,
+        "",
+        &[],
+        100,
+        TranscriptDisplayOptions {
+            show_thinking_blocks: false,
+            ..TranscriptDisplayOptions::default()
+        },
+    )
+    .iter()
+    .map(line_text)
+    .collect();
+
+    assert!(rendered.iter().any(|line| line.contains("do the work")));
+    assert!(rendered.iter().any(|line| line.contains("done")));
+    assert!(
+        !rendered
+            .iter()
+            .any(|line| line.contains("private notes") || line.contains("more private notes")),
+        "thinking lines should be suppressed: {rendered:?}"
+    );
+}
+
+#[test]
+fn render_thinking_blocks_as_consistent_quote_lane() {
+    let items = vec![TranscriptItem::Thinking(
+        "# Plan\nthis is a long thinking line that should wrap with the same gutter on every rendered line"
+            .into(),
+    )];
+
+    let rendered: Vec<String> =
+        render_transcript_with_options(&items, "", &[], 36, TranscriptDisplayOptions::default())
+            .iter()
+            .map(line_text)
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+
+    assert!(
+        rendered.len() > 2,
+        "expected wrapped thinking: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().all(|line| line.starts_with("▏ ")),
+        "every thinking line should carry the quote gutter: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|line| line.contains("Plan")),
+        "markdown heading text should remain visible: {rendered:?}"
+    );
+    assert!(
+        !rendered.iter().any(|line| line.contains("# Plan")),
+        "markdown heading marker should not render literally: {rendered:?}"
+    );
+}
+
+#[test]
+fn render_transcript_can_hide_tool_responses() {
+    let items = vec![
+        TranscriptItem::ToolCall {
+            name: "mcp__blackbox__bbox_search".into(),
+            args: serde_json::json!({"query": "fleet tui"}).to_string(),
+        },
+        TranscriptItem::ToolResult {
+            tool: Some("mcp__blackbox__bbox_search".into()),
+            content: "sensitive result body".into(),
+            is_error: false,
+            rider: None,
+        },
+    ];
+
+    let rendered: Vec<String> = render_transcript_with_options(
+        &items,
+        "",
+        &[],
+        100,
+        TranscriptDisplayOptions {
+            show_tool_responses: false,
+            ..TranscriptDisplayOptions::default()
+        },
+    )
+    .iter()
+    .map(line_text)
+    .collect();
+
+    assert!(rendered.iter().any(|line| line.contains("bbox_search")));
+    assert!(
+        !rendered
+            .iter()
+            .any(|line| line.contains("sensitive result body")),
+        "tool response should be suppressed: {rendered:?}"
+    );
+}
+
+#[test]
+fn render_transcript_can_hide_report_entries() {
+    let items = vec![
+        TranscriptItem::ToolCall {
+            name: "mcp__blackbox__bro_report".into(),
+            args: serde_json::json!({"message": "status update"}).to_string(),
+        },
+        TranscriptItem::Report {
+            message: "status update".into(),
+            needs_input: false,
+        },
+        TranscriptItem::AssistantText("continuing".into()),
+    ];
+
+    let rendered: Vec<String> = render_transcript_with_options(
+        &items,
+        "",
+        &[],
+        100,
+        TranscriptDisplayOptions {
+            show_reports: false,
+            ..TranscriptDisplayOptions::default()
+        },
+    )
+    .iter()
+    .map(line_text)
+    .collect();
+
+    assert!(
+        !rendered
+            .iter()
+            .any(|line| line.contains("report(") || line.contains("◆ status update")),
+        "report entries should be suppressed: {rendered:?}"
+    );
+    assert!(rendered.iter().any(|line| line.contains("continuing")));
+}
+
 // ---- Render snapshot safety net (Phase 0) ------------------------------
 //
 // Two complementary goldens lock the current rendering behavior before the
@@ -932,6 +1071,53 @@ fn compact_tool_call_line_summarizes_content_search() {
 }
 
 #[test]
+fn compact_tool_call_line_renders_mcp_calls_with_leaf_name_and_named_args() {
+    let line = compact_tool_call_line(
+        "mcp__blackbox__bbox_search",
+        r#"{"query":"fleet tui","project":"/repo","limit":5}"#,
+        120,
+    )
+    .unwrap();
+    assert_eq!(
+        line,
+        r#"▸ bbox_search(query="fleet tui", limit=5, project=/repo)"#
+    );
+}
+
+#[test]
+fn compact_tool_call_lines_wrap_mcp_instead_of_falling_back_to_json_blob() {
+    let args = serde_json::json!({
+        "query": "a very long query that would otherwise force the renderer into a pretty printed json block",
+        "filters": {
+            "project": "/repo",
+            "role": "user",
+            "mode": "smart",
+        },
+        "limit": 25,
+    });
+    let lines: Vec<String> =
+        compact_tool_call_lines("mcp__blackbox__bbox_hybrid_search", &args.to_string(), 54)
+            .unwrap()
+            .iter()
+            .map(line_text)
+            .collect();
+
+    assert!(
+        lines.len() > 1,
+        "long MCP compact call should wrap: {lines:?}"
+    );
+    assert!(lines[0].starts_with("▸ bbox_hybrid_search("), "{lines:?}");
+    assert!(
+        lines.iter().skip(1).all(|line| line.starts_with("  ")),
+        "continuation lines should be indented: {lines:?}"
+    );
+    assert!(
+        lines.join(" ").contains("query=") && lines.join(" ").contains("limit=25"),
+        "{lines:?}"
+    );
+}
+
+#[test]
 fn compact_tool_call_line_falls_back_for_large_args() {
     let long = serde_json::json!({
         "path": "src/lib.rs",
@@ -946,6 +1132,61 @@ fn compact_tool_call_line_falls_back_for_large_args() {
 #[test]
 fn compact_tool_call_line_respects_actual_width() {
     assert!(compact_tool_call_line("shell_run", r#"{"cmd":"cargo test --lib"}"#, 20).is_none());
+}
+
+#[test]
+fn compact_tool_call_lines_wrap_shell_run() {
+    let lines: Vec<String> = compact_tool_call_lines(
+        "shell_run",
+        r#"{"cmd":"cargo nextest run --workspace -p bro-cli -p bro-fleet-client","cwd":"/home/invidious/repos/transcript-search"}"#,
+        44,
+    )
+    .unwrap()
+    .iter()
+    .map(line_text)
+    .collect();
+
+    assert!(lines.len() > 1, "{lines:?}");
+    assert!(lines[0].starts_with("▸ shell_run("), "{lines:?}");
+    assert!(lines.iter().any(|line| line.contains("cmd:")), "{lines:?}");
+    assert!(
+        lines.iter().skip(1).all(|line| line.starts_with("  ")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn compact_tool_call_line_summarizes_file_read() {
+    let line = compact_tool_call_line(
+        "file_read",
+        r#"{"file_path":"crates/bro-cli/src/fleet_tui/transcript.rs","line_start":730,"line_end":820}"#,
+        140,
+    )
+    .unwrap();
+    assert_eq!(
+        line,
+        "▸ file_read(crates/bro-cli/src/fleet_tui/transcript.rs, line_start=730, line_end=820)"
+    );
+}
+
+#[test]
+fn compact_tool_call_lines_wrap_content_search() {
+    let lines: Vec<String> = compact_tool_call_lines(
+        "content_search",
+        r#"{"pattern":"render_transcript_with_options|compact_tool_call_lines|content_search","path":"crates/bro-cli/src/fleet_tui","glob":"*.rs"}"#,
+        42,
+    )
+    .unwrap()
+    .iter()
+    .map(line_text)
+    .collect();
+
+    assert!(lines.len() > 1, "{lines:?}");
+    assert!(lines[0].starts_with("▸ content_search("), "{lines:?}");
+    assert!(
+        lines.iter().skip(1).all(|line| line.starts_with("  ")),
+        "{lines:?}"
+    );
 }
 
 #[test]
@@ -2186,6 +2427,186 @@ fn make_test_app(rt: &tokio::runtime::Handle) -> App {
     app
 }
 
+#[test]
+fn rename_event_round_trips_through_transcript_jsonl() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sess-rename.events.jsonl");
+
+    append_rename_event_to_path(&path, "sess-rename", "bro-fixes").unwrap();
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let rename = parse_rename_event_line(&path, contents.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        rename,
+        TranscriptRename {
+            session_id: "sess-rename".to_string(),
+            name: "bro-fixes".to_string(),
+        }
+    );
+}
+
+#[test]
+fn latest_matching_rename_in_transcript_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sess-new.events.jsonl");
+    append_rename_event_to_path(&path, "sess-old", "bro-fixes").unwrap();
+    append_rename_event_to_path(&path, "sess-new", "bro-fixes").unwrap();
+
+    let rename = latest_matching_rename_in_path(&path, "bro-fixes").unwrap();
+    assert_eq!(rename.session_id, "sess-new");
+}
+
+#[test]
+fn resume_target_resolves_name_from_harness_session_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let bro_home = dir.path().join("bro-home");
+    let sessions = bro_home.join("harness-sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    append_rename_event_to_path(
+        &sessions.join("sess-bro-fixes.events.jsonl"),
+        "sess-bro-fixes",
+        "bro-fixes",
+    )
+    .unwrap();
+
+    let old_bro_home = std::env::var_os("BRO_HOME");
+    unsafe { std::env::set_var("BRO_HOME", &bro_home) };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let app = make_test_app(rt.handle());
+
+    assert_eq!(resolve_resume_target(&app, "bro-fixes"), "sess-bro-fixes");
+
+    unsafe {
+        if let Some(old) = old_bro_home {
+            std::env::set_var("BRO_HOME", old);
+        } else {
+            std::env::remove_var("BRO_HOME");
+        }
+    }
+}
+
+#[test]
+fn resume_slash_without_turn_attaches_transcript_without_resuming() {
+    let dir = tempfile::tempdir().unwrap();
+    let bro_home = dir.path().join("bro-home");
+    let sessions = bro_home.join("harness-sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let transcript = sessions.join("sess-bro-fixes.events.jsonl");
+    append_rename_event_to_path(&transcript, "sess-bro-fixes", "bro-fixes").unwrap();
+
+    let old_bro_home = std::env::var_os("BRO_HOME");
+    unsafe { std::env::set_var("BRO_HOME", &bro_home) };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut app = make_test_app(rt.handle());
+    app.mode = AppMode::Standalone {
+        pending_resume: None,
+    };
+    app.zone = Zone::SingleAgent;
+
+    resume_standalone(&mut app, "bro-fixes");
+
+    assert_eq!(app.agents.len(), 1);
+    assert!(!app.agents[0].task.is_daemon_backed());
+    let snap = app.agents[0].task.snapshot();
+    assert_eq!(snap.session_id, "sess-bro-fixes");
+    assert_eq!(
+        snap.transcript_path.as_deref(),
+        Some(transcript.to_str().unwrap())
+    );
+    assert_eq!(app.mode.pending_resume(), None);
+    assert_eq!(app.agents[0].name, "bro-fixes");
+
+    unsafe {
+        if let Some(old) = old_bro_home {
+            std::env::set_var("BRO_HOME", old);
+        } else {
+            std::env::remove_var("BRO_HOME");
+        }
+    }
+}
+
+#[test]
+fn resume_attach_uses_configured_bro_home_when_env_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cfg_dir = root.join("cfg");
+    let bro_home = root.join("configured-bro-home");
+    let sessions = bro_home.join("harness-sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        format!("[paths]\nbro_home = {:?}\n", bro_home.display().to_string()),
+    )
+    .unwrap();
+    let transcript = sessions.join("sess-config-home.events.jsonl");
+    append_rename_event_to_path(&transcript, "sess-config-home", "config-home").unwrap();
+
+    let old_bro_home = std::env::var_os("BRO_HOME");
+    let old_config = std::env::var_os("BLACKBOX_CONFIG");
+    unsafe {
+        std::env::remove_var("BRO_HOME");
+        std::env::set_var("BLACKBOX_CONFIG", cfg_dir.join("config.toml"));
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut app = make_test_app(rt.handle());
+    app.mode = AppMode::Standalone {
+        pending_resume: None,
+    };
+    app.zone = Zone::SingleAgent;
+
+    resume_standalone(&mut app, "config-home");
+
+    assert_eq!(app.agents.len(), 1);
+    let snap = app.agents[0].task.snapshot();
+    assert_eq!(snap.session_id, "sess-config-home");
+    assert_eq!(
+        snap.transcript_path.as_deref(),
+        Some(transcript.to_str().unwrap())
+    );
+
+    unsafe {
+        if let Some(old) = old_bro_home {
+            std::env::set_var("BRO_HOME", old);
+        } else {
+            std::env::remove_var("BRO_HOME");
+        }
+        if let Some(old) = old_config {
+            std::env::set_var("BLACKBOX_CONFIG", old);
+        } else {
+            std::env::remove_var("BLACKBOX_CONFIG");
+        }
+    }
+}
+
+#[test]
+fn standalone_resume_hint_prefers_operator_name() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut app = make_test_app(rt.handle());
+    app.agents.push(Agent {
+        task: AgentHandle::for_test(TaskStatus::Running, "quit-hint"),
+        classifier: None,
+        provider: Provider::Brodex,
+        selected_model: None,
+        selected_effort: None,
+        selected_service_tier: None,
+        selected_cwd: None,
+        name: "bro-fixes".to_string(),
+        name_overridden: true,
+        initial_prompt: None,
+        pending_inputs: VecDeque::new(),
+        seen_user_steers: 0,
+    });
+
+    let hint = standalone_resume_hint(&app).unwrap();
+    assert!(hint.contains("bro agent --resume bro-fixes"));
+    assert!(hint.contains("session-quit-hint"));
+}
+
 /// gap-1189200c: when the roster stream's Added delta creates the agent
 /// row before the off-thread dispatch outcome installs, install_dispatch
 /// must merge into that row instead of pushing a duplicate.
@@ -2358,6 +2779,44 @@ fn running_agent_single_enter_submits() {
     submit(&mut app);
 
     assert!(app.input.is_empty(), "steer_selected should take the input");
+}
+
+#[test]
+fn submit_records_handled_slash_commands_in_composer_history() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut app = make_test_app(rt.handle());
+    app.input = "  /config  ".to_string();
+    app.cursor_pos = app.input.len();
+
+    submit(&mut app);
+
+    let entries = read_history(&app.composer_history_path);
+    let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(texts, vec!["/config"]);
+    assert_eq!(app.zone, Zone::Config);
+}
+
+#[test]
+fn submit_records_unknown_slash_commands_in_composer_history() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut app = make_test_app(rt.handle());
+    app.input = "/bogus".to_string();
+    app.cursor_pos = app.input.len();
+
+    submit(&mut app);
+
+    let entries = read_history(&app.composer_history_path);
+    let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(texts, vec!["/bogus"]);
+    assert!(app.input.is_empty());
+    assert!(
+        app.pending_cockpit_lines
+            .iter()
+            .any(|line| line.contains("unknown command: /bogus")),
+        "unknown command should still surface feedback"
+    );
 }
 
 // ---- D27: long-lived cockpits running stale binaries (unit-N4) -------

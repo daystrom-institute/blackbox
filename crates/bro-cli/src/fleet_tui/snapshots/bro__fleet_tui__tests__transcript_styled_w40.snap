@@ -9,8 +9,8 @@ expression: dump_lines(&lines)
 
 Here is a plan with [b]emphasis[/] and a [White]code[/] token.
 
-[DarkGray,i]✻ considering the edge cases[/]
-[DarkGray,i]✻ and the wrapping[/]
+[Rgb(112, 132, 154),b]▏ [/][Rgb(154, 162, 174)]considering the edge cases[/]
+[Rgb(112, 132, 154),b]▏ [/][Rgb(154, 162, 174)]and the wrapping[/]
 
 [Rgb(118, 150, 124)]▸ file_edit(src/lib.rs)[/]
 [Red]- let x = 1;[/]

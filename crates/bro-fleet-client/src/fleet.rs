@@ -87,6 +87,13 @@ pub struct FleetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<String>,
 
+    /// Operator-facing display preferences for the local Fleet/agent TUI. These
+    /// are client-side only: they affect what the cockpit renders, not what the
+    /// daemon stores or what gets replayed into a provider.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "FleetDisplayConfig::is_empty")]
+    pub display: FleetDisplayConfig,
+
     /// Per-project dispatch env (the "leading edge"), keyed by **canonical repo
     /// path**. Merged verbatim into the worktree dispatch env when the cockpit
     /// dispatches into that repo. This is the project-agnostic replacement for
@@ -104,6 +111,48 @@ pub struct FleetConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub project_closeout: BTreeMap<String, ProjectCloseout>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct FleetDisplayConfig {
+    /// Show model reasoning/thinking blocks in transcript views. Defaults on so
+    /// existing verbose transcript behavior is preserved until an operator opts
+    /// out through `/config`.
+    #[serde(default, rename = "showThinkingBlocks", alias = "show_thinking_blocks")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_thinking_blocks: Option<bool>,
+
+    /// Show successful tool-result bodies in transcript views. Tool calls still
+    /// render when this is off; only response/output blocks are hidden.
+    #[serde(default, rename = "showToolResponses", alias = "show_tool_responses")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_tool_responses: Option<bool>,
+
+    /// Show `report()`/`bro_report` transcript entries in transcript views.
+    /// Roster report state remains visible; this controls transcript rows only.
+    #[serde(default, rename = "showReports", alias = "show_reports")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_reports: Option<bool>,
+}
+
+impl FleetDisplayConfig {
+    pub fn is_empty(&self) -> bool {
+        self.show_thinking_blocks.is_none()
+            && self.show_tool_responses.is_none()
+            && self.show_reports.is_none()
+    }
+
+    pub fn show_thinking_blocks_resolved(&self) -> bool {
+        self.show_thinking_blocks.unwrap_or(true)
+    }
+
+    pub fn show_tool_responses_resolved(&self) -> bool {
+        self.show_tool_responses.unwrap_or(true)
+    }
+
+    pub fn show_reports_resolved(&self) -> bool {
+        self.show_reports.unwrap_or(true)
+    }
 }
 
 /// Per-project dispatch env (leading edge). See [`FleetConfig::project_dispatch`].
@@ -559,6 +608,56 @@ impl AgentHandle {
             }),
             daemon: None,
         }
+    }
+
+    /// Create a local-only handle for an existing session transcript. It has no
+    /// daemon backing, so the next user turn must go through `/control/resume`.
+    #[doc(hidden)]
+    pub fn for_attached_session(
+        provider: Provider,
+        session_id: &str,
+        transcript_path: String,
+        cwd: Option<String>,
+        name: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        use crate::task::now_ms;
+        let now = now_ms();
+        let id = format!("attached-{session_id}");
+        let inner = TaskInner {
+            id,
+            provider,
+            session_id: session_id.to_string(),
+            events: Vec::new(),
+            last_assistant_message: None,
+            report_message: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: String::new(),
+            status: TaskStatus::Completed,
+            started_at: now,
+            completed_at: Some(now),
+            cwd,
+            bro_label: name,
+            recoverable: true,
+            last_event_at_ms: Some(now),
+            model,
+            origin: bro_core::Origin::Cockpit,
+            managed_worktree: None,
+            workflow_owned: false,
+            transcript_path: Some(transcript_path),
+        };
+        AgentHandle {
+            task: Arc::new(Task {
+                inner: parking_lot::Mutex::new(inner),
+                notify: Arc::new(tokio::sync::Notify::new()),
+            }),
+            daemon: None,
+        }
+    }
+
+    pub fn is_daemon_backed(&self) -> bool {
+        self.daemon.is_some()
     }
 
     pub fn id(&self) -> String {
@@ -1867,6 +1966,13 @@ impl FleetOrchestrator {
         cfg.save()
     }
 
+    /// Persist client-side TUI display preferences to `fleet.json`.
+    pub fn set_display(&self, display: FleetDisplayConfig) -> anyhow::Result<PathBuf> {
+        let mut cfg = FleetConfig::load();
+        cfg.display = display;
+        cfg.save()
+    }
+
     /// Fetch the initial daemon roster, then keep the in-memory projection fresh
     /// from one SSE subscription. Gaps, server resync signals, and stream lag all
     /// refetch `/control/roster` before reconnecting.
@@ -2807,6 +2913,35 @@ mod tests {
             closeout.closeout_hooks[&CloseoutEvent::PostSuccess][0],
             "echo done"
         );
+    }
+
+    #[test]
+    fn display_config_round_trips_thinking_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fleet.json");
+        std::fs::write(
+            &p,
+            r#"{
+              "display": {
+                "showThinkingBlocks": false,
+                "showToolResponses": false,
+                "showReports": false
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = FleetConfig::load_strict_from(&p).expect("valid display config loads");
+        assert!(!cfg.display.show_thinking_blocks_resolved());
+        assert!(!cfg.display.show_tool_responses_resolved());
+        assert!(!cfg.display.show_reports_resolved());
+        cfg.save_to(&p).expect("display config saves");
+
+        let saved = std::fs::read_to_string(&p).unwrap();
+        assert!(saved.contains("\"display\""));
+        assert!(saved.contains("\"showThinkingBlocks\": false"));
+        assert!(saved.contains("\"showToolResponses\": false"));
+        assert!(saved.contains("\"showReports\": false"));
     }
 
     #[test]

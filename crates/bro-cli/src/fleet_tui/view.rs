@@ -308,6 +308,13 @@ fn roster_tab_header(app: &App) -> Line<'static> {
 }
 
 pub(super) fn draw_config_body(f: &mut Frame, area: Rect, app: &App) {
+    f.render_widget(
+        Paragraph::new(config_body_lines(app)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+pub(super) fn config_body_lines(app: &App) -> Vec<Line<'static>> {
     let path = FleetConfig::path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "fleet.json path unavailable".to_string());
@@ -335,7 +342,16 @@ pub(super) fn draw_config_body(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else if !enabled && !matches!(field, ConfigField::ClassifierEnabled) {
+        } else if !enabled
+            && !matches!(
+                field,
+                ConfigField::CodeMode
+                    | ConfigField::ThinkingBlocks
+                    | ConfigField::ToolResponses
+                    | ConfigField::Reports
+                    | ConfigField::ClassifierEnabled
+            )
+        {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::Gray)
@@ -368,8 +384,7 @@ pub(super) fn draw_config_body(f: &mut Frame, area: Rect, app: &App) {
         "  ↑/↓ fields   ←/→ options   Space toggles   Enter saves + returns   Esc returns",
         Style::default().fg(Color::DarkGray),
     )));
-
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    lines
 }
 
 pub(super) fn draw_roster(
@@ -771,7 +786,13 @@ pub(super) fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views:
     let initial = initial_prompt(&app.agents[idx]).to_string();
     let queued = queued_user_turns(&mut app.agents[idx], &transcript);
     let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
-    lines.extend(render_transcript(&transcript, &initial, &queued, width));
+    lines.extend(render_transcript_with_options(
+        &transcript,
+        &initial,
+        &queued,
+        width,
+        transcript_display_options(app),
+    ));
 
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     let total = para.line_count(transcript_area.width.max(1));

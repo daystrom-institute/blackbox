@@ -6,13 +6,47 @@ const ARG_MAX_LINES: usize = 15;
 const RESULT_MAX_LINES: usize = 25;
 const TOOL_SOURCE_MAX_LINES: usize = 80;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TranscriptDisplayOptions {
+    pub show_thinking_blocks: bool,
+    pub show_tool_responses: bool,
+    pub show_reports: bool,
+}
+
+impl Default for TranscriptDisplayOptions {
+    fn default() -> Self {
+        Self {
+            show_thinking_blocks: true,
+            show_tool_responses: true,
+            show_reports: true,
+        }
+    }
+}
+
 /// Verbose inline transcript (§5.4): render the parsed [`TranscriptItem`]s in
 /// temporal order, structure carried by markers + color rather than folding.
+#[cfg(test)]
 pub(super) fn render_transcript(
     items: &[TranscriptItem],
     initial_prompt: &str,
     queued_turns: &[&str],
     width: usize,
+) -> Vec<Line<'static>> {
+    render_transcript_with_options(
+        items,
+        initial_prompt,
+        queued_turns,
+        width,
+        TranscriptDisplayOptions::default(),
+    )
+}
+
+pub(super) fn render_transcript_with_options(
+    items: &[TranscriptItem],
+    initial_prompt: &str,
+    queued_turns: &[&str],
+    width: usize,
+    display: TranscriptDisplayOptions,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !initial_prompt.is_empty() {
@@ -32,7 +66,12 @@ pub(super) fn render_transcript(
     }
 
     for (idx, item) in items.iter().enumerate() {
-        let rendered = render_item(item, width, turn_render_status(items, idx));
+        let rendered = render_item(
+            item,
+            width,
+            turn_render_status(items, idx, display),
+            display,
+        );
         // Only space items that actually rendered (a suppressed quiet result
         // adds nothing — no blank line either).
         if !rendered.is_empty() {
@@ -56,10 +95,19 @@ pub(super) fn render_transcript(
     lines
 }
 
+#[cfg(test)]
 pub(super) fn render_committed_items(items: &[TranscriptItem], width: usize) -> Vec<Line<'static>> {
+    render_committed_items_with_options(items, width, TranscriptDisplayOptions::default())
+}
+
+pub(super) fn render_committed_items_with_options(
+    items: &[TranscriptItem],
+    width: usize,
+    display: TranscriptDisplayOptions,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for item in items {
-        let rendered = render_item(item, width, TurnRenderStatus::Normal);
+        let rendered = render_item(item, width, TurnRenderStatus::Normal, display);
         if !rendered.is_empty() {
             let compact_tool_call = item_is_compact_tool_call(item, width);
             lines.extend(rendered);
@@ -75,6 +123,7 @@ pub(super) fn render_item(
     item: &TranscriptItem,
     width: usize,
     status: TurnRenderStatus,
+    display: TranscriptDisplayOptions,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match item {
@@ -90,17 +139,16 @@ pub(super) fn render_item(
             lines.extend(render_markdown_preserving_breaks_with_width(t, width))
         }
         TranscriptItem::Thinking(t) => {
-            for l in t.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("✻ {l}"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )));
+            if !display.show_thinking_blocks {
+                return Vec::new();
             }
+            lines.extend(render_thinking_block(t, width));
         }
         TranscriptItem::ToolCall { name, args } => {
             if is_internal_tool(name) {
+                return Vec::new();
+            }
+            if is_report_tool(name) && !display.show_reports {
                 return Vec::new();
             }
             if let Some(report_lines) = render_report_tool_call(name, args, width) {
@@ -109,8 +157,8 @@ pub(super) fn render_item(
                 lines.extend(edit_lines);
             } else if let Some(source_lines) = render_source_tool_call(name, args, width) {
                 lines.extend(source_lines);
-            } else if let Some(line) = compact_tool_call_line(name, args, width) {
-                lines.push(Line::from(Span::styled(line, tool_call_style())));
+            } else if let Some(compact_lines) = compact_tool_call_lines(name, args, width) {
+                lines.extend(compact_lines);
             } else {
                 lines.push(Line::from(Span::styled(
                     format!("{TOOL_CALL_GLYPH} {name}"),
@@ -126,6 +174,12 @@ pub(super) fn render_item(
             rider,
         } => {
             if tool.as_deref().is_some_and(is_internal_tool) {
+                return Vec::new();
+            }
+            if tool.as_deref().is_some_and(is_report_tool) && !display.show_reports {
+                return Vec::new();
+            }
+            if !display.show_tool_responses {
                 return Vec::new();
             }
             // Errors always show. Otherwise, show the body only for change-making
@@ -162,6 +216,9 @@ pub(super) fn render_item(
             message,
             needs_input,
         } => {
+            if !display.show_reports {
+                return Vec::new();
+            }
             let color = if *needs_input {
                 Color::Yellow
             } else {
@@ -195,25 +252,89 @@ pub(super) fn render_item(
     lines
 }
 
+fn render_thinking_block(text: &str, width: usize) -> Vec<Line<'static>> {
+    let thinking_bg = Color::Rgb(29, 32, 38);
+    let gutter = Style::default()
+        .fg(Color::Rgb(112, 132, 154))
+        .bg(thinking_bg)
+        .add_modifier(Modifier::BOLD);
+    let bg = Style::default()
+        .fg(Color::Rgb(154, 162, 174))
+        .bg(thinking_bg);
+    let content_width = usable_content_width(width, 2).unwrap_or(1);
+    let normalized = normalize_thinking_text(text);
+    render_markdown_preserving_breaks_with_width(&normalized, content_width)
+        .into_iter()
+        .flat_map(|line| word_wrap_line(&line, content_width))
+        .filter(|line| !line_plain_text(line).trim().is_empty())
+        .map(|line| prepend_line_prefix(line, "▏ ", gutter, bg))
+        .collect()
+}
+
+fn normalize_thinking_text(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut previous_blank = false;
+    for line in text.trim_matches('\n').lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            if !previous_blank && !out.is_empty() {
+                out.push(String::new());
+                previous_blank = true;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+        previous_blank = false;
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    if out.is_empty() {
+        String::new()
+    } else {
+        out.join("\n")
+    }
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 fn item_is_compact_tool_call(item: &TranscriptItem, width: usize) -> bool {
     match item {
         TranscriptItem::ToolCall { name, args } if !is_internal_tool(name) => {
             render_report_tool_call(name, args, width).is_some()
                 || render_file_edit_call(name, args, width).is_some()
                 || render_source_tool_call(name, args, width).is_some()
-                || compact_tool_call_line(name, args, width).is_some()
+                || compact_tool_call_text(name, args).is_some()
         }
         _ => false,
     }
 }
 
-pub(super) fn turn_render_status(items: &[TranscriptItem], idx: usize) -> TurnRenderStatus {
+pub(super) fn turn_render_status(
+    items: &[TranscriptItem],
+    idx: usize,
+    display: TranscriptDisplayOptions,
+) -> TurnRenderStatus {
     let mut saw_any = false;
     let mut saw_modelish = false;
     let mut saw_footer = false;
     for item in items.iter().skip(idx + 1) {
         if matches!(item, TranscriptItem::UserSteer(_)) {
             break;
+        }
+        if matches!(item, TranscriptItem::Thinking(_)) && !display.show_thinking_blocks {
+            continue;
+        }
+        if matches!(item, TranscriptItem::ToolResult { .. }) && !display.show_tool_responses {
+            continue;
+        }
+        if item_is_reportish(item) && !display.show_reports {
+            continue;
         }
         saw_any = true;
         match item {
@@ -234,6 +355,15 @@ pub(super) fn turn_render_status(items: &[TranscriptItem], idx: usize) -> TurnRe
         TurnRenderStatus::EmptyResult
     } else {
         TurnRenderStatus::Normal
+    }
+}
+
+fn item_is_reportish(item: &TranscriptItem) -> bool {
+    match item {
+        TranscriptItem::Report { .. } => true,
+        TranscriptItem::ToolCall { name, .. } => is_report_tool(name),
+        TranscriptItem::ToolResult { tool, .. } => tool.as_deref().is_some_and(is_report_tool),
+        _ => false,
     }
 }
 
@@ -607,12 +737,69 @@ pub(super) fn diff_side_lines(
     out
 }
 
+#[cfg(test)]
 pub(super) fn compact_tool_call_line(name: &str, args: &str, width: usize) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(args).ok()?;
-    let rendered = compact_tool_args(name, &value)?;
-    let line = format!("{TOOL_CALL_GLYPH} {name}({rendered})");
-    let max_width = width.saturating_sub(1).min(140);
+    let line = compact_tool_call_text(name, args)?;
+    let max_width = width.saturating_sub(1);
     (max_width > 0 && line.chars().count() <= max_width).then_some(line)
+}
+
+pub(super) fn compact_tool_call_lines(
+    name: &str,
+    args: &str,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    let (display_name, rendered) = compact_tool_call_components(name, args)?;
+    let style = tool_call_style();
+    let prefix = format!("{TOOL_CALL_GLYPH} {display_name}(");
+    let suffix = ")";
+    if rendered.is_empty() {
+        return Some(vec![Line::from(Span::styled(
+            format!("{prefix}{suffix}"),
+            style,
+        ))]);
+    }
+    let available = width.saturating_sub(prefix.chars().count()).max(1);
+    let chunks = wrap_compact_arg_text(&format!("{rendered}{suffix}"), available);
+    Some(
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(idx, chunk)| {
+                if idx == 0 {
+                    Line::from(Span::styled(format!("{prefix}{chunk}"), style))
+                } else {
+                    Line::from(Span::styled(format!("  {chunk}"), style))
+                }
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn compact_tool_call_text(name: &str, args: &str) -> Option<String> {
+    let (display_name, rendered) = compact_tool_call_components(name, args)?;
+    Some(format!("{TOOL_CALL_GLYPH} {display_name}({rendered})"))
+}
+
+fn compact_tool_call_components(name: &str, args: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(args).ok()?;
+    let rendered = if is_mcp_tool(name) {
+        compact_mcp_tool_args(&value)?
+    } else {
+        compact_tool_args(name, &value)?
+    };
+    let display_name = compact_tool_display_name(name);
+    Some((display_name, rendered))
+}
+
+fn wrap_compact_arg_text(text: &str, width: usize) -> Vec<String> {
+    let opts = textwrap::Options::new(width.max(1))
+        .break_words(true)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    textwrap::wrap(text, &opts)
+        .into_iter()
+        .map(|chunk| chunk.into_owned())
+        .collect()
 }
 
 pub(super) fn compact_tool_args(tool: &str, value: &serde_json::Value) -> Option<String> {
@@ -654,6 +841,7 @@ pub(super) fn compact_builtin_tool_args(tool: &str, value: &serde_json::Value) -
         "shell_run" => compact_shell_run_args(value),
         "shell_poll" => compact_shell_poll_args(value),
         "shell_kill" => compact_shell_kill_args(value),
+        "file_read" => compact_file_read_args(value),
         "file_write" => compact_file_write_args(value),
         "content_search" => compact_content_search_args(value),
         "glob" => compact_glob_args(value),
@@ -673,6 +861,31 @@ pub(super) fn compact_builtin_tool_args(tool: &str, value: &serde_json::Value) -
             ],
         ),
         _ => None,
+    }
+}
+
+fn compact_mcp_tool_args(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return Some(String::new());
+            }
+            let mut entries: Vec<(&String, &serde_json::Value)> = map
+                .iter()
+                .filter(|(_, value)| !matches!(value, serde_json::Value::Null))
+                .collect();
+            entries.sort_by_key(|(key, _)| tool_arg_rank("", key));
+            let parts: Vec<String> = entries
+                .into_iter()
+                .map(|(key, value)| format!("{key}={}", compact_mcp_json_value(value)))
+                .collect();
+            Some(parts.join(", "))
+        }
+        serde_json::Value::Array(items) => Some(compact_mcp_json_value(&serde_json::Value::Array(
+            items.clone(),
+        ))),
+        serde_json::Value::Null => Some(String::new()),
+        _ => Some(compact_mcp_json_value(value)),
     }
 }
 
@@ -737,6 +950,27 @@ pub(super) fn compact_shell_kill_args(value: &serde_json::Value) -> Option<Strin
         obj,
         &mut parts,
         &["signal", "grace_ms", "max_output_tokens"],
+    );
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+pub(super) fn compact_file_read_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    if !push_string_arg(obj, &mut parts, "file_path", "", true) {
+        push_string_arg(obj, &mut parts, "path", "", true);
+    }
+    append_present_args(
+        obj,
+        &mut parts,
+        &[
+            "offset",
+            "limit",
+            "line_start",
+            "line_end",
+            "max_bytes",
+            "max_lines",
+        ],
     );
     (!parts.is_empty()).then(|| parts.join(", "))
 }
@@ -900,6 +1134,67 @@ pub(super) fn compact_json_value(value: &serde_json::Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn compact_mcp_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.len() > 80 || s.lines().count() > 1 {
+                compact_text_summary(s)
+            } else {
+                compact_string_arg(s)
+            }
+        }
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                return "[]".into();
+            }
+            if items.len() <= 3
+                && items.iter().all(|item| {
+                    matches!(
+                        item,
+                        serde_json::Value::String(_)
+                            | serde_json::Value::Number(_)
+                            | serde_json::Value::Bool(_)
+                            | serde_json::Value::Null
+                    )
+                })
+            {
+                let parts: Vec<String> = items.iter().map(compact_mcp_json_value).collect();
+                format!("[{}]", parts.join(", "))
+            } else {
+                compact_array_summary(items, "item")
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                "{}".into()
+            } else if map.len() <= 2 {
+                let parts: Vec<String> = map
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {}", compact_mcp_json_value(value)))
+                    .collect();
+                format!("{{{}}}", parts.join(", "))
+            } else {
+                format!("{} fields", map.len())
+            }
+        }
+    }
+}
+
+fn compact_tool_display_name(name: &str) -> String {
+    if is_mcp_tool(name) {
+        tool_name_leaf(name)
+    } else {
+        name.to_string()
+    }
+}
+
+fn is_mcp_tool(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("mcp__")
 }
 
 pub(super) fn compact_string_arg(s: &str) -> String {

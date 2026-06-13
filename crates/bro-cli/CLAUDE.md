@@ -30,6 +30,13 @@ verify shapes against code, but do not violate these without explicit design.
   they carry across the swap. Anything else holding the old task id
   (focus, roster anchor, pending handshakes) must be repointed when the
   resumed handle is installed.
+- `bro agent --resume <session_id|name>` with no prompt is attach-only:
+  create a local, daemon-less row pointed at the existing session event log,
+  render it, and wait for a real composer turn before calling
+  `/control/resume`. Its session path must be resolved via the same
+  `bro_home` precedence as the daemon/fleet client (`BRO_HOME` →
+  `BLACKBOX_CONFIG [paths].bro_home` → state dir), or the TUI silently points
+  at an empty file while the daemon wrote the real transcript elsewhere.
 - Each resumed task runs exactly ONE turn and completes. **Task status IS the
   turn boundary.** `snapshot().turn_active` is meaningless for daemon-backed
   rows (derived from an always-empty local event buffer; reads true even for

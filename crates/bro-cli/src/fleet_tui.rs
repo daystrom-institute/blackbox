@@ -78,6 +78,9 @@ const PROVIDER_SEL_WIDTH: u16 = 38;
 const COMPOSER_HEIGHT: u16 = 3;
 const COMPOSER_MAX_HEIGHT: u16 = 10;
 const COMPOSER_CHROME_COLOR: Color = Color::Rgb(90, 110, 128);
+const HARNESS_EVENT_LOG_SUFFIX: &str = ".events.jsonl";
+const RENAME_EVENT_TYPE: &str = "cockpit";
+const RENAME_EVENT_NAME: &str = "rename";
 const TOOL_CALL_GLYPH: &str = "▸";
 const ROSTER_SELECTED_MARKER: &str = "› ";
 const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
@@ -1003,6 +1006,235 @@ fn refresh_standalone_agent_from_roster(app: &mut App) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptRename {
+    session_id: String,
+    name: String,
+}
+
+fn persist_agent_rename(app: &mut App, idx: usize, name: &str) {
+    match append_agent_rename_event(&app.agents[idx], name) {
+        Ok(()) => app.set_status("renamed", Duration::from_secs(2)),
+        Err(e) => app.set_status(format!("renamed locally; {e}"), Duration::from_secs(5)),
+    }
+}
+
+fn append_agent_rename_event(agent: &Agent, name: &str) -> Result<(), String> {
+    let snap = agent.task.snapshot();
+    let session_id = snap.session_id.trim();
+    if session_id.is_empty() || session_id == "pending" {
+        return Err("session id not resolved yet".to_string());
+    }
+    let path = snap
+        .transcript_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| primary_harness_event_log_path(session_id));
+    append_rename_event_to_path(&path, session_id, name)
+}
+
+fn append_rename_event_to_path(path: &Path, session_id: &str, name: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create transcript dir: {e:#}"))?;
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string();
+    let line = serde_json::json!({
+        "ts": ts,
+        "event": {
+            "type": RENAME_EVENT_TYPE,
+            "event": RENAME_EVENT_NAME,
+            "session_id": session_id,
+            "name": name,
+        }
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("could not open transcript jsonl: {e:#}"))?;
+    writeln!(file, "{line}").map_err(|e| format!("could not write transcript jsonl: {e:#}"))
+}
+
+fn resolve_resume_target(app: &App, target: &str) -> String {
+    let target = target.trim();
+    if target.is_empty() || resume_target_is_session_id(app, target) {
+        return target.to_string();
+    }
+    resolve_resume_name_from_transcripts(app, target)
+        .map(|rename| rename.session_id)
+        .or_else(|| {
+            app.orch.tasks().into_iter().find_map(|handle| {
+                let snap = handle.snapshot();
+                (snap.name.as_deref() == Some(target)).then_some(snap.session_id)
+            })
+        })
+        .unwrap_or_else(|| target.to_string())
+}
+
+fn resume_target_is_session_id(app: &App, target: &str) -> bool {
+    app.orch
+        .tasks()
+        .into_iter()
+        .any(|handle| handle.snapshot().session_id == target)
+        || harness_event_log_paths_for_session(target)
+            .iter()
+            .any(|path| path.exists())
+}
+
+fn resolve_resume_name_from_transcripts(app: &App, target: &str) -> Option<TranscriptRename> {
+    let mut found = None;
+    for path in candidate_harness_event_log_paths(app) {
+        if let Some(rename) = latest_matching_rename_in_path(&path, target) {
+            found = Some(rename);
+        }
+    }
+    found
+}
+
+fn latest_rename_name_for_session(app: &App, session_id: &str) -> Option<String> {
+    let mut found = None;
+    for path in candidate_harness_event_log_paths(app) {
+        if let Some(rename) = latest_rename_for_session_in_path(&path, session_id) {
+            found = Some(rename.name);
+        }
+    }
+    found
+}
+
+fn latest_matching_rename_in_path(path: &Path, target: &str) -> Option<TranscriptRename> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut found = None;
+    for line in contents.lines() {
+        let Some(rename) = parse_rename_event_line(path, line) else {
+            continue;
+        };
+        if rename.name == target {
+            found = Some(rename);
+        }
+    }
+    found
+}
+
+fn latest_rename_for_session_in_path(path: &Path, session_id: &str) -> Option<TranscriptRename> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut found = None;
+    for line in contents.lines() {
+        let Some(rename) = parse_rename_event_line(path, line) else {
+            continue;
+        };
+        if rename.session_id == session_id {
+            found = Some(rename);
+        }
+    }
+    found
+}
+
+fn parse_rename_event_line(path: &Path, line: &str) -> Option<TranscriptRename> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let event = value.get("event").unwrap_or(&value);
+    if event.get("type")?.as_str()? != RENAME_EVENT_TYPE {
+        return None;
+    }
+    if event.get("event")?.as_str()? != RENAME_EVENT_NAME {
+        return None;
+    }
+    let name = event.get("name")?.as_str()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let session_id = event
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| session_id_from_event_log_path(path))?;
+    Some(TranscriptRename { session_id, name })
+}
+
+fn candidate_harness_event_log_paths(app: &App) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for handle in app.orch.tasks() {
+        if let Some(path) = handle.snapshot().transcript_path {
+            push_unique_path(&mut paths, &mut seen, PathBuf::from(path));
+        }
+    }
+    for dir in harness_session_dirs() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_event_log = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(HARNESS_EVENT_LOG_SUFFIX));
+            if is_event_log {
+                push_unique_path(&mut paths, &mut seen, path);
+            }
+        }
+    }
+    paths.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if seen.insert(path.clone()) {
+        paths.push(path);
+    }
+}
+
+fn harness_event_log_paths_for_session(session_id: &str) -> Vec<PathBuf> {
+    harness_session_dirs()
+        .into_iter()
+        .map(|dir| dir.join(format!("{session_id}{HARNESS_EVENT_LOG_SUFFIX}")))
+        .collect()
+}
+
+fn primary_harness_event_log_path(session_id: &str) -> PathBuf {
+    harness_session_dirs()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(format!("{session_id}{HARNESS_EVENT_LOG_SUFFIX}"))
+}
+
+fn harness_session_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_path(&mut dirs, &mut seen, bro_home().join("harness-sessions"));
+    if let Ok(home) = std::env::var("BRO_HOME") {
+        push_unique_path(
+            &mut dirs,
+            &mut seen,
+            PathBuf::from(home).join("harness-sessions"),
+        );
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        push_unique_path(
+            &mut dirs,
+            &mut seen,
+            PathBuf::from(home).join(".bro-harness").join("sessions"),
+        );
+    }
+    dirs
+}
+
+fn session_id_from_event_log_path(path: &Path) -> Option<String> {
+    let file = path.file_name()?.to_str()?;
+    file.strip_suffix(HARNESS_EVENT_LOG_SUFFIX)
+        .map(str::to_string)
+}
+
 /// Keep the focused agent's file-attached transcript tail in sync: attach to
 /// the daemon-provided `transcript_path` when it appears or changes, drop it
 /// when nothing is focused, and consume newly appended events otherwise.
@@ -1587,14 +1819,23 @@ pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_agent_config()?);
     let _log_guard = crate::logging::init_cockpit_logging(orch.store_dir());
     orch.start_roster_subscription().await?;
+    let pending_resume = launch.resume.clone();
     let mut app = App::new_with_mode(
         orch.clone(),
         launch.cwd.clone(),
         tokio::runtime::Handle::current(),
         AppMode::Standalone {
-            pending_resume: launch.resume,
+            pending_resume: None,
         },
     );
+    if let Some(target) = pending_resume {
+        let resolved = resolve_resume_target(&app, &target);
+        if launch.prompt.is_some() {
+            app.mode.set_pending_resume(Some(resolved));
+        } else {
+            attach_standalone_session(&mut app, &resolved, Some(target));
+        }
+    }
     set_next_provider(&mut app, launch.provider);
     if let Some(model) = launch.model {
         app.next_model = Some(model);
@@ -1632,11 +1873,48 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
     } else {
         run_tui_cockpit(app, signals)
     };
+    let resume_hint = if app.mode.is_standalone() && result.is_ok() {
+        standalone_resume_hint(app)
+    } else {
+        None
+    };
     if app.mode.is_standalone() {
         forget_standalone_agents(app, true);
         app.agents.clear();
     }
+    if let Some(hint) = resume_hint {
+        println!("{hint}");
+    }
     result
+}
+
+fn standalone_resume_hint(app: &App) -> Option<String> {
+    let agent = app.agents.first()?;
+    let snap = agent.task.snapshot();
+    let session_id = snap.session_id.trim();
+    if session_id.is_empty() || session_id == "pending" {
+        return None;
+    }
+    let name = latest_rename_name_for_session(app, session_id).or_else(|| {
+        (!agent.name.trim().is_empty() && agent.name != "(session)").then(|| agent.name.clone())
+    });
+    let target = name.as_deref().unwrap_or(session_id);
+    Some(format!(
+        "Use bro agent --resume <session_id|name> to resume this session: bro agent --resume {} (session {})",
+        shell_arg_hint(target),
+        session_id
+    ))
+}
+
+fn shell_arg_hint(value: &str) -> String {
+    let simple = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'));
+    if simple {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 /// Cockpit driver: a loop-of-loops alternating between the alt-screen roster and
@@ -1792,7 +2070,13 @@ fn inline_seed_viewport(app: &mut App, screen_w: u16, screen_h: u16) -> Rect {
         if active.is_empty() && queued.is_empty() {
             Vec::new()
         } else {
-            render_transcript(active, "", &queued, screen_w as usize)
+            render_transcript_with_options(
+                active,
+                "",
+                &queued,
+                screen_w as usize,
+                transcript_display_options(app),
+            )
         }
     } else {
         Vec::new()
@@ -1927,9 +2211,11 @@ where
             terminal.clear_scrollback_and_visible_screen_ansi()?;
             prev_vp = None;
         }
-        if exit_on_zoom_out && app.focused_reflow_requested {
+        if app.focused_reflow_requested {
             if let Some(idx) = inline_focus_idx(app) {
                 app.inline_commits.remove(&inline_commit_key(app, idx));
+            } else if app.mode.is_standalone() {
+                app.inline_commits.clear();
             }
             let seed = inline_seed_viewport(app, screen_w, screen_h);
             terminal.set_viewport_area(seed);
@@ -1939,6 +2225,37 @@ where
         }
         commit_size = Some((screen_w, screen_h));
 
+        let config_panel = app.zone == Zone::Config;
+        let composer_h = if config_panel {
+            0
+        } else {
+            composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h)
+        };
+
+        // History insertion wraps against the terminal's current viewport.
+        // Keep a sane bottom viewport seeded before any pending cockpit/status
+        // message or stable transcript line is inserted into native scrollback.
+        // Otherwise a fresh standalone inline view can still have the custom
+        // terminal's tiny/default viewport, and long lines render one character
+        // per row down the left edge.
+        let preliminary_live_h = if config_panel {
+            screen_h
+        } else {
+            composer_h.max(1).min(screen_h)
+        };
+        if terminal.viewport_area.width != screen_w
+            || terminal.viewport_area.height == 0
+            || terminal.viewport_area.y >= screen_h
+        {
+            terminal.set_viewport_area(Rect::new(
+                0,
+                screen_h.saturating_sub(preliminary_live_h),
+                screen_w,
+                preliminary_live_h,
+            ));
+        }
+
+        let mut inserted_history_now = false;
         // Drain cockpit-generated messages (closeout outcomes, slash-command
         // errors, etc.) into the terminal's native scrollback so they survive
         // resize/reflow and are scrollable — not just a transient footer
@@ -1949,20 +2266,25 @@ where
                 .drain(..)
                 .map(|msg| Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray))))
                 .collect();
+            inserted_history_now = !lines.is_empty();
             let _ = insert_history::insert_history_lines(terminal, lines);
         }
 
-        let composer_h = composer_height(app, Rect::new(0, 0, screen_w, screen_h)).min(screen_h);
-
-        let focus = inline_focus_idx(app);
+        let focus = if config_panel {
+            None
+        } else {
+            inline_focus_idx(app)
+        };
         // Cockpit focus vanished mid-session (agent deleted while zoomed): bounce
         // back to the roster rather than fall through to the standalone intro.
         if exit_on_zoom_out && focus.is_none() {
             return Ok(InlineExit::ZoomOut);
         }
 
-        let mut committed_now = false;
-        let active_lines = if let Some(idx) = focus {
+        let mut committed_now = inserted_history_now;
+        let active_lines = if config_panel {
+            Vec::new()
+        } else if let Some(idx) = focus {
             let transcript = focused_transcript_items(app, idx);
             // File-tail events are complete, append-only records — the
             // harness logs whole steps (one assistant message per model
@@ -1979,7 +2301,7 @@ where
                 let turn_active = app.agents[idx].task.snapshot().turn_active;
                 inline_stable_end(&transcript, turn_active)
             };
-            committed_now =
+            committed_now |=
                 commit_inline_history(app, terminal, idx, &transcript, stable_end, width)?;
 
             let queued = queued_user_turns(&mut app.agents[idx], &transcript);
@@ -1992,13 +2314,21 @@ where
             if active.is_empty() && queued.is_empty() {
                 Vec::new()
             } else {
-                render_transcript(active, "", &queued, width)
+                render_transcript_with_options(
+                    active,
+                    "",
+                    &queued,
+                    width,
+                    transcript_display_options(app),
+                )
             }
         } else {
             standalone_intro_lines(app)
         };
 
-        let active_h = if active_lines.is_empty() {
+        let active_h = if config_panel {
+            screen_h
+        } else if active_lines.is_empty() {
             0
         } else {
             Paragraph::new(active_lines.clone())
@@ -2014,7 +2344,7 @@ where
         } else {
             0
         };
-        let live_h = if app.help_visible {
+        let live_h = if config_panel || app.help_visible {
             screen_h
         } else {
             active_h
@@ -2045,6 +2375,15 @@ where
         }
         terminal.draw(|f| {
             let area = f.area();
+            if config_panel {
+                Paragraph::new(config_body_lines(app))
+                    .wrap(Wrap { trim: false })
+                    .render(area, f.buffer);
+                if app.help_visible {
+                    render_help_overlay(f.buffer, area, app);
+                }
+                return;
+            }
             let composer_h = composer_h.min(area.height);
             let transcript_h = area.height.saturating_sub(composer_h);
             let transcript_area = Rect::new(area.x, area.y, area.width, transcript_h);
@@ -2274,7 +2613,11 @@ where
         let start = cursor.committed.min(transcript.len());
         let end = stable_end.min(transcript.len());
         if end > start {
-            lines.extend(render_committed_items(&transcript[start..end], width));
+            lines.extend(render_committed_items_with_options(
+                &transcript[start..end],
+                width,
+                transcript_display_options(app),
+            ));
         }
     }
     let committed_now = !lines.is_empty();
@@ -2318,7 +2661,7 @@ fn standalone_intro_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(format!("Next: {}", next_tuple(app))),
         Line::from(""),
         Line::from(Span::styled(
-            "Slash commands: /config, /model, /effort, /resume <session_id> [turn], /clear",
+            "Slash commands: /config, /model, /effort, /resume <session_id|name> [turn], /clear",
             Style::default().fg(Color::DarkGray),
         )),
     ]
@@ -3021,10 +3364,11 @@ fn start_rename(app: &mut App) {
 fn submit(app: &mut App) {
     // Commit a pending Ctrl+R rename (roster).
     if let Some(idx) = app.rename_target.take() {
-        let new = app.input.trim();
+        let new = app.input.trim().to_string();
         if !new.is_empty() {
-            app.agents[idx].name = truncate(new, NAME_LEN);
+            app.agents[idx].name = truncate(&new, NAME_LEN);
             app.agents[idx].name_overridden = true;
+            persist_agent_rename(app, idx, &new);
         }
         app.clear_input();
         return;
@@ -3032,7 +3376,9 @@ fn submit(app: &mut App) {
     if app.input.trim().is_empty() {
         return;
     }
+    let history_candidate = app.input.trim().to_string();
     if run_local_slash(app) {
+        record_composer_history(app, &history_candidate);
         app.clear_input();
         return;
     }
@@ -3057,6 +3403,12 @@ fn submit(app: &mut App) {
             app.dispatch_current_input()
         }
         Zone::Config => {}
+    }
+}
+
+fn record_composer_history(app: &App, text: &str) {
+    if !text.is_empty() {
+        let _ = append_history(&app.composer_history_path, text);
     }
 }
 
@@ -3145,8 +3497,8 @@ fn run_local_slash(app: &mut App) -> bool {
     }
 }
 
-/// `/rename <name>` in the zoom view: rename the focused agent (TUI-local,
-/// mirrors the roster's Ctrl+R rename).
+/// `/rename <name>` in the zoom view: rename the focused agent and persist the
+/// alias into the session transcript JSONL. Mirrors the roster's Ctrl+R rename.
 fn rename_focused(app: &mut App, arg: &str) {
     let name = arg.trim();
     if name.is_empty() {
@@ -3159,7 +3511,7 @@ fn rename_focused(app: &mut App, arg: &str) {
     };
     app.agents[idx].name = truncate(name, NAME_LEN);
     app.agents[idx].name_overridden = true;
-    app.set_status("renamed", Duration::from_secs(2));
+    persist_agent_rename(app, idx, name);
 }
 
 fn toggle_fast_mode(app: &mut App, arg: &str) {
@@ -3233,6 +3585,9 @@ fn close_config(app: &mut App) {
 #[derive(Debug, Clone, Copy)]
 enum ConfigField {
     CodeMode,
+    ThinkingBlocks,
+    ToolResponses,
+    Reports,
     ClassifierEnabled,
     ClassifierProvider,
     ClassifierAutoSend,
@@ -3241,8 +3596,11 @@ enum ConfigField {
 }
 
 impl ConfigField {
-    const ALL: [ConfigField; 6] = [
+    const ALL: [ConfigField; 9] = [
         ConfigField::CodeMode,
+        ConfigField::ThinkingBlocks,
+        ConfigField::ToolResponses,
+        ConfigField::Reports,
         ConfigField::ClassifierEnabled,
         ConfigField::ClassifierProvider,
         ConfigField::ClassifierAutoSend,
@@ -3253,6 +3611,9 @@ impl ConfigField {
     fn label(self) -> &'static str {
         match self {
             ConfigField::CodeMode => "Code mode",
+            ConfigField::ThinkingBlocks => "Thinking blocks",
+            ConfigField::ToolResponses => "Tool responses",
+            ConfigField::Reports => "Reports",
             ConfigField::ClassifierEnabled => "Classifier",
             ConfigField::ClassifierProvider => "Intern provider",
             ConfigField::ClassifierAutoSend => "Relay suggestions",
@@ -3269,9 +3630,33 @@ impl ConfigField {
                 .clone()
                 .unwrap_or_else(|| "optional".to_string());
         }
+        if let ConfigField::ThinkingBlocks = self {
+            return if cfg.display.show_thinking_blocks_resolved() {
+                "visible".to_string()
+            } else {
+                "hidden".to_string()
+            };
+        }
+        if let ConfigField::ToolResponses = self {
+            return if cfg.display.show_tool_responses_resolved() {
+                "visible".to_string()
+            } else {
+                "hidden".to_string()
+            };
+        }
+        if let ConfigField::Reports = self {
+            return if cfg.display.show_reports_resolved() {
+                "visible".to_string()
+            } else {
+                "hidden".to_string()
+            };
+        }
         let Some(c) = cfg.classifier.as_ref() else {
             return match self {
                 ConfigField::CodeMode => unreachable!(),
+                ConfigField::ThinkingBlocks => unreachable!(),
+                ConfigField::ToolResponses => unreachable!(),
+                ConfigField::Reports => unreachable!(),
                 ConfigField::ClassifierEnabled => "off".to_string(),
                 ConfigField::ClassifierProvider => "glm".to_string(),
                 ConfigField::ClassifierAutoSend => "on".to_string(),
@@ -3281,6 +3666,9 @@ impl ConfigField {
         };
         match self {
             ConfigField::CodeMode => unreachable!(),
+            ConfigField::ThinkingBlocks => unreachable!(),
+            ConfigField::ToolResponses => unreachable!(),
+            ConfigField::Reports => unreachable!(),
             ConfigField::ClassifierEnabled => {
                 if c.enabled_resolved() {
                     "on".to_string()
@@ -3308,6 +3696,11 @@ impl ConfigField {
             ConfigField::CodeMode => {
                 "Authorial tool surface for new sessions: off, optional (flat + exec/wait), only."
             }
+            ConfigField::ThinkingBlocks => {
+                "Show or hide model reasoning blocks in transcript views."
+            }
+            ConfigField::ToolResponses => "Show or hide tool response/output blocks.",
+            ConfigField::Reports => "Show or hide report() entries in transcript views.",
             ConfigField::ClassifierEnabled => "Start or stop intern companions for fleet agents.",
             ConfigField::ClassifierProvider => "Classifier session provider; must be steerable.",
             ConfigField::ClassifierAutoSend => {
@@ -3366,6 +3759,30 @@ fn config_change_selected(app: &mut App, delta: isize) {
             let current = app.config.code_mode.as_deref().unwrap_or("optional");
             app.config.code_mode = Some(cycle_str_value(Some(current), &VALUES, delta));
         }
+        ConfigField::ThinkingBlocks => {
+            let current = app.config.display.show_thinking_blocks_resolved();
+            app.config.display.show_thinking_blocks = Some(!current);
+            app.focused_reflow_requested = true;
+            if app.mode.is_standalone() {
+                app.inline_commits.clear();
+            }
+        }
+        ConfigField::ToolResponses => {
+            let current = app.config.display.show_tool_responses_resolved();
+            app.config.display.show_tool_responses = Some(!current);
+            app.focused_reflow_requested = true;
+            if app.mode.is_standalone() {
+                app.inline_commits.clear();
+            }
+        }
+        ConfigField::Reports => {
+            let current = app.config.display.show_reports_resolved();
+            app.config.display.show_reports = Some(!current);
+            app.focused_reflow_requested = true;
+            if app.mode.is_standalone() {
+                app.inline_commits.clear();
+            }
+        }
         ConfigField::ClassifierEnabled => {
             let c = ensure_classifier_config(app);
             c.enabled = Some(!c.enabled.unwrap_or(false));
@@ -3414,9 +3831,16 @@ fn cycle_u32_value(current: u32, values: &[u32], delta: isize) -> u32 {
 }
 
 fn apply_config_change(app: &mut App) {
+    if let Err(e) = app.orch.set_display(app.config.display.clone()) {
+        app.set_status(
+            format!("display config save failed: {e:#}"),
+            Duration::from_secs(6),
+        );
+        return;
+    }
     // Persist the fleet-wide code-mode default. load→modify→save preserves the
-    // classifier block, and the set_classifier call below preserves code_mode,
-    // so the two writes compose regardless of order.
+    // display/classifier blocks, and the set_classifier call below preserves
+    // code_mode, so the writes compose regardless of order.
     if let Err(e) = app.orch.set_code_mode(app.config.code_mode.clone()) {
         app.set_status(
             format!("code-mode save failed: {e:#}"),
@@ -3445,6 +3869,14 @@ fn apply_config_change(app: &mut App) {
             );
         }
         Err(e) => app.set_status(format!("config save failed: {e:#}"), Duration::from_secs(6)),
+    }
+}
+
+fn transcript_display_options(app: &App) -> TranscriptDisplayOptions {
+    TranscriptDisplayOptions {
+        show_thinking_blocks: app.config.display.show_thinking_blocks_resolved(),
+        show_tool_responses: app.config.display.show_tool_responses_resolved(),
+        show_reports: app.config.display.show_reports_resolved(),
     }
 }
 
@@ -3518,6 +3950,9 @@ fn remove_agent_row(app: &mut App, idx: usize) -> anyhow::Result<()> {
 fn forget_standalone_agents(app: &mut App, stop_running: bool) {
     let mut failed = 0usize;
     for agent in &app.agents {
+        if !agent.task.is_daemon_backed() {
+            continue;
+        }
         let id = agent.task.id();
         if stop_running && agent.task.snapshot().status == TaskStatus::Running {
             let _ = app.orch.stop(&agent.task);
@@ -3555,27 +3990,82 @@ fn clear_standalone(app: &mut App) {
 fn resume_standalone(app: &mut App, arg: &str) {
     let arg = arg.trim();
     if arg.is_empty() {
-        app.set_status("usage: /resume <session_id> [turn]", Duration::from_secs(4));
+        app.set_status(
+            "usage: /resume <session_id|name> [turn]",
+            Duration::from_secs(4),
+        );
         app.clear_input();
         return;
     }
-    let (session_id, prompt) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
-    app.mode.set_pending_resume(Some(session_id.to_string()));
+    let (target, prompt) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    let session_id = resolve_resume_target(app, target);
     reset_inline_commit_state(app);
     if prompt.trim().is_empty() {
-        forget_standalone_agents(app, true);
-        app.agents.clear();
-        app.focused_agent_id = None;
-        app.clear_input();
-        app.history_cursor = None;
-        app.set_status(
-            format!("resume target set: {session_id}; type a turn to open it"),
-            Duration::from_secs(5),
-        );
+        attach_standalone_session(app, &session_id, Some(target.to_string()));
     } else {
+        app.mode.set_pending_resume(Some(session_id.to_string()));
         app.set_input(prompt.trim().to_string());
         launch_standalone_current_input(app);
     }
+}
+
+fn attach_standalone_session(app: &mut App, session_id: &str, requested_name: Option<String>) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        app.set_status("no session id — can't attach", Duration::from_secs(4));
+        return;
+    }
+    forget_standalone_agents(app, true);
+    let transcript_path = harness_event_log_paths_for_session(session_id)
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| primary_harness_event_log_path(session_id));
+    let transcript_exists = transcript_path.exists();
+    let display_name = latest_rename_name_for_session(app, session_id)
+        .or(requested_name)
+        .unwrap_or_else(|| session_id.to_string());
+    let handle = AgentHandle::for_attached_session(
+        app.next_provider,
+        session_id,
+        transcript_path.display().to_string(),
+        app.launch_cwd.clone(),
+        Some(display_name.clone()),
+        app.next_model.clone(),
+    );
+    let focused_id = handle.id();
+    app.agents.clear();
+    app.agents.push(Agent {
+        task: handle,
+        classifier: None,
+        provider: app.next_provider,
+        selected_model: app.next_model.clone(),
+        selected_effort: app.next_effort.clone(),
+        selected_service_tier: service_tier_for_next_dispatch(app, app.next_provider),
+        selected_cwd: app.launch_cwd.clone(),
+        name: truncate(&display_name, NAME_LEN),
+        name_overridden: true,
+        initial_prompt: None,
+        pending_inputs: VecDeque::new(),
+        seen_user_steers: 0,
+    });
+    app.focused_agent_id = Some(focused_id);
+    app.mode.set_pending_resume(None);
+    app.zone = Zone::SingleAgent;
+    app.clear_input();
+    app.history_cursor = None;
+    app.scroll_from_bottom = 0;
+    reset_inline_commit_state(app);
+    app.focused_tail = None;
+    app.focused_reflow_requested = true;
+    let status = if transcript_exists {
+        format!("attached {session_id}; next turn resumes the session")
+    } else {
+        format!(
+            "attached {session_id}, but transcript file was not found: {}",
+            transcript_path.display()
+        )
+    };
+    app.set_status(status, Duration::from_secs(8));
 }
 
 fn select_model(app: &mut App, arg: &str) {
