@@ -1,0 +1,23 @@
+{
+  "id": "gap-1029874a",
+  "title": "Java signature should expose parameter-list multiline status",
+  "gap_kind": "tooling",
+  "domain": "code.signature Java facts",
+  "wanted_capability": "Java `code.signature` should directly return a small formatting fact such as `params_multiline` so common constructor formatting checks do not require a follow-up `code.read(params_span)`.",
+  "missing_primitive": "JavaSignature.params_multiline",
+  "fallback_used": "Read `params_span` with `code.read` and checked for `\\n`.",
+  "evidence": [
+    "thread-370679a5",
+    "session:cb377cca-dc09-4487-91a1-1701cd691812",
+    "file:crates/bro-harness/src/bindings/code_facts.rs"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/code-signature/java-params-multiline",
+  "notes": "The newly added Java `params_span` was useful and sufficient; this is a small convenience iteration surfaced by the resumed probe.",
+  "resolution": "unresolved",
+  "session_id": "cb377cca-dc09-4487-91a1-1701cd691812",
+  "thread_id": "thread-370679a5",
+  "created_at": "2026-06-13T18:04:47Z",
+  "updated_at": "2026-06-13T18:04:47Z"
+}
