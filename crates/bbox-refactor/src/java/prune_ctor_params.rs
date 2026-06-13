@@ -84,8 +84,8 @@ pub fn analyze_unused_constructor_params(path: &Path) -> Result<UnusedCtorParams
     };
     let body = ctor.child_by_field_name("body");
 
-    // (name, verbatim text, type) per formal parameter, in source order.
-    let mut formal: Vec<(String, String, String)> = Vec::new();
+    // (name, verbatim text, type, start_byte) per formal parameter, in source order.
+    let mut formal: Vec<(String, String, String, usize)> = Vec::new();
     let mut cursor = params_node.walk();
     for p in params_node.named_children(&mut cursor) {
         if p.kind() != "formal_parameter" {
@@ -106,20 +106,20 @@ pub fn analyze_unused_constructor_params(path: &Path) -> Result<UnusedCtorParams
             .unwrap_or("?")
             .trim()
             .to_string();
-        formal.push((name, verbatim, type_name));
+        formal.push((name, verbatim, type_name, p.start_byte()));
     }
 
     let mut removed = Vec::new();
-    let mut kept_text = Vec::new();
+    let mut kept = Vec::new();
     let mut kept_names = Vec::new();
-    for (name, verbatim, type_name) in &formal {
+    for (name, verbatim, type_name, start_byte) in &formal {
         let refs = body
             .map(|b| count_identifier_refs(b, &parsed.source, name))
             .unwrap_or(0);
         if refs == 0 {
             removed.push((name.clone(), type_name.clone()));
         } else {
-            kept_text.push(verbatim.clone());
+            kept.push((verbatim.clone(), *start_byte));
             kept_names.push(name.clone());
         }
     }
@@ -135,8 +135,14 @@ pub fn analyze_unused_constructor_params(path: &Path) -> Result<UnusedCtorParams
         });
     }
 
-    let params_text = &parsed.source[params_node.start_byte()..params_node.end_byte()];
-    let replacement = render_parameter_list_replacement(params_text, &kept_text);
+    let replacement = render_parameter_list_replacement(
+        params_node,
+        &parsed.source,
+        &kept
+            .iter()
+            .map(|(text, start_byte)| (text.as_str(), *start_byte))
+            .collect::<Vec<_>>(),
+    );
     let edit = Some((
         params_node.start_byte(),
         params_node.end_byte(),
@@ -150,6 +156,78 @@ pub fn analyze_unused_constructor_params(path: &Path) -> Result<UnusedCtorParams
         kept: kept_names,
         note: None,
     })
+}
+
+fn render_parameter_list_replacement(
+    params_node: Node<'_>,
+    source: &str,
+    kept: &[(&str, usize)],
+) -> String {
+    if kept.is_empty() {
+        return "()".to_string();
+    }
+
+    let original = &source[params_node.start_byte()..params_node.end_byte()];
+    if !original.contains('\n') {
+        return format!(
+            "({})",
+            kept.iter()
+                .map(|(text, _)| *text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let first_start = kept[0].1;
+    let first_param_same_line = !source[params_node.start_byte()..first_start].contains('\n');
+    let continuation_indent =
+        detect_continuation_indent(params_node, source).unwrap_or_else(|| "    ".to_string());
+
+    if first_param_same_line {
+        let mut out = format!("({}", kept[0].0);
+        for (text, _) in kept.iter().skip(1) {
+            out.push_str(",\n");
+            out.push_str(&continuation_indent);
+            out.push_str(text);
+        }
+        out.push(')');
+        return out;
+    }
+
+    let closing_indent = line_prefix_before(source, params_node.start_byte());
+    let mut out = "(\n".to_string();
+    for (idx, (text, _)) in kept.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&continuation_indent);
+        out.push_str(text);
+    }
+    out.push('\n');
+    out.push_str(&closing_indent);
+    out.push(')');
+    out
+}
+
+fn detect_continuation_indent(params_node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = params_node.walk();
+    for p in params_node.named_children(&mut cursor) {
+        if p.kind() != "formal_parameter" {
+            continue;
+        }
+        if source[params_node.start_byte()..p.start_byte()].contains('\n') {
+            return Some(line_prefix_before(source, p.start_byte()));
+        }
+    }
+    None
+}
+
+fn line_prefix_before(source: &str, byte: usize) -> String {
+    let line_start = source[..byte].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    source[line_start..byte]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect()
 }
 
 /// The first `constructor_declaration` in the class annotated `@Inject`.
@@ -214,67 +292,6 @@ fn count_identifier_refs(node: Node<'_>, source: &str, name: &str) -> usize {
     count
 }
 
-fn render_parameter_list_replacement(params_text: &str, kept_text: &[String]) -> String {
-    if kept_text.is_empty() {
-        return "()".to_string();
-    }
-    if !params_text.contains('\n') {
-        return format!("({})", kept_text.join(", "));
-    }
-
-    let param_indent = detect_continuation_indent(params_text);
-    let closing_on_own_line = params_text
-        .lines()
-        .last()
-        .map(|line| line.trim() == ")")
-        .unwrap_or(false);
-    let closing_indent = if closing_on_own_line {
-        params_text
-            .lines()
-            .last()
-            .map(leading_whitespace)
-            .unwrap_or("")
-            .to_string()
-    } else {
-        String::new()
-    };
-
-    let mut replacement = String::from("(");
-    for (idx, param) in kept_text.iter().enumerate() {
-        replacement.push('\n');
-        replacement.push_str(&param_indent);
-        replacement.push_str(param.trim());
-        if idx + 1 < kept_text.len() {
-            replacement.push(',');
-        }
-    }
-    if closing_on_own_line {
-        replacement.push('\n');
-        replacement.push_str(&closing_indent);
-    }
-    replacement.push(')');
-    replacement
-}
-
-fn detect_continuation_indent(params_text: &str) -> String {
-    for line in params_text.lines().skip(1) {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with(')') {
-            continue;
-        }
-        return leading_whitespace(line).to_string();
-    }
-    "        ".to_string()
-}
-
-fn leading_whitespace(line: &str) -> &str {
-    let end = line
-        .char_indices()
-        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
-        .unwrap_or(line.len());
-    &line[..end]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,26 +328,39 @@ mod tests {
     }
 
     #[test]
-    fn refuses_non_inject_constructor() {
+    fn preserves_multiline_parameter_list_shape() {
         let plan = analyze(
             "package com.acme;\n\
+             import com.google.inject.Inject;\n\
              class S {\n\
-            \x20   S(Repo repo) { }\n\
-            \x20   void use() {}\n\
+            \x20   private final Logger log;\n\
+            \x20   private final UserAdmin userAdmin;\n\
+            \x20   @Inject\n\
+            \x20   S(final Repo repo, final Logger log,\n\
+            \x20     final MeterAdmin meterAdmin, final UserAdmin userAdmin,\n\
+            \x20     final OtherAdmin otherAdmin) {\n\
+            \x20       this.log = log;\n\
+            \x20       this.userAdmin = userAdmin;\n\
+            \x20   }\n\
              }\n",
         );
-        assert!(!plan.ctor_is_inject);
-        assert!(plan.edit.is_none());
-        assert!(
-            plan.note
-                .as_deref()
-                .unwrap()
-                .contains("no @Inject constructor")
+        assert_eq!(
+            plan.removed,
+            vec![
+                ("repo".to_string(), "Repo".to_string()),
+                ("meterAdmin".to_string(), "MeterAdmin".to_string()),
+                ("otherAdmin".to_string(), "OtherAdmin".to_string()),
+            ]
+        );
+        let (_, _, replacement) = plan.edit.expect("edit produced");
+        assert_eq!(
+            replacement,
+            "(final Logger log,\n     final UserAdmin userAdmin)"
         );
     }
 
     #[test]
-    fn preserves_multiline_parameter_list_shape() {
+    fn preserves_multiline_parameter_list_when_first_param_is_on_own_line() {
         let plan = analyze(
             "package com.acme;\n\
              import com.google.inject.Inject;\n\
@@ -349,6 +379,25 @@ mod tests {
         assert_eq!(
             replacement, "(\n        Audit audit,\n        Clock clock)",
             "multiline constructor parameter lists must not collapse"
+        );
+    }
+
+    #[test]
+    fn refuses_non_inject_constructor() {
+        let plan = analyze(
+            "package com.acme;\n\
+             class S {\n\
+            \x20   S(Repo repo) { }\n\
+            \x20   void use() {}\n\
+             }\n",
+        );
+        assert!(!plan.ctor_is_inject);
+        assert!(plan.edit.is_none());
+        assert!(
+            plan.note
+                .as_deref()
+                .unwrap()
+                .contains("no @Inject constructor")
         );
     }
 
