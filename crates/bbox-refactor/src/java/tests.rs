@@ -9896,3 +9896,68 @@ fn extract_java_class_threads_moved_field_with_name_mismatch() {
         "target assigns the moved field by its own name: {target_text}"
     );
 }
+
+#[test]
+fn extract_then_prune_preserves_multiline_inject_constructor() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("LargeView.java");
+    let target = dir.path().join("RepoActions.java");
+    fs::write(
+        &source,
+        "package com.acme;\n\
+         import javax.inject.Inject;\n\
+         class LargeView {\n\
+        \x20   private final Repo repo;\n\
+        \x20   private final Audit audit;\n\
+        \x20   private final Clock clock;\n\
+        \x20   @Inject\n\
+        \x20   LargeView(\n\
+        \x20       Repo repo,\n\
+        \x20       Audit audit,\n\
+        \x20       Clock clock) {\n\
+        \x20       this.repo = repo;\n\
+        \x20       this.audit = audit;\n\
+        \x20       this.clock = clock;\n\
+        \x20   }\n\
+        \x20   void moved() { repo.save(); }\n\
+        \x20   void kept() { audit.record(clock.now()); }\n\
+         }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("RepoActions".to_string());
+    params.delegate_field = Some("repoActions".to_string());
+    params.item_names = Some(vec!["moved".to_string()]);
+    params.move_fields = Some(vec!["repo".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+    params.wiring_mode = Some(guice_external_injection_spec());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        rewritten
+            .contains("LargeView(\n        Repo repo,\n        Audit audit,\n        Clock clock)"),
+        "extractClass must leave the source constructor multiline before cleanup: {rewritten}"
+    );
+
+    fs::write(&source, &rewritten).unwrap();
+    let prune = analyze_unused_constructor_params(&source).unwrap();
+    assert_eq!(
+        prune.removed,
+        vec![("repo".to_string(), "Repo".to_string())]
+    );
+    let (byte_start, byte_end, replacement) = prune.edit.expect("edit produced");
+    let mut cleaned = rewritten;
+    cleaned.replace_range(byte_start..byte_end, &replacement);
+    assert!(
+        cleaned.contains("LargeView(\n        Audit audit,\n        Clock clock)"),
+        "cleanup must preserve the multiline constructor signature: {cleaned}"
+    );
+    assert!(
+        !cleaned.contains("LargeView(Audit audit"),
+        "cleanup must not collapse the constructor signature: {cleaned}"
+    );
+}
