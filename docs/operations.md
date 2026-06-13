@@ -222,7 +222,13 @@ install -m 755 target/release/bro ~/.local/bin/bro
 install -d ~/.local/share/blackbox/memories
 cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 systemctl --user restart blackbox.service blackbox-dev.service
+system-defaults/maintenance/scripts/install-maintenance.sh   # (re)schedule maintenance arcs
 ```
+
+The maintenance script is idempotent and is what keeps storage GC and
+nightly embed compaction actually scheduled — a workflow installed without
+its cron silently never runs (`bbox_inbox` flags this as "Cron scheduling
+gaps"). See `system-defaults/maintenance/maintenance-defaults.md`.
 
 Watch the journal for `auto-reindex: indexed N files` - if the schema
 version changed, the index will drop and rebuild (~5–7 min for 1M docs).

@@ -54,6 +54,23 @@ pub struct VectorConnectivityAlert {
     pub risk_ratio: f32,
 }
 
+/// Cron scheduling gap — the silent-maintenance class (gap-f268badd).
+/// A cron-routing packet declares "a cron drives this workflow"; when no
+/// live cron references it, the maintenance behind it never runs and
+/// nothing says so. The inverse — a live cron whose routing packet is
+/// missing — fires ticks that dispatch nowhere. Plain rows like
+/// `failed_task_rows`: the packet and cron stores sit outside this
+/// crate's DAG, so the daemon's attention tool builds these.
+#[derive(Debug, Clone)]
+pub enum CronScheduleAlert {
+    /// A packet with a `cron-routing` path segment in its domain is
+    /// installed, but no live cron's `routing_packet` resolves to it.
+    UnscheduledRoutingPacket { domain: String },
+    /// A live cron references `domain:<domain>` but no packet with that
+    /// domain is installed.
+    CronMissingPacket { cron_name: String, domain: String },
+}
+
 pub fn compute_inbox(
     kb: &Knowledge,
     threads: &Threads,
@@ -61,6 +78,7 @@ pub fn compute_inbox(
     gaps: &GapStore,
     failed_task_rows: &[(String, String, u64)],
     vector_alerts: &[VectorConnectivityAlert],
+    cron_alerts: &[CronScheduleAlert],
     whiteboards: &WhiteboardRegistry,
     p: &InboxParams,
 ) -> Result<String> {
@@ -108,6 +126,31 @@ pub fn compute_inbox(
                 alert.active_nodes,
                 alert.zero_in_degree_nodes,
             ));
+        }
+        out.push('\n');
+    }
+
+    // 1c. Cron scheduling gaps — maintenance that exists but silently
+    // never runs (gap-f268badd). Not project-filtered: unscheduled
+    // daemon maintenance degrades the whole host.
+    if !cron_alerts.is_empty() {
+        out.push_str(&format!(
+            "## Cron scheduling gaps ({})\n",
+            cron_alerts.len()
+        ));
+        for alert in cron_alerts {
+            match alert {
+                CronScheduleAlert::UnscheduledRoutingPacket { domain } => {
+                    out.push_str(&format!(
+                        "  {domain} — cron-routing packet installed but no cron schedules it; its workflow never runs (install the matching cron spec: bbox_artifact_install kind=cron)\n"
+                    ));
+                }
+                CronScheduleAlert::CronMissingPacket { cron_name, domain } => {
+                    out.push_str(&format!(
+                        "  cron '{cron_name}' — routing packet domain '{domain}' is not installed; ticks dispatch nowhere (install the packet: bbox_artifact_install kind=packet)\n"
+                    ));
+                }
+            }
         }
         out.push('\n');
     }
@@ -904,6 +947,7 @@ mod tests {
             &gaps,
             &[],
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -944,6 +988,7 @@ mod tests {
             &gaps,
             &[],
             &alerts,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/unrelated-project".into()),
@@ -961,6 +1006,56 @@ mod tests {
         assert!(out.contains("voyage-1024"));
         assert!(out.contains("3.01%"));
         assert!(out.contains("embed-compaction-arc"));
+        assert!(!out.contains("clean plate"));
+    }
+
+    /// Cron scheduling gaps are host-level silent-maintenance risk: both
+    /// variants render their own section, survive a project filter, and
+    /// defeat the clean plate (gap-f268badd).
+    #[test]
+    fn inbox_surfaces_cron_schedule_alerts() {
+        let dir = tempdir().unwrap();
+        let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        let threads = Threads::open(&dir.path().join("th.json")).unwrap();
+        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = empty_gaps(&dir);
+        let whiteboards = WhiteboardRegistry::new();
+        let alerts = vec![
+            CronScheduleAlert::UnscheduledRoutingPacket {
+                domain: "cron-routing/daily-compaction".into(),
+            },
+            CronScheduleAlert::CronMissingPacket {
+                cron_name: "embed-compaction-nightly".into(),
+                domain: "cron-routing/embed-compaction".into(),
+            },
+        ];
+
+        let out = compute_inbox(
+            &kb,
+            &threads,
+            &notes,
+            &gaps,
+            &[],
+            &[],
+            &alerts,
+            &whiteboards,
+            &InboxParams {
+                project: Some("/repo/unrelated-project".into()),
+                limit: None,
+                stale_days: None,
+                include_tasks: None,
+                import_gap_spool: None,
+                aggregate_gaps: None,
+                check_gap_closeouts: None,
+                gap_commit_range: None,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("## Cron scheduling gaps (2)"));
+        assert!(out.contains(
+            "cron-routing/daily-compaction — cron-routing packet installed but no cron schedules it"
+        ));
+        assert!(out.contains("cron 'embed-compaction-nightly' — routing packet domain 'cron-routing/embed-compaction' is not installed"));
         assert!(!out.contains("clean plate"));
     }
 
@@ -1105,6 +1200,7 @@ mod tests {
             &gaps,
             &[],
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -1167,6 +1263,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &[],
             &whiteboards,
@@ -1265,6 +1362,7 @@ mod tests {
             &gaps,
             &[],
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
@@ -1327,6 +1425,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &[],
             &whiteboards,
@@ -1398,6 +1497,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &[],
             &whiteboards,

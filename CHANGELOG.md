@@ -8,6 +8,17 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Added
+
+- `bbox_inbox` now surfaces "Cron scheduling gaps": cron-routing packets
+  installed with no live cron scheduling them (maintenance that exists but
+  silently never runs — the class behind storage GC never firing,
+  gap-f268badd), and the inverse, live crons whose routing packet domain is
+  missing. `system-defaults/maintenance/scripts/install-maintenance.sh` is
+  the one-command, idempotent deploy step that installs and schedules both
+  maintenance arcs (daily-compaction, embed-compaction-nightly) including
+  their cron specs.
+
 ### Fixed
 
 - The tool-docs coverage tests (`every_registered_tool_has_a_doc`,

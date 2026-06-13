@@ -111,6 +111,7 @@ impl BlackboxServer {
             let task_store = server.state.task_store.read();
             let failed_rows = collect_failed_tasks(&task_store);
             let vector_alerts = collect_vector_connectivity_alerts();
+            let cron_alerts = collect_cron_schedule_alerts(&server.state);
             let inbox = inbox::compute_inbox(
                 &kb,
                 &threads,
@@ -118,6 +119,7 @@ impl BlackboxServer {
                 &gaps,
                 &failed_rows,
                 &vector_alerts,
+                &cron_alerts,
                 &server.state.whiteboards,
                 &p,
             )?;
@@ -179,7 +181,14 @@ mod tests {
         std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
         run_git(
             &base,
-            &["worktree", "add", "-b", "arc/pin", worktree.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "arc/pin",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let wt = worktree
             .canonicalize()
@@ -228,6 +237,69 @@ mod tests {
                 .is_none()
         );
     }
+
+    /// The silent-maintenance class (gap-f268badd): a shipped cron-routing
+    /// packet compiled with no cron scheduling it must alert; installing the
+    /// matching cron clears it; removing the packet out from under the live
+    /// cron raises the inverse alert. Non-cron-routing packets never alert.
+    #[test]
+    fn cron_schedule_alerts_flag_unscheduled_and_orphaned_crons() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = SharedState::for_test(tmp.path());
+
+        let routing_value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../system-defaults/maintenance/packets/cron-routing/daily-compaction.json"
+        ))
+        .unwrap();
+        let routing: crate::packets::CompileParams = serde_json::from_value(routing_value).unwrap();
+        state.packets.read().compile(&routing).unwrap();
+
+        // A policy packet without a cron-routing segment never alerts.
+        let policy_value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../system-defaults/agentic-corpus/packets/embed/compaction-policy.json"
+        ))
+        .unwrap();
+        let policy: crate::packets::CompileParams = serde_json::from_value(policy_value).unwrap();
+        state.packets.read().compile(&policy).unwrap();
+
+        let alerts = super::collect_cron_schedule_alerts(&state);
+        assert_eq!(
+            alerts.len(),
+            1,
+            "expected one unscheduled-packet alert: {alerts:?}"
+        );
+        assert!(matches!(
+            &alerts[0],
+            crate::inbox::CronScheduleAlert::UnscheduledRoutingPacket { domain }
+                if domain == "cron-routing/daily-compaction"
+        ));
+
+        // Installing the shipped cron spec clears the alert.
+        let cron: crate::crons::CronSpec = serde_json::from_str(include_str!(
+            "../../system-defaults/maintenance/crons/daily-compaction.json"
+        ))
+        .unwrap();
+        state.crons.install(cron);
+        assert!(super::collect_cron_schedule_alerts(&state).is_empty());
+
+        // Removing the packet out from under the live cron raises the inverse.
+        state
+            .packets
+            .read()
+            .remove_domain("cron-routing/daily-compaction")
+            .unwrap();
+        let alerts = super::collect_cron_schedule_alerts(&state);
+        assert_eq!(
+            alerts.len(),
+            1,
+            "expected one missing-packet alert: {alerts:?}"
+        );
+        assert!(matches!(
+            &alerts[0],
+            crate::inbox::CronScheduleAlert::CronMissingPacket { cron_name, domain }
+                if cron_name == "daily-compaction" && domain == "cron-routing/daily-compaction"
+        ));
+    }
 }
 
 /// HNSW connectivity breaches for the inbox (gap-1168b0bd b). Caller-side
@@ -252,6 +324,68 @@ fn collect_vector_connectivity_alerts() -> Vec<crate::inbox::VectorConnectivityA
             }
         })
         .collect()
+}
+
+/// Cron scheduling gaps for the inbox (gap-f268badd). A packet whose
+/// domain carries a `cron-routing` path segment declares "a cron drives
+/// this workflow" — when no live cron references it, the maintenance
+/// behind it silently never runs (the class behind the 118 GB edges-dir
+/// incident). The inverse — a live cron whose `domain:` routing packet
+/// is missing — fires ticks that dispatch nowhere. Caller-side adapter
+/// like `collect_failed_tasks`: the inbox crate sits below the packet
+/// and cron stores in the DAG and takes plain rows.
+fn collect_cron_schedule_alerts(
+    state: &crate::server::state::SharedState,
+) -> Vec<crate::inbox::CronScheduleAlert> {
+    use std::collections::BTreeSet;
+
+    let crons = state.crons.list();
+    let packets = match state.packets.read().list_all() {
+        Ok(packets) => packets,
+        Err(e) => {
+            tracing::warn!("inbox cron-schedule check: packet list failed: {e:#}");
+            return Vec::new();
+        }
+    };
+
+    let packet_domains: BTreeSet<&str> = packets.iter().map(|p| p.domain.as_str()).collect();
+    let scheduled_domains: BTreeSet<&str> = crons
+        .iter()
+        .filter_map(|c| c.routing_packet.strip_prefix("domain:"))
+        .collect();
+
+    let mut alerts = Vec::new();
+    for domain in &packet_domains {
+        let is_cron_routing = domain.split('/').any(|seg| seg == "cron-routing");
+        if is_cron_routing && !scheduled_domains.contains(domain) {
+            alerts.push(crate::inbox::CronScheduleAlert::UnscheduledRoutingPacket {
+                domain: (*domain).to_string(),
+            });
+        }
+    }
+    let mut crons_missing: Vec<_> = crons
+        .iter()
+        .filter_map(|c| {
+            let domain = c.routing_packet.strip_prefix("domain:")?;
+            (!packet_domains.contains(domain)).then(|| {
+                crate::inbox::CronScheduleAlert::CronMissingPacket {
+                    cron_name: c.name.clone(),
+                    domain: domain.to_string(),
+                }
+            })
+        })
+        .collect();
+    crons_missing.sort_by(|a, b| {
+        let key = |alert: &crate::inbox::CronScheduleAlert| match alert {
+            crate::inbox::CronScheduleAlert::CronMissingPacket { cron_name, .. } => {
+                cron_name.clone()
+            }
+            _ => String::new(),
+        };
+        key(a).cmp(&key(b))
+    });
+    alerts.extend(crons_missing);
+    alerts
 }
 
 /// Extract (task_id, provider, started_at) rows for every failed task.
