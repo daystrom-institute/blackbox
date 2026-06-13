@@ -3,9 +3,9 @@
 
 ## Conventions
 
-**Crate-scope CLAUDE.mds: concepts/footguns not lines; finer grain for dense leaves**
+**Crate-scope AGENTS.md: concepts/footguns not lines; finer grain for dense leaves**
 
-Crate-scope CLAUDE.md convention: crates carry a CLAUDE.md holding concepts, footguns, invariants, and domain-scoped details that belong to that crate — never file/line anchors, which rot immediately. Finer grains than crate scope can be considered for sufficiently-dense leaves (e.g. a subdirectory module cluster with its own trust model or domain), with the crate-level file keeping a one-line pointer to the leaf file rather than duplicating it.
+Crate-scope AGENTS.md convention: crates carry an AGENTS.md holding concepts, footguns, invariants, and domain-scoped details that belong to that crate — never file/line anchors, which rot immediately. Finer grains than crate scope can be considered for sufficiently-dense leaves (e.g. a subdirectory module cluster with its own trust model or domain), with the crate-level file keeping a one-line pointer to the leaf file rather than duplicating it.
 
 **Fleet/worktree dispatch env is project/language-agnostic (no hardcoded build env)**
 

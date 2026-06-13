@@ -564,6 +564,7 @@ struct Session {
     cx: ToolCx,
     reference_context_item: Option<crate::context::TurnContextItem>,
     hooks: HookEngine,
+    scoped_project_docs: crate::project_doc::ScopedProjectDocs,
     emitter: Emitter,
     base_opts: TurnOpts,
     /// Explicit caller-supplied system text. Discovered AGENTS/UserInstructions
@@ -685,6 +686,13 @@ impl Session {
         // Sidecar append-only event log next to the snapshot — the durable
         // timestamped record of this session (event_log.rs).
         let event_log = Arc::new(EventLog::for_session(&store.id));
+        let scoped_project_docs = crate::project_doc::ScopedProjectDocs::from_startup_and_event_log(
+            user_instructions
+                .as_ref()
+                .map(|instructions| instructions.loaded_paths.clone())
+                .unwrap_or_default(),
+            event_log.path(),
+        );
         // Hand the transport the stable session id, so it can populate the
         // codex-style `session-id` header + `prompt_cache_key` (vs a random
         // per-request id).
@@ -940,6 +948,7 @@ impl Session {
             cx,
             reference_context_item,
             hooks,
+            scoped_project_docs,
             emitter,
             base_opts,
             explicit_system,
@@ -1452,6 +1461,15 @@ impl Session {
                         Delivery::Rider => result.content.push_str(&n.rider_block()),
                         Delivery::SystemTail => self.tail_nudge = Some(n.message),
                     }
+                }
+                if !result.is_error
+                    && let Some(rider) = self.scoped_project_docs.rider_for_tool_call(
+                        &self.cx.root,
+                        &tc.name,
+                        &tc.args,
+                    )
+                {
+                    result.content.push_str(&rider);
                 }
                 last_tool_results.push(tool_result_trace(tc, &result));
                 results.push(result);
@@ -2343,6 +2361,8 @@ mod tests {
         TwoReadProbes,
         /// Request the synthetic structured-output terminal tool.
         FinalResult,
+        /// Request a test-only file_read call under a child directory.
+        FileReadUnderChild,
         /// Await a gate that tests never release — to be cancelled by interrupt.
         Block,
     }
@@ -2465,6 +2485,21 @@ mod tests {
                         usage: Usage::default(),
                     })
                 }
+                MockTurn::FileReadUnderChild => {
+                    self.shared.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(transport::TurnOutput {
+                        text: String::new(),
+                        thinking: String::new(),
+                        tool_calls: vec![transport::ToolCall {
+                            id: "read-1".into(),
+                            name: "file_read".into(),
+                            args: json!({"file_path": "crates/thing/src/lib.rs"}),
+                        }],
+                        stop: StopReason::ToolCalls,
+                        end_turn: None,
+                        usage: Usage::default(),
+                    })
+                }
                 MockTurn::Text(t) => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
@@ -2527,6 +2562,27 @@ mod tests {
             self.shared.tool_started.fetch_add(1, Ordering::SeqCst);
             self.shared.tool_gate.notified().await;
             bro_tools::ToolResult::Text("slow done".into())
+        }
+    }
+
+    struct FileReadTool;
+
+    #[async_trait]
+    impl bro_tools::Tool for FileReadTool {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+
+        fn description(&self) -> &str {
+            "test-only file read tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type":"object","properties":{"file_path":{"type":"string"}}})
+        }
+
+        async fn call(&self, _input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+            bro_tools::ToolResult::Text("FILE-BODY".into())
         }
     }
 
@@ -2608,6 +2664,7 @@ mod tests {
                         shared: shared.clone(),
                         barrier: Arc::new(tokio::sync::Barrier::new(2)),
                     }),
+                    Arc::new(FileReadTool),
                 ],
                 vec![],
                 &PinPolicy::from_env(),
@@ -2616,6 +2673,7 @@ mod tests {
             cx,
             reference_context_item: None,
             hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
+            scoped_project_docs: crate::project_doc::ScopedProjectDocs::default(),
             strategy: crate::context::dispatch::CompositionStrategy::CodexShaped,
             dispatch: crate::context::dispatch::DispatchState::default(),
             emitter: Emitter::new("test".into()),
@@ -2676,6 +2734,36 @@ mod tests {
         assert_eq!(pushed[0][0].id, "final-1");
         assert_eq!(pushed[0][0].content, r#"{"ok":true}"#);
         assert!(!pushed[0][0].is_error);
+    }
+
+    #[tokio::test]
+    async fn file_read_under_child_dir_attaches_scoped_project_doc_rider() {
+        let root = std::env::temp_dir().join(format!(
+            "bh-agents-rider-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let child = root.join("crates").join("thing");
+        std::fs::create_dir_all(child.join("src")).unwrap();
+        std::fs::write(child.join("AGENTS.md"), "CHILD-DOC").unwrap();
+        std::fs::write(child.join("src").join("lib.rs"), "FILE-BODY").unwrap();
+
+        let (mut session, shared) = mk_session(vec![MockTurn::FileReadUnderChild]);
+        session.cx.root = root.canonicalize().unwrap();
+
+        run_user_turn(&mut session, "read it").await;
+
+        let pushed = shared.pushed_tool_results.lock().unwrap();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].len(), 1);
+        assert_eq!(pushed[0][0].content.matches("CHILD-DOC").count(), 1);
+        assert!(pushed[0][0].content.contains("<harness-project-docs>"));
+        assert!(pushed[0][0].content.contains("FILE-BODY"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
@@ -2868,6 +2956,7 @@ mod tests {
         session.user_instructions = Some(crate::context::UserInstructions {
             directory: "/repo".into(),
             text: "AGENTS_AFTER_COMPACT".into(),
+            loaded_paths: Vec::new(),
         });
 
         session.compact_manual().await.unwrap();
@@ -2968,6 +3057,7 @@ mod tests {
         session.user_instructions = Some(crate::context::UserInstructions {
             directory: "/repo".into(),
             text: agents.into(),
+            loaded_paths: Vec::new(),
         });
 
         let system = compose_system(&session.system_sections(), &session.reg, false);
@@ -3091,6 +3181,7 @@ mod tests {
         session.user_instructions = Some(crate::context::UserInstructions {
             directory: "/repo".into(),
             text: "AGENTS_UNIQUE_RULE".into(),
+            loaded_paths: Vec::new(),
         });
         session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
 
@@ -3139,6 +3230,7 @@ mod tests {
         session.user_instructions = Some(crate::context::UserInstructions {
             directory: "/repo".into(),
             text: "AGENTS_UNIQUE_RULE".into(),
+            loaded_paths: Vec::new(),
         });
         session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
 
@@ -3241,6 +3333,7 @@ mod tests {
         session.user_instructions = Some(crate::context::UserInstructions {
             directory: "/repo".into(),
             text: "AGENTS_UNIQUE_RULE".into(),
+            loaded_paths: Vec::new(),
         });
         session.dispatch = test_dispatch_state(Some(test_scope("task-1")));
         session.push_user_text("turn one");

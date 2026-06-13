@@ -1067,6 +1067,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bbox-refactor",
+ "bro-apply-patch",
  "bro-capabilities",
  "bro-code-mode",
  "bro-core",

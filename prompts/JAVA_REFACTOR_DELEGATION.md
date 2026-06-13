@@ -23,7 +23,7 @@ an injection point. It is overkill for a one-line rename or a move a human can
 do in a single edit.
 
 The tools and their invariants live in `crates/bro-harness/src/bindings/` (read
-`crates/bro-harness/src/bindings/CLAUDE.md` for the trust model). The design home
+`crates/bro-harness/src/bindings/AGENTS.md` for the trust model). The design home
 is `design/bro-harness/refactor-v2-pressure-test.md`.
 
 ## The toolbox the agent drives (don't re-explain it — point at it)

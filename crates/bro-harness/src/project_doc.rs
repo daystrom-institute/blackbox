@@ -18,7 +18,9 @@
 //!   * empty string `""`  ⇒ explicit suppress (no overlay).
 //!   * absent (`None`)    ⇒ not overridden ⇒ this Codex-style overlay.
 
+use serde_json::Value;
 use std::collections::HashSet;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 /// Large-overlay warning threshold. This never truncates instructions; it only
@@ -28,6 +30,8 @@ const DEFAULT_PROJECT_DOC_WARN_BYTES: usize = 256 * 1024;
 const MAX_INCLUDE_DEPTH: usize = 8;
 const AGENTS_FILE: &str = "AGENTS.md";
 const AGENTS_OVERRIDE_FILE: &str = "AGENTS.override.md";
+const RIDER_OPEN: &str = "<harness-project-docs>";
+const RIDER_CLOSE: &str = "</harness-project-docs>";
 
 fn project_doc_warn_bytes() -> usize {
     crate::transport::session_var("BRO_HARNESS_PROJECT_DOC_WARN_BYTES")
@@ -227,10 +231,16 @@ fn read_doc_tree(
     sections
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectDocOverlay {
+    pub(crate) text: String,
+    pub(crate) loaded_paths: Vec<PathBuf>,
+}
+
 /// Assemble the Codex-equivalent overlay from the process cwd + `$CODEX_HOME`.
 /// Returns `None` when no AGENTS docs exist, in which case the caller sends no
 /// system prompt (identical to the prior provider-defaults behavior).
-pub(crate) fn discover(cwd: &Path) -> Option<String> {
+pub(crate) fn discover(cwd: &Path) -> Option<ProjectDocOverlay> {
     let project_doc_files = project_doc_files();
     assemble(
         cwd,
@@ -247,7 +257,7 @@ fn assemble(
     codex_home: Option<&Path>,
     project_doc_files: &[String],
     project_doc_warn_bytes: usize,
-) -> Option<String> {
+) -> Option<ProjectDocOverlay> {
     let mut sections: Vec<String> = Vec::new();
     let mut loaded: Vec<String> = Vec::new();
     let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
@@ -292,7 +302,289 @@ fn assemble(
     );
     sections.insert(0, manifest);
     tracing::info!(files = ?loaded, "loaded AGENTS.md overlay as base system prompt");
-    Some(sections.join("\n\n"))
+    Some(ProjectDocOverlay {
+        text: sections.join("\n\n"),
+        loaded_paths: loaded.into_iter().map(PathBuf::from).collect(),
+    })
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ScopedProjectDocs {
+    delivered: HashSet<PathBuf>,
+}
+
+impl ScopedProjectDocs {
+    /// Build the live dedupe cache from startup docs plus any rider-delivered
+    /// docs already present in the session event log. The event log is the
+    /// durable source of truth for what the model saw; this set is only a
+    /// runtime cache to avoid repeated scans.
+    pub(crate) fn from_startup_and_event_log(
+        startup_paths: impl IntoIterator<Item = PathBuf>,
+        event_log_path: &Path,
+    ) -> Self {
+        let mut delivered: HashSet<PathBuf> = startup_paths.into_iter().collect();
+        delivered.extend(delivered_paths_from_event_log(event_log_path));
+        Self { delivered }
+    }
+
+    pub(crate) fn rider_for_tool_call(
+        &mut self,
+        root: &Path,
+        tool_name: &str,
+        args: &Value,
+    ) -> Option<String> {
+        let touched = touched_paths(root, tool_name, args);
+        if touched.is_empty() {
+            return None;
+        }
+
+        let doc_names = project_doc_files();
+        let mut loaded_paths = self.delivered.clone();
+        let mut newly_loaded = Vec::new();
+        let mut sections = Vec::new();
+        for touched_path in touched {
+            let display_touched = display_path(root, &touched_path);
+            for doc in scoped_agents_paths(root, &touched_path, &doc_names) {
+                let Some(canonical) = canonical_file(&doc) else {
+                    continue;
+                };
+                if self.delivered.contains(&canonical) || loaded_paths.contains(&canonical) {
+                    continue;
+                }
+                let before = sections.len();
+                sections.extend(read_doc_tree(
+                    &canonical,
+                    &mut loaded_paths,
+                    &mut newly_loaded,
+                    0,
+                ));
+                if sections.len() > before {
+                    tracing::info!(
+                        touched = %display_touched,
+                        doc = %canonical.display(),
+                        "attaching scoped AGENTS.md rider"
+                    );
+                }
+            }
+        }
+
+        if sections.is_empty() {
+            return None;
+        }
+
+        let mut canonical_new = Vec::new();
+        for path in newly_loaded.into_iter().map(PathBuf::from) {
+            if self.delivered.insert(path.clone()) {
+                canonical_new.push(path);
+            }
+        }
+        if canonical_new.is_empty() {
+            return None;
+        }
+
+        Some(render_scoped_rider(root, &canonical_new, &sections))
+    }
+}
+
+fn render_scoped_rider(root: &Path, loaded: &[PathBuf], sections: &[String]) -> String {
+    let delivered = loaded
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bodies = loaded
+        .iter()
+        .zip(sections.iter())
+        .map(|(path, body)| {
+            format!(
+                "<INSTRUCTIONS path=\"{}\">\n{}\n</INSTRUCTIONS>",
+                display_path(root, path),
+                body
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "\n\n{RIDER_OPEN}\ndelivered:\n{delivered}\n\nAdditional AGENTS.md instructions now apply because this tool touched a covered path.\n\n{bodies}\n{RIDER_CLOSE}"
+    )
+}
+
+fn touched_paths(root: &Path, tool_name: &str, args: &Value) -> Vec<PathBuf> {
+    match tool_name {
+        "file_read" | "smart_read" | "file_write" | "file_edit" => args
+            .get("file_path")
+            .and_then(Value::as_str)
+            .and_then(|raw| workspace_path(root, raw))
+            .into_iter()
+            .collect(),
+        "apply_patch" => apply_patch_paths(root, args),
+        _ => Vec::new(),
+    }
+}
+
+fn apply_patch_paths(root: &Path, args: &Value) -> Vec<PathBuf> {
+    let Some(patch) = args
+        .get("source")
+        .or_else(|| args.get("patch"))
+        .or_else(|| args.get("input"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let Ok(parsed) = bro_apply_patch::parse_patch(patch) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for hunk in parsed.hunks {
+        match hunk {
+            bro_apply_patch::Hunk::AddFile { path, .. }
+            | bro_apply_patch::Hunk::DeleteFile { path } => {
+                if let Some(path) = workspace_path(root, &path.to_string_lossy()) {
+                    out.push(path);
+                }
+            }
+            bro_apply_patch::Hunk::UpdateFile {
+                path, move_path, ..
+            } => {
+                if let Some(path) = workspace_path(root, &path.to_string_lossy()) {
+                    out.push(path);
+                }
+                if let Some(move_path) = move_path
+                    && let Some(path) = workspace_path(root, &move_path.to_string_lossy())
+                {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn workspace_path(root: &Path, raw: &str) -> Option<PathBuf> {
+    let raw = raw.strip_prefix('@').unwrap_or(raw);
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let normalized = normalize_lexical(&joined);
+    normalized.starts_with(root).then_some(normalized)
+}
+
+fn scoped_agents_paths(root: &Path, touched_path: &Path, names: &[String]) -> Vec<PathBuf> {
+    let dir = if touched_path.is_dir() {
+        touched_path.to_path_buf()
+    } else {
+        touched_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf())
+    };
+    let mut dirs = Vec::new();
+    let mut cursor = Some(dir.as_path());
+    while let Some(cur) = cursor {
+        dirs.push(cur.to_path_buf());
+        if cur == root {
+            break;
+        }
+        cursor = cur.parent();
+    }
+    dirs.reverse();
+
+    let mut paths = Vec::new();
+    for dir in dirs {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                paths.push(candidate);
+            }
+        }
+    }
+    paths
+}
+
+fn display_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+// one-time session resume scan, before the loop serves turns.
+#[allow(clippy::disallowed_methods)]
+fn delivered_paths_from_event_log(path: &Path) -> Vec<PathBuf> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|line| {
+            line.pointer("/event/message/content")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .flat_map(|blocks| {
+            blocks
+                .into_iter()
+                .filter_map(|block| {
+                    block
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .flat_map(|content| delivered_paths_from_rider_text(&content))
+        .collect()
+}
+
+fn delivered_paths_from_rider_text(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(RIDER_OPEN) {
+        rest = &rest[start + RIDER_OPEN.len()..];
+        let Some(end) = rest.find(RIDER_CLOSE) else {
+            break;
+        };
+        let block = &rest[..end];
+        let mut in_delivered_list = false;
+        for line in block.lines() {
+            let trimmed = line.trim();
+            if trimmed == "delivered:" {
+                in_delivered_list = true;
+                continue;
+            }
+            if in_delivered_list && trimmed.is_empty() {
+                break;
+            }
+            if !in_delivered_list {
+                continue;
+            }
+            if let Some(path) = trimmed.strip_prefix("- ") {
+                out.push(PathBuf::from(path.trim()));
+            }
+        }
+        rest = &rest[end + RIDER_CLOSE.len()..];
+    }
+    out
 }
 
 #[cfg(test)]
@@ -329,6 +621,7 @@ mod tests {
             project_doc_files,
             DEFAULT_PROJECT_DOC_WARN_BYTES,
         )
+        .map(|overlay| overlay.text)
     }
 
     #[test]
@@ -467,9 +760,113 @@ mod tests {
 
         let out = assemble(&root, None, &default_docs(), 8).expect("docs present");
         assert!(
-            out.contains(&body),
+            out.text.contains(&body),
             "warning threshold must not mutate project instructions"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scoped_rider_loads_child_doc_once_after_first_touch() {
+        let root = scratch().canonicalize().unwrap();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        write(&root.join(AGENTS_FILE), "ROOT-DOC");
+        let child = root.join("crates").join("thing");
+        write(&child.join(AGENTS_FILE), "CHILD-DOC");
+        write(&child.join("src").join("lib.rs"), "fn main() {}\n");
+        let startup = assemble(&root, None, &default_docs(), DEFAULT_PROJECT_DOC_WARN_BYTES)
+            .expect("startup docs");
+        let mut scoped =
+            ScopedProjectDocs::from_startup_and_event_log(startup.loaded_paths, &root.join("none"));
+
+        let rider = scoped
+            .rider_for_tool_call(
+                &root,
+                "file_read",
+                &serde_json::json!({"file_path": "crates/thing/src/lib.rs"}),
+            )
+            .expect("child doc rider");
+        assert!(rider.contains(RIDER_OPEN), "{rider}");
+        assert!(rider.contains("CHILD-DOC"), "{rider}");
+        assert!(!rider.contains("ROOT-DOC"), "{rider}");
+
+        let again = scoped.rider_for_tool_call(
+            &root,
+            "smart_read",
+            &serde_json::json!({"file_path": "crates/thing/src/other.rs"}),
+        );
+        assert_eq!(again, None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scoped_rider_ignores_shell_run() {
+        let root = scratch().canonicalize().unwrap();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        let child = root.join("crates").join("thing");
+        write(&child.join(AGENTS_FILE), "CHILD-DOC");
+        let mut scoped = ScopedProjectDocs::default();
+
+        let rider = scoped.rider_for_tool_call(
+            &root,
+            "shell_run",
+            &serde_json::json!({"cmd": "cat crates/thing/src/lib.rs"}),
+        );
+        assert_eq!(rider, None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scoped_rider_extracts_apply_patch_paths() {
+        let root = scratch().canonicalize().unwrap();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        let child = root.join("crates").join("thing");
+        write(&child.join(AGENTS_FILE), "CHILD-DOC");
+        let mut scoped = ScopedProjectDocs::default();
+        let patch = "*** Begin Patch\n*** Add File: crates/thing/src/lib.rs\n+fn main() {}\n*** End Patch\n";
+
+        let rider = scoped
+            .rider_for_tool_call(&root, "apply_patch", &serde_json::json!({"source": patch}))
+            .expect("apply_patch should load child doc");
+        assert!(rider.contains("CHILD-DOC"), "{rider}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scoped_rider_reconstructs_delivered_paths_from_event_log() {
+        let root = scratch().canonicalize().unwrap();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        let child = root.join("crates").join("thing");
+        let agents = child.join(AGENTS_FILE);
+        write(&agents, "CHILD-DOC");
+        let rider =
+            render_scoped_rider(&root, std::slice::from_ref(&agents), &["CHILD-DOC".into()]);
+        let log_path = root.join("session.events.jsonl");
+        write(
+            &log_path,
+            &serde_json::json!({
+                "ts": "2026-01-01T00:00:00Z",
+                "event": {
+                    "type": "user",
+                    "message": {
+                        "content": [{
+                            "type": "tool_result",
+                            "content": rider,
+                        }]
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let mut scoped =
+            ScopedProjectDocs::from_startup_and_event_log(Vec::<PathBuf>::new(), &log_path);
+        let rider = scoped.rider_for_tool_call(
+            &root,
+            "file_read",
+            &serde_json::json!({"file_path": "crates/thing/src/lib.rs"}),
+        );
+        assert_eq!(rider, None);
         fs::remove_dir_all(&root).ok();
     }
 }

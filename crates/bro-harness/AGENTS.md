@@ -21,6 +21,13 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
   guarantee. Do not emit partial-then-replace shapes.
 - Steer/user-turn text travels RAW end-to-end (no ambient wrapping on
   steers). The cockpit reconciles queued echoes by exact text match.
+- **Scoped AGENTS riders are transcript events, not sidecars.** When a flat
+  file/edit/patch tool first touches a directory with a more-specific
+  `AGENTS.md`, the harness appends that doc as a rider to the successful
+  `tool_result.content` before emitter/transport delivery. The event log is
+  the durable record of delivery; live sessions only keep an in-memory dedupe
+  set rebuilt from startup docs plus prior rider blocks on resume. `shell_run`
+  is deliberately outside this path.
 
 ## Session + loop model
 
@@ -57,7 +64,7 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
 
 ## Cell bindings (`src/bindings/`)
 
-Dense leaf with its own CLAUDE.md: `src/bindings/CLAUDE.md` carries the
+Dense leaf with its own AGENTS.md: `src/bindings/AGENTS.md` carries the
 refactor cell-DSL invariants (cell-only placement, one-mutation-path trust
 model, hash-anchored span discipline, host-computed lineage, probe-derived
 shapes). Read it before touching the namespaces.

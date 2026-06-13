@@ -20,6 +20,7 @@ bro-core = { path = "../bro-core" }
 bro-protocol = { path = "../bro-protocol" }
 bro-capabilities = { path = "../bro-capabilities" }
 bro-code-mode = { path = "../bro-code-mode" }
+bro-apply-patch = { path = "../bro-apply-patch" }
 bro-tools = { path = "../bro-tools" }
 tokio-util = { version = "0.7", features = ["rt"] }
 bro-lsp = { path = "../bro-lsp" }

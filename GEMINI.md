@@ -6,9 +6,9 @@ Read @PROJECT.md fully before acting; it contains the shared project context and
 @PROJECT.md
 ## Conventions
 
-**Crate-scope CLAUDE.mds: concepts/footguns not lines; finer grain for dense leaves**
+**Crate-scope AGENTS.md: concepts/footguns not lines; finer grain for dense leaves**
 
-Crate-scope CLAUDE.md convention: crates carry a CLAUDE.md holding concepts, footguns, invariants, and domain-scoped details that belong to that crate — never file/line anchors, which rot immediately. Finer grains than crate scope can be considered for sufficiently-dense leaves (e.g. a subdirectory module cluster with its own trust model or domain), with the crate-level file keeping a one-line pointer to the leaf file rather than duplicating it.
+Crate-scope AGENTS.md convention: crates carry an AGENTS.md holding concepts, footguns, invariants, and domain-scoped details that belong to that crate — never file/line anchors, which rot immediately. Finer grains than crate scope can be considered for sufficiently-dense leaves (e.g. a subdirectory module cluster with its own trust model or domain), with the crate-level file keeping a one-line pointer to the leaf file rather than duplicating it.
 
 **Fleet/worktree dispatch env is project/language-agnostic (no hardcoded build env)**
 
@@ -118,6 +118,5 @@ Before any create/open/save/add action that could duplicate an existing object, 
 **Ask Before Mutating Shared Services**
 
 Before restarting, stopping, reloading, replacing, or otherwise mutating shared services or containers that active agents may depend on, first perform a read-only scope check and get explicit operator approval for the named service/container. Applies to blackbox.service, Forgejo, runners, Docker Compose stacks, and other coordination infrastructure.
-
 
 

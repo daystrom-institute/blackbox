@@ -2,6 +2,7 @@ use bro_tools::ToolCx;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
+use std::path::PathBuf;
 
 pub mod dispatch;
 
@@ -197,13 +198,15 @@ impl ContextualUserFragment for EnvironmentContext {
 pub struct UserInstructions {
     pub directory: String,
     pub text: String,
+    pub loaded_paths: Vec<PathBuf>,
 }
 
 impl UserInstructions {
     pub fn from_project(cwd: &Path) -> Option<Self> {
-        crate::project_doc::discover(cwd).map(|text| Self {
+        crate::project_doc::discover(cwd).map(|overlay| Self {
             directory: cwd.to_string_lossy().into_owned(),
-            text,
+            text: overlay.text,
+            loaded_paths: overlay.loaded_paths,
         })
     }
 }
@@ -369,6 +372,7 @@ mod tests {
         let instructions = UserInstructions {
             directory: "/repo".into(),
             text: "rule".into(),
+            loaded_paths: Vec::new(),
         };
         let rendered = instructions.render();
         assert!(rendered.starts_with("# AGENTS.md instructions for /repo"));
