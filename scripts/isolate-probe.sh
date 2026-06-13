@@ -223,6 +223,8 @@ Required chain:
 8. Run compile_command again and require exit_code=0. If exit_code is nonzero, stop immediately
    and call final_result with the cleanup compile failure.
 9. Inspect source_file and verify whether the final constructor parameter list is multiline.
+   Use code.items to locate the final constructor, then code.signature on that constructor span.
+   For Java, read signature.params_span and decide multiline from that parameter span text.
 
 Call final_result with the required fields. Include concise counts for bounces, applies, compiles,
 selected methods, moved fields, wrappers, cleanup removed params, and constructor_multiline_after_cleanup.
