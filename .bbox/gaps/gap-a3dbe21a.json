@@ -1,0 +1,23 @@
+{
+  "id": "gap-a3dbe21a",
+  "title": "Contextual recall nudge still overfires during procedural gap-store work",
+  "gap_kind": "docs_runbook",
+  "domain": "contextual-recall",
+  "wanted_capability": "Contextual-recall nudges should stay suppressed during procedural work that is already using the authoritative live state surface, such as bbox_gaps/bbox_gap checks for existing substrate gaps, unless a specific durable convention/decision/runbook could materially change the operation.",
+  "missing_primitive": "runtime/rendered nudge suppression for procedural bbox_gaps/bbox_gap tasks after the prior contextual-recall overfire fix",
+  "fallback_used": "Used bbox_gaps directly as the authoritative gap-store surface and ignored the repeated bbox_knowledge reminder as noise.",
+  "evidence": [
+    "task:a2a1ebe3-c8ee-4201-a859-806e5ddcf394",
+    "session:b41454ca-cc60-4b61-a1b5-875ab1dc06db",
+    "existing-gap:gap-5e3e3dff",
+    "observed-after:mcp__blackbox__bbox_gaps",
+    "observed-after:mcp__blackbox__bro_report"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/contextual-recall/overfires-on-procedural-state-work",
+  "notes": "Existing gap gap-5e3e3dff is marked addressed, but the current session reproduced the same operator-visible failure mode: while checking whether a bbox_knowledge over-nudging gap already existed, the agent used bbox_gaps as requested and still received repeated recall/reporting nudges. The operator explicitly challenged the noise ('why do you keep mentioning bbox_knowledge?') in the preceding task, making this a UX defect rather than just prompt-compliance chatter.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T21:52:38Z",
+  "updated_at": "2026-06-13T21:52:38Z"
+}
