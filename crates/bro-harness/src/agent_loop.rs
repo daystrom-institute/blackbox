@@ -1328,7 +1328,7 @@ impl Session {
                         content: serde_json::to_string(&structured).unwrap_or_default(),
                         is_error: false,
                     };
-                    self.emitter.tool_results(&[fr_result]);
+                    self.emitter.tool_results(std::slice::from_ref(&fr_result));
                     // Pad any sibling tool calls that were NOT final_result with
                     // interrupted markers so the buffer stays balanced.
                     let mut padding: Vec<transport::ToolResult> = Vec::new();
@@ -1344,6 +1344,10 @@ impl Session {
                     if !padding.is_empty() {
                         self.emitter.tool_results(&padding);
                     }
+                    let mut transport_results = Vec::with_capacity(1 + padding.len());
+                    transport_results.push(fr_result);
+                    transport_results.extend(padding);
+                    self.tx.push_tool_results(transport_results);
                     // Emit the structured result as the final assistant result.
                     self.emitter.result(
                         &serde_json::to_string(&structured).unwrap_or_default(),
@@ -2328,6 +2332,8 @@ mod tests {
         /// Request two read-only `concurrent_probe` calls in one batch (to prove
         /// they dispatch concurrently).
         TwoReadProbes,
+        /// Request the synthetic structured-output terminal tool.
+        FinalResult,
         /// Await a gate that tests never release — to be cancelled by interrupt.
         Block,
     }
@@ -2335,6 +2341,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockShared {
         pushed_users: Arc<Mutex<Vec<String>>>,
+        pushed_tool_results: Arc<Mutex<Vec<Vec<transport::ToolResult>>>>,
         started: Arc<AtomicUsize>,
         completed: Arc<AtomicUsize>,
         compact_calls: Arc<AtomicUsize>,
@@ -2366,7 +2373,13 @@ mod tests {
                 .unwrap()
                 .push(text.to_string());
         }
-        fn push_tool_results(&mut self, _results: Vec<transport::ToolResult>) {}
+        fn push_tool_results(&mut self, results: Vec<transport::ToolResult>) {
+            self.shared
+                .pushed_tool_results
+                .lock()
+                .unwrap()
+                .push(results);
+        }
         async fn run_turn(
             &mut self,
             _tools: &[transport::ToolSpec],
@@ -2423,6 +2436,21 @@ mod tests {
                                 args: json!({}),
                             },
                         ],
+                        stop: StopReason::ToolCalls,
+                        end_turn: None,
+                        usage: Usage::default(),
+                    })
+                }
+                MockTurn::FinalResult => {
+                    self.shared.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(transport::TurnOutput {
+                        text: String::new(),
+                        thinking: String::new(),
+                        tool_calls: vec![transport::ToolCall {
+                            id: "final-1".into(),
+                            name: FINAL_RESULT_TOOL.into(),
+                            args: json!({"ok": true}),
+                        }],
                         stop: StopReason::ToolCalls,
                         end_turn: None,
                         usage: Usage::default(),
@@ -2620,6 +2648,25 @@ mod tests {
             .user_turn(prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_result_tool_result_is_pushed_to_transport_before_return() {
+        let (mut session, shared) = mk_session(vec![MockTurn::FinalResult]);
+        session.output_schema = Some(json!({
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"]
+        }));
+
+        run_user_turn(&mut session, "structured please").await;
+
+        let pushed = shared.pushed_tool_results.lock().unwrap();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].len(), 1);
+        assert_eq!(pushed[0][0].id, "final-1");
+        assert_eq!(pushed[0][0].content, r#"{"ok":true}"#);
+        assert!(!pushed[0][0].is_error);
     }
 
     #[tokio::test]

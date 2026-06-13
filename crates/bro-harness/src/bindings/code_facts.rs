@@ -518,7 +518,7 @@ impl Tool for CodeRead {
     }
 }
 
-/// `code.signature` — extract a function signature from the AST at a Span.
+/// `code.signature` — extract a callable declaration signature from the AST at a Span.
 pub struct CodeSignature;
 
 #[derive(Deserialize)]
@@ -532,7 +532,7 @@ impl Tool for CodeSignature {
         "code.signature"
     }
     fn description(&self) -> &str {
-        "Extract the signature of the function item at (or enclosing) a hash-anchored Span: name, visibility, params, return type, generics, async (pure; syntax_only tier; Rust only for now). Errors with `stale_span` on content drift."
+        "Extract the language-shaped signature of the callable declaration at (or enclosing) a hash-anchored Span. Rust returns function_item facts; Java returns method_declaration/constructor_declaration facts including params_span for formatting checks (pure; syntax_only tier). Errors with `stale_span` on content drift."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -561,37 +561,98 @@ impl Tool for CodeSignature {
         };
         let span = params.span;
         bro_tools::tool::call_blocking(move || {
-            match facts::fn_signature(
+            match facts::callable_signature(
                 &path,
                 span.byte_start,
                 span.byte_end,
                 Some(&span.content_sha256),
             ) {
-                Ok(sig) => {
-                    let params_json: Vec<Value> = sig
-                        .params
-                        .iter()
-                        .map(|p| json!({ "pattern": p.pattern, "type": p.type_text }))
-                        .collect();
-                    ToolResult::Json(json!({
-                        "name": sig.name,
-                        "visibility": sig.visibility,
-                        "is_async": sig.is_async,
-                        "params": params_json,
-                        "return_type": sig.return_type,
-                        "generics": sig.generics,
-                        "span": Span {
-                            file: span.file.clone(),
-                            byte_start: sig.byte_start,
-                            byte_end: sig.byte_end,
-                            content_sha256: sig.content_sha256,
-                        },
-                    }))
-                }
+                Ok(sig) => signature_payload(&span.file, sig),
                 Err(e) => err(format!("code.signature: {e:#}")),
             }
         })
         .await
+    }
+}
+
+fn range_payload(file: &str, range: &facts::SignatureRangeFact) -> Span {
+    Span {
+        file: file.to_string(),
+        byte_start: range.byte_start,
+        byte_end: range.byte_end,
+        content_sha256: range.content_sha256.clone(),
+    }
+}
+
+fn signature_payload(file: &str, sig: facts::SignatureFacts) -> ToolResult {
+    match sig {
+        facts::SignatureFacts::Rust(sig) => {
+            let params_json: Vec<Value> = sig
+                .params
+                .iter()
+                .map(|p| json!({ "pattern": p.pattern, "type": p.type_text }))
+                .collect();
+            ToolResult::Json(json!({
+                "language": sig.language,
+                "kind": sig.kind,
+                "name": sig.name,
+                "visibility": sig.visibility,
+                "is_async": sig.is_async,
+                "params": params_json,
+                "return_type": sig.return_type,
+                "generics": sig.generics,
+                "span": Span {
+                    file: file.to_string(),
+                    byte_start: sig.byte_start,
+                    byte_end: sig.byte_end,
+                    content_sha256: sig.content_sha256,
+                },
+                "signature_span": range_payload(file, &sig.signature_span),
+                "params_span": sig.params_span.as_ref().map(|range| range_payload(file, range)),
+            }))
+        }
+        facts::SignatureFacts::Java(sig) => {
+            let params_json: Vec<Value> = sig
+                .params
+                .iter()
+                .map(|p| {
+                    json!({
+                        "name": p.name,
+                        "type": p.type_text,
+                        "modifiers": p.modifiers,
+                        "annotations": p.annotations,
+                        "varargs": p.varargs,
+                        "span": Span {
+                            file: file.to_string(),
+                            byte_start: p.byte_start,
+                            byte_end: p.byte_end,
+                            content_sha256: sig.content_sha256.clone(),
+                        },
+                    })
+                })
+                .collect();
+            ToolResult::Json(json!({
+                "language": sig.language,
+                "kind": sig.kind,
+                "name": sig.name,
+                "visibility": sig.visibility,
+                "modifiers": sig.modifiers,
+                "annotations": sig.annotations,
+                "params": params_json,
+                "return_type": sig.return_type,
+                "type_parameters": sig.type_parameters,
+                "throws": sig.throws,
+                "throws_text": sig.throws_text,
+                "span": Span {
+                    file: file.to_string(),
+                    byte_start: sig.byte_start,
+                    byte_end: sig.byte_end,
+                    content_sha256: sig.content_sha256,
+                },
+                "signature_span": range_payload(file, &sig.signature_span),
+                "params_span": sig.params_span.as_ref().map(|range| range_payload(file, range)),
+            }))
+        }
     }
 }
 
@@ -679,12 +740,14 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The six methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public fns returning Result\"): `code.items` → filter `kind === \"function_item\"` (the `visibility` field tells you pub/private already) → `Promise.all(fns.map(f => code.signature({ span: f.span })))` → filter on `return_type`. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; an `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
+        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The six methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type SyntaxItemFact = { name?: string; kind: string; visibility?: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
 type QueryCapture = { capture: string; kind: string; text: string; span: Span };
 type FileItems = { file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] };
+type RustSignature = { language: "rust"; kind: "function_item"; name?: string; visibility?: string; is_async: boolean; params: { pattern: string; type?: string }[]; return_type?: string; generics?: string; span: Span; signature_span: Span; params_span?: Span };
+type JavaSignature = { language: "java"; kind: "method_declaration" | "constructor_declaration"; name?: string; visibility?: string; modifiers: string[]; annotations: string[]; params: { name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean; span: Span }[]; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; span: Span; signature_span: Span; params_span?: Span };
 declare const code: {
   /** Enumerate parseable source files (skips dot-dirs, target, node_modules, build, dist, vendor). Feed straight into items({files})/query({files}). */
   files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
@@ -694,8 +757,8 @@ declare const code: {
   query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean; aggregate_capped?: boolean; files_scanned?: number; files_total?: number; hint?: string }>;
   /** Read the exact text of a Span; errors with stale_span on content drift. */
   read(args: { span: Span }): Promise<{ text: string; span: Span }>;
-  /** Signature of the function item at/enclosing a Span (Rust only for now): name, visibility (null = private), params, return_type (null = unit), generics, is_async. Returned span covers the whole function item. Errors with stale_span on drift. */
-  signature(args: { span: Span }): Promise<{ name?: string; visibility?: string; is_async: boolean; params: { pattern: string; type?: string }[]; return_type?: string; generics?: string; span: Span }>;
+  /** Language-shaped callable signature at/enclosing a Span. Rust returns function facts; Java returns method/constructor facts. `span` covers the whole item; `signature_span` covers the declaration header; `params_span` covers the raw parameter list for formatting checks. Errors with stale_span on drift. */
+  signature(args: { span: Span }): Promise<RustSignature | JavaSignature>;
   /** Union same-file Spans into one covering Span (pure; no I/O). */
   spanUnion(args: { spans: Span[] }): Promise<{ span: Span }>;
 };"#
@@ -732,6 +795,29 @@ mod tests {
         "probe.rs"
     }
 
+    fn java_fixture(dir: &Path) -> &'static str {
+        std::fs::write(
+            dir.join("Probe.java"),
+            r#"package com.acme;
+
+class Probe {
+    @Inject
+    public Probe(
+            final Repo repo,
+            @Named("primary") Provider<Foo> fooProvider
+    ) throws IOException {
+    }
+
+    public static <T> List<T> load(final String name, int count) throws IOException, SQLException {
+        return List.of();
+    }
+}
+"#,
+        )
+        .unwrap();
+        "Probe.java"
+    }
+
     fn json_of(result: ToolResult) -> Value {
         match result {
             ToolResult::Json(v) => v,
@@ -744,11 +830,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let file = fixture(&root);
-        let out = json_of(
-            CodeItems
-                .call(json!({ "file": file }), &cx_in(&root))
-                .await,
-        );
+        let out = json_of(CodeItems.call(json!({ "file": file }), &cx_in(&root)).await);
         assert_eq!(out["language"], "rust");
         let items = out["items"].as_array().unwrap();
         assert!(items.iter().any(|i| i["name"] == "beta"), "{items:?}");
@@ -783,11 +865,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let file = fixture(&root);
-        let items = json_of(
-            CodeItems
-                .call(json!({ "file": file }), &cx_in(&root))
-                .await,
-        );
+        let items = json_of(CodeItems.call(json!({ "file": file }), &cx_in(&root)).await);
         let beta_span = items["items"]
             .as_array()
             .unwrap()
@@ -800,11 +878,98 @@ mod tests {
                 .call(json!({ "span": beta_span }), &cx_in(&root))
                 .await,
         );
+        assert_eq!(sig["language"], "rust");
+        assert_eq!(sig["kind"], "function_item");
         assert_eq!(sig["name"], "beta");
         assert_eq!(sig["visibility"], "pub");
         assert_eq!(sig["return_type"], "u8");
         assert_eq!(sig["is_async"], false);
         assert_eq!(sig["span"]["content_sha256"], items["content_sha256"]);
+        assert_eq!(
+            sig["signature_span"]["content_sha256"],
+            items["content_sha256"]
+        );
+        assert_eq!(
+            sig["params_span"]["content_sha256"],
+            items["content_sha256"]
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_extracts_java_constructor_params_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = java_fixture(&root);
+        let items = json_of(CodeItems.call(json!({ "file": file }), &cx_in(&root)).await);
+        let ctor_span = items["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "constructor_declaration")
+            .unwrap()["span"]
+            .clone();
+        let sig = json_of(
+            CodeSignature
+                .call(json!({ "span": ctor_span }), &cx_in(&root))
+                .await,
+        );
+        assert_eq!(sig["language"], "java");
+        assert_eq!(sig["kind"], "constructor_declaration");
+        assert_eq!(sig["name"], "Probe");
+        assert_eq!(sig["visibility"], "public");
+        assert_eq!(sig["return_type"], Value::Null);
+        assert_eq!(sig["modifiers"], json!(["public"]));
+        assert_eq!(sig["annotations"], json!(["@Inject"]));
+        assert_eq!(sig["throws"], json!(["IOException"]));
+        assert_eq!(sig["params"].as_array().unwrap().len(), 2);
+        assert_eq!(sig["params"][0]["name"], "repo");
+        assert_eq!(sig["params"][0]["type"], "Repo");
+        assert_eq!(sig["params"][0]["modifiers"], json!(["final"]));
+        assert_eq!(
+            sig["params"][1]["annotations"],
+            json!([r#"@Named("primary")"#])
+        );
+        let params_text = json_of(
+            CodeRead
+                .call(json!({ "span": sig["params_span"].clone() }), &cx_in(&root))
+                .await,
+        );
+        assert!(
+            params_text["text"].as_str().unwrap().contains('\n'),
+            "{params_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_extracts_java_method_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = java_fixture(&root);
+        let items = json_of(CodeItems.call(json!({ "file": file }), &cx_in(&root)).await);
+        let method_span = items["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "method_declaration" && i["name"] == "load")
+            .unwrap()["span"]
+            .clone();
+        let sig = json_of(
+            CodeSignature
+                .call(json!({ "span": method_span }), &cx_in(&root))
+                .await,
+        );
+        assert_eq!(sig["language"], "java");
+        assert_eq!(sig["kind"], "method_declaration");
+        assert_eq!(sig["name"], "load");
+        assert_eq!(sig["visibility"], "public");
+        assert_eq!(sig["modifiers"], json!(["public", "static"]));
+        assert_eq!(sig["type_parameters"], "<T>");
+        assert_eq!(sig["return_type"], "List<T>");
+        assert_eq!(sig["throws"], json!(["IOException", "SQLException"]));
+        assert_eq!(sig["params"][0]["name"], "name");
+        assert_eq!(sig["params"][0]["type"], "String");
+        assert_eq!(sig["params"][1]["name"], "count");
+        assert_eq!(sig["params"][1]["type"], "int");
     }
 
     #[tokio::test]
@@ -812,11 +977,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let file = fixture(&root);
-        let items = json_of(
-            CodeItems
-                .call(json!({ "file": file }), &cx_in(&root))
-                .await,
-        );
+        let items = json_of(CodeItems.call(json!({ "file": file }), &cx_in(&root)).await);
         let span = items["items"][1]["span"].clone();
         std::fs::write(root.join(file), "pub fn mutated() -> u8 { 1 }\n").unwrap();
         let result = CodeSignature
@@ -833,11 +994,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let file = fixture(&root);
-        let out = json_of(
-            CodeItems
-                .call(json!({ "file": file }), &cx_in(&root))
-                .await,
-        );
+        let out = json_of(CodeItems.call(json!({ "file": file }), &cx_in(&root)).await);
         let span = out["items"][0]["span"].clone();
         std::fs::write(root.join(file), "pub struct Mutated;\n").unwrap();
         let result = CodeRead.call(json!({ "span": span }), &cx_in(&root)).await;
@@ -920,7 +1077,10 @@ mod tests {
 
         let out = json_of(
             CodeItems
-                .call(json!({ "files": ["a.rs", "b.rs", "missing.rs"] }), &cx_in(&root))
+                .call(
+                    json!({ "files": ["a.rs", "b.rs", "missing.rs"] }),
+                    &cx_in(&root),
+                )
                 .await,
         );
         let files = out["files"].as_array().unwrap();
@@ -929,7 +1089,11 @@ mod tests {
         assert_eq!(files[1]["items"][0]["name"], "b");
         assert!(files[2]["error"].as_str().is_some(), "{out}");
         // Single-file shape unchanged.
-        let single = json_of(CodeItems.call(json!({ "file": "a.rs" }), &cx_in(&root)).await);
+        let single = json_of(
+            CodeItems
+                .call(json!({ "file": "a.rs" }), &cx_in(&root))
+                .await,
+        );
         assert_eq!(single["file"], "a.rs");
         assert!(single["items"].is_array());
     }
@@ -939,7 +1103,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
-        std::fs::write(root.join("b.rs"), "pub fn beta() {}\nfn alpha_caller() { alpha(); }\n").unwrap();
+        std::fs::write(
+            root.join("b.rs"),
+            "pub fn beta() {}\nfn alpha_caller() { alpha(); }\n",
+        )
+        .unwrap();
 
         let out = json_of(
             CodeQuery
@@ -950,7 +1118,10 @@ mod tests {
                 .await,
         );
         let captures = out["captures"].as_array().unwrap();
-        let names: Vec<&str> = captures.iter().map(|c| c["text"].as_str().unwrap()).collect();
+        let names: Vec<&str> = captures
+            .iter()
+            .map(|c| c["text"].as_str().unwrap())
+            .collect();
         assert_eq!(names, vec!["alpha", "beta", "alpha_caller"], "{out}");
         // Spans name their files and carry per-file hashes.
         assert_eq!(captures[0]["span"]["file"], "a.rs");
@@ -967,7 +1138,10 @@ mod tests {
                 &cx_in(&root),
             )
             .await;
-        assert!(matches!(bad, ToolResult::Error(ref e) if e.contains("single-file")), "{bad:?}");
+        assert!(
+            matches!(bad, ToolResult::Error(ref e) if e.contains("single-file")),
+            "{bad:?}"
+        );
 
         // A query failing on every file fails the call once.
         let broken = CodeQuery
@@ -976,7 +1150,10 @@ mod tests {
                 &cx_in(&root),
             )
             .await;
-        assert!(matches!(broken, ToolResult::Error(ref e) if e.contains("all 2 file(s) failed")), "{broken:?}");
+        assert!(
+            matches!(broken, ToolResult::Error(ref e) if e.contains("all 2 file(s) failed")),
+            "{broken:?}"
+        );
     }
 
     #[tokio::test]

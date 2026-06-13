@@ -69,11 +69,7 @@ pub fn file_items(path: &Path) -> Result<FileItemsFacts> {
 /// Visibility modifier text of an item node, per language. Rust reads the
 /// `visibility_modifier` child; Java reads `public`/`protected`/`private`
 /// out of the `modifiers` child. Other languages return `None`.
-fn item_visibility(
-    node: tree_sitter::Node<'_>,
-    language: &str,
-    source: &str,
-) -> Option<String> {
+fn item_visibility(node: tree_sitter::Node<'_>, language: &str, source: &str) -> Option<String> {
     let text_of = |n: tree_sitter::Node<'_>| source.get(n.start_byte()..n.end_byte());
     let mut cursor = node.walk();
     match language {
@@ -160,11 +156,7 @@ pub fn file_query(
     }
 
     let mut captures = Vec::new();
-    let mut matches = cursor.matches(
-        &query,
-        parsed.tree.root_node(),
-        parsed.source.as_bytes(),
-    );
+    let mut matches = cursor.matches(&query, parsed.tree.root_node(), parsed.source.as_bytes());
     'outer: while let Some(found) = streaming_iterator::StreamingIterator::next(&mut matches) {
         for capture in found.captures {
             if captures.len() >= MAX_QUERY_CAPTURES {
@@ -200,11 +192,22 @@ pub fn file_query(
 /// Lets position-sensitive consumers (LSP rename) accept whole-item spans:
 /// aiming at an item's `byte_start` hits the `pub` keyword, which
 /// rust-analyzer refuses with "No references found at position".
-pub fn name_span(path: &Path, byte_start: usize, byte_end: usize) -> Result<Option<(usize, usize)>> {
+pub fn name_span(
+    path: &Path,
+    byte_start: usize,
+    byte_end: usize,
+) -> Result<Option<(usize, usize)>> {
     let parsed = super::parse_source_file(path)?;
     let len = parsed.source.len();
-    let (start, end) = (byte_start.min(len), byte_end.min(len).max(byte_start.min(len)));
-    let mut node = match parsed.tree.root_node().named_descendant_for_byte_range(start, end) {
+    let (start, end) = (
+        byte_start.min(len),
+        byte_end.min(len).max(byte_start.min(len)),
+    );
+    let mut node = match parsed
+        .tree
+        .root_node()
+        .named_descendant_for_byte_range(start, end)
+    {
         Some(node) => node,
         None => return Ok(None),
     };
@@ -323,7 +326,15 @@ pub fn parse_check(path: &Path) -> Result<ParseCheckFacts> {
     })
 }
 
-/// One parameter of a function signature.
+/// A byte range extracted from a source signature fact.
+#[derive(Debug, Clone)]
+pub struct SignatureRangeFact {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub content_sha256: String,
+}
+
+/// One parameter of a Rust function signature.
 #[derive(Debug, Clone)]
 pub struct FnParamFact {
     /// Binding pattern text (`raw`, `mut workers`, `&self`, …).
@@ -335,6 +346,8 @@ pub struct FnParamFact {
 /// Signature facts for one function item, extracted from the AST.
 #[derive(Debug, Clone)]
 pub struct FnSignatureFacts {
+    pub language: &'static str,
+    pub kind: String,
     pub name: Option<String>,
     /// Visibility modifier text (`pub`, `pub(crate)`, …); `None` = private.
     pub visibility: Option<String>,
@@ -348,22 +361,72 @@ pub struct FnSignatureFacts {
     /// span, e.g. a name identifier, to the whole item).
     pub byte_start: usize,
     pub byte_end: usize,
+    pub signature_span: SignatureRangeFact,
+    pub params_span: Option<SignatureRangeFact>,
     pub content_sha256: String,
 }
 
-/// Extract the signature of the function item at (or enclosing) the given
-/// byte range. Rust only for now — other languages fail closed with a clear
-/// error rather than guessing at grammar shapes.
+/// One Java formal parameter in a method/constructor signature.
+#[derive(Debug, Clone)]
+pub struct JavaParamFact {
+    pub name: Option<String>,
+    pub type_text: Option<String>,
+    pub modifiers: Vec<String>,
+    pub annotations: Vec<String>,
+    pub varargs: bool,
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+/// Java method/constructor signature facts.
+#[derive(Debug, Clone)]
+pub struct JavaSignatureFacts {
+    pub language: &'static str,
+    pub kind: String,
+    pub name: Option<String>,
+    pub visibility: Option<String>,
+    pub modifiers: Vec<String>,
+    pub annotations: Vec<String>,
+    pub params: Vec<JavaParamFact>,
+    pub return_type: Option<String>,
+    pub type_parameters: Option<String>,
+    pub throws: Vec<String>,
+    pub throws_text: Option<String>,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub signature_span: SignatureRangeFact,
+    pub params_span: Option<SignatureRangeFact>,
+    pub content_sha256: String,
+}
+
+/// Language-dispatched callable declaration signature.
+#[derive(Debug, Clone)]
+pub enum SignatureFacts {
+    Rust(FnSignatureFacts),
+    Java(JavaSignatureFacts),
+}
+
+trait SignatureExtractor {
+    fn extract(parsed: &super::ParsedSource, start: usize, end: usize) -> Result<SignatureFacts>;
+}
+
+struct RustSignatureExtractor;
+struct JavaSignatureExtractor;
+
+/// Extract the signature of the callable item at (or enclosing) the given
+/// byte range. Rust returns Rust-shaped function facts; Java returns
+/// method/constructor-shaped facts. Unsupported languages fail closed with a
+/// clear error rather than guessing at grammar shapes.
 ///
 /// When `expected_content_sha256` is set, the file hash is verified BEFORE
 /// the byte range is interpreted — a drifted file must fail as `stale_span`,
 /// never as a confusing "no function_item at range" against the new tree.
-pub fn fn_signature(
+pub fn callable_signature(
     path: &Path,
     byte_start: usize,
     byte_end: usize,
     expected_content_sha256: Option<&str>,
-) -> Result<FnSignatureFacts> {
+) -> Result<SignatureFacts> {
     let parsed = super::parse_source_file(path)?;
     if let Some(expected) = expected_content_sha256 {
         let current = sha256_hex(parsed.source.as_bytes());
@@ -374,22 +437,60 @@ pub fn fn_signature(
             ));
         }
     }
-    if parsed.language != "rust" {
-        return Err(anyhow!(
-            "fn_signature supports rust only for now (got {})",
-            parsed.language
-        ));
-    }
     let len = parsed.source.len();
-    let (start, end) = (byte_start.min(len), byte_end.min(len).max(byte_start.min(len)));
+    let (start, end) = (
+        byte_start.min(len),
+        byte_end.min(len).max(byte_start.min(len)),
+    );
+    match parsed.language {
+        "rust" => RustSignatureExtractor::extract(&parsed, start, end),
+        "java" => JavaSignatureExtractor::extract(&parsed, start, end),
+        other => Err(anyhow!("code.signature does not support {other}")),
+    }
+}
+
+fn range_fact(byte_start: usize, byte_end: usize, content_sha256: &str) -> SignatureRangeFact {
+    SignatureRangeFact {
+        byte_start,
+        byte_end,
+        content_sha256: content_sha256.to_string(),
+    }
+}
+
+fn text_of(source: &str, node: tree_sitter::Node<'_>) -> String {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn trim_signature_end(source: &str, mut end: usize, floor: usize) -> usize {
+    while end > floor
+        && source
+            .as_bytes()
+            .get(end - 1)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        end -= 1;
+    }
+    end
+}
+
+fn node_at_or_enclosing<'tree>(
+    parsed: &'tree super::ParsedSource,
+    start: usize,
+    end: usize,
+    kinds: &[&str],
+) -> Result<tree_sitter::Node<'tree>> {
     let root = parsed.tree.root_node();
     let mut node = root
         .named_descendant_for_byte_range(start, end)
         .ok_or_else(|| anyhow!("no syntax node at byte range {start}..{end}"))?;
-    while node.kind() != "function_item" {
+    while !kinds.contains(&node.kind()) {
         let Some(parent) = node.parent() else {
             return Err(anyhow!(
-                "no function_item at or enclosing byte range {start}..{end} (innermost node kind: {})",
+                "no {} at or enclosing byte range {start}..{end} (innermost node kind: {})",
+                kinds.join("/"),
                 parsed
                     .tree
                     .root_node()
@@ -400,62 +501,227 @@ pub fn fn_signature(
         };
         node = parent;
     }
+    Ok(node)
+}
 
-    let text_of = |n: tree_sitter::Node<'_>| -> String {
-        parsed
-            .source
-            .get(n.start_byte()..n.end_byte())
-            .unwrap_or_default()
-            .to_string()
-    };
+impl SignatureExtractor for RustSignatureExtractor {
+    fn extract(parsed: &super::ParsedSource, start: usize, end: usize) -> Result<SignatureFacts> {
+        let node = node_at_or_enclosing(parsed, start, end, &["function_item"])?;
+        let content_sha256 = sha256_hex(parsed.source.as_bytes());
 
-    let mut visibility = None;
-    let mut is_async = false;
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "visibility_modifier" => visibility = Some(text_of(child)),
-            "function_modifiers" => is_async = text_of(child).contains("async"),
-            _ => {}
-        }
-    }
-
-    let mut params = Vec::new();
-    if let Some(parameters) = node.child_by_field_name("parameters") {
-        let mut cursor = parameters.walk();
-        for parameter in parameters.named_children(&mut cursor) {
-            match parameter.kind() {
-                "parameter" => params.push(FnParamFact {
-                    pattern: parameter
-                        .child_by_field_name("pattern")
-                        .map(text_of)
-                        .unwrap_or_else(|| text_of(parameter)),
-                    type_text: parameter.child_by_field_name("type").map(text_of),
-                }),
-                "self_parameter" => params.push(FnParamFact {
-                    pattern: text_of(parameter),
-                    type_text: None,
-                }),
-                "attribute_item" | "line_comment" | "block_comment" => {}
-                _ => params.push(FnParamFact {
-                    pattern: text_of(parameter),
-                    type_text: None,
-                }),
+        let mut visibility = None;
+        let mut is_async = false;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "visibility_modifier" => visibility = Some(text_of(&parsed.source, child)),
+                "function_modifiers" => is_async = text_of(&parsed.source, child).contains("async"),
+                _ => {}
             }
         }
-    }
 
-    Ok(FnSignatureFacts {
-        name: node.child_by_field_name("name").map(text_of),
-        visibility,
-        is_async,
-        params,
-        return_type: node.child_by_field_name("return_type").map(text_of),
-        generics: node.child_by_field_name("type_parameters").map(text_of),
-        byte_start: node.start_byte(),
-        byte_end: node.end_byte(),
-        content_sha256: sha256_hex(parsed.source.as_bytes()),
-    })
+        let mut params = Vec::new();
+        let params_node = node.child_by_field_name("parameters");
+        if let Some(parameters) = params_node {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                match parameter.kind() {
+                    "parameter" => params.push(FnParamFact {
+                        pattern: parameter
+                            .child_by_field_name("pattern")
+                            .map(|node| text_of(&parsed.source, node))
+                            .unwrap_or_else(|| text_of(&parsed.source, parameter)),
+                        type_text: parameter
+                            .child_by_field_name("type")
+                            .map(|node| text_of(&parsed.source, node)),
+                    }),
+                    "self_parameter" => params.push(FnParamFact {
+                        pattern: text_of(&parsed.source, parameter),
+                        type_text: None,
+                    }),
+                    "attribute_item" | "line_comment" | "block_comment" => {}
+                    _ => params.push(FnParamFact {
+                        pattern: text_of(&parsed.source, parameter),
+                        type_text: None,
+                    }),
+                }
+            }
+        }
+
+        let signature_end = node
+            .child_by_field_name("body")
+            .map(|body| trim_signature_end(&parsed.source, body.start_byte(), node.start_byte()))
+            .unwrap_or(node.end_byte());
+        Ok(SignatureFacts::Rust(FnSignatureFacts {
+            language: "rust",
+            kind: node.kind().to_string(),
+            name: node
+                .child_by_field_name("name")
+                .map(|node| text_of(&parsed.source, node)),
+            visibility,
+            is_async,
+            params,
+            return_type: node
+                .child_by_field_name("return_type")
+                .map(|node| text_of(&parsed.source, node)),
+            generics: node
+                .child_by_field_name("type_parameters")
+                .map(|node| text_of(&parsed.source, node)),
+            byte_start: node.start_byte(),
+            byte_end: node.end_byte(),
+            signature_span: range_fact(node.start_byte(), signature_end, &content_sha256),
+            params_span: params_node
+                .map(|node| range_fact(node.start_byte(), node.end_byte(), &content_sha256)),
+            content_sha256,
+        }))
+    }
+}
+
+impl SignatureExtractor for JavaSignatureExtractor {
+    fn extract(parsed: &super::ParsedSource, start: usize, end: usize) -> Result<SignatureFacts> {
+        let node = node_at_or_enclosing(
+            parsed,
+            start,
+            end,
+            &["method_declaration", "constructor_declaration"],
+        )?;
+        let content_sha256 = sha256_hex(parsed.source.as_bytes());
+        let params_node = node.child_by_field_name("parameters");
+        let (modifiers, annotations) = java_modifiers_and_annotations(node, &parsed.source);
+        let visibility = modifiers
+            .iter()
+            .find(|m| matches!(m.as_str(), "public" | "protected" | "private"))
+            .cloned();
+        let signature_end = node
+            .child_by_field_name("body")
+            .map(|body| trim_signature_end(&parsed.source, body.start_byte(), node.start_byte()))
+            .unwrap_or(node.end_byte());
+        let throws_text = child_text_by_kind(node, "throws", &parsed.source);
+        let throws = throws_text
+            .as_deref()
+            .map(parse_java_throws)
+            .unwrap_or_default();
+        let params = params_node
+            .map(|params| java_params(params, &parsed.source))
+            .unwrap_or_default();
+
+        Ok(SignatureFacts::Java(JavaSignatureFacts {
+            language: "java",
+            kind: node.kind().to_string(),
+            name: node
+                .child_by_field_name("name")
+                .map(|node| text_of(&parsed.source, node)),
+            visibility,
+            modifiers,
+            annotations,
+            params,
+            return_type: if node.kind() == "method_declaration" {
+                node.child_by_field_name("type")
+                    .map(|node| text_of(&parsed.source, node))
+            } else {
+                None
+            },
+            type_parameters: child_text_by_kind(node, "type_parameters", &parsed.source),
+            throws,
+            throws_text,
+            byte_start: node.start_byte(),
+            byte_end: node.end_byte(),
+            signature_span: range_fact(node.start_byte(), signature_end, &content_sha256),
+            params_span: params_node
+                .map(|node| range_fact(node.start_byte(), node.end_byte(), &content_sha256)),
+            content_sha256,
+        }))
+    }
+}
+
+fn child_text_by_kind(node: tree_sitter::Node<'_>, kind: &str, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| child.kind() == kind)
+        .map(|child| text_of(source, child))
+}
+
+fn java_modifiers_and_annotations(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut modifiers = Vec::new();
+    let mut annotations = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "modifiers" {
+            if !matches!(
+                child.kind(),
+                "marker_annotation" | "annotation" | "public" | "protected" | "private"
+            ) {
+                break;
+            }
+            collect_java_modifier_child(child, source, &mut modifiers, &mut annotations);
+            continue;
+        }
+        let mut modifier_cursor = child.walk();
+        for modifier_child in child.children(&mut modifier_cursor) {
+            collect_java_modifier_child(modifier_child, source, &mut modifiers, &mut annotations);
+        }
+        break;
+    }
+    (modifiers, annotations)
+}
+
+fn collect_java_modifier_child(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    modifiers: &mut Vec<String>,
+    annotations: &mut Vec<String>,
+) {
+    match node.kind() {
+        "public" | "protected" | "private" | "static" | "final" | "abstract" | "synchronized"
+        | "native" | "strictfp" | "default" | "transient" | "volatile" => {
+            modifiers.push(node.kind().to_string());
+        }
+        "marker_annotation" | "annotation" => annotations.push(text_of(source, node)),
+        _ => {}
+    }
+}
+
+fn java_params(params: tree_sitter::Node<'_>, source: &str) -> Vec<JavaParamFact> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "formal_parameter" | "spread_parameter" | "receiver_parameter"
+        ) {
+            continue;
+        }
+        let (modifiers, annotations) = java_modifiers_and_annotations(child, source);
+        out.push(JavaParamFact {
+            name: child
+                .child_by_field_name("name")
+                .map(|node| text_of(source, node)),
+            type_text: child
+                .child_by_field_name("type")
+                .map(|node| text_of(source, node)),
+            modifiers,
+            annotations,
+            varargs: child.kind() == "spread_parameter",
+            byte_start: child.start_byte(),
+            byte_end: child.end_byte(),
+        });
+    }
+    out
+}
+
+fn parse_java_throws(throws_text: &str) -> Vec<String> {
+    throws_text
+        .trim()
+        .strip_prefix("throws")
+        .unwrap_or(throws_text)
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -508,8 +774,7 @@ mod facts_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let path = fixture(&root);
-        let facts =
-            file_query(&path, "(function_item name: (identifier) @fn_name)", None).unwrap();
+        let facts = file_query(&path, "(function_item name: (identifier) @fn_name)", None).unwrap();
         let names: Vec<_> = facts.captures.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(names, vec!["beta", "gamma"]);
         let beta = &facts.captures[0];
@@ -549,7 +814,9 @@ mod facts_tests {
         let source = fs::read_to_string(&path).unwrap();
 
         let at = source.find("fetch").unwrap();
-        let sig = fn_signature(&path, at, at + 5, None).unwrap();
+        let SignatureFacts::Rust(sig) = callable_signature(&path, at, at + 5, None).unwrap() else {
+            panic!("expected rust signature");
+        };
         assert_eq!(sig.name.as_deref(), Some("fetch"));
         assert_eq!(sig.visibility.as_deref(), Some("pub"));
         assert!(sig.is_async);
@@ -559,16 +826,26 @@ mod facts_tests {
         assert_eq!(sig.params[0].pattern, "id");
         assert_eq!(sig.params[0].type_text.as_deref(), Some("u32"));
         assert_eq!(sig.params[1].type_text.as_deref(), Some("&str"));
-        assert_eq!(&source[sig.byte_start..sig.byte_end].split('(').next().unwrap(), &"pub async fn fetch<T: Clone>");
+        assert_eq!(
+            &source[sig.byte_start..sig.byte_end]
+                .split('(')
+                .next()
+                .unwrap(),
+            &"pub async fn fetch<T: Clone>"
+        );
 
         let at = source.find("private_unit").unwrap();
-        let sig = fn_signature(&path, at, at, None).unwrap();
+        let SignatureFacts::Rust(sig) = callable_signature(&path, at, at, None).unwrap() else {
+            panic!("expected rust signature");
+        };
         assert_eq!(sig.visibility, None);
         assert_eq!(sig.return_type, None);
         assert!(!sig.is_async);
 
         let at = source.find("method").unwrap();
-        let sig = fn_signature(&path, at, at + 6, None).unwrap();
+        let SignatureFacts::Rust(sig) = callable_signature(&path, at, at + 6, None).unwrap() else {
+            panic!("expected rust signature");
+        };
         assert_eq!(sig.name.as_deref(), Some("method"));
         assert_eq!(sig.params[0].pattern, "&self");
         assert_eq!(sig.params[0].type_text, None);
@@ -582,7 +859,7 @@ mod facts_tests {
         let path = fixture(&root);
         let source = fs::read_to_string(&path).unwrap();
         let at = source.find("struct Alpha").unwrap();
-        let err = fn_signature(&path, at, at + 5, None).unwrap_err();
+        let err = callable_signature(&path, at, at + 5, None).unwrap_err();
         assert!(err.to_string().contains("no function_item"), "got: {err}");
     }
 
