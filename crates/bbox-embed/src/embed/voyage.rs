@@ -127,10 +127,24 @@ impl EmbeddingProvider for VoyageProvider {
         if !status.is_success() {
             let body = raw.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(512).collect();
-            bail!(
+            let message = format!(
                 "voyage embedding request failed: HTTP {status} batch_size={} body={snippet}",
                 texts.len()
             );
+            // Payload-level rejections (4xx other than timeout/rate-limit)
+            // fail identically on retry — mark them non-retryable so the
+            // queue bisects to the poison item instead of dropping the
+            // whole batch (gap-e3e033ce: one empty string took 51
+            // batch-mates with it).
+            if status.is_client_error()
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                return Err(
+                    anyhow::Error::new(super::queue::NonRetryableBatchError).context(message)
+                );
+            }
+            bail!("{message}");
         }
         let response = raw
             .json::<VoyageResponse>()
@@ -215,6 +229,59 @@ mod tests {
         assert_eq!(provider.dimensions(), VOYAGE_DIMENSIONS);
         let vectors = provider.embed_batch(&["hello".into()]).await.unwrap();
         assert_eq!(vectors[0].len(), VOYAGE_DIMENSIONS);
+    }
+
+    /// Payload-level 4xx is non-retryable (queue bisects to the poison
+    /// item); 429 stays retryable (backoff is the right response).
+    #[tokio::test]
+    async fn voyage_400_is_non_retryable_but_429_is_retryable() {
+        use axum::http::StatusCode;
+
+        async fn bad_request() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"detail": "Input cannot contain empty strings or empty lists"})),
+            )
+        }
+        async fn rate_limited() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"detail": "slow down"})),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/bad", post(bad_request))
+                    .route("/limit", post(rate_limited)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let provider = VoyageProvider::for_test(format!("http://{addr}/bad")).unwrap();
+        let err = provider.embed_batch(&["".into()]).await.unwrap_err();
+        assert!(err.to_string().contains("HTTP 400"));
+        assert!(
+            err.chain().any(|cause| cause
+                .downcast_ref::<super::super::queue::NonRetryableBatchError>()
+                .is_some()),
+            "400 must carry the non-retryable marker: {err:#}"
+        );
+
+        let provider = VoyageProvider::for_test(format!("http://{addr}/limit")).unwrap();
+        let err = provider.embed_batch(&["ok".into()]).await.unwrap_err();
+        assert!(err.to_string().contains("HTTP 429"));
+        assert!(
+            !err.chain().any(|cause| cause
+                .downcast_ref::<super::super::queue::NonRetryableBatchError>()
+                .is_some()),
+            "429 must stay retryable: {err:#}"
+        );
     }
 
     #[test]

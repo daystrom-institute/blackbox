@@ -44,9 +44,7 @@ pub(crate) mod test_call_hook {
     use std::sync::Arc;
 
     type Hook = Arc<
-        dyn Fn(&str, &str, &serde_json::Map<String, Value>) -> anyhow::Result<Value>
-            + Send
-            + Sync,
+        dyn Fn(&str, &str, &serde_json::Map<String, Value>) -> anyhow::Result<Value> + Send + Sync,
     >;
 
     static HOOK: RwLock<Option<Hook>> = RwLock::new(None);

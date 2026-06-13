@@ -21,6 +21,17 @@ out explicitly under `Changed` or `Removed`.
   guarded transcripts — and `embed-compaction-arc` v3 runs it nightly so
   items that predate a route or were dropped after retries eventually
   embed.
+- Provider-rejected embed payloads no longer poison their batch
+  (gap-e3e033ce): a payload-level HTTP 4xx (e.g. Voyage's empty-string
+  rejection) is classified non-retryable, and the queue bisects the batch
+  to the offending item(s) instead of retrying three times and dropping
+  all 52 batch-mates with it. Empty/whitespace text is skipped at enqueue
+  and excluded from coverage (it was the actual root cause — providers
+  reject empty input). Permanently-dropped items are counted in a durable
+  `dropped_count` on `bbox_embed_status` (with a `last_dropped`
+  diagnostic) that a later success does not clear, and a `stalled` route
+  whose shortfall is poison says so rather than pointing at a backfill
+  that cannot close the gap.
 - Inactive workspace-snapshot retention is now budget-bounded
   (gap-efd270dd): `bbox_storage_gc` gains `max_snapshots_per_workspace`
   (default 32) and `max_snapshot_total_bytes_per_workspace` (default

@@ -277,6 +277,13 @@ fn record_index_doc_coverage(
     buckets: &[Bucket],
     doc: &EmbeddingSourceDoc,
 ) -> Result<()> {
+    // Empty-text docs are not embeddable (providers reject empty input;
+    // the queue skips them at enqueue) — excluding them here keeps
+    // coverage convergent instead of reporting permanent phantom residue
+    // (gap-e3e033ce).
+    if !queue::embeddable_text(&doc.content) {
+        return Ok(());
+    }
     let Some(bucket) = reembed_index_doc_bucket(doc) else {
         return Ok(());
     };
@@ -512,6 +519,11 @@ fn enqueue_reembed_index_docs(
 }
 
 fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bool {
+    // Mirror of the coverage-side skip: the queue would reject the empty
+    // text anyway; skipping here keeps reembed's enqueued count honest.
+    if !queue::embeddable_text(&doc.content) {
+        return false;
+    }
     let Some(bucket) = reembed_index_doc_bucket(doc) else {
         return false;
     };
@@ -710,9 +722,22 @@ fn apply_stall_health(response: &mut EmbedStatusResponse) {
         };
         if ratio < STALLED_COVERAGE_THRESHOLD {
             status.health = "stalled".into();
-            status.health_reason = Some(format!(
-                "coverage {ratio:.3} with idle queue — unembedded residue is not being enqueued; run bbox_reembed(route=\"{route}\") or wait for the nightly backfill"
-            ));
+            // A nonzero dropped_count means the shortfall is poison —
+            // payloads the provider permanently rejects (gap-e3e033ce) —
+            // not un-enqueued residue. Reembed won't help; say so instead
+            // of sending the operator to chase a backfill that can't close
+            // the gap.
+            status.health_reason = Some(if status.dropped_count > 0 {
+                format!(
+                    "coverage {ratio:.3} with idle queue; {} item(s) permanently dropped as unembeddable (provider-rejected payloads) — last: {}",
+                    status.dropped_count,
+                    status.last_dropped.as_deref().unwrap_or("(no detail)")
+                )
+            } else {
+                format!(
+                    "coverage {ratio:.3} with idle queue — unembedded residue is not being enqueued; run bbox_reembed(route=\"{route}\") or wait for the nightly backfill"
+                )
+            });
         }
     }
 }
@@ -1103,6 +1128,38 @@ mod tests {
         assert_eq!(
             response.routes["knowledge"].health, "unavailable",
             "error-driven health wins over stall detection"
+        );
+    }
+
+    /// A stalled route whose shortfall is poison (dropped_count > 0) must
+    /// say so rather than send the operator to chase a backfill that can't
+    /// close the gap (gap-e3e033ce).
+    #[test]
+    fn stall_reason_distinguishes_poison_drops_from_unenqueued_residue() {
+        use crate::embed::queue::RouteStatus;
+
+        let mut response = EmbedStatusResponse {
+            routes: Default::default(),
+        };
+        response.routes.insert(
+            "code".into(),
+            RouteStatus {
+                coverage_ratio: Some(0.95),
+                dropped_count: 5,
+                last_dropped: Some("entity_id=project_file:abc: HTTP 400".into()),
+                ..Default::default()
+            },
+        );
+        apply_stall_health(&mut response);
+
+        let code = &response.routes["code"];
+        assert_eq!(code.health, "stalled");
+        let reason = code.health_reason.as_deref().unwrap();
+        assert!(reason.contains("permanently dropped"), "reason: {reason}");
+        assert!(reason.contains("HTTP 400"), "names the cause: {reason}");
+        assert!(
+            !reason.contains("bbox_reembed"),
+            "must not send the operator to a backfill that can't help: {reason}"
         );
     }
 

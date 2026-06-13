@@ -18,6 +18,37 @@ const MAX_BATCH_RETRIES: u8 = 3;
 const MAX_ROUTE_QUEUE_DEPTH: u64 = 10_000;
 const MAX_ROUTE_QUEUE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Text the embedding providers will accept. Voyage rejects empty strings
+/// with HTTP 400 ("Input cannot contain empty strings"), and the rejection
+/// drops the whole batch — one empty chunk stranded 51 batch-mates
+/// (gap-e3e033ce). Whitespace-only text embeds to noise anyway. Coverage
+/// computation uses the same predicate so skipped items don't read as
+/// missing residue forever.
+pub fn embeddable_text(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
+/// Marker for provider failures no retry can fix — payload-level HTTP 4xx
+/// rejections (not 408/429). Providers attach this to the error chain so
+/// the worker bisects the batch to the poison item(s) instead of retrying
+/// a request that will fail identically three times and then dropping
+/// every batch-mate with it (gap-e3e033ce).
+#[derive(Debug)]
+pub struct NonRetryableBatchError;
+
+impl std::fmt::Display for NonRetryableBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("non-retryable embedding batch rejection")
+    }
+}
+
+impl std::error::Error for NonRetryableBatchError {}
+
+fn is_non_retryable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<NonRetryableBatchError>().is_some())
+}
+
 type ProviderSpec = (String, Arc<dyn EmbeddingProvider>, Option<u32>, String);
 
 #[derive(Debug, Clone)]
@@ -50,6 +81,18 @@ pub struct RouteStatus {
     /// Distinguishes "guarded" from "broken" (gap-b9d39c10).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_state: Option<String>,
+    /// Cumulative count of items the queue permanently dropped — poison
+    /// payloads the provider rejects (HTTP 4xx) and retry-exhausted
+    /// batches. Unlike `last_error`, this is NOT cleared by a later
+    /// success, so it stays an honest "this much will never embed" signal
+    /// (gap-e3e033ce). A nonzero count explains a coverage ratio that
+    /// parks below 1.0 with an idle queue — that residue is unembeddable,
+    /// not un-enqueued.
+    pub dropped_count: u64,
+    /// Diagnostic for the most recent permanent drop (entity_id + cause).
+    /// Durable like `dropped_count` — survives later successes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_dropped: Option<String>,
 }
 
 impl Default for RouteStatus {
@@ -70,6 +113,8 @@ impl Default for RouteStatus {
             last_error: None,
             coverage_ratio: None,
             coverage_state: None,
+            dropped_count: 0,
+            last_dropped: None,
         }
     }
 }
@@ -223,6 +268,15 @@ impl EmbedQueueHandle {
                 return false;
             }
         };
+        if !embeddable_text(&request.text) {
+            tracing::debug!(
+                route = %resolved.queue_route,
+                entity_id = %request.entity_id,
+                chunk_hash = %request.chunk_hash,
+                "embedding enqueue skipped empty text (providers reject empty input)"
+            );
+            return false;
+        }
         if !self.should_embed(&request, &resolved.vector_route) {
             tracing::debug!(
                 route = %resolved.queue_route,
@@ -679,6 +733,21 @@ async fn process_batch_outcome(
             *backoff = spec.retry_backoff;
         }
         Err(err) => {
+            if is_non_retryable(&err) {
+                // Retrying an identical payload rejection fails identically;
+                // bisect to the poison item(s) instead of dropping the batch.
+                tracing::warn!(
+                    route = %spec.route,
+                    batch = batch.len(),
+                    error = %sanitize_error(&err),
+                    "embedding batch rejected by provider; isolating poison payload"
+                );
+                isolate_poison_batch(spec, batch).await;
+                retry_batch.clear();
+                *retry_attempts = 0;
+                *backoff = spec.retry_backoff;
+                return;
+            }
             let sanitized = sanitize_error(&err);
             tracing::warn!(
                 route = %spec.route,
@@ -696,6 +765,107 @@ async fn process_batch_outcome(
             .await
             {
                 *backoff = spec.retry_backoff;
+            }
+        }
+    }
+}
+
+/// Bisect a non-retryably-rejected batch down to the poison item(s):
+/// re-embed the halves independently so one provider-rejected payload
+/// (e.g. an empty string Voyage 400s on) cannot strand its batch-mates
+/// (gap-e3e033ce). Poison items are dropped individually and counted in
+/// the route's durable `dropped_count` with the entity_id in
+/// `last_dropped`; the route stays available (the batch-mates embedded,
+/// so the route is healthy). Transient errors during isolation re-try the
+/// same sub-batch; the call budget bounds the whole pass (~2x batch size
+/// worst case) so a flapping provider cannot wedge the worker here.
+async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
+    let mut stack = vec![batch];
+    let mut budget: usize = 2 * MAX_BATCH_DOCS + 16;
+    while let Some(batch) = stack.pop() {
+        if batch.is_empty() {
+            continue;
+        }
+        if budget == 0 {
+            let message = format!(
+                "embedding poison isolation call budget exhausted; dropping {} item(s)",
+                batch.len()
+            );
+            tracing::warn!(route = %spec.route, dropped = batch.len(), "{message}");
+            mark_poison_dropped(
+                &spec.statuses,
+                &spec.route,
+                batch.len() as u64,
+                batch_text_bytes(&batch),
+                &message,
+            );
+            continue;
+        }
+        budget -= 1;
+        let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
+        match spec.provider.embed_batch(&texts).await {
+            Ok(vectors) => {
+                if spec.persist_vectors {
+                    if let Err(err) = persist_vectors(spec, &batch, vectors) {
+                        let sanitized = sanitize_error(&err);
+                        let message = format!(
+                            "vector persistence failed during poison isolation: {sanitized}"
+                        );
+                        tracing::warn!(route = %spec.route, error = %sanitized, "{message}");
+                        mark_poison_dropped(
+                            &spec.statuses,
+                            &spec.route,
+                            batch.len() as u64,
+                            batch_text_bytes(&batch),
+                            &message,
+                        );
+                        continue;
+                    }
+                }
+                mark_success(
+                    &spec.statuses,
+                    &spec.route,
+                    batch.len() as u64,
+                    batch_text_bytes(&batch),
+                );
+            }
+            Err(err) => {
+                let non_retryable = is_non_retryable(&err);
+                if non_retryable && batch.len() == 1 {
+                    let req = &batch[0];
+                    let sanitized = sanitize_error(&err);
+                    let message = format!(
+                        "embedding item dropped as poison payload: entity_id={} chunk_hash={} text_bytes={}: {sanitized}",
+                        req.entity_id,
+                        req.chunk_hash,
+                        req.text.len()
+                    );
+                    tracing::warn!(
+                        route = %spec.route,
+                        entity_id = %req.entity_id,
+                        chunk_hash = %req.chunk_hash,
+                        error = %sanitized,
+                        "poison embedding payload dropped"
+                    );
+                    mark_poison_dropped(
+                        &spec.statuses,
+                        &spec.route,
+                        1,
+                        batch_text_bytes(&batch),
+                        &message,
+                    );
+                } else if non_retryable {
+                    let mut left = batch;
+                    let right = left.split_off(left.len() / 2);
+                    stack.push(left);
+                    stack.push(right);
+                } else {
+                    // Transient failure mid-isolation: brief backoff and
+                    // retry the same sub-batch; the budget bounds total work.
+                    mark_retry(&spec.statuses, &spec.route);
+                    tokio::time::sleep(spec.retry_backoff).await;
+                    stack.push(batch);
+                }
             }
         }
     }
@@ -969,6 +1139,29 @@ fn mark_dropped(
     status.health = "unavailable".into();
     status.health_reason = Some(classify_error_reason(message).into());
     status.last_error = Some(message.to_string());
+    status.dropped_count = status.dropped_count.saturating_add(count);
+    status.last_dropped = Some(message.to_string());
+}
+
+/// Drop poison items isolated out of an otherwise-healthy batch
+/// (gap-e3e033ce). Unlike `mark_dropped` this does NOT flip the route
+/// unavailable: we proved the route works by embedding the batch-mates,
+/// so the only honest signal is the durable `dropped_count`/`last_dropped`
+/// pair — not a route-wide outage. The diagnostic is recorded on the
+/// durable fields so a later success cannot wipe it.
+fn mark_poison_dropped(
+    statuses: &RwLock<BTreeMap<String, RouteStatus>>,
+    route: &str,
+    count: u64,
+    bytes: u64,
+    message: &str,
+) {
+    let mut statuses = statuses.write();
+    let status = statuses.entry(route.to_string()).or_default();
+    status.queue_depth = status.queue_depth.saturating_sub(count);
+    status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
+    status.dropped_count = status.dropped_count.saturating_add(count);
+    status.last_dropped = Some(message.to_string());
 }
 
 fn mark_error(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, message: &str) {
@@ -1160,6 +1353,94 @@ mod tests {
         queue.shutdown();
     }
 
+    /// One provider-rejected payload must not strand its batch-mates
+    /// (gap-e3e033ce): the worker bisects the non-retryable batch, embeds
+    /// the good items, and drops only the poison item with its entity_id
+    /// named in last_error.
+    #[tokio::test]
+    async fn poison_payload_is_isolated_and_batch_mates_embed() {
+        struct PoisonProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl EmbeddingProvider for PoisonProvider {
+            async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if texts.iter().any(|text| text == "POISON") {
+                    return Err(anyhow::Error::new(NonRetryableBatchError)
+                        .context("voyage embedding request failed: HTTP 400 body=Input cannot contain empty strings"));
+                }
+                Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+            }
+
+            fn dimensions(&self) -> usize {
+                4
+            }
+
+            fn model_name(&self) -> &str {
+                "mock"
+            }
+
+            fn id(&self) -> &str {
+                "mock"
+            }
+        }
+
+        let provider = Arc::new(PoisonProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", provider.clone())],
+            Duration::from_millis(20),
+            Duration::from_millis(10),
+        );
+        assert!(queue.enqueue(request_with_text(Bucket::Code, "good-a", "h1", "fn a() {}")));
+        assert!(queue.enqueue(request_with_text(Bucket::Code, "bad-b", "h2", "POISON")));
+        assert!(queue.enqueue(request_with_text(Bucket::Code, "good-c", "h3", "fn c() {}")));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let status = queue.status().routes["code"].clone();
+        assert_eq!(status.indexed_count, 2, "both good items embed: {status:?}");
+        assert_eq!(status.queue_depth, 0);
+        // The poison drop is recorded on the DURABLE fields, which a later
+        // mark_success (the good batch-mate embedding after the drop) does
+        // not clear — that clobbering of last_error was the original bug.
+        assert_eq!(status.dropped_count, 1, "exactly the poison item dropped");
+        let last_dropped = status
+            .last_dropped
+            .expect("poison drop records last_dropped");
+        assert!(
+            last_dropped.contains("poison payload") && last_dropped.contains("bad-b"),
+            "drop diagnostic names the poison entity: {last_dropped}"
+        );
+        // Route is healthy — the batch-mates proved it works; a single
+        // poison item must not flip the whole route unavailable.
+        assert!(
+            status.available,
+            "poison isolation keeps the route available"
+        );
+        queue.shutdown();
+    }
+
+    /// Empty text never reaches the provider — Voyage rejects it with an
+    /// HTTP 400 that would poison the whole batch (gap-e3e033ce).
+    #[tokio::test]
+    async fn enqueue_skips_empty_text() {
+        let provider = Arc::new(MockProvider::ok());
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", provider.clone())],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        assert!(!queue.enqueue(request_with_text(Bucket::Code, "empty", "h1", "")));
+        assert!(!queue.enqueue(request_with_text(Bucket::Code, "blank", "h2", "  \n\t")));
+        let status = queue.status().routes["code"].clone();
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(status.queue_bytes, 0);
+        queue.shutdown();
+    }
+
     #[tokio::test]
     async fn provider_outage_drops_batch_after_retry_limit() {
         let queue = EmbedQueueHandle::from_providers_for_test(
@@ -1261,12 +1542,21 @@ mod tests {
     }
 
     fn request(bucket: Bucket, entity_id: &str, chunk_hash: &str) -> EmbedRequest {
+        request_with_text(bucket, entity_id, chunk_hash, "hello")
+    }
+
+    fn request_with_text(
+        bucket: Bucket,
+        entity_id: &str,
+        chunk_hash: &str,
+        text: &str,
+    ) -> EmbedRequest {
         EmbedRequest {
             bucket,
             project_id: None,
             entity_id: entity_id.into(),
             chunk_hash: chunk_hash.into(),
-            text: "hello".into(),
+            text: text.into(),
         }
     }
 }
