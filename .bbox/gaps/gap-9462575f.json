@@ -15,7 +15,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/extract-class-moved-final-field-ctor-wiring",
   "notes": "Newly dominant cost in the god-class decomposition loop now that seam-finding (gap-2a3f03e5) is solved. Design question for the fix: a moved DI-injected final field can either be (a) threaded as a constructor param from the source (source holds the injected ref and passes it in — matches own_construction) or (b) re-annotated for injection on the extracted class if it becomes a DI component. (a) is the safe default and what the probe agent did by hand.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-13T00:05:22Z",
-  "updated_at": "2026-06-13T00:05:22Z"
+  "updated_at": "2026-06-13T00:48:53Z",
+  "resolved_at": "2026-06-13T00:48:53Z",
+  "resolution_note": "extractClass now threads moved fields initialized from a surviving ctor parameter (the DI pattern) through the target ctor (param+assignment), threads the param into source-side construction, and deletes the orphaned source assignment. The 28-cell ctor-repair grind is eliminated (probe 36→8 cells). Plus an architecture pivot per operator (design for Guice interception): java.extractClass now auto-defaults DI-managed sources (@Inject present) to external_injection — the delegate becomes an unscoped @Inject Guice bean (AOP-interceptable), moved deps re-rooted as the delegate's @Inject ctor params, flavor matched to the source (com.google.inject vs jakarta/javax). Probe-cohesion-4 (glm-5.1, contracts fixed): agent left wiring unset, binding auto-selected external_injection, delegate is @Inject Guice-managed, compile exit 0, 5 cells. RESIDUAL (tracked as thread task, not blocking): the moved deps remain dead @Inject params on the SOURCE ctor — \"move the injection point\" cleanup (remove unused source ctor params) is the next refinement. Gate: 3952 nextest --workspace, zero new clippy (541=541), lint-concurrency ok."
 }

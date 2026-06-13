@@ -1,5 +1,110 @@
 use super::*;
 
+/// A moved field that the source constructor initializes and must therefore be
+/// threaded through the target's constructor (gap-9462575f). Its declaration
+/// moves verbatim onto the target (via `moved_field_text`), so the target needs
+/// a constructor parameter + assignment to initialize it, the source-side
+/// `new Target(...)` must pass the original initializer expression, and the now
+/// orphaned `this.<name> = <expr>;` in the source ctor must be deleted.
+struct MovedThreadedField {
+    name: String,
+    type_name: String,
+    /// The RHS of the source ctor's `this.<name> = <expr>;`, verbatim. Using the
+    /// expression (not the field name) is what makes a field/parameter name
+    /// mismatch — e.g. `this.fooAdmin = foosAdmin;` — thread correctly.
+    init_expr: String,
+    /// Byte range of the whole assignment statement in the source, for deletion.
+    assign_range: (usize, usize),
+}
+
+/// Scan the source's first constructor for `this.<field> = <param>;` (or bare
+/// `<field> = <param>;`) assignments to a moved field, where `<param>` is a bare
+/// reference to one of the constructor's own parameters. Returns name ->
+/// (param_expr, statement_range).
+///
+/// The constructor-parameter restriction is deliberate and load-bearing: it
+/// pins the feature to the dependency-injection pattern (a moved `final` field
+/// initialized from an injected ctor param). Those params SURVIVE the
+/// extraction, so threading the param into `new Target(...)` is safe and
+/// side-effect-free. An initializer that is a method call, a computed
+/// expression, or another field (`this.grid = buildGrid()`) is NOT threaded —
+/// it may reference members being moved away, have side effects, or be ordering-
+/// sensitive; the existing behavior (declaration moves, operator handles wiring)
+/// is correct there. A field assigned more than once (conditional/complex init)
+/// is also omitted, since auto-threading one branch would be wrong.
+fn moved_field_ctor_assignments(
+    constructor: Node<'_>,
+    source: &str,
+    moved: &HashSet<&str>,
+) -> std::collections::HashMap<String, (String, (usize, usize))> {
+    let mut out: std::collections::HashMap<String, (String, (usize, usize))> =
+        std::collections::HashMap::new();
+    let param_names = constructor_parameter_names(constructor, source);
+    let mut seen_twice: HashSet<String> = HashSet::new();
+    let Some(body) = constructor.child_by_field_name("body") else {
+        return out;
+    };
+    let mut cursor = body.walk();
+    for stmt in body.named_children(&mut cursor) {
+        if stmt.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(expr) = stmt.named_child(0) else {
+            continue;
+        };
+        if expr.kind() != "assignment_expression" {
+            continue;
+        }
+        let Some(lhs) = expr.child_by_field_name("left") else {
+            continue;
+        };
+        let field_name = match lhs.kind() {
+            "field_access" => match (
+                lhs.child_by_field_name("object"),
+                lhs.child_by_field_name("field"),
+            ) {
+                (Some(obj), Some(fld)) if obj.kind() == "this" => {
+                    fld.utf8_text(source.as_bytes()).ok().map(str::to_string)
+                }
+                _ => None,
+            },
+            "identifier" => lhs.utf8_text(source.as_bytes()).ok().map(str::to_string),
+            _ => None,
+        };
+        let Some(field_name) = field_name else {
+            continue;
+        };
+        if !moved.contains(field_name.as_str()) {
+            continue;
+        }
+        let Some(rhs) = expr.child_by_field_name("right") else {
+            continue;
+        };
+        // Only a bare reference to a surviving constructor parameter qualifies.
+        if rhs.kind() != "identifier" {
+            continue;
+        }
+        let Ok(param) = rhs.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        if !param_names.contains(param) {
+            continue;
+        }
+        if out.contains_key(&field_name) {
+            seen_twice.insert(field_name);
+            continue;
+        }
+        out.insert(
+            field_name,
+            (param.to_string(), (stmt.start_byte(), stmt.end_byte())),
+        );
+    }
+    for name in seen_twice {
+        out.remove(&name);
+    }
+    out
+}
+
 pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let target_path = p
@@ -165,6 +270,43 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         });
     }
 
+    // gap-9462575f: moved fields the source constructor initializes (typically
+    // `final` DI-injected dependencies) must be threaded through the target's
+    // constructor. Their declarations move verbatim with no initializer, so
+    // without a ctor param the target has an uninitialized final field, and the
+    // source-side `this.field = <expr>;` becomes an orphan assignment to a field
+    // that no longer exists there. Capture the initializer expression verbatim
+    // (so a field/param name mismatch threads correctly) + the statement range
+    // to delete. The target ctor params + assignments are added for every wiring
+    // strategy; threading the exprs into `new Target(...)` is own_construction-
+    // only and happens at the wiring site below.
+    let moved_ctor_assignments = first_constructor_node(class_node, &parsed.source)
+        .map(|ctor| moved_field_ctor_assignments(ctor, &parsed.source, &moved_field_set))
+        .unwrap_or_default();
+    // Stable order matching the moved field declaration order.
+    let moved_threaded: Vec<MovedThreadedField> = selected_fields
+        .iter()
+        .filter_map(|f| {
+            moved_ctor_assignments
+                .get(&f.name)
+                .map(|(expr, range)| MovedThreadedField {
+                    name: f.name.clone(),
+                    type_name: f.type_name.clone(),
+                    init_expr: expr.clone(),
+                    assign_range: *range,
+                })
+        })
+        .collect();
+    // Target ctor takes captured deps, then callbacks, then the threaded moved
+    // fields. The field DECLARATIONS for the moved ones come from
+    // `moved_field_text`, so they are NOT added to `dependency_field_text` —
+    // only to the constructor param list below.
+    let mut ctor_params = all_target_ctor_params.clone();
+    ctor_params.extend(moved_threaded.iter().map(|m| JavaParameterSpec {
+        type_name: m.type_name.clone(),
+        name: m.name.clone(),
+    }));
+
     // Locate the source-side `field_declaration` node for each static-final
     // capture so we can (a) render the original declaration verbatim onto
     // the target and (b) emit a removal edit on the source.
@@ -239,13 +381,13 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .map(|param| format!("    private final {} {};", param.type_name, param.name))
         .collect::<Vec<_>>()
         .join("\n");
-    let constructor_text = if all_target_ctor_params.is_empty() {
+    let constructor_text = if ctor_params.is_empty() {
         String::new()
     } else {
         let raw = java_constructor_decl(
             &target_class_name,
             "public",
-            &all_target_ctor_params,
+            &ctor_params,
             true,
             None,
         )?;
@@ -1214,6 +1356,53 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         });
     }
 
+    // gap-9462575f: delete the now-orphaned `this.<moved> = <expr>;` source ctor
+    // assignments — the field has moved to the target, which the source now
+    // constructs (own_construction) or which an external owner populates. The
+    // initializer expression has already been threaded into the wiring args
+    // above. These statements live in the ctor body, disjoint from the moved
+    // field declarations removed above.
+    let src_bytes = parsed.source.as_bytes();
+    for m in &moved_threaded {
+        let (stmt_start, stmt_end) = m.assign_range;
+        let line_start = parsed.source[..stmt_start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(stmt_start);
+        // Only swallow the whole physical line when the statement is ALONE on
+        // it (everything before it is indentation), so no blank line is left
+        // behind. A single-line constructor body —
+        // `OrderService(Repo repo) { this.repo = repo; }` — shares the line
+        // with the signature and opening brace; deleting to line start there
+        // would eat the ctor declaration AND collide with the wiring insert at
+        // the body start. In that case delete just the statement (plus one
+        // trailing space) and leave the rest of the line intact.
+        let alone_on_line = parsed.source[line_start..stmt_start].trim().is_empty();
+        let (del_start, mut del_end) = if alone_on_line {
+            let mut end = stmt_end;
+            while end < src_bytes.len()
+                && src_bytes[end] != b'\n'
+                && src_bytes[end].is_ascii_whitespace()
+            {
+                end += 1;
+            }
+            if end < src_bytes.len() && src_bytes[end] == b'\n' {
+                end += 1;
+            }
+            (line_start, end)
+        } else {
+            (stmt_start, stmt_end)
+        };
+        if !alone_on_line && del_end < src_bytes.len() && src_bytes[del_end] == b' ' {
+            del_end += 1;
+        }
+        source_edits.push(TextEdit {
+            byte_start: del_start,
+            byte_end: del_end,
+            replacement: String::new(),
+        });
+    }
+
     // Source-side visibility widening for referenced inner types (Gap 5).
     // Widen each below-floor inner-type declaration to the floor so the
     // qualified `<SourceClass>.<InnerType>` references on the new target
@@ -1303,6 +1492,11 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             .collect();
         for spec in &callback_specs {
             args.push(format!("this::{}", spec.method_name));
+        }
+        // gap-9462575f: thread each moved-field initializer expression, in the
+        // same order they were appended to `ctor_params`.
+        for m in &moved_threaded {
+            args.push(m.init_expr.clone());
         }
         format!(
             "this.{delegate_field} = new {target_class_name}({});",

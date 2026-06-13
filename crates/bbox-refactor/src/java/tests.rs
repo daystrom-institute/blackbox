@@ -9778,3 +9778,121 @@ fn java_concurrency_audit_flags_unsafe_remove_if_on_synchronized_set() {
     assert_eq!(findings[0]["operation"], "removeIf");
     assert_eq!(findings[0]["confidence"], "high");
 }
+
+// gap-9462575f: a moved `final` field that the source constructor initializes
+// must be threaded through the extracted class's constructor — declared on the
+// target, taken as a ctor param + assigned, passed from the source-side
+// `new Target(...)`, and its now-orphaned source-ctor assignment deleted. This
+// is the dominant cost when decomposing DI-heavy god classes: the moved fields
+// are injected dependencies the source ctor wires up.
+#[test]
+fn extract_java_class_threads_moved_final_field_through_target_ctor() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Service.java");
+    let target = dir.path().join("Writer.java");
+    fs::write(
+        &source,
+        "package com.example;\n\
+         class Service {\n\
+        \x20   private final Repo repo;\n\
+        \x20   private final Logger log;\n\
+        \x20   Service(Repo repo, Logger log) {\n\
+        \x20       this.repo = repo;\n\
+        \x20       this.log = log;\n\
+        \x20   }\n\
+        \x20   void save() { repo.write(); }\n\
+        \x20   void other() { log.info(); }\n\
+         }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Writer".to_string());
+    params.delegate_field = Some("writer".to_string());
+    params.item_names = Some(vec!["save".to_string()]);
+    params.move_fields = Some(vec!["repo".to_string()]);
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    assert_eq!(plan.edits.len(), 2);
+
+    // Target carries the moved field decl, a ctor param for it, and the assignment.
+    let target_text = &plan.edits[1].edits[0].replacement;
+    assert!(
+        target_text.contains("private final Repo repo;"),
+        "target field decl: {target_text}"
+    );
+    assert!(
+        target_text.contains("public Writer(Repo repo)"),
+        "target ctor must take the moved final field as a param: {target_text}"
+    );
+    assert!(
+        target_text.contains("this.repo = repo;"),
+        "target ctor must assign the moved final field: {target_text}"
+    );
+
+    // Source threads its own ctor param into the construction and drops the orphan.
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        rewritten.contains("this.writer = new Writer(repo);"),
+        "source must thread `repo` into the delegate construction: {rewritten}"
+    );
+    assert!(
+        !rewritten.contains("this.repo = repo;"),
+        "orphaned source-ctor assignment to the moved field must be deleted: {rewritten}"
+    );
+    // The unmoved final field's wiring + declaration are untouched.
+    assert!(
+        rewritten.contains("this.log = log;"),
+        "unmoved field assignment retained: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("private final Logger log;"),
+        "unmoved field declaration retained: {rewritten}"
+    );
+}
+
+// gap-9462575f corollary: a field/parameter NAME MISMATCH in the source ctor
+// (`this.fooAdmin = foosAdmin;`) must thread the parameter expression, not the
+// field name — the exact case that cost the probe agent cells to discover.
+#[test]
+fn extract_java_class_threads_moved_field_with_name_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Holder.java");
+    let target = dir.path().join("Part.java");
+    fs::write(
+        &source,
+        "package com.example;\n\
+         class Holder {\n\
+        \x20   private final Thing fooAdmin;\n\
+        \x20   Holder(Thing foosAdmin) {\n\
+        \x20       this.fooAdmin = foosAdmin;\n\
+        \x20   }\n\
+        \x20   void use() { fooAdmin.run(); }\n\
+         }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Part".to_string());
+    params.delegate_field = Some("part".to_string());
+    params.item_names = Some(vec!["use".to_string()]);
+    params.move_fields = Some(vec!["fooAdmin".to_string()]);
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    // Threads the PARAMETER (`foosAdmin`), not the field name (`fooAdmin`).
+    assert!(
+        rewritten.contains("this.part = new Part(foosAdmin);"),
+        "must thread the ctor parameter expression, not the field name: {rewritten}"
+    );
+    // Target ctor param keeps the field's identity (`fooAdmin`).
+    let target_text = &plan.edits[1].edits[0].replacement;
+    assert!(
+        target_text.contains("this.fooAdmin = fooAdmin;"),
+        "target assigns the moved field by its own name: {target_text}"
+    );
+}

@@ -142,10 +142,13 @@ RETURNS { file, class, cluster_count, clusters, cross_cluster_calls, provenance 
     move_fields     fields touched ONLY by this cluster → java.extractClass `moveFields`
     score           cohesion 0..1 (internal touches / (internal + cross-cluster coupling));
                     higher = cleaner to extract. Singletons / low scores = weak seams.
-    expected_wiring "delegate" | "callback" | "source_instance" → java.extractClass `wiring`
-                    delegate: source holds it as a field and calls in (clean split)
-                    callback: cluster calls back into source (thread functional callbacks)
-                    source_instance: bidirectional coupling — split is not clean, reconsider
+    expected_wiring "delegate" | "callback" | "source_instance" — the cluster's COUPLING
+                    shape, a seam-QUALITY signal (NOT java.extractClass's `wiring` param,
+                    which is the DI strategy — leave that unset; see below).
+                    delegate: clean one-way split — source holds it and calls in. Extract directly.
+                    callback: cluster calls back into source — those surface as external_call
+                              findings to resolve (or pick a cleaner seam).
+                    source_instance: bidirectional coupling — not a clean seam, prefer another cluster.
     internal_field_touches / internal_calls / inbound_calls / outbound_calls — the raw counts
   cross_cluster_calls[]: {from_cluster, to_cluster, from_method, to_method} — coupling you
                     keep before deciding to split. Beware false seams: fields that are merely
@@ -156,10 +159,15 @@ RECIPE (god-class decomposition)
   const seam = a.clusters.filter(c => c.score >= 0.7 && c.item_names.length > 1)
                          .sort((x,y) => y.score - x.score)[0];   // pick the cleanest real seam
   if (!seam) { text("no clean seam — class may be genuinely cohesive or need finer analysis"); exit(); }
+  // Prefer expected_wiring === "delegate" seams (clean one-way splits).
   const r = await java.extractClass({
     file, target: `.../${seam.name_hint}.java`, delegateField: lc(seam.name_hint),
     methods: seam.item_names, moveFields: seam.move_fields,
-    className: seam.name_hint, wiring: seam.expected_wiring, wrappers: true,
+    className: seam.name_hint, wrappers: true,
+    // NOTE: do NOT pass `wiring` here. extractClass auto-selects it from the
+    // source: a Guice/DI-managed class (uses @Inject) gets external_injection
+    // so the delegate stays container-managed and AOP-interceptable. Only set
+    // wiring explicitly to force own_construction (a plain `new`-ed delegate).
   });
   // then edits.createFile/merge/apply + compile-gate, as java.describe shows"#;
 
