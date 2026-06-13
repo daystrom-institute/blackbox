@@ -182,6 +182,11 @@ fn render_parameter_list_replacement(
     let first_param_same_line = !source[params_node.start_byte()..first_start].contains('\n');
     let continuation_indent =
         detect_continuation_indent(params_node, source).unwrap_or_else(|| "    ".to_string());
+    let closing_on_own_line = original
+        .lines()
+        .last()
+        .map(|line| line.trim() == ")")
+        .unwrap_or(false);
 
     if first_param_same_line {
         let mut out = format!("({}", kept[0].0);
@@ -203,8 +208,10 @@ fn render_parameter_list_replacement(
         out.push_str(&continuation_indent);
         out.push_str(text);
     }
-    out.push('\n');
-    out.push_str(&closing_indent);
+    if closing_on_own_line {
+        out.push('\n');
+        out.push_str(&closing_indent);
+    }
     out.push(')');
     out
 }
@@ -355,7 +362,7 @@ mod tests {
         let (_, _, replacement) = plan.edit.expect("edit produced");
         assert_eq!(
             replacement,
-            "(final Logger log,\n     final UserAdmin userAdmin)"
+            "(final Logger log,\n      final UserAdmin userAdmin)"
         );
     }
 
