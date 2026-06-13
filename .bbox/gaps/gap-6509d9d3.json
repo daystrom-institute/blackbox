@@ -1,0 +1,22 @@
+{
+  "id": "gap-6509d9d3",
+  "title": "Edit algebra lacks batch createFile operation",
+  "gap_kind": "tooling",
+  "domain": "edit algebra",
+  "wanted_capability": "An edits operation that accepts multiple `{path, content}` creates in one call so transforms that create several files do not need model-authored loops.",
+  "missing_primitive": "edits.createFiles",
+  "fallback_used": "Looped over `creates` and called `edits.createFile` once per file.",
+  "evidence": [
+    "thread-370679a5",
+    "session:cb377cca-dc09-4487-91a1-1701cd691812"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/edits/batch-create-files",
+  "notes": "This probe only created one file, so it was not painful here; the resumed probe flagged it as a scaling issue for sweeps.",
+  "resolution": "unresolved",
+  "session_id": "cb377cca-dc09-4487-91a1-1701cd691812",
+  "thread_id": "thread-370679a5",
+  "created_at": "2026-06-13T18:04:47Z",
+  "updated_at": "2026-06-13T18:04:47Z"
+}

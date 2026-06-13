@@ -1,0 +1,23 @@
+{
+  "id": "gap-0d3648fc",
+  "title": "Invalid streamed tool JSON silently becomes empty tool args",
+  "gap_kind": "tooling",
+  "domain": "bro-harness structured tool calls",
+  "wanted_capability": "When an Anthropic-compatible provider streams invalid `input_json_delta` for a tool call, the harness should fail closed or surface a parse error instead of parsing it as `{}` and letting terminal structured outputs silently lose data.",
+  "missing_primitive": "strict tool input JSON parse failure reporting",
+  "fallback_used": "Used the textual retrospective and raw JSONL deltas to recover the probe feedback.",
+  "evidence": [
+    "thread-370679a5",
+    "session:cb377cca-dc09-4487-91a1-1701cd691812",
+    "file:crates/bro-harness/src/transport/anthropic.rs"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/harness/invalid-tool-json-silent-empty-args",
+  "notes": "Observed on the DeepSeek isolate probe retrospective: the provider streamed unquoted string values in `final_result` input_json_delta; `parse_tool_input` returned `{}`. The turn completed successfully with result `{}`, hiding the schema failure.",
+  "resolution": "unresolved",
+  "session_id": "cb377cca-dc09-4487-91a1-1701cd691812",
+  "thread_id": "thread-370679a5",
+  "created_at": "2026-06-13T18:04:47Z",
+  "updated_at": "2026-06-13T18:04:47Z"
+}
