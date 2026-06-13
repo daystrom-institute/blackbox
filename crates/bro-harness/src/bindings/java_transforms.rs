@@ -236,6 +236,16 @@ struct ExtractClassParams {
     /// external callers keep compiling (v1 `source_delegate_wrappers`).
     #[serde(default, alias = "keepPublicApi")]
     wrappers: Option<bool>,
+    /// Run full analysis/synthesis but omit the heavy edit/create payloads.
+    /// Agents use this to inspect findings on risky seams before carrying the
+    /// full target text through the isolate.
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
 }
 
 #[async_trait]
@@ -257,7 +267,8 @@ impl Tool for JavaExtractClass {
                 "moveFields": { "type": "array", "items": { "type": "string" }, "description": "Field names to move with the methods (mutable fields written by extracted code MUST be listed here)." },
                 "className": { "type": "string", "description": "Name for the new class (default: derived from target filename)." },
                 "wiring": { "type": "string", "enum": ["own_construction", "external_injection", "none"], "description": "How the source obtains the delegate. AUTO-SELECTED from the source — leave unset: a Guice/DI source (@Inject) gets external_injection (delegate stays container-managed + AOP-interceptable); a non-DI source gets own_construction. Set only to force a choice." },
-                "wrappers": { "type": "boolean", "description": "Keep thin delegating wrappers for the moved methods on the source class, preserving its public API. Pass true whenever callers OUTSIDE this file use the moved methods." }
+                "wrappers": { "type": "boolean", "description": "Keep thin delegating wrappers for the moved methods on the source class, preserving its public API. Pass true whenever callers OUTSIDE this file use the moved methods." },
+                "previewOnly": { "type": "boolean", "description": "Run the full planner but omit heavy change/create payloads. Use this for risky seams to inspect findings and dependency_projection before re-calling without previewOnly to apply." }
             },
             "required": ["file", "target", "delegateField", "methods"]
         })
@@ -276,7 +287,7 @@ impl Tool for JavaExtractClass {
             Ok(p) => p,
             Err(e) => {
                 return err(format!(
-                    "java.extractClass: bad input — expected {{ file, target, delegateField, methods: string[], moveFields?, className?, wiring? }}; {e}"
+                    "java.extractClass: bad input — expected {{ file, target, delegateField, methods: string[], moveFields?, className?, wiring?, previewOnly? }}; {e}"
                 ));
             }
         };
@@ -402,6 +413,9 @@ impl Tool for JavaExtractClass {
             let empty_sha = bbox_refactor::sha256_hex(&[]);
             let mut changes: Vec<Value> = Vec::new();
             let mut creates: Vec<Value> = Vec::new();
+            let mut would_change_files: Vec<Value> = Vec::new();
+            let mut would_create_files: Vec<Value> = Vec::new();
+            let preview_only = params.preview_only.unwrap_or(false);
             for file_edit in &plan.edits {
                 let rel = match relativize(&root, &file_edit.path) {
                     Ok(r) => r,
@@ -418,19 +432,36 @@ impl Tool for JavaExtractClass {
                         .iter()
                         .map(|e| e.replacement.as_str())
                         .collect();
-                    creates.push(json!({ "path": rel, "content": content }));
+                    would_create_files.push(json!({
+                        "path": rel,
+                        "bytes": content.len(),
+                    }));
+                    if !preview_only {
+                        creates.push(json!({ "path": rel, "content": content }));
+                    }
                     continue;
                 }
-                for edit in &file_edit.edits {
-                    changes.push(json!({
-                        "span": {
-                            "file": rel,
-                            "byte_start": edit.byte_start,
-                            "byte_end": edit.byte_end,
-                            "content_sha256": file_edit.original_sha256,
-                        },
-                        "new_text": edit.replacement,
+                if !file_edit.edits.is_empty() {
+                    let replacement_bytes: usize =
+                        file_edit.edits.iter().map(|e| e.replacement.len()).sum();
+                    would_change_files.push(json!({
+                        "path": rel,
+                        "edit_count": file_edit.edits.len(),
+                        "replacement_bytes": replacement_bytes,
                     }));
+                }
+                for edit in &file_edit.edits {
+                    if !preview_only {
+                        changes.push(json!({
+                            "span": {
+                                "file": rel,
+                                "byte_start": edit.byte_start,
+                                "byte_end": edit.byte_end,
+                                "content_sha256": file_edit.original_sha256,
+                            },
+                            "new_text": edit.replacement,
+                        }));
+                    }
                 }
             }
             for create in &plan.file_creates {
@@ -438,7 +469,13 @@ impl Tool for JavaExtractClass {
                     Ok(r) => r,
                     Err(e) => return err(format!("java.extractClass: {e}")),
                 };
-                creates.push(json!({ "path": rel, "content": create.content }));
+                would_create_files.push(json!({
+                    "path": rel,
+                    "bytes": create.content.len(),
+                }));
+                if !preview_only {
+                    creates.push(json!({ "path": rel, "content": create.content }));
+                }
             }
 
             // The v1 analysis structs ARE the findings vocabulary
@@ -480,6 +517,9 @@ impl Tool for JavaExtractClass {
                 "creates": creates,
                 "findings": findings,
                 "dependency_projection": dependency_projection,
+                "preview_only": preview_only,
+                "would_change_files": would_change_files,
+                "would_create_files": would_create_files,
                 "fixme_count": fixme_count,
                 "provenance": "syntax_only",
             }))
@@ -527,8 +567,13 @@ PARAMS
                           source calls a moved method, pass wrappers: true or their compile breaks.
                           Caller survey is one call: code.query({ files: (await code.files({ language: "java" })).files.map(f => f.file),
                           query: "(method_invocation name: (identifier) @call)" }) then filter @call by method name.
+  previewOnly?: boolean   run the same planner but return [] for changes/creates and use
+                          would_change_files/would_create_files summaries instead. Use this on
+                          risky seams to inspect findings + dependency_projection before carrying
+                          full edit payloads through the isolate. Re-call without previewOnly to apply.
 
-RETURNS { title, changes, creates, findings, dependency_projection, fixme_count, provenance }
+RETURNS { title, changes, creates, findings, dependency_projection, preview_only,
+          would_change_files, would_create_files, fixme_count, provenance }
   changes:  hash-anchored {span, new_text}[] → edits.merge
   creates:  {path, content}[]               → edits.createFile (one call each)
   dependency_projection: compact pre-apply summary of which captured fields will become target
@@ -750,12 +795,12 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
         description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); composes after extractClass+apply."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
-type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; fixme_count: number; provenance: "syntax_only" };
+type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
-  extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean }): Promise<JavaTransformResult>;
+  extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
 };"#
@@ -870,6 +915,68 @@ public class OrderService {
             span["content_sha256"],
             bbox_refactor::sha256_hex(FIXTURE.as_bytes()),
             "{span}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_only_omits_edit_payloads_but_keeps_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(root.join("src/com/acme/OrderService.java"), FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderPricing.java",
+                        "delegateField": "pricing",
+                        "methods": ["price", "discount"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(result["preview_only"], true, "{result}");
+        assert!(
+            result["changes"].as_array().unwrap().is_empty(),
+            "preview should not ship edit payloads: {result}"
+        );
+        assert!(
+            result["creates"].as_array().unwrap().is_empty(),
+            "preview should not ship create payloads: {result}"
+        );
+        assert!(
+            result["would_change_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "src/com/acme/OrderService.java"),
+            "preview should summarize source edits: {result}"
+        );
+        assert!(
+            result["would_create_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == "src/com/acme/OrderPricing.java"),
+            "preview should summarize target creation: {result}"
+        );
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| { f["finding"] == "captured_dependency" && f["name"] == "taxRate" }),
+            "preview should still include dependency findings: {result}"
+        );
+        assert_eq!(
+            result["dependency_projection"]["constructor_param_count"], 1,
+            "{result}"
         );
     }
 
