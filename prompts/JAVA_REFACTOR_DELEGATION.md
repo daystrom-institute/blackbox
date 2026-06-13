@@ -44,9 +44,11 @@ restate them:
   before extraction to decide whether `wrappers: true` is needed, and for cheap
   blast-radius checks. `analysis.describe`.
 - **`java.extractClass({ file, target, delegateField, methods, moveFields?,
-  wrappers? })`** — moves methods + fields into a new delegate class, synthesizes
-  both sides, returns `{ changes, creates, findings }` for the edits algebra.
-  `java.describe({ transform: "extractClass" })`.
+  wrappers?, previewOnly? })`** — moves methods + fields into a new delegate
+  class, synthesizes both sides, returns `{ changes, creates, findings,
+  dependency_projection }` for the edits algebra. `previewOnly` runs the same
+  planner but omits heavy edit payloads so a risky seam can be inspected before
+  applying. `java.describe({ transform: "extractClass" })`.
 - **`java.removeUnusedConstructorParams({ file })`** — drops dead `@Inject`
   constructor params left after an extract strands a dependency (moves the
   injection point). Returns `{ changes, ... }`. `java.describe`.
@@ -74,10 +76,14 @@ god class":
    Guice AOP. (`own_construction` `new`s up the delegate — invisible to Guice
    method interception. Only force it when AOP is irrelevant, e.g. AspectJ
    weaving or a non-DI source.)
-4. `edits.begin → createFile(s) → merge(changes) → apply`.
-5. **Compile-gate** with the project's incremental build (the post-apply truth
+4. Inspect `dependency_projection`. A clean service seam should have
+   injectable/provider captures or no captures. If it flags non-injectable
+   constructor params, choose a cleaner seam, move the field, or make the
+   binding decision explicit before applying.
+5. `edits.begin → createFile(s) → merge(changes) → apply`.
+6. **Compile-gate** with the project's incremental build (the post-apply truth
    that tree-sitter validation cannot give you).
-6. `java.removeUnusedConstructorParams({ file })` → merge/apply → re-compile.
+7. `java.removeUnusedConstructorParams({ file })` → merge/apply → re-compile.
    Run it **after** the extract is applied — the orphaned `this.dep = dep` must
    already be gone for the param to read as unused. This fully *moves* the
    injection point rather than leaving dead `@Inject` params on the source.
@@ -94,7 +100,15 @@ A good brief is a **task with guardrails**, not a script. Tell it:
   `expected_wiring` value as `java.extractClass`'s `wiring`: they are different
   axes — cohesion *topology* vs DI *strategy*. This conflation is a real trap.)
 - Use `wrappers` to preserve the public API; survey callers first.
+- Use `previewOnly` only when the seam is genuinely risky or ambiguous: mixed
+  mutable state, unclear captured dependencies, source-instance callbacks, or a
+  large edit payload. Do not add a mandatory preview tax to clean service-only
+  seams; the normal call already returns `dependency_projection`.
 - The exact **compile-gate command** for the project.
+- Prefer `shell_run`'s host-side `output_filter` for noisy compile gates. It
+  preserves the primary command exit status because filtering happens after
+  capture. Report the unfiltered command as the gate even when you filter the
+  rendered output.
 - That transforms are **not idempotent** — a target-exists refusal after a
   successful apply means that step is DONE, not a retry (without this, agents
   shell-delete the created file and loop).
@@ -103,8 +117,9 @@ A good brief is a **task with guardrails**, not a script. Tell it:
 - **One concern per dispatch.** Decomposing a god class is many extractions;
   each is its own dispatch against a fresh seam survey.
 - A **structured return JSON** so you can verify without reading the transcript:
-  `{ concern, cluster_score, methods_moved, fields_moved, delegate_is_inject,
-  injection_point_moved, params_removed, applied, compile, cells_used, summary }`.
+  `{ concern, cluster_score, methods_moved, fields_moved, preview_used,
+  dependency_projection, delegate_is_inject, injection_point_moved,
+  params_removed, applied, compile, cells_used, summary }`.
 
 ## Dispatch mechanics
 
@@ -140,14 +155,19 @@ A good brief is a **task with guardrails**, not a script. Tell it:
 - **external_injection needs every ctor param injectable.** Captured (read-not-
   moved) deps become the delegate's `@Inject` params; if one is non-injectable
   view state, the build compiles but Guice can't wire it. Pick clean
-  service-cluster seams.
+  service-cluster seams. `dependency_projection` now calls this out before you
+  apply.
+- **Do not pipe the build through `head`/`tail`/short-circuiting filters.** Use
+  `shell_run({ output_filter })` when the build is noisy, or run the bare gate.
+  The returned `exit_code` must be the build's exit code, not a filter's.
 
 ## Your verify loop (don't trust the self-report)
 
 The dispatched agent's final JSON is a claim, not evidence. As orchestrator:
 
 1. **Re-run the compile-gate yourself** on the worktree. Exit 0 or it didn't
-   happen.
+   happen. If you filter output, use `shell_run`'s `output_filter`, not a shell
+   pipeline, and keep the exact unfiltered command in the run record.
 2. **Inspect the diff.** Is the delegate an `@Inject` bean (not `new`-ed)? Did
    the source get it injected? Did the injection point actually move (source ctor
    shrank), or are dead params left? Did mutable state move as plain fields, not

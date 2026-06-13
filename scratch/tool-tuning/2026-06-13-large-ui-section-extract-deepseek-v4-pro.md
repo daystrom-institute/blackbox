@@ -285,3 +285,32 @@ Remaining code construct candidates:
 - Pre-extract captured-dependency projection for `java.extractClass`.
 - Optional dry-run/preview mode for `java.extractClass` when a seam is less
   obviously safe than this one.
+
+## Probe 4 Follow-Up Implementation
+
+The three reusable construct candidates are now implemented in the public
+tooling surface:
+
+- `shell_run`/`shell_poll`/`shell_kill` accept `output_filter`, a host-side
+  matching-line filter applied after capture. The returned `exit_code` remains
+  the primary shell command's exit code.
+- `java.extractClass` returns `dependency_projection` and per-capture
+  `captured_dependency` findings so captured-but-not-moved fields are visible
+  before applying edits.
+- `java.extractClass` accepts `previewOnly` for risky seams. It runs the same
+  planner and returns findings/projection plus file-size summaries, but omits
+  heavy edit/create payloads.
+
+The Java delegation recipe was updated to make these the desired path without
+adding mandatory probe overhead: clean service-only seams can use a normal
+`java.extractClass` call and read `dependency_projection`; ambiguous seams use
+`previewOnly` first; noisy compile gates use `output_filter` instead of shell
+pipes.
+
+Probe 5 should rerun the same unit against the same provider and measure:
+
+- whether compile output filtering avoids noisy-output pressure without losing
+  the real build status;
+- whether `dependency_projection` changes the bro's pre-apply reasoning;
+- whether `previewOnly` is used only if the bro identifies real seam risk;
+- whether cells/tool calls drop or at least stop shifting into workaround code.
