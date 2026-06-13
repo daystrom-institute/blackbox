@@ -86,6 +86,19 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
     if route == "all" {
         return Ok(Bucket::ALL.to_vec());
     }
+    // Every route except the transcript corpus (whose rebuild is guarded
+    // behind include_transcripts because it is a heavy scan). This is the
+    // residue-convergence sweep the nightly embed-compaction arc runs so
+    // items that predate a route or were dropped after retries eventually
+    // embed (gap-b9d39c10): enqueue dedupes already-embedded items, so the
+    // sweep is idempotent.
+    if route == "backfill" {
+        return Ok(Bucket::ALL
+            .iter()
+            .copied()
+            .filter(|bucket| *bucket != Bucket::Transcripts)
+            .collect());
+    }
     Bucket::ALL
         .iter()
         .copied()
@@ -93,7 +106,7 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
         .map(|bucket| vec![bucket])
         .with_context(|| {
             format!(
-                "unknown embedding route `{route}`; expected one of: all, {}",
+                "unknown embedding route `{route}`; expected one of: all, backfill, {}",
                 Bucket::ALL
                     .iter()
                     .map(|bucket| bucket.as_str())
@@ -654,6 +667,12 @@ fn contradiction_threshold() -> f32 {
         .read()
 }
 
+/// Coverage below this with an idle queue marks a route `stalled`: the
+/// residue exists but nothing is enqueueing it, so it will never converge
+/// without an explicit backfill (gap-b9d39c10 — git_message sat at 0%
+/// coverage with queue_depth=0 and health=ok).
+const STALLED_COVERAGE_THRESHOLD: f32 = 0.98;
+
 pub(crate) fn status_response_for_buckets(
     stores: &crate::providers::CorpusStores<'_>,
     buckets: &[Bucket],
@@ -672,7 +691,30 @@ pub(crate) fn status_response_for_buckets(
         };
     }
     queue::normalize_route_statuses(&mut response);
+    apply_stall_health(&mut response);
     Ok(response)
+}
+
+/// Runs after `normalize_route_statuses` (which owns the error-driven
+/// `ok`/`unavailable` states): an available route whose coverage sits under
+/// the threshold with an EMPTY queue is not "ok" — it is residue that is
+/// never being enqueued. Health only signalled errors before; convergence
+/// failures were invisible (gap-b9d39c10).
+fn apply_stall_health(response: &mut EmbedStatusResponse) {
+    for (route, status) in response.routes.iter_mut() {
+        if !status.available || status.queue_depth > 0 {
+            continue;
+        }
+        let Some(ratio) = status.coverage_ratio else {
+            continue;
+        };
+        if ratio < STALLED_COVERAGE_THRESHOLD {
+            status.health = "stalled".into();
+            status.health_reason = Some(format!(
+                "coverage {ratio:.3} with idle queue — unembedded residue is not being enqueued; run bbox_reembed(route=\"{route}\") or wait for the nightly backfill"
+            ));
+        }
+    }
 }
 
 pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
@@ -685,10 +727,20 @@ pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
         Bucket::Threads,
         Bucket::AgentManifest,
     ];
-    Ok(serde_json::to_string_pretty(&status_response_for_buckets(
-        &state.corpus_stores(),
-        STATUS_COVERAGE_BUCKETS,
-    )?)?)
+    let mut response =
+        status_response_for_buckets(&state.corpus_stores(), STATUS_COVERAGE_BUCKETS)?;
+    // Transcript coverage is deliberately not computed here (it is a heavy
+    // corpus scan); say so explicitly instead of reporting a null that is
+    // indistinguishable from a broken route (gap-b9d39c10).
+    if let Some(status) = response.routes.get_mut(Bucket::Transcripts.as_str()) {
+        if status.coverage_ratio.is_none() {
+            status.coverage_state = Some(
+                "guarded: coverage not computed (heavy corpus scan); rebuild via bbox_reembed(route=\"transcripts\", include_transcripts=true)"
+                    .into(),
+            );
+        }
+    }
+    Ok(serde_json::to_string_pretty(&response)?)
 }
 
 pub(crate) fn agent_manifest_embedding(
@@ -973,6 +1025,85 @@ mod tests {
         );
         let err = buckets_for_reembed_route("missing").unwrap_err();
         assert!(err.to_string().contains("unknown embedding route"));
+    }
+
+    /// `backfill` is the nightly residue-convergence sweep: every bucket
+    /// except the guarded transcript corpus (gap-b9d39c10).
+    #[test]
+    fn reembed_backfill_route_covers_all_but_transcripts() {
+        let buckets = buckets_for_reembed_route("backfill").unwrap();
+        assert!(!buckets.contains(&Bucket::Transcripts));
+        assert_eq!(buckets.len(), Bucket::ALL.len() - 1);
+        for bucket in Bucket::ALL {
+            if bucket != Bucket::Transcripts {
+                assert!(buckets.contains(&bucket), "missing {bucket:?}");
+            }
+        }
+    }
+
+    /// An available route with residue (coverage under threshold) and an
+    /// EMPTY queue is `stalled`, not `ok` — that state previously read as
+    /// healthy while git_message sat at 0% forever (gap-b9d39c10). A busy
+    /// queue, full coverage, or an error-driven `unavailable` all keep
+    /// their existing health.
+    #[test]
+    fn stall_health_flags_low_coverage_with_idle_queue() {
+        use crate::embed::queue::RouteStatus;
+
+        let mut response = EmbedStatusResponse {
+            routes: Default::default(),
+        };
+        response.routes.insert(
+            "git_message".into(),
+            RouteStatus {
+                coverage_ratio: Some(0.0),
+                ..Default::default()
+            },
+        );
+        response.routes.insert(
+            "notes".into(),
+            RouteStatus {
+                coverage_ratio: Some(0.684),
+                queue_depth: 120,
+                ..Default::default()
+            },
+        );
+        response.routes.insert(
+            "code".into(),
+            RouteStatus {
+                coverage_ratio: Some(1.0),
+                ..Default::default()
+            },
+        );
+        response.routes.insert(
+            "knowledge".into(),
+            RouteStatus {
+                available: false,
+                health: "unavailable".into(),
+                health_reason: Some("credentials".into()),
+                coverage_ratio: Some(0.2),
+                ..Default::default()
+            },
+        );
+        apply_stall_health(&mut response);
+
+        let git = &response.routes["git_message"];
+        assert_eq!(git.health, "stalled");
+        assert!(
+            git.health_reason
+                .as_deref()
+                .unwrap()
+                .contains("bbox_reembed"),
+        );
+        assert_eq!(
+            response.routes["notes"].health, "ok",
+            "busy queue means residue is draining"
+        );
+        assert_eq!(response.routes["code"].health, "ok");
+        assert_eq!(
+            response.routes["knowledge"].health, "unavailable",
+            "error-driven health wins over stall detection"
+        );
     }
 
     #[test]

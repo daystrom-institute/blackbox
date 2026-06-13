@@ -1,8 +1,9 @@
 {
   "name": "embed-compaction-arc",
-  "version": 2,
+  "version": 3,
   "policy_packet": "domain:workflow-policy/arc-budget",
   "vars_schema": {
+    "backfill_result": { "kind": "object" },
     "vector_status": { "kind": "object" },
     "search_quiesced": { "kind": "bool" },
     "rebuild_started": { "kind": "bool" },
@@ -11,8 +12,27 @@
     "notified": { "kind": "bool" }
   },
   "actors": {},
-  "start": "Setup",
+  "start": "BackfillResidue",
   "nodes": {
+    "BackfillResidue": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "into_var": "backfill_result",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_reembed",
+            "arguments": {
+              "route": "backfill",
+              "max_entities": 50000
+            }
+          },
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "Setup" }
+    },
     "Setup": {
       "actor": "",
       "on_enter": [

@@ -10,6 +10,17 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Embedding coverage now converges and says so when it can't
+  (gap-b9d39c10): `bbox_embed_status` reports health=`stalled` (with a
+  health_reason naming the fix) when an available route's coverage sits
+  under threshold with an idle queue — previously that state read as
+  health=ok forever (git_message sat at 0% coverage invisibly). The
+  transcripts route reports an explicit `coverage_state` ("guarded: …")
+  instead of a null indistinguishable from broken. `bbox_reembed` gains
+  `route="backfill"` — an idempotent residue sweep of every route except
+  guarded transcripts — and `embed-compaction-arc` v3 runs it nightly so
+  items that predate a route or were dropped after retries eventually
+  embed.
 - Inactive workspace-snapshot retention is now budget-bounded
   (gap-efd270dd): `bbox_storage_gc` gains `max_snapshots_per_workspace`
   (default 32) and `max_snapshot_total_bytes_per_workspace` (default

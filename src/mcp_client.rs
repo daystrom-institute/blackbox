@@ -31,6 +31,44 @@ use tokio::time::timeout;
 
 use crate::orchestration::mcp::{McpServerConfig, McpStore, global_store_path, project_store_path};
 
+/// Test-only override for `call_tool`. Workflow tests that walk shipped
+/// arcs hit `mcp_call` nodes which would otherwise resolve the OPERATOR'S
+/// global MCP registry and call a live daemon — a test-isolation violation
+/// (and a rustls "No provider set" panic in processes that never ran
+/// daemon startup). Tests install a hook that answers the call in-process;
+/// the RAII guard uninstalls on drop.
+#[cfg(test)]
+pub(crate) mod test_call_hook {
+    use parking_lot::RwLock;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    type Hook = Arc<
+        dyn Fn(&str, &str, &serde_json::Map<String, Value>) -> anyhow::Result<Value>
+            + Send
+            + Sync,
+    >;
+
+    static HOOK: RwLock<Option<Hook>> = RwLock::new(None);
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn install(hook: Hook) -> Guard {
+        *HOOK.write() = Some(hook);
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *HOOK.write() = None;
+        }
+    }
+
+    pub(crate) fn get() -> Option<Hook> {
+        HOOK.read().clone()
+    }
+}
+
 /// Resolve the named MCP server from the merged global+project store.
 /// Returns the entry's transport config + a flag indicating which
 /// store it came from (for diagnostics).
@@ -75,6 +113,10 @@ pub async fn call_tool(
     project_dir: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(hook) = test_call_hook::get() {
+        return hook(server_name, tool_name, &arguments);
+    }
     let cfg = resolve_server(server_name, project_dir)?;
     let dur = Duration::from_secs(timeout_secs.max(1));
     let result = timeout(dur, do_call(cfg, tool_name, arguments, cwd)).await;

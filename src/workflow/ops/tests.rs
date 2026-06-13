@@ -1186,6 +1186,20 @@ async fn embed_compaction_arc_gates_against_vector_status_vars() {
     let tmp = tempfile::tempdir().unwrap();
     let vector_store = Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
     let _guard = vectors::install_test_global(vector_store.clone());
+    // The v3 arc opens with a BackfillResidue mcp_call (bbox_reembed
+    // route=backfill). Answer it in-process — without the hook the op
+    // resolves the operator's GLOBAL MCP registry and would call a live
+    // daemon from a test.
+    let _mcp_guard = crate::mcp_client::test_call_hook::install(Arc::new(|server, tool, args| {
+        assert_eq!(server, "blackbox");
+        assert_eq!(tool, "bbox_reembed");
+        assert_eq!(
+            args.get("route").and_then(Value::as_str),
+            Some("backfill"),
+            "nightly backfill must sweep the non-transcript routes"
+        );
+        Ok(serde_json::json!({"status": "queue_refill_started"}))
+    }));
     let route = "test-compaction-route";
     for idx in 0..10 {
         let theta = idx as f32 * 0.01;
@@ -1242,6 +1256,10 @@ async fn embed_compaction_arc_gates_against_vector_status_vars() {
     .await;
 
     assert_eq!(result.status, "completed");
+    assert!(
+        result.vars.get("backfill_result").is_some(),
+        "BackfillResidue must capture the reembed response"
+    );
     assert_eq!(result.vars.get("rebuild_started"), Some(&Value::Bool(true)));
     assert_eq!(result.vars.get("swapped"), Some(&Value::Bool(true)));
     assert!(result.events.iter().any(|event| {

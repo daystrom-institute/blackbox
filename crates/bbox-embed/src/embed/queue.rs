@@ -45,6 +45,11 @@ pub struct RouteStatus {
     pub retried_count: u64,
     pub last_error: Option<String>,
     pub coverage_ratio: Option<f32>,
+    /// Why `coverage_ratio` is absent when it is deliberately not computed
+    /// (e.g. transcripts: the corpus scan is too heavy for a status call).
+    /// Distinguishes "guarded" from "broken" (gap-b9d39c10).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_state: Option<String>,
 }
 
 impl Default for RouteStatus {
@@ -64,6 +69,7 @@ impl Default for RouteStatus {
             retried_count: 0,
             last_error: None,
             coverage_ratio: None,
+            coverage_state: None,
         }
     }
 }
