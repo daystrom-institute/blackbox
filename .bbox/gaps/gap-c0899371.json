@@ -1,0 +1,26 @@
+{
+  "id": "gap-c0899371",
+  "title": "Pre-extract Java field classification is missing",
+  "gap_kind": "refactor_primitive",
+  "domain": "java-refactor",
+  "wanted_capability": "A pre-transform analysis that classifies candidate fields as static/final constants, mutable instance state, injected/provider dependencies, and read/write participants by method.",
+  "missing_primitive": "analysis.fieldClassification({ file, fields })",
+  "fallback_used": "The probe cross-referenced cohesion cluster move_fields, raw modifier queries, and post-hoc extractClass captured-variable findings.",
+  "evidence": [
+    "probe:large-ui-section-extract-deepseek-v4-pro-2",
+    "scratch/tool-tuning/2026-06-13-large-ui-section-extract-deepseek-v4-pro.md"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/java-refactor/field-classification",
+  "suggested_owner": "blackbox",
+  "notes": "Genericized from a private Java refactor probe. Raw modifier query results were misleading; the transform findings later identified mutable moved state correctly.",
+  "resolution": "addressed",
+  "task_id": "3495eb89-27d4-4c18-a1a0-27e79133821a",
+  "session_id": "39b336cc-514f-4118-a7f3-d23e62f2147c",
+  "provider": "deepseek",
+  "created_at": "2026-06-13T21:07:36Z",
+  "updated_at": "2026-06-13T21:22:36Z",
+  "resolved_at": "2026-06-13T21:22:36Z",
+  "resolution_note": "Implemented analysis.fieldClassification({ file, fields?, className? }) as a Java pre-extract field state surface. It classifies static-final constants, injected/provider fields, mutable instance state, and read/write sites grouped by enclosing method for seam planning."
+}

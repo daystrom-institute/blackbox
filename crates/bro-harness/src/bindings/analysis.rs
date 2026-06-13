@@ -49,6 +49,15 @@ struct ReferencesParams {
     declaring_class: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct FieldClassificationParams {
+    file: String,
+    #[serde(default)]
+    fields: Option<Vec<String>>,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+}
+
 #[async_trait]
 impl Tool for AnalysisCohesionClusters {
     fn name(&self) -> &str {
@@ -269,6 +278,127 @@ impl Tool for AnalysisReferences {
     }
 }
 
+/// `analysis.fieldClassification` — pre-extract field state/read-write facts
+/// for Java classes.
+pub struct AnalysisFieldClassification;
+
+fn field_classification_payload(
+    file: &str,
+    found: &bbox_refactor::facts::FileJavaFieldClassificationFacts,
+) -> Value {
+    let fields: Vec<Value> = found
+        .fields
+        .iter()
+        .map(|field| {
+            let accesses: Vec<Value> = field
+                .accesses
+                .iter()
+                .map(|access| {
+                    json!({
+                        "method": access.method,
+                        "kind": access.kind,
+                        "line": access.line,
+                        "column": access.column,
+                        "context": access.context,
+                    })
+                })
+                .collect();
+            json!({
+                "name": field.name,
+                "type": field.type_text,
+                "owner_class": field.owner_class,
+                "visibility": field.visibility,
+                "modifiers": field.modifiers,
+                "annotations": field.annotations,
+                "is_static_final": field.is_static_final,
+                "is_mutable_instance": field.is_mutable_instance,
+                "is_injected": field.is_injected,
+                "injection_style": field.injection_style,
+                "is_provider": field.is_provider,
+                "reads": field.reads,
+                "writes": field.writes,
+                "read_by": field.read_by,
+                "written_by": field.written_by,
+                "accesses": accesses,
+            })
+        })
+        .collect();
+    json!({
+        "file": file,
+        "language": found.language,
+        "content_sha256": found.content_sha256,
+        "source_len": found.source_len,
+        "fields": fields,
+        "provenance": "syntax_only",
+    })
+}
+
+#[async_trait]
+impl Tool for AnalysisFieldClassification {
+    fn name(&self) -> &str {
+        "analysis.fieldClassification"
+    }
+    fn description(&self) -> &str {
+        "Classify Java fields before extraction: static/final vs mutable instance state, injection/provider hints, and read/write sites grouped by enclosing method. Use this before java.extractClass when deciding whether moved fields are constants, dependencies, or mutable view state. Pure; syntax_only; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative .java source file." },
+                "fields": { "type": "array", "items": { "type": "string" }, "description": "Optional field names to classify. Omit to classify every field in the file/class." },
+                "className": { "type": "string", "description": "Optional owner class name to restrict the field set." }
+            },
+            "required": ["file"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("analysis".to_string(), "fieldClassification".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: FieldClassificationParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "analysis.fieldClassification: bad input — expected {{ file, fields?: string[] }}; {e}"
+                ));
+            }
+        };
+        if params.fields.as_ref().is_some_and(Vec::is_empty) {
+            return err("analysis.fieldClassification: `fields`, when passed, must be non-empty");
+        }
+        let path = match bro_tools::workspace::resolve_in_root(&cx.root, &params.file) {
+            Ok(path) => path,
+            Err(e) => {
+                return err(format!(
+                    "analysis.fieldClassification: {}: {e}",
+                    params.file
+                ));
+            }
+        };
+        let file = params.file;
+        let fields = params.fields;
+        let class_name = params.class_name;
+        bro_tools::tool::call_blocking(
+            move || match bbox_refactor::facts::java_field_classification(
+                &path,
+                fields.as_deref(),
+                class_name.as_deref(),
+            ) {
+                Ok(found) => ToolResult::Json(field_classification_payload(&file, &found)),
+                Err(e) => err(format!("analysis.fieldClassification: {e:#}")),
+            },
+        )
+        .await
+    }
+}
+
 /// `analysis.describe` — depth-on-demand contract for one analysis (matches
 /// the java.describe pattern; the namespace index stays a compact one-liner).
 pub struct AnalysisDescribe;
@@ -376,6 +506,45 @@ RECIPE
   const r = await java.extractClass({ ..., wrappers: hasExternalCallers });
 "#;
 
+const FIELD_CLASSIFICATION_CONTRACT: &str = r#"analysis.fieldClassification — classify Java field declarations before extraction.
+
+WHAT IT DOES
+  Reads one Java file and returns a reduced per-field answer:
+  declaration kind (static/final/mutable), injection/provider hints, and read/write
+  sites grouped by enclosing method. Injection hints cover both @Inject field
+  annotations and @Inject constructors that assign this.field = param. This is
+  the pre-extract answer to "are these move_fields constants, dependencies, or
+  mutable source state?" Use it instead of raw field_declaration modifier queries.
+
+PARAMS
+  file: string        workspace-relative .java file
+  fields?: string[]   optional field names to classify; omit for all fields
+  className?: string  optional owner class restriction
+
+RETURNS { file, language, content_sha256, source_len, fields, provenance }
+  fields[]:
+    name, type, owner_class, visibility, modifiers, annotations
+    is_static_final       true for constants that can usually move as constants
+    is_mutable_instance   true for non-static, non-final instance state
+    is_injected           declaration has @Inject, or @Inject ctor assigns this.field = param
+    injection_style       "field_annotation" | "constructor_param" | null
+    is_provider           declared type is a Provider-like type
+    reads / writes        access counts in the current source file
+    read_by / written_by  enclosing method names
+    accesses[]            small diagnostic sites: method, kind, line, column, context
+
+RECIPE
+  const cls = await analysis.fieldClassification({
+    file,
+    fields: seam.move_fields,
+    className: "SourceView"
+  });
+  const mutable = cls.fields.filter(f => f.is_mutable_instance);
+  const constants = cls.fields.filter(f => f.is_static_final);
+  const deps = cls.fields.filter(f => f.is_injected || f.is_provider);
+  // Keep the classification in store(); echo only the small derived counts/table.
+"#;
+
 #[async_trait]
 impl Tool for AnalysisDescribe {
     fn name(&self) -> &str {
@@ -410,8 +579,11 @@ impl Tool for AnalysisDescribe {
         match analysis {
             "cohesionClusters" => ToolResult::Json(json!({ "contract": COHESION_CONTRACT })),
             "references" => ToolResult::Json(json!({ "contract": REFERENCES_CONTRACT })),
+            "fieldClassification" => {
+                ToolResult::Json(json!({ "contract": FIELD_CLASSIFICATION_CONTRACT }))
+            }
             other => err(format!(
-                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references)"
+                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification)"
             )),
         }
     }
@@ -422,6 +594,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(AnalysisCohesionClusters) as Arc<dyn Tool>,
         Arc::new(AnalysisReferences) as Arc<dyn Tool>,
+        Arc::new(AnalysisFieldClassification) as Arc<dyn Tool>,
         Arc::new(AnalysisDescribe) as Arc<dyn Tool>,
     ]
 }
@@ -432,11 +605,13 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "analysis".to_string(),
-        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count Java symbol references across the workspace without full capture payloads. USE THESE rather than reconstructing reductions from code.query captures."
+        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count Java symbol references across the workspace without full capture payloads; fieldClassification — classify Java fields as constants/deps/mutable state with read/write sites. USE THESE rather than reconstructing reductions from code.query captures."
             .to_string(),
         declarations: r#"type CohesionCluster = { id: string; name_hint: string; item_names: string[]; move_fields: string[]; score: number; internal_field_touches: number; internal_calls: number; inbound_calls: number; outbound_calls: number; expected_wiring: "delegate" | "callback" | "source_instance" };
 type CrossClusterCall = { from_cluster: string; to_cluster: string; from_method: string; to_method: string };
 type ReferenceExample = { path: string; line: number; column: number; byte_start: number; byte_end: number; context: string; is_test_site: boolean; usage_kind: "type_reference" | "method_invocation" | "field_access" | "method_reference" | "import"; matched_name: string };
+type FieldAccess = { method?: string; kind: "read" | "write"; line: number; column: number; context: string };
+type FieldClassification = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static_final: boolean; is_mutable_instance: boolean; is_injected: boolean; injection_style?: "field_annotation" | "constructor_param"; is_provider: boolean; reads: number; writes: number; read_by: string[]; written_by: string[]; accesses: FieldAccess[] };
 declare const analysis: {
   /** Full contract (params, result vocabulary, recipe) for one analysis. Call before first use. */
   describe(args: { analysis: string }): Promise<{ contract: string }>;
@@ -444,6 +619,8 @@ declare const analysis: {
   cohesionClusters(args: { file: string }): Promise<{ file: string; class: Record<string, unknown>; cluster_count: number; clusters: CohesionCluster[]; cross_cluster_calls: CrossClusterCall[]; provenance: "syntax_only" }>;
   /** Count Java references to simple symbols across the workspace without returning full capture payloads. Use before extraction to decide wrappers:true, distinguish forwarded fields, or estimate production/test blast radius. */
   references(args: { symbols: string[]; kinds?: Array<"type_reference" | "method_invocation" | "field_access" | "method_reference" | "import">; declaringClass?: string }): Promise<{ symbols: string[]; total_usages: number; unique_files: number; production_sites: number; test_sites: number; counts_by_symbol: Record<string, number>; files_by_symbol: Record<string, string[]>; examples_by_symbol: Record<string, ReferenceExample[]>; provenance: "syntax_only" }>;
+  /** Classify Java fields before extraction: constants/dependencies/mutable state plus read/write sites by method. */
+  fieldClassification(args: { file: string; fields?: string[]; className?: string }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; fields: FieldClassification[]; provenance: "syntax_only" }>;
 };"#
             .to_string(),
     }
@@ -641,6 +818,103 @@ public class OrderService {
     }
 
     #[tokio::test]
+    async fn field_classification_reports_state_and_read_write_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("Widget.java"),
+            r#"package com.acme;
+
+class Widget {
+    @Inject
+    private final Repo repo;
+    private final Service service;
+    private int count;
+    private static final String KIND = "widget";
+
+    @Inject
+    Widget(Repo repo, Service service) {
+        this.repo = repo;
+        this.service = service;
+    }
+
+    void bump() {
+        count = count + 1;
+        count++;
+        log(KIND);
+    }
+
+    void show() {
+        log(count);
+        repo.load();
+        service.refresh();
+    }
+
+    void log(Object value) {}
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisFieldClassification
+                .call(
+                    json!({
+                        "file": "Widget.java",
+                        "fields": ["repo", "service", "count", "KIND"],
+                        "className": "Widget"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(out["provenance"], "syntax_only", "{out}");
+        let fields = out["fields"].as_array().unwrap();
+        let repo = fields.iter().find(|field| field["name"] == "repo").unwrap();
+        assert_eq!(repo["is_injected"], true, "{repo}");
+        assert_eq!(repo["injection_style"], "field_annotation", "{repo}");
+        assert_eq!(repo["is_mutable_instance"], false, "{repo}");
+        assert_eq!(repo["read_by"], json!(["show"]), "{repo}");
+
+        let service = fields
+            .iter()
+            .find(|field| field["name"] == "service")
+            .unwrap();
+        assert_eq!(service["is_injected"], true, "{service}");
+        assert_eq!(service["injection_style"], "constructor_param", "{service}");
+        assert_eq!(service["read_by"], json!(["show"]), "{service}");
+
+        let count = fields
+            .iter()
+            .find(|field| field["name"] == "count")
+            .unwrap();
+        assert_eq!(count["is_mutable_instance"], true, "{count}");
+        assert!(
+            count["reads"].as_u64().unwrap() >= 2,
+            "expected reads: {count}"
+        );
+        assert!(
+            count["writes"].as_u64().unwrap() >= 2,
+            "expected writes: {count}"
+        );
+        assert!(
+            count["written_by"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "bump"),
+            "{count}"
+        );
+
+        let kind = fields.iter().find(|field| field["name"] == "KIND").unwrap();
+        assert_eq!(kind["is_static_final"], true, "{kind}");
+        assert_eq!(kind["is_mutable_instance"], false, "{kind}");
+        assert_eq!(kind["read_by"], json!(["bump"]), "{kind}");
+    }
+
+    #[tokio::test]
     async fn describe_returns_contract_and_rejects_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let cx = cx_in(dir.path());
@@ -672,7 +946,7 @@ public class OrderService {
             .call(json!({ "analysis": "bogus" }), &cx)
             .await;
         assert!(
-            matches!(unknown, ToolResult::Error(ref e) if e.contains("available: cohesionClusters, references")),
+            matches!(unknown, ToolResult::Error(ref e) if e.contains("available: cohesionClusters, references, fieldClassification")),
             "{unknown:?}"
         );
     }

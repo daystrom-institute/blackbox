@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::chunker;
 use crate::{SyntaxItem, sha256_hex};
@@ -185,6 +186,564 @@ pub fn file_query(
         content_sha256: sha256_hex(parsed.source.as_bytes()),
         captures,
     })
+}
+
+/// One Java field declaration fact.
+#[derive(Debug, Clone)]
+pub struct JavaFieldFact {
+    pub name: String,
+    pub type_text: String,
+    pub owner_class: Option<String>,
+    pub visibility: Option<String>,
+    pub modifiers: Vec<String>,
+    pub annotations: Vec<String>,
+    pub is_static: bool,
+    pub is_final: bool,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub name_byte_start: usize,
+    pub name_byte_end: usize,
+}
+
+/// Java field declaration inventory for one file.
+#[derive(Debug, Clone)]
+pub struct FileJavaFieldsFacts {
+    pub language: &'static str,
+    pub content_sha256: String,
+    pub source_len: usize,
+    pub fields: Vec<JavaFieldFact>,
+}
+
+/// One classified Java field access site.
+#[derive(Debug, Clone)]
+pub struct JavaFieldAccessFact {
+    pub method: Option<String>,
+    pub kind: String,
+    pub line: usize,
+    pub column: usize,
+    pub context: String,
+}
+
+/// Pre-extract field classification for one Java field.
+#[derive(Debug, Clone)]
+pub struct JavaFieldClassificationFact {
+    pub name: String,
+    pub type_text: String,
+    pub owner_class: Option<String>,
+    pub visibility: Option<String>,
+    pub modifiers: Vec<String>,
+    pub annotations: Vec<String>,
+    pub is_static_final: bool,
+    pub is_mutable_instance: bool,
+    pub is_injected: bool,
+    pub injection_style: Option<String>,
+    pub is_provider: bool,
+    pub reads: usize,
+    pub writes: usize,
+    pub read_by: Vec<String>,
+    pub written_by: Vec<String>,
+    pub accesses: Vec<JavaFieldAccessFact>,
+}
+
+/// Field classification payload for one Java file.
+#[derive(Debug, Clone)]
+pub struct FileJavaFieldClassificationFacts {
+    pub language: &'static str,
+    pub content_sha256: String,
+    pub source_len: usize,
+    pub fields: Vec<JavaFieldClassificationFact>,
+}
+
+/// Inventory Java fields in `path`, optionally restricted to one owner class.
+pub fn java_fields(path: &Path, class_name: Option<&str>) -> Result<FileJavaFieldsFacts> {
+    let parsed = super::parse_source_file(path)?;
+    if parsed.language != "java" {
+        return Err(anyhow!("code.fields only supports java files"));
+    }
+    let content_sha256 = sha256_hex(parsed.source.as_bytes());
+    let source_len = parsed.source.len();
+    let fields = java_field_facts_for_parsed(&parsed, class_name);
+    Ok(FileJavaFieldsFacts {
+        language: parsed.language,
+        content_sha256,
+        source_len,
+        fields,
+    })
+}
+
+/// Classify Java fields before an extraction, optionally restricted by field
+/// names and/or owner class.
+pub fn java_field_classification(
+    path: &Path,
+    field_names: Option<&[String]>,
+    class_name: Option<&str>,
+) -> Result<FileJavaFieldClassificationFacts> {
+    let parsed = super::parse_source_file(path)?;
+    if parsed.language != "java" {
+        return Err(anyhow!(
+            "analysis.fieldClassification only supports java files"
+        ));
+    }
+    let all_fields = java_field_facts_for_parsed(&parsed, class_name);
+    let constructor_injected_fields = java_constructor_injected_fields(&parsed, class_name);
+    let requested: BTreeSet<&str> = field_names
+        .map(|names| names.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let selected: Vec<JavaFieldFact> = all_fields
+        .into_iter()
+        .filter(|field| requested.is_empty() || requested.contains(field.name.as_str()))
+        .collect();
+    let mut by_name: BTreeMap<String, Vec<JavaFieldAccessFact>> = selected
+        .iter()
+        .map(|field| (field.name.clone(), Vec::new()))
+        .collect();
+    let selected_names: BTreeSet<&str> = selected.iter().map(|field| field.name.as_str()).collect();
+
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "identifier" {
+            continue;
+        }
+        let Ok(name) = node.utf8_text(parsed.source.as_bytes()) else {
+            continue;
+        };
+        if !selected_names.contains(name) {
+            continue;
+        }
+        let Some(access_node) = java_source_field_access_node(node) else {
+            continue;
+        };
+        if java_identifier_shadowed(node, name, &parsed.source) {
+            continue;
+        }
+        let (line, column) = source_line_col(&parsed.source, access_node.start_byte());
+        let method = java_enclosing_callable_name(access_node, &parsed.source);
+        let kind = java_access_kind(access_node).to_string();
+        let context = source_line_context(&parsed.source, access_node.start_byte());
+        if let Some(accesses) = by_name.get_mut(name) {
+            accesses.push(JavaFieldAccessFact {
+                method,
+                kind,
+                line,
+                column,
+                context,
+            });
+        }
+    }
+
+    let mut fields = Vec::new();
+    for field in selected {
+        let mut accesses = by_name.remove(&field.name).unwrap_or_default();
+        accesses.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then(a.column.cmp(&b.column))
+                .then(a.kind.cmp(&b.kind))
+        });
+        let mut read_by = BTreeSet::new();
+        let mut written_by = BTreeSet::new();
+        let mut reads = 0usize;
+        let mut writes = 0usize;
+        for access in &accesses {
+            let method = access
+                .method
+                .clone()
+                .unwrap_or_else(|| "(class-initializer)".to_string());
+            if access.kind == "write" {
+                writes += 1;
+                written_by.insert(method);
+            } else {
+                reads += 1;
+                read_by.insert(method);
+            }
+        }
+        let is_static_final = field.is_static && field.is_final;
+        let field_annotation_injected = field
+            .annotations
+            .iter()
+            .any(|annotation| java_annotation_is_inject(annotation));
+        let constructor_injected =
+            constructor_injected_fields.contains(&(field.owner_class.clone(), field.name.clone()));
+        let injection_style = if field_annotation_injected {
+            Some("field_annotation".to_string())
+        } else if constructor_injected {
+            Some("constructor_param".to_string())
+        } else {
+            None
+        };
+        let is_provider =
+            field.type_text.contains("Provider<") || field.type_text.ends_with("Provider");
+        fields.push(JavaFieldClassificationFact {
+            name: field.name,
+            type_text: field.type_text,
+            owner_class: field.owner_class,
+            visibility: field.visibility,
+            modifiers: field.modifiers,
+            annotations: field.annotations,
+            is_static_final,
+            is_mutable_instance: !is_static_final && !field.is_final && !field.is_static,
+            is_injected: injection_style.is_some(),
+            injection_style,
+            is_provider,
+            reads,
+            writes,
+            read_by: read_by.into_iter().collect(),
+            written_by: written_by.into_iter().collect(),
+            accesses,
+        });
+    }
+
+    Ok(FileJavaFieldClassificationFacts {
+        language: parsed.language,
+        content_sha256: sha256_hex(parsed.source.as_bytes()),
+        source_len: parsed.source.len(),
+        fields,
+    })
+}
+
+fn java_field_facts_for_parsed(
+    parsed: &super::ParsedSource,
+    class_name: Option<&str>,
+) -> Vec<JavaFieldFact> {
+    let mut fields = Vec::new();
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "field_declaration" {
+            let owner_class = java_owner_class_name(node, &parsed.source);
+            if class_name.is_some_and(|wanted| owner_class.as_deref() != Some(wanted)) {
+                continue;
+            }
+            let type_text = node
+                .child_by_field_name("type")
+                .map(|child| text_of(&parsed.source, child))
+                .unwrap_or_else(|| "?".to_string());
+            let (modifiers, annotations) = java_modifiers_and_annotations(node, &parsed.source);
+            let visibility = modifiers
+                .iter()
+                .find(|m| matches!(m.as_str(), "public" | "protected" | "private"))
+                .cloned();
+            let is_static = modifiers.iter().any(|m| m == "static");
+            let is_final = modifiers.iter().any(|m| m == "final");
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() != "variable_declarator" && child.kind() != "variable_declarator_id"
+                {
+                    continue;
+                }
+                let Some(name_node) = java_field_name_node(child) else {
+                    continue;
+                };
+                let Some(name) = parsed
+                    .source
+                    .get(name_node.start_byte()..name_node.end_byte())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                fields.push(JavaFieldFact {
+                    name,
+                    type_text: type_text.clone(),
+                    owner_class: owner_class.clone(),
+                    visibility: visibility.clone(),
+                    modifiers: modifiers.clone(),
+                    annotations: annotations.clone(),
+                    is_static,
+                    is_final,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    name_byte_start: name_node.start_byte(),
+                    name_byte_end: name_node.end_byte(),
+                });
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    fields.sort_by(|a, b| {
+        a.byte_start
+            .cmp(&b.byte_start)
+            .then(a.name_byte_start.cmp(&b.name_byte_start))
+    });
+    fields
+}
+
+fn java_constructor_injected_fields(
+    parsed: &super::ParsedSource,
+    class_name: Option<&str>,
+) -> BTreeSet<(Option<String>, String)> {
+    let mut injected = BTreeSet::new();
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "constructor_declaration" {
+            let owner_class = java_owner_class_name(node, &parsed.source);
+            if class_name.is_some_and(|wanted| owner_class.as_deref() != Some(wanted)) {
+                continue;
+            }
+            let (_, annotations) = java_modifiers_and_annotations(node, &parsed.source);
+            if !annotations
+                .iter()
+                .any(|annotation| java_annotation_is_inject(annotation))
+            {
+                continue;
+            }
+            let params: BTreeSet<String> = node
+                .child_by_field_name("parameters")
+                .map(|params| {
+                    java_params(params, &parsed.source)
+                        .into_iter()
+                        .filter_map(|param| param.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if params.is_empty() {
+                continue;
+            }
+            let mut ctor_stack = vec![node];
+            while let Some(descendant) = ctor_stack.pop() {
+                if descendant.kind() == "assignment_expression"
+                    && let Some((field_name, param_name)) =
+                        java_this_field_param_assignment(descendant, &parsed.source)
+                    && params.contains(&param_name)
+                {
+                    injected.insert((owner_class.clone(), field_name));
+                }
+                let mut cursor = descendant.walk();
+                for child in descendant.named_children(&mut cursor) {
+                    ctor_stack.push(child);
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    injected
+}
+
+fn java_this_field_param_assignment(
+    assignment: tree_sitter::Node<'_>,
+    source: &str,
+) -> Option<(String, String)> {
+    let left = assignment.child_by_field_name("left")?;
+    let right = assignment.child_by_field_name("right")?;
+    let field_name = java_this_field_name(left, source)?;
+    let param_name = java_identifier_text(right, source)?;
+    Some((field_name, param_name))
+}
+
+fn java_this_field_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "field_access" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    if object.kind() != "this" && object.kind() != "this_expression" {
+        return None;
+    }
+    node.child_by_field_name("field")
+        .map(|field| text_of(source, field))
+}
+
+fn java_identifier_text(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "identifier" {
+        return Some(text_of(source, node));
+    }
+    None
+}
+
+fn java_field_name_node(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    node.child_by_field_name("name").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "identifier")
+    })
+}
+
+fn java_owner_class_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "record_declaration"
+                | "enum_declaration"
+                | "interface_declaration"
+        ) {
+            return parent
+                .child_by_field_name("name")
+                .map(|name| text_of(source, name));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn java_source_field_access_node(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let parent = node.parent()?;
+    match parent.kind() {
+        "variable_declarator"
+        | "formal_parameter"
+        | "spread_parameter"
+        | "catch_formal_parameter"
+        | "method_declaration"
+        | "constructor_declaration"
+        | "class_declaration"
+        | "interface_declaration"
+        | "record_declaration"
+        | "enum_declaration"
+        | "annotation_type_declaration"
+        | "labeled_statement"
+        | "type_parameter"
+        | "marker_annotation"
+        | "annotation"
+        | "enum_constant"
+        | "method_invocation" => {
+            if parent.child_by_field_name("name").map(|child| child.id()) == Some(node.id()) {
+                return None;
+            }
+        }
+        "field_access" => {
+            if parent.child_by_field_name("field").map(|child| child.id()) == Some(node.id()) {
+                let object = parent.child_by_field_name("object")?;
+                if object.kind() == "this" || object.kind() == "this_expression" {
+                    return Some(parent);
+                }
+                return None;
+            }
+        }
+        "scoped_identifier" | "scoped_type_identifier" | "type_identifier" | "generic_type" => {
+            return None;
+        }
+        _ => {}
+    }
+    Some(node)
+}
+
+fn java_identifier_shadowed(node: tree_sitter::Node<'_>, name: &str, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(scope) = current {
+        if scope.kind() == "class_body" {
+            return false;
+        }
+        if matches!(
+            scope.kind(),
+            "block" | "method_declaration" | "constructor_declaration" | "lambda_expression"
+        ) && java_scope_declares_before(scope, name, node.start_byte(), source)
+        {
+            return true;
+        }
+        current = scope.parent();
+    }
+    false
+}
+
+fn java_scope_declares_before(
+    scope: tree_sitter::Node<'_>,
+    name: &str,
+    before: usize,
+    source: &str,
+) -> bool {
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before {
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "formal_parameter"
+                | "spread_parameter"
+                | "catch_formal_parameter"
+                | "local_variable_declaration"
+                | "resource"
+        ) && java_declares_name(node, name, source)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+fn java_declares_name(node: tree_sitter::Node<'_>, name: &str, source: &str) -> bool {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        return text_of(source, name_node) == name;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(|child| {
+        if child.kind() == "variable_declarator"
+            && let Some(name_node) = java_field_name_node(child)
+        {
+            return text_of(source, name_node) == name;
+        }
+        false
+    })
+}
+
+fn java_access_kind(mut access_node: tree_sitter::Node<'_>) -> &'static str {
+    while let Some(parent) = access_node.parent() {
+        match parent.kind() {
+            "assignment_expression" => {
+                if parent.child_by_field_name("left").map(|child| child.id())
+                    == Some(access_node.id())
+                {
+                    return "write";
+                }
+                return "read";
+            }
+            "update_expression" => return "write",
+            "parenthesized_expression" | "cast_expression" => {
+                access_node = parent;
+            }
+            _ => return "read",
+        }
+    }
+    "read"
+}
+
+fn java_enclosing_callable_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "method_declaration" || n.kind() == "constructor_declaration" {
+            return n
+                .child_by_field_name("name")
+                .map(|name| text_of(source, name));
+        }
+        current = n.parent();
+    }
+    None
+}
+
+fn source_line_col(source: &str, byte: usize) -> (usize, usize) {
+    let prefix = &source[..byte.min(source.len())];
+    let line = prefix.as_bytes().iter().filter(|b| **b == b'\n').count() + 1;
+    let col = prefix
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail.chars().count() + 1)
+        .unwrap_or_else(|| prefix.chars().count() + 1);
+    (line, col)
+}
+
+fn source_line_context(source: &str, byte: usize) -> String {
+    let start = source[..byte.min(source.len())]
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let end = source[byte.min(source.len())..]
+        .find('\n')
+        .map(|idx| byte.min(source.len()) + idx)
+        .unwrap_or(source.len());
+    source[start..end].trim().to_string()
 }
 
 /// Byte range of the `name` identifier of the item at (or enclosing) the
@@ -682,6 +1241,14 @@ fn collect_java_modifier_child(
         "marker_annotation" | "annotation" => annotations.push(text_of(source, node)),
         _ => {}
     }
+}
+
+fn java_annotation_is_inject(annotation: &str) -> bool {
+    let annotation = annotation.trim().trim_start_matches('@');
+    annotation == "Inject"
+        || annotation.starts_with("Inject(")
+        || annotation.ends_with(".Inject")
+        || annotation.contains(".Inject(")
 }
 
 fn java_params(params: tree_sitter::Node<'_>, source: &str) -> Vec<JavaParamFact> {

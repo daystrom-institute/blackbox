@@ -203,6 +203,104 @@ impl Tool for CodeItems {
     }
 }
 
+/// `code.fields` — Java field declaration inventory with declaration spans.
+pub struct CodeFields;
+
+#[derive(Deserialize)]
+struct CodeFieldsParams {
+    file: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+}
+
+fn fields_payload(file: &str, found: &facts::FileJavaFieldsFacts) -> Value {
+    let fields: Vec<Value> = found
+        .fields
+        .iter()
+        .map(|field| {
+            json!({
+                "name": field.name,
+                "type": field.type_text,
+                "owner_class": field.owner_class,
+                "visibility": field.visibility,
+                "modifiers": field.modifiers,
+                "annotations": field.annotations,
+                "is_static": field.is_static,
+                "is_final": field.is_final,
+                "is_static_final": field.is_static && field.is_final,
+                "is_mutable_instance": !field.is_static && !field.is_final,
+                "span": Span {
+                    file: file.to_string(),
+                    byte_start: field.byte_start,
+                    byte_end: field.byte_end,
+                    content_sha256: found.content_sha256.clone(),
+                },
+                "name_span": Span {
+                    file: file.to_string(),
+                    byte_start: field.name_byte_start,
+                    byte_end: field.name_byte_end,
+                    content_sha256: found.content_sha256.clone(),
+                },
+            })
+        })
+        .collect();
+    json!({
+        "file": file,
+        "language": found.language,
+        "content_sha256": found.content_sha256,
+        "source_len": found.source_len,
+        "fields": fields,
+    })
+}
+
+#[async_trait]
+impl Tool for CodeFields {
+    fn name(&self) -> &str {
+        "code.fields"
+    }
+    fn description(&self) -> &str {
+        "Inventory Java field declarations in one source file, returning name/type/modifiers/annotations/owner_class plus hash-anchored declaration and name spans. Optional className restricts to one owner class. Pure; syntax_only tier."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative .java source file." },
+                "className": { "type": "string", "description": "Optional Java class name to restrict field results to one owner class." }
+            },
+            "required": ["file"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("code".to_string(), "fields".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: CodeFieldsParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.fields: {e}")),
+        };
+        let path = match resolve(&cx.root, &params.file) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.fields: {}: {e}", params.file)),
+        };
+        let file = params.file;
+        let class_name = params.class_name;
+        bro_tools::tool::call_blocking(move || {
+            match facts::java_fields(&path, class_name.as_deref()) {
+                Ok(found) => ToolResult::Json(fields_payload(&file, &found)),
+                Err(e) => err(format!("code.fields: {e:#}")),
+            }
+        })
+        .await
+    }
+}
+
 /// `code.files` — enumerate the tree-sitter-supported source files of the
 /// working set (gap-3ec052ea's original ask: fact pipelines self-contained,
 /// no tools.glob bootstrap).
@@ -731,6 +829,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(CodeFiles) as Arc<dyn Tool>,
         Arc::new(CodeItems) as Arc<dyn Tool>,
+        Arc::new(CodeFields) as Arc<dyn Tool>,
         Arc::new(CodeQuery) as Arc<dyn Tool>,
         Arc::new(CodeRead) as Arc<dyn Tool>,
         Arc::new(CodeSignature) as Arc<dyn Tool>,
@@ -744,12 +843,14 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The six methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
+        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The seven methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Use `code.fields` for Java field declarations; do not hand-roll field_declaration queries just to learn modifiers/type/name. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type SyntaxItemFact = { name?: string; kind: string; visibility?: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
+type JavaFieldFact = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static: boolean; is_final: boolean; is_static_final: boolean; is_mutable_instance: boolean; span: Span; name_span: Span };
 type QueryCapture = { capture: string; kind: string; text: string; span: Span };
 type FileItems = { file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] };
+type FileFields = { file: string; language: "java"; content_sha256: string; source_len: number; fields: JavaFieldFact[] };
 type RustSignature = { language: "rust"; kind: "function_item"; name?: string; visibility?: string; is_async: boolean; params: { pattern: string; type?: string }[]; return_type?: string; generics?: string; span: Span; signature_span: Span; params_span?: Span };
 type JavaSignature = { language: "java"; kind: "method_declaration" | "constructor_declaration"; name?: string; visibility?: string; modifiers: string[]; annotations: string[]; params: { name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean; span: Span }[]; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; span: Span; signature_span: Span; params_span?: Span };
 declare const code: {
@@ -757,6 +858,8 @@ declare const code: {
   files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
   /** Inventory top-level syntax items. visibility is "pub"/"public"/... or undefined = private. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
   items(args: { file: string } | { files: string[] }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
+  /** Inventory Java field declarations with type/modifiers/annotations/owner and hash-anchored declaration/name spans. Use this instead of raw field_declaration queries. */
+  fields(args: { file: string; className?: string }): Promise<FileFields>;
   /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. The batch is aggregate-capped (~20k captures): a broad query over a large repo sets aggregate_capped + files_scanned/files_total + hint — narrow the query or the file set and re-run rather than widening blindly. */
   query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean; aggregate_capped?: boolean; files_scanned?: number; files_total?: number; hint?: string }>;
   /** Read the exact text of a Span; errors with stale_span on content drift. */
@@ -806,6 +909,11 @@ mod tests {
 
 class Probe {
     @Inject
+    private final Repo repo;
+    private int count;
+    static final String KIND = "probe";
+
+    @Inject
     public Probe(
             final Repo repo,
             @Named("primary") Provider<Foo> fooProvider
@@ -814,6 +922,10 @@ class Probe {
 
     public static <T> List<T> load(final String name, int count) throws IOException, SQLException {
         return List.of();
+    }
+
+    static class Inner {
+        private String ignored;
     }
 }
 "#,
@@ -862,6 +974,47 @@ class Probe {
         let span = captures[0]["span"].clone();
         let read = json_of(CodeRead.call(json!({ "span": span }), &cx_in(&root)).await);
         assert_eq!(read["text"], "beta");
+    }
+
+    #[tokio::test]
+    async fn fields_returns_java_field_declaration_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = java_fixture(&root);
+        let out = json_of(
+            CodeFields
+                .call(json!({ "file": file }), &cx_in(&root))
+                .await,
+        );
+        assert_eq!(out["language"], "java");
+        let fields = out["fields"].as_array().unwrap();
+        let names: Vec<&str> = fields
+            .iter()
+            .map(|field| field["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["repo", "count", "KIND", "ignored"], "{out}");
+        let repo = fields.iter().find(|field| field["name"] == "repo").unwrap();
+        assert_eq!(repo["type"], "Repo");
+        assert_eq!(repo["owner_class"], "Probe");
+        assert_eq!(repo["visibility"], "private");
+        assert_eq!(repo["modifiers"], json!(["private", "final"]));
+        assert_eq!(repo["annotations"], json!(["@Inject"]));
+        assert_eq!(repo["is_static_final"], false);
+        assert_eq!(repo["span"]["content_sha256"], out["content_sha256"]);
+        assert_eq!(repo["name_span"]["content_sha256"], out["content_sha256"]);
+
+        let filtered = json_of(
+            CodeFields
+                .call(json!({ "file": file, "className": "Probe" }), &cx_in(&root))
+                .await,
+        );
+        let filtered_names: Vec<&str> = filtered["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(filtered_names, vec!["repo", "count", "KIND"]);
     }
 
     #[tokio::test]

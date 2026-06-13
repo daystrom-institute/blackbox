@@ -1,0 +1,20 @@
+{
+  "id": "gap-ba6b813e",
+  "title": "Java field facts are not discoverable from code.items feedback",
+  "gap_kind": "docs_runbook",
+  "domain": "refactor-isolate",
+  "wanted_capability": "When code.items omits Java field_declaration facts, the tool or docs should point callers to code.fields instead of making them infer the separate field surface.",
+  "missing_primitive": "code.items-to-code.fields discoverability hint",
+  "fallback_used": "Recipe now states that code.items does not surface Java field declarations and instructs probes to use code.fields.",
+  "evidence": [
+    "thread-8d968b2d",
+    "probe-large-ui-3-retro"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/refactor-isolate/code-items-java-fields-discoverability",
+  "notes": "This is a discoverability/runbook gap rather than a missing fact surface; code.fields exists and works.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T21:39:26Z",
+  "updated_at": "2026-06-13T21:39:26Z"
+}

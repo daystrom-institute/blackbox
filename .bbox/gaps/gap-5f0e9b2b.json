@@ -1,0 +1,26 @@
+{
+  "id": "gap-5f0e9b2b",
+  "title": "Java field declarations are not surfaced by code.items",
+  "gap_kind": "mcp_surface",
+  "domain": "code-nav",
+  "wanted_capability": "A code navigation surface that returns Java field declarations with name, type, modifiers, annotations, owner class, and span so agents do not have to write raw tree-sitter queries for routine field inspection.",
+  "missing_primitive": "code.fields({ file }) or Java field_declaration support in code.items",
+  "fallback_used": "The probe used raw code.query field_declaration patterns plus code.read/signature cross-checks.",
+  "evidence": [
+    "probe:large-ui-section-extract-deepseek-v4-pro-2",
+    "scratch/tool-tuning/2026-06-13-large-ui-section-extract-deepseek-v4-pro.md"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/code-nav/java-fields-not-in-code-items",
+  "suggested_owner": "blackbox",
+  "notes": "Genericized from a private Java refactor probe. The missing field surface added multiple avoidable code-mode cells and caused post-transform verification retries.",
+  "resolution": "addressed",
+  "task_id": "3495eb89-27d4-4c18-a1a0-27e79133821a",
+  "session_id": "39b336cc-514f-4118-a7f3-d23e62f2147c",
+  "provider": "deepseek",
+  "created_at": "2026-06-13T21:07:26Z",
+  "updated_at": "2026-06-13T21:22:36Z",
+  "resolved_at": "2026-06-13T21:22:36Z",
+  "resolution_note": "Implemented code.fields({ file, className? }) as a Java field declaration fact surface exposed through bro-harness/code_facts. It returns owner class, type, visibility, modifiers, annotations, static/final flags, and declaration/name spans without requiring raw tree-sitter field_declaration queries."
+}
