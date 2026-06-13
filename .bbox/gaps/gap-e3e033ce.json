@@ -14,8 +14,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/embed/poison-payload-batch-drop",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-cb8f3b2d",
   "created_at": "2026-06-13T01:39:11Z",
-  "updated_at": "2026-06-13T01:39:11Z"
+  "updated_at": "2026-06-13T03:20:01Z",
+  "resolved_at": "2026-06-13T03:20:01Z",
+  "resolution_note": "Root cause confirmed by a live Voyage probe: empty-string chunks → HTTP 400 \"Input cannot contain empty strings\", and the rejection dropped the whole 52-item batch after 3 identical retries (51 good batch-mates stranded, route flipped unavailable, re-failed every nightly backfill). Fix (commit 857206b0, worktree storage-maintenance-leaks): (a) empty/whitespace text skipped at enqueue AND excluded from coverage via shared embeddable_text predicate — the direct fix; (b) payload-level HTTP 4xx (not 408/429) classified NonRetryableBatchError by the Voyage provider, and the queue worker bisects such a batch to the poison item(s) instead of retry-then-drop, so one bad payload can't strand batch-mates (call budget bounds the pass); (c) durable dropped_count + last_dropped on RouteStatus that mark_success does NOT clear (the original last_error overloading was why the test caught the good batch-mate clobbering the drop record); poison isolation keeps the route available; (d) bbox_embed_status stall reason distinguishes poison from un-enqueued residue so operators aren't pointed at a backfill that can't help. Full suite 3,966 green. NOT done from the gap's wishlist: a persisted cross-restart poison skip-list (current design re-bisects poison each backfill — cheap since empty-text is now skipped pre-enqueue, so the residual poison set is tiny/empty in practice) and chunk-time sanitization of the underlying defect. Pending: merge to beta + deploy (in progress this session)."
 }
