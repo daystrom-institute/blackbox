@@ -77,14 +77,11 @@ impl BlackboxServer {
                     ));
                 }
             };
+            let edge_index = server.state.edge_index.read();
             let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
-            mcp_tools::inspect::inspect_entity(
-                &p,
-                &provider_ctx,
-                &entity_ref,
-                &server.state.edge_index.read(),
-            )
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_edge_index(&edge_index);
+            mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, &edge_index)
         })
         .await
     }
@@ -120,12 +117,14 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_find_paths", move || {
+            let edge_index = server.state.edge_index.read();
             let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_edge_index(&edge_index);
             mcp_tools::find_paths::find_paths(
                 &p,
                 &provider_ctx,
-                &server.state.edge_index.read(),
+                &edge_index,
                 &mut server.state.path_cache.write(),
             )
         })
@@ -142,12 +141,14 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_bundle_evidence", move || {
+            let edge_index = server.state.edge_index.read();
             let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_edge_index(&edge_index);
             mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
-                &server.state.edge_index.read(),
+                &edge_index,
                 &mut server.state.path_cache.write(),
             )
         })
@@ -164,8 +165,10 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
+            let edge_index = server.state.edge_index.read();
             let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_edge_index(&edge_index);
             mcp_tools::ref_size::ref_size(&p, &provider_ctx)
         })
         .await
@@ -207,15 +210,12 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_blame", move || {
+            let edge_index = server.state.edge_index.read();
             let provider_ctx =
-                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref());
+                ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
+                    .with_edge_index(&edge_index);
             let projects = server.state.projects.read().list();
-            mcp_tools::blame::blame(
-                &p,
-                &provider_ctx,
-                &server.state.edge_index.read(),
-                &projects,
-            )
+            mcp_tools::blame::blame(&p, &provider_ctx, &edge_index, &projects)
         })
         .await
     }
@@ -276,6 +276,59 @@ mod tests {
         let wire = serde_json::to_value(result).unwrap();
         wire["content"][0]["text"].as_str().unwrap().to_string()
     }
+    /// Symbols are edge-projected vertices: the indexer derives their edges
+    /// but writes no entity doc (gap-496fe07f). A symbol ref the edge
+    /// sidecar names must inspect OK (existence = edge participation); a
+    /// well-formed ref nothing points at must stay not_found.
+    #[tokio::test]
+    async fn inspect_resolves_edge_projected_symbol_without_entity_doc() {
+        use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+        use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let symbol = "symbol:d723917f:KnowledgeStore:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let file = "project_file:d723917f:31d088f0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:163";
+        *server.state.edge_index.write() = EdgeIndex::from_edges_for_tests(vec![Edge {
+            source: crate::entity_ref::EntityRef::parse(symbol).unwrap(),
+            kind: "DEFINED_IN".into(),
+            target: crate::entity_ref::EntityRef::parse(file).unwrap(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: Default::default(),
+        }]);
+
+        let inspect = |entity_ref: String| {
+            let server = server.clone();
+            async move {
+                let result = server
+                    .bbox_inspect_entity(Parameters(InspectEntityParams {
+                        entity_ref,
+                        edge_types: None,
+                        direction: None,
+                        per_type_limit: Some(5),
+                        property_mode: Some("full".into()),
+                    }))
+                    .await;
+                serde_json::from_str::<serde_json::Value>(&extract_text(&result)).unwrap()
+            }
+        };
+
+        let found = inspect(symbol.to_string()).await;
+        assert_eq!(found["status"], "ok", "edge-backed symbol must inspect: {found}");
+        assert_eq!(found["properties"]["qualified_name"], "KnowledgeStore");
+        assert_eq!(found["properties"]["source"], "edge_projection");
+
+        let orphan = inspect(
+            "symbol:d723917f:KnowledgeStore:cccccccccccccccccccccccccccccccc".to_string(),
+        )
+        .await;
+        assert_eq!(
+            orphan["status"], "error.not_found",
+            "edge-less symbol ref must stay not_found: {orphan}"
+        );
+    }
+
     #[test]
     fn bbox_describe_schema_omits_installed_agents_by_default() {
         let tmp = tempfile::tempdir().unwrap();

@@ -138,12 +138,25 @@ fn symbol_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>
     properties.insert("qualified_name".into(), qualified_name.to_string());
     properties.insert("defn_hash".into(), defn_hash.to_string());
     if let Some(stores) = ctx.stores() {
-        let indexed = stores
-            .idx
-            .read()
-            .entity_properties(&r.to_string())?
-            .ok_or_else(|| anyhow::anyhow!("symbol entity {r} not found"))?;
-        properties.extend(indexed);
+        match stores.idx.read().entity_properties(&r.to_string())? {
+            Some(indexed) => {
+                properties.extend(indexed);
+            }
+            None => {
+                // Symbols are edge-projected vertices: the indexer derives
+                // DEFINED_IN/CONTAINS_SYMBOL/CALLS edges but writes no
+                // entity doc (gap-496fe07f). When the call site supplied
+                // the edge sidecar, edge participation IS existence; a
+                // well-formed ref nothing points at stays not_found.
+                let edge_backed = ctx.edge_index().is_some_and(|edges| {
+                    !edges.forward_edges(r).is_empty() || !edges.reverse_edges(r).is_empty()
+                });
+                if !edge_backed {
+                    anyhow::bail!("symbol entity {r} not found");
+                }
+                properties.insert("source".into(), "edge_projection".into());
+            }
+        }
     }
     Ok(empty_neighborhood_view(r, properties))
 }

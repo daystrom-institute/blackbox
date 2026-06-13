@@ -96,6 +96,13 @@ pub struct ProviderContext<'a> {
     /// daemon state type they were registered with. Keeps per-call state
     /// without this crate naming the daemon's types.
     ext: Option<&'a (dyn std::any::Any + Send + Sync)>,
+    /// Edge sidecar, when the call site already holds a read guard.
+    /// Edge-projected vertex types (symbol, symbol_v2) have no entity doc
+    /// of their own — the indexer derives only their edges (gap-496fe07f)
+    /// — so their existence check falls back to edge participation when
+    /// this is present. Absent → those providers keep the strict
+    /// indexed-doc requirement.
+    edges: Option<&'a bbox_edge_index::edge_index::EdgeIndex>,
 }
 
 impl<'a> ProviderContext<'a> {
@@ -103,6 +110,7 @@ impl<'a> ProviderContext<'a> {
         Self {
             stores: Some(stores),
             ext: None,
+            edges: None,
         }
     }
 
@@ -113,13 +121,23 @@ impl<'a> ProviderContext<'a> {
         Self {
             stores: Some(stores),
             ext: Some(ext),
+            edges: None,
         }
+    }
+
+    pub fn with_edge_index(
+        mut self,
+        edges: &'a bbox_edge_index::edge_index::EdgeIndex,
+    ) -> Self {
+        self.edges = Some(edges);
+        self
     }
 
     pub fn empty_for_tests() -> Self {
         Self {
             stores: None,
             ext: None,
+            edges: None,
         }
     }
 
@@ -129,6 +147,10 @@ impl<'a> ProviderContext<'a> {
 
     pub fn ext(&self) -> Option<&'a (dyn std::any::Any + Send + Sync)> {
         self.ext
+    }
+
+    pub fn edge_index(&self) -> Option<&'a bbox_edge_index::edge_index::EdgeIndex> {
+        self.edges
     }
 }
 
