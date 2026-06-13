@@ -1567,23 +1567,20 @@ impl TaskStore {
 // If defense-in-depth text guards are wanted in the future, reintroduce
 // a prefix here and gate on `AmbientContext::provider`.
 
-/// Per-turn recall directive. The managed-region CORE RULE reliably
-/// triggers `bbox_knowledge` queries on cold-start but attention-
-/// decays within-session on Claude Opus 4.7 and Gemini 2.5-flash:
-/// at ~15 turns of accumulated context, the session-start memory
-/// guidance no longer binds. Per-turn ambient injection survives
-/// because it rides with every turn. Keep the wording calibrated as
-/// a knowledge/runbook recall check, not a mandatory first action, because Codex tends
-/// to over-comply with hard ordering language here. Parallels the
-/// empirical fix for `bbox_note` emission (DEFAULT_COMPLETION_CONTRACT
-/// below).
+/// Recall directive. The managed-region CORE RULE reliably triggers
+/// `bbox_knowledge` queries on cold-start but can attention-decay within long
+/// sessions on weaker providers. Keep this as a standing instruction, not a
+/// per-turn reminder: repeated developer-message injection made Codex/Brodex
+/// over-comply during procedural live-state work (especially gap-store work)
+/// where `bbox_gaps`/`bbox_gap` is already the authoritative surface.
 pub const RECALL_DIRECTIVE: &str = "\
-Recall: early in tasks where durable knowledge, prior decisions, conventions, \
-or system runbooks could change the answer, query `bbox_knowledge` with a \
-short phrase from the user's request. It is not the surface for scoped pins, \
-side-channel notes, active threads, or transcripts. If the result is empty or \
-too broad, try one sharper phrase before relying on live filesystem state or \
-prior knowledge.";
+Use `bbox_knowledge` when durable knowledge, prior decisions, conventions, or \
+system runbooks could materially change the answer. It is not the surface for \
+procedural live-state work already using the authoritative store: scoped pins, \
+side-channel notes, active threads, transcripts, gap-store checks/writes \
+(`bbox_gaps`/`bbox_gap*`), or repo-owned state commits. If a recall check is \
+appropriate and the first result is empty or too broad, try one sharper phrase \
+before relying on live filesystem state or prior knowledge.";
 
 /// Ambient nudge for recursive orchestrators (allow_recursion=true).
 /// They're usually fan-out coordinators, and the most common silent
@@ -1672,14 +1669,15 @@ project path, not prose, not \"pending\">\n\
   bro=<`bro` from the `bbox_scope` block, if present>\n\
   session_id=<`session` from the `bbox_scope` block, if present>";
 
-/// Per-turn milestone-reporting nudge for every dispatch. Empirically,
+/// Milestone-reporting directive for every dispatch. Empirically,
 /// only brodex agents called `bro_report` mid-run across 12+ fleet
 /// cockpit dispatches — GLM/DeepSeek/MiniMax rows stayed blank the
 /// entire run, leaving the cockpit blind. The reporting instruction in
-/// the rendered AGENTS.md is session-start-only and decays at depth on
-/// weaker models; the ambient prefix survives because it rides with
-/// every turn. Positioned late (after the completion contract, before
-/// workspace-tools) per repo convention so it stays in attention.
+/// the rendered AGENTS.md is session-start-only and can decay at depth on
+/// weaker models, but per-turn injection is too noisy on Codex/Brodex because
+/// it appears after ordinary tool calls. Positioned late (after the completion
+/// contract, before workspace-tools) per repo convention so it stays in
+/// attention without repeating every turn.
 /// Wording is deliberately terse — shorter context survives truncation
 /// and the instruction is self-explanatory.
 pub const MILESTONE_REPORT_HINT: &str = "\
@@ -2068,10 +2066,9 @@ impl AmbientContext {
     /// text recursion guard is emitted.
     ///
     /// Cadence declarations carry the empirical calibration the old glued
-    /// preamble encoded positionally: `recall` and `milestone` are per-turn
-    /// (session-start guidance attention-decays within-session; per-turn
-    /// injection survives — see the doc comments on RECALL_DIRECTIVE and
-    /// MILESTONE_REPORT_HINT), the rest are standing. `contract` and
+    /// preamble encoded positionally. Directives are standing by default;
+    /// recurring behavioral nudges belong in the harness HookEngine/NudgeLedger
+    /// so they can be triggered and throttled by actual turn state. `contract` and
     /// `milestone` declare `needs_scope`: their texts reference the
     /// `bbox_scope` correlation keys, so the harness drops them whenever no
     /// current scope exists.
@@ -2087,7 +2084,12 @@ impl AmbientContext {
             }
         };
         let mut directives = vec![
-            directive("recall", DirectiveCadence::PerTurn, false, RECALL_DIRECTIVE),
+            directive(
+                "recall",
+                DirectiveCadence::Standing,
+                false,
+                RECALL_DIRECTIVE,
+            ),
             directive(
                 "task_shape",
                 DirectiveCadence::Standing,
@@ -2122,7 +2124,7 @@ impl AmbientContext {
         }
         directives.push(directive(
             "milestone",
-            DirectiveCadence::PerTurn,
+            DirectiveCadence::Standing,
             true,
             MILESTONE_REPORT_HINT,
         ));
@@ -6825,17 +6827,26 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_context_recall_directive_is_per_turn() {
+    fn dispatch_context_recall_directive_is_standing_and_exempts_live_state_surfaces() {
         let payload = AmbientContext::default().dispatch_context(None);
         let recall = directive(&payload, "recall");
-        // Calibration: session-start guidance attention-decays within-session;
-        // per-turn injection survives (RECALL_DIRECTIVE doc comment).
-        assert_eq!(recall.cadence, bro_protocol::DirectiveCadence::PerTurn);
+        assert_eq!(recall.cadence, bro_protocol::DirectiveCadence::Standing);
         assert!(!recall.needs_scope);
         assert!(recall.text.contains("bbox_knowledge"));
-        assert!(recall.text.contains("not the surface for scoped pins"));
-        assert!(recall.text.contains("short phrase"));
+        assert!(recall.text.contains("procedural live-state work"));
+        assert!(recall.text.contains("bbox_gaps"));
+        assert!(recall.text.contains("bbox_gap*"));
+        assert!(recall.text.contains("repo-owned state commits"));
         assert!(!recall.text.contains("FIRST tool call"));
+    }
+
+    #[test]
+    fn dispatch_context_milestone_directive_is_standing() {
+        let payload = AmbientContext::default().dispatch_context(None);
+        let milestone = directive(&payload, "milestone");
+        assert_eq!(milestone.cadence, bro_protocol::DirectiveCadence::Standing);
+        assert!(milestone.needs_scope);
+        assert!(milestone.text.contains("bro_report"));
     }
 
     #[test]

@@ -36,11 +36,8 @@ use std::collections::{HashMap, HashSet};
 /// note, turning a silent fallback into actionable signal for refining the tool
 /// surface. Cross-cutting policy, so it's added at delivery (not per rule), but
 /// session-deduped so periodic nudges cannot repeatedly compel notes.
-const GAP_NOTE_DIRECTIVE: &str = " — If this tool is the wrong fit because it's buggy, \
-    missing a capability, or wrong-shaped for the job, don't silently fall back: file a \
-    tool-surface gap note with `bbox_note(kind=\"followup\")` naming the tool and the gap \
-    once per distinct issue. That feedback is used to fix bugs, expand capabilities, and \
-    refine these tools. If the nudge simply doesn't apply here, ignore it.";
+const GAP_NOTE_DIRECTIVE: &str = " If this suggestion is wrong for the task, ignore it; \
+    if the tool surface is actually missing or wrong-shaped, file `bbox_note(kind=\"followup\")`.";
 
 /// Focused kill switch for the gap-note rider. `BRO_HARNESS_NUDGES=0` disables
 /// the whole hook subsystem; this leaves nudges on while making "quiet down"
@@ -390,9 +387,9 @@ impl Hook for ShellGrepHook {
         }
         vec![Candidate {
             rule_id: "shell-grep-to-code-search".into(),
-            message: "You searched the repo with a shell tool. For indexed, \
-                      gitignore-aware code/graph search prefer `bbox_code_query` or \
-                      `bbox_hybrid_search` (load via `tool_search` if not yet available)."
+            message: "For broad or repeated repo searches, prefer indexed, \
+                      gitignore-aware code/graph search via `bbox_code_query` or \
+                      `bbox_hybrid_search` when those tools fit and are available."
                 .into(),
             delivery: Delivery::Rider,
             kind: NudgeKind::Periodic { cooldown: 6 },
@@ -758,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn delivered_nudges_carry_adopt_or_explain_directive() {
+    fn delivered_nudges_carry_quiet_gap_followup_escape_hatch() {
         // The first delivered nudge gets the gap-note directive appended at the
         // engine choke point.
         let mut eng = HookEngine::new(vec![Box::new(ShellGrepHook)], NudgeLedger::default());
@@ -767,11 +764,11 @@ mod tests {
         let msg = &out[0].message;
         assert!(
             msg.contains("bbox_note"),
-            "directive names the gap-note tool"
+            "directive names the followup-note tool"
         );
         assert!(
-            msg.contains("gap note"),
-            "directive frames it as a gap note"
+            msg.contains("If this suggestion is wrong"),
+            "directive frames non-applicable suggestions as ignorable"
         );
         // The rule's own body is still there ahead of the directive.
         assert!(msg.contains("indexed"));

@@ -1,0 +1,22 @@
+{
+  "id": "gap-663baff0",
+  "title": "blackboxd --help initializes daemon state and attempts to bind",
+  "gap_kind": "tooling",
+  "domain": "harness/cli-startup",
+  "wanted_capability": "CLI help/version probes for daemon binaries should be side-effect-light: parse flags and print help/version without opening stores, restoring workflows, starting background workers, or binding the daemon port.",
+  "missing_primitive": "early help/version exit before blackboxd server initialization",
+  "fallback_used": "Verified installed blackboxd by checksum instead of invoking --help, after the help probe initialized daemon state and exited with address-in-use.",
+  "evidence": [
+    "task:aa6e22d9-351e-4996-ae1c-0faa31bf2d42",
+    "session:b41454ca-cc60-4b61-a1b5-875ab1dc06db",
+    "command:blackboxd --help",
+    "stderr:startup logs followed by Address already in use (os error 98)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/harness-cli/blackboxd-help-starts-daemon",
+  "notes": "Surfaced while running RETRO_HARNESS against the rebuild/reinstall session. This is operator-visible harness friction: a normal install verification command caused daemon initialization and tried to bind the already-running service port.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-13T22:26:01Z",
+  "updated_at": "2026-06-13T22:26:01Z"
+}
