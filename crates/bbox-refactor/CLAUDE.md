@@ -60,6 +60,29 @@ the cell choke point reuses it.
   node, and the cell choke point bounces the apply on post-write validation.
   Synthetic fixtures without `super()` hide this — it bit only on a real
   class whose constructor began with `super()`.
+- **Moved DI fields thread through the target ctor; the parameter restriction
+  is load-bearing (gap-9462575f).** `extract_class` threads a moved field that
+  the source ctor initializes *from a surviving ctor parameter*
+  (`this.repo = repo`, incl. the field/param name-mismatch case) into the
+  target's constructor — target ctor param + assignment, the param passed at
+  the source-side construction, the orphaned source assignment deleted. The
+  restriction to bare-ctor-parameter initializers is what keeps it safe: an
+  initializer that is a method call or computed expr (`this.grid = buildGrid()`
+  where `buildGrid` is moved) is NOT threaded, and only genuine injected deps —
+  never mutable state or constants — become ctor params. A single-line ctor
+  body (`X(Repo r) { this.r = r; }`) shares its line with the signature, so the
+  orphan deletion must be statement-scoped there, not full-line, or it eats the
+  signature and collides with the wiring insert.
+- **`removeUnusedConstructorParams` (`prune_ctor_params.rs`) is the composable
+  injection-point move, not an extract side-effect.** After an extract strands
+  a dependency's ctor parameter, this pure substrate fn drops params with zero
+  references in the `@Inject` ctor *body* — a parameter is ctor-scoped, so
+  "unused" is a local decision (no whole-class scan), and reference-counting
+  deliberately over-counts (a same-named field access keeps the param) so the
+  ambiguous direction is never an unsafe delete. `@Inject` ctors ONLY: a
+  manually-called ctor's `new` callers would break. One change replaces the
+  whole parameter list (no per-param comma surgery). New capability, no new plan
+  kind — a pure fn exposed at the crate root behind a `java.*` binding.
 
 ## Sibling boundary
 

@@ -70,6 +70,30 @@ Footguns that bit:
   external callers compile unchanged. Survey callers first (the one-call
   `code.files` → `code.query({files})`); the transform can't know whether
   anything off-file uses a moved method.
+- **DI policy lives in the binding, never the engine.** `bbox_refactor`'s
+  extract synthesis is framework-neutral by charter; the binding is the layer
+  that reads the source and decides wiring. `java.extractClass` auto-defaults a
+  Guice/DI source (uses `@Inject`) to `external_injection` so the delegate is a
+  container-constructed `@Inject` bean — interceptable by Guice AOP, which a
+  `new`-ed (`own_construction`) delegate is not. The delegate is left UNSCOPED
+  (never `@Singleton`): Guice JIT-binds a concrete `@Inject` class fresh per
+  injection point, matching a view's per-instance lifecycle so moved mutable
+  state can't leak. The `@Inject` flavor is matched to the source
+  (`com.google.inject` / `jakarta` / `javax`). Leave `wiring` unset to get this.
+- **`expected_wiring` ≠ `wiring` — the vocabulary collision that bit a probe.**
+  `analysis.cohesionClusters`'s `expected_wiring`
+  (`delegate`/`callback`/`source_instance`) is a cohesion-TOPOLOGY / seam-quality
+  signal; `java.extractClass`'s `wiring`
+  (`own_construction`/`external_injection`/`none`) is the DI STRATEGY. Feeding
+  the former into the latter (a recipe once did) makes the agent pass an invalid
+  enum and "repair" it to `own_construction`, silently defeating the AOP-ready
+  default. The cohesion recipe leaves `wiring` unset.
+- **Moving the injection point composes; it is not an extract side-effect.**
+  `external_injection` leaves the moved deps as dead `@Inject` params on the
+  source ctor. `java.removeUnusedConstructorParams` drops them, but only AFTER
+  the extract is applied — the orphaned `this.dep = dep` must already be gone or
+  the param still reads as referenced. Flow:
+  `extractClass → apply → removeUnusedConstructorParams → apply`.
 
 ## The trust model (don't re-litigate per binding)
 
