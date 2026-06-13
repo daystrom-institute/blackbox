@@ -18,6 +18,7 @@
 //! `syntax_only` tier (no ledger issuance — that tier is the floor anyway);
 //! `lsp_verified` Java kinds wait on jdtls in bro-lsp (v2 §7's named gate).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -54,6 +55,147 @@ fn detect_inject_fqn(source: &str) -> Option<String> {
     // `@Inject` present but no recognized single-type import (wildcard import,
     // or the annotation arrives via a star import) — default to the Guice flavor.
     Some("com.google.inject.Inject".to_string())
+}
+
+fn build_dependency_projection(
+    plan: &bbox_refactor::RefactorPlan,
+    move_fields: &[String],
+    effective_wiring: &str,
+    classification: Option<&bbox_refactor::facts::FileJavaFieldClassificationFacts>,
+) -> (Value, Vec<Value>) {
+    let moved: BTreeSet<&str> = move_fields.iter().map(String::as_str).collect();
+    let fields_by_name: BTreeMap<&str, &bbox_refactor::facts::JavaFieldClassificationFact> =
+        classification
+            .map(|facts| {
+                facts
+                    .fields
+                    .iter()
+                    .map(|field| (field.name.as_str(), field))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    let external_injection = effective_wiring == "external_injection";
+    let mut capture_projections = Vec::new();
+    let mut constructor_params = Vec::new();
+    let mut non_injectable_params = Vec::new();
+    let mut moved_field_names = Vec::new();
+    let mut static_final_constants = Vec::new();
+
+    for capture in &plan.captured_variables {
+        let field = fields_by_name.get(capture.name.as_str()).copied();
+        let field_is_moved = moved.contains(capture.name.as_str());
+        let moved_constructor_param = field_is_moved
+            && field
+                .and_then(|f| f.injection_style.as_deref())
+                .is_some_and(|style| style == "constructor_param");
+        let route = if capture.source_static_final && !field_is_moved {
+            "moved_static_final_constant"
+        } else if field_is_moved && moved_constructor_param {
+            "moved_field_constructor_param"
+        } else if field_is_moved {
+            "moved_field"
+        } else {
+            "captured_constructor_param"
+        };
+        let target_constructor_param = matches!(
+            route,
+            "captured_constructor_param" | "moved_field_constructor_param"
+        );
+        let is_injected = field.map(|f| f.is_injected).unwrap_or(false);
+        let is_provider = field.map(|f| f.is_provider).unwrap_or(false);
+        let injection_style = field.and_then(|f| f.injection_style.clone());
+        let wireability = if !target_constructor_param {
+            "not_constructor_param"
+        } else {
+            match effective_wiring {
+                "external_injection" if is_injected => "likely_injectable",
+                "external_injection" if is_provider => "provider_binding_review",
+                "external_injection" => "non_injectable_capture",
+                "none" => "manual_wiring_required",
+                _ => "source_argument",
+            }
+        };
+        let risk = if external_injection && target_constructor_param && !is_injected && !is_provider
+        {
+            Some("non_injectable_capture")
+        } else if effective_wiring == "own_construction"
+            && target_constructor_param
+            && capture.source_mutable
+        {
+            Some("snapshot_mutable_capture")
+        } else {
+            None
+        };
+        let recommendation = match risk {
+            Some("non_injectable_capture") => Some(
+                "target @Inject constructor will ask the DI container for this captured source field; move the field only if it belongs on the delegate, supply an injectable binding/provider, or choose a seam with injected captures",
+            ),
+            Some("snapshot_mutable_capture") => Some(
+                "own_construction passes the source field value once; move the mutable field or choose a seam that does not snapshot changing source state",
+            ),
+            _ => None,
+        };
+
+        let mut projection = json!({
+            "finding": "captured_dependency",
+            "name": capture.name,
+            "type": capture.source_type,
+            "route": route,
+            "target_constructor_param": target_constructor_param,
+            "wiring": effective_wiring,
+            "wireability": wireability,
+            "source_mutable": capture.source_mutable,
+            "source_static_final": capture.source_static_final,
+            "field_is_moved": field_is_moved,
+            "is_injected": is_injected,
+            "is_provider": is_provider,
+        });
+        if let Some(style) = injection_style {
+            projection["injection_style"] = json!(style);
+        }
+        if let Some(risk) = risk {
+            projection["risk"] = json!(risk);
+        }
+        if let Some(recommendation) = recommendation {
+            projection["recommendation"] = json!(recommendation);
+        }
+        if let Some(field) = field {
+            projection["reads"] = json!(field.reads);
+            projection["writes"] = json!(field.writes);
+            projection["read_by"] = json!(field.read_by);
+            projection["written_by"] = json!(field.written_by);
+        }
+
+        if target_constructor_param {
+            constructor_params.push(projection.clone());
+        }
+        if projection.get("risk").and_then(Value::as_str) == Some("non_injectable_capture") {
+            non_injectable_params.push(capture.name.clone());
+        }
+        if field_is_moved {
+            moved_field_names.push(capture.name.clone());
+        }
+        if route == "moved_static_final_constant" {
+            static_final_constants.push(capture.name.clone());
+        }
+        capture_projections.push(projection);
+    }
+
+    let projection = json!({
+        "wiring": effective_wiring,
+        "constructor_param_count": constructor_params.len(),
+        "constructor_params": constructor_params,
+        "non_injectable_params": non_injectable_params,
+        "moved_captured_fields": moved_field_names,
+        "static_final_constants": static_final_constants,
+        "summary": match effective_wiring {
+            "external_injection" => "external_injection means target constructor params must be DI-resolvable; review non_injectable_params before apply",
+            "none" => "wiring none leaves target constructor params for the operator to wire manually",
+            _ => "own_construction passes constructor params from the source instance; review snapshot_mutable_capture risks before apply",
+        },
+    });
+    (projection, capture_projections)
 }
 
 /// Workspace-relative form of a plan-emitted absolute path, tolerant of the
@@ -229,6 +371,28 @@ impl Tool for JavaExtractClass {
                     plan.leftovers.join("; ")
                 ));
             }
+            let captured_names: Vec<String> = plan
+                .captured_variables
+                .iter()
+                .map(|capture| capture.name.clone())
+                .collect();
+            let field_classification = if captured_names.is_empty() {
+                None
+            } else {
+                bbox_refactor::facts::java_field_classification(
+                    &root.join(&params.file),
+                    Some(&captured_names),
+                    None,
+                )
+                .ok()
+            };
+            let move_fields = params.move_fields.clone().unwrap_or_default();
+            let (dependency_projection, dependency_findings) = build_dependency_projection(
+                &plan,
+                &move_fields,
+                &effective_wiring,
+                field_classification.as_ref(),
+            );
 
             // FileEdits → hash-anchored span changes (the edits.merge shape).
             // The v1 planner emits NEW files as whole-content inserts against
@@ -285,6 +449,7 @@ impl Tool for JavaExtractClass {
                 f["finding"] = json!("captured_variable");
                 findings.push(f);
             }
+            findings.extend(dependency_findings);
             for c in &plan.external_calls {
                 let mut f = serde_json::to_value(c).unwrap_or_default();
                 f["finding"] = json!("external_call");
@@ -314,6 +479,7 @@ impl Tool for JavaExtractClass {
                 "changes": changes,
                 "creates": creates,
                 "findings": findings,
+                "dependency_projection": dependency_projection,
                 "fixme_count": fixme_count,
                 "provenance": "syntax_only",
             }))
@@ -362,12 +528,19 @@ PARAMS
                           Caller survey is one call: code.query({ files: (await code.files({ language: "java" })).files.map(f => f.file),
                           query: "(method_invocation name: (identifier) @call)" }) then filter @call by method name.
 
-RETURNS { title, changes, creates, findings, fixme_count, provenance }
+RETURNS { title, changes, creates, findings, dependency_projection, fixme_count, provenance }
   changes:  hash-anchored {span, new_text}[] → edits.merge
   creates:  {path, content}[]               → edits.createFile (one call each)
+  dependency_projection: compact pre-apply summary of which captured fields will become target
+                          constructor params under the selected wiring. For external_injection,
+                          non_injectable_params names captures that the DI container is unlikely
+                          to resolve without moving the field, supplying a binding/provider, or
+                          choosing a cleaner seam.
   findings: analysis facts, each tagged with `finding`:
     captured_variable     source fields the moved code reads — non-moved ones become constructor params;
                           source_mutable/source_static_final classify the promotion
+    captured_dependency   per-capture projection: route, target_constructor_param, wireability,
+                          injection_style, risk, and recommendation
     external_call         calls to source-class methods NOT in the moved set; recommended_resolution is one of
                           cross_class_static_call | add_to_item_names | add_to_callback_externals |
                           inject_source_instance | drop_the_call
@@ -576,7 +749,8 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
         description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); composes after extractClass+apply."
             .to_string(),
-        declarations: r#"type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; fixme_count: number; provenance: "syntax_only" };
+        declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
+type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; fixme_count: number; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
@@ -759,6 +933,93 @@ public class OrderService {
         assert!(
             !source_new_text.contains("new OrderWriter"),
             "DI source must NOT new up the delegate (defeats Guice AOP): {source_new_text}"
+        );
+    }
+
+    const DI_MIXED_CAPTURE_FIXTURE: &str = r#"package com.acme;
+
+import com.google.inject.Inject;
+
+class OrderService {
+    private final Repo repo;
+    private final UiState state;
+
+    @Inject
+    OrderService(Repo repo) {
+        this.repo = repo;
+        this.state = new UiState();
+    }
+
+    void render() {
+        repo.write(state.label());
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn dependency_projection_flags_non_injectable_external_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            DI_MIXED_CAPTURE_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderRenderer.java",
+                        "delegateField": "renderer",
+                        "methods": ["render"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let projection = &result["dependency_projection"];
+        assert_eq!(projection["wiring"], "external_injection", "{result}");
+        let non_injectable = projection["non_injectable_params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            non_injectable.contains(&Some("state")),
+            "plain source state should be flagged for DI review: {projection}"
+        );
+
+        let params = projection["constructor_params"].as_array().unwrap();
+        let repo = params
+            .iter()
+            .find(|param| param["name"] == "repo")
+            .expect("repo projection");
+        assert_eq!(repo["wireability"], "likely_injectable", "{repo}");
+        assert_eq!(repo["injection_style"], "constructor_param", "{repo}");
+
+        let state = params
+            .iter()
+            .find(|param| param["name"] == "state")
+            .expect("state projection");
+        assert_eq!(state["wireability"], "non_injectable_capture", "{state}");
+        assert_eq!(state["risk"], "non_injectable_capture", "{state}");
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["finding"] == "captured_dependency"
+                        && finding["name"] == "state"
+                        && finding["risk"] == "non_injectable_capture"
+                }),
+            "captured_dependency finding should mirror projection: {result}"
         );
     }
 
