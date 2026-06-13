@@ -59,6 +59,17 @@ pub(crate) struct StorageGcParams {
     /// Maximum age in days for inactive snapshots. Default 14.
     #[serde(default = "default_snapshot_max_age_days")]
     pub max_snapshot_age_days: Option<u64>,
+    /// Count budget for retained inactive snapshots per workspace. Bounds the
+    /// age-based keep (floors always retain and consume the budget): at
+    /// multi-agent commit rates, age-only retention reaches ~100 GB steady
+    /// state. Default 32.
+    #[serde(default = "default_snapshot_max_count")]
+    pub max_snapshots_per_workspace: Option<u64>,
+    /// Byte budget for retained inactive snapshots per workspace, consumed
+    /// newest-first; bounds the age-based keep like the count budget.
+    /// Default 16 GiB.
+    #[serde(default = "default_snapshot_max_total_bytes")]
+    pub max_snapshot_total_bytes_per_workspace: Option<u64>,
     /// Auto-prune dangling_path and legacy_unknown orphans after this many
     /// days. Default 30.
     #[serde(default = "default_orphan_after_days")]
@@ -99,6 +110,12 @@ fn default_branch_grace_minutes() -> u64 {
 }
 fn default_snapshot_max_age_days() -> Option<u64> {
     Some(14)
+}
+fn default_snapshot_max_count() -> Option<u64> {
+    Some(storage_health::DEFAULT_SNAPSHOT_MAX_COUNT_PER_WORKSPACE)
+}
+fn default_snapshot_max_total_bytes() -> Option<u64> {
+    Some(storage_health::DEFAULT_SNAPSHOT_MAX_TOTAL_BYTES_PER_WORKSPACE)
 }
 fn default_orphan_after_days() -> u64 {
     30
@@ -151,6 +168,8 @@ impl BlackboxServer {
                     keep_recent_per_repo: p.keep_recent_snapshots_per_repo,
                     branch_switch_grace_minutes: p.branch_switch_grace_minutes,
                     max_age_days: p.max_snapshot_age_days,
+                    max_count_per_workspace: p.max_snapshots_per_workspace,
+                    max_total_bytes_per_workspace: p.max_snapshot_total_bytes_per_workspace,
                 },
                 backups: storage_health::BackupRetentionPolicy {
                     max_total_bytes: p.max_backup_total_bytes,

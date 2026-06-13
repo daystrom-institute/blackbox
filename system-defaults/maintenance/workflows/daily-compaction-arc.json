@@ -1,6 +1,6 @@
 {
   "name": "daily-compaction-arc",
-  "version": 1,
+  "version": 2,
   "policy_packet": "domain:workflow-policy/arc-budget",
   "vars_schema": {
     "system_event_compaction_result": { "kind": "object" },
@@ -41,7 +41,10 @@
               "prune_temps": true,
               "prune_inactive_snapshots": true,
               "max_backup_age_days": 7,
-              "keep_newest_backup_per_source": 1
+              "keep_newest_backup_per_source": 1,
+              "max_snapshot_age_days": 7,
+              "max_snapshots_per_workspace": 32,
+              "max_snapshot_total_bytes_per_workspace": 17179869184
             }
           },
           "on_failure": "warn"

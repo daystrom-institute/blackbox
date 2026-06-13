@@ -2815,6 +2815,8 @@ mod tests {
                     keep_recent_per_repo: 0,
                     branch_switch_grace_minutes: 0,
                     max_age_days: None,
+                    max_count_per_workspace: None,
+                    max_total_bytes_per_workspace: None,
                 },
                 ..Default::default()
             };
@@ -2907,6 +2909,8 @@ mod tests {
                     keep_recent_per_repo: 0,
                     branch_switch_grace_minutes: 0,
                     max_age_days: None,
+                    max_count_per_workspace: None,
+                    max_total_bytes_per_workspace: None,
                 },
                 ..Default::default()
             };

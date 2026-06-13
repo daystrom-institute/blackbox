@@ -10,6 +10,15 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Inactive workspace-snapshot retention is now budget-bounded
+  (gap-efd270dd): `bbox_storage_gc` gains `max_snapshots_per_workspace`
+  (default 32) and `max_snapshot_total_bytes_per_workspace` (default
+  16 GiB), bounding the age-based keep so per-commit snapshot churn can no
+  longer reach ~100 GB steady state inside the age window. Floors (recent
+  per workspace/repo, branch-switch grace) always retain and consume the
+  budget. The in-daemon 6h maintenance pass inherits the budgets via the
+  policy default, and `daily-compaction-arc` v2 passes explicit
+  `max_snapshot_age_days=7` plus both budgets.
 - `bbox_inbox` now surfaces "Cron scheduling gaps": cron-routing packets
   installed with no live cron scheduling them (maintenance that exists but
   silently never runs — the class behind storage GC never firing,

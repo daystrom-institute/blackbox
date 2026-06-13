@@ -1589,7 +1589,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_storage_gc",
         category: ToolCategory::StorageHealth,
         summary: "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule for temps, backups, orphan classes, inactive snapshots, and observed cap warnings.",
-        when_to_use: "Use for sidecar cleanup after inspecting health. Defaults retain newest backups, recent inactive snapshots per workspace/repo, branch-switch grace, and keep observed history. `dangling_path` and `legacy_unknown` orphans can auto-prune after grace; `explicitly_unregistered` requires `prune_explicitly_unregistered=true`. `prune_duplicate_packets=true` additionally dedupes byte-identical rule-packet copies (keeps the newest per domain/scope/project; Apply-referenced copies are protected).",
+        when_to_use: "Use for sidecar cleanup after inspecting health. Defaults retain newest backups, recent inactive snapshots per workspace/repo, branch-switch grace, and keep observed history. Inactive-snapshot age retention is bounded by per-workspace count/byte budgets (`max_snapshots_per_workspace`, default 32; `max_snapshot_total_bytes_per_workspace`, default 16 GiB) so under-age snapshots still prune once a workspace exceeds the budget — floors always win. `dangling_path` and `legacy_unknown` orphans can auto-prune after grace; `explicitly_unregistered` requires `prune_explicitly_unregistered=true`. `prune_duplicate_packets=true` additionally dedupes byte-identical rule-packet copies (keeps the newest per domain/scope/project; Apply-referenced copies are protected).",
         example: None,
     },
     ToolDoc {

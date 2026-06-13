@@ -845,6 +845,17 @@ pub struct SnapshotRetentionPolicy {
     pub keep_recent_per_repo: u64,
     pub branch_switch_grace_minutes: u64,
     pub max_age_days: Option<u64>,
+    /// Hard cap on retained inactive snapshot directories per workspace.
+    /// Bounds the age-based keep: a snapshot under `max_age_days` is only
+    /// retained while the workspace's retained count stays under this cap
+    /// (floors — recent/grace — always retain and consume the cap). Without
+    /// a count/byte budget, age-only retention reaches ~100 GB steady state
+    /// at multi-agent commit rates (gap-efd270dd).
+    pub max_count_per_workspace: Option<u64>,
+    /// Total byte budget for retained inactive snapshots per workspace,
+    /// consumed newest-first. Bounds the age-based keep the same way as
+    /// `max_count_per_workspace`; floors always retain even over budget.
+    pub max_total_bytes_per_workspace: Option<u64>,
 }
 
 impl Default for SnapshotRetentionPolicy {
@@ -855,9 +866,16 @@ impl Default for SnapshotRetentionPolicy {
             keep_recent_per_repo: 10,
             branch_switch_grace_minutes: 60,
             max_age_days: Some(14),
+            max_count_per_workspace: Some(DEFAULT_SNAPSHOT_MAX_COUNT_PER_WORKSPACE),
+            max_total_bytes_per_workspace: Some(DEFAULT_SNAPSHOT_MAX_TOTAL_BYTES_PER_WORKSPACE),
         }
     }
 }
+
+/// Default count budget for retained inactive snapshots per workspace.
+pub const DEFAULT_SNAPSHOT_MAX_COUNT_PER_WORKSPACE: u64 = 32;
+/// Default byte budget for retained inactive snapshots per workspace (16 GiB).
+pub const DEFAULT_SNAPSHOT_MAX_TOTAL_BYTES_PER_WORKSPACE: u64 = 16 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupRetentionPolicy {
@@ -1157,6 +1175,28 @@ fn plan_snapshot_gc(
         });
     }
 
+    // Aggregate to snapshot directories: retention decisions are per
+    // snapshot (a head-<sha> directory), not per file — and the count/byte
+    // budgets only make sense at that grain. A dir's age is its newest
+    // file's age; its weight is the byte sum of its files.
+    struct DirAgg {
+        project_id: String,
+        age_secs: u64,
+        bytes: u64,
+    }
+    let mut dirs: HashMap<String, DirAgg> = HashMap::new();
+    for snapshot in &snapshots {
+        let entry = dirs
+            .entry(snapshot.snapshot_dir.clone())
+            .or_insert_with(|| DirAgg {
+                project_id: snapshot.project_id.clone(),
+                age_secs: snapshot.age_secs,
+                bytes: 0,
+            });
+        entry.age_secs = entry.age_secs.min(snapshot.age_secs);
+        entry.bytes += snapshot.file.bytes;
+    }
+
     let retain_by_workspace = retained_snapshot_dirs(
         snapshots
             .iter()
@@ -1171,62 +1211,123 @@ fn plan_snapshot_gc(
     );
     let grace_secs = policy.branch_switch_grace_minutes * 60;
 
-    for snapshot in snapshots {
-        // TODO: policy.keep_active is currently a no-op pending active-snapshot detection
-        let retained_reason = None
-            .or_else(|| {
-                retain_by_workspace
-                    .contains(&snapshot.snapshot_dir)
-                    .then(|| "snapshot_retained_recent_workspace".to_string())
-            })
-            .or_else(|| {
-                retain_by_repo
-                    .contains(&snapshot.snapshot_dir)
-                    .then(|| "snapshot_retained_recent_repo".to_string())
-            })
-            .or_else(|| {
-                (snapshot.age_secs < grace_secs).then(|| {
-                    format!(
-                        "snapshot_retained_branch_switch_grace(age={}s,need={}s)",
-                        snapshot.age_secs, grace_secs
-                    )
+    // Walk each workspace's snapshot dirs newest-first, consuming the
+    // count/byte budgets. Floors (recent workspace/repo, grace) always
+    // retain and consume budget; the age-based keep applies only while
+    // budget remains — that bound is what keeps steady-state disk usage
+    // finite at high commit rates (gap-efd270dd).
+    let mut by_workspace: HashMap<&str, Vec<(&String, &DirAgg)>> = HashMap::new();
+    for (dir, agg) in &dirs {
+        by_workspace
+            .entry(agg.project_id.as_str())
+            .or_default()
+            .push((dir, agg));
+    }
+    // TODO: policy.keep_active is currently a no-op pending active-snapshot detection
+    let mut dir_fate: HashMap<String, (bool, String)> = HashMap::new();
+    for (_workspace, mut entries) in by_workspace {
+        entries.sort_by(|a, b| a.1.age_secs.cmp(&b.1.age_secs).then(a.0.cmp(b.0)));
+        let mut count_used: u64 = 0;
+        let mut bytes_used: u64 = 0;
+        for (dir, agg) in entries {
+            let floor_reason = None
+                .or_else(|| {
+                    retain_by_workspace
+                        .contains(dir)
+                        .then(|| "snapshot_retained_recent_workspace".to_string())
                 })
-            })
-            .or_else(|| {
-                policy.max_age_days.and_then(|max_days| {
-                    (snapshot.age_secs < max_days * 86400).then(|| {
+                .or_else(|| {
+                    retain_by_repo
+                        .contains(dir)
+                        .then(|| "snapshot_retained_recent_repo".to_string())
+                })
+                .or_else(|| {
+                    (agg.age_secs < grace_secs).then(|| {
                         format!(
-                            "snapshot_retained_under_max_age(age={}s,max_days={})",
-                            snapshot.age_secs, max_days
+                            "snapshot_retained_branch_switch_grace(age={}s,need={}s)",
+                            agg.age_secs, grace_secs
                         )
                     })
-                })
-            });
+                });
 
-        if let Some(rule) = retained_reason {
-            candidates.push(GcCandidate {
-                path: snapshot.file.path.clone(),
-                kind: snapshot.file.kind,
-                bytes: snapshot.file.bytes,
-                project_id: snapshot.file.project_id.clone(),
-                rule,
-                deletable: false,
-            });
-        } else {
-            candidates.push(GcCandidate {
-                path: snapshot.file.path.clone(),
-                kind: snapshot.file.kind,
-                bytes: snapshot.file.bytes,
-                project_id: snapshot.file.project_id.clone(),
-                rule: format!(
-                    "snapshot_prunable(max_age_days={:?},keep_recent_per_workspace={},keep_recent_per_repo={})",
-                    policy.max_age_days,
-                    policy.keep_recent_per_workspace,
-                    policy.keep_recent_per_repo
+            if let Some(rule) = floor_reason {
+                count_used += 1;
+                bytes_used = bytes_used.saturating_add(agg.bytes);
+                dir_fate.insert(dir.clone(), (false, rule));
+                continue;
+            }
+
+            let under_age = policy
+                .max_age_days
+                .is_some_and(|max_days| agg.age_secs < max_days * 86400);
+            if !under_age {
+                dir_fate.insert(
+                    dir.clone(),
+                    (
+                        true,
+                        format!(
+                            "snapshot_prunable(max_age_days={:?},keep_recent_per_workspace={},keep_recent_per_repo={})",
+                            policy.max_age_days,
+                            policy.keep_recent_per_workspace,
+                            policy.keep_recent_per_repo
+                        ),
+                    ),
+                );
+                continue;
+            }
+
+            let over_count = policy
+                .max_count_per_workspace
+                .is_some_and(|cap| count_used >= cap);
+            let over_bytes = policy
+                .max_total_bytes_per_workspace
+                .is_some_and(|cap| bytes_used.saturating_add(agg.bytes) > cap);
+            if over_count || over_bytes {
+                dir_fate.insert(
+                    dir.clone(),
+                    (
+                        true,
+                        format!(
+                            "snapshot_prunable_over_budget(count_used={},max_count={:?},bytes_used={},dir_bytes={},max_bytes={:?})",
+                            count_used,
+                            policy.max_count_per_workspace,
+                            bytes_used,
+                            agg.bytes,
+                            policy.max_total_bytes_per_workspace
+                        ),
+                    ),
+                );
+                continue;
+            }
+
+            count_used += 1;
+            bytes_used = bytes_used.saturating_add(agg.bytes);
+            dir_fate.insert(
+                dir.clone(),
+                (
+                    false,
+                    format!(
+                        "snapshot_retained_under_max_age(age={}s,max_days={})",
+                        agg.age_secs,
+                        policy.max_age_days.unwrap_or(0)
+                    ),
                 ),
-                deletable: true,
-            });
+            );
         }
+    }
+
+    for snapshot in snapshots {
+        let Some((deletable, rule)) = dir_fate.get(&snapshot.snapshot_dir) else {
+            continue;
+        };
+        candidates.push(GcCandidate {
+            path: snapshot.file.path.clone(),
+            kind: snapshot.file.kind,
+            bytes: snapshot.file.bytes,
+            project_id: snapshot.file.project_id.clone(),
+            rule: rule.clone(),
+            deletable: *deletable,
+        });
     }
 }
 
@@ -2092,6 +2193,8 @@ mod tests {
                     keep_recent_per_repo: 0,
                     branch_switch_grace_minutes: 0,
                     max_age_days: Some(0),
+                    max_count_per_workspace: None,
+                    max_total_bytes_per_workspace: None,
                 },
                 ..GcPolicy::default()
             },
@@ -2111,6 +2214,169 @@ mod tests {
             candidates
                 .iter()
                 .any(|c| c.path.contains("head-old") && c.deletable)
+        );
+    }
+
+    /// The count budget bounds the age-based keep (gap-efd270dd): with
+    /// max_count_per_workspace=2, the recent floor plus one under-age
+    /// snapshot retain; everything older prunes even though far under
+    /// max_age_days.
+    #[test]
+    fn inactive_snapshot_count_budget_bounds_age_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        let active = write_snapshot_jsonl(&edges_dir, "p1", "head-active");
+        set_mtime_days_old(&active, 0);
+        for (id, days) in [("head-b", 1), ("head-c", 2), ("head-d", 3), ("head-e", 4)] {
+            let path = write_snapshot_jsonl(&edges_dir, "p1", id);
+            set_mtime_days_old(&path, days);
+        }
+        write_workspace_manifest(
+            &edges_dir,
+            "p1",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "p1", "head-active");
+
+        let registered: HashSet<String> = ["p1".to_string()].into_iter().collect();
+        let candidates = plan_gc_with_policy(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: true,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+            &GcPolicy {
+                materialized_snapshots: SnapshotRetentionPolicy {
+                    keep_active: true,
+                    keep_recent_per_workspace: 1,
+                    keep_recent_per_repo: 0,
+                    branch_switch_grace_minutes: 0,
+                    // Everything is under age — only the budget can prune.
+                    max_age_days: Some(10_000),
+                    max_count_per_workspace: Some(2),
+                    max_total_bytes_per_workspace: None,
+                },
+                ..GcPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let fate = |needle: &str| {
+            candidates
+                .iter()
+                .find(|c| c.path.contains(needle))
+                .map(|c| (c.deletable, c.rule.clone()))
+        };
+        assert_eq!(
+            fate("head-b").map(|f| f.0),
+            Some(false),
+            "newest inactive snapshot is floor-retained"
+        );
+        assert_eq!(
+            fate("head-c").map(|f| f.0),
+            Some(false),
+            "second snapshot fits the count budget"
+        );
+        for id in ["head-d", "head-e"] {
+            let (deletable, rule) = fate(id).expect("candidate exists");
+            assert!(deletable, "{id} must prune over the count budget: {rule}");
+            assert!(
+                rule.starts_with("snapshot_prunable_over_budget"),
+                "{id} rule must name the budget: {rule}"
+            );
+        }
+    }
+
+    /// The byte budget prunes under-age snapshots once the workspace's
+    /// retained bytes exceed the ceiling — but floors always win over the
+    /// budget (never delete the recent floor to satisfy bytes).
+    #[test]
+    fn inactive_snapshot_byte_budget_bounds_age_keep_but_floors_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        let active = write_snapshot_jsonl(&edges_dir, "p1", "head-active");
+        set_mtime_days_old(&active, 0);
+        let recent = write_snapshot_jsonl(&edges_dir, "p1", "head-recent");
+        set_mtime_days_old(&recent, 1);
+        let older = write_snapshot_jsonl(&edges_dir, "p1", "head-older");
+        set_mtime_days_old(&older, 2);
+        write_workspace_manifest(
+            &edges_dir,
+            "p1",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "p1", "head-active");
+
+        let registered: HashSet<String> = ["p1".to_string()].into_iter().collect();
+        let candidates = plan_gc_with_policy(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: true,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+            &GcPolicy {
+                materialized_snapshots: SnapshotRetentionPolicy {
+                    keep_active: true,
+                    keep_recent_per_workspace: 1,
+                    keep_recent_per_repo: 0,
+                    branch_switch_grace_minutes: 0,
+                    max_age_days: Some(10_000),
+                    max_count_per_workspace: None,
+                    // Smaller than a single snapshot file: the floor still
+                    // retains; everything else is over budget.
+                    max_total_bytes_per_workspace: Some(1),
+                },
+                ..GcPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let recent_candidate = candidates
+            .iter()
+            .find(|c| c.path.contains("head-recent"))
+            .expect("recent snapshot is a candidate");
+        assert!(
+            !recent_candidate.deletable,
+            "floor-retained snapshot survives even over the byte budget: {}",
+            recent_candidate.rule
+        );
+        let older_candidate = candidates
+            .iter()
+            .find(|c| c.path.contains("head-older"))
+            .expect("older snapshot is a candidate");
+        assert!(
+            older_candidate.deletable,
+            "under-age snapshot over the byte budget must prune: {}",
+            older_candidate.rule
+        );
+        assert!(
+            older_candidate
+                .rule
+                .starts_with("snapshot_prunable_over_budget"),
+            "rule must name the budget: {}",
+            older_candidate.rule
         );
     }
 
