@@ -1,0 +1,19 @@
+{
+  "id": "2ac05aa7",
+  "title": "blackbox TLS commitment — rustls-only",
+  "content": "Project convention (blackbox daemon itself): TLS library choice is rustls, not openssl. This was locked in during phase-1 as part of the 'no openssl' house rule — the daemon ships a rustls-only TLS stack. Any design proposal that suggests keeping openssl or migrating back to it is a non-starter. Any evaluator of migration proposals must weight `uses_rustls=true` as a hard requirement, not a preference.",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-04-19T23:12:17Z",
+  "updated_at": "2026-04-19T23:12:17Z",
+  "recall_count": 0
+}
