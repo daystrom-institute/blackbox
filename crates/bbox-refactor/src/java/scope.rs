@@ -626,6 +626,7 @@ fn infer_expression_type(node: Node<'_>, source: &str) -> Option<String> {
                 .find(|child| child.kind() != "(" && child.kind() != ")")
                 .and_then(|child| infer_expression_type(child, source))
         }
+        "method_invocation" => infer_method_invocation_type(node, source),
         "string_literal" => Some("String".to_string()),
         "character_literal" => Some("char".to_string()),
         "true" | "false" => Some("boolean".to_string()),
@@ -642,6 +643,94 @@ fn infer_expression_type(node: Node<'_>, source: &str) -> Option<String> {
             .map(floating_literal_type),
         _ => None,
     }
+}
+
+fn infer_method_invocation_type(node: Node<'_>, source: &str) -> Option<String> {
+    let method_name = node
+        .child_by_field_name("name")
+        .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?;
+
+    if let Some(return_type) = unique_same_file_method_return_type(node, method_name, source) {
+        return Some(return_type);
+    }
+
+    if !is_known_static_factory_method(method_name) {
+        return None;
+    }
+
+    node.child_by_field_name("object")
+        .and_then(|object| object.utf8_text(source.as_bytes()).ok())
+        .map(str::trim)
+        .filter(|receiver| is_probable_static_type_reference(receiver))
+        .map(str::to_string)
+}
+
+fn unique_same_file_method_return_type(
+    node: Node<'_>,
+    method_name: &str,
+    source: &str,
+) -> Option<String> {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+
+    let mut return_types = Vec::new();
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "method_declaration"
+            && current
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                .is_some_and(|name| name.trim() == method_name)
+            && let Some(type_node) = current.child_by_field_name("type")
+            && let Ok(type_text) = type_node.utf8_text(source.as_bytes())
+        {
+            let trimmed = type_text.trim();
+            if !trimmed.is_empty()
+                && trimmed != "void"
+                && !is_inferred_or_invalid_java_type(trimmed)
+                && !return_types.iter().any(|seen| seen == trimmed)
+            {
+                return_types.push(trimmed.to_string());
+            }
+        }
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    if return_types.len() == 1 {
+        return_types.pop()
+    } else {
+        None
+    }
+}
+
+fn is_known_static_factory_method(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "of" | "from" | "valueOf" | "copyOf" | "getInstance" | "newInstance"
+    )
+}
+
+fn is_probable_static_type_reference(receiver: &str) -> bool {
+    if receiver.is_empty()
+        || receiver == "this"
+        || receiver == "super"
+        || receiver.contains('(')
+        || receiver.contains(' ')
+    {
+        return false;
+    }
+    receiver
+        .rsplit('.')
+        .next()
+        .and_then(|segment| segment.chars().next())
+        .is_some_and(|first| first.is_ascii_uppercase())
 }
 
 fn concrete_object_creation_type(type_text: &str) -> Option<String> {

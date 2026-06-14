@@ -393,10 +393,7 @@ mod tests {
             "*** Begin Patch\n*** Add File: ../{sibling_name}/escaped.txt\n+escaped\n*** End Patch"
         );
         apply_patch(&patch, base_dir.path()).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "escaped\n"
-        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "escaped\n");
     }
 
     #[test]

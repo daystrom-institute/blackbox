@@ -19,7 +19,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/code-mode-read/direct-line-range-read",
   "notes": "Generic finding from private Java probes. This is an ergonomics gap that creates avoidable cells and stale-span mistakes during bounded inspection. A result-record probe produced several retry cells and one failed apply because the agent had to bridge analysis line ranges to exact byte ranges manually. The calculation reprobe still needed a separate bounded read after methodRegions gating to obtain exact oldText for extractMethodCodeBlock; a direct code.readLines or methodRegions exact_text field would remove that cell.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-14T03:54:32Z",
-  "updated_at": "2026-06-14T05:10:57Z"
+  "updated_at": "2026-06-14T05:20:51Z",
+  "resolved_at": "2026-06-14T05:20:51Z",
+  "resolution_note": "Addressed by adding the code.readLines({ file, startLine, endLine }) isolate binding. It reads exact text by 1-based inclusive line range and returns the text plus a hash-anchored span/length metadata, so methodRegions line ranges can be bridged to extractMethodCodeBlock oldText without raw bounded file reads."
 }

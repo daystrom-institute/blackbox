@@ -628,6 +628,127 @@ impl Tool for CodeRead {
     }
 }
 
+/// `code.readLines` — read exact source text by 1-based inclusive line range.
+pub struct CodeReadLines;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeReadLinesParams {
+    file: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+#[async_trait]
+impl Tool for CodeReadLines {
+    fn name(&self) -> &str {
+        "code.readLines"
+    }
+    fn description(&self) -> &str {
+        "Read exact source text for a 1-based inclusive line range and return a hash-anchored Span (pure)."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative file path." },
+                "startLine": { "type": "integer", "minimum": 1 },
+                "endLine": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["file", "startLine", "endLine"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("code".to_string(), "readLines".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: CodeReadLinesParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.readLines: {e}")),
+        };
+        if params.start_line == 0 || params.end_line == 0 || params.start_line > params.end_line {
+            return err(format!(
+                "code.readLines: invalid line range {}..{}; use 1-based inclusive lines",
+                params.start_line, params.end_line
+            ));
+        }
+        let path = match resolve(&cx.root, &params.file) {
+            Ok(p) => p,
+            Err(e) => return err(format!("code.readLines: {e}")),
+        };
+        bro_tools::tool::call_blocking(move || {
+            let bytes = match read_file_bytes(&path) {
+                Ok(b) => b,
+                Err(e) => return err(format!("code.readLines: {}: {e}", params.file)),
+            };
+            let source = String::from_utf8_lossy(&bytes);
+            let Some((byte_start, byte_end)) =
+                line_range_to_bytes(&source, params.start_line, params.end_line)
+            else {
+                let line_count = source.lines().count().max(1);
+                return err(format!(
+                    "code.readLines: line range {}..{} out of bounds for {} ({} line(s))",
+                    params.start_line, params.end_line, params.file, line_count
+                ));
+            };
+            let content_sha256 = bbox_refactor::sha256_hex(&bytes);
+            let text = source[byte_start..byte_end].to_string();
+            let span = Span {
+                file: params.file,
+                byte_start,
+                byte_end,
+                content_sha256,
+            };
+            ToolResult::Json(json!({
+                "text": text,
+                "span": span,
+                "startLine": params.start_line,
+                "endLine": params.end_line,
+                "byte_length": byte_end.saturating_sub(byte_start),
+                "char_length": source[byte_start..byte_end].chars().count(),
+                "truncated": false
+            }))
+        })
+        .await
+    }
+}
+
+fn line_range_to_bytes(source: &str, start_line: usize, end_line: usize) -> Option<(usize, usize)> {
+    let mut line_no = 1usize;
+    let mut line_start = 0usize;
+    let mut start_byte = None;
+    let mut end_byte = None;
+
+    for (idx, ch) in source.char_indices() {
+        if line_no == start_line && start_byte.is_none() {
+            start_byte = Some(line_start);
+        }
+        if ch == '\n' {
+            if line_no == end_line {
+                end_byte = Some(idx + ch.len_utf8());
+                break;
+            }
+            line_no += 1;
+            line_start = idx + ch.len_utf8();
+        }
+    }
+
+    if line_no == start_line && start_byte.is_none() {
+        start_byte = Some(line_start);
+    }
+    if line_no == end_line && end_byte.is_none() {
+        end_byte = Some(source.len());
+    }
+
+    Some((start_byte?, end_byte?))
+}
+
 /// `code.signature` — extract a callable declaration signature from the AST at a Span.
 pub struct CodeSignature;
 
@@ -840,6 +961,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(CodeFields) as Arc<dyn Tool>,
         Arc::new(CodeQuery) as Arc<dyn Tool>,
         Arc::new(CodeRead) as Arc<dyn Tool>,
+        Arc::new(CodeReadLines) as Arc<dyn Tool>,
         Arc::new(CodeSignature) as Arc<dyn Tool>,
         Arc::new(CodeSpanUnion) as Arc<dyn Tool>,
     ]
@@ -851,7 +973,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The seven methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Use `code.fields` for Java field declarations; do not hand-roll field_declaration queries just to learn modifiers/type/name. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
+        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The eight methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Use `code.fields` for Java field declarations; do not hand-roll field_declaration queries just to learn modifiers/type/name. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. For line ranges from analysis.methodRegions, use `code.readLines({ file, startLine, endLine })` to produce exact oldText and a hash-anchored span. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
 type SyntaxItemFact = { name?: string; kind: string; visibility?: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
@@ -872,6 +994,8 @@ declare const code: {
   query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean; aggregate_capped?: boolean; files_scanned?: number; files_total?: number; hint?: string }>;
   /** Read the exact text of a Span; errors with stale_span on content drift. `truncated` is always false for successful reads; UI/tool display may still elide long text. */
   read(args: { span: Span }): Promise<{ text: string; span: Span; byte_length: number; char_length: number; truncated: false }>;
+  /** Read exact text by 1-based inclusive line range and return a hash-anchored Span. Use for methodRegions line ranges -> oldText. */
+  readLines(args: { file: string; startLine: number; endLine: number }): Promise<{ text: string; span: Span; startLine: number; endLine: number; byte_length: number; char_length: number; truncated: false }>;
   /** Language-shaped callable signature at/enclosing a Span. Rust returns function facts; Java returns method/constructor facts. `span` covers the whole item; `signature_span` covers the declaration header; `params_span` covers the raw parameter list for formatting checks. Errors with stale_span on drift. */
   signature(args: { span: Span }): Promise<RustSignature | JavaSignature>;
   /** Union same-file Spans into one covering Span (pure; no I/O). */
@@ -985,6 +1109,29 @@ class Probe {
         assert_eq!(read["byte_length"], 4);
         assert_eq!(read["char_length"], 4);
         assert_eq!(read["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn read_lines_returns_exact_text_and_hash_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = fixture(&root);
+        let out = json_of(
+            CodeReadLines
+                .call(
+                    json!({ "file": file, "startLine": 3, "endLine": 5 }),
+                    &cx_in(&root),
+                )
+                .await,
+        );
+
+        assert_eq!(out["text"], "pub fn beta() -> u8 {\n    7\n}\n");
+        assert_eq!(out["startLine"], 3);
+        assert_eq!(out["endLine"], 5);
+        assert_eq!(out["truncated"], false);
+        assert_eq!(out["span"]["file"], file);
+        assert_eq!(out["span"]["byte_start"], 19);
+        assert_eq!(out["byte_length"], out["text"].as_str().unwrap().len());
     }
 
     #[tokio::test]
@@ -1394,8 +1541,9 @@ class Probe {
             .await;
         let value = match result {
             ToolResult::Json(v) => v,
-            ToolResult::Text(t) => serde_json::from_str(&t)
-                .unwrap_or_else(|e| panic!("text not JSON: {e}: {t}")),
+            ToolResult::Text(t) => {
+                serde_json::from_str(&t).unwrap_or_else(|e| panic!("text not JSON: {e}: {t}"))
+            }
             other => panic!("expected json/text, got {other:?}"),
         };
         assert_eq!(

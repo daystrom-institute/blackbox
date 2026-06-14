@@ -835,31 +835,56 @@ fn call_site_replacement_indent(source: &str, byte: usize) -> String {
 }
 
 fn reindent_block(text: &str, indent: &str) -> String {
-    let mut line_indents = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.bytes().take_while(|b| *b == b' ').count())
-        .collect::<Vec<_>>();
-    let min_indent = if line_indents.first().copied() == Some(0)
-        && line_indents.iter().skip(1).all(|count| *count > 0)
-    {
-        line_indents.iter().skip(1).copied().min().unwrap_or(0)
-    } else {
-        line_indents.drain(..).min().unwrap_or(0)
-    };
-
+    let common_indent = common_leading_whitespace(text);
     text.lines()
         .map(|line| {
             if line.trim().is_empty() {
                 String::new()
             } else {
-                let leading_spaces = line.bytes().take_while(|b| *b == b' ').count();
-                let strip = min_indent.min(leading_spaces);
-                format!("{indent}{}", &line[strip..])
+                let stripped = line.strip_prefix(&common_indent).unwrap_or(line);
+                format!("{indent}{stripped}")
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn common_leading_whitespace(text: &str) -> String {
+    let mut prefixes = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(leading_whitespace)
+        .collect::<Vec<_>>();
+    if prefixes.first().is_some_and(|prefix| prefix.is_empty())
+        && prefixes.iter().skip(1).all(|prefix| !prefix.is_empty())
+    {
+        prefixes.remove(0);
+    }
+    let Some(first) = prefixes.first().copied() else {
+        return String::new();
+    };
+    let mut common_len = first.len();
+    for prefix in prefixes.iter().skip(1) {
+        common_len = common_prefix_len(&first[..common_len], prefix);
+    }
+    first[..common_len].to_string()
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    let end = line
+        .char_indices()
+        .find_map(|(idx, ch)| (!matches!(ch, ' ' | '\t')).then_some(idx))
+        .unwrap_or(line.len());
+    &line[..end]
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    left.char_indices()
+        .zip(right.chars())
+        .take_while(|((_, l), r)| l == r)
+        .map(|((idx, ch), _)| idx + ch.len_utf8())
+        .last()
+        .unwrap_or(0)
 }
 
 fn format_helper_insert(source: &str, enclosing_end: usize, helper_decl: &str) -> (usize, String) {

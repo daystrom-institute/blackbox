@@ -9462,7 +9462,7 @@ fn extract_code_block_refuses_var_capture_parameter_without_operator_help() {
         "package p;\n\
          class VarCapture {\n\
          \x20   void run() {\n\
-         \x20       var names = java.util.List.of(\"a\");\n\
+         \x20       var names = Factory.names(\"a\");\n\
          \x20       System.out.println(names);\n\
          \x20   }\n\
          }\n",
@@ -9727,17 +9727,16 @@ fn extract_code_block_result_record_refuses_unresolved_var_live_out() {
         "package p;\n\
          class VarResultUnresolved {\n\
          \x20   int run() {\n\
-         \x20       var a = value();\n\
+         \x20       var a = unknownValue();\n\
          \x20       int b = 2;\n\
          \x20       return a + b;\n\
          \x20   }\n\
-         \x20   int value() { return 1; }\n\
          }\n",
     )
     .unwrap();
     let mut params = java_plan_params("extract_java_code_block_to_method", &path);
     params.project_dir = Some(path_string(dir.path()));
-    params.old_text = Some("var a = value();\n        int b = 2;".to_string());
+    params.old_text = Some("var a = unknownValue();\n        int b = 2;".to_string());
     params.module_name = Some("prep".to_string());
     let mut entries = std::collections::BTreeMap::new();
     entries.insert("result_record".to_string(), serde_json::json!(true));
@@ -9931,6 +9930,45 @@ fn extract_java_code_block_to_method_preserves_formatting_when_applied() {
         "{rewritten}"
     );
     assert!(!rewritten.contains("}    private"), "{rewritten}");
+}
+
+#[test]
+fn extract_java_code_block_to_method_reindents_deep_nested_helper_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("DeepFormat.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class DeepFormat {\n\
+         \x20   void run(boolean enabled) {\n\
+         \x20       while (enabled) {\n\
+         \x20           if (enabled) {\n\
+         \x20               int value = 1;\n\
+         \x20               System.out.println(value);\n\
+         \x20           }\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let selected = "                int value = 1;\n                System.out.println(value);";
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some(selected.to_string());
+    params.module_name = Some("emitValue".to_string());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &path);
+
+    assert!(
+        rewritten.contains("    private void emitValue() {\n        int value = 1;\n        System.out.println(value);\n    }\n"),
+        "{rewritten}"
+    );
+    assert!(
+        !rewritten.contains("                    int value = 1;"),
+        "{rewritten}"
+    );
 }
 
 #[test]
@@ -10256,6 +10294,86 @@ fn method_regions_reports_resolved_types_for_simple_var_capture_and_live_out() {
         .expect("value live-out");
     assert_eq!(value.type_text, "var");
     assert_eq!(value.resolved_type.as_deref(), Some("String"));
+}
+
+#[test]
+fn method_regions_resolves_var_type_from_same_file_method_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarMethodCall.java");
+    let source = "package p;\n\
+         class VarMethodCall {\n\
+         \x20   void build() {\n\
+         \x20       var prefix = makePrefix();\n\
+         \x20       log(prefix);\n\
+         \x20   }\n\
+         \x20   String makePrefix() { return \"a\"; }\n\
+         \x20   void log(Object value) {}\n\
+         }\n";
+    fs::write(&path, source).unwrap();
+    let start = source.find("log(prefix)").unwrap();
+    let end = start + "log(prefix);".len();
+
+    let facts = analyze_java_method_regions(
+        &path,
+        "build",
+        Some("VarMethodCall"),
+        Some(&[JavaMethodRegionRequest {
+            label: Some("candidate".to_string()),
+            byte_start: Some(start),
+            byte_end: Some(end),
+            start_line: None,
+            end_line: None,
+        }]),
+    )
+    .unwrap();
+
+    let prefix = facts.requested_ranges[0]
+        .captures
+        .iter()
+        .find(|var| var.name == "prefix")
+        .expect("prefix capture");
+    assert_eq!(prefix.type_text, "var");
+    assert_eq!(prefix.resolved_type.as_deref(), Some("String"));
+}
+
+#[test]
+fn method_regions_resolves_var_type_from_known_static_factory_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarStaticFactory.java");
+    let source = "package p;\n\
+         class VarStaticFactory {\n\
+         \x20   void build() {\n\
+         \x20       var created = Widget.of(\"a\");\n\
+         \x20       log(created);\n\
+         \x20   }\n\
+         \x20   void log(Object value) {}\n\
+         }\n\
+         class Widget { static Widget of(String value) { return new Widget(); } }\n";
+    fs::write(&path, source).unwrap();
+    let start = source.find("log(created)").unwrap();
+    let end = start + "log(created);".len();
+
+    let facts = analyze_java_method_regions(
+        &path,
+        "build",
+        Some("VarStaticFactory"),
+        Some(&[JavaMethodRegionRequest {
+            label: Some("candidate".to_string()),
+            byte_start: Some(start),
+            byte_end: Some(end),
+            start_line: None,
+            end_line: None,
+        }]),
+    )
+    .unwrap();
+
+    let created = facts.requested_ranges[0]
+        .captures
+        .iter()
+        .find(|var| var.name == "created")
+        .expect("created capture");
+    assert_eq!(created.type_text, "var");
+    assert_eq!(created.resolved_type.as_deref(), Some("Widget"));
 }
 
 #[test]

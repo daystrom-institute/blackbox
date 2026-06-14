@@ -1,0 +1,26 @@
+{
+  "id": "gap-dceee690",
+  "title": "Resolve Java var types for jOOQ table new-record factories",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools/java",
+  "wanted_capability": "methodRegions should provide resolved_type for Java var declarations initialized by table/factory new-record patterns where the receiver type or generic table record type implies the returned record type.",
+  "missing_primitive": "Java var RHS resolution for chained table new-record factory patterns",
+  "fallback_used": "Probe agent inferred the record type manually after compile exposed an incorrect helper parameter type, then patched the helper signature.",
+  "evidence": [
+    "thread-8d968b2d",
+    "probe task 703b8a8b-d38d-4eff-97aa-1e14551f2a05",
+    "retro task 3b2b0002-b877-4c6f-b824-e9812f94e19d",
+    "session 9ac4e4b9-79bc-40ff-948e-c9b9e7f40e07"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/java-var-jooq-newrecord-resolution",
+  "notes": "Generic finding from a private Java calculation-stage reprobe. Keep public notes library-pattern-level only; do not include private table, record, package, or method names.",
+  "resolution": "unresolved",
+  "task_id": "703b8a8b-d38d-4eff-97aa-1e14551f2a05",
+  "session_id": "9ac4e4b9-79bc-40ff-948e-c9b9e7f40e07",
+  "provider": "deepseek",
+  "thread_id": "thread-8d968b2d",
+  "created_at": "2026-06-14T05:42:21Z",
+  "updated_at": "2026-06-14T05:42:21Z"
+}

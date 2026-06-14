@@ -55,6 +55,11 @@ out explicitly under `Changed` or `Removed`.
   into `includeNestedStatementRegions` for marker searches inside giant
   enclosing loops/blocks. `java.extractMethodCodeBlock` consumes resolved
   simple `var` types while still refusing unresolved inferred helper boundaries.
+- Java extraction probes now cover the next tranche of isolate ergonomics:
+  `resolved_type` also handles conservative same-file method-call returns and
+  known static-factory receivers, `code.readLines({ file, startLine, endLine })`
+  reads exact hash-anchored source text from line ranges, and generated helper
+  bodies strip common deep-nesting indentation before insertion.
 - Embedding coverage now converges and says so when it can't
   (gap-b9d39c10): `bbox_embed_status` reports health=`stalled` (with a
   health_reason naming the fix) when an available route's coverage sits

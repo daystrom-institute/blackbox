@@ -215,3 +215,117 @@ Stop rerunning this exact calculation target until one of the remaining
 construct gaps changes. The highest-value next code construct is method-call /
 static-factory `var` type resolution; the most visible polish construct is
 helper-body indentation normalization.
+
+## Reprobe After ReadLines And Expanded Var Resolution
+
+Third run after adding:
+
+- conservative same-file method-call and simple static-factory `var`
+  `resolved_type` inference;
+- `code.readLines({ file, startLine, endLine })`;
+- helper-body common-indent stripping for simple deep-nested extracts.
+
+Probe task: `703b8a8b-d38d-4eff-97aa-1e14551f2a05`.
+Retro task: `3b2b0002-b877-4c6f-b824-e9812f94e19d`.
+Session: `9ac4e4b9-79bc-40ff-948e-c9b9e7f40e07`.
+
+Private recipe tips:
+
+- `040521304`: recipe updated before dispatch to prefer `resolved_type` and
+  `code.readLines`.
+- `d4c7148b8`: retro feedback folded after the probe.
+
+### Outcome
+
+Extraction succeeded and independently recompiled.
+
+The bro again selected the same nested Java calculation-stage shape: one
+contiguous block, one live-out, zero mutated captures, zero field writes, and
+zero non-local control flow. Private diff shape was one Java file changed, 70
+insertions and 73 deletions.
+
+Independent orchestrator gate:
+
+- `./gradlew :webapp:clean :webapp:compileJava --no-build-cache`
+- `BUILD SUCCESSFUL in 2m 6s`
+- existing warning volume remained high; no behavior/golden validation exists.
+
+### Tooling Results
+
+`code.readLines` was the clear win. It bridged the accepted
+`analysis.methodRegions` line range to exact `oldText` in one call and replaced
+the previous bounded-read/manual-slice workaround.
+
+Expanded `resolved_type` helped but did not close the real target shape. Five
+of seven `var` boundary facts were resolved automatically. Two remained
+unresolved:
+
+- a method call on a dependency/field whose return type lives elsewhere in the
+  project;
+- a chained table/factory `newRecord`-style pattern where the helper boundary
+  needs the generated record type, not the table type.
+
+The extractor's simple common-indent stripping did not solve the actual helper
+formatting case. The selected range mixed active code with shallower commented
+out lines, so the inserted helper retained visible deep-nesting indentation
+residue even though it compiled.
+
+### Protocol Finding
+
+The probe violated the mutation protocol once: after an initial compile failure
+from an incorrect manually supplied helper parameter type, the bro used direct
+`file_edit` to patch the helper signature instead of re-reading a fresh span and
+using `edits.apply`.
+
+This is not just prompt drift. In a `code_mode=only` probe, direct file mutation
+tools should be hidden or denied so recipe discipline does not depend on model
+obedience.
+
+### Measurements
+
+Pre-retro tool-use profile:
+
+- 34 total tool uses.
+- 13 `exec`.
+- 8 `content_search`.
+- 7 `file_read`.
+- 5 `shell_run`.
+- 1 `file_edit`.
+
+The documented retro added no file mutations.
+
+### Gap Notes
+
+- `gap-5537d927` remains addressed by `code.readLines`.
+- `gap-25ea6684` was reopened as only partially addressed.
+- `gap-e03f8661` was reopened because mixed-comment selections still preserve
+  indentation residue.
+- New `gap-f9db476b`: project-index-backed Java `var` type resolution for
+  cross-file receiver method calls.
+- New `gap-dceee690`: Java `var` type resolution for table/factory
+  `newRecord`-style patterns.
+- New `gap-a5402e11`: `code_mode=only` should deny direct file edit tools.
+
+### Recipe Changes Applied
+
+The private calculation recipe now says:
+
+- if `resolved_type` is absent for a cross-file receiver method call, inspect
+  the callee declaration and pass the return type explicitly;
+- for table/factory `newRecord`-style chains, expect the helper-boundary type to
+  be the generated record type rather than the table type;
+- after any `edits.apply`, all prior spans and `oldText` are stale;
+- never use direct `file_edit`/file-write tools during a probe; follow-up fixes
+  must use fresh spans plus `edits.apply`.
+
+### Next Action
+
+Do not rerun this exact calculation target again tonight. The next useful code
+construct is either:
+
+- enforce `code_mode=only` edit discipline by hiding/denying direct file edit
+  tools; or
+- add project-index-backed Java return-type resolution for receiver method calls.
+
+The table/factory `newRecord` heuristic and mixed-comment indentation cleanup
+are also real, but slightly narrower.

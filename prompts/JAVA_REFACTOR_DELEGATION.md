@@ -141,22 +141,33 @@ the class-decomposition flow:
      outputs with explicit Java types, call `java.extractMethodCodeBlock` with
      `resultRecord: true` (and usually `resultRecordName`). If a capture or
      live-out has `type: "var"` plus `resolved_type`, treat the resolved type as
-     the explicit type for the helper boundary. If it has `type: "var"` without
-     `resolved_type`, resolve it yourself and pass `parameters`/`arguments` or
-     `returnType`/`returnVar`. Do not use the result-record path for unresolved
-     `var`/inferred types, discontiguous ranges, or values declared inside a
-     nested scope that would not be visible at the helper return site.
-3. If gates pass, bounded-read the exact range and call
+     the explicit type for the helper boundary. Current `resolved_type` covers
+     simple literals/constructors/casts/arrays plus conservative same-file
+     method-call returns and known static-factory receivers. If it has
+     `type: "var"` without `resolved_type`, resolve it yourself and pass
+     `parameters`/`arguments` or `returnType`/`returnVar`. Current known manual
+     branches are cross-file receiver method calls and library table/factory
+     `newRecord`-style patterns. Do not use the result-record path for
+     unresolved `var`/inferred types, discontiguous ranges, or values declared
+     inside a nested scope that would not be visible at the helper return site.
+3. If gates pass, use `code.readLines({ file, startLine, endLine })` on the
+   accepted line range to get exact `oldText` and a hash-anchored span, then call
    `java.extractMethodCodeBlock({ file, oldText, methodName, className })`,
    adding `resultRecord: true` only for the safe bundle case above.
 4. Apply via `edits.merge → edits.apply`, compile, `java.hygiene({ files:
-   [file] })`, and compile again if hygiene changed anything.
+   [file] })`, and compile again if hygiene changed anything. Never patch probe
+   output with direct file edit tools; if a follow-up edit is required, re-read a
+   fresh span and route it through `edits.apply`.
 5. Inspect the diff around the call site and inserted helper after hygiene.
    Compile success is necessary but not sufficient if helper spacing or
    indentation is obviously wrong.
 6. If gates fail, stop with the `stop_reasons`, `live_outs`, and candidate
    ranges. Do not hand-build a record object or discontiguous helper inside a
    probe.
+
+After any `edits.apply`, treat all prior spans, `oldText`, and region facts as
+stale. Re-run `analysis.methodRegions` / `code.readLines` before retrying a
+transform or composing a follow-up edit set.
 
 The load-bearing mutation cell shape:
 

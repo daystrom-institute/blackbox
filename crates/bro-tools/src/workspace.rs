@@ -1518,7 +1518,7 @@ impl Tool for ApplyPatch {
         "apply_patch"
     }
     fn description(&self) -> &str {
-         "Edit files with a `*** Begin Patch` / `*** End Patch` envelope of \
+        "Edit files with a `*** Begin Patch` / `*** End Patch` envelope of \
          `*** Add File:` / `*** Update File:` / `*** Delete File:` (and optional \
          `*** Move to:`) hunks; update lines are prefixed ' ' (context), '+' \
          (add), or '-' (remove). This is a FREEFORM tool — emit the patch text \
