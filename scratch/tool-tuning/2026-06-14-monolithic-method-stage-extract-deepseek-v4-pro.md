@@ -571,3 +571,99 @@ Rerun the same recipe from the updated private branch tip. The success criterion
 is no longer "any clean extraction"; it is either a real multi-live-out
 `resultRecord:true` attempt with explicit handling of captured `var` inputs, or
 a structured stop proving no such contiguous candidate exists.
+
+## Targeted Result-Record Rerun
+
+Seventh probe after hardening the private recipe so a single-live-out extraction
+no longer satisfies the run:
+
+- Probe task: `85d1cae9-c671-4e63-ad34-8c4db8fefa5d`.
+- Retro task: `5c8b7845-69a5-442b-856c-471797dd2b39`.
+- Session: `609ee71a-6edf-4e54-835f-c2f2f43aadfe`.
+- Private recipe branch tip at dispatch: `4c2fc20cc`.
+- Target shape: same large Java/Vaadin builder method, generalized here to
+  avoid private project identifiers.
+
+### Seventh Probe Outcome
+
+This run successfully exercised `java.extractMethodCodeBlock({ resultRecord:
+true })` on a contiguous multi-live-out block. The bro first gated a wider
+candidate with three live-outs; the transform correctly refused because one
+candidate output was scoped inside a lambda and not visible at the helper return
+site. It then narrowed to a two-live-out candidate where both outputs were
+top-level typed locals and generated:
+
+- a private nested record with two components;
+- a helper returning that record;
+- call-site unpacking from the record result.
+
+Independent orchestrator validation:
+
+```bash
+./gradlew :webapp:clean :webapp:compileJava --no-build-cache
+```
+
+Result: `BUILD SUCCESSFUL in 1m 40s` with the known warning stream.
+
+The run did **not** exercise the captured-`var` parameter guard. The captured
+input to the generated helper had an explicit type, so the fail-closed
+`error.inferred_capture_parameter_type` path remains covered by unit tests but
+not yet by this private-code probe.
+
+### Seventh Probe Measurements
+
+Measured from the harness event log before retro:
+
+- 33 total tool uses
+- 22 `exec`
+- 6 `file_read`
+- 2 `shell_run`
+- 2 `content_search`
+- 1 done note
+
+Recoverable issues:
+
+- an attempted broad source read used an out-of-bounds span;
+- the wider result-record candidate correctly returned a not-visible live-out
+  refusal;
+- several retries came from bridging `analysis.methodRegions` line ranges to
+  exact `oldText` bytes for `java.extractMethodCodeBlock`.
+
+### Seventh Probe Retro Findings
+
+The retro identified three concrete followups:
+
+- The result-record construct is validated for a two-live-out Java block and for
+  a wider-candidate refusal when one potential output is not visible at the
+  helper return site.
+- Captured-`var` parameter handling is still unvalidated by probe. Future runs
+  need a target candidate whose `analysis.methodRegions.captures[]` includes at
+  least one `type: "var"` input before the probe can claim that guard was
+  exercised.
+- The recipe needs a mechanical line-range to `oldText` bridge. The expensive
+  cells were not conceptual refactoring work; they were oldText/span
+  reconstruction and apply retries.
+
+### Seventh Probe Followups
+
+Private recipe branch updated and pushed after the retro:
+
+- added an explicit line-range -> `oldText` bridge step;
+- records that split-controls result-record success does not validate
+  captured-`var` parameter handling;
+- requires future captured-`var` probes to gate explicitly for
+  `captures[].type === "var"`.
+
+Public gap updates:
+
+- `gap-5537d927` updated with probe-7 evidence for direct line-range reads.
+- `gap-d78bc989` filed for exact replacement span/text preview before Java
+  extract apply.
+
+### Updated Next Action
+
+The current recipe has now validated the result-record path. The next tranche
+should either pick a separate captured-`var` target or implement one of the
+oldText ergonomics constructs (`code.readLines`, exact range text on
+`analysis.methodRegions`, or preview span/text from `extractMethodCodeBlock`)
+before running another extraction-heavy probe.

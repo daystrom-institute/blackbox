@@ -9,13 +9,15 @@
   "evidence": [
     "thread-8d968b2d",
     "task:0ab7ef76-1b56-4d43-8bcc-1aa5fe2e843a",
-    "task:d07b12ca-dcba-4cd4-9d8e-b57e348e3484"
+    "task:d07b12ca-dcba-4cd4-9d8e-b57e348e3484",
+    "task:85d1cae9-c671-4e63-ad34-8c4db8fefa5d",
+    "task:5c8b7845-69a5-442b-856c-471797dd2b39"
   ],
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/code-mode-read/direct-line-range-read",
-  "notes": "Generic finding from a private Java probe. This is an ergonomics gap that creates avoidable cells and stale-span mistakes during bounded inspection.",
+  "notes": "Generic finding from private Java probes. This is an ergonomics gap that creates avoidable cells and stale-span mistakes during bounded inspection. A result-record probe produced several retry cells and one failed apply because the agent had to bridge analysis line ranges to exact byte ranges manually.",
   "resolution": "unresolved",
   "created_at": "2026-06-14T03:54:32Z",
-  "updated_at": "2026-06-14T03:54:32Z"
+  "updated_at": "2026-06-14T04:08:39Z"
 }

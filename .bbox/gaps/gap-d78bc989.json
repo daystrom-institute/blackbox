@@ -1,0 +1,21 @@
+{
+  "id": "gap-d78bc989",
+  "title": "Expose exact replacement span before Java extract apply",
+  "gap_kind": "refactor_primitive",
+  "domain": "java-refactor",
+  "wanted_capability": "Java extract-method preview should expose the exact byte span and text the planner will replace before the caller applies edits, so agents can compare that span with the intended oldText and avoid parse-error retries from off-by-one oldText construction.",
+  "missing_primitive": "extractMethodCodeBlock preview metadata for exact replacement span/text",
+  "fallback_used": "The probe inspected returned edit spans after failed applies, re-derived oldText from full-file line slicing, and retried until tree-sitter validation passed.",
+  "evidence": [
+    "thread-8d968b2d",
+    "task:85d1cae9-c671-4e63-ad34-8c4db8fefa5d",
+    "task:5c8b7845-69a5-442b-856c-471797dd2b39"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/java-refactor/extract-method-preview-exact-replacement-span",
+  "notes": "Generic finding from a private Java result-record probe. The transform eventually succeeded, but lack of an explicit pre-apply span/text preview caused avoidable oldText/apply retry cells.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-14T04:08:48Z",
+  "updated_at": "2026-06-14T04:08:48Z"
+}
