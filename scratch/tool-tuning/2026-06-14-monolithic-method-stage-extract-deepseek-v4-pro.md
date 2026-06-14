@@ -388,3 +388,99 @@ multi-live-out Java extract-method regions. This probe reaffirmed
 discontiguous-region extraction as a real second-order construct, but the
 single contiguous block with multiple outputs is the closer, higher-leverage
 next step.
+
+## Rerun After Result-Record Generation
+
+Fifth probe after adding `resultRecord:true` support to
+`java.extractMethodCodeBlock` and updating the private recipe to exercise a
+multi-live-out contiguous block:
+
+- Probe task: `ff3f0200-1d3c-4c93-93a2-66f7c3c01cd2`.
+- Retro task: `38e34aec-2936-4038-b6cb-7e261de0aa92`.
+- Session: `d8fa5fa9-61b1-41bd-82f3-4b7b3501e8bf`.
+- Private recipe branch tip: `3e6d4a80a`.
+- Target shape: same large Java/Vaadin builder method, generalized here to
+  avoid private project identifiers.
+
+### Fifth Probe Outcome
+
+The result-record path worked for the intended shape: a contiguous block with
+six live-out locals was extracted into a helper returning a private nested
+record, with call-site unpacking for the returned values.
+
+The generated result-record mechanics were sound, but one captured input local
+had been declared with Java `var`. The transform propagated that inferred token
+into the helper parameter list, which is not valid Java. The bro repaired the
+signature manually in the disposable worktree before the final compile. That is
+not acceptable as the steady-state workflow, but it is useful evidence for the
+next construct.
+
+Independent validation used a cache-busting compile gate after the probe:
+
+```bash
+./gradlew :webapp:clean :webapp:compileJava --no-build-cache
+```
+
+That gate completed successfully after the disposable repair.
+
+### Fifth Probe Measurements
+
+Measured from the harness event log before retro:
+
+- 40 total tool uses
+- 12 `file_read`
+- 11 `exec`
+- 5 `shell_run`
+- 4 `todo_write`
+- 4 `content_search`
+- 2 `glob`
+- 1 `smart_read`
+- 1 attempted direct knowledge lookup from code mode
+
+Recoverable errors observed:
+
+- code-mode local scope did not persist across exec cells;
+- direct blackbox knowledge lookup was not available inside code mode;
+- one edit attempt used a stale string after hygiene/reformatting changed the
+  source.
+
+### Fifth Probe Retro Findings
+
+The documented retro was run by resuming the original session with
+`bro_resume`, not by `bro_retro`.
+
+The retro identified one main code construct and several recipe/process
+adjustments:
+
+- Implement a Java capture-type resolver for extract-method parameters. If a
+  captured input local is reported as `var`, the transform should resolve a
+  concrete parameter type or fail closed before producing edits.
+- Keep gate -> bounded read -> transform -> apply in one code cell when
+  possible. Exec-cell JavaScript locals are intentionally scoped to one cell;
+  cross-cell state needs explicit persistence.
+- After any orchestrator-side reset, revert, or worktree cleanup, verify file
+  state before rerunning analysis. The earlier probe confusion was caused by
+  external worktree mutation while the bro still owned the worktree.
+- Select candidate ranges that actually exercise the desired construct. A
+  zero-live-out listener-only extraction is useful for basic extraction, but it
+  does not probe result-record generation.
+- Treat cached Gradle success as insufficient after semantic source edits. Use
+  `--no-build-cache` plus a clean/recompile step or an equivalent proof that the
+  edited source was compiled.
+
+### Fifth Probe Gaps
+
+Filed public, sanitized gap notes:
+
+- `gap-ce7174ea`: resolve Java `var` captures before generating helper
+  parameters.
+- `gap-b79620d1`: probe compile gates should avoid build-cache false positives
+  after edits.
+
+### Updated Next Action
+
+Implement the Java capture-type construct next. The narrowest acceptable first
+step is fail-closed behavior for `var` captures in generated helper parameters;
+the better construct is a resolver that can infer concrete local types from the
+enclosing method source and feed explicit parameter metadata to
+`java.extractMethodCodeBlock`.
