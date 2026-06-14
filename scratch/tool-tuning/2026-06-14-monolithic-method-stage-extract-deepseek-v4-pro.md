@@ -484,3 +484,90 @@ step is fail-closed behavior for `var` captures in generated helper parameters;
 the better construct is a resolver that can infer concrete local types from the
 enclosing method source and feed explicit parameter metadata to
 `java.extractMethodCodeBlock`.
+
+## Rerun After Var-Capture Guard
+
+Sixth probe after deploying fail-closed helper parameter validation and updating
+the private recipe with capture-type guidance:
+
+- Probe task: `0ab7ef76-1b56-4d43-8bcc-1aa5fe2e843a`.
+- Retro task: `d07b12ca-dcba-4cd4-9d8e-b57e348e3484`.
+- Session: `9ad4dd66-080e-416e-a599-b8a8afdd6dda`.
+- Private recipe branch tip at dispatch: `fca37d93e`.
+- Target shape: same large Java/Vaadin builder method, generalized here to
+  avoid private project identifiers.
+
+### Sixth Probe Outcome
+
+This run was mechanically successful but did not exercise the intended
+construct. The bro selected a smaller contiguous setup block with one live-out
+local, extracted it to a private helper, ran hygiene, and both compile gates
+passed. That proves the basic single-live-out extraction path still works after
+the var-capture guard, but it does not validate the result-record plus
+captured-`var` parameter path.
+
+Independent orchestrator validation:
+
+```bash
+./gradlew :webapp:clean :webapp:compileJava --no-build-cache
+```
+
+Result: `BUILD SUCCESSFUL in 1m 33s` with the known large warning stream.
+
+### Sixth Probe Measurements
+
+Measured from the harness event log before retro:
+
+- 18 total tool uses
+- 12 `exec`
+- 2 `shell_run`
+- 1 `content_search`
+- 1 `glob`
+- 1 direct knowledge lookup
+- 1 done note
+
+Recoverable issue:
+
+- one stale-span read caused by attempting a source span with a placeholder hash
+  before deriving the real content hash.
+
+### Sixth Probe Retro Findings
+
+The retro classified the run as a recipe miss:
+
+- The recipe still said to inspect the target stage first and choose a clean
+  region. That allowed the bro to downshift to the easiest valid extraction
+  rather than the construct under test.
+- For construct-targeted probes, the recipe must explicitly require the smallest
+  region that still exercises the named construct. For this tranche, that means
+  a multi-live-out candidate using `resultRecord:true`; a single-live-out helper
+  should be reported as non-target rather than applied.
+- The compact marker search produced scattered matches, but the substrate did
+  not cluster/rank them by candidate region shape. The bro manually inspected
+  line ranges and picked the easiest one.
+- Direct bounded source reads remain slightly awkward because code-mode reads
+  require a current span/hash; a line-range helper would avoid placeholder-hash
+  retries.
+
+### Sixth Probe Followups
+
+Private recipe branch updated and pushed after the retro:
+
+- construct under test is now an explicit input;
+- the concrete prompt forbids satisfying this rerun with zero/single-live-out
+  extraction;
+- the recipe records a compiled extraction that misses the construct target as a
+  recipe miss, not success.
+
+New sanitized public gaps:
+
+- `gap-f29d5848`: cluster marker-matched statement ranges before long-method
+  extraction.
+- `gap-5537d927`: provide direct line-range reads without manual span hashes.
+
+### Updated Next Action
+
+Rerun the same recipe from the updated private branch tip. The success criterion
+is no longer "any clean extraction"; it is either a real multi-live-out
+`resultRecord:true` attempt with explicit handling of captured `var` inputs, or
+a structured stop proving no such contiguous candidate exists.
