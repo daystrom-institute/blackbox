@@ -9535,6 +9535,94 @@ fn extract_code_block_refuses_multi_return() {
 }
 
 #[test]
+fn extract_code_block_generates_result_record_for_multi_live_outs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("MultiResult.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class MultiResult {\n\
+         \x20   int run() {\n\
+         \x20       int a = 1;\n\
+         \x20       String b = \"two\";\n\
+         \x20       log(a);\n\
+         \x20       log(b);\n\
+         \x20       return a + b.length();\n\
+         \x20   }\n\
+         \x20   void log(Object value) {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some(
+        "int a = 1;\n        String b = \"two\";\n        log(a);\n        log(b);".to_string(),
+    );
+    params.module_name = Some("prep".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("result_record".to_string(), serde_json::json!(true));
+    entries.insert(
+        "result_record_name".to_string(),
+        serde_json::json!("PrepResult"),
+    );
+    params.toml_entries = Some(entries);
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &path);
+
+    assert!(
+        rewritten.contains("PrepResult prepResult = prep();\n        int a = prepResult.a();\n        String b = prepResult.b();"),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.contains("private record PrepResult(int a, String b) {}"),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.contains("private PrepResult prep() {\n        int a = 1;\n        String b = \"two\";\n        log(a);\n        log(b);\n        return new PrepResult(a, b);\n    }"),
+        "{rewritten}"
+    );
+    assert!(
+        plan.leftovers
+            .iter()
+            .any(|note| note.contains("result_record=PrepResult")),
+        "{:?}",
+        plan.leftovers
+    );
+}
+
+#[test]
+fn extract_code_block_result_record_refuses_var_live_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarResult.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class VarResult {\n\
+         \x20   int run() {\n\
+         \x20       var a = 1;\n\
+         \x20       int b = 2;\n\
+         \x20       return a + b;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("var a = 1;\n        int b = 2;".to_string());
+    params.module_name = Some("prep".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("result_record".to_string(), serde_json::json!(true));
+    params.toml_entries = Some(entries);
+
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("result_record_inferred_type(a)"), "got: {err}");
+}
+
+#[test]
 fn extract_code_block_refuses_non_local_return() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Ret.java");

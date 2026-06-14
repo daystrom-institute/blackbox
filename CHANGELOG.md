@@ -38,6 +38,11 @@ out explicitly under `Changed` or `Removed`.
   exposes the existing code-block extractor as a code-mode transform returning
   `edits.merge` changes with explicit hints for multi-live-out and control-flow
   refusals.
+- `java.extractMethodCodeBlock` can now opt into `resultRecord: true` for
+  multiple safe Java live-outs: it synthesizes a private nested record, returns
+  the bundle from the helper, and unpacks the components at the call site while
+  refusing inferred types and nested-scope live-outs that would not be visible at
+  the helper return site.
 - `analysis.methodRegions` now supports compact long-method inventories via
   `includeStatementRegions`, `statementContains`, line-window filters, and
   `statementLimit`, plus a `statement_region_summary` that reports total,

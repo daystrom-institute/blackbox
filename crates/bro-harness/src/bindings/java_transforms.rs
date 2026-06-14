@@ -307,6 +307,12 @@ struct JavaExtractMethodCodeBlockParams {
     return_type: Option<String>,
     #[serde(default, rename = "returnVar", alias = "return_var")]
     return_var: Option<String>,
+    #[serde(default, rename = "resultRecord", alias = "result_record")]
+    result_record: Option<bool>,
+    #[serde(default, rename = "resultRecordName", alias = "result_record_name")]
+    result_record_name: Option<String>,
+    #[serde(default, rename = "resultRecordVar", alias = "result_record_var")]
+    result_record_var: Option<String>,
     #[serde(
         default,
         rename = "previewOnly",
@@ -647,7 +653,7 @@ impl Tool for JavaExtractMethodCodeBlock {
         "java.extractMethodCodeBlock"
     }
     fn description(&self) -> &str {
-        "Extract one exact contiguous Java code block from a method body into a helper method. Thin code-mode binding over extract_java_code_block_to_method: infers captures, arguments, and zero/one return value; refuses mutated captures, multiple live-outs, and non-local control flow. Returns hash-anchored {changes} for edits.merge — never writes. Run analysis.methodRegions first for contiguity/live-out gates."
+        "Extract one exact contiguous Java code block from a method body into a helper method. Thin code-mode binding over extract_java_code_block_to_method: infers captures, arguments, and zero/one return value; refuses mutated captures, unsafe multiple live-outs, and non-local control flow. Returns hash-anchored {changes} for edits.merge — never writes. Run analysis.methodRegions first for contiguity/live-out gates."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -663,6 +669,9 @@ impl Tool for JavaExtractMethodCodeBlock {
                 "arguments": { "type": "array", "items": { "type": "string" }, "description": "Optional argument override aligned with parameters." },
                 "returnType": { "type": "string", "description": "Optional return type override. Omit to infer void or one live-out variable." },
                 "returnVar": { "type": "string", "description": "Optional return variable name override." },
+                "resultRecord": { "type": "boolean", "description": "Opt in to generated nested-record result bundle when the selected block has multiple live-out locals. Default false: multi-live-out blocks still refuse." },
+                "resultRecordName": { "type": "string", "description": "Optional generated record type name when resultRecord is true. Default <MethodName>Result." },
+                "resultRecordVar": { "type": "string", "description": "Optional call-site local name for the helper result record. Default <methodName>Result." },
                 "previewOnly": { "type": "boolean", "description": "Run the planner but omit edit payloads; returns would_change_files and findings." }
             },
             "required": ["file", "oldText", "methodName"]
@@ -728,6 +737,15 @@ impl Tool for JavaExtractMethodCodeBlock {
             if let Some(return_var) = params.return_var {
                 toml_entries.insert("return_var".to_string(), json!(return_var));
             }
+            if let Some(result_record) = params.result_record {
+                toml_entries.insert("result_record".to_string(), json!(result_record));
+            }
+            if let Some(result_record_name) = params.result_record_name {
+                toml_entries.insert("result_record_name".to_string(), json!(result_record_name));
+            }
+            if let Some(result_record_var) = params.result_record_var {
+                toml_entries.insert("result_record_var".to_string(), json!(result_record_var));
+            }
             if !toml_entries.is_empty() {
                 plan_input["toml_entries"] = Value::Object(toml_entries);
             }
@@ -746,7 +764,11 @@ impl Tool for JavaExtractMethodCodeBlock {
                 Err(e) => {
                     let msg = format!("{e:#}");
                     let hint = if msg.contains("multi_return_needs_record") {
-                        " — run analysis.methodRegions on this candidate range to inspect live_outs, then pick a smaller block or wait for record/result-object generation"
+                        " — run analysis.methodRegions on this candidate range to inspect live_outs; if each live-out is a real top-level output with an explicit type, re-call with resultRecord: true, otherwise pick a smaller block"
+                    } else if msg.contains("result_record_live_out_not_visible") {
+                        " — resultRecord can only return locals visible at the helper return site; widen the range to include the declaring scope or pick top-level statements"
+                    } else if msg.contains("result_record_inferred_type") {
+                        " — resultRecord requires explicit Java component types; avoid `var` live-outs or provide a typed boundary manually"
                     } else if msg.contains("mutated_capture") {
                         " — run analysis.methodRegions to see mutated captures before choosing a smaller range"
                     } else if msg.contains("non_local_control_flow") {
@@ -902,6 +924,17 @@ PARAMS
   arguments?: string[]  override call-site args aligned with parameters
   returnType?: string   override inferred return type
   returnVar?: string    override inferred return variable name
+  resultRecord?: boolean
+                        opt in to a generated nested record result bundle when
+                        the selected block has multiple live-out locals. Default
+                        false: multi-live-out blocks still refuse. Requires each
+                        live-out to be visible at the helper return site and to
+                        have an explicit type (not `var` / inferred).
+  resultRecordName?: string
+                        generated record type name. Default <MethodName>Result.
+  resultRecordVar?: string
+                        call-site local name for the helper result record.
+                        Default <methodName>Result.
   previewOnly?: boolean run the planner but return [] changes and only summaries/findings
 
 RETURNS { title, changes, findings, preview_only, would_change_files, fixme_count, provenance }
@@ -911,7 +944,13 @@ RETURNS { title, changes, findings, preview_only, would_change_files, fixme_coun
 
 REFUSALS
   error.mutated_capture(name)       selected range mutates a captured local/param
-  error.multi_return_needs_record   more than one local declared inside is read after
+  error.multi_return_needs_record   more than one local declared inside is read after;
+                                    re-call with resultRecord:true only when the
+                                    live-outs are real top-level outputs
+  error.result_record_live_out_not_visible
+                                    a requested record component is not visible
+                                    at the generated helper return site
+  error.result_record_inferred_type requested record component has `var`/inferred type
   error.non_local_control_flow      return/break/continue would cross the extraction boundary
   oldText match failures            selected text must match exactly once
 
@@ -926,12 +965,15 @@ RECIPE
     text({ stop_reasons: r.extractability.stop_reasons, live_outs: r.live_outs });
     exit();
   }
-  // Then read the exact accepted range and pass it as oldText.
-  const x = await java.extractMethodCodeBlock({
-    file, oldText, methodName: "buildControls", className: "View"
+  // Then read the exact accepted range and pass it as oldText. If the gate
+  // stopped only because of multiple real, explicitly typed top-level live-outs,
+  // set resultRecord:true; otherwise omit the resultRecord fields.
+  const result = await java.extractMethodCodeBlock({
+    file, oldText, methodName: "buildControls", className: "View",
+    resultRecord: true, resultRecordName: "BuildControlsResult"
   });
   const es = await edits.begin();
-  await edits.merge({ es, changes: x.changes });
+  await edits.merge({ es, changes: result.changes });
   await edits.apply({ es });
   // compile, java.hygiene({ files: [file] }), compile again if hygiene changed
 "#;
@@ -1481,8 +1523,8 @@ declare const java: {
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
-  /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures, multiple live-outs, and non-local control flow. */
-  extractMethodCodeBlock(args: { file: string; oldText: string; methodName: string; className?: string; visibility?: "private" | "package-private" | "protected" | "public"; newText?: string; parameters?: Array<{ type: string; name: string }>; arguments?: string[]; returnType?: string; returnVar?: string; previewOnly?: boolean }): Promise<JavaExtractMethodResult>;
+  /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
+  extractMethodCodeBlock(args: { file: string; oldText: string; methodName: string; className?: string; visibility?: "private" | "package-private" | "protected" | "public"; newText?: string; parameters?: Array<{ type: string; name: string }>; arguments?: string[]; returnType?: string; returnVar?: string; resultRecord?: boolean; resultRecordName?: string; resultRecordVar?: string; previewOnly?: boolean }): Promise<JavaExtractMethodResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -1705,6 +1747,61 @@ public class OrderService {
             }
             other => panic!("expected multi-live-out refusal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn extract_method_code_block_can_generate_result_record_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Multi.java"),
+            "class Multi {\n\
+            \x20   int run() {\n\
+            \x20       int a = 1;\n\
+            \x20       String b = \"two\";\n\
+            \x20       return a + b.length();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractMethodCodeBlock
+                .call(
+                    json!({
+                        "file": "src/Multi.java",
+                        "oldText": "int a = 1;\n        String b = \"two\";",
+                        "methodName": "prep",
+                        "resultRecord": true,
+                        "resultRecordName": "PrepResult"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let replacements = result["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|change| change["new_text"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            replacements.contains("PrepResult prepResult = prep();"),
+            "{replacements}"
+        );
+        assert!(
+            replacements.contains("private record PrepResult(int a, String b) {}"),
+            "{replacements}"
+        );
+        assert!(
+            replacements.contains("return new PrepResult(a, b);"),
+            "{replacements}"
+        );
+        assert_eq!(result["fixme_count"], 0, "{result}");
     }
 
     #[tokio::test]

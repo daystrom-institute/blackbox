@@ -127,13 +127,18 @@ the class-decomposition flow:
 2. Re-run `analysis.methodRegions` with one exact candidate range. Treat the
    returned gates as authoritative:
    - `requested_contiguous` must be true for today's one-block extractor.
-   - `extractability.can_extract_with_current_tool` must be true.
-   - `live_outs.length <= 1`; more means record/result-object generation is
-     missing. Inspect `after_use_kinds` and `component_tree_consumptions` before
-     deciding whether the live-out set is a true result bundle or a UI tree /
-     return-value boundary.
+   - If `extractability.can_extract_with_current_tool` is true, proceed normally.
+   - If the only blocker is multiple live-outs, inspect `after_use_kinds` and
+     `component_tree_consumptions` before deciding whether the live-out set is a
+     true result bundle or a UI tree / return-value boundary. For true top-level
+     outputs with explicit Java types, call `java.extractMethodCodeBlock` with
+     `resultRecord: true` (and usually `resultRecordName`). Do not use the
+     result-record path for `var`/inferred types, discontiguous ranges, or values
+     declared inside a nested scope that would not be visible at the helper
+     return site.
 3. If gates pass, bounded-read the exact range and call
-   `java.extractMethodCodeBlock({ file, oldText, methodName, className })`.
+   `java.extractMethodCodeBlock({ file, oldText, methodName, className })`,
+   adding `resultRecord: true` only for the safe bundle case above.
 4. Apply via `edits.merge → edits.apply`, compile, `java.hygiene({ files:
    [file] })`, and compile again if hygiene changed anything.
 5. Inspect the diff around the call site and inserted helper after hygiene.

@@ -13,7 +13,9 @@
 //! - **Return value**: a variable declared inside the range and used
 //!   at a later byte position in the enclosing method. The helper
 //!   returns it; the call site captures it into a variable of the
-//!   matching type. Zero such variables → helper returns `void`.
+//!   matching type. Zero such variables → helper returns `void`. With
+//!   `toml_entries.result_record=true`, multiple visible, explicitly
+//!   typed live-outs can be bundled into a generated nested record.
 //!
 //! ## Refusals (the extract is unsafe / impossible at the requested range)
 //!
@@ -23,9 +25,10 @@
 //!   happens at the call site, or extract a smaller range that doesn't
 //!   include the reassignment.
 //! - `error.multi_return_needs_record` — more than one variable
-//!   declared inside the range is used after. Write a record class
-//!   yourself, then re-run with a smaller range that produces a single
-//!   record value.
+//!   declared inside the range is used after. By default this still
+//!   refuses. Pass `toml_entries.result_record=true` to synthesize a
+//!   nested record result bundle when each live-out is visible at the
+//!   helper return site and has an explicit Java type.
 //! - `error.non_local_control_flow(kind)` — a `return` / `break` /
 //!   `continue` inside the range targets a method or loop outside the
 //!   range. The extract would change control-flow semantics. Either
@@ -51,6 +54,19 @@
 
 use super::scope::{ScopeTree, analyze_range};
 use super::*;
+
+#[derive(Debug, Clone)]
+struct ResultRecordComponent {
+    type_text: String,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResultRecordPlan {
+    type_name: String,
+    var_name: String,
+    components: Vec<ResultRecordComponent>,
+}
 
 pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
@@ -139,8 +155,11 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         );
     }
 
-    // Refuse: multi-return.
-    if analysis.inner_decls_used_after.len() > 1 {
+    let result_record_requested = toml_bool(&p.toml_entries, "result_record");
+
+    // Refuse: multi-return unless the caller explicitly requested the
+    // generated result-record path.
+    if analysis.inner_decls_used_after.len() > 1 && !result_record_requested {
         let names: Vec<&str> = analysis
             .inner_decls_used_after
             .iter()
@@ -233,16 +252,40 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         .filter(|value| !value.is_empty() && is_java_identifier(value))
         .map(str::to_string);
 
-    let (return_type, return_var): (String, Option<String>) =
-        match (operator_return_type.as_deref(), &inferred_return) {
-            (Some("void"), _) => ("void".to_string(), None),
-            (Some(t), _) => (
-                t.to_string(),
-                operator_return_var.or_else(|| inferred_return.as_ref().map(|(_, n)| n.clone())),
-            ),
-            (None, Some((ty, name))) => (ty.clone(), Some(name.clone())),
-            (None, None) => ("void".to_string(), None),
-        };
+    let result_record = if analysis.inner_decls_used_after.len() > 1 {
+        if operator_return_type.is_some() {
+            bail!(
+                "error.result_record_return_type_conflict: result_record=true cannot be combined \
+                 with return_type; use result_record_name to choose the generated record type"
+            );
+        }
+        Some(build_result_record_plan(
+            p,
+            helper_name,
+            &scope_tree,
+            &analysis,
+            region_start,
+            region_end,
+            &parsed.source,
+        )?)
+    } else {
+        None
+    };
+
+    let (return_type, return_var): (String, Option<String>) = match (
+        result_record.as_ref(),
+        operator_return_type.as_deref(),
+        &inferred_return,
+    ) {
+        (Some(record), _, _) => (record.type_name.clone(), Some(record.var_name.clone())),
+        (None, Some("void"), _) => ("void".to_string(), None),
+        (None, Some(t), _) => (
+            t.to_string(),
+            operator_return_var.or_else(|| inferred_return.as_ref().map(|(_, n)| n.clone())),
+        ),
+        (None, None, Some((ty, name))) => (ty.clone(), Some(name.clone())),
+        (None, None, None) => ("void".to_string(), None),
+    };
     let is_void = return_type == "void";
 
     let enclosing_is_static = has_java_modifier_node(enclosing_method, "static");
@@ -281,7 +324,24 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         .trim_end_matches(|c: char| c.is_whitespace())
         .to_string();
     let mut helper_body_indented = reindent_block(&extracted, &helper_inner_indent);
-    if !is_void {
+    if let Some(record) = &result_record {
+        if !helper_body_indented.is_empty() {
+            helper_body_indented.push('\n');
+        }
+        helper_body_indented.push_str(&helper_inner_indent);
+        helper_body_indented.push_str("return new ");
+        helper_body_indented.push_str(&record.type_name);
+        helper_body_indented.push('(');
+        helper_body_indented.push_str(
+            &record
+                .components
+                .iter()
+                .map(|component| component.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        helper_body_indented.push_str(");");
+    } else if !is_void {
         let ret_name = return_var.as_deref().unwrap_or("result");
         if !helper_body_indented.is_empty() {
             helper_body_indented.push('\n');
@@ -291,16 +351,41 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         helper_body_indented.push_str(ret_name);
         helper_body_indented.push(';');
     }
-    let helper_decl = format!(
+    let mut helper_decl = format!(
         "{helper_indent}{visibility_prefix}{static_prefix}{return_type} {helper_name}({param_list}) {{\n\
          {helper_body_indented}\n\
          {helper_indent}}}\n"
     );
+    if let Some(record) = &result_record {
+        helper_decl = format!(
+            "{}\n\n{}",
+            render_result_record_decl(record, &helper_indent),
+            helper_decl
+        );
+    }
 
     // Call site.
     let arg_list = effective_args.join(", ");
     let call_site_indent = call_site_replacement_indent(&parsed.source, region_start);
+    let call_site_line_indent = line_indent_at(&parsed.source, region_start);
     let replacement = if let Some(text) = p.new_text.clone() {
+        text
+    } else if let Some(record) = &result_record {
+        let var = return_var.as_deref().unwrap_or("result");
+        let mut text =
+            format!("{call_site_indent}{return_type} {var} = {helper_name}({arg_list});");
+        for component in &record.components {
+            text.push('\n');
+            text.push_str(&call_site_line_indent);
+            text.push_str(component.type_text.trim());
+            text.push(' ');
+            text.push_str(&component.name);
+            text.push_str(" = ");
+            text.push_str(var);
+            text.push('.');
+            text.push_str(&component.name);
+            text.push_str("();");
+        }
         text
     } else if is_void {
         format!("{call_site_indent}{helper_name}({arg_list});")
@@ -344,6 +429,18 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         leftovers.push(format!(
             "this_super_refs={} (preserved verbatim; helper is on the same class)",
             analysis.this_super_refs
+        ));
+    }
+    if let Some(record) = &result_record {
+        leftovers.push(format!(
+            "result_record={} components=[{}]",
+            record.type_name,
+            record
+                .components
+                .iter()
+                .map(|component| format!("{} {}", component.type_text, component.name))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
@@ -471,6 +568,30 @@ fn is_java_identifier(s: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
+fn toml_bool(
+    entries: &Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    key: &str,
+) -> bool {
+    entries
+        .as_ref()
+        .and_then(|map| map.get(key))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn toml_str(
+    entries: &Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    key: &str,
+) -> Option<String> {
+    entries
+        .as_ref()
+        .and_then(|map| map.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn toml_str_array(
     entries: &Option<std::collections::BTreeMap<String, serde_json::Value>>,
     key: &str,
@@ -489,6 +610,142 @@ fn toml_str_array(
         .filter_map(|v| v.as_str())
         .map(str::to_string)
         .collect()
+}
+
+fn build_result_record_plan(
+    p: &RefactorPlanParams,
+    helper_name: &str,
+    scope_tree: &ScopeTree,
+    analysis: &super::scope::RangeAnalysis,
+    region_start: usize,
+    region_end: usize,
+    source: &str,
+) -> Result<ResultRecordPlan> {
+    let type_name = toml_str(&p.toml_entries, "result_record_name")
+        .unwrap_or_else(|| default_result_record_name(helper_name));
+    if !is_java_identifier(&type_name) {
+        bail!("result_record_name `{type_name}` is not a valid Java identifier");
+    }
+    if source.contains(&format!("record {type_name}("))
+        || source.contains(&format!("class {type_name} "))
+        || source.contains(&format!("class {type_name}{{"))
+    {
+        bail!("result_record_name `{type_name}` conflicts with an existing nested type");
+    }
+    let var_name = toml_str(&p.toml_entries, "result_record_var")
+        .unwrap_or_else(|| format!("{}Result", lower_camel_identifier(helper_name)));
+    if !is_java_identifier(&var_name) {
+        bail!("result_record_var `{var_name}` is not a valid Java identifier");
+    }
+
+    let mut components = Vec::new();
+    for decl in live_out_decls_in_declaration_order(
+        scope_tree,
+        &analysis.inner_decls_used_after,
+        region_start,
+        region_end,
+    ) {
+        if decl.scope_end <= region_end {
+            bail!(
+                "error.result_record_live_out_not_visible({}): live-out `{}` is not visible at \
+                 the helper return site; widen the range to include the declaring scope or pick a \
+                 top-level statement block",
+                decl.name,
+                decl.name
+            );
+        }
+        let type_text = decl.type_text.trim();
+        if type_text == "var" || type_text == "<inferred>" || type_text.is_empty() {
+            bail!(
+                "error.result_record_inferred_type({}): live-out `{}` has inferred type `{}`; \
+                 result-record generation requires explicit component types",
+                decl.name,
+                decl.name,
+                type_text
+            );
+        }
+        components.push(ResultRecordComponent {
+            type_text: type_text.to_string(),
+            name: decl.name.clone(),
+        });
+    }
+    if components.len() != analysis.inner_decls_used_after.len() {
+        let names = analysis
+            .inner_decls_used_after
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "error.result_record_live_out_resolution: could not resolve live-out declarations for ({names})"
+        );
+    }
+
+    Ok(ResultRecordPlan {
+        type_name,
+        var_name,
+        components,
+    })
+}
+
+fn live_out_decls_in_declaration_order<'a>(
+    scope_tree: &'a ScopeTree,
+    live_outs: &[(String, String)],
+    region_start: usize,
+    region_end: usize,
+) -> Vec<&'a super::scope::Declaration> {
+    scope_tree
+        .declarations()
+        .iter()
+        .filter(|decl| {
+            decl.name_byte_start >= region_start
+                && decl.name_byte_end <= region_end
+                && live_outs.iter().any(|(name, _)| name == &decl.name)
+        })
+        .collect()
+}
+
+fn default_result_record_name(helper_name: &str) -> String {
+    let mut chars = helper_name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {
+            format!(
+                "{}{}Result",
+                first.to_ascii_uppercase(),
+                chars.collect::<String>()
+            )
+        }
+        Some(first) => format!("{}{}Result", first, chars.collect::<String>()),
+        None => "ExtractedResult".to_string(),
+    }
+}
+
+fn lower_camel_identifier(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_uppercase() => {
+            format!(
+                "{}{}",
+                first.to_ascii_lowercase(),
+                chars.collect::<String>()
+            )
+        }
+        Some(_) => name.to_string(),
+        None => "result".to_string(),
+    }
+}
+
+fn render_result_record_decl(record: &ResultRecordPlan, helper_indent: &str) -> String {
+    let components = record
+        .components
+        .iter()
+        .map(|component| format!("{} {}", component.type_text.trim(), component.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{helper_indent}private record {}({}) {{}}",
+        record.type_name, components
+    )
 }
 
 fn method_body_indent_for(class_node: Node<'_>, source: &str) -> String {
@@ -541,12 +798,18 @@ fn call_site_replacement_indent(source: &str, byte: usize) -> String {
 }
 
 fn reindent_block(text: &str, indent: &str) -> String {
-    let min_indent = text
+    let mut line_indents = text
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| line.bytes().take_while(|b| *b == b' ').count())
-        .min()
-        .unwrap_or(0);
+        .collect::<Vec<_>>();
+    let min_indent = if line_indents.first().copied() == Some(0)
+        && line_indents.iter().skip(1).all(|count| *count > 0)
+    {
+        line_indents.iter().skip(1).copied().min().unwrap_or(0)
+    } else {
+        line_indents.drain(..).min().unwrap_or(0)
+    };
 
     text.lines()
         .map(|line| {
