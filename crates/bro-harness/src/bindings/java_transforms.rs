@@ -988,6 +988,56 @@ RECIPE
   // compile, java.hygiene({ files: [file] }), compile again if hygiene changed
 "#;
 
+const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
+
+WHAT IT DOES
+  Replaces exploratory previewOnly loops with a single compact preflight.
+  Bundles: overload resolution, field initializer closure, external caller
+  survey, and DI wireability checks. If ready:true, skip previewOnly and go
+  directly to extractClass + edits.apply in the next cell.
+
+PARAMS
+  file: string         workspace-relative .java file
+  methods: string[]    method names from cohesion cluster (seam.item_names)
+  moveFields?: string[] field names from cohesion cluster (seam.move_fields)
+  className?: string   optional owner class name
+
+RETURNS { file, methods, overloads, resolved_methods, field_closure,
+          augmented_move_fields, augmented_fields_differ, external_callers,
+          has_external_callers, non_injectable_mutable, wiring_recommendation,
+          ready, blockers, provenance }
+  overloads: { method: [signature, ...] }  only present if dupes detected
+  resolved_methods: signature-qualified names ready for extractClass
+  field_closure: { field: [dep, ...] }     transitive constant deps
+  augmented_move_fields: move_fields + closure deps
+  augmented_fields_differ: true if closure added fields
+  external_callers: { method: [file, ...] }  callers outside the source file
+  has_external_callers: true → use wrappers:true in extractClass
+  non_injectable_mutable: mutable instance fields not DI-injectable
+  wiring_recommendation: "external_injection" | "own_construction"
+  ready: true if no blockers found; false → inspect blockers before applying
+  blockers: ["overload_multiple_signatures" | "external_callers_on_moved_methods"
+             | "non_injectable_mutable_fields"]
+
+RECIPE
+  const pp = await java.extractClassPreviewPlan({
+    file, methods: seam.item_names, moveFields: seam.move_fields,
+  });
+  if (!pp.ready) {
+    text(JSON.stringify({ preflight_blocked: true, blockers: pp.blockers }));
+    // Decide: narrow the seam, add wrappers, or fix overloads.
+    exit();
+  }
+  // Use augmented fields and resolved methods in the extract call:
+  const result = await java.extractClass({
+    file, target,
+    methods: pp.resolved_methods,
+    moveFields: pp.augmented_move_fields,
+    wrappers: pp.has_external_callers,
+    // wiring unset — extractClass auto-selects from source
+  });
+"#;
+
 #[async_trait]
 impl Tool for JavaDescribe {
     fn name(&self) -> &str {
@@ -1032,8 +1082,11 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": NORMALIZE_WHITESPACE_CONTRACT }))
             }
             "hygiene" => ToolResult::Json(json!({ "contract": HYGIENE_CONTRACT })),
+            "extractClassPreviewPlan" => {
+                ToolResult::Json(json!({ "contract": PREVIEW_PLAN_CONTRACT }))
+            }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractMethodCodeBlock, removeUnusedConstructorParams, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractMethodCodeBlock, removeUnusedConstructorParams, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -1503,10 +1556,294 @@ impl Tool for JavaHygiene {
     }
 }
 
+/// `java.extractClassPreviewPlan` — one-cell seam-dependency preflight that
+/// replaces exploratory preview loops. Bundles overload resolution, field
+/// initializer closure, external caller survey, and DI wireability checks into
+/// a single compact answer. If the preflight is clean, skip previewOnly and go
+/// directly to extractClass + edits.apply.
+pub struct JavaExtractClassPreviewPlan;
+
+#[derive(Deserialize)]
+struct PreviewPlanParams {
+    file: String,
+    methods: Vec<String>,
+    #[serde(default, rename = "moveFields", alias = "move_fields")]
+    move_fields: Option<Vec<String>>,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+}
+
+#[async_trait]
+impl Tool for JavaExtractClassPreviewPlan {
+    fn name(&self) -> &str {
+        "java.extractClassPreviewPlan"
+    }
+    fn description(&self) -> &str {
+        "Preflight a java.extractClass seam before applying: resolves overloaded method signatures, computes field initializer closure, surveys external callers of moved helpers, and reports DI wireability risks. One cell instead of 5+ previewOnly exploratory calls. Use when cohesionClusters returns a candidate cluster — run this first, then skip previewOnly if ready:true. Pure; syntax_only; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative .java source file." },
+                "methods": { "type": "array", "items": { "type": "string" }, "description": "Method names from the cohesion cluster (seam.item_names)." },
+                "moveFields": { "type": "array", "items": { "type": "string" }, "description": "Field names from the cohesion cluster (seam.move_fields)." },
+                "className": { "type": "string", "description": "Optional owner class name." }
+            },
+            "required": ["file", "methods"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: PreviewPlanParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.extractClassPreviewPlan: bad input — expected {{ file, methods }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        let file = params.file.clone();
+        let move_fields = params.move_fields.clone().unwrap_or_default();
+        let class_name = params.class_name.clone();
+        bro_tools::tool::call_blocking(move || {
+            let path = root.join(&file);
+
+            // 1. Overload resolution — detect duplicate bare names via
+            //    tree-sitter query for method declarations, then extract
+            //    parameter-type suffixes.
+            let mut overloads: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut resolved_methods: Vec<String> = params.methods.clone();
+            let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for name in &params.methods {
+                *name_counts.entry(name.as_str()).or_default() += 1;
+            }
+            let dupes: Vec<&str> = name_counts
+                .iter()
+                .filter(|(_, c)| **c > 1)
+                .map(|(&n, _)| n)
+                .collect();
+            if !dupes.is_empty() {
+                // Query for all method declarations in the file.
+                // Captures: @name = method name, @params = formal_parameters.
+                match bbox_refactor::facts::file_query(
+                    &path,
+                    "(method_declaration name: (identifier) @name parameters: (formal_parameters) @params) @method",
+                    None,
+                ) {
+                    Ok(file_facts) => {
+                        for &dupe_name in &dupes {
+                            let mut sigs: Vec<String> = Vec::new();
+                            for cap in &file_facts.captures {
+                                if cap.capture == "name" && cap.text == dupe_name {
+                                    // Find the paired @params capture — it follows @name
+                                    // in the same match group. We accumulate by walking
+                                    // all captures and matching name→params pairs.
+                                    // Simpler: just collect all @params whose preceding
+                                    // @name matched this dupe_name.
+                                    let params_idx = file_facts.captures.iter().position(
+                                        |c| c.capture == "params" && c.byte_start > cap.byte_end
+                                            && c.byte_start < cap.byte_end + 200,
+                                    );
+                                    if let Some(idx) = params_idx {
+                                        let params_text = &file_facts.captures[idx].text;
+                                        sigs.push(format!("{dupe_name}{params_text}"));
+                                    }
+                                }
+                            }
+                            sigs.sort();
+                            sigs.dedup();
+                            if !sigs.is_empty() {
+                                overloads.insert(dupe_name.to_string(), sigs.clone());
+                                for m in &mut resolved_methods {
+                                    if m == dupe_name {
+                                        *m = sigs[0].clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return err(format!(
+                            "java.extractClassPreviewPlan: method query: {e:#}"
+                        ));
+                    }
+                }
+            }
+
+            // 2. Field initializer closure.
+            let mut augmented_move_fields = move_fields.clone();
+            let mut field_closure: Value = json!({});
+            if !move_fields.is_empty() {
+                match bbox_refactor::facts::java_field_initializer_closure(
+                    &path,
+                    &move_fields,
+                    class_name.as_deref(),
+                ) {
+                    Ok(closure) => {
+                        for (_field, deps) in &closure {
+                            for dep in deps {
+                                if !augmented_move_fields.contains(dep) {
+                                    augmented_move_fields.push(dep.clone());
+                                }
+                            }
+                        }
+                        field_closure = serde_json::to_value(closure).unwrap_or(json!({}));
+                    }
+                    Err(e) => {
+                        // Non-fatal: fieldClassification is the fallback.
+                        tracing::warn!("fieldInitializerClosure: {e:#}");
+                    }
+                }
+            }
+
+            // 3. External caller survey via the find_java_usages plan kind
+            //    (same path analysis.references uses).
+            let mut external_callers: Value = json!({});
+            let mut has_external_callers = false;
+            if !params.methods.is_empty() {
+                let symbols: Vec<String> = params.methods.iter().map(|m| {
+                    m.split('(').next().unwrap_or(m).to_string()
+                }).collect();
+                let plan_input = json!({
+                    "kind": "find_java_usages",
+                    "source": "",
+                    "project_dir": root.to_string_lossy(),
+                    "item_names": symbols,
+                    "item_kinds": json!(["method_invocation"]),
+                    "declaring_class": class_name,
+                    "summary_only": true,
+                });
+                match serde_json::from_value::<bbox_refactor::RefactorPlanParams>(plan_input) {
+                    Ok(plan_params) => {
+                        match bbox_refactor::plan(&plan_params) {
+                            Ok(plan_json) => {
+                                if let Ok(summary) = serde_json::from_str::<Value>(&plan_json) {
+                                    if let Some(files_by_name) = summary
+                                        .get("usage_files_by_name")
+                                        .and_then(Value::as_object)
+                                    {
+                                        let rel_file = path
+                                            .strip_prefix(&root)
+                                            .unwrap_or(&path)
+                                            .to_string_lossy()
+                                            .to_string();
+                                        let ext: BTreeMap<String, Vec<String>> = files_by_name
+                                            .iter()
+                                            .filter_map(|(sym, files)| {
+                                                let external: Vec<String> = files
+                                                    .as_array()
+                                                    .unwrap_or(&vec![])
+                                                    .iter()
+                                                    .filter_map(|f| {
+                                                        let f = f.as_str().unwrap_or("");
+                                                        if f != rel_file { Some(f.to_string()) } else { None }
+                                                    })
+                                                    .collect();
+                                                if external.is_empty() { None } else { Some((sym.clone(), external)) }
+                                            })
+                                            .collect();
+                                        has_external_callers = !ext.is_empty();
+                                        external_callers = serde_json::to_value(ext).unwrap_or(json!({}));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("find_java_usages in previewPlan: {e:#}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("previewPlan param: {e:#}");
+                    }
+                }
+            }
+
+            // 4. DI wireability check via fieldClassification.
+            let mut non_injectable_mutable: Vec<String> = Vec::new();
+            let mut wiring_recommendation = "external_injection"; // default for DI sources
+            if !augmented_move_fields.is_empty() {
+                // Read source for DI detection.
+                let source = std::fs::read_to_string(&path).unwrap_or_default();
+                match bbox_refactor::facts::java_field_classification(
+                    &path,
+                    Some(&augmented_move_fields),
+                    class_name.as_deref(),
+                ) {
+                    Ok(classification) => {
+                        let is_di = detect_inject_fqn(&source).is_some();
+                        if !is_di {
+                            wiring_recommendation = "own_construction";
+                        }
+                        for field in &classification.fields {
+                            if field.is_mutable_instance && !field.is_injected && !field.is_provider {
+                                non_injectable_mutable.push(field.name.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("fieldClassification in previewPlan: {e:#}");
+                    }
+                }
+            }
+
+            let blockers: Vec<&str> = {
+                let mut b: Vec<&str> = Vec::new();
+                if !overloads.is_empty() {
+                    // Overloads are resolved now (signature-qualified names), but
+                    // flag if resolution produced ambiguous results.
+                    for sigs in overloads.values() {
+                        if sigs.len() > 1 {
+                            b.push("overload_multiple_signatures");
+                            break;
+                        }
+                    }
+                }
+                if has_external_callers {
+                    b.push("external_callers_on_moved_methods");
+                }
+                if !non_injectable_mutable.is_empty() {
+                    b.push("non_injectable_mutable_fields");
+                }
+                b
+            };
+            let ready = blockers.is_empty();
+
+            let augmented_fields_differ =
+                augmented_move_fields.len() != move_fields.len();
+
+            ToolResult::Json(json!({
+                "file": file,
+                "methods": params.methods,
+                "overloads": overloads,
+                "resolved_methods": resolved_methods,
+                "field_closure": field_closure,
+                "augmented_move_fields": augmented_move_fields,
+                "augmented_fields_differ": augmented_fields_differ,
+                "external_callers": external_callers,
+                "has_external_callers": has_external_callers,
+                "non_injectable_mutable": non_injectable_mutable,
+                "wiring_recommendation": wiring_recommendation,
+                "ready": ready,
+                "blockers": blockers,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// The `java.*` binding set.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(JavaExtractClass) as Arc<dyn Tool>,
+        Arc::new(JavaExtractClassPreviewPlan) as Arc<dyn Tool>,
         Arc::new(JavaExtractMethodCodeBlock) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaOrganizeImports) as Arc<dyn Tool>,
@@ -1522,7 +1859,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractMethodCodeBlock — extract one contiguous code block into a helper method after analysis.methodRegions gates; removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan — one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock — extract one contiguous code block into a helper method after analysis.methodRegions gates; removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -1531,6 +1868,8 @@ type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string;
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
+  /** Preflight a java.extractClass seam: overloads, field closure, external callers, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
+  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */

@@ -571,6 +571,72 @@ impl Tool for AnalysisMethodRegions {
     }
 }
 
+/// `analysis.fieldInitializerClosure` — transitive field/constant initializer
+/// dependency closure for moved fields.
+pub struct AnalysisFieldInitializerClosure;
+
+#[derive(Deserialize)]
+struct FieldInitClosureParams {
+    file: String,
+    fields: Vec<String>,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+}
+
+#[async_trait]
+impl Tool for AnalysisFieldInitializerClosure {
+    fn name(&self) -> &str {
+        "analysis.fieldInitializerClosure"
+    }
+    fn description(&self) -> &str {
+        "Compute transitive field/constant dependency closure for moved fields. For each static final field in 'fields', finds constants referenced in its initializer and follows the chain transitively. Use before java.extractClass to prevent compile failures from moved constants whose initializers reference source constants left behind. Pure; syntax_only; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative .java source file." },
+                "fields": { "type": "array", "items": { "type": "string" }, "description": "Field names to compute initializer closure for (typically seam.move_fields)." },
+                "className": { "type": "string", "description": "Optional owner class name when the file has multiple classes." }
+            },
+            "required": ["file", "fields"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: FieldInitClosureParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "analysis.fieldInitializerClosure: bad input — expected {{ file, fields }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            match bbox_refactor::facts::java_field_initializer_closure(
+                &root.join(&params.file),
+                &params.fields,
+                params.class_name.as_deref(),
+            ) {
+                Ok(closure) => ToolResult::Json(json!({
+                    "file": params.file,
+                    "fields": params.fields,
+                    "closure": closure,
+                    "provenance": "syntax_only",
+                })),
+                Err(e) => err(format!("analysis.fieldInitializerClosure: {e:#}")),
+            }
+        })
+        .await
+    }
+}
+
 /// `analysis.describe` — depth-on-demand contract for one analysis (matches
 /// the java.describe pattern; the namespace index stays a compact one-liner).
 pub struct AnalysisDescribe;
@@ -809,6 +875,40 @@ RECIPE (monolithic-method stage extraction)
   // Then call java.extractMethodCodeBlock with the exact text from the accepted range.
 "#;
 
+const FIELD_INIT_CLOSURE_CONTRACT: &str = r#"analysis.fieldInitializerClosure — transitive field/constant initializer dependency closure.
+
+WHAT IT DOES
+  For each static final field in `fields`, walks its initializer and finds
+  references to OTHER static final fields/constants in the same file. Then
+  follows those references transitively to produce the full closure — the set
+  of all source constants that must move with each requested field to preserve
+  compile-time validity. Only fields with non-empty closures appear in the
+  result; a field with no constant dependencies returns nothing.
+
+PARAMS
+  file: string        workspace-relative .java file
+  fields: string[]    field names to check (typically seam.move_fields)
+  className?: string  optional owner class restriction
+
+RETURNS { file, fields, closure, provenance }
+  closure: { [field_name]: string[] }  only present for fields with deps;
+          values are sorted alphabetically
+
+RECIPE
+  const fc = await analysis.fieldInitializerClosure({
+    file, fields: seam.move_fields,
+  });
+  if (Object.keys(fc.closure).length) {
+    // Add transitive deps to move_fields before calling java.extractClass
+    for (const [field, deps] of Object.entries(fc.closure)) {
+      for (const dep of deps) {
+        if (!seam.move_fields.includes(dep)) seam.move_fields.push(dep);
+      }
+    }
+  }
+  // Now seam.move_fields includes the full transitive closure.
+"#;
+
 #[async_trait]
 impl Tool for AnalysisDescribe {
     fn name(&self) -> &str {
@@ -847,8 +947,11 @@ impl Tool for AnalysisDescribe {
                 ToolResult::Json(json!({ "contract": FIELD_CLASSIFICATION_CONTRACT }))
             }
             "methodRegions" => ToolResult::Json(json!({ "contract": METHOD_REGIONS_CONTRACT })),
+            "fieldInitializerClosure" => {
+                ToolResult::Json(json!({ "contract": FIELD_INIT_CLOSURE_CONTRACT }))
+            }
             other => err(format!(
-                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification, methodRegions)"
+                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification, methodRegions, fieldInitializerClosure)"
             )),
         }
     }
@@ -861,6 +964,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(AnalysisReferences) as Arc<dyn Tool>,
         Arc::new(AnalysisFieldClassification) as Arc<dyn Tool>,
         Arc::new(AnalysisMethodRegions) as Arc<dyn Tool>,
+        Arc::new(AnalysisFieldInitializerClosure) as Arc<dyn Tool>,
         Arc::new(AnalysisDescribe) as Arc<dyn Tool>,
     ]
 }
@@ -871,7 +975,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "analysis".to_string(),
-        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count Java symbol references across the workspace without full capture payloads; fieldClassification — classify Java fields as constants/deps/mutable state with read/write sites; methodRegions — analyze Java method-body regions before extract-method gates. USE THESE rather than reconstructing reductions from code.query captures."
+        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count Java symbol references across the workspace without full capture payloads; fieldClassification — classify Java fields as constants/deps/mutable state with read/write sites; methodRegions — analyze Java method-body regions before extract-method gates; fieldInitializerClosure — transitive field/constant dependency closure for moved fields (prevents extract-time compile failures from missed initializer deps). USE THESE rather than reconstructing reductions from code.query captures."
             .to_string(),
         declarations: r#"type CohesionCluster = { id: string; name_hint: string; item_names: string[]; move_fields: string[]; score: number; internal_field_touches: number; internal_calls: number; inbound_calls: number; outbound_calls: number; expected_wiring: "delegate" | "callback" | "source_instance" };
 type CrossClusterCall = { from_cluster: string; to_cluster: string; from_method: string; to_method: string };
@@ -893,6 +997,8 @@ declare const analysis: {
   fieldClassification(args: { file: string; fields?: string[]; className?: string }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; fields: FieldClassification[]; provenance: "syntax_only" }>;
   /** Analyze one Java method's top-level statement regions and optional candidate ranges before extract-method. Use this for contiguity/live-out gates. */
   methodRegions(args: { file: string; method: string; className?: string; includeStatementRegions?: boolean; includeNestedStatementRegions?: boolean; statementLimit?: number; statementStartLine?: number; statementEndLine?: number; statementContains?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_region_summary: MethodRegionStatementSummary; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
+  /** Compute transitive field/constant dependency closure for moved fields. For each static final field, finds constants referenced in its initializer and follows the chain transitively. Use before java.extractClass. */
+  fieldInitializerClosure(args: { file: string; fields: string[]; className?: string }): Promise<{ file: string; fields: string[]; closure: Record<string, string[]>; provenance: "syntax_only" }>;
 };"#
             .to_string(),
     }
@@ -1373,6 +1479,110 @@ class NestedStage {
         assert!(kinds.contains(&"expression_statement"), "{out}");
         assert_eq!(
             out["statement_region_summary"]["filter"]["include_nested_statement_regions"], true,
+            "{out}"
+        );
+    }
+
+    const CLOSURE_FIXTURE: &str = r#"package com.acme;
+
+public class ClosureTest {
+    private static final String A = "a";
+    private static final String B = A;
+    private static final String C = B;
+    private static final String D = C + "extra";
+    private static final String E = "independent";
+    private int counter;
+}
+"#;
+
+    #[tokio::test]
+    async fn field_initializer_closure_finds_transitive_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("ClosureTest.java"), CLOSURE_FIXTURE).unwrap();
+        let cx = cx_in(root);
+
+        // B → A, so B's closure should contain A
+        let out = json_of(
+            AnalysisFieldInitializerClosure
+                .call(
+                    json!({ "file": "ClosureTest.java", "fields": ["B"] }),
+                    &cx,
+                )
+                .await,
+        );
+        let closure = &out["closure"];
+        assert!(closure["B"].is_array(), "{out}");
+        let b_deps: Vec<&str> = closure["B"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(b_deps.contains(&"A"), "{out}");
+
+        // C → B → A, so C's closure should contain [A, B]
+        let out = json_of(
+            AnalysisFieldInitializerClosure
+                .call(
+                    json!({ "file": "ClosureTest.java", "fields": ["C"] }),
+                    &cx,
+                )
+                .await,
+        );
+        let c_deps: Vec<&str> = out["closure"]["C"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(c_deps.contains(&"A"), "{out}");
+        assert!(c_deps.contains(&"B"), "{out}");
+
+        // D → C → B → A, full chain
+        let out = json_of(
+            AnalysisFieldInitializerClosure
+                .call(
+                    json!({ "file": "ClosureTest.java", "fields": ["D"] }),
+                    &cx,
+                )
+                .await,
+        );
+        let d_deps: Vec<&str> = out["closure"]["D"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(d_deps.contains(&"A"), "{out}");
+        assert!(d_deps.contains(&"B"), "{out}");
+        assert!(d_deps.contains(&"C"), "{out}");
+
+        // E has no constant deps → should not appear in closure
+        let out = json_of(
+            AnalysisFieldInitializerClosure
+                .call(
+                    json!({ "file": "ClosureTest.java", "fields": ["E"] }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(
+            !out["closure"].as_object().unwrap().contains_key("E"),
+            "{out}"
+        );
+
+        // Non-static field → no deps
+        let out = json_of(
+            AnalysisFieldInitializerClosure
+                .call(
+                    json!({ "file": "ClosureTest.java", "fields": ["counter"] }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(
+            !out["closure"].as_object().unwrap().contains_key("counter"),
             "{out}"
         );
     }

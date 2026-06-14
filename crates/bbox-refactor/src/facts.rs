@@ -405,6 +405,146 @@ pub fn java_field_classification(
     })
 }
 
+/// Transitive field/constant initializer dependency closure for one Java file.
+///
+/// For each field in `field_names` that is static final, this walks the field's
+/// initializer and finds references to OTHER static final fields/constants in
+/// the same file. It then follows those references transitively to produce the
+/// full closure — the set of all source constants that must move with each
+/// requested field to preserve compile-time validity.
+///
+/// This prevents the "moved `CONDENSATE_ADDITIONAL_COLUMNS` but its initializer
+/// referenced `ADJUSTED_TOTAL` which stayed in the source" class of
+/// extract-time compile failure.
+///
+/// Returns `{ field_name: [transitive_dep_name, ...] }` — only fields that
+/// actually have transitive dependencies are included.
+pub fn java_field_initializer_closure(
+    path: &Path,
+    field_names: &[String],
+    class_name: Option<&str>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let parsed = super::parse_source_file(path)?;
+    if parsed.language != "java" {
+        return Err(anyhow!(
+            "analysis.fieldInitializerClosure only supports java files"
+        ));
+    }
+
+    let all_fields = java_field_facts_for_parsed(&parsed, class_name);
+    let static_final_names: BTreeSet<&str> = all_fields
+        .iter()
+        .filter(|f| f.is_static && f.is_final)
+        .map(|f| f.name.as_str())
+        .collect();
+
+    // Build initializer refs for ALL static final fields (not just requested
+    // ones), so transitive closure can follow dependency chains beyond the
+    // originally requested set.
+    let mut initializer_refs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() != "field_declaration" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+            continue;
+        }
+        let owner_class = java_owner_class_name(node, &parsed.source);
+        if class_name.is_some_and(|wanted| owner_class.as_deref() != Some(wanted)) {
+            continue;
+        }
+        // Check if static final.
+        let (modifiers, _annotations) = java_modifiers_and_annotations(node, &parsed.source);
+        let is_static_final =
+            modifiers.iter().any(|m| m == "static") && modifiers.iter().any(|m| m == "final");
+        if !is_static_final {
+            continue;
+        }
+        // Find the variable_declarator and get name + initializer.
+        let mut decl_name: Option<String> = None;
+        let mut init_node: Option<tree_sitter::Node<'_>> = None;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                decl_name = child
+                    .child_by_field_name("name")
+                    .map(|n| text_of(&parsed.source, n));
+                init_node = child.child_by_field_name("value");
+            }
+        }
+        let Some(field_name) = decl_name else {
+            continue;
+        };
+        let Some(init) = init_node else {
+            continue;
+        };
+        let refs = collect_identifiers_in_subtree(init, &parsed.source);
+        let dep_set: BTreeSet<String> = refs
+            .into_iter()
+            .filter(|r| static_final_names.contains(r.as_str()) && r != &field_name)
+            .collect();
+        initializer_refs.insert(field_name, dep_set);
+    }
+
+    // Compute transitive closure: for each requested field, follow dependency
+    // chains until fixed point.
+    let requested: BTreeSet<&str> = field_names.iter().map(String::as_str).collect();
+    let mut closure: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in &requested {
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut frontier: Vec<String> = initializer_refs
+            .get(*name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        while let Some(dep) = frontier.pop() {
+            if !deps.insert(dep.clone()) {
+                continue;
+            }
+            for transitive in initializer_refs
+                .get(&dep)
+                .cloned()
+                .unwrap_or_default()
+            {
+                if !deps.contains(&transitive) {
+                    frontier.push(transitive);
+                }
+            }
+        }
+        if !deps.is_empty() {
+            let mut sorted: Vec<String> = deps.into_iter().collect();
+            sorted.sort();
+            closure.insert(name.to_string(), sorted);
+        }
+    }
+    Ok(closure)
+}
+
+/// Collect all identifier names in a subtree — used for initializer reference
+/// extraction.
+fn collect_identifiers_in_subtree(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                ids.insert(text.to_string());
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    ids
+}
+
 fn java_field_facts_for_parsed(
     parsed: &super::ParsedSource,
     class_name: Option<&str>,
