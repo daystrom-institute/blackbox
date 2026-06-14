@@ -4,8 +4,10 @@
 //! `apply_replacements`, and `derive_new_contents_from_chunks`
 //! (`codex-rs/apply-patch/src/lib.rs`, Apache-2.0 — see NOTICE) onto `std::fs`
 //! against a base directory, without Codex's async `ExecutorFileSystem`,
-//! sandbox context, `AbsolutePathBuf`, or `similar`-based diffs. Every hunk path
-//! is resolved relative to `base` and confined to it.
+//! sandbox context, `AbsolutePathBuf`, or `similar`-based diffs. Every hunk
+//! path is resolved against `base`: relative paths join `base` and `..`
+//! components are collapsed lexically; absolute paths are accepted as-is —
+//! no containment check (gap-e0ae3e7d).
 
 use crate::parser::{Hunk, UpdateFileChunk, parse_patch};
 use crate::seek_sequence::seek_sequence;
@@ -54,8 +56,9 @@ pub struct ApplyOutcome {
 }
 
 /// Apply a codex `*** Begin Patch` envelope under `base`. Every hunk path is
-/// resolved relative to `base`; absolute or escaping paths are rejected, so a
-/// patch can only touch files inside the worktree.
+/// resolved against `base`: relative paths join `base` (with `..` components
+/// collapsed lexically), absolute paths are accepted as-is. There is no
+/// containment check — see module docs.
 pub fn apply_patch(patch_text: &str, base: &Path) -> Result<ApplyOutcome, ApplyError> {
     let parsed = parse_patch(patch_text)?;
     let mut outcome = ApplyOutcome::default();
@@ -246,36 +249,32 @@ fn apply_replacements(
     lines
 }
 
-/// Resolve `rel` against `base`, rejecting absolute paths and any `..` that
-/// would escape the worktree. Lexical only (no symlink resolution) — enough to
-/// keep an apply confined to the base dir.
+/// Resolve `rel` against `base`. Relative paths are joined and `..`
+/// components collapsed lexically; absolute paths are returned as-is
+/// (normalized). No containment check — see module docs. `..` is prevented
+/// from popping past the path's leading prefix + root so absolute paths
+/// stay absolute (e.g. `/foo/..` → `/`, `C:\foo\..` → `C:\`).
 fn resolve_within(base: &Path, rel: &Path) -> Result<PathBuf, ApplyError> {
-    let mut out = base.to_path_buf();
+    let mut out = if rel.is_absolute() {
+        PathBuf::new()
+    } else {
+        base.to_path_buf()
+    };
+    let mut prefix_count: usize = 0;
     for comp in rel.components() {
         match comp {
-            Component::Normal(c) => out.push(c),
+            Component::Prefix(_) | Component::RootDir => {
+                out.push(comp.as_os_str());
+                prefix_count += 1;
+            }
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() || !out.starts_with(base) {
-                    return Err(ApplyError::Path {
-                        path: rel.display().to_string(),
-                        message: "path escapes the worktree".to_string(),
-                    });
+                if out.components().count() > prefix_count {
+                    out.pop();
                 }
             }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(ApplyError::Path {
-                    path: rel.display().to_string(),
-                    message: "absolute paths are not allowed".to_string(),
-                });
-            }
+            Component::Normal(c) => out.push(c),
         }
-    }
-    if !out.starts_with(base) {
-        return Err(ApplyError::Path {
-            path: rel.display().to_string(),
-            message: "path escapes the worktree".to_string(),
-        });
     }
     Ok(out)
 }
@@ -360,15 +359,89 @@ mod tests {
     }
 
     #[test]
-    fn escaping_path_is_rejected_and_nothing_is_written() {
+    fn dotdot_components_normalize_lexically() {
+        // A path with `..` collapses to its canonical form under `base` —
+        // no rejection. The file is written at the normalized location.
         let dir = base();
-        let err = apply_patch(
-            "*** Begin Patch\n*** Add File: ../escape.txt\n+pwned\n*** End Patch",
+        let sub = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        apply_patch(
+            "*** Begin Patch\n*** Add File: a/b/../c.txt\n+hi\n*** End Patch",
             dir.path(),
         )
-        .unwrap_err();
-        assert!(matches!(err, ApplyError::Path { .. }), "{err:?}");
-        assert!(!dir.path().parent().unwrap().join("escape.txt").exists());
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/c.txt")).unwrap(),
+            "hi\n"
+        );
+        assert!(!dir.path().join("a/b/c.txt").exists());
+    }
+
+    #[test]
+    fn dotdot_escape_lands_outside_base() {
+        // `..` past the base lands the file outside it — no rejection.
+        // We use a sibling tempdir as the target to keep the test hermetic.
+        let base_dir = base();
+        let outside_dir = base();
+        let target = outside_dir.path().join("escaped.txt");
+        let sibling_name = outside_dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: ../{sibling_name}/escaped.txt\n+escaped\n*** End Patch"
+        );
+        apply_patch(&patch, base_dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "escaped\n"
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_accepted() {
+        // Absolute paths are accepted as-is. The file is written at the
+        // absolute path (here, a tempdir we control so the test isn't
+        // touching real filesystem state).
+        let dir = base();
+        let target = dir.path().join("abs_marker.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+absolute\n*** End Patch",
+            target.display()
+        );
+        apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "absolute\n");
+    }
+
+    #[test]
+    fn tilde_is_a_literal_path_component() {
+        // `~` is not expanded by `Path` (no shell involved) — it remains a
+        // literal path component. The patch path starts with `~/marker.txt`,
+        // so the resolved path is `<base>/~/marker.txt`. An implementation
+        // that expanded leading `~/...` would land the file at
+        // `$HOME/marker.txt` instead, and the assertion would fail.
+        let dir = base();
+        let literal_tilde_dir = dir.path().join("~");
+        std::fs::create_dir_all(&literal_tilde_dir).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: ~/marker.txt\n+tilde\n*** End Patch";
+        apply_patch(patch, dir.path()).unwrap();
+        let landed = literal_tilde_dir.join("marker.txt");
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "tilde\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_absolute_path_preserves_root() {
+        // Regression for the drive-absolute bug: a path like `C:\a\..\b.txt`
+        // must normalize to `C:\b.txt`, not `C:some\where\a\..\b.txt` and not
+        // the drive-relative `C:b.txt`. Test the resolver directly so the
+        // assertion is hermetic (no need to actually write at the drive
+        // root, which would require elevation on some systems).
+        let base = Path::new(r"C:\work\repo");
+        let rel = Path::new(r"C:\a\..\b.txt");
+        let resolved = resolve_within(base, rel).unwrap();
+        assert_eq!(resolved, PathBuf::from(r"C:\b.txt"));
     }
 
     #[test]

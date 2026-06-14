@@ -61,7 +61,7 @@ impl Tool for AnalysisCohesionClusters {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative .java file; the FIRST class declaration is analyzed." }
+                "file": { "type": "string", "description": "Path to a .java file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is. The FIRST class declaration is analyzed." }
             },
             "required": ["file"]
         })
@@ -286,7 +286,10 @@ WHAT IT DOES
   from code.query captures (that path OOMs on a sweep or burns ~50 cells by hand).
 
 PARAMS
-  file: string   workspace-relative .java file
+  file: string   Path to a .java file. Relative paths resolve against the
+                     session worktree root; absolute paths are accepted
+                     as-is. (Refactor plan OUTPUTS still must land inside
+                     the worktree — see java.* transform integrity checks.)
 
 RETURNS { file, class, cluster_count, clusters, cross_cluster_calls, provenance }
   clusters[]: each is a ready-to-extract seam —
@@ -350,7 +353,7 @@ PARAMS
 RETURNS { symbols, total_usages, unique_files, production_sites, test_sites,
           counts_by_symbol, files_by_symbol, examples_by_symbol, provenance }
   counts_by_symbol: { [symbol]: count }
-  files_by_symbol:  { [symbol]: workspace-relative files[] }
+  files_by_symbol:  { [symbol]: relative-to-worktree-root files[] }
   examples_by_symbol: top 5 examples per symbol with path, line, column, context,
                       usage_kind, is_test_site. Examples are for orientation only;
                       use code.query/code.items if you need hash-anchored spans.

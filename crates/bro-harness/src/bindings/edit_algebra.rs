@@ -337,7 +337,7 @@ impl Tool for EditsCreateFile {
             "type": "object",
             "properties": {
                 "es": { "type": "string", "description": "EditSet id from edits.begin." },
-                "path": { "type": "string", "description": "Workspace-relative path that must not yet exist." },
+                "path": { "type": "string", "description": "Path that must not yet exist. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
                 "content": { "type": "string" }
             },
             "required": ["es", "path", "content"]

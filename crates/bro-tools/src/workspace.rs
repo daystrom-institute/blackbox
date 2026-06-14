@@ -1,9 +1,12 @@
 //! Workspace tools: file, shell, and git. Ported from daystrom-mk2
 //! `Daystrom.Worker/Tools/{FileTools,ShellTools,GitWorkspaceTools}`.
 //!
-//! All paths are resolved against and confined to `cx.root`. Shell commands
-//! pass through [`SafetyPolicy::deny_command`]; `git_commit` additionally
-//! rejects staged sensitive files.
+//! File paths are normalized — relative paths join `cx.root`, absolute
+//! paths are accepted as-is. There is no containment boundary here: the
+//! harness has no other sandboxing machinery, and `shell` already escapes
+//! any lexical `cx.root` with `git -C`, `find`, `tee`, `sed -i`, etc.
+//! Shell commands pass through [`SafetyPolicy::deny_command`]; `git_commit`
+//! additionally rejects staged sensitive files.
 
 use crate::tool::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use async_trait::async_trait;
@@ -280,11 +283,21 @@ fn is_sensitive_env_key(key: &str) -> bool {
     .any(|needle| upper.contains(needle))
 }
 
-/// Resolve a caller-supplied path against the effective worktree root and
-/// refuse escapes (`..`, absolute paths outside root, symlink traversal).
-/// Shared with the `shell` module so shell `cwd` resolution uses the same
-/// confinement, and pub for harness domain bindings (`code.*`) so cell-facing
-/// file access composes the same guard.
+/// Resolve a caller-supplied path to a normalized absolute path. Relative
+/// paths are joined against the effective worktree root (the launch root or,
+/// after `exit_worktree(publish)` removed a managed fleet worktree, the base
+/// repository advertised by the fleet env); absolute paths are returned as-is
+/// after lexical normalization.
+///
+/// **There is no containment check.** The harness has no other sandboxing
+/// machinery, and `shell` already escapes any lexical `cx.root` boundary with
+/// `git -C`, absolute paths, `find`, `sed -i`, `tee`, etc. The pretense of
+/// confining the structured file tools to `cx.root` was a speed bump on
+/// `file_read`/`file_edit`/`file_write`/`code.*` that the agent routinely
+/// bypassed via shell in two or three calls per file (gap-e0ae3e7d,
+/// friction/2026-June-13-0840pm-worktree-containment-issues.md). Callers that
+/// need a real containment boundary must layer one below the file tools
+/// (process-level sandbox), not in them.
 pub fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     let root = effective_root(root);
     let joined = if Path::new(rel).is_absolute() {
@@ -292,22 +305,17 @@ pub fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     } else {
         root.join(rel)
     };
-    // Lexical containment check first (works for not-yet-existing paths).
-    let normalized = normalize_lexical(&joined);
-    let root_norm = normalize_lexical(&root);
-    if !normalized.starts_with(&root_norm) {
-        anyhow::bail!("path escapes worktree root: {rel}");
-    }
-    Ok(normalized)
+    Ok(normalize_lexical(&joined))
 }
 
-/// Resolve a read-only file path. Normal worktree confinement still applies,
-/// but explicit `@...` file mentions get Codex-style handling: `@relative/path`
-/// strips the marker and resolves inside the worktree, while `@/abs/path.md`
-/// can read instruction docs outside the worktree. Harness-owned dump files are
-/// also readable by absolute path so oversized tool-result riders can point at
-/// a lossless recovery path. This is intentionally not used by write/edit/shell
-/// tools.
+/// Resolve a read-only file path. Relative paths join the effective worktree
+/// root; absolute paths are accepted as-is. Explicit `@...` file mentions get
+/// Codex-style handling on top of that: `@relative/path` strips the marker
+/// and resolves inside the root, while `@/abs/path.md` can read instruction
+/// docs outside the root. Harness-owned dump files are also readable by
+/// absolute path so oversized tool-result riders can point at a lossless
+/// recovery path. This is intentionally not used by write/edit/shell tools
+/// (those go through [`resolve_in_root`]).
 fn resolve_read_path(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     let Some(stripped) = raw.strip_prefix('@') else {
         let path = Path::new(raw);
@@ -468,9 +476,10 @@ const FILE_READ_DEFAULT_MAX_LINES: usize = 2000;
 
 #[derive(Deserialize, JsonSchema)]
 struct FileReadInput {
-    /// Path to the file, relative to the worktree root. `@relative/path` is
-    /// accepted as a file mention; `@/absolute/instruction.md` is accepted for
-    /// read-only instruction docs outside the worktree.
+    /// Path to the file. Relative paths resolve against the worktree root;
+    /// absolute paths are accepted as-is. `@relative/path` is accepted as a
+    /// file mention; `@/absolute/instruction.md` is accepted for read-only
+    /// instruction docs outside the worktree.
     file_path: String,
     /// 1-based start line (inclusive). Omit to read from the beginning.
     start_line: Option<usize>,
@@ -576,7 +585,8 @@ impl Tool for FileRead {
 
 #[derive(Deserialize, JsonSchema)]
 struct FileWriteInput {
-    /// Path to write, relative to the worktree root. Parent dirs are created.
+    /// Path to write. Relative paths resolve against the worktree root;
+    /// absolute paths are accepted as-is. Parent dirs are created.
     file_path: String,
     /// Full new contents of the file.
     #[serde(default)]
@@ -656,7 +666,8 @@ fn record_edit(cx: &ToolCx, path: &Path, pre: &[u8], post: &[u8]) {
 
 #[derive(Deserialize, JsonSchema)]
 struct ListDirInput {
-    /// Directory to list, relative to the worktree root. Defaults to root.
+    /// Directory to list. Relative paths resolve against the worktree root;
+    /// absolute paths are accepted as-is. Defaults to root.
     path: Option<String>,
 }
 
@@ -949,7 +960,8 @@ impl Tool for GitCommit {
 
 #[derive(Deserialize, JsonSchema)]
 struct FileEditInput {
-    /// Path to the file, relative to the worktree root.
+    /// Path to the file. Relative paths resolve against the worktree root;
+    /// absolute paths are accepted as-is.
     file_path: String,
     /// Exact text to find. Must be unique in the file unless `replace_all`.
     old_string: String,
@@ -1405,9 +1417,10 @@ impl Tool for Glob {
 
 #[derive(Deserialize, JsonSchema)]
 struct SmartReadInput {
-    /// Path to the file, relative to the worktree root. `@relative/path` is
-    /// accepted as a file mention; `@/absolute/instruction.md` is accepted for
-    /// read-only instruction docs outside the worktree.
+    /// Path to the file. Relative paths resolve against the worktree root;
+    /// absolute paths are accepted as-is. `@relative/path` is accepted as a
+    /// file mention; `@/absolute/instruction.md` is accepted for read-only
+    /// instruction docs outside the worktree.
     file_path: String,
     /// Line count above which the file is outlined instead of returned whole
     /// (default 400).
@@ -1505,11 +1518,12 @@ impl Tool for ApplyPatch {
         "apply_patch"
     }
     fn description(&self) -> &str {
-        "Edit files with a `*** Begin Patch` / `*** End Patch` envelope of \
+         "Edit files with a `*** Begin Patch` / `*** End Patch` envelope of \
          `*** Add File:` / `*** Update File:` / `*** Delete File:` (and optional \
          `*** Move to:`) hunks; update lines are prefixed ' ' (context), '+' \
          (add), or '-' (remove). This is a FREEFORM tool — emit the patch text \
-         directly, do not wrap it in JSON. Paths are relative to the worktree root."
+         directly, do not wrap it in JSON. Paths are relative to the worktree \
+         root; absolute paths are accepted as-is."
     }
     fn input_schema(&self) -> Value {
         // JSON-function fallback shape. The freeform/grammar channel delivers
@@ -1643,12 +1657,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_path_escape() {
+    fn normalizes_relative_and_absolute_paths() {
         let root = PathBuf::from("/work/repo");
-        assert!(resolve_in_root(&root, "../etc/passwd").is_err());
-        assert!(resolve_in_root(&root, "src/main.rs").is_ok());
-        assert!(resolve_in_root(&root, "/work/repo/src/x").is_ok());
-        assert!(resolve_in_root(&root, "/etc/passwd").is_err());
+        // Relative paths join against the root, with `..` components
+        // collapsed lexically — no containment check, no rejection. The pop
+        // walks past the root on the way out (matches the existing
+        // `normalize_lexical` semantics), so `../etc/passwd` lands one level
+        // up, not at the filesystem root.
+        assert_eq!(
+            resolve_in_root(&root, "src/main.rs").unwrap(),
+            PathBuf::from("/work/repo/src/main.rs")
+        );
+        assert_eq!(
+            resolve_in_root(&root, "src/../other/x.rs").unwrap(),
+            PathBuf::from("/work/repo/other/x.rs")
+        );
+        assert_eq!(
+            resolve_in_root(&root, "../etc/passwd").unwrap(),
+            PathBuf::from("/work/etc/passwd")
+        );
+        // Absolute paths are returned normalized, including ones that don't
+        // live under the worktree root.
+        assert_eq!(
+            resolve_in_root(&root, "/work/repo/src/x").unwrap(),
+            PathBuf::from("/work/repo/src/x")
+        );
+        assert_eq!(
+            resolve_in_root(&root, "/etc/passwd").unwrap(),
+            PathBuf::from("/etc/passwd")
+        );
     }
 
     #[test]

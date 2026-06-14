@@ -108,8 +108,8 @@ impl Tool for JavaExtractClass {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative Java source file holding the class to extract from." },
-                "target": { "type": "string", "description": "Workspace-relative path for the NEW class file (must not exist)." },
+                "file": { "type": "string", "description": "Path to a Java source file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
+                "target": { "type": "string", "description": "Path for the NEW class file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is. Must not exist (bounces at apply)." },
                 "delegateField": { "type": "string", "description": "Field name for the delegate instance on the source class." },
                 "methods": { "type": "array", "items": { "type": "string" }, "description": "Method names to move to the new class." },
                 "moveFields": { "type": "array", "items": { "type": "string" }, "description": "Field names to move with the methods (mutable fields written by extracted code MUST be listed here)." },
@@ -330,8 +330,17 @@ pub struct JavaDescribe;
 const EXTRACT_CLASS_CONTRACT: &str = r#"java.extractClass — extract methods/fields from a Java class into a new delegate class.
 
 PARAMS
-  file: string            workspace-relative .java file; the FIRST class declaration is the source class
-  target: string          workspace-relative path for the new class file (bounces at apply if it exists)
+  file: string            Path to a .java file. Relative paths resolve against
+                          the session worktree root; absolute paths are
+                          accepted as-is. The FIRST class declaration is the
+                          source class. (Refactor plan OUTPUTS still must
+                          land inside the worktree — see transform integrity
+                          checks.)
+  target: string          Path for the new class file. Relative paths
+                          resolve against the session worktree root;
+                          absolute paths are accepted as-is. Bounces at
+                          apply if it exists. Refactor plan integrity still
+                          requires the target to land inside the worktree.
   delegateField: string   delegate field name added to the source class
   methods: string[]       method names to move (selection is yours — inspect with code.items/code.query first)
   moveFields?: string[]   fields to move with them. REQUIRED for any mutable field the moved code WRITES
@@ -445,7 +454,9 @@ ORDERING (important)
   must already be gone, otherwise the param still reads as referenced and is kept. The
   composition is: extractClass → edits.apply → removeUnusedConstructorParams → edits.apply.
 
-PARAMS  { file: string }   workspace-relative .java file
+PARAMS  { file: string }   Path to a .java file. Relative paths resolve
+                              against the session worktree root; absolute
+                              paths are accepted as-is.
 RETURNS { changes, ctor_is_inject, removed: string[], kept: string[], findings, note, provenance }
   changes: [] when nothing is removable (see note); otherwise one span→new_text → edits.merge
   removed/kept: parameter names; findings: { finding:"removed_param", name, type } each
@@ -482,7 +493,7 @@ impl Tool for JavaRemoveUnusedCtorParams {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative Java file whose first class's @Inject constructor to prune." }
+                "file": { "type": "string", "description": "Path to a Java file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." }
             },
             "required": ["file"]
         })
@@ -678,7 +689,7 @@ public class OrderService {
                 .any(|f| f["finding"] == "captured_variable" && f["name"] == "taxRate"),
             "{findings:?}"
         );
-        // Spans are workspace-relative and hash-anchored.
+        // Spans are relative to the worktree root and hash-anchored.
         let span = &result["changes"][0]["span"];
         assert_eq!(span["file"], "src/com/acme/OrderService.java");
         assert_eq!(

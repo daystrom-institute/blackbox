@@ -8,6 +8,26 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Changed
+
+- File tools no longer pretend to confine to the session worktree
+  (gap-e0ae3e7d, friction/2026-June-13-0840pm-worktree-containment-issues.md):
+  `file_read` / `file_edit` / `file_write` / `code.*` bindings / `apply_patch`
+  accept absolute paths; relative paths still join against the effective
+  worktree root. The `path escapes worktree root` denial is gone. The
+  harness has no other sandboxing machinery — shell already escaped any
+  `cx.root` boundary with `git -C`, `find`, `tee`, `sed -i`, etc. — so the
+  structured-tool containment was a speed bump, not a boundary. Schema
+  descriptions updated to say "Relative paths resolve against the worktree
+  root; absolute paths are accepted as-is." `bro_tools::workspace::
+  resolve_in_root` and `bro_apply_patch::apply::resolve_within` are now pure
+  path normalizers. **LSP refactor plan integrity** at `lsp_facts.rs`
+  (`WorkspaceEdit` outside the worktree) and `java_transforms.rs`
+  (`relativize`) intentionally retained — those are refactor plan
+  safety checks, not file-tool confinement. `analysis.*` and `java.*` input
+  schemas updated to reflect the new path contract; their plan OUTPUTS
+  are still required to land inside the worktree. Gap-e0ae3e7d addressed.
+
 ### Added
 
 - Embedding coverage now converges and says so when it can't

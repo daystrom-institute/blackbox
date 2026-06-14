@@ -16,8 +16,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/harness/worktree-session-scope",
   "notes": "The on-disk worktree is stranded but visible to `sandbox_status` and `git worktree list`. The harness's `launch_root` is permanent for the session. The 'fresh starting place' is achievable on a new branch in the main worktree, but the operator's \"new worktree\" framing implies a separate disk directory, which the tool surface can't reach. Either the tool surface needs a switch primitive, or the operator-facing language (\"worktree\" vs \"branch\") needs a sharp distinction in the daily-cleaning / closeout docs.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "task_id": "f2f66c28-6df5-4b56-980c-b03659940efa",
   "created_at": "2026-06-14T02:41:36Z",
-  "updated_at": "2026-06-14T02:41:36Z"
+  "updated_at": "2026-06-14T03:49:29Z",
+  "resolved_at": "2026-06-14T03:49:29Z",
+  "resolution_note": "Addressed by dropping the lexical-containment check in `bro_tools::workspace::resolve_in_root` and `bro_apply_patch::apply::resolve_within`. File tools (`file_read`/`file_edit`/`file_write`/`code.*`/`analysis.*`/`java.*`/apply-patch) now accept absolute paths; relative paths still join against the effective worktree root. Schema descriptions updated to say so. The `path escapes worktree root` denial is gone. The harness had no other sandboxing machinery — shell already escaped any `cx.root` boundary with `git -C`, `find`, `tee`, `sed -i`, etc. — so the structured-tool confinement was a speed bump, not a boundary (friction/2026-June-13-0840pm-worktree-containment-issues.md). LSP refactor plan safety checks (`lsp_facts.rs::WorkspaceEdit` and `java_transforms.rs::refactor_plan`) intentionally retained: those are refactor plan integrity checks, not file-tool confinement."
 }

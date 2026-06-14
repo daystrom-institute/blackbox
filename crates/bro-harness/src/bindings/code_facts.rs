@@ -8,9 +8,10 @@
 //! so drift-guarding is a property of the address, not a discipline
 //! (code-mode-cell-dsl.md §3).
 //!
-//! Paths are root-relative and confined to the session worktree root via the
-//! same [`bro_tools::workspace::resolve_in_root`] guard the flat file tools
-//! use. Zero daemon reach-back (decision af3c4783).
+//! Paths are normalized by the same [`bro_tools::workspace::resolve_in_root`]
+//! helper the flat file tools use: relative paths join the session worktree
+//! root, absolute paths are accepted as-is — there is no containment check
+//! (gap-e0ae3e7d). Zero daemon reach-back (decision af3c4783).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -25,7 +26,9 @@ use serde_json::{Value, json};
 /// Hash-anchored byte span — the cell DSL's composability quantum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
-    /// Workspace-relative file path.
+    /// File path the span was cut from. May be relative to the session
+    /// worktree root or absolute (e.g. when a span is minted from a file
+    /// outside the worktree).
     pub file: String,
     pub byte_start: usize,
     pub byte_end: usize,
@@ -37,7 +40,7 @@ fn span_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "file": { "type": "string", "description": "Workspace-relative file path." },
+            "file": { "type": "string", "description": "File path. May be relative to the session worktree root or absolute." },
             "byte_start": { "type": "integer", "minimum": 0 },
             "byte_end": { "type": "integer", "minimum": 0 },
             "content_sha256": { "type": "string", "description": "sha256 of the full file content the span was cut from." }
@@ -56,8 +59,9 @@ fn err(msg: impl std::fmt::Display) -> ToolResult {
     ToolResult::Error(msg.to_string())
 }
 
-/// Resolve a workspace-relative path inside the session root, reading the
-/// guard from the same confinement the flat file tools use.
+/// Resolve a path through the same normalizer the flat file tools use —
+/// relative paths join the effective session root, absolute paths are
+/// accepted as-is. There is no containment boundary here.
 fn resolve(root: &Path, file: &str) -> anyhow::Result<std::path::PathBuf> {
     bro_tools::workspace::resolve_in_root(root, file)
 }
@@ -148,8 +152,8 @@ impl Tool for CodeItems {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative source file path (single-file shape)." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of workspace-relative paths; the host fans out (use instead of a cell for-loop)." }
+                "file": { "type": "string", "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape)." },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); the host fans out (use instead of a cell for-loop)." }
             }
         })
     }
@@ -224,7 +228,7 @@ impl Tool for CodeFiles {
         json!({
             "type": "object",
             "properties": {
-                "dir": { "type": "string", "description": "Workspace-relative subdirectory to enumerate (default: the whole workspace)." },
+                "dir": { "type": "string", "description": "Subdirectory to enumerate. Relative paths resolve against the session worktree root; absolute paths are accepted as-is. Default: the whole workspace." },
                 "language": { "type": "string", "description": "Restrict to one language name, as reported by code.items (e.g. \"rust\")." }
             }
         })
@@ -300,8 +304,8 @@ impl Tool for CodeQuery {
         json!({
             "type": "object",
             "properties": {
-                "file": { "type": "string", "description": "Workspace-relative source file path (single-file shape)." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of workspace-relative paths; the host fans out and returns a flat captures array." },
+                "file": { "type": "string", "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape)." },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); the host fans out and returns a flat captures array." },
                 "query": { "type": "string", "description": "Tree-sitter query source, e.g. \"(function_item name: (identifier) @fn_name)\"." },
                 "within": {
                     "type": "object",
@@ -1192,12 +1196,55 @@ class Probe {
     }
 
     #[tokio::test]
-    async fn paths_are_confined_to_root() {
+    async fn dotdot_path_errors_because_target_is_absent() {
+        // `../outside.rs` resolves to a file under the parent of the
+        // session root. The test exercises the *error surface*, not a
+        // confinement rejection: tree-sitter fails to parse a missing
+        // file. The previous test of this shape (called
+        // `paths_are_confined_to_root`) passed for the same reason but
+        // misled the model into thinking containment still applied.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let result = CodeItems
             .call(json!({ "file": "../outside.rs" }), &cx_in(&root))
             .await;
         assert!(matches!(result, ToolResult::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn absolute_path_outside_root_is_accepted() {
+        // `code.*` accepts absolute paths. Create a real source file in a
+        // sibling tempdir, point `code.items` at it via its absolute path,
+        // and confirm it parses successfully.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap();
+        let target = outside.join("external.rs");
+        std::fs::write(&target, "pub fn hello() {}\n").unwrap();
+        let result = CodeItems
+            .call(
+                json!({ "file": target.display().to_string() }),
+                &cx_in(&root),
+            )
+            .await;
+        let value = match result {
+            ToolResult::Json(v) => v,
+            ToolResult::Text(t) => serde_json::from_str(&t)
+                .unwrap_or_else(|e| panic!("text not JSON: {e}: {t}")),
+            other => panic!("expected json/text, got {other:?}"),
+        };
+        assert_eq!(
+            value["file"].as_str(),
+            Some(target.display().to_string().as_str()),
+            "{value}"
+        );
+        let names: Vec<&str> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["name"].as_str())
+            .collect();
+        assert!(names.contains(&"hello"), "names: {names:?}");
     }
 }
