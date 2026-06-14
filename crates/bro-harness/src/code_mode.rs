@@ -476,6 +476,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// Echoes its input back as JSON — proves a cell's `tools.echo(...)` reaches
     /// a real `Tool::call` through the seam.
@@ -511,12 +512,29 @@ mod tests {
         }
     }
 
-    fn exec_with(callable: Vec<Arc<dyn Tool>>) -> Arc<dyn Tool> {
+    fn code_mode_pair(callable: Vec<Arc<dyn Tool>>) -> (Arc<dyn Tool>, Arc<dyn Tool>) {
         let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
             callable.clone(),
             test_cx(),
         ));
-        code_mode_tools(&callable, seam, CodeMode::Only, &BTreeMap::new()).remove(0)
+        let mut tools = code_mode_tools(&callable, seam, CodeMode::Only, &BTreeMap::new());
+        let exec = tools.remove(0);
+        let wait = tools.remove(0);
+        (exec, wait)
+    }
+
+    fn exec_with(callable: Vec<Arc<dyn Tool>>) -> Arc<dyn Tool> {
+        code_mode_pair(callable).0
+    }
+
+    fn yielded_cell_id(text: &str) -> String {
+        let marker = "Script running with cell ID ";
+        let start = text.find(marker).expect("yielded cell id missing") + marker.len();
+        text[start..]
+            .split('.')
+            .next()
+            .expect("yielded cell id terminator missing")
+            .to_string()
     }
 
     #[test]
@@ -543,6 +561,86 @@ mod tests {
             .await;
         match result {
             ToolResult::Text(t) => assert!(t.contains("\"a\":1"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cell_shell_run_output_filter_arrays_return_terminal_result() {
+        let exec = exec_with(vec![Arc::new(bro_tools::ShellRun) as Arc<dyn Tool>]);
+        let source = r#"
+const result = await tools.shell_run({
+  command: "printf 'noise\nBUILD SUCCESSFUL\nerror: keep\n'; printf 'warning: keep\nignore\n' >&2; exit 7",
+  yield_time_ms: 0,
+  timeout_ms: 300_000,
+  max_output_tokens: 12_000,
+  output_filter: {
+    stdout: ["BUILD SUCCESSFUL", "error:"],
+    stderr: ["warning:"]
+  }
+});
+text(JSON.stringify(result));
+"#;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            exec.call(json!({ "source": source }), &test_cx()),
+        )
+        .await
+        .expect("code-mode shell_run with output_filter arrays must not hang");
+        match result {
+            ToolResult::Text(t) => {
+                assert!(t.contains("\"exit_code\":7"), "got: {t}");
+                assert!(t.contains("BUILD SUCCESSFUL"), "got: {t}");
+                assert!(t.contains("error: keep"), "got: {t}");
+                assert!(t.contains("warning: keep"), "got: {t}");
+                assert!(t.contains("\"output_filter\""), "got: {t}");
+                assert!(!t.contains("noise"), "got: {t}");
+                assert!(!t.contains("ignore"), "got: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cell_shell_run_output_filter_can_yield_then_wait() {
+        let (exec, wait) = code_mode_pair(vec![Arc::new(bro_tools::ShellRun) as Arc<dyn Tool>]);
+        let source = r#"// @exec: {"yield_time_ms": 50}
+const result = await tools.shell_run({
+  command: "sleep 0.2; printf 'noise\nBUILD SUCCESSFUL\n'",
+  yield_time_ms: 0,
+  timeout_ms: 300_000,
+  max_output_tokens: 12_000,
+  output_filter: { stdout: "BUILD SUCCESSFUL" }
+});
+text(JSON.stringify(result));
+"#;
+
+        let initial = exec.call(json!({ "source": source }), &test_cx()).await;
+        let cell_id = match initial {
+            ToolResult::Text(t) => {
+                assert!(t.contains("Script running with cell ID"), "got: {t}");
+                assert!(!t.contains("BUILD SUCCESSFUL"), "got: {t}");
+                yielded_cell_id(&t)
+            }
+            other => panic!("expected yielded text, got {other:?}"),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait.call(
+                json!({ "cell_id": cell_id, "yield_time_ms": 5000 }),
+                &test_cx(),
+            ),
+        )
+        .await
+        .expect("waiting on yielded shell_run cell must complete");
+        match result {
+            ToolResult::Text(t) => {
+                assert!(t.contains("\"exit_code\":0"), "got: {t}");
+                assert!(t.contains("BUILD SUCCESSFUL"), "got: {t}");
+                assert!(t.contains("\"output_filter\""), "got: {t}");
+                assert!(!t.contains("noise"), "got: {t}");
+            }
             other => panic!("expected text, got {other:?}"),
         }
     }

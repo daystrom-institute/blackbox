@@ -83,3 +83,40 @@ ergonomics:
   - normalize generated field annotation placement.
 - Compact reference-summary mode for `analysis.references`.
 - Caller-role classification facts for larger query-object targets.
+
+## Rerun After Cleanup Utilities
+
+After installing the cleanup changes, the same provider/model reran the same
+unit of work in a fresh disposable worktree.
+
+Outcome:
+
+- The extraction applied successfully again.
+- The source delegate field now rendered with annotation on its own line.
+- Method deletion no longer left the wide blank-line gap observed in the first
+  run.
+- A stale source-side static import still survived the main extraction and had
+  to be removed in a follow-up isolate edit.
+- The new extracted class still had minor formatting residue: missing blank line
+  before the class declaration, a double blank line after the constructor, and
+  one indentation drift inherited from the moved method body.
+- Compile passed before cleanup and after cleanup.
+
+Additional tool feedback:
+
+- The bro first called `shell_run` with `output_filter` as strings and received
+  a validation error requiring arrays.
+- The corrected `output_filter: { stdout: [...], stderr: [...] }` call then
+  stranded the turn: blackbox reported the tool as running, but host inspection
+  showed no Gradle/harness child process and no persisted tool result.
+- Recovery used shell-native filtering via `bash -o pipefail -lc './gradlew ...
+  2>&1 | egrep ...'` through bare `shell_run`, which returned normally.
+
+Follow-up construct candidates:
+
+- Add source-side organize-imports cleanup into `java.extractClass` after wrapper
+  generation, including single-member static imports.
+- Add Java target/source whitespace normalization after generated create/edit
+  application.
+- Investigate `shell_run.output_filter` result delivery; the stuck call is a
+  harness/tool defect or contract quirk from this campaign, not recipe content.

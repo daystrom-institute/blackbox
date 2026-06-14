@@ -23,7 +23,7 @@ use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use async_trait::async_trait;
 use regex::Regex;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -246,11 +246,38 @@ fn cap_tail(s: &str, budget: usize) -> (String, usize) {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct ShellOutputFilterInput {
     /// Keep only stdout lines matching one of these regexes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_filter_patterns")]
+    #[schemars(with = "ShellOutputFilterPatternsSchema")]
     stdout: Vec<String>,
     /// Keep only stderr lines matching one of these regexes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_filter_patterns")]
+    #[schemars(with = "ShellOutputFilterPatternsSchema")]
     stderr: Vec<String>,
+}
+
+#[derive(JsonSchema)]
+#[schemars(untagged)]
+#[allow(dead_code)]
+enum ShellOutputFilterPatternsSchema {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ShellOutputFilterPatternsInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_filter_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match ShellOutputFilterPatternsInput::deserialize(deserializer)? {
+        ShellOutputFilterPatternsInput::One(pattern) => Ok(vec![pattern]),
+        ShellOutputFilterPatternsInput::Many(patterns) => Ok(patterns),
+    }
 }
 
 #[derive(Clone)]
@@ -1504,6 +1531,34 @@ mod tests {
             matches!(r, ToolResult::Error(ref e) if e.contains("invalid regex")),
             "{r:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn output_filter_accepts_string_pattern_shorthand() {
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({
+                        "command": "printf 'noise\nBUILD SUCCESSFUL\nerror: real\n'; printf 'warning: keep\nignore\n' >&2; exit 7",
+                        "yield_time_ms": 0,
+                        "output_filter": {
+                            "stdout": "BUILD SUCCESSFUL|error:",
+                            "stderr": "warning:"
+                        }
+                    }),
+                    &cx(),
+                )
+                .await,
+        );
+
+        assert_eq!(v["exit_code"], 7, "{v}");
+        let stdout = v["stdout"].as_str().unwrap();
+        assert!(stdout.contains("BUILD SUCCESSFUL"), "{v}");
+        assert!(stdout.contains("error: real"), "{v}");
+        assert!(!stdout.contains("noise"), "{v}");
+        let stderr = v["stderr"].as_str().unwrap();
+        assert!(stderr.contains("warning: keep"), "{v}");
+        assert!(!stderr.contains("ignore"), "{v}");
     }
 
     #[tokio::test]

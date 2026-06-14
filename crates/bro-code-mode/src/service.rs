@@ -572,11 +572,12 @@ async fn run_cell_control(
     let mut termination_requested = false;
     let mut runtime_closed = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-    // Most recently requested yield window. A delegated tool invocation is
-    // atomic with respect to cell yield: while any nested tool call is in
-    // flight the yield timer is suppressed (the nested tool's own
-    // yield/timeout contract governs how long it blocks), and when the last
-    // in-flight call returns the timer is re-armed with a fresh window.
+    // Most recently requested yield window. A delegated tool invocation may
+    // outlive the outer cell yield window (notably a blocking shell_run inside
+    // code-mode). The cell is allowed to yield while a nested call is still in
+    // flight; a later wait observes the eventual tool response and runtime result.
+    // When a nested call returns before the cell yields, re-arm a fresh window
+    // from tool-return so post-tool async work still gets a fair yield boundary.
     let mut yield_window_ms: Option<u64> = initial_yield_time_ms;
     let mut tool_call_tasks = JoinSet::new();
     let mut notification_tasks = JoinSet::new();
@@ -822,16 +823,13 @@ async fn run_cell_control(
                     }
                 }
             }
-            // Suppressed while a nested tool call is in flight: the in-flight
-            // invocation is atomic w.r.t. cell yield, so the timer must not
-            // force a "still running" yield mid-call.
             _ = async {
                 if let Some(yield_timer) = yield_timer.as_mut() {
                     yield_timer.await;
                 } else {
                     std::future::pending::<()>().await;
                 }
-            }, if tool_call_tasks.is_empty() => {
+            } => {
                 yield_timer = None;
                 send_yield_response(&cell_id, &mut content_items, &mut response_tx);
             }
@@ -946,8 +944,8 @@ mod tests {
     }
 
     /// Delegate whose nested tool calls block for `delay` before returning
-    /// `"slow-result"`. Used to prove a delegated invocation is atomic with
-    /// respect to the cell yield timer.
+    /// `"slow-result"`. Used to exercise code-mode yield behavior while a
+    /// delegated invocation is still in flight.
     struct SlowToolDelegate {
         delay: Duration,
     }
@@ -991,10 +989,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_tool_call_in_flight_suppresses_yield_timer() {
+    async fn nested_tool_call_in_flight_can_yield_and_later_complete() {
         // The nested tool call (500 ms) outlives the cell yield window
-        // (100 ms). The cell must NOT yield "still running" mid-call; it must
-        // return the tool's result as a terminal Result.
+        // (100 ms). The cell should yield promptly instead of hiding a long
+        // nested call; a follow-up wait then receives the eventual result.
         let service = CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
             delay: Duration::from_millis(500),
         }));
@@ -1016,21 +1014,36 @@ mod tests {
 
         assert_eq!(
             response,
-            RuntimeResponse::Result {
+            RuntimeResponse::Yielded {
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+            }
+        );
+
+        let wait = service
+            .wait(WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 1_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait,
+            WaitOutcome::LiveCell(RuntimeResponse::Result {
                 cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "slow-result".to_string(),
                 }],
                 error_text: None,
-            }
+            })
         );
     }
 
     #[tokio::test]
     async fn yield_window_rearms_after_nested_tool_returns() {
-        // After the nested call (300 ms) returns, a fresh yield window
-        // (100 ms) is armed from tool-return; the still-pending cell then
-        // yields with the output produced so far.
+        // The initial cell yield can now fire while the nested call is still
+        // running. After the nested call (300 ms) returns, a follow-up wait sees
+        // the output produced after tool-return before yielding again.
         let service = CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
             delay: Duration::from_millis(300),
         }));
@@ -1055,10 +1068,25 @@ mod tests {
             response,
             RuntimeResponse::Yielded {
                 cell_id: cell_id("1"),
+                content_items: Vec::new(),
+            }
+        );
+
+        let wait = service
+            .wait(WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 1_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait,
+            WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+                cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "tool-returned".to_string(),
                 }],
-            }
+            })
         );
 
         let _ = service.terminate(cell_id("1")).await;

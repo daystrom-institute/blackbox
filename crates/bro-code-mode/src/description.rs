@@ -18,7 +18,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Runs raw JavaScript -- no Node, no file system, no network access, no console. No Node stdlib globals exist: no `Buffer`, no `TextEncoder`/`TextDecoder`, no `process`, no `require`. Do not name local variables `text`, `image`, `store`, `load`, `notify`, or `exit` — they shadow the global helpers and cause `TypeError: x is not a function`.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
-- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call in flight never triggers a yield; the window restarts when the call returns.
+- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms. For a long-running cell, raise it up front (e.g. `// @exec: {"yield_time_ms": 60000}`) instead of burning turns on repeated `wait` polls. A nested tool call may still be in flight when the cell yields; call `wait` with the returned cell id to observe the eventual tool response and final result.
 - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
 - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded. Each `exec` cell is a FRESH scope: locals from earlier cells are gone — redeclare them, or pass values across cells via `store()`/`load()`.
 
@@ -42,7 +42,7 @@ const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` return
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
 - Queued `notify(...)` payloads from the cell are delivered in a `[notifications]` section of the result.
-- A nested tool call in flight never triggers a yield; the yield window restarts when the call returns.
+- A nested tool call may still be in flight when `wait` yields; call `wait` again with the same `cell_id` until it returns the eventual tool response or final result.
 - If the cell is still running, `wait` may yield again with the same `cell_id`.
 - If the cell has already finished, `wait` returns the completed result and closes the cell."#;
 // Based off of https://modelcontextprotocol.io/specification/draft/schema#calltoolresult

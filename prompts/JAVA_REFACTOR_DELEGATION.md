@@ -132,7 +132,8 @@ A good brief is a **task with guardrails**, not a script. Tell it:
 - For noisy compile gates, give the agent the `shell_run` call with host-side
   `output_filter` as the primary invocation shape. It preserves the primary
   command exit status because filtering happens after capture. Report the
-  unfiltered command as the gate even when rendered output is filtered.
+  unfiltered command as the gate even when rendered output is filtered. Filter
+  streams accept either one regex string or an array of regex strings.
 - That transforms are **not idempotent** — a target-exists refusal after a
   successful apply means that step is DONE, not a retry (without this, agents
   shell-delete the created file and loop).
@@ -184,6 +185,8 @@ A good brief is a **task with guardrails**, not a script. Tell it:
 - **Do not pipe the build through `head`/`tail`/short-circuiting filters.** Use
   `shell_run({ output_filter })` when the build is noisy, or run the bare gate.
   The returned `exit_code` must be the build's exit code, not a filter's.
+- **If a long code-mode `shell_run` yields while still running, resume the cell
+  with `wait`.** Do not re-run the build just because the outer JS cell yielded.
 - **Steers are recipe deltas.** If you have to steer a running probe, treat the
   steer as evidence that the recipe/prompt is under-specified. Before the next
   rerun, refine the prompt text or add a recipe comment so future agents start
