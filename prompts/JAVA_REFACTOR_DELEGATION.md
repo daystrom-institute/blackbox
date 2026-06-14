@@ -44,15 +44,19 @@ restate them:
   before extraction to decide whether `wrappers: true` is needed, and for cheap
   blast-radius checks. `analysis.describe`.
 - **`analysis.methodRegions({ file, method, className?, ranges? })`** — the
-  long-method region gate. Returns filtered top-level statement regions and
-  optional candidate-range facts: captures, live-outs, field touches,
-  lambdas/listeners, non-local control flow, and `extractability.stop_reasons`.
+  long-method region gate. Returns filtered top-level statement regions by
+  default, optional nested statement regions, and optional candidate-range facts:
+  captures, live-outs, field touches, lambdas/listeners, non-local control flow,
+  and `extractability.stop_reasons`.
   For giant methods, use `statementContains` / `statementStartLine` /
-  `statementEndLine` / `statementLimit`, or set `includeStatementRegions:false`
-  for gate-only calls. Live-outs carry `after_use_kinds` and
-  `component_tree_consumptions` so UI tree wiring and return-value outputs are
-  visible. Use this before extract-method work; do not reconstruct live-outs by
-  hand.
+  `statementEndLine` / `statementLimit`; if the target marker sits inside one
+  giant loop/block, add `includeNestedStatementRegions:true` to get inner
+  statement line ranges. Set `includeStatementRegions:false` for gate-only
+  calls. Captures/live-outs declared with Java `var` keep `type: "var"` and add
+  `resolved_type` when syntax-only inference can prove a concrete type.
+  Live-outs carry `after_use_kinds` and `component_tree_consumptions` so UI tree
+  wiring and return-value outputs are visible. Use this before extract-method
+  work; do not reconstruct live-outs by hand.
 - **`java.extractClass({ file, target, delegateField, methods, moveFields?,
   wrappers?, previewOnly? })`** — moves methods + fields into a new delegate
   class, synthesizes both sides, returns `{ changes, creates, findings,
@@ -123,7 +127,10 @@ the class-decomposition flow:
 1. For giant methods, search/filter first instead of dumping the full method:
    `analysis.methodRegions({ file, method, className, statementContains,
    statementLimit })`, or use a line window with `statementStartLine` /
-   `statementEndLine`. Pick one candidate by `line_range`/`preview`.
+   `statementEndLine`. If the returned candidate is only a giant enclosing
+   loop/block, re-run with `includeNestedStatementRegions:true` and use the
+   inner statement `line_range` values as markers for exact range gating. Pick
+   one candidate by `line_range`/`preview`.
 2. Re-run `analysis.methodRegions` with one exact candidate range. Treat the
    returned gates as authoritative:
    - `requested_contiguous` must be true for today's one-block extractor.
@@ -132,10 +139,13 @@ the class-decomposition flow:
      `component_tree_consumptions` before deciding whether the live-out set is a
      true result bundle or a UI tree / return-value boundary. For true top-level
      outputs with explicit Java types, call `java.extractMethodCodeBlock` with
-     `resultRecord: true` (and usually `resultRecordName`). Do not use the
-     result-record path for `var`/inferred types, discontiguous ranges, or values
-     declared inside a nested scope that would not be visible at the helper
-     return site.
+     `resultRecord: true` (and usually `resultRecordName`). If a capture or
+     live-out has `type: "var"` plus `resolved_type`, treat the resolved type as
+     the explicit type for the helper boundary. If it has `type: "var"` without
+     `resolved_type`, resolve it yourself and pass `parameters`/`arguments` or
+     `returnType`/`returnVar`. Do not use the result-record path for unresolved
+     `var`/inferred types, discontiguous ranges, or values declared inside a
+     nested scope that would not be visible at the helper return site.
 3. If gates pass, bounded-read the exact range and call
    `java.extractMethodCodeBlock({ file, oldText, methodName, className })`,
    adding `resultRecord: true` only for the safe bundle case above.

@@ -163,7 +163,7 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         let names: Vec<&str> = analysis
             .inner_decls_used_after
             .iter()
-            .map(|(n, _)| n.as_str())
+            .map(|live_out| live_out.name.as_str())
             .collect();
         bail!(
             "error.multi_return_needs_record: the range declares {} variables that are read after \
@@ -194,7 +194,12 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         let params = analysis
             .captures
             .iter()
-            .map(|c| (c.type_text.clone(), c.name.clone()))
+            .map(|c| {
+                (
+                    effective_java_type(&c.type_text, c.resolved_type_text.as_deref()),
+                    c.name.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         let args = analysis.captures.iter().map(|c| c.name.clone()).collect();
         (params, args)
@@ -242,10 +247,13 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
     // operator-supplied toml_entries.return_type override.
     // -----------------------------------------------------------------
 
-    let inferred_return: Option<(String, String)> = analysis
-        .inner_decls_used_after
-        .first()
-        .map(|(name, ty)| (ty.clone(), name.clone()));
+    let inferred_return: Option<(String, String)> =
+        analysis.inner_decls_used_after.first().map(|live_out| {
+            (
+                effective_java_type(&live_out.type_text, live_out.resolved_type_text.as_deref()),
+                live_out.name.clone(),
+            )
+        });
 
     let operator_return_type = p
         .toml_entries
@@ -666,18 +674,18 @@ fn build_result_record_plan(
                 decl.name
             );
         }
-        let type_text = decl.type_text.trim();
-        if is_inferred_java_type(type_text) {
+        let type_text = effective_java_type(&decl.type_text, decl.resolved_type_text.as_deref());
+        if is_inferred_java_type(&type_text) {
             bail!(
                 "error.result_record_inferred_type({}): live-out `{}` has inferred type `{}`; \
                  result-record generation requires explicit component types",
                 decl.name,
                 decl.name,
-                type_text
+                decl.type_text.trim()
             );
         }
         components.push(ResultRecordComponent {
-            type_text: type_text.to_string(),
+            type_text,
             name: decl.name.clone(),
         });
     }
@@ -685,7 +693,7 @@ fn build_result_record_plan(
         let names = analysis
             .inner_decls_used_after
             .iter()
-            .map(|(name, _)| name.as_str())
+            .map(|live_out| live_out.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
@@ -705,9 +713,21 @@ fn is_inferred_java_type(type_text: &str) -> bool {
     trimmed.is_empty() || trimmed == "var" || trimmed == "<inferred>"
 }
 
+fn effective_java_type(type_text: &str, resolved_type_text: Option<&str>) -> String {
+    if is_inferred_java_type(type_text) {
+        if let Some(resolved) = resolved_type_text
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return resolved.to_string();
+        }
+    }
+    type_text.to_string()
+}
+
 fn live_out_decls_in_declaration_order<'a>(
     scope_tree: &'a ScopeTree,
-    live_outs: &[(String, String)],
+    live_outs: &[super::scope::LiveOutRef],
     region_start: usize,
     region_end: usize,
 ) -> Vec<&'a super::scope::Declaration> {
@@ -717,7 +737,7 @@ fn live_out_decls_in_declaration_order<'a>(
         .filter(|decl| {
             decl.name_byte_start >= region_start
                 && decl.name_byte_end <= region_end
-                && live_outs.iter().any(|(name, _)| name == &decl.name)
+                && live_outs.iter().any(|live_out| live_out.name == decl.name)
         })
         .collect()
 }

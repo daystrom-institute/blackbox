@@ -911,9 +911,11 @@ WHAT IT DOES
   and infers void vs one returned live-out variable. Generated helper insertion
   preserves call-site indentation, method spacing, and moved-body relative
   indentation; still run java.hygiene after apply for imports and file-level
-  whitespace. If an inferred captured parameter type is `var` / inferred, the
-  planner refuses before edits; pass explicit parameters/arguments after
-  resolving the declaration type.
+  whitespace. If analysis.methodRegions reports `type:"var"` plus
+  `resolved_type`, the planner can use that syntax-only type projection. If an
+  inferred captured parameter or live-out type remains `var` / unresolved, the
+  planner refuses before edits; pass explicit parameters/arguments or
+  returnType/returnVar after resolving the declaration type.
 
 PARAMS
   file: string          workspace-relative .java file
@@ -926,7 +928,8 @@ PARAMS
   parameters?: Array<{ type: string, name: string }>
                         override inferred helper params; usually omit
   arguments?: string[]  override call-site args aligned with parameters
-  returnType?: string   override inferred return type
+  returnType?: string   override inferred return type; use when a live-out has
+                        type:"var" and no resolved_type
   returnVar?: string    override inferred return variable name
   resultRecord?: boolean
                         opt in to a generated nested record result bundle when

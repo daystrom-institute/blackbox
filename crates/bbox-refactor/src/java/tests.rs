@@ -9517,6 +9517,36 @@ fn extract_code_block_allows_explicit_type_for_var_capture_parameter() {
 }
 
 #[test]
+fn extract_code_block_uses_resolved_type_for_simple_var_capture_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarCaptureResolved.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class VarCaptureResolved {\n\
+         \x20   void run() {\n\
+         \x20       var message = \"hello\";\n\
+         \x20       System.out.println(message);\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(message);".to_string());
+    params.module_name = Some("logMessage".to_string());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &path);
+    assert!(
+        rewritten.contains("private void logMessage(String message)"),
+        "{rewritten}"
+    );
+    assert!(rewritten.contains("logMessage(message);"), "{rewritten}");
+}
+
+#[test]
 fn extract_code_block_infers_void_when_no_return_needed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Side.java");
@@ -9656,7 +9686,7 @@ fn extract_code_block_generates_result_record_for_multi_live_outs() {
 }
 
 #[test]
-fn extract_code_block_result_record_refuses_var_live_out() {
+fn extract_code_block_result_record_uses_resolved_type_for_var_live_out() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("VarResult.java");
     fs::write(
@@ -9674,6 +9704,40 @@ fn extract_code_block_result_record_refuses_var_live_out() {
     let mut params = java_plan_params("extract_java_code_block_to_method", &path);
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("var a = 1;\n        int b = 2;".to_string());
+    params.module_name = Some("prep".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("result_record".to_string(), serde_json::json!(true));
+    params.toml_entries = Some(entries);
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &path);
+    assert!(
+        rewritten.contains("private record PrepResult(int a, int b) {}"),
+        "{rewritten}"
+    );
+}
+
+#[test]
+fn extract_code_block_result_record_refuses_unresolved_var_live_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarResultUnresolved.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class VarResultUnresolved {\n\
+         \x20   int run() {\n\
+         \x20       var a = value();\n\
+         \x20       int b = 2;\n\
+         \x20       return a + b;\n\
+         \x20   }\n\
+         \x20   int value() { return 1; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("var a = value();\n        int b = 2;".to_string());
     params.module_name = Some("prep".to_string());
     let mut entries = std::collections::BTreeMap::new();
     entries.insert("result_record".to_string(), serde_json::json!(true));
@@ -9998,6 +10062,77 @@ fn method_regions_can_filter_or_omit_statement_inventory() {
 }
 
 #[test]
+fn method_regions_can_inventory_nested_statements_for_marker_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("NestedStage.java");
+    let source = "package p;\n\
+         class NestedStage {\n\
+         \x20   void build(boolean keepGoing) {\n\
+         \x20       while (keepGoing) {\n\
+         \x20           int before = 1;\n\
+         \x20           int targetStageValue = before + 1;\n\
+         \x20           log(targetStageValue);\n\
+         \x20       }\n\
+         \x20   }\n\
+         \x20   void log(Object value) {}\n\
+         }\n";
+    fs::write(&path, source).unwrap();
+
+    let top_level = analyze_java_method_regions_with_options(
+        &path,
+        "build",
+        Some("NestedStage"),
+        None,
+        Some(&JavaMethodRegionsOptions {
+            statement_contains: Some("targetStageValue".to_string()),
+            statement_limit: Some(10),
+            ..JavaMethodRegionsOptions::default()
+        }),
+    )
+    .unwrap();
+    assert_eq!(top_level.statement_regions.len(), 1);
+    assert_eq!(top_level.statement_regions[0].kind, "while_statement");
+
+    let nested = analyze_java_method_regions_with_options(
+        &path,
+        "build",
+        Some("NestedStage"),
+        None,
+        Some(&JavaMethodRegionsOptions {
+            include_nested_statement_regions: true,
+            statement_contains: Some("targetStageValue".to_string()),
+            statement_limit: Some(10),
+            ..JavaMethodRegionsOptions::default()
+        }),
+    )
+    .unwrap();
+    let kinds = nested
+        .statement_regions
+        .iter()
+        .map(|region| region.kind.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        kinds.contains(&"local_variable_declaration"),
+        "kinds={kinds:?}; regions={:?}",
+        nested.statement_regions
+    );
+    assert!(
+        kinds.contains(&"expression_statement"),
+        "kinds={kinds:?}; regions={:?}",
+        nested.statement_regions
+    );
+    assert_eq!(
+        nested
+            .statement_region_summary
+            .filter
+            .as_ref()
+            .unwrap()
+            .include_nested_statement_regions,
+        true
+    );
+}
+
+#[test]
 fn method_regions_classifies_component_tree_consumed_live_outs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("View.java");
@@ -10071,6 +10206,56 @@ fn method_regions_classifies_component_tree_consumed_live_outs() {
             .any(|site| site.kind == "component_tree_argument" && site.method == "add"),
         "{field:?}"
     );
+}
+
+#[test]
+fn method_regions_reports_resolved_types_for_simple_var_capture_and_live_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarFacts.java");
+    let source = "package p;\n\
+         class VarFacts {\n\
+         \x20   String build() {\n\
+         \x20       var prefix = \"a\";\n\
+         \x20       var value = \"b\";\n\
+         \x20       log(prefix);\n\
+         \x20       return value;\n\
+         \x20   }\n\
+         \x20   void log(Object value) {}\n\
+         }\n";
+    fs::write(&path, source).unwrap();
+    let start = source.find("var value").unwrap();
+    let end = source.find("return value").unwrap();
+
+    let facts = analyze_java_method_regions(
+        &path,
+        "build",
+        Some("VarFacts"),
+        Some(&[JavaMethodRegionRequest {
+            label: Some("candidate".to_string()),
+            byte_start: Some(start),
+            byte_end: Some(end),
+            start_line: None,
+            end_line: None,
+        }]),
+    )
+    .unwrap();
+
+    let range = &facts.requested_ranges[0];
+    let prefix = range
+        .captures
+        .iter()
+        .find(|var| var.name == "prefix")
+        .expect("prefix capture");
+    assert_eq!(prefix.type_text, "var");
+    assert_eq!(prefix.resolved_type.as_deref(), Some("String"));
+
+    let value = range
+        .live_outs
+        .iter()
+        .find(|var| var.name == "value")
+        .expect("value live-out");
+    assert_eq!(value.type_text, "var");
+    assert_eq!(value.resolved_type.as_deref(), Some("String"));
 }
 
 #[test]

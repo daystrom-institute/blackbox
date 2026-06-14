@@ -16,11 +16,13 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/java-inner-scope-method-regions",
   "notes": "Sanitized from a private Java calculation-stage probe. Top-level statement filtering remains useful for UI/listener recipes, but nested calculation stages inside a giant loop need a marker-to-nested-range path.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "task_id": "c6a99057-3c65-43d8-8cbd-adfb8f37ca49",
   "session_id": "2dd5b5e5-b448-49b4-8bb9-01d50a81f4eb",
   "provider": "deepseek",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T04:39:53Z",
-  "updated_at": "2026-06-14T04:39:53Z"
+  "updated_at": "2026-06-14T04:51:00Z",
+  "resolved_at": "2026-06-14T04:51:00Z",
+  "resolution_note": "Addressed with opt-in nested statement inventory: analysis.methodRegions accepts includeNestedStatementRegions and returns matching nested statement regions for marker searches inside giant enclosing loops/blocks, while preserving top-level-only default behavior."
 }

@@ -65,6 +65,11 @@ pub enum DeclKind {
 pub struct Declaration {
     pub name: String,
     pub type_text: String,
+    /// Best-effort syntax-only type resolution for inferred declarations
+    /// such as `var x = new Foo()` or `var n = 1`. Kept separate from
+    /// `type_text` so callers can distinguish source-declared `var` from
+    /// a concrete type projection.
+    pub resolved_type_text: Option<String>,
     /// Byte range of the declaration's name token.
     pub name_byte_start: usize,
     pub name_byte_end: usize,
@@ -157,6 +162,7 @@ fn collect_type_parameters(
                 tree.push(Declaration {
                     name: text.to_string(),
                     type_text: "<type-parameter>".to_string(),
+                    resolved_type_text: None,
                     name_byte_start: tp_child.start_byte(),
                     name_byte_end: tp_child.end_byte(),
                     scope_start: child.start_byte(),
@@ -193,6 +199,7 @@ fn collect_formal_parameters(
                 tree.push(Declaration {
                     name: name.to_string(),
                     type_text,
+                    resolved_type_text: None,
                     name_byte_start: name_n.start_byte(),
                     name_byte_end: name_n.end_byte(),
                     scope_start: params.start_byte(),
@@ -236,6 +243,7 @@ fn collect_block(block: Node<'_>, source: &str, tree: &mut ScopeTree) {
                         tree.push(Declaration {
                             name: name.to_string(),
                             type_text: type_n.utf8_text(bytes).unwrap_or("").trim().to_string(),
+                            resolved_type_text: None,
                             name_byte_start: name_n.start_byte(),
                             name_byte_end: name_n.end_byte(),
                             scope_start: name_n.start_byte(),
@@ -426,6 +434,7 @@ fn collect_local_decl(node: Node<'_>, block_end: usize, source: &str, tree: &mut
         tree.push(Declaration {
             name: name.to_string(),
             type_text: type_text.clone(),
+            resolved_type_text: resolve_var_declaration_type(&type_text, child, source),
             name_byte_start: name_node.start_byte(),
             name_byte_end: name_node.end_byte(),
             scope_start: name_node.start_byte(),
@@ -449,6 +458,7 @@ fn collect_resource(res: Node<'_>, try_end: usize, source: &str, tree: &mut Scop
     tree.push(Declaration {
         name: name.to_string(),
         type_text: type_n.utf8_text(bytes).unwrap_or("").trim().to_string(),
+        resolved_type_text: None,
         name_byte_start: name_n.start_byte(),
         name_byte_end: name_n.end_byte(),
         scope_start: name_n.start_byte(),
@@ -478,6 +488,7 @@ fn collect_catch_param(param: Node<'_>, body: Node<'_>, source: &str, tree: &mut
     tree.push(Declaration {
         name: name.to_string(),
         type_text: type_n.utf8_text(bytes).unwrap_or("").trim().to_string(),
+        resolved_type_text: None,
         name_byte_start: name_n.start_byte(),
         name_byte_end: name_n.end_byte(),
         scope_start: param.start_byte(),
@@ -500,6 +511,7 @@ fn collect_lambda_params(lambda: Node<'_>, source: &str, tree: &mut ScopeTree) {
                 tree.push(Declaration {
                     name: name.to_string(),
                     type_text: "<inferred>".to_string(),
+                    resolved_type_text: None,
                     name_byte_start: p.start_byte(),
                     name_byte_end: p.end_byte(),
                     scope_start: p.start_byte(),
@@ -517,6 +529,7 @@ fn collect_lambda_params(lambda: Node<'_>, source: &str, tree: &mut ScopeTree) {
                             tree.push(Declaration {
                                 name: name.to_string(),
                                 type_text: "<inferred>".to_string(),
+                                resolved_type_text: None,
                                 name_byte_start: child.start_byte(),
                                 name_byte_end: child.end_byte(),
                                 scope_start: child.start_byte(),
@@ -539,6 +552,7 @@ fn collect_lambda_params(lambda: Node<'_>, source: &str, tree: &mut ScopeTree) {
                                         .unwrap_or("")
                                         .trim()
                                         .to_string(),
+                                    resolved_type_text: None,
                                     name_byte_start: name_n.start_byte(),
                                     name_byte_end: name_n.end_byte(),
                                     scope_start: child.start_byte(),
@@ -574,6 +588,93 @@ fn has_final_modifier(node: Node<'_>) -> bool {
     false
 }
 
+fn resolve_var_declaration_type(
+    type_text: &str,
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    if type_text.trim() != "var" {
+        return None;
+    }
+    let value = declarator.child_by_field_name("value")?;
+    infer_expression_type(value, source).filter(|ty| !is_inferred_or_invalid_java_type(ty))
+}
+
+fn infer_expression_type(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "object_creation_expression" => node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.utf8_text(source.as_bytes()).ok())
+            .map(str::trim)
+            .filter(|ty| !ty.is_empty())
+            .and_then(concrete_object_creation_type),
+        "array_creation_expression" => node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.utf8_text(source.as_bytes()).ok())
+            .map(str::trim)
+            .filter(|ty| !ty.is_empty())
+            .map(|ty| format!("{ty}[]")),
+        "cast_expression" => node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.utf8_text(source.as_bytes()).ok())
+            .map(str::trim)
+            .filter(|ty| !ty.is_empty())
+            .map(str::to_string),
+        "parenthesized_expression" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() != "(" && child.kind() != ")")
+                .and_then(|child| infer_expression_type(child, source))
+        }
+        "string_literal" => Some("String".to_string()),
+        "character_literal" => Some("char".to_string()),
+        "true" | "false" => Some("boolean".to_string()),
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal" => node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(integer_literal_type),
+        "decimal_floating_point_literal" | "hex_floating_point_literal" => node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(floating_literal_type),
+        _ => None,
+    }
+}
+
+fn concrete_object_creation_type(type_text: &str) -> Option<String> {
+    let trimmed = type_text.trim();
+    if trimmed.is_empty() || trimmed.contains("<>") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn integer_literal_type(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.ends_with('L') || trimmed.ends_with('l') {
+        "long".to_string()
+    } else {
+        "int".to_string()
+    }
+}
+
+fn floating_literal_type(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.ends_with('F') || trimmed.ends_with('f') {
+        "float".to_string()
+    } else {
+        "double".to_string()
+    }
+}
+
+fn is_inferred_or_invalid_java_type(type_text: &str) -> bool {
+    let trimmed = type_text.trim();
+    trimmed.is_empty() || trimmed == "var" || trimmed == "<inferred>"
+}
+
 // ============================================================================
 // Range analysis on a built ScopeTree
 // ============================================================================
@@ -582,6 +683,7 @@ fn has_final_modifier(node: Node<'_>) -> bool {
 pub struct CapturedRef {
     pub name: String,
     pub type_text: String,
+    pub resolved_type_text: Option<String>,
     // kept: parsed final-modifier flag for captured ref; consumed by future plan kinds
     #[allow(dead_code)]
     pub is_final: bool,
@@ -603,13 +705,20 @@ pub struct NonLocalControlFlow {
     pub byte_end: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct LiveOutRef {
+    pub name: String,
+    pub type_text: String,
+    pub resolved_type_text: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RangeAnalysis {
     /// Variables read inside the range whose declaration is outside.
     pub captures: Vec<CapturedRef>,
     /// Variables declared inside the range and used at some byte
     /// position later in the enclosing method (return-value candidates).
-    pub inner_decls_used_after: Vec<(String, String)>,
+    pub inner_decls_used_after: Vec<LiveOutRef>,
     /// `return` / `break` / `continue` that targets outside the range.
     pub non_local_control_flow: Vec<NonLocalControlFlow>,
     /// Bare identifier references inside the range that don't resolve
@@ -654,6 +763,7 @@ pub fn analyze_range(
                                         CapturedRef {
                                             name: text.to_string(),
                                             type_text: decl.type_text.clone(),
+                                            resolved_type_text: decl.resolved_type_text.clone(),
                                             is_final: decl.is_final,
                                             mutated: false,
                                         },
@@ -739,11 +849,13 @@ pub fn analyze_range(
                         if !analysis
                             .inner_decls_used_after
                             .iter()
-                            .any(|(name, _)| name == &decl.name)
+                            .any(|live_out| live_out.name == decl.name)
                         {
-                            analysis
-                                .inner_decls_used_after
-                                .push((decl.name.clone(), decl.type_text.clone()));
+                            analysis.inner_decls_used_after.push(LiveOutRef {
+                                name: decl.name.clone(),
+                                type_text: decl.type_text.clone(),
+                                resolved_type_text: decl.resolved_type_text.clone(),
+                            });
                         }
                     }
                 }
@@ -1017,9 +1129,21 @@ mod tests {
         let used_after: Vec<&str> = analysis
             .inner_decls_used_after
             .iter()
-            .map(|(n, _)| n.as_str())
+            .map(|live_out| live_out.name.as_str())
             .collect();
         assert!(used_after.contains(&"y"), "used_after={used_after:?}");
+    }
+
+    #[test]
+    fn scope_resolves_simple_var_declaration_type() {
+        let src = "class T { void run() { var text = \"x\"; System.out.println(text); } }";
+        let tree = parse_java(src);
+        let method = find_method(tree.root_node(), src, "run");
+        let scope = ScopeTree::build_from_method(method, src);
+        let use_byte = byte_after_first(src, "println(");
+        let resolved = scope.resolve("text", use_byte).unwrap();
+        assert_eq!(resolved.type_text, "var");
+        assert_eq!(resolved.resolved_type_text.as_deref(), Some("String"));
     }
 
     #[test]

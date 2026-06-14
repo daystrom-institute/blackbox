@@ -28,6 +28,8 @@ pub struct JavaMethodRegionsOptions {
     #[serde(default = "default_true")]
     pub include_statement_regions: bool,
     #[serde(default)]
+    pub include_nested_statement_regions: bool,
+    #[serde(default)]
     pub statement_limit: Option<usize>,
     #[serde(default)]
     pub statement_start_line: Option<usize>,
@@ -41,6 +43,7 @@ impl Default for JavaMethodRegionsOptions {
     fn default() -> Self {
         Self {
             include_statement_regions: true,
+            include_nested_statement_regions: false,
             statement_limit: None,
             statement_start_line: None,
             statement_end_line: None,
@@ -66,6 +69,8 @@ pub struct JavaMethodRegionStatementSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaMethodRegionStatementFilterSummary {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_nested_statement_regions: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +94,8 @@ pub struct JavaRegionVariableFact {
     pub name: String,
     #[serde(rename = "type")]
     pub type_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_type: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mutated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -209,7 +216,7 @@ pub fn analyze_java_method_regions_with_options(
     let field_names = collect_class_field_names(class_node, &parsed.source);
 
     let options = options.cloned().unwrap_or_default();
-    let statement_nodes = top_level_statement_nodes(body);
+    let statement_nodes = statement_nodes(body, options.include_nested_statement_regions);
     let matched_statement_nodes =
         matching_statement_nodes(&statement_nodes, &parsed.source, &options);
     let selected_statement_nodes = limit_statement_nodes(matched_statement_nodes.clone(), &options);
@@ -333,6 +340,7 @@ fn region_fact_for_bytes(
         .map(|capture| JavaRegionVariableFact {
             name: capture.name.clone(),
             type_text: capture.type_text.clone(),
+            resolved_type: capture.resolved_type_text.clone(),
             mutated: capture.mutated,
             after_use_kinds: Vec::new(),
             component_tree_consumptions: Vec::new(),
@@ -341,9 +349,10 @@ fn region_fact_for_bytes(
     let mut live_outs = analysis
         .inner_decls_used_after
         .iter()
-        .map(|(name, type_text)| JavaRegionVariableFact {
-            name: name.clone(),
-            type_text: type_text.clone(),
+        .map(|live_out| JavaRegionVariableFact {
+            name: live_out.name.clone(),
+            type_text: live_out.type_text.clone(),
+            resolved_type: live_out.resolved_type_text.clone(),
             mutated: false,
             after_use_kinds: Vec::new(),
             component_tree_consumptions: Vec::new(),
@@ -470,6 +479,13 @@ fn java_node_name(node: Node<'_>, source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn statement_nodes(body: Node<'_>, include_nested: bool) -> Vec<Node<'_>> {
+    if include_nested {
+        return nested_statement_nodes(body);
+    }
+    top_level_statement_nodes(body)
+}
+
 fn top_level_statement_nodes(body: Node<'_>) -> Vec<Node<'_>> {
     let mut out = Vec::new();
     let mut cursor = body.walk();
@@ -480,6 +496,60 @@ fn top_level_statement_nodes(body: Node<'_>) -> Vec<Node<'_>> {
         out.push(child);
     }
     out
+}
+
+fn nested_statement_nodes(body: Node<'_>) -> Vec<Node<'_>> {
+    let mut out = Vec::new();
+    let mut stack = Vec::new();
+    let mut cursor = body.walk();
+    let mut children = body.named_children(&mut cursor).collect::<Vec<_>>();
+    children.reverse();
+    for child in children {
+        stack.push(child);
+    }
+    while let Some(node) = stack.pop() {
+        if is_java_statement_node(node) {
+            out.push(node);
+        }
+        if matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration" | "class_declaration"
+        ) {
+            continue;
+        }
+        let mut cursor = node.walk();
+        let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        children.reverse();
+        for child in children {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+fn is_java_statement_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "assert_statement"
+            | "break_statement"
+            | "continue_statement"
+            | "do_statement"
+            | "enhanced_for_statement"
+            | "expression_statement"
+            | "for_statement"
+            | "if_statement"
+            | "labeled_statement"
+            | "local_variable_declaration"
+            | "return_statement"
+            | "switch_expression"
+            | "switch_statement"
+            | "synchronized_statement"
+            | "throw_statement"
+            | "try_statement"
+            | "try_with_resources_statement"
+            | "while_statement"
+            | "yield_statement"
+    )
 }
 
 fn matching_statement_nodes<'a>(
@@ -552,7 +622,8 @@ fn statement_summary(
 fn statement_filter_summary(
     options: &JavaMethodRegionsOptions,
 ) -> Option<JavaMethodRegionStatementFilterSummary> {
-    if options.statement_start_line.is_none()
+    if !options.include_nested_statement_regions
+        && options.statement_start_line.is_none()
         && options.statement_end_line.is_none()
         && options.statement_contains.is_none()
         && options.statement_limit.is_none()
@@ -560,6 +631,7 @@ fn statement_filter_summary(
         return None;
     }
     Some(JavaMethodRegionStatementFilterSummary {
+        include_nested_statement_regions: options.include_nested_statement_regions,
         start_line: options.statement_start_line,
         end_line: options.statement_end_line,
         contains: options.statement_contains.clone(),
@@ -666,6 +738,7 @@ fn method_parameters(method: Node<'_>, source: &str) -> Vec<JavaRegionVariableFa
         out.push(JavaRegionVariableFact {
             name: name.to_string(),
             type_text,
+            resolved_type: None,
             mutated: false,
             after_use_kinds: Vec::new(),
             component_tree_consumptions: Vec::new(),

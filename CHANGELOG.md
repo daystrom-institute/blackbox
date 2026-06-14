@@ -50,6 +50,11 @@ out explicitly under `Changed` or `Removed`.
   `after_use_kinds` and `component_tree_consumptions` so Java UI extraction
   probes can distinguish return values and in-region component-tree wiring from
   undifferentiated multi-live-out blockers.
+- `analysis.methodRegions` now exposes syntax-only `resolved_type` hints for
+  Java `var` captures/live-outs when the type is locally derivable, and can opt
+  into `includeNestedStatementRegions` for marker searches inside giant
+  enclosing loops/blocks. `java.extractMethodCodeBlock` consumes resolved
+  simple `var` types while still refusing unresolved inferred helper boundaries.
 - Embedding coverage now converges and says so when it can't
   (gap-b9d39c10): `bbox_embed_status` reports health=`stalled` (with a
   health_reason naming the fix) when an available route's coverage sits

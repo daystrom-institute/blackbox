@@ -72,6 +72,12 @@ struct MethodRegionsParams {
         alias = "include_statement_regions"
     )]
     include_statement_regions: Option<bool>,
+    #[serde(
+        default,
+        rename = "includeNestedStatementRegions",
+        alias = "include_nested_statement_regions"
+    )]
+    include_nested_statement_regions: bool,
     #[serde(default, rename = "statementLimit", alias = "statement_limit")]
     statement_limit: Option<usize>,
     #[serde(default, rename = "statementStartLine", alias = "statement_start_line")]
@@ -112,6 +118,7 @@ impl MethodRegionsParams {
     fn options(&self) -> bbox_refactor::JavaMethodRegionsOptions {
         bbox_refactor::JavaMethodRegionsOptions {
             include_statement_regions: self.include_statement_regions.unwrap_or(true),
+            include_nested_statement_regions: self.include_nested_statement_regions,
             statement_limit: self.statement_limit,
             statement_start_line: self.statement_start_line,
             statement_end_line: self.statement_end_line,
@@ -471,7 +478,7 @@ impl Tool for AnalysisMethodRegions {
         "analysis.methodRegions"
     }
     fn description(&self) -> &str {
-        "Analyze one Java method body before extract-method work. Returns top-level statement regions and optional requested ranges with captures, live-outs, field touches, lambda/listener counts, non-local control flow, and extractability stop reasons. Pure; syntax_only; never writes. Use this for the contiguity/live-out gates before java.extractMethodCodeBlock."
+        "Analyze one Java method body before extract-method work. Returns top-level statement regions by default, optional nested statement regions, and optional requested ranges with captures, live-outs, field touches, lambda/listener counts, non-local control flow, and extractability stop reasons. Pure; syntax_only; never writes. Use this for the contiguity/live-out gates before java.extractMethodCodeBlock."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -481,6 +488,7 @@ impl Tool for AnalysisMethodRegions {
                 "method": { "type": "string", "description": "Method or constructor name to analyze." },
                 "className": { "type": "string", "description": "Optional owner class name when the file has multiple classes." },
                 "includeStatementRegions": { "type": "boolean", "description": "Default true. Set false when only requested_ranges and statement_region_summary are needed." },
+                "includeNestedStatementRegions": { "type": "boolean", "description": "Default false. When true, statement_regions inventories nested Java statement nodes instead of only method-body top-level statements; useful when a giant loop/block encloses the target marker." },
                 "statementLimit": { "type": "integer", "description": "Optional cap on returned statement_regions after filtering." },
                 "statementStartLine": { "type": "integer", "description": "Optional line filter: include statement regions whose line range overlaps this start line or later." },
                 "statementEndLine": { "type": "integer", "description": "Optional line filter: include statement regions whose line range overlaps this end line or earlier." },
@@ -723,6 +731,9 @@ PARAMS
   method: string      method or constructor name
   className?: string  optional owner class restriction
   includeStatementRegions?: boolean  default true; set false for gate-only calls
+  includeNestedStatementRegions?: boolean default false; when true,
+                            statement_regions inventories nested statements,
+                            not only method-body top-level statements
   statementLimit?: number            cap returned statement_regions after filtering
   statementStartLine?: number        include statements overlapping this line or later
   statementEndLine?: number          include statements overlapping this line or earlier
@@ -749,6 +760,9 @@ RETURNS
     id, label, kind, byte_start, byte_end, line_range, statement_count, preview
     captures[]            locals/params declared before the region and read inside
                            (mutated=true means the current extractor must stop)
+                           If a source declaration uses Java `var`, `type` stays
+                           "var"; `resolved_type` is present only when syntax-only
+                           inference found a concrete helper-safe type.
     live_outs[]           locals declared inside the region and read after it
                            (>1 means current extractor needs a record/result bundle)
                            Each live-out may include after_use_kinds[] such as
@@ -756,6 +770,8 @@ RETURNS
                            component_tree_argument, component_tree_receiver,
                            and component_tree_consumptions[] for in-region
                            UI/component-tree wiring like layout.add(child).
+                           `resolved_type` follows the same Java `var` convention
+                           as captures.
     field_touches[]       class fields read/written in the region
     lambda_count / listener_call_count
     non_local_control_flow[]  return/break/continue that would change semantics;
@@ -769,6 +785,13 @@ RECIPE (monolithic-method stage extraction)
   // For large methods, search/filter first instead of materializing every statement.
   const a = await analysis.methodRegions({
     file, method: "buildView", className: "View",
+    statementContains: "flowSplit", statementLimit: 20
+  });
+  // If the marker sits inside one giant top-level loop/block, opt into nested
+  // statement inventory and use the returned line ranges to gate exact ranges.
+  const nested = await analysis.methodRegions({
+    file, method: "buildView", className: "View",
+    includeNestedStatementRegions: true,
     statementContains: "flowSplit", statementLimit: 20
   });
   // Identify a candidate from the compact statement_regions result, then analyze
@@ -856,8 +879,8 @@ type ReferenceExample = { path: string; line: number; column: number; byte_start
 type FieldAccess = { method?: string; kind: "read" | "write"; line: number; column: number; context: string };
 type FieldClassification = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static_final: boolean; is_mutable_instance: boolean; is_injected: boolean; injection_style?: "field_annotation" | "constructor_param"; is_provider: boolean; reads: number; writes: number; read_by: string[]; written_by: string[]; accesses: FieldAccess[] };
 type ComponentTreeConsumption = { kind: "component_tree_argument" | "component_tree_receiver" | string; method: string; line: number; column: number };
-type MethodRegionVar = { name: string; type: string; mutated?: boolean; after_use_kinds?: string[]; component_tree_consumptions?: ComponentTreeConsumption[] };
-type MethodRegionStatementSummary = { total_count: number; matched_count: number; returned_count: number; omitted_count: number; included: boolean; filter?: { start_line?: number; end_line?: number; contains?: string; limit?: number } };
+type MethodRegionVar = { name: string; type: string; resolved_type?: string; mutated?: boolean; after_use_kinds?: string[]; component_tree_consumptions?: ComponentTreeConsumption[] };
+type MethodRegionStatementSummary = { total_count: number; matched_count: number; returned_count: number; omitted_count: number; included: boolean; filter?: { include_nested_statement_regions?: boolean; start_line?: number; end_line?: number; contains?: string; limit?: number } };
 type MethodRegion = { id: string; label?: string; kind: string; byte_start: number; byte_end: number; line_range: [number, number]; statement_count: number; preview: string; captures: MethodRegionVar[]; live_outs: MethodRegionVar[]; field_touches: { name: string; reads: number; writes: number }[]; enclosing_class_refs: string[]; this_super_refs: number; lambda_count: number; listener_call_count: number; non_local_control_flow: { kind: string; line: number; column: number }[]; extractability: { can_extract_with_current_tool: boolean; stop_reasons: string[]; live_out_count: number; mutated_capture_count: number; non_local_control_flow_count: number } };
 declare const analysis: {
   /** Full contract (params, result vocabulary, recipe) for one analysis. Call before first use. */
@@ -869,7 +892,7 @@ declare const analysis: {
   /** Classify Java fields before extraction: constants/dependencies/mutable state plus read/write sites by method. */
   fieldClassification(args: { file: string; fields?: string[]; className?: string }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; fields: FieldClassification[]; provenance: "syntax_only" }>;
   /** Analyze one Java method's top-level statement regions and optional candidate ranges before extract-method. Use this for contiguity/live-out gates. */
-  methodRegions(args: { file: string; method: string; className?: string; includeStatementRegions?: boolean; statementLimit?: number; statementStartLine?: number; statementEndLine?: number; statementContains?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_region_summary: MethodRegionStatementSummary; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
+  methodRegions(args: { file: string; method: string; className?: string; includeStatementRegions?: boolean; includeNestedStatementRegions?: boolean; statementLimit?: number; statementStartLine?: number; statementEndLine?: number; statementContains?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_region_summary: MethodRegionStatementSummary; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
 };"#
             .to_string(),
     }
@@ -1296,6 +1319,60 @@ class Stage {
         assert_eq!(out["statement_region_summary"]["included"], false, "{out}");
         assert_eq!(
             out["statement_region_summary"]["filter"]["contains"], "beta",
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn method_regions_can_return_nested_filtered_statement_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("NestedStage.java"),
+            r#"package com.acme;
+
+class NestedStage {
+    void build(boolean keepGoing) {
+        while (keepGoing) {
+            int before = 1;
+            int targetStageValue = before + 1;
+            log(targetStageValue);
+        }
+    }
+
+    void log(Object value) {}
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisMethodRegions
+                .call(
+                    json!({
+                        "file": "NestedStage.java",
+                        "method": "build",
+                        "className": "NestedStage",
+                        "includeNestedStatementRegions": true,
+                        "statementContains": "targetStageValue",
+                        "statementLimit": 10
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let kinds = out["statement_regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|region| region["kind"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"local_variable_declaration"), "{out}");
+        assert!(kinds.contains(&"expression_statement"), "{out}");
+        assert_eq!(
+            out["statement_region_summary"]["filter"]["include_nested_statement_regions"], true,
             "{out}"
         );
     }
