@@ -2045,14 +2045,16 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 Err(e) => return err(format!("read delegate: {e}")),
             };
 
-            // Extract method signatures from the delegate using file_query.
-            #[derive(Debug)]
+            // Extract method signatures from the delegate. For each moved method,
+            // capture the full method header (modifiers + return-type + name +
+            // params + throws) by finding the text from the method declaration
+            // start to the opening brace. Use this header as the wrapper
+            // signature template, replacing only the access modifier with
+            // `private` for non-public wrappers.
             struct MethodSig {
                 bare_name: String,
-                return_type: String,
-                params: String,
-                param_names: Vec<String>,
-                visibility: String,
+                header: String,       // full header before `{` body
+                param_names: Vec<String>, // just the param identifiers
             }
             let mut sigs: Vec<MethodSig> = Vec::new();
             for method in &params.methods {
@@ -2064,44 +2066,52 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 ) {
                     for cap in &facts.captures {
                         if cap.capture == "name" && cap.text == bare {
-                            // Re-read the method text from delegate_src to extract
-                            // return type / params / param names.
                             if let Some(method_cap) = facts.captures.iter().find(
                                 |mc| mc.capture == "method"
                                     && mc.byte_start <= cap.byte_start
                                     && mc.byte_end >= cap.byte_end,
                             ) {
                                 let mtext = &delegate_src[method_cap.byte_start..method_cap.byte_end];
-                                // Extract return type: text before the method name.
-                                let before_name = &delegate_src[method_cap.byte_start..cap.byte_start];
-                                let ret = before_name
-                                    .split_whitespace()
-                                    .filter(|w| !w.is_empty() && *w != bare)
-                                    .last()
-                                    .unwrap_or("void");
-                                let return_type = if ret == bare { "void" } else { ret };
-                                // Extract params text and param names.
-                                let params_start = mtext.find('(').unwrap_or(0);
-                                let params_end = mtext.rfind(')').unwrap_or(mtext.len());
-                                let params_text = &mtext[params_start..=params_end];
-                                let param_names: Vec<String> = params_text[1..params_text.len()-1]
-                                    .split(',')
-                                    .filter_map(|p| {
-                                        let parts: Vec<&str> = p.split_whitespace().collect();
-                                        parts.last().map(|n| n.to_string())
-                                    })
-                                    .collect();
-                                let vis = if mtext.trim_start().starts_with("public") {
-                                    "public"
+                                // Find opening brace — the header is everything before it.
+                                let brace_pos = mtext.find('{').unwrap_or(mtext.len());
+                                let header = mtext[..brace_pos].trim().to_string();
+                                // Extract param names from the header's param list.
+                                let params_start = header.find('(').unwrap_or(header.len());
+                                let params_end = header.rfind(')').unwrap_or(header.len());
+                                let param_names: Vec<String> = if params_start < params_end {
+                                    // Split on commas not nested inside <...> angle brackets.
+                                    let param_str = &header[params_start+1..params_end];
+                                    let mut names = Vec::new();
+                                    let mut depth = 0;
+                                    let mut current = String::new();
+                                    for ch in param_str.chars() {
+                                        match ch {
+                                            '<' => { depth += 1; current.push(ch); }
+                                            '>' => { depth -= 1; current.push(ch); }
+                                            ',' if depth == 0 => {
+                                                let parts: Vec<&str> = current.trim().split_whitespace().collect();
+                                                if let Some(name) = parts.last() {
+                                                    names.push(name.to_string());
+                                                }
+                                                current.clear();
+                                            }
+                                            _ => current.push(ch),
+                                        }
+                                    }
+                                    if !current.trim().is_empty() {
+                                        let parts: Vec<&str> = current.trim().split_whitespace().collect();
+                                        if let Some(name) = parts.last() {
+                                            names.push(name.to_string());
+                                        }
+                                    }
+                                    names
                                 } else {
-                                    "private"
+                                    Vec::new()
                                 };
                                 sigs.push(MethodSig {
                                     bare_name: bare.to_string(),
-                                    return_type: return_type.to_string(),
-                                    params: params_text.to_string(),
+                                    header,
                                     param_names,
-                                    visibility: vis.to_string(),
                                 });
                             }
                         }
@@ -2132,17 +2142,35 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 }
             }
 
-            // Synthesize wrapper methods and insert before the delegate field
-            // declaration or at the end of the class body.
+            // Synthesize wrapper methods. Deduplicate by bare name — one
+            // wrapper per moved method, regardless of how many call sites.
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
             let mut wrapper_texts: Vec<String> = Vec::new();
             for sig in &sigs {
                 if !needs_wrappers.contains(&sig.bare_name) { continue; }
+                if !seen.insert(&sig.bare_name) { continue; }
                 let call_args = sig.param_names.join(", ");
-                let return_prefix = if sig.return_type == "void" { "" } else { "return " };
+                // Build wrapper signature from the delegate header, replacing
+                // `public` with `private` if the delegate method is public.
+                let wrapper_sig = sig.header
+                    .replace("public ", "private ")
+                    .replace("protected ", "private ");
+                // If the header already starts with `private`, keep it.
+                let wrapper_sig = if wrapper_sig.contains("private ") {
+                    wrapper_sig
+                } else if !wrapper_sig.contains("public ") && !wrapper_sig.contains("protected ") {
+                    format!("private {}", wrapper_sig)
+                } else {
+                    wrapper_sig
+                };
+                let return_prefix = if wrapper_sig.trim_start().starts_with("private void") {
+                    ""
+                } else {
+                    "return "
+                };
                 wrapper_texts.push(format!(
-                    "    {} {} {}{} {{\n        {}this.{}.{}({});\n    }}\n",
-                    sig.visibility, sig.return_type, sig.bare_name, sig.params,
-                    return_prefix, params.delegate_field, sig.bare_name, call_args
+                    "    {} {{\n        {}this.{}.{}({});\n    }}",
+                    wrapper_sig, return_prefix, params.delegate_field, sig.bare_name, call_args
                 ));
             }
             if wrapper_texts.is_empty() {
