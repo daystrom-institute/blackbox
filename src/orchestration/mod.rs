@@ -4760,8 +4760,9 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
     let event_count = observed_event_count(&inner);
     let last_activity = inner.last_assistant_message.as_deref().map(|msg| {
         let clean = msg.replace('\n', " ");
-        if clean.len() > 80 {
-            format!("{}…", &clean[..80])
+        let teaser: String = clean.chars().take(80).collect();
+        if teaser.len() < clean.len() {
+            format!("{teaser}…")
         } else {
             clean
         }
@@ -5696,6 +5697,26 @@ mod tests {
         assert_eq!(json["result"], "short final answer");
         assert!(json.get("resultTruncated").is_none());
         assert!(json.get("resultBytes").is_none());
+    }
+
+    #[test]
+    fn timeout_snapshot_truncates_last_activity_on_char_boundary() {
+        let running = task_with(
+            TaskStatus::Running,
+            "",
+            vec![serde_json::json!({"type": "assistant", "idx": 1})],
+        );
+        running.inner.lock().last_assistant_message =
+            Some(format!("{}’{}", "x".repeat(79), "tail"));
+
+        let json = timeout_snapshot_json(&running);
+
+        assert_eq!(
+            json["lastAssistantSnippet"],
+            format!("{}’…", "x".repeat(79)),
+            "timeout snapshot teaser must not byte-slice through UTF-8"
+        );
+        assert_eq!(json["timed_out"], true);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "id": "gap-23c41e46",
+  "title": "bro_wait did not return when watched task completed",
+  "gap_kind": "tooling",
+  "domain": "bro-orchestration",
+  "wanted_capability": "bro_wait(task_id, timeout_seconds) should return promptly when the watched task transitions to a terminal state (completed/failed/cancelled).",
+  "impact": "medium",
+  "blocking_level": "blocks_task",
+  "dedupe_key": "tooling/bro-orchestration/bro-wait-no-return-on-completion",
+  "notes": "Probe task 41b9497a-4f4c-45d9-aa59-a22640161830 (brodex gpt-5.5, 69 turns, 4894 events) completed and bro_status returned status=completed with full result/snapshot. bro_wait was called with timeout_seconds=300 and was rejected by the user after more than 300s had elapsed — the task had completed but bro_wait had not returned. This blocks the standard probe orchestration loop (dispatch → wait → verify → retro) and forces a manual bro_status poll instead of the intended blocking wait primitive.",
+  "resolution": "addressed",
+  "created_at": "2026-06-14T18:10:41Z",
+  "updated_at": "2026-06-14T19:10:24Z",
+  "resolved_at": "2026-06-14T19:10:24Z",
+  "resolution_note": "Root-caused and fixed in src/orchestration/mod.rs. Incident timeline: bro_wait entered at 2026-06-14T17:49:01Z with timeout_seconds=300; at 2026-06-14T17:54:01Z the daemon hit the timeout path and panicked while constructing timeout_snapshot_json, slicing last_assistant_message with clean[..80] through a UTF-8 curly apostrophe. The wait timeout itself fired; the response task died before returning the timeout snapshot, leaving the caller pending until operator interruption. Fix: timeout_snapshot_json now truncates lastAssistantSnippet with chars().take(80), and regression timeout_snapshot_truncates_last_activity_on_char_boundary covers the exact byte-boundary panic shape."
+}
