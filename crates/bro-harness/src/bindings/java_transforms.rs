@@ -1869,23 +1869,53 @@ impl Tool for JavaExtractClassPreviewPlan {
                             }
                         }
                     }
-                }
-            }
-
-            let blockers: Vec<&str> = {
-                let mut b: Vec<&str> = Vec::new();
-                if !overloads.is_empty() {
-                    for sigs in overloads.values() {
-                        if sigs.len() > 1 {
-                            b.push("overload_multiple_signatures");
-                            break;
+                    // 5b. Reverse: for each moved helper, find same-class callers
+                    //     NOT in the move set (these need wrappers post-extract).
+                    //     Add them to internal_helper_deps keyed by the helper.
+                    if let Ok(method_facts) = bbox_refactor::facts::file_query(
+                        &path,
+                        "(method_declaration name: (identifier) @name) @method",
+                        None,
+                    ) {
+                        for cap in &file_facts.captures {
+                            if cap.capture != "call" { continue; }
+                            if !moved_bare.contains(cap.text.as_str()) { continue; }
+                            // This invocation calls a moved method. Find the
+                            // enclosing method.
+                            if let Some(enc) = method_facts.captures.iter().find(
+                                |mc| mc.capture == "name"
+                                    && mc.byte_start <= cap.byte_start
+                                    && mc.byte_end >= cap.byte_end
+                            ) {
+                                if !moved_bare.contains(enc.text.as_str()) {
+                                    let moved_name = params.methods.iter()
+                                        .find(|m| m.starts_with(&format!("{}(", cap.text.as_str())))
+                                        .cloned()
+                                        .unwrap_or_else(|| cap.text.clone());
+                                    let entry = internal_helper_deps
+                                        .entry(moved_name)
+                                        .or_default();
+                                    if !entry.contains(&enc.text) {
+                                        entry.push(enc.text.clone());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                // External callers are NOT a hard blocker — the remedy is
-                // wrappers:true, which the bro applies during extractClass.
-                // Flag it informatively in has_external_callers but don't
-                // block ready.
+            }
+
+            let overloads_resolved = !overloads.is_empty();
+            let blockers: Vec<&str> = {
+                let mut b: Vec<&str> = Vec::new();
+                // When overloads were auto-resolved, force the bro to use
+                // resolved_methods by blocking ready. The re-run with
+                // resolved_methods will have no dupes and pass ready:true.
+                if overloads_resolved {
+                    b.push("overloads_resolved_use_resolved_methods");
+                }
+                // External callers: NOT a hard blocker — wrappers:true is the
+                // remedy. Flagged informatively in has_external_callers.
                 if !non_injectable_mutable.is_empty() {
                     b.push("non_injectable_mutable_fields");
                 }
@@ -1903,6 +1933,7 @@ impl Tool for JavaExtractClassPreviewPlan {
                 "file": file,
                 "methods": params.methods,
                 "overloads": overloads,
+                "overloads_resolved": overloads_resolved,
                 "resolved_methods": resolved_methods,
                 "field_closure": field_closure,
                 "augmented_move_fields": augmented_move_fields,
@@ -1951,7 +1982,7 @@ declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Preflight a java.extractClass seam: overloads, field closure, external callers, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
-  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
+  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
