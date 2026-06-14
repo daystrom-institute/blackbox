@@ -9677,6 +9677,48 @@ fn extract_java_code_block_to_method_arguments_default_to_param_names() {
 }
 
 #[test]
+fn extract_java_code_block_to_method_preserves_formatting_when_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Format.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Format {\n\
+         \x20   void run() {\n\
+         \x20       int x = 1;\n\
+         \x20       if (x > 0) {\n\
+         \x20           System.out.println(x);\n\
+         \x20       }\n\
+         \x20       System.out.println(\"done\");\n\
+         \x20   }\n\
+         \n\
+         \x20   void next() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let selected = "        if (x > 0) {\n            System.out.println(x);\n        }";
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some(selected.to_string());
+    params.module_name = Some("emitPositive".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &path);
+
+    assert!(
+        rewritten.contains("        emitPositive(x);\n        System.out.println(\"done\");"),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.contains(
+            "    }\n\n    private void emitPositive(int x) {\n        if (x > 0) {\n            System.out.println(x);\n        }\n    }\n\n    void next() {}"
+        ),
+        "{rewritten}"
+    );
+    assert!(!rewritten.contains("}    private"), "{rewritten}");
+}
+
+#[test]
 fn method_regions_reports_live_outs_and_field_touches_for_candidate_range() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Stage.java");

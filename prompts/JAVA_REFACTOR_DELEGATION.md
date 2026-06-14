@@ -128,7 +128,10 @@ the class-decomposition flow:
    `java.extractMethodCodeBlock({ file, oldText, methodName, className })`.
 4. Apply via `edits.merge → edits.apply`, compile, `java.hygiene({ files:
    [file] })`, and compile again if hygiene changed anything.
-5. If gates fail, stop with the `stop_reasons`, `live_outs`, and candidate
+5. Inspect the diff around the call site and inserted helper after hygiene.
+   Compile success is necessary but not sufficient if helper spacing or
+   indentation is obviously wrong.
+6. If gates fail, stop with the `stop_reasons`, `live_outs`, and candidate
    ranges. Do not hand-build a record object or discontiguous helper inside a
    probe.
 
@@ -231,6 +234,10 @@ A good brief is a **task with guardrails**, not a script. Tell it:
   transform should do the move; a separate post-apply hygiene phase handles
   imports/formatting through `java.hygiene({ files })`. Residual hygiene is a
   construct gap, not a reason to rerun the semantic transform.
+- **Compile success does not prove generated helper quality.** Inspect the local
+  diff after `java.extractMethodCodeBlock` + hygiene. The expected shape is a
+  normally indented call site, one blank line between methods, helper signature
+  on its own line, and moved-body relative indentation preserved.
 - **Steers are recipe deltas.** If you have to steer a running probe, treat the
   steer as evidence that the recipe/prompt is under-specified. Before the next
   rerun, refine the prompt text or add a recipe comment so future agents start

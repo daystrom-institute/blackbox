@@ -614,7 +614,15 @@ impl Tool for CodeRead {
                 ));
             }
             let text = String::from_utf8_lossy(&bytes[span.byte_start..span.byte_end]).to_string();
-            ToolResult::Json(json!({ "text": text, "span": span }))
+            let byte_length = span.byte_end.saturating_sub(span.byte_start);
+            let char_length = text.chars().count();
+            ToolResult::Json(json!({
+                "text": text,
+                "span": span,
+                "byte_length": byte_length,
+                "char_length": char_length,
+                "truncated": false
+            }))
         })
         .await
     }
@@ -862,8 +870,8 @@ declare const code: {
   fields(args: { file: string; className?: string }): Promise<FileFields>;
   /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. The batch is aggregate-capped (~20k captures): a broad query over a large repo sets aggregate_capped + files_scanned/files_total + hint — narrow the query or the file set and re-run rather than widening blindly. */
   query(args: { file: string; query: string; within?: { byte_start: number; byte_end: number } } | { files: string[]; query: string }): Promise<{ file: string; language: string; content_sha256: string; captures: QueryCapture[]; truncated: boolean } | { captures: QueryCapture[]; files: ({ file: string; language: string; content_sha256: string; captures: number } | { file: string; error: string })[]; truncated: boolean; aggregate_capped?: boolean; files_scanned?: number; files_total?: number; hint?: string }>;
-  /** Read the exact text of a Span; errors with stale_span on content drift. */
-  read(args: { span: Span }): Promise<{ text: string; span: Span }>;
+  /** Read the exact text of a Span; errors with stale_span on content drift. `truncated` is always false for successful reads; UI/tool display may still elide long text. */
+  read(args: { span: Span }): Promise<{ text: string; span: Span; byte_length: number; char_length: number; truncated: false }>;
   /** Language-shaped callable signature at/enclosing a Span. Rust returns function facts; Java returns method/constructor facts. `span` covers the whole item; `signature_span` covers the declaration header; `params_span` covers the raw parameter list for formatting checks. Errors with stale_span on drift. */
   signature(args: { span: Span }): Promise<RustSignature | JavaSignature>;
   /** Union same-file Spans into one covering Span (pure; no I/O). */
@@ -974,6 +982,9 @@ class Probe {
         let span = captures[0]["span"].clone();
         let read = json_of(CodeRead.call(json!({ "span": span }), &cx_in(&root)).await);
         assert_eq!(read["text"], "beta");
+        assert_eq!(read["byte_length"], 4);
+        assert_eq!(read["char_length"], 4);
+        assert_eq!(read["truncated"], false);
     }
 
     #[tokio::test]

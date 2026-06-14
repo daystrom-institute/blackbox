@@ -674,7 +674,9 @@ pub fn analyze_range(
                         }
                     }
                 }
-                "return_statement" => {
+                "return_statement"
+                    if !return_is_inside_selected_lambda(n, range_start, range_end) =>
+                {
                     analysis.non_local_control_flow.push(NonLocalControlFlow {
                         kind: "return".to_string(),
                         byte_start: n.start_byte(),
@@ -783,6 +785,24 @@ fn is_declaration_site(node: Node<'_>) -> bool {
             .is_some_and(|p| p.id() == node.id()),
         _ => false,
     }
+}
+
+fn return_is_inside_selected_lambda(
+    return_node: Node<'_>,
+    range_start: usize,
+    range_end: usize,
+) -> bool {
+    let mut cursor = return_node.parent();
+    while let Some(parent) = cursor {
+        match parent.kind() {
+            "lambda_expression" => {
+                return parent.start_byte() >= range_start && parent.end_byte() <= range_end;
+            }
+            "method_declaration" | "constructor_declaration" => return false,
+            _ => cursor = parent.parent(),
+        }
+    }
+    false
 }
 
 fn is_mutation_target(node: Node<'_>) -> bool {
@@ -1047,6 +1067,35 @@ mod tests {
         // Extract just `return 0;`
         let r_start = src.find("return 0").unwrap();
         let r_end = src[r_start..].find(';').unwrap() + r_start + 1;
+        let analysis = analyze_range(&scope, method, r_start, r_end, src);
+        assert_eq!(analysis.non_local_control_flow.len(), 1);
+        assert_eq!(analysis.non_local_control_flow[0].kind, "return");
+    }
+
+    #[test]
+    fn analyze_range_does_not_flag_return_inside_fully_selected_lambda() {
+        let src = "class T { void run(Binder b) { b.withValidator(v -> { if (v == null) return false; return true; }); } }";
+        let tree = parse_java(src);
+        let method = find_method(tree.root_node(), src, "run");
+        let scope = ScopeTree::build_from_method(method, src);
+        let r_start = src.find("b.withValidator").unwrap();
+        let r_end = src.find("; } }").unwrap() + 1;
+        let analysis = analyze_range(&scope, method, r_start, r_end, src);
+        assert!(
+            analysis.non_local_control_flow.is_empty(),
+            "non_local={:?}",
+            analysis.non_local_control_flow
+        );
+    }
+
+    #[test]
+    fn analyze_range_flags_return_inside_partially_selected_lambda() {
+        let src = "class T { void run(Binder b) { b.withValidator(v -> { if (v == null) return false; return true; }); } }";
+        let tree = parse_java(src);
+        let method = find_method(tree.root_node(), src, "run");
+        let scope = ScopeTree::build_from_method(method, src);
+        let r_start = src.find("return false").unwrap();
+        let r_end = r_start + "return false;".len();
         let analysis = analyze_range(&scope, method, r_start, r_end, src);
         assert_eq!(analysis.non_local_control_flow.len(), 1);
         assert_eq!(analysis.non_local_control_flow[0].kind, "return");

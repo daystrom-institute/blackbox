@@ -884,7 +884,10 @@ WHAT IT DOES
   Thin code-mode binding over the existing extract_java_code_block_to_method
   planner. It extracts one exact contiguous statement range from inside a Java
   method/constructor body, infers captured locals/params as helper parameters,
-  and infers void vs one returned live-out variable.
+  and infers void vs one returned live-out variable. Generated helper insertion
+  preserves call-site indentation, method spacing, and moved-body relative
+  indentation; still run java.hygiene after apply for imports and file-level
+  whitespace.
 
 PARAMS
   file: string          workspace-relative .java file

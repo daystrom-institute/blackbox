@@ -80,6 +80,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- `java.extractMethodCodeBlock` now preserves call-site indentation, inserts
+  helpers with normalized method spacing, and re-indents moved blocks relative
+  to the helper body instead of collapsing nested indentation.
+  `analysis.methodRegions` no longer treats `return` statements inside a fully
+  selected Java lambda as method-level non-local control flow. `code.read` now
+  reports exact `byte_length`, `char_length`, and `truncated=false` metadata so
+  display truncation is not confused with source truncation.
 - The tool-docs coverage tests (`every_registered_tool_has_a_doc`,
   `description_summary_parity`) now resolve their `src/` scan root at
   runtime (walking up from the test cwd to the `[workspace]` manifest)

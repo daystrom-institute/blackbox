@@ -275,18 +275,22 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
     // operator-confirmed) variable declared INSIDE the range, the
     // extracted text already contains its declaration; the return is
     // synthesized after.
+    let helper_indent = method_body_indent_for(class_node, &parsed.source);
+    let helper_inner_indent = format!("{helper_indent}    ");
     let extracted = selected
         .trim_end_matches(|c: char| c.is_whitespace())
         .to_string();
-    let helper_body = if is_void {
-        extracted.clone()
-    } else {
+    let mut helper_body_indented = reindent_block(&extracted, &helper_inner_indent);
+    if !is_void {
         let ret_name = return_var.as_deref().unwrap_or("result");
-        format!("{extracted}\nreturn {ret_name};")
-    };
-    let helper_indent = method_body_indent_for(class_node, &parsed.source);
-    let helper_inner_indent = format!("{helper_indent}    ");
-    let helper_body_indented = reindent_block(&helper_body, &helper_inner_indent);
+        if !helper_body_indented.is_empty() {
+            helper_body_indented.push('\n');
+        }
+        helper_body_indented.push_str(&helper_inner_indent);
+        helper_body_indented.push_str("return ");
+        helper_body_indented.push_str(ret_name);
+        helper_body_indented.push(';');
+    }
     let helper_decl = format!(
         "{helper_indent}{visibility_prefix}{static_prefix}{return_type} {helper_name}({param_list}) {{\n\
          {helper_body_indented}\n\
@@ -295,20 +299,22 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
 
     // Call site.
     let arg_list = effective_args.join(", ");
+    let call_site_indent = call_site_replacement_indent(&parsed.source, region_start);
     let replacement = if let Some(text) = p.new_text.clone() {
         text
     } else if is_void {
-        format!("{helper_name}({arg_list});")
+        format!("{call_site_indent}{helper_name}({arg_list});")
     } else {
         // The call site captures the helper's return into a local of
         // the matching type, named to match the inner declaration we
         // hoisted (so post-range uses still bind correctly).
         let var = return_var.as_deref().unwrap_or("result");
-        format!("{return_type} {var} = {helper_name}({arg_list});")
+        format!("{call_site_indent}{return_type} {var} = {helper_name}({arg_list});")
     };
 
     let enclosing_end = enclosing_method.end_byte();
-    let helper_insert_text = format_helper_insert(&parsed.source, enclosing_end, &helper_decl);
+    let (helper_insert_end, helper_insert_text) =
+        format_helper_insert(&parsed.source, enclosing_end, &helper_decl);
 
     let mut edits = vec![
         TextEdit {
@@ -318,7 +324,7 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         },
         TextEdit {
             byte_start: enclosing_end,
-            byte_end: enclosing_end,
+            byte_end: helper_insert_end,
             replacement: helper_insert_text,
         },
     ];
@@ -507,28 +513,75 @@ fn method_body_indent_for(class_node: Node<'_>, source: &str) -> String {
     "    ".to_string()
 }
 
+fn line_indent_at(source: &str, byte: usize) -> String {
+    let bytes = source.as_bytes();
+    let mut line_start = byte.min(bytes.len());
+    while line_start > 0 && bytes[line_start - 1] != b'\n' {
+        line_start -= 1;
+    }
+    let mut cursor = line_start;
+    while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\t') {
+        cursor += 1;
+    }
+    source[line_start..cursor].to_string()
+}
+
+fn call_site_replacement_indent(source: &str, byte: usize) -> String {
+    let bytes = source.as_bytes();
+    let mut line_start = byte.min(bytes.len());
+    while line_start > 0 && bytes[line_start - 1] != b'\n' {
+        line_start -= 1;
+    }
+    if line_start == byte {
+        return line_indent_at(source, byte);
+    }
+    // The edit starts after existing line-leading whitespace, so that
+    // whitespace remains in the file and must not be duplicated.
+    String::new()
+}
+
 fn reindent_block(text: &str, indent: &str) -> String {
+    let min_indent = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.bytes().take_while(|b| *b == b' ').count())
+        .min()
+        .unwrap_or(0);
+
     text.lines()
         .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() {
+            if line.trim().is_empty() {
                 String::new()
             } else {
-                format!("{indent}{trimmed}")
+                let leading_spaces = line.bytes().take_while(|b| *b == b' ').count();
+                let strip = min_indent.min(leading_spaces);
+                format!("{indent}{}", &line[strip..])
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn format_helper_insert(source: &str, enclosing_end: usize, helper_decl: &str) -> String {
+fn format_helper_insert(source: &str, enclosing_end: usize, helper_decl: &str) -> (usize, String) {
     let bytes = source.as_bytes();
-    let after = enclosing_end;
-    let next_two = (bytes.get(after).copied(), bytes.get(after + 1).copied());
-    let prefix = match next_two {
-        (Some(b'\n'), Some(b'\n')) => "",
-        (Some(b'\n'), _) => "\n",
-        _ => "\n\n",
+    let mut whitespace_end = enclosing_end;
+    while whitespace_end < bytes.len()
+        && matches!(bytes[whitespace_end], b' ' | b'\t' | b'\r' | b'\n')
+    {
+        whitespace_end += 1;
+    }
+
+    let separator_end = source[enclosing_end..whitespace_end]
+        .rfind('\n')
+        .map(|idx| enclosing_end + idx + 1)
+        .unwrap_or(enclosing_end);
+    let next_non_ws = bytes.get(whitespace_end).copied();
+    let suffix = match next_non_ws {
+        Some(b'}') | None => "",
+        _ => "\n",
     };
-    format!("{prefix}{helper_decl}")
+    (
+        separator_end,
+        format!("\n\n{}{}\n", helper_decl.trim_end_matches('\n'), suffix),
+    )
 }

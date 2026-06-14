@@ -708,7 +708,9 @@ RETURNS
                            (>1 means current extractor needs a record/result bundle)
     field_touches[]       class fields read/written in the region
     lambda_count / listener_call_count
-    non_local_control_flow[]  return/break/continue that would change semantics
+    non_local_control_flow[]  return/break/continue that would change semantics;
+                              returns inside a fully selected lambda are local
+                              to that lambda and do not count here
     extractability        { can_extract_with_current_tool, stop_reasons,
                             live_out_count, mutated_capture_count,
                             non_local_control_flow_count }

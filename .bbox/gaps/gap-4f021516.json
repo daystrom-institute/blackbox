@@ -15,11 +15,13 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/java-extract-method-format-hygiene",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "task_id": "93e8d074-b02e-4d07-9840-50fec6083ebe",
   "session_id": "9ae9ebee-4e91-4768-83c5-c639f4ed7bd6",
   "provider": "deepseek",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T01:51:49Z",
-  "updated_at": "2026-06-14T01:51:49Z"
+  "updated_at": "2026-06-14T02:02:10Z",
+  "resolved_at": "2026-06-14T02:02:10Z",
+  "resolution_note": "Addressed by preserving call-site indentation, replacing method-separator whitespace during helper insertion, and re-indenting moved blocks relative to the helper body in java.extractMethodCodeBlock."
 }
