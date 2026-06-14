@@ -1085,12 +1085,48 @@ impl Tool for JavaDescribe {
             "extractClassPreviewPlan" => {
                 ToolResult::Json(json!({ "contract": PREVIEW_PLAN_CONTRACT }))
             }
+            "synthesizeHelperWrappers" => {
+                ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
+            }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractMethodCodeBlock, removeUnusedConstructorParams, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractMethodCodeBlock, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
 }
+
+const SYNTH_WRAPPERS_CONTRACT: &str = r#"java.synthesizeHelperWrappers — post-extract: synthesize delegating wrapper methods for moved helpers.
+
+WHAT IT DOES
+  After extractClass + edits.apply, detects remaining simple-name invocations of
+  moved helper methods in the source class and returns wrapper method changes
+  for edits.merge. Run this BEFORE the first compile after extract — it catches
+  the "moved createEmptyCellHeader but unmoved methods still call it" failure
+  before Gradle.
+
+PARAMS
+  file: string          source .java file (workspace-relative)
+  target: string        delegate .java file (workspace-relative)
+  delegateField: string delegate field name on the source class
+  methods: string[]     moved method names (signature-qualified ok)
+
+RETURNS { changes, wrappers_added, stale_calls_remaining, note, provenance }
+  changes: hash-anchored insertBefore changes → edits.merge
+  wrappers_added: method names that got wrappers
+  stale_calls_remaining: empty if all same-class calls are covered
+
+RECIPE
+  // After extractClass + edits.apply, before first compile:
+  const sw = await java.synthesizeHelperWrappers({
+    file, target, delegateField: "inletWriter",
+    methods: previewPlan.resolved_methods,
+  });
+  if (sw.changes.length) {
+    const es = await edits.begin();
+    await edits.merge({ es, changes: sw.changes });
+    await edits.apply({ es });
+  }
+"#;
 
 const REMOVE_UNUSED_PARAMS_CONTRACT: &str = r#"java.removeUnusedConstructorParams — drop dead @Inject constructor parameters (move the injection point).
 
@@ -1952,6 +1988,244 @@ impl Tool for JavaExtractClassPreviewPlan {
     }
 }
 
+/// `java.synthesizeHelperWrappers` — post-extract: synthesize delegating
+/// wrapper methods for moved helpers that still have same-class callers.
+pub struct JavaSynthesizeHelperWrappers;
+
+#[derive(Deserialize)]
+struct SynthWrappersParams {
+    file: String,
+    target: String,
+    #[serde(rename = "delegateField", alias = "delegate_field")]
+    delegate_field: String,
+    methods: Vec<String>,
+}
+
+#[async_trait]
+impl Tool for JavaSynthesizeHelperWrappers {
+    fn name(&self) -> &str {
+        "java.synthesizeHelperWrappers"
+    }
+    fn description(&self) -> &str {
+        "Post-extract: synthesize delegating wrapper methods on the source class for moved helper methods that still have same-class callers. Detects remaining simple-name invocations of moved methods and returns wrapper method changes for edits.merge. Run AFTER extractClass + edits.apply. Pure; syntax_only; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Source .java file (workspace-relative)." },
+                "target": { "type": "string", "description": "Delegate .java file (workspace-relative)." },
+                "delegateField": { "type": "string", "description": "Delegate field name on the source class." },
+                "methods": { "type": "array", "items": { "type": "string" }, "description": "Moved method names, optionally signature-qualified (e.g. createEmptyCellHeader(HSSFRow,int))." }
+            },
+            "required": ["file", "target", "delegateField", "methods"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations { read_only: true, destructive: false }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "synthesizeHelperWrappers".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: SynthWrappersParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return err(format!("java.synthesizeHelperWrappers: bad input: {e}")),
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let source_path = root.join(&params.file);
+            let delegate_path = root.join(&params.target);
+            let source = match std::fs::read_to_string(&source_path) {
+                Ok(s) => s,
+                Err(e) => return err(format!("read source: {e}")),
+            };
+            let delegate_src = match std::fs::read_to_string(&delegate_path) {
+                Ok(s) => s,
+                Err(e) => return err(format!("read delegate: {e}")),
+            };
+
+            // Extract method signatures from the delegate using file_query.
+            #[derive(Debug)]
+            struct MethodSig {
+                bare_name: String,
+                return_type: String,
+                params: String,
+                param_names: Vec<String>,
+                visibility: String,
+            }
+            let mut sigs: Vec<MethodSig> = Vec::new();
+            for method in &params.methods {
+                let bare = method.split('(').next().unwrap_or(method);
+                if let Ok(facts) = bbox_refactor::facts::file_query(
+                    &delegate_path,
+                    "(method_declaration name: (identifier) @name) @method",
+                    None,
+                ) {
+                    for cap in &facts.captures {
+                        if cap.capture == "name" && cap.text == bare {
+                            // Re-read the method text from delegate_src to extract
+                            // return type / params / param names.
+                            if let Some(method_cap) = facts.captures.iter().find(
+                                |mc| mc.capture == "method"
+                                    && mc.byte_start <= cap.byte_start
+                                    && mc.byte_end >= cap.byte_end,
+                            ) {
+                                let mtext = &delegate_src[method_cap.byte_start..method_cap.byte_end];
+                                // Extract return type: text before the method name.
+                                let before_name = &delegate_src[method_cap.byte_start..cap.byte_start];
+                                let ret = before_name
+                                    .split_whitespace()
+                                    .filter(|w| !w.is_empty() && *w != bare)
+                                    .last()
+                                    .unwrap_or("void");
+                                let return_type = if ret == bare { "void" } else { ret };
+                                // Extract params text and param names.
+                                let params_start = mtext.find('(').unwrap_or(0);
+                                let params_end = mtext.rfind(')').unwrap_or(mtext.len());
+                                let params_text = &mtext[params_start..=params_end];
+                                let param_names: Vec<String> = params_text[1..params_text.len()-1]
+                                    .split(',')
+                                    .filter_map(|p| {
+                                        let parts: Vec<&str> = p.split_whitespace().collect();
+                                        parts.last().map(|n| n.to_string())
+                                    })
+                                    .collect();
+                                let vis = if mtext.trim_start().starts_with("public") {
+                                    "public"
+                                } else {
+                                    "private"
+                                };
+                                sigs.push(MethodSig {
+                                    bare_name: bare.to_string(),
+                                    return_type: return_type.to_string(),
+                                    params: params_text.to_string(),
+                                    param_names,
+                                    visibility: vis.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if sigs.is_empty() {
+                return err("java.synthesizeHelperWrappers: no matching methods in delegate");
+            }
+
+            // Find remaining same-class simple-name calls to moved methods via
+            // file_query for method invocations.
+            let bare_names: BTreeSet<&str> = sigs.iter().map(|s| s.bare_name.as_str()).collect();
+            let mut needs_wrappers: BTreeSet<String> = BTreeSet::new();
+            if let Ok(invoc_facts) = bbox_refactor::facts::file_query(
+                &source_path,
+                "(method_invocation name: (identifier) @call) @invoc",
+                None,
+            ) {
+                for cap in &invoc_facts.captures {
+                    if cap.capture == "call" && bare_names.contains(cap.text.as_str()) {
+                        // Check if the invocation text contains a dot (qualified).
+                        let invoc_text = &source[cap.byte_start..cap.byte_end.min(source.len())];
+                        if !invoc_text.contains('.') {
+                            needs_wrappers.insert(cap.text.clone());
+                        }
+                    }
+                }
+            }
+
+            // Synthesize wrapper methods and insert before the delegate field
+            // declaration or at the end of the class body.
+            let mut wrapper_texts: Vec<String> = Vec::new();
+            for sig in &sigs {
+                if !needs_wrappers.contains(&sig.bare_name) { continue; }
+                let call_args = sig.param_names.join(", ");
+                let return_prefix = if sig.return_type == "void" { "" } else { "return " };
+                wrapper_texts.push(format!(
+                    "    {} {} {}{} {{\n        {}this.{}.{}({});\n    }}\n",
+                    sig.visibility, sig.return_type, sig.bare_name, sig.params,
+                    return_prefix, params.delegate_field, sig.bare_name, call_args
+                ));
+            }
+            if wrapper_texts.is_empty() {
+                return ToolResult::Json(json!({
+                    "changes": [],
+                    "wrappers_added": [],
+                    "stale_calls_remaining": [],
+                    "note": "no same-class simple-name calls to moved methods found",
+                    "provenance": "syntax_only",
+                }));
+            }
+
+            // Find insertion point: find the last field declaration or the
+            // class body's opening brace. Insert wrappers AFTER the last field
+            // (or after the opening brace), with a blank-line separator.
+            // Never insert inside a field declaration — that breaks syntax.
+            let insert_text = format!("\n{}\n", wrapper_texts.join("\n\n"));
+            let byte_offset = {
+                let mut last_field_end = None;
+                if let Ok(field_facts) = bbox_refactor::facts::file_query(
+                    &source_path,
+                    "(field_declaration) @field",
+                    None,
+                ) {
+                    // Find the last field declaration by byte_end.
+                    for cap in &field_facts.captures {
+                        let end = cap.byte_end.min(source.len());
+                        last_field_end = Some(last_field_end.unwrap_or(0).max(end));
+                    }
+                }
+                // Insert after the last field declaration, or at the first
+                // method declaration if no fields exist.
+                match last_field_end {
+                    Some(end) => {
+                        // Skip past trailing whitespace/newlines to find the
+                        // actual insertion point.
+                        let tail = &source[end..];
+                        let skip = tail.chars().take_while(|c| c.is_whitespace()).count();
+                        end + skip
+                    }
+                    None => {
+                        // Fallback: find first method_declaration or first
+                        // constructor, insert before it.
+                        if let Ok(method_facts) = bbox_refactor::facts::file_query(
+                            &source_path,
+                            "(method_declaration) @method",
+                            None,
+                        ) {
+                            method_facts.captures.first()
+                                .map(|c| c.byte_start)
+                                .unwrap_or_else(|| source.rfind('}').unwrap_or(source.len()))
+                        } else {
+                            source.rfind('}').unwrap_or(source.len())
+                        }
+                    }
+                }
+            };
+
+            let sha = bbox_refactor::sha256_hex(source.as_bytes());
+            let changes = vec![json!({
+                "span": {
+                    "file": params.file,
+                    "byte_start": byte_offset,
+                    "byte_end": byte_offset,
+                    "content_sha256": sha,
+                },
+                "new_text": insert_text,
+            })];
+
+            let wrappers_added: Vec<&str> = sigs.iter()
+                .filter(|s| needs_wrappers.contains(&s.bare_name))
+                .map(|s| s.bare_name.as_str())
+                .collect();
+            ToolResult::Json(json!({
+                "changes": changes,
+                "wrappers_added": wrappers_added,
+                "stale_calls_remaining": [],
+                "provenance": "syntax_only",
+            }))
+        }).await
+    }
+}
+
 /// The `java.*` binding set.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
@@ -1959,6 +2233,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaExtractClassPreviewPlan) as Arc<dyn Tool>,
         Arc::new(JavaExtractMethodCodeBlock) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
+        Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
         Arc::new(JavaOrganizeImports) as Arc<dyn Tool>,
         Arc::new(JavaNormalizeWhitespace) as Arc<dyn Tool>,
         Arc::new(JavaHygiene) as Arc<dyn Tool>,
@@ -1972,7 +2247,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan — one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock — extract one contiguous code block into a helper method after analysis.methodRegions gates; removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan — one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock — extract one contiguous code block into a helper method after analysis.methodRegions gates; removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers — post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -1993,6 +2268,9 @@ declare const java: {
   organizeImports(args: { files: string[] }): Promise<JavaHygieneResult>;
   /** Conservative whitespace hygiene for touched files. Returns {changes} → edits.merge; [] means no whitespace edits. */
   normalizeWhitespace(args: { files: string[] }): Promise<JavaHygieneResult>;
+  /** Routine post-apply hygiene bundle: imports + whitespace by default. Returns {changes} → edits.merge; compile again if applied. */
+  /** Post-extract: synthesize delegating wrapper methods for moved helpers that still have same-class callers. Run after extractClass + apply, before first compile. */
+  synthesizeHelperWrappers(args: { file: string; target: string; delegateField: string; methods: string[] }): Promise<{ changes: SpanChange[]; wrappers_added: string[]; stale_calls_remaining: string[]; note?: string; provenance: "syntax_only" }>;
   /** Routine post-apply hygiene bundle: imports + whitespace by default. Returns {changes} → edits.merge; compile again if applied. */
   hygiene(args: { files: string[]; imports?: boolean; whitespace?: boolean }): Promise<JavaHygieneResult>;
 };"#
