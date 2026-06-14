@@ -119,3 +119,99 @@ Private recipe commit: `a369b7e34`.
 The calculation recipe is worth keeping, but the immediate next move is recipe
 refinement plus a small type-resolution construct, not another rerun of the same
 target. The probe already succeeded and exposed the ergonomic bottleneck.
+
+## Reprobe After Nested Regions And Resolved Types
+
+Second run after adding `includeNestedStatementRegions` and syntax-only
+`resolved_type` hints:
+
+- Probe task: `aa0647dd-9a3a-4eb6-83fe-62b688e54d0a`.
+- Retro task: `9e6ecce9-6dd1-422b-8365-596ab86455f9`.
+- Session: `fc516b86-b68e-41cd-9e23-f14b8486b4b3`.
+- Private recipe tip: `c73cc28cb` at dispatch; updated to `3c969f7b3` after
+  retro feedback.
+
+### Reprobe Outcome
+
+Extraction succeeded again on the same target shape: a nested Java calculation
+stage inside a large loop. The new tooling changed the path:
+
+1. Top-level `statementContains` returned the enclosing loop, as expected.
+2. `includeNestedStatementRegions:true` surfaced inner statement markers, which
+   were used to gate the exact range.
+3. `analysis.methodRegions` reported a clean contiguous block with one live-out,
+   no mutated captures, and no non-local control flow.
+4. `resolved_type` handled most `var` boundary facts automatically.
+5. Two `var` captures still lacked `resolved_type` because their RHS forms were
+   method-call/static-factory-like; the bro manually traced those types and
+   passed explicit `parameters`.
+6. `java.extractMethodCodeBlock` applied cleanly, then compile, hygiene, and
+   recompile all passed.
+
+The orchestrator independently reran the clean no-build-cache compile gate:
+`BUILD SUCCESSFUL in 2m 6s`.
+
+Behavior validation is still structural-only. There is no golden output for the
+numeric calculation stage.
+
+### Reprobe Measurements
+
+Pre-retro probe tool-use profile:
+
+- 39 total tool uses.
+- 15 `content_search`.
+- 11 `exec`.
+- 7 `file_read`.
+- 4 `shell_poll`.
+- 2 `shell_run`.
+
+Diff shape:
+
+- 1 Java file changed.
+- 70 insertions, 72 deletions.
+
+One real tool error occurred: the bro tried `content_search(...)` inside a
+code-mode exec cell. It recovered by using direct tool calls. This is recipe
+wording friction, not a failed refactor primitive.
+
+### Reprobe Retro Findings
+
+- `includeNestedStatementRegions:true` materially improved discovery. It did
+  not eliminate the exact range read, but it removed manual reasoning about
+  nested loop structure.
+- `resolved_type` materially improved `var` handling, but only for locally
+  derivable syntax forms. Method-call/static-factory RHS forms still require
+  manual tracing.
+- `analysis.methodRegions` still does not return exact range text, so
+  `oldText` requires a separate bounded read after gate acceptance.
+- Deep-nesting helper-body indentation residue reproduced after hygiene. This
+  keeps the formatting gap open.
+- Clean compile dominates wall-clock time; recompiles after hygiene should avoid
+  `clean` unless the first gate revealed generated-source/cache ambiguity.
+
+### Reprobe Recipe Changes Applied
+
+The private calculation prompt was updated after retro:
+
+- tell probes to call `content_search` directly rather than as a bare exec-cell
+  function;
+- name method-call/static-factory RHS tracing as the fallback when `resolved_type`
+  is absent;
+- state that a separate exact range read is required for `oldText`;
+- compile after hygiene without `clean` unless generated-source/cache ambiguity
+  was observed.
+
+### Gap Notes
+
+- New `gap-25ea6684`: resolve Java `var` types through method-call and
+  static-factory RHS patterns.
+- Updated `gap-5537d927`: direct line-range / exact range read ergonomics; this
+  reprobe still needed a separate read to produce `oldText`.
+- Updated `gap-e03f8661`: helper-body indentation residue reproduced.
+
+### Next Action
+
+Stop rerunning this exact calculation target until one of the remaining
+construct gaps changes. The highest-value next code construct is method-call /
+static-factory `var` type resolution; the most visible polish construct is
+helper-body indentation normalization.

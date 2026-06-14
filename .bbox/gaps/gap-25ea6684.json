@@ -1,0 +1,26 @@
+{
+  "id": "gap-25ea6684",
+  "title": "Resolve Java var types through method-call and static-factory RHS patterns",
+  "gap_kind": "refactor_primitive",
+  "domain": "refactor-tools/java",
+  "wanted_capability": "methodRegions should provide resolved_type for Java var declarations whose initializer is a method call or known static-factory pattern when a syntax/index-backed return type is available, so extract-method probes do not manually trace declaration sites and callee signatures.",
+  "missing_primitive": "Java var resolved_type for method-call RHS and known static factories",
+  "fallback_used": "Probe agent manually searched unresolved var declaration sites, traced a method return type, and inferred a known static factory return type before passing explicit helper parameters.",
+  "evidence": [
+    "thread-8d968b2d",
+    "probe task aa0647dd-9a3a-4eb6-83fe-62b688e54d0a",
+    "retro task 9e6ecce9-6dd1-422b-8365-596ab86455f9",
+    "session fc516b86-b68e-41cd-9e23-f14b8486b4b3"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/refactor-tools/java-var-method-call-resolution",
+  "notes": "Follow-on to gap-40d8c31a. Local syntax-only var resolution now covers simple literals/casts/constructors, but this reprobe still spent cells resolving method-call/static-factory RHS forms manually. Keep public notes generic; evidence came from a private Java calculation-stage probe.",
+  "resolution": "unresolved",
+  "task_id": "aa0647dd-9a3a-4eb6-83fe-62b688e54d0a",
+  "session_id": "fc516b86-b68e-41cd-9e23-f14b8486b4b3",
+  "provider": "deepseek",
+  "thread_id": "thread-8d968b2d",
+  "created_at": "2026-06-14T05:10:46Z",
+  "updated_at": "2026-06-14T05:10:46Z"
+}
