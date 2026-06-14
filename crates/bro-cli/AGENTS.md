@@ -93,6 +93,10 @@ verify shapes against code, but do not violate these without explicit design.
 - One Enter submits. No arm/confirm double-keypress patterns in the chat
   flow — typing a message is already deliberate. (Reserve arm-confirm for
   destructive bulk actions like prune.)
+- Roster/task state must distinguish provider failure from operator
+  interruption: daemon `Failed` renders as failed/error, while `Cancelled`
+  renders as interrupted. Collapsing both into "interrupted" hides transport
+  faults and makes live-probe failures look like user action.
 - Surface daemon error bodies (`{"error": …}`), never bare reqwest status
   lines ("HTTP status client error (400 …)" is a bug, not an error message).
 - The agent name defaults to the first-turn excerpt until renamed — never

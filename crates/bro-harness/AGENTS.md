@@ -62,6 +62,18 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
   `BRO_HOME`, so a leaked env var writes into the operator's real session
   store.
 
+## Responses transport
+
+- The Brodex/OpenAI Responses path owns two wire modes under one transport:
+  ChatGPT-OAuth uses the Codex-style Responses WebSocket first, while API-key
+  auth goes straight to HTTP-SSE. WebSocket transport faults are session-
+  permanent fallback to HTTP-SSE; `response.failed`/API errors are surfaced as
+  API failures, not replayed over HTTP to hide the real cause.
+- The transcript/input buffer is authoritative across WS -> HTTP fallback.
+  WebSocket turns commit to `ResponsesState` only after a terminal event parses
+  successfully; fallback full-replays from that pristine state. Do not add a
+  second conversation buffer or commit partial WS state before parse success.
+
 ## Cell bindings (`src/bindings/`)
 
 Dense leaf with its own AGENTS.md: `src/bindings/AGENTS.md` carries the
