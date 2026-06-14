@@ -3972,7 +3972,12 @@ mod constructor_param_clusters;
 pub(crate) use constructor_param_clusters::plan_cluster_inject_params_java;
 mod prune_ctor_params;
 pub use prune_ctor_params::{UnusedCtorParamsPlan, analyze_unused_constructor_params};
+mod hygiene;
 mod imports;
+pub use hygiene::{
+    java_hygiene_file, normalize_java_whitespace_file, normalize_java_whitespace_text,
+    organize_java_imports, organize_java_imports_text,
+};
 mod public_api_guard;
 use imports::*;
 pub(crate) use public_api_guard::plan_java_public_api_guard;

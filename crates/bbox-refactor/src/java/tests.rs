@@ -1257,7 +1257,17 @@ fn java_organize_imports_keeps_explicit_when_no_wildcard() {
     params.project_dir = Some(path_string(dir.path()));
     // When there's nothing to change the planner returns no edits;
     // accept either no plan-edits OR a plan that preserves the import.
-    let plan_text = plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+    let plan_text = match plan_java_lsp_organize_imports(&params, &PlanContext::default()) {
+        Ok(plan_text) => plan_text,
+        Err(err) => {
+            assert!(
+                err.to_string()
+                    .contains("no Java import organization edits needed"),
+                "{err:#}"
+            );
+            return;
+        }
+    };
     let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
     if let Some(file_edit) = plan.edits.first() {
         if let Some(edit) = file_edit.edits.first() {
@@ -1306,7 +1316,17 @@ fn g16_organize_imports_preserves_annotation_references() {
 
     let mut params = java_plan_params("java_lsp_organize_imports", &source);
     params.project_dir = Some(path_string(dir.path()));
-    let plan_text = plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+    let plan_text = match plan_java_lsp_organize_imports(&params, &PlanContext::default()) {
+        Ok(plan_text) => plan_text,
+        Err(err) => {
+            assert!(
+                err.to_string()
+                    .contains("no Java import organization edits needed"),
+                "{err:#}"
+            );
+            return;
+        }
+    };
     let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
     if let Some(edit) = plan.edits.first().and_then(|fe| fe.edits.first()) {
         assert!(
@@ -1365,7 +1385,17 @@ fn java_organize_imports_keeps_explicit_from_uncovered_package() {
 
     let mut params = java_plan_params("java_lsp_organize_imports", &source);
     params.project_dir = Some(path_string(dir.path()));
-    let plan_text = plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+    let plan_text = match plan_java_lsp_organize_imports(&params, &PlanContext::default()) {
+        Ok(plan_text) => plan_text,
+        Err(err) => {
+            assert!(
+                err.to_string()
+                    .contains("no Java import organization edits needed"),
+                "{err:#}"
+            );
+            return;
+        }
+    };
     let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
     if let Some(file_edit) = plan.edits.first() {
         if let Some(edit) = file_edit.edits.first() {

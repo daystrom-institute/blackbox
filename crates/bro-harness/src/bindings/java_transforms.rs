@@ -19,7 +19,7 @@
 //! `lsp_verified` Java kinds wait on jdtls in bro-lsp (v2 §7's named gate).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -212,6 +212,73 @@ fn relativize(root: &Path, path: &str) -> Result<String, String> {
         return Ok(rel.to_string_lossy().to_string());
     }
     Err(format!("plan touches `{path}` outside the worktree root"))
+}
+
+fn resolve_workspace_file(root: &Path, file: &str, tool: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(file);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "{tool}: file must be a workspace-relative path without `..`: {file}"
+        ));
+    }
+    Ok(root.join(rel))
+}
+
+fn file_edits_to_changes(
+    root: &Path,
+    tool: &str,
+    file_edits: &[bbox_refactor::FileEdit],
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let mut changes = Vec::new();
+    let mut changed_files = Vec::new();
+    for file_edit in file_edits {
+        let rel = relativize(root, &file_edit.path)?;
+        if !file_edit.edits.is_empty() {
+            let replacement_bytes: usize = file_edit
+                .edits
+                .iter()
+                .map(|edit| edit.replacement.len())
+                .sum();
+            changed_files.push(json!({
+                "path": rel,
+                "edit_count": file_edit.edits.len(),
+                "replacement_bytes": replacement_bytes,
+            }));
+        }
+        for edit in &file_edit.edits {
+            changes.push(json!({
+                "span": {
+                    "file": rel,
+                    "byte_start": edit.byte_start,
+                    "byte_end": edit.byte_end,
+                    "content_sha256": file_edit.original_sha256,
+                },
+                "new_text": edit.replacement,
+            }));
+        }
+    }
+    if changes.is_empty() {
+        tracing::debug!(tool, "java hygiene binding returned no changes");
+    }
+    Ok((changes, changed_files))
+}
+
+#[derive(Deserialize)]
+struct JavaFilesParams {
+    files: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct JavaHygieneParams {
+    files: Vec<String>,
+    #[serde(default)]
+    imports: Option<bool>,
+    #[serde(default)]
+    whitespace: Option<bool>,
 }
 
 /// `java.extractClass` — extract methods/fields from a Java class into a new
@@ -646,8 +713,13 @@ impl Tool for JavaDescribe {
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
+            "organizeImports" => ToolResult::Json(json!({ "contract": ORGANIZE_IMPORTS_CONTRACT })),
+            "normalizeWhitespace" => {
+                ToolResult::Json(json!({ "contract": NORMALIZE_WHITESPACE_CONTRACT }))
+            }
+            "hygiene" => ToolResult::Json(json!({ "contract": HYGIENE_CONTRACT })),
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, removeUnusedConstructorParams)"
+                "java.describe: unknown transform `{other}` (available: extractClass, removeUnusedConstructorParams, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -688,6 +760,68 @@ RECIPE
     await edits.merge({ es, changes: r.changes });
     await edits.apply({ es });
   } else { text(r.note); }"#;
+
+const ORGANIZE_IMPORTS_CONTRACT: &str = r#"java.organizeImports — prune/sort Java imports for touched files.
+
+WHAT IT DOES
+  Runs the syntax-only Java import hygiene planner on each workspace-relative
+  file. It keeps imports whose simple names are referenced by the AST, prunes
+  unused single-type and single-member static imports, preserves wildcard imports,
+  and adds uniquely-resolvable project-local type imports for simple names.
+
+WHY SYNTAX-ONLY
+  The code-mode binding does not currently carry a JDTLS session handle. This is
+  the same conservative heuristic used by extract-class target generation; it
+  returns hash-anchored edits for `edits.merge` and never writes.
+
+PARAMS  { files: string[] }   touched/created workspace-relative .java files
+RETURNS { changes, changed_files, findings, provenance }
+  changes: hash-anchored span changes for edits.merge; [] means no import edits.
+  findings: per-file no-change or changed summaries.
+
+RECIPE
+  const r = await java.organizeImports({ files: touchedFiles });
+  if (r.changes.length) { const es = await edits.begin(); await edits.merge({ es, changes: r.changes }); await edits.apply({ es }); }"#;
+
+const NORMALIZE_WHITESPACE_CONTRACT: &str = r#"java.normalizeWhitespace — conservative Java whitespace hygiene for touched files.
+
+WHAT IT DOES
+  Normalizes the small formatting residues common after generated Java
+  refactors: package/import/type spacing, excessive blank-line runs, trailing
+  whitespace, and one-space indentation drift on common statement/declaration
+  lines. It is intentionally not a full Java formatter.
+
+PARAMS  { files: string[] }   touched/created workspace-relative .java files
+RETURNS { changes, changed_files, findings, provenance }
+  changes: one whole-file hash-anchored change per changed file; [] means clean.
+
+RECIPE
+  Run after the semantic transform compiles. If changes are returned, apply them
+  and compile again."#;
+
+const HYGIENE_CONTRACT: &str = r#"java.hygiene — post-apply Java hygiene bundle for touched files.
+
+WHAT IT DOES
+  Runs import hygiene and whitespace hygiene in-memory per file, then returns at
+  most one whole-file change per changed file. This is the routine recipes should
+  call after the semantic transform applies and compiles.
+
+PARAMS
+  files: string[]       touched/created workspace-relative .java files
+  imports?: boolean     default true
+  whitespace?: boolean  default true
+
+RETURNS { changes, changed_files, findings, provenance }
+  findings includes per-file routines_applied; [] changes means no hygiene edits.
+
+RECIPE
+  const h = await java.hygiene({ files: touchedFiles });
+  if (h.changes.length) {
+    const es = await edits.begin();
+    await edits.merge({ es, changes: h.changes });
+    await edits.apply({ es });
+    // compile again
+  }"#;
 
 /// `java.removeUnusedConstructorParams` — drop `@Inject` constructor parameters
 /// left dead by a structural move (the injection-point cleanup that composes
@@ -777,11 +911,292 @@ impl Tool for JavaRemoveUnusedCtorParams {
     }
 }
 
+pub struct JavaOrganizeImports;
+
+#[async_trait]
+impl Tool for JavaOrganizeImports {
+    fn name(&self) -> &str {
+        "java.organizeImports"
+    }
+    fn description(&self) -> &str {
+        "Post-apply Java import hygiene for touched files. Syntax-only: prunes/sorts imports and adds uniquely-resolvable project-local imports. Returns {changes} for edits.merge; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Touched/created workspace-relative Java files."
+                }
+            },
+            "required": ["files"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "organizeImports".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaFilesParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.organizeImports: bad input — expected {{ files: string[] }}; {e}"
+                ));
+            }
+        };
+        if params.files.is_empty() {
+            return err("java.organizeImports: `files` must not be empty");
+        }
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let mut file_edits = Vec::new();
+            let mut findings = Vec::new();
+            for file in params.files {
+                let abs = match resolve_workspace_file(&root, &file, "java.organizeImports") {
+                    Ok(path) => path,
+                    Err(e) => return err(e),
+                };
+                match bbox_refactor::organize_java_imports(&root, &abs) {
+                    Ok(mut edits) if !edits.is_empty() => {
+                        findings.push(json!({
+                            "finding": "imports_changed",
+                            "file": file,
+                            "edit_count": edits.iter().map(|e| e.edits.len()).sum::<usize>(),
+                        }));
+                        file_edits.append(&mut edits);
+                    }
+                    Ok(_) => findings.push(json!({
+                        "finding": "no_import_changes",
+                        "file": file,
+                    })),
+                    Err(e) => return err(format!("java.organizeImports: {file}: {e:#}")),
+                }
+            }
+            let (changes, changed_files) =
+                match file_edits_to_changes(&root, "java.organizeImports", &file_edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.organizeImports: {e}")),
+                };
+            ToolResult::Json(json!({
+                "changes": changes,
+                "changed_files": changed_files,
+                "findings": findings,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
+pub struct JavaNormalizeWhitespace;
+
+#[async_trait]
+impl Tool for JavaNormalizeWhitespace {
+    fn name(&self) -> &str {
+        "java.normalizeWhitespace"
+    }
+    fn description(&self) -> &str {
+        "Conservative post-apply Java whitespace hygiene for touched files: package/import/type spacing, excessive blank lines, trailing whitespace, and one-space indentation drift. Returns {changes} for edits.merge; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Touched/created workspace-relative Java files."
+                }
+            },
+            "required": ["files"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "normalizeWhitespace".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaFilesParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.normalizeWhitespace: bad input — expected {{ files: string[] }}; {e}"
+                ));
+            }
+        };
+        if params.files.is_empty() {
+            return err("java.normalizeWhitespace: `files` must not be empty");
+        }
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let mut file_edits = Vec::new();
+            let mut findings = Vec::new();
+            for file in params.files {
+                let abs = match resolve_workspace_file(&root, &file, "java.normalizeWhitespace") {
+                    Ok(path) => path,
+                    Err(e) => return err(e),
+                };
+                match bbox_refactor::normalize_java_whitespace_file(&abs) {
+                    Ok(mut edits) if !edits.is_empty() => {
+                        findings.push(json!({
+                            "finding": "whitespace_changed",
+                            "file": file,
+                            "edit_count": edits.iter().map(|e| e.edits.len()).sum::<usize>(),
+                        }));
+                        file_edits.append(&mut edits);
+                    }
+                    Ok(_) => findings.push(json!({
+                        "finding": "no_whitespace_changes",
+                        "file": file,
+                    })),
+                    Err(e) => return err(format!("java.normalizeWhitespace: {file}: {e:#}")),
+                }
+            }
+            let (changes, changed_files) =
+                match file_edits_to_changes(&root, "java.normalizeWhitespace", &file_edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.normalizeWhitespace: {e}")),
+                };
+            ToolResult::Json(json!({
+                "changes": changes,
+                "changed_files": changed_files,
+                "findings": findings,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
+pub struct JavaHygiene;
+
+#[async_trait]
+impl Tool for JavaHygiene {
+    fn name(&self) -> &str {
+        "java.hygiene"
+    }
+    fn description(&self) -> &str {
+        "Routine post-apply Java hygiene bundle for touched files. Runs import hygiene and conservative whitespace hygiene in-memory, returns at most one whole-file {changes} entry per changed file for edits.merge; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Touched/created workspace-relative Java files."
+                },
+                "imports": {
+                    "type": "boolean",
+                    "description": "Run import hygiene. Default true."
+                },
+                "whitespace": {
+                    "type": "boolean",
+                    "description": "Run whitespace hygiene. Default true."
+                }
+            },
+            "required": ["files"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "hygiene".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaHygieneParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.hygiene: bad input — expected {{ files: string[], imports?: boolean, whitespace?: boolean }}; {e}"
+                ));
+            }
+        };
+        if params.files.is_empty() {
+            return err("java.hygiene: `files` must not be empty");
+        }
+        let imports = params.imports.unwrap_or(true);
+        let whitespace = params.whitespace.unwrap_or(true);
+        if !imports && !whitespace {
+            return err("java.hygiene: at least one of `imports` or `whitespace` must be true");
+        }
+        let mut routines_checked = Vec::new();
+        if imports {
+            routines_checked.push("organize_imports");
+        }
+        if whitespace {
+            routines_checked.push("normalize_whitespace");
+        }
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let mut file_edits = Vec::new();
+            let mut findings = Vec::new();
+            for file in params.files {
+                let abs = match resolve_workspace_file(&root, &file, "java.hygiene") {
+                    Ok(path) => path,
+                    Err(e) => return err(e),
+                };
+                match bbox_refactor::java_hygiene_file(&root, &abs, imports, whitespace) {
+                    Ok((mut edits, routines_applied)) if !edits.is_empty() => {
+                        findings.push(json!({
+                            "finding": "hygiene_changed",
+                            "file": file,
+                            "routines_applied": routines_applied,
+                            "edit_count": edits.iter().map(|e| e.edits.len()).sum::<usize>(),
+                        }));
+                        file_edits.append(&mut edits);
+                    }
+                    Ok((_edits, routines_applied)) => findings.push(json!({
+                        "finding": "no_hygiene_changes",
+                        "file": file,
+                        "routines_checked": routines_checked.clone(),
+                        "routines_applied": routines_applied,
+                    })),
+                    Err(e) => return err(format!("java.hygiene: {file}: {e:#}")),
+                }
+            }
+            let (changes, changed_files) =
+                match file_edits_to_changes(&root, "java.hygiene", &file_edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.hygiene: {e}")),
+                };
+            ToolResult::Json(json!({
+                "changes": changes,
+                "changed_files": changed_files,
+                "findings": findings,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// The `java.*` binding set.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(JavaExtractClass) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
+        Arc::new(JavaOrganizeImports) as Arc<dyn Tool>,
+        Arc::new(JavaNormalizeWhitespace) as Arc<dyn Tool>,
+        Arc::new(JavaHygiene) as Arc<dyn Tool>,
         Arc::new(JavaDescribe) as Arc<dyn Tool>,
     ]
 }
@@ -792,10 +1207,11 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); composes after extractClass+apply."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
+type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
@@ -803,6 +1219,12 @@ declare const java: {
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
+  /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
+  organizeImports(args: { files: string[] }): Promise<JavaHygieneResult>;
+  /** Conservative whitespace hygiene for touched files. Returns {changes} → edits.merge; [] means no whitespace edits. */
+  normalizeWhitespace(args: { files: string[] }): Promise<JavaHygieneResult>;
+  /** Routine post-apply hygiene bundle: imports + whitespace by default. Returns {changes} → edits.merge; compile again if applied. */
+  hygiene(args: { files: string[]; imports?: boolean; whitespace?: boolean }): Promise<JavaHygieneResult>;
 };"#
             .to_string(),
     }
@@ -864,6 +1286,10 @@ public class OrderService {
         }
     }
 
+    fn first_replacement(result: &Value) -> &str {
+        result["changes"][0]["new_text"].as_str().unwrap()
+    }
+
     #[tokio::test]
     async fn extract_class_returns_changes_creates_and_findings() {
         let dir = tempfile::tempdir().unwrap();
@@ -915,6 +1341,165 @@ public class OrderService {
             span["content_sha256"],
             bbox_refactor::sha256_hex(FIXTURE.as_bytes()),
             "{span}"
+        );
+    }
+
+    #[tokio::test]
+    async fn organize_imports_returns_import_hygiene_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Thing.java"),
+            r#"package com.acme;
+
+import java.util.Set;
+import java.util.List;
+public class Thing {
+    public List<String> list() {
+        return List.of();
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaOrganizeImports
+                .call(json!({ "files": ["src/com/acme/Thing.java"] }), &cx)
+                .await,
+        );
+        assert_eq!(result["provenance"], "syntax_only", "{result}");
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1, "{result}");
+        assert!(first_replacement(&result).contains("import java.util.List;"));
+        assert!(!first_replacement(&result).contains("Set"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn normalize_whitespace_returns_spacing_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Thing.java"),
+            r#"package com.acme;
+import java.util.List;
+public class Thing {
+    public Thing() {
+    }
+
+
+    public List<String> list() {
+         return List.of();
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaNormalizeWhitespace
+                .call(json!({ "files": ["src/com/acme/Thing.java"] }), &cx)
+                .await,
+        );
+        let rewritten = first_replacement(&result);
+        assert!(
+            rewritten.contains("package com.acme;\n\nimport java.util.List;\n\npublic class Thing"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("\n\n\n"), "{rewritten}");
+        assert!(
+            rewritten.contains("\n        return List.of();"),
+            "{rewritten}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hygiene_combines_import_and_whitespace_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Thing.java"),
+            r#"package com.acme;
+import java.util.Set;
+import java.util.List;
+public class Thing {
+    public Thing() {
+    }
+
+
+    public List<String> list() {
+         return List.of();
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaHygiene
+                .call(json!({ "files": ["src/com/acme/Thing.java"] }), &cx)
+                .await,
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1, "{result}");
+        assert_eq!(
+            result["findings"][0]["routines_applied"],
+            json!(["organize_imports", "normalize_whitespace"]),
+            "{result}"
+        );
+        let rewritten = first_replacement(&result);
+        assert!(!rewritten.contains("Set"), "{rewritten}");
+        assert!(
+            rewritten.contains("package com.acme;\n\nimport java.util.List;\n\npublic class Thing"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("\n\n\n"), "{rewritten}");
+        assert!(
+            rewritten.contains("\n        return List.of();"),
+            "{rewritten}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hygiene_noop_reports_checked_routines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Thing.java"),
+            r#"package com.acme;
+
+import java.util.List;
+
+public class Thing {
+    public List<String> list() {
+        return List.of();
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaHygiene
+                .call(json!({ "files": ["src/com/acme/Thing.java"] }), &cx)
+                .await,
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 0, "{result}");
+        assert_eq!(
+            result["findings"][0]["routines_checked"],
+            json!(["organize_imports", "normalize_whitespace"]),
+            "{result}"
+        );
+        assert_eq!(
+            result["findings"][0]["routines_applied"],
+            json!([]),
+            "{result}"
         );
     }
 

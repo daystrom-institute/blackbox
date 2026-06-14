@@ -669,7 +669,7 @@ pub(super) fn compute_java_organize_imports_edit(
     } else if start == end {
         format!("\n{}\n", sorted.join("\n"))
     } else {
-        sorted.join("\n")
+        format!("{}\n", sorted.join("\n"))
     };
     if source[start..end] == replacement {
         return Ok(None);
