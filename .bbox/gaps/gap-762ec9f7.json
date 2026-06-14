@@ -1,0 +1,21 @@
+{
+  "id": "gap-762ec9f7",
+  "title": "Expose Java extract-method as a code-mode java.* binding",
+  "gap_kind": "mcp_surface",
+  "domain": "refactor-tools",
+  "wanted_capability": "A code-mode namespace binding such as java.extractMethodCodeBlock({ file, range or oldText, methodName }) that returns edits.merge-compatible changes like java.extractClass, plus a focused java.describe contract for the transform.",
+  "missing_primitive": "java.extractMethodCodeBlock isolate binding",
+  "fallback_used": "The probe discovered and used the lower-level bbox_refactor_plan(kind=\"extract_java_code_block_to_method\") surface instead of a java.* binding.",
+  "evidence": [
+    "probe-monolithic-method-1",
+    "task:b37f3d64-a3ed-4e3a-928e-d984b4bfcafa"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/refactor-tools/java-extract-method-isolate-binding",
+  "notes": "Generic ergonomic gap: extractClass has a code-mode binding with contract text and edits payloads; extract-method currently requires the lower-level refactor-plan surface.",
+  "resolution": "unresolved",
+  "thread_id": "thread-8d968b2d",
+  "created_at": "2026-06-14T01:13:44Z",
+  "updated_at": "2026-06-14T01:13:44Z"
+}
