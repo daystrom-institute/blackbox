@@ -715,6 +715,83 @@ fn roster_shift_tab_cycles_next_provider() {
 }
 
 #[test]
+fn standalone_pre_prompt_shift_tab_cycles_next_provider() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let dir = tempfile::tempdir().unwrap();
+    let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
+    let mut app = App::new_with_mode(
+        orch,
+        None,
+        rt.handle().clone(),
+        AppMode::Standalone {
+            pending_resume: None,
+        },
+    );
+    app.composer_history_path = dir.path().join("composer_history.jsonl");
+    app.zone = Zone::SingleAgent;
+    assert!(app.agents.is_empty());
+    assert_eq!(app.next_provider, Provider::Brodex);
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+    );
+
+    assert_eq!(app.zone, Zone::SingleAgent);
+    assert_eq!(app.next_provider, Provider::VibeBh);
+    assert_eq!(
+        app.next_model.as_deref(),
+        default_model_for(Provider::VibeBh)
+    );
+    assert_eq!(
+        app.next_effort.as_deref(),
+        default_effort_for(Provider::VibeBh)
+    );
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+
+    assert_eq!(app.next_provider, Provider::Glm);
+}
+
+#[test]
+fn help_elides_back_to_roster_in_standalone_agent_mode() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let dir = tempfile::tempdir().unwrap();
+    let orch = std::sync::Arc::new(FleetOrchestrator::for_test(dir.path().join("fleet")));
+    let mut standalone = App::new_with_mode(
+        orch,
+        None,
+        rt.handle().clone(),
+        AppMode::Standalone {
+            pending_resume: None,
+        },
+    );
+    standalone.zone = Zone::SingleAgent;
+    let standalone_lines: Vec<String> = help_shortcut_lines(&standalone)
+        .iter()
+        .map(line_text)
+        .collect();
+    assert!(
+        !standalone_lines
+            .iter()
+            .any(|line| line.contains("back to roster")),
+        "{standalone_lines:?}"
+    );
+
+    let mut zoom = make_test_app(rt.handle());
+    zoom.zone = Zone::SingleAgent;
+    let zoom_lines: Vec<String> = help_shortcut_lines(&zoom).iter().map(line_text).collect();
+    assert!(
+        zoom_lines
+            .iter()
+            .any(|line| line.contains("back to roster")),
+        "{zoom_lines:?}"
+    );
+}
+
+#[test]
 fn splice_paste_keeps_multiline_as_one_buffer() {
     // The 16-phantom-dispatch regression: a multi-line paste must land as a
     // single composer buffer with embedded soft newlines, NOT one dispatch

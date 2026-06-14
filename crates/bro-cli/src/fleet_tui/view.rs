@@ -173,7 +173,35 @@ pub(super) fn draw_help_overlay(f: &mut Frame, app: &App) {
 pub(super) fn render_help_overlay(buf: &mut ratatui::buffer::Buffer, frame_area: Rect, app: &App) {
     use ratatui::widgets::Widget;
 
-    let shortcut_lines: Vec<Line<'static>> = match app.zone {
+    let shortcut_lines = help_shortcut_lines(app);
+    let h = (shortcut_lines.len() as u16 + 2).min(frame_area.height);
+    // Auto-fit width to the longest shortcut line (and the title), so no row is
+    // truncated regardless of zone. +4 = borders + trailing breathing room.
+    let title = " shortcuts — Esc to dismiss ";
+    let content_w = shortcut_lines
+        .iter()
+        .map(ratatui::text::Line::width)
+        .max()
+        .unwrap_or(40)
+        .max(title.chars().count());
+    let w = (content_w as u16 + 4).min(frame_area.width);
+    let area = centered_rect(w, h, frame_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " shortcuts — Esc to dismiss ",
+            Style::default().fg(Color::Cyan),
+        ));
+    Widget::render(Clear, area, buf);
+    let inner = block.inner(area);
+    Widget::render(&block, area, buf);
+    let para = Paragraph::new(shortcut_lines).style(Style::default().fg(Color::White));
+    Widget::render(para, inner, buf);
+}
+
+pub(super) fn help_shortcut_lines(app: &App) -> Vec<Line<'static>> {
+    match app.zone {
         Zone::Roster => vec![
             Line::from("  ↑/↓           navigate agents"),
             Line::from("  1-9           jump to agent row (index column)"),
@@ -190,6 +218,17 @@ pub(super) fn render_help_overlay(buf: &mut ratatui::buffer::Buffer, frame_area:
             Line::from("  /stop-running interrupt all running agents"),
             Line::from("  /closeout     fold selected worktree → target"),
             Line::from("  Ctrl+Q        quit (Esc never quits)"),
+        ],
+        Zone::SingleAgent if app.mode.is_standalone() => vec![
+            Line::from("  Esc           interrupt running turn"),
+            Line::from("  Ctrl+X        stop / delete agent"),
+            Line::from("  Ctrl+K        prune terminal agents"),
+            Line::from("  /stop-running interrupt all running agents"),
+            Line::from("  /closeout     fold this worktree → target"),
+            Line::from("  ↑/↓           recall input history"),
+            Line::from("  scroll        native — tmux / mouse / trackpad"),
+            Line::from("  mouse drag    select / copy transcript text"),
+            Line::from("  Ctrl+Q        quit"),
         ],
         Zone::SingleAgent => vec![
             Line::from("  ←             back to roster"),
@@ -230,31 +269,7 @@ pub(super) fn render_help_overlay(buf: &mut ratatui::buffer::Buffer, frame_area:
             Line::from("  →             back to models (no commit)"),
             Line::from("  Esc           cancel selector, restore selection"),
         ],
-    };
-    let h = (shortcut_lines.len() as u16 + 2).min(frame_area.height);
-    // Auto-fit width to the longest shortcut line (and the title), so no row is
-    // truncated regardless of zone. +4 = borders + trailing breathing room.
-    let title = " shortcuts — Esc to dismiss ";
-    let content_w = shortcut_lines
-        .iter()
-        .map(ratatui::text::Line::width)
-        .max()
-        .unwrap_or(40)
-        .max(title.chars().count());
-    let w = (content_w as u16 + 4).min(frame_area.width);
-    let area = centered_rect(w, h, frame_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " shortcuts — Esc to dismiss ",
-            Style::default().fg(Color::Cyan),
-        ));
-    Widget::render(Clear, area, buf);
-    let inner = block.inner(area);
-    Widget::render(&block, area, buf);
-    let para = Paragraph::new(shortcut_lines).style(Style::default().fg(Color::White));
-    Widget::render(para, inner, buf);
+    }
 }
 
 pub(super) fn draw_roster_body(

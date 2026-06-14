@@ -2694,6 +2694,13 @@ fn standalone_intro_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
+fn standalone_waiting_for_first_prompt(app: &App) -> bool {
+    app.mode.is_standalone()
+        && app.zone == Zone::SingleAgent
+        && app.agents.is_empty()
+        && app.input.is_empty()
+}
+
 fn page_scroll_step(app: &App) -> usize {
     app.last_transcript_height.max(1) as usize
 }
@@ -2778,12 +2785,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     app.prune_armed_until = None;
     // Completion carveouts: slash commands and roster @project aliases own Tab
     // and ↑/↓ while their menus are up. Otherwise Tab cycles roster tabs from
-    // home, Shift+Tab cycles the next roster dispatch provider, or Tab cycles
-    // the current provider / model / effort sub-selector level.
+    // home, Shift+Tab cycles the next dispatch provider (roster, plus the
+    // standalone pre-prompt shell), or Tab cycles the current provider / model /
+    // effort sub-selector level.
     let slash = slash_active(app);
     let project = project_active(app);
     let shift_tab = key.code == KeyCode::BackTab || (key.code == KeyCode::Tab && shift);
-    if shift_tab && !slash && !project && app.zone == Zone::Roster {
+    if shift_tab
+        && !slash
+        && !project
+        && (app.zone == Zone::Roster || standalone_waiting_for_first_prompt(app))
+    {
         cycle_provider(app, 1);
         return;
     }
