@@ -1793,11 +1793,85 @@ impl Tool for JavaExtractClassPreviewPlan {
                 }
             }
 
+            // 5. Private helper dependency check: moved methods may call
+            //    private helpers that are NOT in the move set. These produce
+            //    compile failures after extract unless the helpers are also
+            //    moved or the calls are routed through the delegate.
+            let mut internal_helper_deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            if !params.methods.is_empty() && !resolved_methods.is_empty() {
+                // Query method invocations in the source file.
+                if let Ok(file_facts) = bbox_refactor::facts::file_query(
+                    &path,
+                    "(method_invocation name: (identifier) @call) @invoc",
+                    None,
+                ) {
+                    let moved_bare: BTreeSet<&str> = params.methods.iter()
+                        .map(|m| m.split('(').next().unwrap_or(m))
+                        .collect();
+                    // For each invocation, check if the called name is a moved
+                    // method — we need the inverse: what non-moved helpers do
+                    // moved methods call? We approximate by collecting all
+                    // invocations in moved methods' byte ranges.
+                    // Simpler: collect all method invocations, then check
+                    // which call targets are referenced by moved methods but
+                    // not in the move set.
+                    let mut moved_method_ranges: Vec<(usize, usize, String)> = Vec::new();
+                    // Re-query for method declarations to get byte ranges
+                    // and the set of all source method names.
+                    let mut source_method_names: BTreeSet<String> = BTreeSet::new();
+                    if let Ok(method_facts) = bbox_refactor::facts::file_query(
+                        &path,
+                        "(method_declaration name: (identifier) @name) @method",
+                        None,
+                    ) {
+                        for cap in &method_facts.captures {
+                            if cap.capture == "name" {
+                                source_method_names.insert(cap.text.clone());
+                                if moved_bare.contains(cap.text.as_str()) {
+                                    if let Some(method_cap) = method_facts.captures.iter()
+                                        .find(|mc| mc.capture == "method"
+                                            && mc.byte_start <= cap.byte_start
+                                            && mc.byte_end >= cap.byte_end)
+                                    {
+                                        moved_method_ranges.push((
+                                            method_cap.byte_start, method_cap.byte_end,
+                                            cap.text.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (start, end, moved_name) in &moved_method_ranges {
+                        let mut called: BTreeSet<String> = BTreeSet::new();
+                        for cap in &file_facts.captures {
+                            if cap.capture == "call"
+                                && cap.byte_start >= *start
+                                && cap.byte_end <= *end
+                                && !moved_bare.contains(cap.text.as_str())
+                            {
+                                called.insert(cap.text.clone());
+                            }
+                        }
+                        if !called.is_empty() {
+                            let source_helpers: Vec<String> = called
+                                .into_iter()
+                                .filter(|c| source_method_names.contains(c.as_str()))
+                                .collect();
+                            if !source_helpers.is_empty() {
+                                internal_helper_deps.insert(
+                                    moved_name.clone(),
+                                    source_helpers,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             let blockers: Vec<&str> = {
                 let mut b: Vec<&str> = Vec::new();
                 if !overloads.is_empty() {
-                    // Overloads are resolved now (signature-qualified names), but
-                    // flag if resolution produced ambiguous results.
                     for sigs in overloads.values() {
                         if sigs.len() > 1 {
                             b.push("overload_multiple_signatures");
@@ -1810,6 +1884,9 @@ impl Tool for JavaExtractClassPreviewPlan {
                 }
                 if !non_injectable_mutable.is_empty() {
                     b.push("non_injectable_mutable_fields");
+                }
+                if !internal_helper_deps.is_empty() {
+                    b.push("internal_helper_dependencies");
                 }
                 b
             };
@@ -1829,6 +1906,7 @@ impl Tool for JavaExtractClassPreviewPlan {
                 "external_callers": external_callers,
                 "has_external_callers": has_external_callers,
                 "non_injectable_mutable": non_injectable_mutable,
+                "internal_helper_deps": internal_helper_deps,
                 "wiring_recommendation": wiring_recommendation,
                 "ready": ready,
                 "blockers": blockers,
@@ -1869,7 +1947,7 @@ declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Preflight a java.extractClass seam: overloads, field closure, external callers, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
-  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
+  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
