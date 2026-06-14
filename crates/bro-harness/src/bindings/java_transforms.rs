@@ -767,6 +767,8 @@ impl Tool for JavaExtractMethodCodeBlock {
                         " — run analysis.methodRegions on this candidate range to inspect live_outs; if each live-out is a real top-level output with an explicit type, re-call with resultRecord: true, otherwise pick a smaller block"
                     } else if msg.contains("result_record_live_out_not_visible") {
                         " — resultRecord can only return locals visible at the helper return site; widen the range to include the declaring scope or pick top-level statements"
+                    } else if msg.contains("inferred_capture_parameter_type") {
+                        " — Java helper parameters cannot use `var`/inferred types; resolve the captured declaration type and re-call with explicit parameters/arguments"
                     } else if msg.contains("result_record_inferred_type") {
                         " — resultRecord requires explicit Java component types; avoid `var` live-outs or provide a typed boundary manually"
                     } else if msg.contains("mutated_capture") {
@@ -909,7 +911,9 @@ WHAT IT DOES
   and infers void vs one returned live-out variable. Generated helper insertion
   preserves call-site indentation, method spacing, and moved-body relative
   indentation; still run java.hygiene after apply for imports and file-level
-  whitespace.
+  whitespace. If an inferred captured parameter type is `var` / inferred, the
+  planner refuses before edits; pass explicit parameters/arguments after
+  resolving the declaration type.
 
 PARAMS
   file: string          workspace-relative .java file
@@ -951,6 +955,9 @@ REFUSALS
                                     a requested record component is not visible
                                     at the generated helper return site
   error.result_record_inferred_type requested record component has `var`/inferred type
+  error.inferred_capture_parameter_type
+                                    inferred helper parameter has `var`/inferred type;
+                                    pass explicit parameters/arguments
   error.non_local_control_flow      return/break/continue would cross the extraction boundary
   oldText match failures            selected text must match exactly once
 

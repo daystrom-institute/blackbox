@@ -9454,6 +9454,69 @@ fn extract_code_block_infers_single_capture_without_operator_help() {
 }
 
 #[test]
+fn extract_code_block_refuses_var_capture_parameter_without_operator_help() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarCapture.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class VarCapture {\n\
+         \x20   void run() {\n\
+         \x20       var names = java.util.List.of(\"a\");\n\
+         \x20       System.out.println(names);\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(names);".to_string());
+    params.module_name = Some("logNames".to_string());
+
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("inferred_capture_parameter_type(names)"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn extract_code_block_allows_explicit_type_for_var_capture_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("VarCaptureOverride.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class VarCaptureOverride {\n\
+         \x20   void run() {\n\
+         \x20       var names = java.util.List.of(\"a\");\n\
+         \x20       System.out.println(names);\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(names);".to_string());
+    params.module_name = Some("logNames".to_string());
+    params.parameters = Some(vec![JavaParameterSpec {
+        type_name: "java.util.List<String>".to_string(),
+        name: "names".to_string(),
+    }]);
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &path);
+    assert!(
+        rewritten.contains("private void logNames(java.util.List<String> names)"),
+        "{rewritten}"
+    );
+    assert!(rewritten.contains("logNames(names);"), "{rewritten}");
+}
+
+#[test]
 fn extract_code_block_infers_void_when_no_return_needed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Side.java");

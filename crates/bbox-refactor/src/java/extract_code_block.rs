@@ -224,6 +224,18 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
             }
             _ => (inferred_params, inferred_args),
         };
+    for (type_text, name) in &effective_params {
+        if is_inferred_java_type(type_text) {
+            bail!(
+                "error.inferred_capture_parameter_type({}): captured helper parameter `{}` has \
+                 inferred type `{}`; Java helper method parameters require explicit types. \
+                 Resolve the declaration type and pass operator-supplied parameters/arguments.",
+                name,
+                name,
+                type_text.trim()
+            );
+        }
+    }
 
     // -----------------------------------------------------------------
     // Return type — infer from inner_decls_used_after (single var) or
@@ -655,7 +667,7 @@ fn build_result_record_plan(
             );
         }
         let type_text = decl.type_text.trim();
-        if type_text == "var" || type_text == "<inferred>" || type_text.is_empty() {
+        if is_inferred_java_type(type_text) {
             bail!(
                 "error.result_record_inferred_type({}): live-out `{}` has inferred type `{}`; \
                  result-record generation requires explicit component types",
@@ -686,6 +698,11 @@ fn build_result_record_plan(
         var_name,
         components,
     })
+}
+
+fn is_inferred_java_type(type_text: &str) -> bool {
+    let trimmed = type_text.trim();
+    trimmed.is_empty() || trimmed == "var" || trimmed == "<inferred>"
 }
 
 fn live_out_decls_in_declaration_order<'a>(
