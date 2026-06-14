@@ -2404,14 +2404,15 @@ where
         let prev_top = prev_vp.map(|p| p.y);
         prev_vp = Some(viewport);
         terminal.set_viewport_area(viewport);
-        if vp_changed {
-            // Viewport moved/resized: clear stale terminal rows it no longer
-            // occupies / now covers. When history was committed THIS frame,
-            // insert_history wrote it into rows above the new top, so clear
-            // only from the new top down (never wipe that history). On a pure
-            // shrink with no commit, the vacated band above the new top holds
-            // only old composer/active rows — clear from the OLD top so the
-            // stale rows (e.g. a leftover composer border) are wiped too.
+        if vp_changed || prev_vp.is_none() {
+            // Viewport moved/resized, or first frame: clear stale terminal
+            // rows it no longer occupies / now covers. When history was
+            // committed THIS frame, insert_history wrote it into rows above
+            // the new top, so clear only from the new top down (never wipe
+            // that history). On a pure shrink with no commit, the vacated
+            // band above the new top holds only old composer/active rows —
+            // clear from the OLD top so the stale rows (e.g. a leftover
+            // composer border) are wiped too.
             let clear_y = if committed_now {
                 viewport.y
             } else {
@@ -5166,7 +5167,7 @@ fn single_agent_composer_bottom_titles(
             let readout = format_token_readout(tokens, threshold);
             right.push(Span::styled(
                 format!("  {readout} "),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::White),
             ));
         }
         titles.push(Line::from(right).right_aligned());
