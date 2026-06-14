@@ -1,0 +1,23 @@
+{
+  "id": "gap-e0ae3e7d",
+  "title": "Harness file-tool scope is permanently bound to launch worktree; in-session `git worktree add` produces an unreachable dir",
+  "gap_kind": "tooling",
+  "domain": "harness/sandbox",
+  "wanted_capability": "File-mutation and read tools (`file_read`, `file_edit`, `file_write`, `code.*`, `analysis.*`, `java.*`) can operate in a worktree other than the session's `launch_root`. Today, `git worktree add <somewhere>` from within a session leaves `<somewhere>` stranded — every standard tool returns `path escapes worktree root`, and the only operator workaround is to spawn a fresh dispatch.",
+  "missing_primitive": "A session-scoped `sandbox_worktree_enter` / `sandbox_set_root` primitive that re-binds the file-mutation and read scopes (file_read/edit/write, code.*, analysis.*, java.*) to a different worktree path. Currently `sandbox_status(root=…)` only inspects, it doesn't switch.",
+  "fallback_used": "Stopped and asked the operator to choose between (1) branch-in-main-worktree (loses disk isolation) and (2) spawn a fresh sub-agent in the new worktree (heavyweight for a small fix). Operator picked (1).",
+  "evidence": [
+    "task:f2f66c28-6df5-4b56-980c-b03659940efa",
+    "session:231cdfca-6687-4280-9801-c821bf261683",
+    "file:prompts/RETRO_HARNESS.md",
+    "file:friction/2026-June-13-0840pm-worktree-containment-issues.md"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/harness/worktree-session-scope",
+  "notes": "The on-disk worktree is stranded but visible to `sandbox_status` and `git worktree list`. The harness's `launch_root` is permanent for the session. The 'fresh starting place' is achievable on a new branch in the main worktree, but the operator's \"new worktree\" framing implies a separate disk directory, which the tool surface can't reach. Either the tool surface needs a switch primitive, or the operator-facing language (\"worktree\" vs \"branch\") needs a sharp distinction in the daily-cleaning / closeout docs.",
+  "resolution": "unresolved",
+  "task_id": "f2f66c28-6df5-4b56-980c-b03659940efa",
+  "created_at": "2026-06-14T02:41:36Z",
+  "updated_at": "2026-06-14T02:41:36Z"
+}
