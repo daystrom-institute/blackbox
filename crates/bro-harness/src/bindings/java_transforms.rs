@@ -281,6 +281,48 @@ struct JavaHygieneParams {
     whitespace: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct JavaExtractMethodCodeBlockParams {
+    file: String,
+    #[serde(rename = "oldText", alias = "old_text")]
+    old_text: String,
+    #[serde(
+        rename = "methodName",
+        alias = "method_name",
+        alias = "helperName",
+        alias = "helper_name"
+    )]
+    method_name: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default, rename = "newText", alias = "new_text")]
+    new_text: Option<String>,
+    #[serde(default)]
+    parameters: Option<Vec<JavaExtractMethodParam>>,
+    #[serde(default)]
+    arguments: Option<Vec<String>>,
+    #[serde(default, rename = "returnType", alias = "return_type")]
+    return_type: Option<String>,
+    #[serde(default, rename = "returnVar", alias = "return_var")]
+    return_var: Option<String>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct JavaExtractMethodParam {
+    #[serde(rename = "type", alias = "typeName", alias = "type_name")]
+    type_name: String,
+    name: String,
+}
+
 /// `java.extractClass` — extract methods/fields from a Java class into a new
 /// delegate class, with capture analysis and source-side wiring.
 pub struct JavaExtractClass;
@@ -595,6 +637,165 @@ impl Tool for JavaExtractClass {
     }
 }
 
+/// `java.extractMethodCodeBlock` — extract one contiguous Java statement
+/// range into a private helper method.
+pub struct JavaExtractMethodCodeBlock;
+
+#[async_trait]
+impl Tool for JavaExtractMethodCodeBlock {
+    fn name(&self) -> &str {
+        "java.extractMethodCodeBlock"
+    }
+    fn description(&self) -> &str {
+        "Extract one exact contiguous Java code block from a method body into a helper method. Thin code-mode binding over extract_java_code_block_to_method: infers captures, arguments, and zero/one return value; refuses mutated captures, multiple live-outs, and non-local control flow. Returns hash-anchored {changes} for edits.merge — never writes. Run analysis.methodRegions first for contiguity/live-out gates."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative Java source file." },
+                "oldText": { "type": "string", "description": "Exact contiguous source text to extract. Must match exactly once." },
+                "methodName": { "type": "string", "description": "Name of the new helper method." },
+                "className": { "type": "string", "description": "Optional enclosing class name when the file has multiple classes." },
+                "visibility": { "type": "string", "enum": ["private", "package-private", "protected", "public"], "description": "Helper visibility. Default private." },
+                "newText": { "type": "string", "description": "Optional explicit call-site replacement. Usually omit and let the planner synthesize it." },
+                "parameters": { "type": "array", "items": { "type": "object", "properties": { "type": { "type": "string" }, "name": { "type": "string" } }, "required": ["type", "name"] }, "description": "Optional operator override for helper parameters. Omit to infer captures." },
+                "arguments": { "type": "array", "items": { "type": "string" }, "description": "Optional argument override aligned with parameters." },
+                "returnType": { "type": "string", "description": "Optional return type override. Omit to infer void or one live-out variable." },
+                "returnVar": { "type": "string", "description": "Optional return variable name override." },
+                "previewOnly": { "type": "boolean", "description": "Run the planner but omit edit payloads; returns would_change_files and findings." }
+            },
+            "required": ["file", "oldText", "methodName"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "extractMethodCodeBlock".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaExtractMethodCodeBlockParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.extractMethodCodeBlock: bad input — expected {{ file, oldText, methodName, className?, visibility?, previewOnly? }}; {e}"
+                ));
+            }
+        };
+        if params.old_text.trim().is_empty() {
+            return err("java.extractMethodCodeBlock: `oldText` must be non-empty");
+        }
+        if params.method_name.trim().is_empty() {
+            return err("java.extractMethodCodeBlock: `methodName` must be non-empty");
+        }
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let mut plan_input = json!({
+                "kind": "extract_java_code_block_to_method",
+                "source": params.file,
+                "project_dir": root.to_string_lossy(),
+                "old_text": params.old_text,
+                "module_name": params.method_name,
+            });
+            if let Some(class_name) = params.class_name {
+                plan_input["impl_name"] = json!(class_name);
+            }
+            if let Some(visibility) = params.visibility {
+                plan_input["visibility"] = json!(visibility);
+            }
+            if let Some(new_text) = params.new_text {
+                plan_input["new_text"] = json!(new_text);
+            }
+            if let Some(parameters) = params.parameters {
+                plan_input["parameters"] = json!(
+                    parameters
+                        .into_iter()
+                        .map(|param| json!({ "type": param.type_name, "name": param.name }))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let mut toml_entries = serde_json::Map::new();
+            if let Some(arguments) = params.arguments {
+                toml_entries.insert("arguments".to_string(), json!(arguments));
+            }
+            if let Some(return_type) = params.return_type {
+                toml_entries.insert("return_type".to_string(), json!(return_type));
+            }
+            if let Some(return_var) = params.return_var {
+                toml_entries.insert("return_var".to_string(), json!(return_var));
+            }
+            if !toml_entries.is_empty() {
+                plan_input["toml_entries"] = Value::Object(toml_entries);
+            }
+
+            let plan_params: bbox_refactor::RefactorPlanParams =
+                match serde_json::from_value(plan_input) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return err(format!(
+                            "java.extractMethodCodeBlock: internal param shape: {e}"
+                        ));
+                    }
+                };
+            let plan_json = match bbox_refactor::plan(&plan_params) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let hint = if msg.contains("multi_return_needs_record") {
+                        " — run analysis.methodRegions on this candidate range to inspect live_outs, then pick a smaller block or wait for record/result-object generation"
+                    } else if msg.contains("mutated_capture") {
+                        " — run analysis.methodRegions to see mutated captures before choosing a smaller range"
+                    } else if msg.contains("non_local_control_flow") {
+                        " — run analysis.methodRegions to locate the return/break/continue gate before mutating"
+                    } else {
+                        ""
+                    };
+                    return err(format!("java.extractMethodCodeBlock: {msg}{hint}"));
+                }
+            };
+            let plan: bbox_refactor::RefactorPlan = match serde_json::from_str(&plan_json) {
+                Ok(p) => p,
+                Err(e) => return err(format!("java.extractMethodCodeBlock: plan decode: {e}")),
+            };
+            if plan.plan_status != bbox_refactor::PlanStatus::Planned {
+                return err(format!(
+                    "java.extractMethodCodeBlock: planner returned {:?} — {}",
+                    plan.plan_status,
+                    plan.leftovers.join("; ")
+                ));
+            }
+            let (mut changes, changed_files) =
+                match file_edits_to_changes(&root, "java.extractMethodCodeBlock", &plan.edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.extractMethodCodeBlock: {e}")),
+                };
+            let preview_only = params.preview_only.unwrap_or(false);
+            if preview_only {
+                changes.clear();
+            }
+            let findings = plan
+                .leftovers
+                .iter()
+                .map(|note| json!({ "finding": "note", "detail": note }))
+                .collect::<Vec<_>>();
+            ToolResult::Json(json!({
+                "title": plan.title,
+                "changes": changes,
+                "findings": findings,
+                "preview_only": preview_only,
+                "would_change_files": changed_files,
+                "fixme_count": plan.fixme_count.as_ref().map(|f| f.plan_only + f.warning).unwrap_or(0),
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -677,6 +878,61 @@ RECIPE (one cell; locals do NOT survive across cells — store() anything you ne
   const applied = await edits.apply({ es });   // tree-sitter validates both files; bounces roll back
   // then compile-gate via shell (e.g. ./gradlew :module:compileJava) and report"#;
 
+const EXTRACT_METHOD_CODE_BLOCK_CONTRACT: &str = r#"java.extractMethodCodeBlock — extract one contiguous Java code block into a helper method.
+
+WHAT IT DOES
+  Thin code-mode binding over the existing extract_java_code_block_to_method
+  planner. It extracts one exact contiguous statement range from inside a Java
+  method/constructor body, infers captured locals/params as helper parameters,
+  and infers void vs one returned live-out variable.
+
+PARAMS
+  file: string          workspace-relative .java file
+  oldText: string       exact contiguous source text to extract; must match once
+  methodName: string    new helper method name
+  className?: string    optional enclosing class when the file has multiple classes
+  visibility?: "private" | "package-private" | "protected" | "public"
+                        default private
+  newText?: string      explicit call-site replacement; usually omit
+  parameters?: Array<{ type: string, name: string }>
+                        override inferred helper params; usually omit
+  arguments?: string[]  override call-site args aligned with parameters
+  returnType?: string   override inferred return type
+  returnVar?: string    override inferred return variable name
+  previewOnly?: boolean run the planner but return [] changes and only summaries/findings
+
+RETURNS { title, changes, findings, preview_only, would_change_files, fixme_count, provenance }
+  changes: hash-anchored {span,new_text}[] for edits.merge
+  findings: planner notes such as enclosing method/static helper facts
+  would_change_files: edit summaries; present in both preview and normal mode
+
+REFUSALS
+  error.mutated_capture(name)       selected range mutates a captured local/param
+  error.multi_return_needs_record   more than one local declared inside is read after
+  error.non_local_control_flow      return/break/continue would cross the extraction boundary
+  oldText match failures            selected text must match exactly once
+
+RECIPE
+  // First run the gate. Do not skip this on long/monolithic methods.
+  const gate = await analysis.methodRegions({
+    file, method: "buildView", className: "View",
+    ranges: [{ label: "candidate", startLine: 120, endLine: 155 }]
+  });
+  const r = gate.requested_ranges[0];
+  if (!gate.requested_contiguous || !r.extractability.can_extract_with_current_tool) {
+    text({ stop_reasons: r.extractability.stop_reasons, live_outs: r.live_outs });
+    exit();
+  }
+  // Then read the exact accepted range and pass it as oldText.
+  const x = await java.extractMethodCodeBlock({
+    file, oldText, methodName: "buildControls", className: "View"
+  });
+  const es = await edits.begin();
+  await edits.merge({ es, changes: x.changes });
+  await edits.apply({ es });
+  // compile, java.hygiene({ files: [file] }), compile again if hygiene changed
+"#;
+
 #[async_trait]
 impl Tool for JavaDescribe {
     fn name(&self) -> &str {
@@ -710,6 +966,9 @@ impl Tool for JavaDescribe {
             .unwrap_or_default();
         match transform {
             "extractClass" => ToolResult::Json(json!({ "contract": EXTRACT_CLASS_CONTRACT })),
+            "extractMethodCodeBlock" => {
+                ToolResult::Json(json!({ "contract": EXTRACT_METHOD_CODE_BLOCK_CONTRACT }))
+            }
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -719,7 +978,7 @@ impl Tool for JavaDescribe {
             }
             "hygiene" => ToolResult::Json(json!({ "contract": HYGIENE_CONTRACT })),
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, removeUnusedConstructorParams, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractMethodCodeBlock, removeUnusedConstructorParams, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -1193,6 +1452,7 @@ impl Tool for JavaHygiene {
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(JavaExtractClass) as Arc<dyn Tool>,
+        Arc::new(JavaExtractMethodCodeBlock) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaOrganizeImports) as Arc<dyn Tool>,
         Arc::new(JavaNormalizeWhitespace) as Arc<dyn Tool>,
@@ -1207,16 +1467,19 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractMethodCodeBlock — extract one contiguous code block into a helper method after analysis.methodRegions gates; removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
+type JavaExtractMethodResult = { title: string; changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
+  /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures, multiple live-outs, and non-local control flow. */
+  extractMethodCodeBlock(args: { file: string; oldText: string; methodName: string; className?: string; visibility?: "private" | "package-private" | "protected" | "public"; newText?: string; parameters?: Array<{ type: string; name: string }>; arguments?: string[]; returnType?: string; returnVar?: string; previewOnly?: boolean }): Promise<JavaExtractMethodResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -1342,6 +1605,103 @@ public class OrderService {
             bbox_refactor::sha256_hex(FIXTURE.as_bytes()),
             "{span}"
         );
+    }
+
+    #[tokio::test]
+    async fn extract_method_code_block_returns_merge_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Auto.java"),
+            "package com.acme;\n\
+             class Auto {\n\
+            \x20   int compute(int seed) {\n\
+            \x20       int doubled = seed * 2;\n\
+            \x20       return doubled;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractMethodCodeBlock
+                .call(
+                    json!({
+                        "file": "src/com/acme/Auto.java",
+                        "oldText": "int doubled = seed * 2;",
+                        "methodName": "doubleIt",
+                        "className": "Auto"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(result["provenance"], "syntax_only", "{result}");
+        assert_eq!(result["preview_only"], false, "{result}");
+        let changes = result["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2, "{result}");
+        let replacements = changes
+            .iter()
+            .map(|change| change["new_text"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            replacements.contains("int doubled = doubleIt(seed);"),
+            "{replacements}"
+        );
+        assert!(
+            replacements.contains("private int doubleIt(int seed)"),
+            "{replacements}"
+        );
+        assert!(
+            result["would_change_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"] == "src/com/acme/Auto.java"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_method_code_block_multi_live_out_error_points_to_region_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/Multi.java"),
+            "class Multi {\n\
+            \x20   int run() {\n\
+            \x20       int a = 1;\n\
+            \x20       int b = 2;\n\
+            \x20       return a + b;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = JavaExtractMethodCodeBlock
+            .call(
+                json!({
+                    "file": "src/Multi.java",
+                    "oldText": "int a = 1;\n        int b = 2;",
+                    "methodName": "prep"
+                }),
+                &cx,
+            )
+            .await;
+
+        match result {
+            ToolResult::Error(e) => {
+                assert!(e.contains("multi_return_needs_record"), "{e}");
+                assert!(e.contains("analysis.methodRegions"), "{e}");
+            }
+            other => panic!("expected multi-live-out refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

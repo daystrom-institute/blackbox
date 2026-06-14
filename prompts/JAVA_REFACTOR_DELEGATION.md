@@ -43,12 +43,22 @@ restate them:
   split, and capped examples without materializing full capture payloads. Use it
   before extraction to decide whether `wrappers: true` is needed, and for cheap
   blast-radius checks. `analysis.describe`.
+- **`analysis.methodRegions({ file, method, className?, ranges? })`** — the
+  long-method region gate. Returns top-level statement regions and optional
+  candidate-range facts: captures, live-outs, field touches, lambdas/listeners,
+  non-local control flow, and `extractability.stop_reasons`. Use this before
+  extract-method work; do not reconstruct live-outs by hand.
 - **`java.extractClass({ file, target, delegateField, methods, moveFields?,
   wrappers?, previewOnly? })`** — moves methods + fields into a new delegate
   class, synthesizes both sides, returns `{ changes, creates, findings,
   dependency_projection }` for the edits algebra. `previewOnly` runs the same
   planner but omits heavy edit payloads so a risky seam can be inspected before
   applying. `java.describe({ transform: "extractClass" })`.
+- **`java.extractMethodCodeBlock({ file, oldText, methodName, className? })`**
+  — extracts one exact contiguous Java code block into a helper method. Run
+  `analysis.methodRegions` first; if the candidate is non-contiguous, has
+  multiple live-outs, mutates captures, or crosses return/break/continue, stop
+  and report the missing construct rather than hand-editing a helper.
 - **`java.removeUnusedConstructorParams({ file })`** — drops dead `@Inject`
   constructor params left after an extract strands a dependency (moves the
   injection point). Returns `{ changes, ... }`. `java.describe`.
@@ -98,7 +108,29 @@ god class":
    transform. `java.removeUnusedConstructorParams({ file })` runs
    **after** the extract is applied — the orphaned `this.dep = dep` must already
    be gone for the param to read as unused. Re-compile if hygiene changes
-   anything.
+anything.
+
+## Monolithic method extraction flow
+
+For "extract one stage from a giant method", use this smaller flow instead of
+the class-decomposition flow:
+
+1. `analysis.methodRegions({ file, method, className })` for a compact method
+   map. Pick one candidate by `line_range`/`preview`, not by dumping the whole
+   method into the cell.
+2. Re-run `analysis.methodRegions` with one exact candidate range. Treat the
+   returned gates as authoritative:
+   - `requested_contiguous` must be true for today's one-block extractor.
+   - `extractability.can_extract_with_current_tool` must be true.
+   - `live_outs.length <= 1`; more means record/result-object generation is
+     missing.
+3. If gates pass, bounded-read the exact range and call
+   `java.extractMethodCodeBlock({ file, oldText, methodName, className })`.
+4. Apply via `edits.merge → edits.apply`, compile, `java.hygiene({ files:
+   [file] })`, and compile again if hygiene changed anything.
+5. If gates fail, stop with the `stop_reasons`, `live_outs`, and candidate
+   ranges. Do not hand-build a record object or discontiguous helper inside a
+   probe.
 
 The load-bearing mutation cell shape:
 

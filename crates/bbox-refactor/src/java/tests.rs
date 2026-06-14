@@ -9677,6 +9677,78 @@ fn extract_java_code_block_to_method_arguments_default_to_param_names() {
 }
 
 #[test]
+fn method_regions_reports_live_outs_and_field_touches_for_candidate_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Stage.java");
+    let source = "package p;\n\
+         class Stage {\n\
+         \x20   private int count;\n\
+         \x20   void build(int seed) {\n\
+         \x20       int first = seed + 1;\n\
+         \x20       int second = first + count;\n\
+         \x20       int third = second + 1;\n\
+         \x20       log(first);\n\
+         \x20       log(second);\n\
+         \x20       log(third);\n\
+         \x20   }\n\
+         \x20   void log(Object value) {}\n\
+         }\n";
+    fs::write(&path, source).unwrap();
+    let start = source.find("int first").unwrap();
+    let end = source.find("int third").unwrap();
+
+    let facts = analyze_java_method_regions(
+        &path,
+        "build",
+        Some("Stage"),
+        Some(&[JavaMethodRegionRequest {
+            label: Some("candidate".to_string()),
+            byte_start: Some(start),
+            byte_end: Some(end),
+            start_line: None,
+            end_line: None,
+        }]),
+    )
+    .unwrap();
+
+    assert_eq!(facts.method_name, "build");
+    assert!(
+        facts.statement_regions.len() >= 6,
+        "{:?}",
+        facts.statement_regions
+    );
+    let range = &facts.requested_ranges[0];
+    let live_outs: Vec<&str> = range
+        .live_outs
+        .iter()
+        .map(|var| var.name.as_str())
+        .collect();
+    assert_eq!(live_outs, vec!["first", "second"], "{range:?}");
+    assert!(
+        range
+            .captures
+            .iter()
+            .any(|var| var.name == "seed" && var.type_text == "int"),
+        "{range:?}"
+    );
+    assert!(
+        range
+            .field_touches
+            .iter()
+            .any(|field| field.name == "count" && field.reads == 1),
+        "{range:?}"
+    );
+    assert_eq!(range.extractability.can_extract_with_current_tool, false);
+    assert!(
+        range
+            .extractability
+            .stop_reasons
+            .contains(&"multi_live_out_needs_record".to_string()),
+        "{range:?}"
+    );
+}
+
+#[test]
 fn prune_java_orphans_rejects_unknown_item_kind() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_java(

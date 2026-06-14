@@ -14,8 +14,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/java-refactor/method-body-region-analysis",
   "notes": "Generic finding from a private long-method probe. The core cost was manual region/contiguity/live-out analysis before extract_java_code_block_to_method.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T01:13:44Z",
-  "updated_at": "2026-06-14T01:13:44Z"
+  "updated_at": "2026-06-14T01:30:16Z",
+  "resolved_at": "2026-06-14T01:30:16Z",
+  "resolution_note": "Implemented syntax-only Java method-body region analysis as bbox_refactor::analyze_java_method_regions plus code-mode analysis.methodRegions({ file, method, className?, ranges? }). It reports top-level statement regions and requested candidate ranges with captures, live-outs, field touches, lambda/listener counts, non-local control flow, and extractability stop reasons so probes can run contiguity/live-out gates before mutation."
 }

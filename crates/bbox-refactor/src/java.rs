@@ -3907,6 +3907,11 @@ pub(crate) use leaf_plans::{
     plan_migrate_java_type_usages,
 };
 pub(crate) use method_object::plan_convert_method_to_class;
+pub use method_regions::{
+    FileJavaMethodRegionsFacts, JavaFieldTouchFact, JavaMethodRegionExtractability,
+    JavaMethodRegionFact, JavaMethodRegionRequest, JavaNonLocalControlFlowFact,
+    JavaRegionVariableFact, analyze_java_method_regions,
+};
 pub(crate) use migrate_receiver::plan_migrate_java_method_receiver;
 pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
 pub(crate) use promote_inner::plan_promote_java_inner_class;
@@ -3939,6 +3944,7 @@ mod jooq_mutations;
 mod leaf_plans;
 mod method_object;
 mod method_params;
+mod method_regions;
 mod migrate_receiver;
 mod move_and_callers;
 mod promote_inner;

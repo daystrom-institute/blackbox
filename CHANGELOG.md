@@ -30,6 +30,14 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Java isolate refactor probes now have first-class long-method extraction
+  gates: `analysis.methodRegions({ file, method, className?, ranges? })`
+  reports statement/candidate-region captures, live-outs, field touches,
+  lambda/listener counts, non-local control flow, and extractability stop
+  reasons; `java.extractMethodCodeBlock({ file, oldText, methodName, ... })`
+  exposes the existing code-block extractor as a code-mode transform returning
+  `edits.merge` changes with explicit hints for multi-live-out and control-flow
+  refusals.
 - Embedding coverage now converges and says so when it can't
   (gap-b9d39c10): `bbox_embed_status` reports health=`stalled` (with a
   health_reason naming the fix) when an available route's coverage sits

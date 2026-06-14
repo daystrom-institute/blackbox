@@ -58,6 +58,42 @@ struct FieldClassificationParams {
     class_name: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MethodRegionsParams {
+    file: String,
+    method: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(default)]
+    ranges: Option<Vec<MethodRegionRangeParam>>,
+}
+
+#[derive(Deserialize)]
+struct MethodRegionRangeParam {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default, rename = "byteStart", alias = "byte_start")]
+    byte_start: Option<usize>,
+    #[serde(default, rename = "byteEnd", alias = "byte_end")]
+    byte_end: Option<usize>,
+    #[serde(default, rename = "startLine", alias = "start_line")]
+    start_line: Option<usize>,
+    #[serde(default, rename = "endLine", alias = "end_line")]
+    end_line: Option<usize>,
+}
+
+impl From<MethodRegionRangeParam> for bbox_refactor::JavaMethodRegionRequest {
+    fn from(value: MethodRegionRangeParam) -> Self {
+        Self {
+            label: value.label,
+            byte_start: value.byte_start,
+            byte_end: value.byte_end,
+            start_line: value.start_line,
+            end_line: value.end_line,
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for AnalysisCohesionClusters {
     fn name(&self) -> &str {
@@ -399,6 +435,101 @@ impl Tool for AnalysisFieldClassification {
     }
 }
 
+/// `analysis.methodRegions` — method-body region/dataflow facts for
+/// monolithic-method extract planning.
+pub struct AnalysisMethodRegions;
+
+#[async_trait]
+impl Tool for AnalysisMethodRegions {
+    fn name(&self) -> &str {
+        "analysis.methodRegions"
+    }
+    fn description(&self) -> &str {
+        "Analyze one Java method body before extract-method work. Returns top-level statement regions and optional requested ranges with captures, live-outs, field touches, lambda/listener counts, non-local control flow, and extractability stop reasons. Pure; syntax_only; never writes. Use this for the contiguity/live-out gates before java.extractMethodCodeBlock."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative .java source file." },
+                "method": { "type": "string", "description": "Method or constructor name to analyze." },
+                "className": { "type": "string", "description": "Optional owner class name when the file has multiple classes." },
+                "ranges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string" },
+                            "startLine": { "type": "integer" },
+                            "endLine": { "type": "integer" },
+                            "byteStart": { "type": "integer" },
+                            "byteEnd": { "type": "integer" }
+                        }
+                    },
+                    "description": "Optional candidate ranges to analyze. Each range is either {startLine,endLine} or {byteStart,byteEnd}."
+                }
+            },
+            "required": ["file", "method"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("analysis".to_string(), "methodRegions".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: MethodRegionsParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "analysis.methodRegions: bad input — expected {{ file, method, className?, ranges? }}; {e}"
+                ));
+            }
+        };
+        if params.method.trim().is_empty() {
+            return err("analysis.methodRegions: `method` must be non-empty");
+        }
+        let path = match bro_tools::workspace::resolve_in_root(&cx.root, &params.file) {
+            Ok(path) => path,
+            Err(e) => return err(format!("analysis.methodRegions: {}: {e}", params.file)),
+        };
+        let file = params.file;
+        let method = params.method;
+        let class_name = params.class_name;
+        let ranges = params
+            .ranges
+            .unwrap_or_default()
+            .into_iter()
+            .map(bbox_refactor::JavaMethodRegionRequest::from)
+            .collect::<Vec<_>>();
+        bro_tools::tool::call_blocking(move || {
+            let range_slice = if ranges.is_empty() {
+                None
+            } else {
+                Some(ranges.as_slice())
+            };
+            match bbox_refactor::analyze_java_method_regions(
+                &path,
+                &method,
+                class_name.as_deref(),
+                range_slice,
+            ) {
+                Ok(found) => {
+                    let mut value = serde_json::to_value(found).unwrap_or_else(|_| json!({}));
+                    value["file"] = json!(file);
+                    ToolResult::Json(value)
+                }
+                Err(e) => err(format!("analysis.methodRegions: {e:#}")),
+            }
+        })
+        .await
+    }
+}
+
 /// `analysis.describe` — depth-on-demand contract for one analysis (matches
 /// the java.describe pattern; the namespace index stays a compact one-liner).
 pub struct AnalysisDescribe;
@@ -545,6 +676,59 @@ RECIPE
   // Keep the classification in store(); echo only the small derived counts/table.
 "#;
 
+const METHOD_REGIONS_CONTRACT: &str = r#"analysis.methodRegions — analyze Java method-body regions before extract-method work.
+
+WHAT IT DOES
+  Reads one Java method/constructor body and returns a bounded region report.
+  The default `statement_regions` are the method body's top-level statements.
+  Optional `ranges` are exact candidate regions you want to gate before
+  java.extractMethodCodeBlock. Each region is analyzed with the same lexical
+  scope/dataflow engine as the mutating extractor.
+
+PARAMS
+  file: string        workspace-relative .java file
+  method: string      method or constructor name
+  className?: string  optional owner class restriction
+  ranges?: Array<{
+    label?: string,
+    startLine?: number, endLine?: number,     // 1-based inclusive lines
+    byteStart?: number, byteEnd?: number      // exact byte span alternative
+  }>
+
+RETURNS
+  { file, class_name, method_name, method_line_range, body_line_range,
+    parameters, statement_regions, requested_ranges, requested_contiguous,
+    provenance }
+
+  region fields:
+    id, label, kind, byte_start, byte_end, line_range, statement_count, preview
+    captures[]            locals/params declared before the region and read inside
+                           (mutated=true means the current extractor must stop)
+    live_outs[]           locals declared inside the region and read after it
+                           (>1 means current extractor needs a record/result bundle)
+    field_touches[]       class fields read/written in the region
+    lambda_count / listener_call_count
+    non_local_control_flow[]  return/break/continue that would change semantics
+    extractability        { can_extract_with_current_tool, stop_reasons,
+                            live_out_count, mutated_capture_count,
+                            non_local_control_flow_count }
+
+RECIPE (monolithic-method stage extraction)
+  const a = await analysis.methodRegions({ file, method: "buildView", className: "View" });
+  // Identify a candidate from statement_regions by line_range/preview, then analyze
+  // the exact contiguous range before mutating:
+  const gate = await analysis.methodRegions({
+    file, method: "buildView", className: "View",
+    ranges: [{ label: "controls", startLine: 120, endLine: 155 }]
+  });
+  const r = gate.requested_ranges[0];
+  if (!gate.requested_contiguous || !r.extractability.can_extract_with_current_tool) {
+    text({ stop_reasons: r.extractability.stop_reasons, live_outs: r.live_outs });
+    exit(); // choose a smaller contiguous block or wait for a stronger primitive
+  }
+  // Then call java.extractMethodCodeBlock with the exact text from the accepted range.
+"#;
+
 #[async_trait]
 impl Tool for AnalysisDescribe {
     fn name(&self) -> &str {
@@ -582,8 +766,9 @@ impl Tool for AnalysisDescribe {
             "fieldClassification" => {
                 ToolResult::Json(json!({ "contract": FIELD_CLASSIFICATION_CONTRACT }))
             }
+            "methodRegions" => ToolResult::Json(json!({ "contract": METHOD_REGIONS_CONTRACT })),
             other => err(format!(
-                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification)"
+                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification, methodRegions)"
             )),
         }
     }
@@ -595,6 +780,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(AnalysisCohesionClusters) as Arc<dyn Tool>,
         Arc::new(AnalysisReferences) as Arc<dyn Tool>,
         Arc::new(AnalysisFieldClassification) as Arc<dyn Tool>,
+        Arc::new(AnalysisMethodRegions) as Arc<dyn Tool>,
         Arc::new(AnalysisDescribe) as Arc<dyn Tool>,
     ]
 }
@@ -605,13 +791,15 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "analysis".to_string(),
-        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count Java symbol references across the workspace without full capture payloads; fieldClassification — classify Java fields as constants/deps/mutable state with read/write sites. USE THESE rather than reconstructing reductions from code.query captures."
+        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count Java symbol references across the workspace without full capture payloads; fieldClassification — classify Java fields as constants/deps/mutable state with read/write sites; methodRegions — analyze Java method-body regions before extract-method gates. USE THESE rather than reconstructing reductions from code.query captures."
             .to_string(),
         declarations: r#"type CohesionCluster = { id: string; name_hint: string; item_names: string[]; move_fields: string[]; score: number; internal_field_touches: number; internal_calls: number; inbound_calls: number; outbound_calls: number; expected_wiring: "delegate" | "callback" | "source_instance" };
 type CrossClusterCall = { from_cluster: string; to_cluster: string; from_method: string; to_method: string };
 type ReferenceExample = { path: string; line: number; column: number; byte_start: number; byte_end: number; context: string; is_test_site: boolean; usage_kind: "type_reference" | "method_invocation" | "field_access" | "method_reference" | "import"; matched_name: string };
 type FieldAccess = { method?: string; kind: "read" | "write"; line: number; column: number; context: string };
 type FieldClassification = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static_final: boolean; is_mutable_instance: boolean; is_injected: boolean; injection_style?: "field_annotation" | "constructor_param"; is_provider: boolean; reads: number; writes: number; read_by: string[]; written_by: string[]; accesses: FieldAccess[] };
+type MethodRegionVar = { name: string; type: string; mutated?: boolean };
+type MethodRegion = { id: string; label?: string; kind: string; byte_start: number; byte_end: number; line_range: [number, number]; statement_count: number; preview: string; captures: MethodRegionVar[]; live_outs: MethodRegionVar[]; field_touches: { name: string; reads: number; writes: number }[]; enclosing_class_refs: string[]; this_super_refs: number; lambda_count: number; listener_call_count: number; non_local_control_flow: { kind: string; line: number; column: number }[]; extractability: { can_extract_with_current_tool: boolean; stop_reasons: string[]; live_out_count: number; mutated_capture_count: number; non_local_control_flow_count: number } };
 declare const analysis: {
   /** Full contract (params, result vocabulary, recipe) for one analysis. Call before first use. */
   describe(args: { analysis: string }): Promise<{ contract: string }>;
@@ -621,6 +809,8 @@ declare const analysis: {
   references(args: { symbols: string[]; kinds?: Array<"type_reference" | "method_invocation" | "field_access" | "method_reference" | "import">; declaringClass?: string }): Promise<{ symbols: string[]; total_usages: number; unique_files: number; production_sites: number; test_sites: number; counts_by_symbol: Record<string, number>; files_by_symbol: Record<string, string[]>; examples_by_symbol: Record<string, ReferenceExample[]>; provenance: "syntax_only" }>;
   /** Classify Java fields before extraction: constants/dependencies/mutable state plus read/write sites by method. */
   fieldClassification(args: { file: string; fields?: string[]; className?: string }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; fields: FieldClassification[]; provenance: "syntax_only" }>;
+  /** Analyze one Java method's top-level statement regions and optional candidate ranges before extract-method. Use this for contiguity/live-out gates. */
+  methodRegions(args: { file: string; method: string; className?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
 };"#
             .to_string(),
     }
@@ -912,6 +1102,84 @@ class Widget {
         assert_eq!(kind["is_static_final"], true, "{kind}");
         assert_eq!(kind["is_mutable_instance"], false, "{kind}");
         assert_eq!(kind["read_by"], json!(["bump"]), "{kind}");
+    }
+
+    #[tokio::test]
+    async fn method_regions_reports_requested_range_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("Stage.java"),
+            r#"package com.acme;
+
+class Stage {
+    private int count;
+
+    void build(int seed) {
+        int first = seed + 1;
+        int second = first + count;
+        int third = second + 1;
+        log(first);
+        log(second);
+        log(third);
+    }
+
+    void log(Object value) {}
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisMethodRegions
+                .call(
+                    json!({
+                        "file": "Stage.java",
+                        "method": "build",
+                        "className": "Stage",
+                        "ranges": [{ "label": "candidate", "startLine": 7, "endLine": 8 }]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(out["file"], "Stage.java", "{out}");
+        assert_eq!(out["provenance"], "syntax_only", "{out}");
+        assert!(
+            out["statement_regions"].as_array().unwrap().len() >= 6,
+            "{out}"
+        );
+        let range = &out["requested_ranges"][0];
+        assert_eq!(
+            range["extractability"]["can_extract_with_current_tool"], false,
+            "{range}"
+        );
+        assert!(
+            range["extractability"]["stop_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "multi_live_out_needs_record"),
+            "{range}"
+        );
+        assert!(
+            range["live_outs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|var| var["name"] == "first"),
+            "{range}"
+        );
+        assert!(
+            range["field_touches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field["name"] == "count" && field["reads"] == 1),
+            "{range}"
+        );
     }
 
     #[tokio::test]
