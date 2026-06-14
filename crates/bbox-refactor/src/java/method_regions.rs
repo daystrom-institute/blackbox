@@ -5,7 +5,7 @@
 //! bounded report that agents can use for the recipe gates: contiguity,
 //! captured locals, live-outs, mutated captures, and non-local control flow.
 
-use super::scope::{ScopeTree, analyze_range};
+use super::scope::{Declaration, ScopeTree, analyze_range};
 use super::*;
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +24,77 @@ pub struct JavaMethodRegionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JavaMethodRegionsOptions {
+    #[serde(default = "default_true")]
+    pub include_statement_regions: bool,
+    #[serde(default)]
+    pub statement_limit: Option<usize>,
+    #[serde(default)]
+    pub statement_start_line: Option<usize>,
+    #[serde(default)]
+    pub statement_end_line: Option<usize>,
+    #[serde(default)]
+    pub statement_contains: Option<String>,
+}
+
+impl Default for JavaMethodRegionsOptions {
+    fn default() -> Self {
+        Self {
+            include_statement_regions: true,
+            statement_limit: None,
+            statement_start_line: None,
+            statement_end_line: None,
+            statement_contains: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JavaMethodRegionStatementSummary {
+    pub total_count: usize,
+    pub matched_count: usize,
+    pub returned_count: usize,
+    pub omitted_count: usize,
+    pub included: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<JavaMethodRegionStatementFilterSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JavaMethodRegionStatementFilterSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JavaComponentTreeConsumptionFact {
+    pub kind: String,
+    pub method: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaRegionVariableFact {
     pub name: String,
     #[serde(rename = "type")]
     pub type_text: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mutated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_use_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub component_tree_consumptions: Vec<JavaComponentTreeConsumptionFact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +155,7 @@ pub struct FileJavaMethodRegionsFacts {
     pub method_line_range: (usize, usize),
     pub body_line_range: (usize, usize),
     pub parameters: Vec<JavaRegionVariableFact>,
+    pub statement_region_summary: JavaMethodRegionStatementSummary,
     pub statement_regions: Vec<JavaMethodRegionFact>,
     pub requested_ranges: Vec<JavaMethodRegionFact>,
     pub requested_contiguous: bool,
@@ -101,6 +167,16 @@ pub fn analyze_java_method_regions(
     method_name: &str,
     class_name: Option<&str>,
     ranges: Option<&[JavaMethodRegionRequest]>,
+) -> Result<FileJavaMethodRegionsFacts> {
+    analyze_java_method_regions_with_options(path, method_name, class_name, ranges, None)
+}
+
+pub fn analyze_java_method_regions_with_options(
+    path: &Path,
+    method_name: &str,
+    class_name: Option<&str>,
+    ranges: Option<&[JavaMethodRegionRequest]>,
+    options: Option<&JavaMethodRegionsOptions>,
 ) -> Result<FileJavaMethodRegionsFacts> {
     let parsed = parse_source_file(path)?;
     if parsed.language != "java" {
@@ -132,23 +208,36 @@ pub fn analyze_java_method_regions(
     let scope_tree = ScopeTree::build_from_method(method, &parsed.source);
     let field_names = collect_class_field_names(class_node, &parsed.source);
 
+    let options = options.cloned().unwrap_or_default();
     let statement_nodes = top_level_statement_nodes(body);
-    let statement_regions = statement_nodes
-        .iter()
-        .enumerate()
-        .map(|(idx, node)| {
-            region_fact(
-                format!("stmt-{}", idx + 1),
-                None,
-                node.kind().to_string(),
-                *node,
-                &scope_tree,
-                method,
-                &parsed.source,
-                &field_names,
-            )
-        })
-        .collect::<Vec<_>>();
+    let matched_statement_nodes =
+        matching_statement_nodes(&statement_nodes, &parsed.source, &options);
+    let selected_statement_nodes = limit_statement_nodes(matched_statement_nodes.clone(), &options);
+    let statement_regions = if options.include_statement_regions {
+        selected_statement_nodes
+            .iter()
+            .map(|(original_idx, node)| {
+                region_fact(
+                    format!("stmt-{}", original_idx + 1),
+                    None,
+                    node.kind().to_string(),
+                    *node,
+                    &scope_tree,
+                    method,
+                    &parsed.source,
+                    &field_names,
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let statement_region_summary = statement_summary(
+        statement_nodes.len(),
+        matched_statement_nodes.len(),
+        statement_regions.len(),
+        &options,
+    );
 
     let requested_ranges = ranges
         .unwrap_or_default()
@@ -195,6 +284,7 @@ pub fn analyze_java_method_regions(
         method_line_range,
         body_line_range,
         parameters,
+        statement_region_summary,
         statement_regions,
         requested_ranges,
         requested_contiguous,
@@ -244,6 +334,8 @@ fn region_fact_for_bytes(
             name: capture.name.clone(),
             type_text: capture.type_text.clone(),
             mutated: capture.mutated,
+            after_use_kinds: Vec::new(),
+            component_tree_consumptions: Vec::new(),
         })
         .collect::<Vec<_>>();
     let mut live_outs = analysis
@@ -253,8 +345,18 @@ fn region_fact_for_bytes(
             name: name.clone(),
             type_text: type_text.clone(),
             mutated: false,
+            after_use_kinds: Vec::new(),
+            component_tree_consumptions: Vec::new(),
         })
         .collect::<Vec<_>>();
+    enrich_live_outs(
+        &mut live_outs,
+        scope_tree,
+        method,
+        byte_start,
+        byte_end,
+        source,
+    );
     live_outs.sort_by(|a, b| a.name.cmp(&b.name));
     let non_local_control_flow = analysis
         .non_local_control_flow
@@ -380,6 +482,91 @@ fn top_level_statement_nodes(body: Node<'_>) -> Vec<Node<'_>> {
     out
 }
 
+fn matching_statement_nodes<'a>(
+    statement_nodes: &'a [Node<'a>],
+    source: &str,
+    options: &JavaMethodRegionsOptions,
+) -> Vec<(usize, Node<'a>)> {
+    let contains = options
+        .statement_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    statement_nodes
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, node)| {
+            let (start_line, end_line) = line_range_for(source, node.start_byte(), node.end_byte());
+            if let Some(filter_start) = options.statement_start_line
+                && end_line < filter_start
+            {
+                return false;
+            }
+            if let Some(filter_end) = options.statement_end_line
+                && start_line > filter_end
+            {
+                return false;
+            }
+            if let Some(needle) = contains {
+                return source
+                    .get(node.start_byte()..node.end_byte())
+                    .is_some_and(|text| text.contains(needle));
+            }
+            true
+        })
+        .collect::<Vec<_>>()
+}
+
+fn limit_statement_nodes<'a>(
+    mut selected: Vec<(usize, Node<'a>)>,
+    options: &JavaMethodRegionsOptions,
+) -> Vec<(usize, Node<'a>)> {
+    if let Some(limit) = options.statement_limit {
+        selected.truncate(limit);
+    }
+    selected
+}
+
+fn statement_summary(
+    total_count: usize,
+    matched_count: usize,
+    returned_count: usize,
+    options: &JavaMethodRegionsOptions,
+) -> JavaMethodRegionStatementSummary {
+    let omitted_count = if options.include_statement_regions {
+        total_count.saturating_sub(returned_count)
+    } else {
+        total_count
+    };
+    JavaMethodRegionStatementSummary {
+        total_count,
+        matched_count,
+        returned_count,
+        omitted_count,
+        included: options.include_statement_regions,
+        filter: statement_filter_summary(options),
+    }
+}
+
+fn statement_filter_summary(
+    options: &JavaMethodRegionsOptions,
+) -> Option<JavaMethodRegionStatementFilterSummary> {
+    if options.statement_start_line.is_none()
+        && options.statement_end_line.is_none()
+        && options.statement_contains.is_none()
+        && options.statement_limit.is_none()
+    {
+        return None;
+    }
+    Some(JavaMethodRegionStatementFilterSummary {
+        start_line: options.statement_start_line,
+        end_line: options.statement_end_line,
+        contains: options.statement_contains.clone(),
+        limit: options.statement_limit,
+    })
+}
+
 fn collect_class_field_names(class_node: Node<'_>, source: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let Some(body) = class_node.child_by_field_name("body") else {
@@ -480,9 +667,276 @@ fn method_parameters(method: Node<'_>, source: &str) -> Vec<JavaRegionVariableFa
             name: name.to_string(),
             type_text,
             mutated: false,
+            after_use_kinds: Vec::new(),
+            component_tree_consumptions: Vec::new(),
         });
     }
     out
+}
+
+fn enrich_live_outs(
+    live_outs: &mut [JavaRegionVariableFact],
+    scope_tree: &ScopeTree,
+    method: Node<'_>,
+    byte_start: usize,
+    byte_end: usize,
+    source: &str,
+) {
+    for live_out in live_outs {
+        let Some(decl) =
+            inner_declaration_for_name(scope_tree, &live_out.name, byte_start, byte_end)
+        else {
+            continue;
+        };
+        live_out.after_use_kinds =
+            after_use_kinds_for_decl(scope_tree, method, decl, byte_end, source);
+        live_out.component_tree_consumptions = component_tree_consumptions_for_decl(
+            scope_tree, method, decl, byte_start, byte_end, source,
+        );
+    }
+}
+
+fn inner_declaration_for_name<'a>(
+    scope_tree: &'a ScopeTree,
+    name: &str,
+    byte_start: usize,
+    byte_end: usize,
+) -> Option<&'a Declaration> {
+    scope_tree.declarations().iter().find(|decl| {
+        decl.name == name && decl.name_byte_start >= byte_start && decl.name_byte_end <= byte_end
+    })
+}
+
+fn after_use_kinds_for_decl(
+    scope_tree: &ScopeTree,
+    method: Node<'_>,
+    decl: &Declaration,
+    byte_end: usize,
+    source: &str,
+) -> Vec<String> {
+    let mut kinds = BTreeSet::new();
+    let mut stack = vec![method];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= byte_end {
+            continue;
+        }
+        if node.start_byte() >= byte_end
+            && matches!(node.kind(), "identifier" | "type_identifier")
+            && identifier_resolves_to(scope_tree, node, decl, source)
+        {
+            kinds.insert(classify_after_use(node, source));
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    kinds.into_iter().collect()
+}
+
+fn component_tree_consumptions_for_decl(
+    scope_tree: &ScopeTree,
+    method: Node<'_>,
+    decl: &Declaration,
+    byte_start: usize,
+    byte_end: usize,
+    source: &str,
+) -> Vec<JavaComponentTreeConsumptionFact> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut stack = vec![method];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= byte_start || node.start_byte() >= byte_end {
+            continue;
+        }
+        if node.start_byte() >= byte_start
+            && node.end_byte() <= byte_end
+            && matches!(node.kind(), "identifier" | "type_identifier")
+            && identifier_resolves_to(scope_tree, node, decl, source)
+            && let Some((kind, method_name, call)) =
+                component_tree_consumption_for_identifier(node, source)
+        {
+            let (line, column) = line_col(source, node.start_byte());
+            let key = (
+                kind.clone(),
+                method_name.clone(),
+                line,
+                column,
+                call.start_byte(),
+            );
+            if seen.insert(key) {
+                out.push(JavaComponentTreeConsumptionFact {
+                    kind,
+                    method: method_name,
+                    line,
+                    column,
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then(a.column.cmp(&b.column))
+            .then(a.kind.cmp(&b.kind))
+            .then(a.method.cmp(&b.method))
+    });
+    out
+}
+
+fn identifier_resolves_to(
+    scope_tree: &ScopeTree,
+    node: Node<'_>,
+    decl: &Declaration,
+    source: &str,
+) -> bool {
+    if is_declaration_name(node) {
+        return false;
+    }
+    let Ok(name) = node.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    scope_tree
+        .resolve(name, node.start_byte())
+        .is_some_and(|resolved| {
+            resolved.name == decl.name
+                && resolved.name_byte_start == decl.name_byte_start
+                && resolved.name_byte_end == decl.name_byte_end
+        })
+}
+
+fn classify_after_use(node: Node<'_>, source: &str) -> String {
+    if has_ancestor_kind(node, "return_statement") {
+        return "return_value".to_string();
+    }
+    if let Some((kind, _, _)) = component_tree_consumption_for_identifier(node, source) {
+        return kind;
+    }
+    if is_method_invocation_receiver(node) {
+        return "method_receiver".to_string();
+    }
+    if is_inside_argument_list(node) {
+        return "method_argument".to_string();
+    }
+    if is_write_access(node) {
+        return "assignment_target".to_string();
+    }
+    "expression".to_string()
+}
+
+fn component_tree_consumption_for_identifier<'a>(
+    node: Node<'a>,
+    source: &str,
+) -> Option<(String, String, Node<'a>)> {
+    if let Some(call) = enclosing_method_invocation_with_argument(node)
+        && let Some(method_name) = method_invocation_name(call, source)
+        && is_component_tree_wiring_method(&method_name)
+    {
+        return Some(("component_tree_argument".to_string(), method_name, call));
+    }
+    if let Some(call) = enclosing_method_invocation_with_receiver(node)
+        && let Some(method_name) = method_invocation_name(call, source)
+        && is_component_tree_wiring_method(&method_name)
+    {
+        return Some(("component_tree_receiver".to_string(), method_name, call));
+    }
+    None
+}
+
+fn enclosing_method_invocation_with_argument<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let mut cursor = node.parent();
+    while let Some(parent) = cursor {
+        if parent.kind() == "argument_list" {
+            let call = parent.parent()?;
+            if call.kind() == "method_invocation" {
+                return Some(call);
+            }
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            return None;
+        }
+        cursor = parent.parent();
+    }
+    None
+}
+
+fn enclosing_method_invocation_with_receiver<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let mut cursor = node.parent();
+    while let Some(parent) = cursor {
+        if parent.kind() == "method_invocation"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| contains_node(object, node))
+        {
+            return Some(parent);
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            return None;
+        }
+        cursor = parent.parent();
+    }
+    None
+}
+
+fn is_component_tree_wiring_method(name: &str) -> bool {
+    matches!(
+        name,
+        "add" | "addAndExpand" | "addComponentAtIndex" | "setContent" | "setHeader" | "setFooter"
+    )
+}
+
+fn method_invocation_name(call: Node<'_>, source: &str) -> Option<String> {
+    call.child_by_field_name("name")
+        .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+        .map(str::to_string)
+}
+
+fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.parent();
+    while let Some(parent) = cursor {
+        if parent.kind() == kind {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            return false;
+        }
+        cursor = parent.parent();
+    }
+    false
+}
+
+fn is_method_invocation_receiver(node: Node<'_>) -> bool {
+    enclosing_method_invocation_with_receiver(node).is_some()
+}
+
+fn is_inside_argument_list(node: Node<'_>) -> bool {
+    let mut cursor = node.parent();
+    while let Some(parent) = cursor {
+        if parent.kind() == "argument_list" {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            return false;
+        }
+        cursor = parent.parent();
+    }
+    false
 }
 
 fn resolve_requested_range(

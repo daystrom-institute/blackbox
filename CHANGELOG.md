@@ -38,6 +38,13 @@ out explicitly under `Changed` or `Removed`.
   exposes the existing code-block extractor as a code-mode transform returning
   `edits.merge` changes with explicit hints for multi-live-out and control-flow
   refusals.
+- `analysis.methodRegions` now supports compact long-method inventories via
+  `includeStatementRegions`, `statementContains`, line-window filters, and
+  `statementLimit`, plus a `statement_region_summary` that reports total,
+  matched, returned, and omitted statement counts. Live-out variables now include
+  `after_use_kinds` and `component_tree_consumptions` so Java UI extraction
+  probes can distinguish return values and in-region component-tree wiring from
+  undifferentiated multi-live-out blockers.
 - Embedding coverage now converges and says so when it can't
   (gap-b9d39c10): `bbox_embed_status` reports health=`stalled` (with a
   health_reason naming the fix) when an available route's coverage sits

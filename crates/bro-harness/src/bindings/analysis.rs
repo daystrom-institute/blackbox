@@ -66,6 +66,20 @@ struct MethodRegionsParams {
     class_name: Option<String>,
     #[serde(default)]
     ranges: Option<Vec<MethodRegionRangeParam>>,
+    #[serde(
+        default,
+        rename = "includeStatementRegions",
+        alias = "include_statement_regions"
+    )]
+    include_statement_regions: Option<bool>,
+    #[serde(default, rename = "statementLimit", alias = "statement_limit")]
+    statement_limit: Option<usize>,
+    #[serde(default, rename = "statementStartLine", alias = "statement_start_line")]
+    statement_start_line: Option<usize>,
+    #[serde(default, rename = "statementEndLine", alias = "statement_end_line")]
+    statement_end_line: Option<usize>,
+    #[serde(default, rename = "statementContains", alias = "statement_contains")]
+    statement_contains: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +104,18 @@ impl From<MethodRegionRangeParam> for bbox_refactor::JavaMethodRegionRequest {
             byte_end: value.byte_end,
             start_line: value.start_line,
             end_line: value.end_line,
+        }
+    }
+}
+
+impl MethodRegionsParams {
+    fn options(&self) -> bbox_refactor::JavaMethodRegionsOptions {
+        bbox_refactor::JavaMethodRegionsOptions {
+            include_statement_regions: self.include_statement_regions.unwrap_or(true),
+            statement_limit: self.statement_limit,
+            statement_start_line: self.statement_start_line,
+            statement_end_line: self.statement_end_line,
+            statement_contains: self.statement_contains.clone(),
         }
     }
 }
@@ -454,6 +480,11 @@ impl Tool for AnalysisMethodRegions {
                 "file": { "type": "string", "description": "Workspace-relative .java source file." },
                 "method": { "type": "string", "description": "Method or constructor name to analyze." },
                 "className": { "type": "string", "description": "Optional owner class name when the file has multiple classes." },
+                "includeStatementRegions": { "type": "boolean", "description": "Default true. Set false when only requested_ranges and statement_region_summary are needed." },
+                "statementLimit": { "type": "integer", "description": "Optional cap on returned statement_regions after filtering." },
+                "statementStartLine": { "type": "integer", "description": "Optional line filter: include statement regions whose line range overlaps this start line or later." },
+                "statementEndLine": { "type": "integer", "description": "Optional line filter: include statement regions whose line range overlaps this end line or earlier." },
+                "statementContains": { "type": "string", "description": "Optional substring filter over the statement source text, useful as a marker-first compact query." },
                 "ranges": {
                     "type": "array",
                     "items": {
@@ -497,6 +528,7 @@ impl Tool for AnalysisMethodRegions {
             Ok(path) => path,
             Err(e) => return err(format!("analysis.methodRegions: {}: {e}", params.file)),
         };
+        let options = params.options();
         let file = params.file;
         let method = params.method;
         let class_name = params.class_name;
@@ -512,11 +544,12 @@ impl Tool for AnalysisMethodRegions {
             } else {
                 Some(ranges.as_slice())
             };
-            match bbox_refactor::analyze_java_method_regions(
+            match bbox_refactor::analyze_java_method_regions_with_options(
                 &path,
                 &method,
                 class_name.as_deref(),
                 range_slice,
+                Some(&options),
             ) {
                 Ok(found) => {
                     let mut value = serde_json::to_value(found).unwrap_or_else(|_| json!({}));
@@ -689,6 +722,11 @@ PARAMS
   file: string        workspace-relative .java file
   method: string      method or constructor name
   className?: string  optional owner class restriction
+  includeStatementRegions?: boolean  default true; set false for gate-only calls
+  statementLimit?: number            cap returned statement_regions after filtering
+  statementStartLine?: number        include statements overlapping this line or later
+  statementEndLine?: number          include statements overlapping this line or earlier
+  statementContains?: string         substring marker filter for statement source text
   ranges?: Array<{
     label?: string,
     startLine?: number, endLine?: number,     // 1-based inclusive lines
@@ -697,8 +735,15 @@ PARAMS
 
 RETURNS
   { file, class_name, method_name, method_line_range, body_line_range,
-    parameters, statement_regions, requested_ranges, requested_contiguous,
-    provenance }
+    parameters, statement_region_summary, statement_regions, requested_ranges,
+    requested_contiguous, provenance }
+
+  statement_region_summary:
+    total_count      total top-level statement count in the method body
+    matched_count    count matching statementStartLine/statementEndLine/statementContains
+    returned_count   count materialized in statement_regions
+    omitted_count    total statements omitted by filtering, limit, or include=false
+    included         false when includeStatementRegions=false
 
   region fields:
     id, label, kind, byte_start, byte_end, line_range, statement_count, preview
@@ -706,6 +751,11 @@ RETURNS
                            (mutated=true means the current extractor must stop)
     live_outs[]           locals declared inside the region and read after it
                            (>1 means current extractor needs a record/result bundle)
+                           Each live-out may include after_use_kinds[] such as
+                           return_value, method_argument, method_receiver,
+                           component_tree_argument, component_tree_receiver,
+                           and component_tree_consumptions[] for in-region
+                           UI/component-tree wiring like layout.add(child).
     field_touches[]       class fields read/written in the region
     lambda_count / listener_call_count
     non_local_control_flow[]  return/break/continue that would change semantics;
@@ -716,9 +766,14 @@ RETURNS
                             non_local_control_flow_count }
 
 RECIPE (monolithic-method stage extraction)
-  const a = await analysis.methodRegions({ file, method: "buildView", className: "View" });
-  // Identify a candidate from statement_regions by line_range/preview, then analyze
-  // the exact contiguous range before mutating:
+  // For large methods, search/filter first instead of materializing every statement.
+  const a = await analysis.methodRegions({
+    file, method: "buildView", className: "View",
+    statementContains: "flowSplit", statementLimit: 20
+  });
+  // Identify a candidate from the compact statement_regions result, then analyze
+  // the exact contiguous range before mutating. For gate-only calls, set
+  // includeStatementRegions:false and pass ranges.
   const gate = await analysis.methodRegions({
     file, method: "buildView", className: "View",
     ranges: [{ label: "controls", startLine: 120, endLine: 155 }]
@@ -800,7 +855,9 @@ type CrossClusterCall = { from_cluster: string; to_cluster: string; from_method:
 type ReferenceExample = { path: string; line: number; column: number; byte_start: number; byte_end: number; context: string; is_test_site: boolean; usage_kind: "type_reference" | "method_invocation" | "field_access" | "method_reference" | "import"; matched_name: string };
 type FieldAccess = { method?: string; kind: "read" | "write"; line: number; column: number; context: string };
 type FieldClassification = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static_final: boolean; is_mutable_instance: boolean; is_injected: boolean; injection_style?: "field_annotation" | "constructor_param"; is_provider: boolean; reads: number; writes: number; read_by: string[]; written_by: string[]; accesses: FieldAccess[] };
-type MethodRegionVar = { name: string; type: string; mutated?: boolean };
+type ComponentTreeConsumption = { kind: "component_tree_argument" | "component_tree_receiver" | string; method: string; line: number; column: number };
+type MethodRegionVar = { name: string; type: string; mutated?: boolean; after_use_kinds?: string[]; component_tree_consumptions?: ComponentTreeConsumption[] };
+type MethodRegionStatementSummary = { total_count: number; matched_count: number; returned_count: number; omitted_count: number; included: boolean; filter?: { start_line?: number; end_line?: number; contains?: string; limit?: number } };
 type MethodRegion = { id: string; label?: string; kind: string; byte_start: number; byte_end: number; line_range: [number, number]; statement_count: number; preview: string; captures: MethodRegionVar[]; live_outs: MethodRegionVar[]; field_touches: { name: string; reads: number; writes: number }[]; enclosing_class_refs: string[]; this_super_refs: number; lambda_count: number; listener_call_count: number; non_local_control_flow: { kind: string; line: number; column: number }[]; extractability: { can_extract_with_current_tool: boolean; stop_reasons: string[]; live_out_count: number; mutated_capture_count: number; non_local_control_flow_count: number } };
 declare const analysis: {
   /** Full contract (params, result vocabulary, recipe) for one analysis. Call before first use. */
@@ -812,7 +869,7 @@ declare const analysis: {
   /** Classify Java fields before extraction: constants/dependencies/mutable state plus read/write sites by method. */
   fieldClassification(args: { file: string; fields?: string[]; className?: string }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; fields: FieldClassification[]; provenance: "syntax_only" }>;
   /** Analyze one Java method's top-level statement regions and optional candidate ranges before extract-method. Use this for contiguity/live-out gates. */
-  methodRegions(args: { file: string; method: string; className?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
+  methodRegions(args: { file: string; method: string; className?: string; includeStatementRegions?: boolean; statementLimit?: number; statementStartLine?: number; statementEndLine?: number; statementContains?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_region_summary: MethodRegionStatementSummary; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
 };"#
             .to_string(),
     }
@@ -1149,6 +1206,11 @@ class Stage {
 
         assert_eq!(out["file"], "Stage.java", "{out}");
         assert_eq!(out["provenance"], "syntax_only", "{out}");
+        assert_eq!(out["statement_region_summary"]["total_count"], 6, "{out}");
+        assert_eq!(
+            out["statement_region_summary"]["returned_count"], 6,
+            "{out}"
+        );
         assert!(
             out["statement_regions"].as_array().unwrap().len() >= 6,
             "{out}"
@@ -1181,6 +1243,60 @@ class Stage {
                 .iter()
                 .any(|field| field["name"] == "count" && field["reads"] == 1),
             "{range}"
+        );
+    }
+
+    #[tokio::test]
+    async fn method_regions_can_return_compact_filtered_statement_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("Stage.java"),
+            r#"package com.acme;
+
+class Stage {
+    void build() {
+        int alpha = 1;
+        int beta = 2;
+        int gamma = alpha + beta;
+        log(gamma);
+    }
+
+    void log(Object value) {}
+}
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisMethodRegions
+                .call(
+                    json!({
+                        "file": "Stage.java",
+                        "method": "build",
+                        "className": "Stage",
+                        "includeStatementRegions": false,
+                        "statementContains": "beta",
+                        "statementLimit": 1
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(out["statement_regions"], json!([]), "{out}");
+        assert_eq!(out["statement_region_summary"]["total_count"], 4, "{out}");
+        assert_eq!(out["statement_region_summary"]["matched_count"], 2, "{out}");
+        assert_eq!(
+            out["statement_region_summary"]["returned_count"], 0,
+            "{out}"
+        );
+        assert_eq!(out["statement_region_summary"]["omitted_count"], 4, "{out}");
+        assert_eq!(out["statement_region_summary"]["included"], false, "{out}");
+        assert_eq!(
+            out["statement_region_summary"]["filter"]["contains"], "beta",
+            "{out}"
         );
     }
 

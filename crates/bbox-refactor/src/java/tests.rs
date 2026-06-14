@@ -9791,6 +9791,138 @@ fn method_regions_reports_live_outs_and_field_touches_for_candidate_range() {
 }
 
 #[test]
+fn method_regions_can_filter_or_omit_statement_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Stage.java");
+    let source = "package p;\n\
+         class Stage {\n\
+         \x20   void build() {\n\
+         \x20       int alpha = 1;\n\
+         \x20       int beta = 2;\n\
+         \x20       int gamma = alpha + beta;\n\
+         \x20       log(gamma);\n\
+         \x20   }\n\
+         \x20   void log(Object value) {}\n\
+         }\n";
+    fs::write(&path, source).unwrap();
+    let facts = analyze_java_method_regions_with_options(
+        &path,
+        "build",
+        Some("Stage"),
+        None,
+        Some(&JavaMethodRegionsOptions {
+            include_statement_regions: true,
+            statement_contains: Some("beta".to_string()),
+            statement_limit: Some(1),
+            ..JavaMethodRegionsOptions::default()
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(facts.statement_region_summary.total_count, 4);
+    assert_eq!(facts.statement_region_summary.matched_count, 2);
+    assert_eq!(facts.statement_region_summary.returned_count, 1);
+    assert_eq!(facts.statement_region_summary.omitted_count, 3);
+    assert_eq!(facts.statement_regions.len(), 1);
+    assert_eq!(facts.statement_regions[0].id, "stmt-2");
+    assert!(facts.statement_regions[0].preview.contains("beta"));
+
+    let omitted = analyze_java_method_regions_with_options(
+        &path,
+        "build",
+        Some("Stage"),
+        None,
+        Some(&JavaMethodRegionsOptions {
+            include_statement_regions: false,
+            ..JavaMethodRegionsOptions::default()
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(omitted.statement_region_summary.total_count, 4);
+    assert_eq!(omitted.statement_region_summary.returned_count, 0);
+    assert_eq!(omitted.statement_region_summary.omitted_count, 4);
+    assert!(!omitted.statement_region_summary.included);
+    assert!(omitted.statement_regions.is_empty());
+}
+
+#[test]
+fn method_regions_classifies_component_tree_consumed_live_outs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    let source = "package p;\n\
+         class View {\n\
+         \x20   Component build(boolean show) {\n\
+         \x20       Layout root = new Layout();\n\
+         \x20       Component field = new Component();\n\
+         \x20       root.add(field);\n\
+         \x20       if (show) {\n\
+         \x20           field.setVisible(true);\n\
+         \x20       }\n\
+         \x20       return root;\n\
+         \x20   }\n\
+         }\n\
+         class Layout { void add(Component c) {} }\n\
+         class Component { void setVisible(boolean v) {} }\n";
+    fs::write(&path, source).unwrap();
+    let start = source.find("Layout root").unwrap();
+    let end = source.find("if (show)").unwrap();
+
+    let facts = analyze_java_method_regions(
+        &path,
+        "build",
+        Some("View"),
+        Some(&[JavaMethodRegionRequest {
+            label: Some("build_tree".to_string()),
+            byte_start: Some(start),
+            byte_end: Some(end),
+            start_line: None,
+            end_line: None,
+        }]),
+    )
+    .unwrap();
+
+    let range = &facts.requested_ranges[0];
+    let root = range
+        .live_outs
+        .iter()
+        .find(|var| var.name == "root")
+        .expect("root should be a return live-out");
+    assert!(
+        root.after_use_kinds
+            .iter()
+            .any(|kind| kind == "return_value"),
+        "{root:?}"
+    );
+    assert!(
+        root.component_tree_consumptions
+            .iter()
+            .any(|site| site.kind == "component_tree_receiver" && site.method == "add"),
+        "{root:?}"
+    );
+
+    let field = range
+        .live_outs
+        .iter()
+        .find(|var| var.name == "field")
+        .expect("field should be a post-region use live-out");
+    assert!(
+        field
+            .after_use_kinds
+            .iter()
+            .any(|kind| kind == "method_receiver"),
+        "{field:?}"
+    );
+    assert!(
+        field
+            .component_tree_consumptions
+            .iter()
+            .any(|site| site.kind == "component_tree_argument" && site.method == "add"),
+        "{field:?}"
+    );
+}
+
+#[test]
 fn prune_java_orphans_rejects_unknown_item_kind() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_java(

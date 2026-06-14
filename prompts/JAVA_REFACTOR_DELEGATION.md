@@ -44,10 +44,15 @@ restate them:
   before extraction to decide whether `wrappers: true` is needed, and for cheap
   blast-radius checks. `analysis.describe`.
 - **`analysis.methodRegions({ file, method, className?, ranges? })`** — the
-  long-method region gate. Returns top-level statement regions and optional
-  candidate-range facts: captures, live-outs, field touches, lambdas/listeners,
-  non-local control flow, and `extractability.stop_reasons`. Use this before
-  extract-method work; do not reconstruct live-outs by hand.
+  long-method region gate. Returns filtered top-level statement regions and
+  optional candidate-range facts: captures, live-outs, field touches,
+  lambdas/listeners, non-local control flow, and `extractability.stop_reasons`.
+  For giant methods, use `statementContains` / `statementStartLine` /
+  `statementEndLine` / `statementLimit`, or set `includeStatementRegions:false`
+  for gate-only calls. Live-outs carry `after_use_kinds` and
+  `component_tree_consumptions` so UI tree wiring and return-value outputs are
+  visible. Use this before extract-method work; do not reconstruct live-outs by
+  hand.
 - **`java.extractClass({ file, target, delegateField, methods, moveFields?,
   wrappers?, previewOnly? })`** — moves methods + fields into a new delegate
   class, synthesizes both sides, returns `{ changes, creates, findings,
@@ -115,15 +120,18 @@ anything.
 For "extract one stage from a giant method", use this smaller flow instead of
 the class-decomposition flow:
 
-1. `analysis.methodRegions({ file, method, className })` for a compact method
-   map. Pick one candidate by `line_range`/`preview`, not by dumping the whole
-   method into the cell.
+1. For giant methods, search/filter first instead of dumping the full method:
+   `analysis.methodRegions({ file, method, className, statementContains,
+   statementLimit })`, or use a line window with `statementStartLine` /
+   `statementEndLine`. Pick one candidate by `line_range`/`preview`.
 2. Re-run `analysis.methodRegions` with one exact candidate range. Treat the
    returned gates as authoritative:
    - `requested_contiguous` must be true for today's one-block extractor.
    - `extractability.can_extract_with_current_tool` must be true.
    - `live_outs.length <= 1`; more means record/result-object generation is
-     missing.
+     missing. Inspect `after_use_kinds` and `component_tree_consumptions` before
+     deciding whether the live-out set is a true result bundle or a UI tree /
+     return-value boundary.
 3. If gates pass, bounded-read the exact range and call
    `java.extractMethodCodeBlock({ file, oldText, methodName, className })`.
 4. Apply via `edits.merge → edits.apply`, compile, `java.hygiene({ files:

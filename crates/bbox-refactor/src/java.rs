@@ -3908,9 +3908,11 @@ pub(crate) use leaf_plans::{
 };
 pub(crate) use method_object::plan_convert_method_to_class;
 pub use method_regions::{
-    FileJavaMethodRegionsFacts, JavaFieldTouchFact, JavaMethodRegionExtractability,
-    JavaMethodRegionFact, JavaMethodRegionRequest, JavaNonLocalControlFlowFact,
-    JavaRegionVariableFact, analyze_java_method_regions,
+    FileJavaMethodRegionsFacts, JavaComponentTreeConsumptionFact, JavaFieldTouchFact,
+    JavaMethodRegionExtractability, JavaMethodRegionFact, JavaMethodRegionRequest,
+    JavaMethodRegionStatementFilterSummary, JavaMethodRegionStatementSummary,
+    JavaMethodRegionsOptions, JavaNonLocalControlFlowFact, JavaRegionVariableFact,
+    analyze_java_method_regions, analyze_java_method_regions_with_options,
 };
 pub(crate) use migrate_receiver::plan_migrate_java_method_receiver;
 pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
