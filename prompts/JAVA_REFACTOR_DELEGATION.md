@@ -91,10 +91,14 @@ god class":
    captures or no captures.
 6. **Compile-gate** with the project's incremental build (the post-apply truth
    that tree-sitter validation cannot give you).
-7. `java.removeUnusedConstructorParams({ file })` → merge/apply → re-compile.
-   Run it **after** the extract is applied — the orphaned `this.dep = dep` must
-   already be gone for the param to read as unused. This fully *moves* the
-   injection point rather than leaving dead `@Inject` params on the source.
+7. Run post-apply hygiene on touched/created files only. Use general hygiene
+   primitives when available (constructor-param cleanup, organize/prune imports,
+   formatter/spacing cleanup) instead of reimplementing cleanup inside each
+   semantic transform. `java.removeUnusedConstructorParams({ file })` runs
+   **after** the extract is applied — the orphaned `this.dep = dep` must already
+   be gone for the param to read as unused. If no hygiene primitive exists,
+   report the residue as a construct gap rather than hand-editing broad cosmetic
+   changes. Re-compile if hygiene changes anything.
 
 The load-bearing mutation cell shape:
 
@@ -139,6 +143,10 @@ A good brief is a **task with guardrails**, not a script. Tell it:
   shell-delete the created file and loop).
 - To **move the injection point** with `removeUnusedConstructorParams` after the
   extract compiles.
+- To treat hygiene as a standard post-apply phase on touched files only:
+  organize/prune imports and normalize formatting through available primitives,
+  then compile again if hygiene changed anything. Do not ask the agent to
+  hand-roll cosmetic cleanup with ad hoc string edits.
 - **One concern per dispatch.** Decomposing a god class is many extractions;
   each is its own dispatch against a fresh seam survey.
 - A **structured return JSON** so you can verify without reading the transcript:
@@ -187,6 +195,10 @@ A good brief is a **task with guardrails**, not a script. Tell it:
   The returned `exit_code` must be the build's exit code, not a filter's.
 - **If a long code-mode `shell_run` yields while still running, resume the cell
   with `wait`.** Do not re-run the build just because the outer JS cell yielded.
+- **Hygiene is taught as a routine, not hidden in every mutator.** The semantic
+  transform should do the move; a separate post-apply hygiene phase handles
+  imports/formatting when a safe primitive exists. Missing hygiene is a construct
+  gap, not a reason to rerun the semantic transform.
 - **Steers are recipe deltas.** If you have to steer a running probe, treat the
   steer as evidence that the recipe/prompt is under-specified. Before the next
   rerun, refine the prompt text or add a recipe comment so future agents start
