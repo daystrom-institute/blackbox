@@ -15,9 +15,11 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness/responses-stream-fault-diagnostics",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "task_id": "fa231bdf-3015-4be8-bf22-521f7cd3d1cc",
   "session_id": "b41454ca-cc60-4b61-a1b5-875ab1dc06db",
   "created_at": "2026-06-13T22:55:11Z",
-  "updated_at": "2026-06-13T22:55:11Z"
+  "updated_at": "2026-06-13T23:19:26Z",
+  "resolved_at": "2026-06-13T23:19:26Z",
+  "resolution_note": "Addressed in worktree /home/invidious/repos/transcript-search-responses-idiomatic: HTTP-SSE stream faults now include request_id, response_id, last typed event + sequence, attempt/max attempts, bytes consumed, emitted_text, and terminal_seen in retry logs and terminal errors; fleet TUI now renders failed tasks as Failed instead of Interrupted so transport failures are distinct from operator cancellation; Responses WebSocket path now handles documented previous_response_not_found by retrying full input without previous_response_id and treats websocket_connection_limit_reached as a transport fallback to HTTP-SSE. Verified with cargo check -p bro-harness -p bro-cli and cargo nextest run --workspace (4024 passed, 24 skipped)."
 }
