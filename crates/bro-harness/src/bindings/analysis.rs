@@ -1505,10 +1505,7 @@ public class ClosureTest {
         // B → A, so B's closure should contain A
         let out = json_of(
             AnalysisFieldInitializerClosure
-                .call(
-                    json!({ "file": "ClosureTest.java", "fields": ["B"] }),
-                    &cx,
-                )
+                .call(json!({ "file": "ClosureTest.java", "fields": ["B"] }), &cx)
                 .await,
         );
         let closure = &out["closure"];
@@ -1524,10 +1521,7 @@ public class ClosureTest {
         // C → B → A, so C's closure should contain [A, B]
         let out = json_of(
             AnalysisFieldInitializerClosure
-                .call(
-                    json!({ "file": "ClosureTest.java", "fields": ["C"] }),
-                    &cx,
-                )
+                .call(json!({ "file": "ClosureTest.java", "fields": ["C"] }), &cx)
                 .await,
         );
         let c_deps: Vec<&str> = out["closure"]["C"]
@@ -1542,10 +1536,7 @@ public class ClosureTest {
         // D → C → B → A, full chain
         let out = json_of(
             AnalysisFieldInitializerClosure
-                .call(
-                    json!({ "file": "ClosureTest.java", "fields": ["D"] }),
-                    &cx,
-                )
+                .call(json!({ "file": "ClosureTest.java", "fields": ["D"] }), &cx)
                 .await,
         );
         let d_deps: Vec<&str> = out["closure"]["D"]
@@ -1561,10 +1552,7 @@ public class ClosureTest {
         // E has no constant deps → should not appear in closure
         let out = json_of(
             AnalysisFieldInitializerClosure
-                .call(
-                    json!({ "file": "ClosureTest.java", "fields": ["E"] }),
-                    &cx,
-                )
+                .call(json!({ "file": "ClosureTest.java", "fields": ["E"] }), &cx)
                 .await,
         );
         assert!(

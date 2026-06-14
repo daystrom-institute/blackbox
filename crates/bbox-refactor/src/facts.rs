@@ -504,11 +504,7 @@ pub fn java_field_initializer_closure(
             if !deps.insert(dep.clone()) {
                 continue;
             }
-            for transitive in initializer_refs
-                .get(&dep)
-                .cloned()
-                .unwrap_or_default()
-            {
+            for transitive in initializer_refs.get(&dep).cloned().unwrap_or_default() {
                 if !deps.contains(&transitive) {
                     frontier.push(transitive);
                 }
@@ -525,10 +521,7 @@ pub fn java_field_initializer_closure(
 
 /// Collect all identifier names in a subtree — used for initializer reference
 /// extraction.
-fn collect_identifiers_in_subtree(
-    root: tree_sitter::Node<'_>,
-    source: &str,
-) -> BTreeSet<String> {
+fn collect_identifiers_in_subtree(root: tree_sitter::Node<'_>, source: &str) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
