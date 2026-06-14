@@ -120,3 +120,51 @@ Follow-up construct candidates:
   application.
 - Investigate `shell_run.output_filter` result delivery; the stuck call is a
   harness/tool defect or contract quirk from this campaign, not recipe content.
+
+## Rerun After Output-Filter Fix
+
+After rebuilding and installing the harness with the output-filter fix, the same
+provider/model reran the same query-object unit of work in a fresh disposable
+worktree.
+
+Outcome:
+
+- Extraction applied successfully again.
+- The filtered compile gate returned normally through `shell_run.output_filter`
+  with `exit_code=0` and `BUILD SUCCESSFUL`; the prior stranded-tool symptom did
+  not recur.
+- Independent orchestrator compile verification also passed.
+- Code-mode `wait` was used successfully for a yielded analysis cell.
+- Source-side delegate annotation placement and method-deletion whitespace stayed
+  improved.
+- Remaining cleanup artifacts were cosmetic/static-analysis oriented: a stale
+  source-side import survived because compile does not enforce unused imports,
+  and the generated target class still had import/blank-line/indentation residue.
+- No manual surgery, failed cells, or runtime steers were needed.
+
+Actual pre-retro tool-use count:
+
+- 16 total tool uses
+- 5 `exec`
+- 4 `smart_read`
+- 4 `file_read`
+- 1 `wait`
+- 1 `shell_run`
+- 1 `list_dir`
+
+Retro findings:
+
+- No substrate gaps were filed by the bro.
+- The bro noted that unscoped reference counts for common method names can be
+  noisy; recipe/prompt guidance should ask for a `declaringClass`-scoped pass
+  once the target class is known.
+- Large `exec` outputs spilling to a harness dump are workable, but the path is
+  not surfaced as ergonomically as a direct inline reference.
+
+Follow-up construct candidates:
+
+- Java organize-imports or import-prune cleanup for source and generated target
+  files after `java.extractClass`.
+- Java generated-target formatting cleanup for import/class spacing, constructor
+  blank lines, and moved-body indentation.
+- More ergonomic surfacing for large code-mode output dumps.
