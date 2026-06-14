@@ -1364,6 +1364,7 @@ impl Session {
                         self.turns,
                         None,
                         None,
+                        self.compact_threshold,
                     );
                     // Turn-boundary event-log drain (see end of user_turn).
                     let log = self.event_log.clone();
@@ -1560,7 +1561,7 @@ impl Session {
 
         if matches!(break_reason, "cancelled" | "interrupted_dispatch") {
             self.emitter
-                .result_interrupted(&final_text, &self.total_usage, self.turns);
+                .result_interrupted(&final_text, &self.total_usage, self.turns, self.compact_threshold);
         } else {
             self.emitter.result(
                 &final_text,
@@ -1568,6 +1569,7 @@ impl Session {
                 self.turns,
                 None,
                 suspicious.then_some(&turn_end),
+                self.compact_threshold,
             );
         }
         // Drain the sidecar event-log writer at the turn boundary — bounds

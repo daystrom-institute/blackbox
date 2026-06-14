@@ -177,19 +177,22 @@ fn default_entries() -> BTreeMap<String, Entry> {
     // false-memory summary). gpt-5* = 400K per the codex-rs reference
     // (`protocol/src/openai_models.rs`); deepseek-v4* and MiniMax-M* are
     // 1M-class; older deepseek ids stay 128K.
-    for (k, w) in [
-        ("claude-*", 200_000),
-        ("glm-*", 200_000),
-        ("deepseek-v4*", 1_000_000),
-        ("deepseek-*", 128_000),
-        ("MiniMax-M*", 1_000_000),
-        ("gpt-5*", 400_000),
+    // MiniMax-M* compact_at is 0.45 (450K threshold) per the official
+    // recommendation for agentic workloads — the sparse-attention effective
+    // range benefits from earlier compaction.
+    for (k, w, r) in [
+        ("claude-*", 200_000, None),
+        ("glm-*", 200_000, None),
+        ("deepseek-v4*", 1_000_000, None),
+        ("deepseek-*", 128_000, None),
+        ("MiniMax-M*", 1_000_000, Some(0.45)),
+        ("gpt-5*", 400_000, None),
     ] {
         m.insert(
             k.into(),
             Entry {
                 context_window: Some(w),
-                compact_at: None,
+                compact_at: r,
             },
         );
     }

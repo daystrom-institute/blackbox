@@ -40,6 +40,13 @@ pub enum TranscriptItem {
     TurnFooter {
         num_turns: Option<u64>,
         cost_usd: Option<f64>,
+        /// Total input tokens (cache-inclusive) for the turn, from the
+        /// `usage` block of the `result` envelope event.
+        input_tokens: Option<u64>,
+        /// Current compaction threshold for the session's model, from the
+        /// harness-side `CompactionPolicy::threshold`. The percentage bar
+        /// is `input_tokens / compaction_threshold * 100`.
+        compaction_threshold: Option<u64>,
     },
 }
 

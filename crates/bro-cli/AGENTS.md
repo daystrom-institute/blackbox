@@ -105,6 +105,22 @@ verify shapes against code, but do not violate these without explicit design.
   prompt; when this cockpit launched the dispatch, display the operator's own
   text instead (the wrapped form stays in the file for forensics).
 
+## Composer footer token readout
+
+- The zoomed-in composer footer shows a context-token readout after the
+  thread name: `my-thread  225k tok (50%)`. It reads `TurnFooter.input_tokens`
+  and `TurnFooter.compaction_threshold` from the file-tailed session event log
+  (`last_focused_token_info`).
+- Token data only exists after a turn completes (the harness emits both
+  fields on the `result` event). A fresh dispatch with no completed turn
+  shows nothing.
+- `compaction_threshold` is optional — older harness builds that predate the
+  field emission still show the bare token count (`225k tok`) without the
+  percentage. Never duplicate the harness compaction-policy lookup table in
+  the cockpit; the percentage gap during a harness upgrade is self-healing.
+- If this readout is missing data the TUI needs, add an emit lever in
+  bro-harness — never reconstruct it cockpit-side.
+
 ## Validation
 
 - Unit tests lie about TUI behavior; validate user-visible changes with tmux

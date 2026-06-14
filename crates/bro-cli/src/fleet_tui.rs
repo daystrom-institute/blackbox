@@ -1318,6 +1318,25 @@ fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
     app.agents[idx].task.transcript()
 }
 
+/// Last `TurnFooter` token fields from the focused tail: `(input_tokens,
+/// compaction_threshold)`. Returns `None` when no footer has landed yet.
+/// `compaction_threshold` may be `None` with older harness builds that don't
+/// emit it yet — the caller shows the token count alone in that case.
+fn last_focused_token_info(app: &App, idx: usize) -> Option<(u64, Option<u64>)> {
+    let items = focused_transcript_items(app, idx);
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TranscriptItem::TurnFooter {
+                input_tokens,
+                compaction_threshold,
+                ..
+            } => input_tokens.map(|tok| (tok, *compaction_threshold)),
+            _ => None,
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchMode {
     Fleet,
@@ -5140,8 +5159,17 @@ fn single_agent_composer_bottom_titles(
 ) -> Option<Vec<Line<'static>>> {
     let mut titles = vec![Line::from(single_agent_status_spans(app, views, order))];
     if let Some(idx) = app.selected_agent() {
-        let name = truncate(&app.agents[idx].name, 30);
-        titles.push(Line::from(single_agent_name_title_spans(&name)).right_aligned());
+        let a = &app.agents[idx];
+        let name = truncate(&a.name, 30);
+        let mut right = single_agent_name_title_spans(&name);
+        if let Some((tokens, threshold)) = last_focused_token_info(app, idx) {
+            let readout = format_token_readout(tokens, threshold);
+            right.push(Span::styled(
+                format!("  {readout} "),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        titles.push(Line::from(right).right_aligned());
     }
     Some(titles)
 }
@@ -5235,6 +5263,21 @@ fn roster_model_label<'a>(
 /// AgentView) pair the roster and zoom paths always carry together.
 fn roster_model_label_for<'a>(a: &'a Agent, v: &'a AgentView) -> std::borrow::Cow<'a, str> {
     roster_model_label(a.selected_model.as_deref(), v.model.as_deref(), a.provider)
+}
+
+fn format_token_readout(tokens: u64, threshold: Option<u64>) -> String {
+    let tok = if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    };
+    match threshold {
+        Some(t) if t > 0 => {
+            let pct = ((tokens as f64 / t as f64) * 100.0).round() as u64;
+            format!("{tok} tok ({pct}%)")
+        }
+        _ => format!("{tok} tok"),
+    }
 }
 
 fn next_tuple(app: &App) -> String {

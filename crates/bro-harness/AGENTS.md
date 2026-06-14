@@ -29,6 +29,21 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
   set rebuilt from startup docs plus prior rider blocks on resume. `shell_run`
   is deliberately outside this path.
 
+## Compaction policy
+
+- Compaction thresholds are model-family properties in `compaction.rs`:
+  `default_entries()`. The default ratio is 0.75 of the context window.
+  MiniMax-M* is an exception: `compact_at: 0.45` (450K threshold on a 1M
+  window) per official recommendation — sparse-attention effective range
+  benefits from earlier compaction.
+- When a downstream consumer (cockpit, etc.) needs the current threshold,
+  **emit it into the session event log** (`compaction_threshold` on the
+  `result` event). Never let the consumer duplicate the lookup table — that
+  table drifts immediately.
+- The `threshold()` function returns `window × ratio` rounded down.
+  Resolution walks exact-model → longest-glob → "default" independently for
+  each field, so a glob can set the window while inheriting the ratio.
+
 ## Session + loop model
 
 - One `user_turn` = one model conversation turn, possibly many model steps

@@ -262,6 +262,7 @@ impl Emitter {
         num_turns: u64,
         cost_usd: Option<f64>,
         suspicious_turn_end: Option<&Value>,
+        compaction_threshold: Option<u64>,
     ) {
         // Emit the Anthropic-native usage shape (fresh `input_tokens` plus
         // `cache_read_input_tokens` / `cache_creation_input_tokens`) so the
@@ -286,6 +287,9 @@ impl Emitter {
         if let Some(diag) = suspicious_turn_end {
             v["suspicious_turn_end"] = diag.clone();
         }
+        if let Some(t) = compaction_threshold {
+            v["compaction_threshold"] = json!(t);
+        }
         self.write_line(v);
     }
 
@@ -293,8 +297,14 @@ impl Emitter {
     /// is deliberately not `subtype: success`: callers that key on successful
     /// completion keep their existing behavior for natural finishes, while
     /// interruption-aware consumers can distinguish a partial deliverable.
-    pub fn result_interrupted(&self, text: &str, usage: &Usage, num_turns: u64) {
-        self.write_line(json!({
+    pub fn result_interrupted(
+        &self,
+        text: &str,
+        usage: &Usage,
+        num_turns: u64,
+        compaction_threshold: Option<u64>,
+    ) {
+        let mut v = json!({
             "type": "result",
             "subtype": "interrupted",
             "interrupted": true,
@@ -307,7 +317,11 @@ impl Emitter {
                 "cache_read_input_tokens": usage.cached_input_tokens,
                 "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             },
-        }));
+        });
+        if let Some(t) = compaction_threshold {
+            v["compaction_threshold"] = json!(t);
+        }
+        self.write_line(v);
     }
 
     /// Terminal `result` event for a turn that FAILED. Mirrors `result()` but
@@ -351,7 +365,7 @@ mod tests {
         let emitter = Emitter::with_callback("session-1".into(), sink);
 
         emitter.system_init();
-        emitter.result("done", &Usage::default(), 1, None, None);
+        emitter.result("done", &Usage::default(), 1, None, None, None);
 
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 2);
@@ -520,7 +534,7 @@ mod tests {
         };
         let emitter = Emitter::with_callback("session-int".into(), sink);
 
-        emitter.result_interrupted("partial answer", &Usage::default(), 0);
+        emitter.result_interrupted("partial answer", &Usage::default(), 0, None);
 
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 1);

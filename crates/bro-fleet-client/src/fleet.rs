@@ -831,10 +831,31 @@ pub fn parse_transcript(events: &[Value]) -> Vec<TranscriptItem> {
                     .to_string();
                 out.push(TranscriptItem::CompactBoundary { trigger });
             }
-            "result" => out.push(TranscriptItem::TurnFooter {
-                num_turns: e.get("num_turns").and_then(|n| n.as_u64()),
-                cost_usd: e.get("total_cost_usd").and_then(|c| c.as_f64()),
-            }),
+            "result" => {
+                let usage = e.get("usage");
+                let input_tokens = usage.and_then(|u| {
+                    let raw = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_read = u
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_create = u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let total = raw + cache_read + cache_create;
+                    if total > 0 { Some(total) } else { None }
+                });
+                let compaction_threshold = e
+                    .get("compaction_threshold")
+                    .and_then(|v| v.as_u64());
+                out.push(TranscriptItem::TurnFooter {
+                    num_turns: e.get("num_turns").and_then(|n| n.as_u64()),
+                    cost_usd: e.get("total_cost_usd").and_then(|c| c.as_f64()),
+                    input_tokens,
+                    compaction_threshold,
+                })
+            }
             _ => {}
         }
     }
@@ -2414,7 +2435,8 @@ mod tests {
             items[7],
             TranscriptItem::TurnFooter {
                 num_turns: Some(2),
-                cost_usd: Some(_)
+                cost_usd: Some(_),
+                ..
             }
         ));
     }
