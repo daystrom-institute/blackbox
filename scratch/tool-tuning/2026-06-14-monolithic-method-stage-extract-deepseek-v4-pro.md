@@ -314,3 +314,77 @@ successful listener-only extraction:
 - extract-method preview/result-record generation for multi-live-out block
   extraction;
 - discontiguous-region extraction for interleaved UI-builder concerns.
+
+## Probe After Compact Method-Region Gates
+
+Fourth probe after adding compact/filter output and UI-tree live-out
+classification to `analysis.methodRegions`:
+
+- Probe task: `d4655d60-d8c3-41b6-b14f-aea4683c089b`.
+- Retro task: `f1631d67-dcfb-4f5c-b384-ab84801f008d`.
+- Session: `27ac61e3-60b4-4872-98be-1f160d1eb6ce`.
+- Target shape: same large Java/Vaadin builder method and split-controls
+  candidate, generalized here to avoid private project identifiers.
+
+### Fourth Probe Outcome
+
+No mutation was applied. This was the correct stop.
+
+The probe used the newly added compact path directly:
+
+1. `statementContains` plus `statementLimit` reduced a 178-statement method to
+   15 matching statement regions and reported `matched_count`, `omitted_count`,
+   `returned_count`, and `total_count`.
+2. `includeStatementRegions:false` returned gate-only output for exact candidate
+   ranges without materializing full statement inventories.
+3. The broader split-controls concern was confirmed as non-contiguous across
+   three clusters.
+4. The most cohesive contiguous controls-assembly block had six live-out locals,
+   so current `java.extractMethodCodeBlock` correctly could not apply.
+5. `after_use_kinds` and `component_tree_consumptions` made the live-out
+   decision much clearer: some UI locals were wired into the component tree in
+   the candidate block, but still had post-region receiver/argument uses and
+   therefore remained real outputs.
+6. The adjacent listener block was extractable by itself, but the probe avoided
+   repeating the previously solved smaller extraction because it would not
+   address the broader concern under test.
+
+### Fourth Probe Measurements
+
+Measured from the harness event log before retro:
+
+- 18 total probe tool uses
+- 5 `exec` code-mode cells
+- 9 `file_read`
+- 2 `content_search`
+- 1 `glob`
+- 1 `mcp__blackbox__bbox_note`
+- 0 error-bearing tool results
+
+Retro added 4 tool calls: 2 `file_read`, 1 `exec`, and 1 done note.
+
+### Fourth Probe Retro Findings
+
+The new `methodRegions` controls were a decisive improvement:
+
+- `statementContains` / `statementLimit` avoided the old broad 178-statement
+  dump path.
+- `includeStatementRegions:false` made exact range gates compact.
+- `after_use_kinds` and `component_tree_consumptions` were sufficient for the
+  live-out decision; no manual live-out counting was needed.
+- Lambda-local returns stayed local; no non-local-control-flow regression
+  appeared.
+
+Remaining waste was recipe sequencing, not a new code gap: the bro still used
+several bounded raw reads to map the method after the compact statement search.
+The retro recommendation is to gate directly from the compact
+`statementContains` line ranges, and only read source once a transform needs
+exact `oldText` or the gate is ambiguous.
+
+### Updated Next Action
+
+The next code construct should be result-record/result-bundle generation for
+multi-live-out Java extract-method regions. This probe reaffirmed
+discontiguous-region extraction as a real second-order construct, but the
+single contiguous block with multiple outputs is the closer, higher-leverage
+next step.
