@@ -608,6 +608,9 @@ impl Tool for AnalysisFieldInitializerClosure {
             destructive: false,
         }
     }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("analysis".to_string(), "fieldInitializerClosure".to_string()))
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: FieldInitClosureParams = match serde_json::from_value(input) {
             Ok(p) => p,

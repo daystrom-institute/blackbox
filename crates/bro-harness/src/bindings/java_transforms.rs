@@ -1599,6 +1599,9 @@ impl Tool for JavaExtractClassPreviewPlan {
             destructive: false,
         }
     }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "extractClassPreviewPlan".to_string()))
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: PreviewPlanParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -1879,9 +1882,10 @@ impl Tool for JavaExtractClassPreviewPlan {
                         }
                     }
                 }
-                if has_external_callers {
-                    b.push("external_callers_on_moved_methods");
-                }
+                // External callers are NOT a hard blocker — the remedy is
+                // wrappers:true, which the bro applies during extractClass.
+                // Flag it informatively in has_external_callers but don't
+                // block ready.
                 if !non_injectable_mutable.is_empty() {
                     b.push("non_injectable_mutable_fields");
                 }
