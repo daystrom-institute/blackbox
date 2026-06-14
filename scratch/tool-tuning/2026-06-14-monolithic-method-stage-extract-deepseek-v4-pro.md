@@ -127,3 +127,107 @@ Do not rerun this exact probe yet. The next useful move is code/recipe work:
 either implement method-body region analysis first, or add the `java.*`
 extract-method binding plus a live-out preview/report before trying another
 monolithic method.
+
+## Rerun After Method-Region Gates
+
+Second probe after adding the direct code-mode bindings:
+
+- Probe task: `93e8d074-b02e-4d07-9840-50fec6083ebe`.
+- Retro task: `f720ebb1-9f43-4ae0-92f4-b7ef783e635b`.
+- Session: `9ae9ebee-4e91-4768-83c5-c639f4ed7bd6`.
+- Private recipe branch tip: `5684f0b46`.
+- Target shape: same large Java/Vaadin dialog-builder method and same controls
+  sub-surface, generalized here to avoid private project identifiers.
+
+### Rerun Outcome
+
+The new direct path worked:
+
+1. The bro verified JDK 25 from daemon-propagated `JAVA_HOME`.
+2. It found `analysis.methodRegions`, `java.extractMethodCodeBlock`, and
+   `java.hygiene`.
+3. It used `analysis.methodRegions` to reject broad/tight stage ranges, then
+   selected a smaller listener-registration block with zero live-outs and no
+   non-local control flow.
+4. It called `java.extractMethodCodeBlock`, applied the returned edit set with
+   `edits.apply`, compiled, ran `java.hygiene`, applied hygiene, and compiled
+   again.
+5. The orchestrator re-ran the compile gate independently with JDK 25:
+   `BUILD SUCCESSFUL in 1s`.
+
+Compile success is not the whole story. Diff review found the generated helper
+was compile-valid but badly formatted:
+
+- call-site indentation was lost;
+- the new helper began on the same line as the previous method's closing brace;
+- helper-body indentation was collapsed;
+- `java.hygiene` sorted imports and removed some blank lines, but did not repair
+  helper insertion spacing or moved-body indentation.
+
+This turns post-transform formatting into a real construct gap, not a cosmetic
+note. Future probes should not call a compile-valid helper extraction fully
+successful until they inspect the call site/helper formatting or a stronger
+Java formatter/hygiene primitive exists.
+
+### Rerun Measurements
+
+Measured from the harness event log before retro:
+
+- 30 total probe tool uses
+- 11 `exec` code-mode cells
+- 13 `file_read`
+- 3 `shell_run`
+- 1 `smart_read`
+- 1 `glob`
+- 1 `content_search`
+- 0 error-bearing tool results
+
+The retro was one additional `exec` cell in the same provider session.
+
+### Rerun Retro Findings
+
+The bro and orchestrator found these recurring substrate gaps:
+
+1. **Lambda-local return classification.** The region analyzer counted returns
+   inside validator/listener lambdas as non-local control flow. For an
+   extraction where the whole lambda expression moves inside the helper, those
+   returns are local to the lambda and should not block the broader stage.
+2. **UI-tree live-out over-reporting.** A component declared inside the candidate
+   block but consumed by component-tree wiring inside that same block was counted
+   as a true live-out. The method return value was also counted like an ordinary
+   live-out. This made the broader region look like a multi-output extraction
+   even though part of the state was already tree-consumed.
+3. **Method-region output was too broad.** A 178-statement region report pushed
+   the bro into harness dumps and follow-up bounded reads. `methodRegions` needs
+   a compact/filter/search mode for long methods.
+4. **`code.read` needs truncation metadata.** The bro burned a cell verifying
+   whether returned text was truly truncated or only display-truncated.
+5. **Line-range gates should warn or expand.** The bro had to re-run a gate
+   because the first line range ended just before a statement that logically
+   belonged to the listener block.
+6. **Java extraction formatting/hygiene is insufficient.** The transform and
+   current hygiene compose to a compile-valid result, but not a professionally
+   formatted result.
+
+### Gap Notes Filed
+
+- `gap-8516bf36`: Java method-region NLOCF should treat lambda-local returns as
+  local.
+- `gap-d7e01105`: Java method-region live-out facts need UI tree-consumption
+  classification.
+- `gap-c21ea5e8`: `methodRegions` needs filtered compact output for very long
+  methods.
+- `gap-df0d3979`: `code.read` should report whether returned text was
+  truncated.
+- `gap-4f021516`: Java extract-method/hygiene should preserve helper
+  formatting, indentation, and method spacing.
+
+### Updated Next Action
+
+Do not rerun this exact probe again until the extraction formatting/hygiene gap
+is addressed. The next code tranche should either:
+
+- fix `java.extractMethodCodeBlock` insertion/body indentation and/or upgrade
+  `java.hygiene` to repair helper spacing and indentation; or
+- refine `analysis.methodRegions` for lambda-local returns and UI-tree
+  live-outs so the broader stage can be gated accurately.

@@ -1,0 +1,25 @@
+{
+  "id": "gap-df0d3979",
+  "title": "code.read should report whether returned text was truncated",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools/code-mode",
+  "wanted_capability": "code.read results should include explicit returned byte/char counts and a truncated boolean so agents can distinguish actual source text from display truncation and avoid redundant file_read calls.",
+  "missing_primitive": "code.read truncation metadata",
+  "fallback_used": "Probe used an extra file_read to verify exact source text before extraction.",
+  "evidence": [
+    "thread-8d968b2d",
+    "task 93e8d074-b02e-4d07-9840-50fec6083ebe",
+    "retro task f720ebb1-9f43-4ae0-92f4-b7ef783e635b",
+    "scratch/tool-tuning/2026-06-14-monolithic-method-stage-extract-deepseek-v4-pro.md"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/refactor-tools/code-read-truncation-flag",
+  "resolution": "unresolved",
+  "task_id": "93e8d074-b02e-4d07-9840-50fec6083ebe",
+  "session_id": "9ae9ebee-4e91-4768-83c5-c639f4ed7bd6",
+  "provider": "deepseek",
+  "thread_id": "thread-8d968b2d",
+  "created_at": "2026-06-14T01:51:49Z",
+  "updated_at": "2026-06-14T01:51:49Z"
+}
