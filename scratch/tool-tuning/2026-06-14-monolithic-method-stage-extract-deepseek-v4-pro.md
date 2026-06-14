@@ -231,3 +231,86 @@ is addressed. The next code tranche should either:
   `java.hygiene` to repair helper spacing and indentation; or
 - refine `analysis.methodRegions` for lambda-local returns and UI-tree
   live-outs so the broader stage can be gated accurately.
+
+## Rerun After Lambda/Formatting Fixes
+
+Third probe after public commit `e2e7c41d` and the matching private recipe
+update:
+
+- Probe task: `9fb860e8-ab62-419e-a5b8-fa719150c1d8`.
+- Retro task: `27b01cf5-3e22-4999-97ac-fc2840361c5e`.
+- Session: `72b138a9-d2c4-4d1f-bf36-41657881bac6`.
+- Target shape: same large Java/Vaadin dialog-builder method and same controls
+  sub-surface, generalized here to avoid private project identifiers.
+
+### Third Rerun Outcome
+
+The direct pipeline worked end-to-end:
+
+1. The bro verified daemon-propagated JDK 25 before the compile gate.
+2. It used `analysis.methodRegions` to gate a contiguous listener-registration
+   region.
+3. The selected region had five top-level statements, 12 captured locals, zero
+   live-outs, zero mutated captures, and zero non-local control flow.
+4. Returns inside fully selected lambdas/listeners were not reported as
+   method-level non-local control flow. The lambda-local return fix removed the
+   previous false stop.
+5. `java.extractMethodCodeBlock` returned two edits with no FIXMEs; the bro
+   applied them through `edits.apply`.
+6. Compile passed, `java.hygiene` made one touched-file cleanup, and compile
+   passed again.
+
+The orchestrator independently reran the compile gate with JDK 25:
+`BUILD SUCCESSFUL in 1s`.
+
+Diff review confirmed the formatting fix worked:
+
+- call-site indentation was preserved;
+- the inserted helper was separated from the enclosing method with normal method
+  spacing;
+- moved-body indentation was preserved;
+- hygiene only performed import/blank-line cleanup.
+
+No new substrate gap was filed from this rerun.
+
+### Third Rerun Measurements
+
+Measured from the harness event log:
+
+- 26 total probe tool uses
+- 11 `exec` code-mode cells
+- 10 `file_read`
+- 2 `shell_run`
+- 1 `content_search`
+- 1 `glob`
+- 1 `sandbox_grounding`
+
+The retro added no tool calls. There was one recoverable code-cell scope error:
+the bro tried to reuse a JavaScript local from a prior exec cell, then recovered
+by re-running the gate/read sequence in one cell.
+
+### Third Rerun Retro Findings
+
+The retro reported no missing primitive. The remaining waste was recipe
+sequencing:
+
+- for methods over roughly 200 lines, search for a marker first and gate a
+  bounded range instead of dumping the full method inventory;
+- keep gate -> exact read -> transform -> apply in one exec cell where practical,
+  because exec cells do not share JavaScript local scope;
+- trust compile `exit_code: 0` on successful gates, and read shell dumps only on
+  failure or targeted warning/debug inspection.
+
+The private recipe and prompt were updated with those steers after the rerun.
+
+### Current Next Action
+
+This exact monolithic-method recipe no longer needs another immediate rerun. The
+remaining construct candidates are the broader ones still not exercised by this
+successful listener-only extraction:
+
+- UI/component-tree consumed-local classification for Java live-out gates;
+- compact/filter/search mode for `analysis.methodRegions` on very long methods;
+- extract-method preview/result-record generation for multi-live-out block
+  extraction;
+- discontiguous-region extraction for interleaved UI-builder concerns.
