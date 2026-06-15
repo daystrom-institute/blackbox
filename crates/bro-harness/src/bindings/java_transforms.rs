@@ -2354,16 +2354,24 @@ impl Tool for JavaExtractColumnSpec {
                                 if cap.capture == "addcol" && cap.text == "addColumn"
                                     && cap.byte_start >= m_start && cap.byte_end <= m_end
                                 {
-                                    // Get the fluent chain text following this
-                                    // addColumn call. Extract key, header, align.
                                     let chain_start = cap.byte_end;
                                     let chain_end = source[chain_start..]
                                         .find(';').map(|i| chain_start + i).unwrap_or(m_end);
                                     let chain = &source[chain_start..chain_end];
+                                    // Skip LitRenderer columns — they have complex
+                                    // templates that the spec record can't represent.
+                                    if chain.contains("LitRenderer") { continue; }
                                     let key = chain.find(".setKey(\"").and_then(|i| {
                                         let s = &chain[i+9..];
                                         s.find('"').map(|j| s[..j].to_string())
                                     }).unwrap_or_default();
+                                    // If no key, derive from header (lowercase, no spaces).
+                                    let key = if key.is_empty() {
+                                        chain.find(".setHeader(\"").and_then(|i| {
+                                            let s = &chain[i+12..];
+                                            s.find('"').map(|j| s[..j].to_lowercase().replace(' ', "_"))
+                                        }).unwrap_or_else(|| format!("col_{}", cols.len()))
+                                    } else { key };
                                     let header = chain.find(".setHeader(\"").and_then(|i| {
                                         let s = &chain[i+12..];
                                         s.find('"').map(|j| s[..j].to_string())
@@ -2372,8 +2380,6 @@ impl Tool for JavaExtractColumnSpec {
                                         else if chain.contains("START") { "START" }
                                         else if chain.contains("END") { "END" }
                                         else { "CENTER" };
-                                    // Provider text: everything between addColumn( and the
-                                    // first .set or ).
                                     let provider_text = source[cap.byte_start..chain_start]
                                         .trim().to_string();
                                     cols.push(ColInfo { key, header, provider_text, align: align.to_string() });
