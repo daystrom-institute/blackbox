@@ -2148,14 +2148,16 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 }
             }
 
-            // Synthesize wrapper methods. Skip methods that extractClass
-            // already wrapped (source has `this.delegateField.method(` call).
-            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            // Synthesize wrapper methods. Deduplicate by bare_name + param
+            // count so overloaded methods each get their own wrapper.
+            // Skip methods that extractClass already wrapped.
+            let mut seen: BTreeSet<String> = BTreeSet::new();
             let mut wrapper_texts: Vec<String> = Vec::new();
             let delegate_call = format!("{}.{}(", params.delegate_field, "");
             for sig in &sigs {
                 if !needs_wrappers.contains(&sig.bare_name) { continue; }
-                if !seen.insert(&sig.bare_name) { continue; }
+                let dedup_key = format!("{}({})", sig.bare_name, sig.param_names.len());
+                if !seen.insert(dedup_key) { continue; }
                 // Skip if source already has a delegating wrapper for this method.
                 let wrapper_call = format!("{}{}(", delegate_call, sig.bare_name);
                 if source.contains(&wrapper_call) { continue; }
