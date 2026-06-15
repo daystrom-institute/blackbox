@@ -467,7 +467,7 @@ Content is capped at 12KB per document. Responses are capped at 80KB to avoid bl
 Maintained in `src/orchestration/providers.rs`:
 
 - **Claude** - Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
-- **GLM** - Z.AI Coding Plan API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `glm-5.1`, helper model `glm-4.5-air`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-zai` by default). Legacy `zai-coding-plan/...` model slugs are normalized at dispatch.
+- **GLM** - Z.AI Coding Plan API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `glm-5.2`, helper model `glm-4.5-air`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-zai` by default). Legacy `zai-coding-plan/...` model slugs are normalized at dispatch.
 - **DeepSeek** - DeepSeek API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `deepseek-v4-pro`, helper model `deepseek-v4-flash`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-ds` by default). Legacy `deepseek/...` model slugs are normalized at dispatch.
 - **Codex** - gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot** - Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.

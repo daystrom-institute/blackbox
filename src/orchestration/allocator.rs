@@ -414,7 +414,7 @@ pub fn built_in_config() -> AllocatorConfig {
         "premium",
         vec![
             (Brodex, Some("gpt-5.5"), Some("high"), None),
-            (Glm, Some("glm-5.1"), Some("high"), None),
+            (Glm, Some("glm-5.2"), Some("high"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("high"), None),
             (Minimax, Some("MiniMax-M3"), Some("high"), None),
             (VibeBh, Some("magistral-medium-latest"), Some("high"), None),
