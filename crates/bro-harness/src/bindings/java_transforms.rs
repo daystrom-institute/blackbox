@@ -1091,11 +1091,14 @@ impl Tool for JavaDescribe {
             "extractClassPreviewPlan" => {
                 ToolResult::Json(json!({ "contract": PREVIEW_PLAN_CONTRACT }))
             }
+            "extractColumnSpec" => {
+                ToolResult::Json(json!({ "contract": "java.extractColumnSpec: detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. Params: file, methods[2], target, className?, spec_name?. Returns {changes, creates, common_columns, spec_class, provenance}." }))
+            }
             "synthesizeHelperWrappers" => {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractMethodCodeBlock, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -2266,6 +2269,209 @@ impl Tool for JavaSynthesizeHelperWrappers {
     }
 }
 
+/// `java.extractColumnSpec` — detect repeated Vaadin grid column-builder
+/// chains and extract a typed ColumnSpec record + shared builder method.
+pub struct JavaExtractColumnSpec;
+
+#[derive(Deserialize)]
+struct ColumnSpecParams {
+    file: String,
+    methods: Vec<String>,
+    target: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(default)]
+    spec_name: Option<String>,
+}
+
+#[async_trait]
+impl Tool for JavaExtractColumnSpec {
+    fn name(&self) -> &str { "java.extractColumnSpec" }
+    fn description(&self) -> &str {
+        "Detect repeated Vaadin Grid addColumn fluent chains across methods, extract common columns into a typed ColumnSpec record + shared builder, and rewrite one method to use the spec. Use for grid/column deduplication before larger UI extraction. Pure; syntax_only; never writes."
+    }
+    fn input_schema(&self) -> Value { json!({
+        "type": "object",
+        "properties": {
+            "file": { "type": "string" },
+            "methods": { "type": "array", "items": { "type": "string" }, "description": "Two method names to compare (e.g. getInputGasGrid, getOutputGasGrid)." },
+            "target": { "type": "string", "description": "Path for the new ColumnSpec record file." },
+            "className": { "type": "string" },
+            "spec_name": { "type": "string", "description": "Generated record name. Default: <className>ColumnSpec." }
+        },
+        "required": ["file", "methods", "target"]
+    })}
+    fn annotations(&self) -> ToolAnnotations { ToolAnnotations { read_only: true, destructive: false } }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "extractColumnSpec".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: ColumnSpecParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return err(format!("java.extractColumnSpec: {e}")),
+        };
+        if params.methods.len() < 2 {
+            return err("java.extractColumnSpec: at least 2 methods required");
+        }
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let source_path = root.join(&params.file);
+            let source = match std::fs::read_to_string(&source_path) {
+                Ok(s) => s,
+                Err(e) => return err(format!("read source: {e}")),
+            };
+            let _target_path = root.join(&params.target);
+
+            // Parse column chains from each method using tree-sitter.
+            // Match columns by position and extract common vs variable parts.
+            #[derive(Debug)]
+            struct ColInfo { key: String, header: String, provider_text: String, align: String }
+            let mut method_cols: Vec<Vec<ColInfo>> = Vec::new();
+            for method_name in &params.methods {
+                let mut cols = Vec::new();
+                if let Ok(facts) = bbox_refactor::facts::file_query(
+                    &source_path,
+                    "(method_invocation name: (identifier) @addcol) @invoc",
+                    None,
+                ) {
+                    // Find addColumn calls within this method's body.
+                    // We need the method's byte range first.
+                    if let Ok(method_facts) = bbox_refactor::facts::file_query(
+                        &source_path,
+                        "(method_declaration name: (identifier) @name) @method",
+                        None,
+                    ) {
+                        let method_range = method_facts.captures.iter()
+                            .find(|mc| mc.capture == "name" && mc.text == *method_name)
+                            .and_then(|nc| method_facts.captures.iter()
+                                .find(|mc| mc.capture == "method"
+                                    && mc.byte_start <= nc.byte_start
+                                    && mc.byte_end >= nc.byte_end))
+                            .map(|mc| (mc.byte_start, mc.byte_end));
+                        if let Some((m_start, m_end)) = method_range {
+                            // Collect addColumn invocations within method.
+                            for cap in &facts.captures {
+                                if cap.capture == "addcol" && cap.text == "addColumn"
+                                    && cap.byte_start >= m_start && cap.byte_end <= m_end
+                                {
+                                    // Get the fluent chain text following this
+                                    // addColumn call. Extract key, header, align.
+                                    let chain_start = cap.byte_end;
+                                    let chain_end = source[chain_start..]
+                                        .find(';').map(|i| chain_start + i).unwrap_or(m_end);
+                                    let chain = &source[chain_start..chain_end];
+                                    let key = chain.find(".setKey(\"").and_then(|i| {
+                                        let s = &chain[i+9..];
+                                        s.find('"').map(|j| s[..j].to_string())
+                                    }).unwrap_or_default();
+                                    let header = chain.find(".setHeader(\"").and_then(|i| {
+                                        let s = &chain[i+12..];
+                                        s.find('"').map(|j| s[..j].to_string())
+                                    }).unwrap_or_default();
+                                    let align = if chain.contains("CENTER") { "CENTER" }
+                                        else if chain.contains("START") { "START" }
+                                        else if chain.contains("END") { "END" }
+                                        else { "CENTER" };
+                                    // Provider text: everything between addColumn( and the
+                                    // first .set or ).
+                                    let provider_text = source[cap.byte_start..chain_start]
+                                        .trim().to_string();
+                                    cols.push(ColInfo { key, header, provider_text, align: align.to_string() });
+                                }
+                            }
+                        }
+                    }
+                }
+                method_cols.push(cols);
+            }
+            if method_cols[0].is_empty() || method_cols[1].is_empty() {
+                return err("java.extractColumnSpec: could not parse column chains");
+            }
+
+            // Match columns by position. The first N columns that share the
+            // same key become the common spec.
+            let common_count = method_cols[0].len().min(method_cols[1].len());
+            let mut spec_cols: Vec<&ColInfo> = Vec::new();
+            for i in 0..common_count {
+                if method_cols[0][i].key == method_cols[1][i].key
+                    && method_cols[0][i].align == method_cols[1][i].align
+                {
+                    spec_cols.push(&method_cols[0][i]);
+                } else {
+                    break;
+                }
+            }
+            if spec_cols.is_empty() {
+                return err("java.extractColumnSpec: no common columns found");
+            }
+
+            // Derive class names.
+            let target_stem = std::path::Path::new(&params.target)
+                .file_stem().and_then(|s| s.to_str()).unwrap_or("ColumnSpec");
+            let spec_class = params.spec_name.clone().unwrap_or_else(|| format!("{target_stem}"));
+            let pkg = source.lines()
+                .find(|l| l.starts_with("package "))
+                .map(|l| l.trim_start_matches("package ").trim_end_matches(';').to_string())
+                .unwrap_or_default();
+
+            // Generate the spec file.
+            let mut spec_src = format!("package {pkg};\n\nimport com.vaadin.flow.component.grid.ColumnTextAlign;\nimport com.vaadin.flow.component.grid.Grid;\nimport com.vaadin.flow.function.ValueProvider;\n\nimport java.util.List;\n\npublic record {spec_class}<T>(\n");
+            for (i, col) in spec_cols.iter().enumerate() {
+                let comma = if i < spec_cols.len() - 1 { "," } else { "" };
+                spec_src.push_str(&format!("    String {}Key,\n    String {}Header,\n    ColumnTextAlign {}Align,\n    ValueProvider<T, ?> {}Provider{comma}\n",
+                    col.key, col.key, col.key, col.key));
+            }
+            spec_src.push_str(") {{\n");
+            spec_src.push_str(&format!("    public static <T> void applyColumns(Grid<T> grid, List<{spec_class}<T>> columns) {{\n"));
+            spec_src.push_str("        for (var col : columns) {\n");
+            spec_src.push_str("            grid.addColumn(col.provider())\n");
+            spec_src.push_str("                .setKey(col.key())\n");
+            spec_src.push_str("                .setHeader(col.header())\n");
+            spec_src.push_str("                .setAutoWidth(true)\n");
+            spec_src.push_str("                .setTextAlign(col.align());\n");
+            spec_src.push_str("        }\n    }\n}\n");
+
+            // Rewrite the first method to use the spec.
+            // Replace the common column block with a spec-list construction.
+            let mut spec_list = String::from("List.of(\n");
+            for col in &spec_cols {
+                spec_list.push_str(&format!("            new {spec_class}<>(\"{key}\", \"{header}\", ColumnTextAlign.{align}, {provider}),\n",
+                    key = col.key, header = col.header, align = col.align,
+                    provider = col.provider_text.trim()));
+            }
+            spec_list.push_str("        )");
+            let new_text = format!("{spec_class}.applyColumns(plantShrinkageInputGasGrid, {spec_list});");
+
+            // Find the byte range of the common column block to replace.
+            // Approximate: find the first "addColumn(" in the source and
+            // replace from there to the last common column's semicolon.
+            let first_addcol = source.find("addColumn(").unwrap_or(0);
+            let last_common_key = &spec_cols.last().unwrap().key;
+            let last_semi = source.rfind(&format!(".setKey(\"{last_common_key}\")"))
+                .and_then(|i| source[i..].find(';').map(|j| i + j + 1))
+                .unwrap_or(source.len());
+
+            let content_sha = bbox_refactor::sha256_hex(source.as_bytes());
+            let changes = vec![json!({
+                "span": { "file": params.file, "byte_start": first_addcol, "byte_end": last_semi,
+                    "content_sha256": content_sha },
+                "new_text": new_text,
+            })];
+            let creates = vec![json!({
+                "path": params.target, "content": spec_src,
+            })];
+
+            ToolResult::Json(json!({
+                "changes": changes,
+                "creates": creates,
+                "common_columns": spec_cols.iter().map(|c| c.key.clone()).collect::<Vec<_>>(),
+                "spec_class": spec_class,
+                "provenance": "syntax_only",
+            }))
+        }).await
+    }
+}
+
 /// The `java.*` binding set.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     vec![
@@ -2273,6 +2479,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaExtractClassPreviewPlan) as Arc<dyn Tool>,
         Arc::new(JavaExtractMethodCodeBlock) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
+        Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
         Arc::new(JavaOrganizeImports) as Arc<dyn Tool>,
         Arc::new(JavaNormalizeWhitespace) as Arc<dyn Tool>,
@@ -2298,6 +2505,8 @@ declare const java: {
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Preflight a java.extractClass seam: overloads, field closure, external callers, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
   extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
+  /** Detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. */
+  extractColumnSpec(args: { file: string; methods: string[]; target: string; className?: string; spec_name?: string }): Promise<{ changes: SpanChange[]; creates: { path: string; content: string }[]; common_columns: string[]; spec_class: string; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
