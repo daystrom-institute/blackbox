@@ -408,6 +408,14 @@ impl Tool for JavaExtractClass {
         };
         let root = cx.root.clone();
         bro_tools::tool::call_blocking(move || {
+            // Derive module_name from target path stem — always set it so
+            // the v1 planner doesn't fall back to the source class name.
+            let module_name = params.class_name.clone().or_else(|| {
+                std::path::Path::new(&params.target)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+            });
             let mut plan_input = json!({
                 "kind": "extract_java_class",
                 "source": params.file,
@@ -415,12 +423,10 @@ impl Tool for JavaExtractClass {
                 "project_dir": root.to_string_lossy(),
                 "item_names": params.methods,
                 "delegate_field": params.delegate_field,
+                "module_name": module_name,
             });
             if let Some(fields) = &params.move_fields {
                 plan_input["move_fields"] = json!(fields);
-            }
-            if let Some(name) = &params.class_name {
-                plan_input["module_name"] = json!(name);
             }
             // Wiring policy. A Guice-managed source defaults to
             // external_injection so the delegate is itself a container-
@@ -2142,13 +2148,17 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 }
             }
 
-            // Synthesize wrapper methods. Deduplicate by bare name — one
-            // wrapper per moved method, regardless of how many call sites.
+            // Synthesize wrapper methods. Skip methods that extractClass
+            // already wrapped (source has `this.delegateField.method(` call).
             let mut seen: BTreeSet<&str> = BTreeSet::new();
             let mut wrapper_texts: Vec<String> = Vec::new();
+            let delegate_call = format!("{}.{}(", params.delegate_field, "");
             for sig in &sigs {
                 if !needs_wrappers.contains(&sig.bare_name) { continue; }
                 if !seen.insert(&sig.bare_name) { continue; }
+                // Skip if source already has a delegating wrapper for this method.
+                let wrapper_call = format!("{}{}(", delegate_call, sig.bare_name);
+                if source.contains(&wrapper_call) { continue; }
                 let call_args = sig.param_names.join(", ");
                 // Build wrapper signature from the delegate header, replacing
                 // `public` with `private` if the delegate method is public.
