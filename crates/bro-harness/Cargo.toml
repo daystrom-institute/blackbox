@@ -11,6 +11,10 @@ edition = "2024"
 name = "bro-harness"
 path = "src/main.rs"
 
+[[bin]]
+name = "isolate"
+path = "src/bin/isolate.rs"
+
 [lib]
 name = "bro_harness"
 path = "src/lib.rs"

@@ -103,6 +103,27 @@ Targeted recipes:
 - Frontend/site/docs-only changes: run the docs/site build only when that surface
   is touched.
 
+**Isolate binding validation (`isolate` binary).** When working on the harness
+isolate bindings (`java.*`, `analysis.*`, `code.*`, `edits.*`, `lsp.*` under
+`crates/bro-harness/src/bindings`), validate a tool's behavior locally against
+a fixture or a real target root without running the full harness, dispatching a
+probe, or writing a Rust test. Build it with `cargo build -p bro-harness --bin
+isolate`, then:
+
+```bash
+isolate --list                                            # enumerate the surface
+isolate --root <dir> --describe <tool>                    # a tool's input schema
+isolate --root <dir> <tool> --args '<json>'               # run; pretty-print JSON
+isolate --root <dir> <tool> --args-file args.json \
+  --field /internal_helper_deps --strict
+```
+
+`--field <json-pointer>` extracts one result field (avoids a `jq`/`python` pipe);
+`--strict` rejects a run whose `file` arg is missing under `--root` (guards the
+silent empty-result footgun where a wrong path reads as empty instead of
+erroring). It builds a `ToolCx` rooted at `--root` and calls the binding directly
+— no agent loop, LLM, or daemon.
+
 Do not record exact test counts in this file. Counts stale quickly and do not
 help an agent choose the right validation.
 
