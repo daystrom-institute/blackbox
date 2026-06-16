@@ -1,6 +1,37 @@
+pub const DEFAULT_DISPATCH_SURFACE: &str = "default";
+pub const WORKFLOW_AGENT_SURFACE: &str = "agent-internal";
+
 pub fn dispatch_mcp_url(bind_host: &str, port: u16) -> String {
+    dispatch_mcp_url_with_surface(bind_host, port, DEFAULT_DISPATCH_SURFACE)
+}
+
+pub fn dispatch_mcp_url_with_surface(bind_host: &str, port: u16, surface: &str) -> String {
     let host = dispatch_mcp_host(bind_host);
-    format!("http://{host}:{port}/mcp?surface=agent-internal")
+    format!("http://{host}:{port}/mcp?surface={surface}")
+}
+
+pub fn dispatch_mcp_surface_for_origin(origin: bro_core::Origin) -> &'static str {
+    match origin {
+        bro_core::Origin::Workflow => WORKFLOW_AGENT_SURFACE,
+        _ => DEFAULT_DISPATCH_SURFACE,
+    }
+}
+
+pub fn dispatch_mcp_url_for_origin(base_url: &str, origin: bro_core::Origin) -> String {
+    dispatch_mcp_url_with_replaced_surface(base_url, dispatch_mcp_surface_for_origin(origin))
+}
+
+pub fn dispatch_mcp_url_with_replaced_surface(base_url: &str, surface: &str) -> String {
+    let Some((prefix, query)) = base_url.split_once('?') else {
+        return format!("{base_url}?surface={surface}");
+    };
+    let mut parts: Vec<String> = query
+        .split('&')
+        .filter(|part| !part.is_empty() && !part.starts_with("surface="))
+        .map(str::to_string)
+        .collect();
+    parts.push(format!("surface={surface}"));
+    format!("{prefix}?{}", parts.join("&"))
 }
 
 pub fn dispatch_mcp_host(bind_host: &str) -> &str {

@@ -2946,7 +2946,12 @@ fn spawn_harness_in_process_task(
     tokio::spawn(async move {
         let mut args = args;
         let result = async {
-            let mcp_config = build_in_process_mcp_config(&mut args, tool_placement)?;
+            let self_mcp_url = std::env::var("BLACKBOX_MCP_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|url| crate::dispatch_mcp::dispatch_mcp_url_for_origin(&url, origin));
+            let mcp_config =
+                build_in_process_mcp_config(&mut args, tool_placement, self_mcp_url.as_deref())?;
             run_harness_in_process(
                 args,
                 cwd,
@@ -3217,6 +3222,7 @@ async fn run_harness_in_process(
 fn build_in_process_mcp_config(
     args: &mut Vec<String>,
     tool_placement: Option<BTreeMap<String, String>>,
+    self_mcp_url: Option<&str>,
 ) -> anyhow::Result<Option<bro_harness::mcp::McpConfig>> {
     let raw_mcp_config = take_cli_value_arg(args, "--mcp-config");
     let mut config = match raw_mcp_config {
@@ -3226,7 +3232,7 @@ fn build_in_process_mcp_config(
             tool_placement: Default::default(),
         },
     };
-    add_transient_blackbox_mcp_server(&mut config);
+    add_transient_blackbox_mcp_server(&mut config, self_mcp_url);
     config.tool_placement = parse_dispatch_tool_placement(tool_placement)?;
     if config.servers.is_empty() && config.tool_placement.is_empty() {
         Ok(None)
@@ -3235,11 +3241,11 @@ fn build_in_process_mcp_config(
     }
 }
 
-fn add_transient_blackbox_mcp_server(config: &mut bro_harness::mcp::McpConfig) {
-    let Some(url) = std::env::var("BLACKBOX_MCP_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
+fn add_transient_blackbox_mcp_server(
+    config: &mut bro_harness::mcp::McpConfig,
+    self_mcp_url: Option<&str>,
+) {
+    let Some(url) = self_mcp_url.filter(|s| !s.is_empty()) else {
         return;
     };
     let name = crate::util::blackbox_mcp_name();
@@ -3250,7 +3256,7 @@ fn add_transient_blackbox_mcp_server(config: &mut bro_harness::mcp::McpConfig) {
         .servers
         .push(bro_harness::mcp::McpServerConfig::Http {
             name,
-            url,
+            url: url.to_string(),
             headers: BTreeMap::new(),
             exclude_tools: Vec::new(),
         });
@@ -4868,7 +4874,6 @@ mod tests {
     #[test]
     fn in_process_mcp_config_strips_cli_arg_and_applies_dispatch_placement() {
         let mut env = crate::util::TestEnvGuard::new();
-        env.set("BLACKBOX_MCP_URL", "http://127.0.0.1:7264/mcp");
         env.set("BLACKBOX_MCP_NAME", "selfbox");
 
         let mut args = vec![
@@ -4897,6 +4902,7 @@ mod tests {
                 "mcp__external__placed".to_string(),
                 "in-box".to_string(),
             )])),
+            Some("http://127.0.0.1:7264/mcp?surface=default"),
         )
         .unwrap()
         .unwrap();
@@ -4913,6 +4919,11 @@ mod tests {
         assert_eq!(config.servers.len(), 2);
         assert!(config.servers.iter().any(|s| s.name() == "external"));
         assert!(config.servers.iter().any(|s| s.name() == "selfbox"));
+        assert!(config.servers.iter().any(|s| matches!(
+            s,
+            bro_harness::mcp::McpServerConfig::Http { name, url, .. }
+                if name == "selfbox" && url == "http://127.0.0.1:7264/mcp?surface=default"
+        )));
         assert_eq!(
             config.tool_placement.get("mcp__external__placed"),
             Some(&bro_harness::mcp::ToolPlacement::InBox)
@@ -4922,6 +4933,28 @@ mod tests {
                 .tool_placement
                 .contains_key("mcp__external__ignored_json_source")
         );
+    }
+
+    #[test]
+    fn in_process_mcp_config_uses_supplied_self_mcp_surface_url() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_MCP_NAME", "selfbox");
+        let mut args = Vec::new();
+
+        let config = build_in_process_mcp_config(
+            &mut args,
+            None,
+            Some("http://127.0.0.1:7264/mcp?surface=agent-internal"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(config.servers.iter().any(|s| matches!(
+            s,
+            bro_harness::mcp::McpServerConfig::Http { name, url, .. }
+                if name == "selfbox"
+                    && url == "http://127.0.0.1:7264/mcp?surface=agent-internal"
+        )));
     }
 
     #[test]
@@ -4967,15 +5000,18 @@ mod tests {
         .unwrap();
         let mut env = crate::util::TestEnvGuard::new();
         env.set("BLACKBOX_CONFIG", config_path.to_str().unwrap());
-        env.set("BLACKBOX_MCP_URL", "http://127.0.0.1:7264/mcp");
         env.set("BLACKBOX_MCP_NAME", "selfbox");
 
         let mut args = fleet_mcp_dispatch_args(Provider::Glm, bro_core::Origin::Cockpit);
         assert_eq!(args[0], "--mcp-config");
 
-        let config = build_in_process_mcp_config(&mut args, None)
-            .unwrap()
-            .unwrap();
+        let config = build_in_process_mcp_config(
+            &mut args,
+            None,
+            Some("http://127.0.0.1:7264/mcp?surface=default"),
+        )
+        .unwrap()
+        .unwrap();
         assert!(args.is_empty(), "--mcp-config consumed from argv");
         assert!(config.servers.iter().any(|s| s.name() == "tmux"));
         assert!(config.servers.iter().any(|s| s.name() == "selfbox"));
