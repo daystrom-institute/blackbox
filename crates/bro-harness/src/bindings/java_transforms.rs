@@ -1601,6 +1601,41 @@ impl Tool for JavaHygiene {
     }
 }
 
+/// True for an unqualified (`foo(...)`) or `this.`/`super.`-receiver call — a
+/// candidate same-class helper invocation. Qualified calls on other objects
+/// (`obj.foo(...)`, `Type.foo(...)`, `a.b.foo(...)`) are NOT same-class, even
+/// when the bare name collides with a source-declared accessor: the bean-
+/// accessor false positive where `obj.setName(p.getName())` must not match a
+/// declared `setName`/`getName`.
+fn is_same_class_helper_call(invoc_text: &str) -> bool {
+    let before_paren = invoc_text.split('(').next().unwrap_or(invoc_text);
+    match before_paren.rfind('.') {
+        None => true,
+        Some(dot) => {
+            let receiver = before_paren[..dot].trim_end();
+            receiver.ends_with("this") || receiver.ends_with("super")
+        }
+    }
+}
+
+/// Slice the source text of the `method_invocation` node enclosing the
+/// `[start, end]` capture (matched against pre-collected `@invoc` ranges).
+/// Returns "" if no enclosing invocation is found (the `@call` is always
+/// nested in `@invoc` by the query, so this is a defensive default that
+/// preserves the prior count-it behavior rather than dropping a call).
+fn enclosing_invocation_text<'a>(
+    source: &'a str,
+    invoc_ranges: &[(usize, usize)],
+    start: usize,
+    end: usize,
+) -> &'a str {
+    invoc_ranges
+        .iter()
+        .find(|(s, e)| *s <= start && *e >= end)
+        .and_then(|(s, e)| source.get(*s..*e))
+        .unwrap_or("")
+}
+
 /// `java.extractClassPreviewPlan` — one-cell seam-dependency preflight that
 /// replaces exploratory preview loops. Bundles overload resolution, field
 /// initializer closure, external caller survey, and DI wireability checks into
@@ -1813,12 +1848,13 @@ impl Tool for JavaExtractClassPreviewPlan {
                 }
             }
 
+            // Source text for the target file, read once and reused by the DI
+            // wireability check and the internal-helper-dependency scan below.
+            let source = std::fs::read_to_string(&path).unwrap_or_default();
             // 4. DI wireability check via fieldClassification.
             let mut non_injectable_mutable: Vec<String> = Vec::new();
             let mut wiring_recommendation = "external_injection"; // default for DI sources
             if !augmented_move_fields.is_empty() {
-                // Read source for DI detection.
-                let source = std::fs::read_to_string(&path).unwrap_or_default();
                 match bbox_refactor::facts::java_field_classification(
                     &path,
                     Some(&augmented_move_fields),
@@ -1855,6 +1891,18 @@ impl Tool for JavaExtractClassPreviewPlan {
                 ) {
                     let moved_bare: BTreeSet<&str> = params.methods.iter()
                         .map(|m| m.split('(').next().unwrap_or(m))
+                        .collect();
+                    // Byte ranges of every method_invocation node, used below to
+                    // classify each call as same-class (unqualified or
+                    // `this.`/`super.`) vs. a call on another object. Without
+                    // this, bean accessors like `obj.setName(p.getName())`
+                    // collide with declared accessors and false-positive as
+                    // internal-helper deps.
+                    let invoc_ranges: Vec<(usize, usize)> = file_facts
+                        .captures
+                        .iter()
+                        .filter(|c| c.capture == "invoc")
+                        .map(|c| (c.byte_start, c.byte_end))
                         .collect();
                     // For each invocation, check if the called name is a moved
                     // method — we need the inverse: what non-moved helpers do
@@ -1897,6 +1945,12 @@ impl Tool for JavaExtractClassPreviewPlan {
                                 && cap.byte_start >= *start
                                 && cap.byte_end <= *end
                                 && !moved_bare.contains(cap.text.as_str())
+                                && is_same_class_helper_call(enclosing_invocation_text(
+                                    &source,
+                                    &invoc_ranges,
+                                    cap.byte_start,
+                                    cap.byte_end,
+                                ))
                             {
                                 called.insert(cap.text.clone());
                             }
@@ -1925,6 +1979,18 @@ impl Tool for JavaExtractClassPreviewPlan {
                         for cap in &file_facts.captures {
                             if cap.capture != "call" { continue; }
                             if !moved_bare.contains(cap.text.as_str()) { continue; }
+                            // Only a same-class call (unqualified or `this.`/
+                            // `super.`) makes the enclosing method a wrapper
+                            // candidate; a call on another object
+                            // (`obj.movedName()`) does not.
+                            if !is_same_class_helper_call(enclosing_invocation_text(
+                                &source,
+                                &invoc_ranges,
+                                cap.byte_start,
+                                cap.byte_end,
+                            )) {
+                                continue;
+                            }
                             // This invocation calls a moved method. Find the
                             // enclosing method.
                             if let Some(enc) = method_facts.captures.iter().find(
@@ -3538,4 +3604,90 @@ public class AggregationAdmin {
             "{result}"
         );
     }
+
+    #[tokio::test]
+    async fn preview_plan_internal_helper_deps_are_receiver_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/StatusPanel.java"),
+            RECEIVER_AWARE_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/StatusPanel.java",
+                        "methods": ["buildGrid"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let names: Vec<&str> = result["internal_helper_deps"]["buildGrid"]
+            .as_array()
+            .expect("buildGrid has internal-helper deps")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Genuine same-class helper calls are still flagged (positive controls).
+        assert!(
+            names.contains(&"formatCell"),
+            "unqualified same-class helper must be flagged: {result}"
+        );
+        assert!(
+            names.contains(&"normalize"),
+            "`this.`-receiver same-class helper must be flagged: {result}"
+        );
+        // Bean accessors on local/domain objects must NOT be flagged even though
+        // StatusPanel declares same-named accessors (the false positive).
+        assert!(
+            !names.contains(&"getName") && !names.contains(&"setName"),
+            "bean accessors on locals are not same-class deps: {result}"
+        );
+    }
+
+    const RECEIVER_AWARE_FIXTURE: &str = r#"package com.acme;
+
+class StatusPanel {
+    private Item active;
+
+    // Moved method: mixes genuine same-class helper calls with bean accessors
+    // on local objects whose names collide with declared accessors.
+    void buildGrid() {
+        Item obj = new Item();
+        Item p = new Item();
+        obj.setName(p.getName());   // bean accessors on locals — NOT same-class deps
+        String cell = formatCell(); // unqualified same-class helper
+        this.normalize();           // `this.`-receiver same-class helper
+    }
+
+    // Same-named accessors that the old name-only match collided with.
+    String getName() {
+        return active.label;
+    }
+
+    void setName(String n) {
+        active.label = n;
+    }
+
+    // Genuine same-class helpers.
+    String formatCell() {
+        return "cell";
+    }
+
+    void normalize() {
+        active.label = "";
+    }
+
+    static class Item {
+        String label;
+    }
+}
+"#;
 }
