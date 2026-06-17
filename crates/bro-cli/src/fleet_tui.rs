@@ -1324,17 +1324,14 @@ fn focused_transcript_items(app: &App, idx: usize) -> Vec<TranscriptItem> {
 /// emit it yet — the caller shows the token count alone in that case.
 fn last_focused_token_info(app: &App, idx: usize) -> Option<(u64, Option<u64>)> {
     let items = focused_transcript_items(app, idx);
-    items
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            TranscriptItem::TurnFooter {
-                input_tokens,
-                compaction_threshold,
-                ..
-            } => input_tokens.map(|tok| (tok, *compaction_threshold)),
-            _ => None,
-        })
+    items.iter().rev().find_map(|item| match item {
+        TranscriptItem::TurnFooter {
+            input_tokens,
+            compaction_threshold,
+            ..
+        } => input_tokens.map(|tok| (tok, *compaction_threshold)),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

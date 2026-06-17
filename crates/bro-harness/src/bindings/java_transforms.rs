@@ -1091,9 +1091,9 @@ impl Tool for JavaDescribe {
             "extractClassPreviewPlan" => {
                 ToolResult::Json(json!({ "contract": PREVIEW_PLAN_CONTRACT }))
             }
-            "extractColumnSpec" => {
-                ToolResult::Json(json!({ "contract": "java.extractColumnSpec: detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. Params: file, methods[2], target, className?, spec_name?. Returns {changes, creates, common_columns, spec_class, provenance}." }))
-            }
+            "extractColumnSpec" => ToolResult::Json(
+                json!({ "contract": "java.extractColumnSpec: detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. Params: file, methods[2], target, className?, spec_name?. Returns {changes, creates, common_columns, spec_class, provenance}." }),
+            ),
             "synthesizeHelperWrappers" => {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
@@ -2097,7 +2097,10 @@ impl Tool for JavaSynthesizeHelperWrappers {
         })
     }
     fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations { read_only: true, destructive: false }
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
     }
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "synthesizeHelperWrappers".to_string()))
@@ -2128,7 +2131,7 @@ impl Tool for JavaSynthesizeHelperWrappers {
             // `private` for non-public wrappers.
             struct MethodSig {
                 bare_name: String,
-                header: String,       // full header before `{` body
+                header: String,           // full header before `{` body
                 param_names: Vec<String>, // just the param identifiers
             }
             let mut sigs: Vec<MethodSig> = Vec::new();
@@ -2141,12 +2144,13 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 ) {
                     for cap in &facts.captures {
                         if cap.capture == "name" && cap.text == bare {
-                            if let Some(method_cap) = facts.captures.iter().find(
-                                |mc| mc.capture == "method"
+                            if let Some(method_cap) = facts.captures.iter().find(|mc| {
+                                mc.capture == "method"
                                     && mc.byte_start <= cap.byte_start
-                                    && mc.byte_end >= cap.byte_end,
-                            ) {
-                                let mtext = &delegate_src[method_cap.byte_start..method_cap.byte_end];
+                                    && mc.byte_end >= cap.byte_end
+                            }) {
+                                let mtext =
+                                    &delegate_src[method_cap.byte_start..method_cap.byte_end];
                                 // Find opening brace — the header is everything before it.
                                 let brace_pos = mtext.find('{').unwrap_or(mtext.len());
                                 let header = mtext[..brace_pos].trim().to_string();
@@ -2155,16 +2159,23 @@ impl Tool for JavaSynthesizeHelperWrappers {
                                 let params_end = header.rfind(')').unwrap_or(header.len());
                                 let param_names: Vec<String> = if params_start < params_end {
                                     // Split on commas not nested inside <...> angle brackets.
-                                    let param_str = &header[params_start+1..params_end];
+                                    let param_str = &header[params_start + 1..params_end];
                                     let mut names = Vec::new();
                                     let mut depth = 0;
                                     let mut current = String::new();
                                     for ch in param_str.chars() {
                                         match ch {
-                                            '<' => { depth += 1; current.push(ch); }
-                                            '>' => { depth -= 1; current.push(ch); }
+                                            '<' => {
+                                                depth += 1;
+                                                current.push(ch);
+                                            }
+                                            '>' => {
+                                                depth -= 1;
+                                                current.push(ch);
+                                            }
                                             ',' if depth == 0 => {
-                                                let parts: Vec<&str> = current.trim().split_whitespace().collect();
+                                                let parts: Vec<&str> =
+                                                    current.trim().split_whitespace().collect();
                                                 if let Some(name) = parts.last() {
                                                     names.push(name.to_string());
                                                 }
@@ -2174,7 +2185,8 @@ impl Tool for JavaSynthesizeHelperWrappers {
                                         }
                                     }
                                     if !current.trim().is_empty() {
-                                        let parts: Vec<&str> = current.trim().split_whitespace().collect();
+                                        let parts: Vec<&str> =
+                                            current.trim().split_whitespace().collect();
                                         if let Some(name) = parts.last() {
                                             names.push(name.to_string());
                                         }
@@ -2224,16 +2236,23 @@ impl Tool for JavaSynthesizeHelperWrappers {
             let mut wrapper_texts: Vec<String> = Vec::new();
             let delegate_call = format!("{}.{}(", params.delegate_field, "");
             for sig in &sigs {
-                if !needs_wrappers.contains(&sig.bare_name) { continue; }
+                if !needs_wrappers.contains(&sig.bare_name) {
+                    continue;
+                }
                 let dedup_key = format!("{}({})", sig.bare_name, sig.param_names.len());
-                if !seen.insert(dedup_key) { continue; }
+                if !seen.insert(dedup_key) {
+                    continue;
+                }
                 // Skip if source already has a delegating wrapper for this method.
                 let wrapper_call = format!("{}{}(", delegate_call, sig.bare_name);
-                if source.contains(&wrapper_call) { continue; }
+                if source.contains(&wrapper_call) {
+                    continue;
+                }
                 let call_args = sig.param_names.join(", ");
                 // Build wrapper signature from the delegate header, replacing
                 // `public` with `private` if the delegate method is public.
-                let wrapper_sig = sig.header
+                let wrapper_sig = sig
+                    .header
                     .replace("public ", "private ")
                     .replace("protected ", "private ");
                 // If the header already starts with `private`, keep it.
@@ -2300,7 +2319,9 @@ impl Tool for JavaSynthesizeHelperWrappers {
                             "(method_declaration) @method",
                             None,
                         ) {
-                            method_facts.captures.first()
+                            method_facts
+                                .captures
+                                .first()
                                 .map(|c| c.byte_start)
                                 .unwrap_or_else(|| source.rfind('}').unwrap_or(source.len()))
                         } else {
@@ -2321,7 +2342,8 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 "new_text": insert_text,
             })];
 
-            let wrappers_added: Vec<&str> = sigs.iter()
+            let wrappers_added: Vec<&str> = sigs
+                .iter()
                 .filter(|s| needs_wrappers.contains(&s.bare_name))
                 .map(|s| s.bare_name.as_str())
                 .collect();
@@ -2331,7 +2353,8 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 "stale_calls_remaining": [],
                 "provenance": "syntax_only",
             }))
-        }).await
+        })
+        .await
     }
 }
 
@@ -2352,22 +2375,31 @@ struct ColumnSpecParams {
 
 #[async_trait]
 impl Tool for JavaExtractColumnSpec {
-    fn name(&self) -> &str { "java.extractColumnSpec" }
+    fn name(&self) -> &str {
+        "java.extractColumnSpec"
+    }
     fn description(&self) -> &str {
         "Detect repeated Vaadin Grid addColumn fluent chains across methods, extract common columns into a typed ColumnSpec record + shared builder, and rewrite one method to use the spec. Use for grid/column deduplication before larger UI extraction. Pure; syntax_only; never writes."
     }
-    fn input_schema(&self) -> Value { json!({
-        "type": "object",
-        "properties": {
-            "file": { "type": "string" },
-            "methods": { "type": "array", "items": { "type": "string" }, "description": "Two method names to compare (e.g. getInputGasGrid, getOutputGasGrid)." },
-            "target": { "type": "string", "description": "Path for the new ColumnSpec record file." },
-            "className": { "type": "string" },
-            "spec_name": { "type": "string", "description": "Generated record name. Default: <className>ColumnSpec." }
-        },
-        "required": ["file", "methods", "target"]
-    })}
-    fn annotations(&self) -> ToolAnnotations { ToolAnnotations { read_only: true, destructive: false } }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "methods": { "type": "array", "items": { "type": "string" }, "description": "Two method names to compare (e.g. getInputGasGrid, getOutputGasGrid)." },
+                "target": { "type": "string", "description": "Path for the new ColumnSpec record file." },
+                "className": { "type": "string" },
+                "spec_name": { "type": "string", "description": "Generated record name. Default: <className>ColumnSpec." }
+            },
+            "required": ["file", "methods", "target"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "extractColumnSpec".to_string()))
     }

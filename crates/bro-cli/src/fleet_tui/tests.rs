@@ -1586,7 +1586,7 @@ fn render_transcript_marks_empty_completed_turn() {
             cost_usd: Some(0.0),
             input_tokens: None,
             compaction_threshold: None,
-            },
+        },
     ];
     let rendered: Vec<String> = render_transcript(&items, "", &[], 100)
         .iter()
@@ -2116,7 +2116,7 @@ fn stale_commit_cursor_does_not_panic() {
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-            },
+        },
     ];
     let committed: usize = 10;
     let stable_end = inline_stable_end(&items, false);
@@ -2158,7 +2158,7 @@ fn superset_snapshot_preserves_cursor_and_only_emits_new_items() {
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-            });
+        });
         // Turn 2 (complete, 4 items)
         v.push(TranscriptItem::UserSteer("t2 steer".into()));
         v.push(TranscriptItem::AssistantText("t2 text".into()));
@@ -2171,7 +2171,7 @@ fn superset_snapshot_preserves_cursor_and_only_emits_new_items() {
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-            });
+        });
         // Turn 3 (active, 4 items)
         v.push(TranscriptItem::UserSteer("t3 steer".into()));
         v.push(TranscriptItem::AssistantText("t3 text".into()));
@@ -2477,7 +2477,7 @@ fn stable_end_returns_all_when_turn_inactive() {
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-            },
+        },
     ];
     assert_eq!(inline_stable_end(&items, false), 3);
 }
@@ -2508,7 +2508,7 @@ fn stable_end_excludes_active_turn_after_completed_turn() {
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-            },
+        },
         TranscriptItem::UserSteer("second".into()),
         TranscriptItem::AssistantText("working on it".into()),
         TranscriptItem::ToolCall {
@@ -2530,7 +2530,7 @@ fn stable_end_includes_multiple_completed_turns() {
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-            },
+        },
         TranscriptItem::UserSteer("turn 2".into()),
         TranscriptItem::AssistantText("done 2".into()),
         TranscriptItem::TurnFooter {
@@ -2538,7 +2538,7 @@ fn stable_end_includes_multiple_completed_turns() {
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-            },
+        },
         TranscriptItem::UserSteer("turn 3".into()),
         TranscriptItem::AssistantText("active".into()),
     ];

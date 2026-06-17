@@ -1560,8 +1560,12 @@ impl Session {
         }
 
         if matches!(break_reason, "cancelled" | "interrupted_dispatch") {
-            self.emitter
-                .result_interrupted(&final_text, &self.total_usage, self.turns, self.compact_threshold);
+            self.emitter.result_interrupted(
+                &final_text,
+                &self.total_usage,
+                self.turns,
+                self.compact_threshold,
+            );
         } else {
             self.emitter.result(
                 &final_text,
