@@ -95,3 +95,11 @@ Dense leaf with its own AGENTS.md: `src/bindings/AGENTS.md` carries the
 refactor cell-DSL invariants (cell-only placement, one-mutation-path trust
 model, hash-anchored span discipline, host-computed lineage, probe-derived
 shapes). Read it before touching the namespaces.
+
+## Isolate CLI cell mode
+
+`src/bin/isolate.rs` is a command-line probe surface over the same harness
+tool/runtime contract, not its own JS embedding. Cell mode must go through
+`code_mode_tools` + `HostTools`, so repeated `--cell` / `--cell-file` inputs in
+one process share the code-mode session KV/function store and nested `tools.*`
+/ namespace calls honor the same callable surface as harness consumers.

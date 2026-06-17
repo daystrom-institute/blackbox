@@ -30,6 +30,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `isolate` now has code-mode cell execution via repeated `--cell` or
+  `--cell-file` flags, using the same harness `exec` runtime so nested
+  `tools.*` / namespace calls and session `store()` / `load()` work during
+  command-line probe validation.
 - Java isolate refactor probes now have first-class long-method extraction
   gates: `analysis.methodRegions({ file, method, className?, ranges? })`
   reports statement/candidate-region captures, live-outs, field touches,

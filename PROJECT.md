@@ -116,13 +116,18 @@ isolate --root <dir> --describe <tool>                    # a tool's input schem
 isolate --root <dir> <tool> --args '<json>'               # run; pretty-print JSON
 isolate --root <dir> <tool> --args-file args.json \
   --field /internal_helper_deps --strict
+isolate --root <dir> --cell 'const r = await tools.file_read({file_path:"src/Foo.java"}); text(r);'
+isolate --root <dir> --cell-file setup.js --cell-file verify.js
 ```
 
 `--field <json-pointer>` extracts one result field (avoids a `jq`/`python` pipe);
 `--strict` rejects a run whose `file` arg is missing under `--root` (guards the
 silent empty-result footgun where a wrong path reads as empty instead of
 erroring). It builds a `ToolCx` rooted at `--root` and calls the binding directly
-— no agent loop, LLM, or daemon.
+— no agent loop, LLM, or daemon. `--cell` / `--cell-file` evaluates full
+code-mode JavaScript cells through the same `exec` runtime a harness consumer
+uses, including nested `tools.*` / namespace calls and session-scoped
+`store()` / `load()` across repeated cells in one invocation.
 
 Do not record exact test counts in this file. Counts stale quickly and do not
 help an agent choose the right validation.
