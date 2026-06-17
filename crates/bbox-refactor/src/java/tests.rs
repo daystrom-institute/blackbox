@@ -1343,6 +1343,61 @@ fn g16_organize_imports_preserves_annotation_references() {
 // Gap 28: two unrelated wildcards plus a standalone explicit from a
 // third (uncovered) package — all three preserved.
 #[test]
+fn organize_imports_skips_import_shadowed_by_local_nested_type() {
+    // gap-bf1716de: a file that declares its own nested `MeterDto` and
+    // references it by simple name must NOT receive a bare
+    // `import com.x.dto.MeterDto;`, even though a top-level `com.x.dto.MeterDto`
+    // exists elsewhere. The bare name binds to the local nested type (Java
+    // shadowing), so the import would be shadowed and unused.
+    let dir = tempfile::tempdir().unwrap();
+    let dto_dir = dir.path().join("src/main/java/com/x/dto");
+    let ui_dir = dir.path().join("src/main/java/com/x/ui");
+    fs::create_dir_all(&dto_dir).unwrap();
+    fs::create_dir_all(&ui_dir).unwrap();
+    fs::write(
+        dto_dir.join("MeterDto.java"),
+        "package com.x.dto;\npublic class MeterDto {}\n",
+    )
+    .unwrap();
+    let source = ui_dir.join("ViewWithNestedMeterDto.java");
+    fs::write(
+        &source,
+        "package com.x.ui;\n\n\
+         public class ViewWithNestedMeterDto {\n\
+        \x20   private MeterDto dto;\n\
+        \x20   private static class MeterDto {}\n\
+         }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("java_lsp_organize_imports", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan_text = match plan_java_lsp_organize_imports(&params, &PlanContext::default()) {
+        Ok(plan_text) => plan_text,
+        Err(err) => {
+            // No edits needed at all is a correct outcome — nothing to add.
+            assert!(
+                err.to_string()
+                    .contains("no Java import organization edits needed"),
+                "{err:#}"
+            );
+            return;
+        }
+    };
+    let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+    let added_shadow = plan.edits.iter().any(|file_edit| {
+        file_edit
+            .edits
+            .iter()
+            .any(|edit| edit.replacement.contains("import com.x.dto.MeterDto;"))
+    });
+    assert!(
+        !added_shadow,
+        "must not add an import shadowed by the local nested MeterDto"
+    );
+}
+
+#[test]
 fn java_organize_imports_keeps_explicit_from_uncovered_package() {
     let dir = tempfile::tempdir().unwrap();
     let admin_dir = dir.path().join("src/main/java/com/x/admin");

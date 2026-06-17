@@ -559,6 +559,12 @@ pub(super) fn compute_java_organize_imports_edit(
     collect_java_type_references(tree.root_node(), source, &mut used_types);
     let mut used_static_members = HashSet::new();
     collect_java_static_member_references(tree.root_node(), source, &mut used_static_members);
+    // gap-bf1716de: nested/member types declared in THIS compilation unit
+    // shadow any same-simple-name top-level type from another package, so a
+    // bare reference binds locally. Never add a bare import for such a name —
+    // it would be shadowed and unused.
+    let mut local_nested_types = HashSet::new();
+    collect_inner_class_simple_names(tree.root_node(), source, false, &mut local_nested_types);
     let current_package = extract_java_package(source);
     let existing_imports = extract_java_imports(source);
     let mut imports = existing_imports
@@ -591,6 +597,13 @@ pub(super) fn compute_java_organize_imports_edit(
         .collect::<HashSet<_>>();
     for used in &used_types {
         if existing_simple.contains(used) {
+            continue;
+        }
+        // gap-bf1716de: a simple name satisfied by a nested/member type
+        // declared in this file binds to that nested type (Java shadowing);
+        // adding a bare import would be shadowed and unused regardless of any
+        // same-name top-level type elsewhere in the project.
+        if local_nested_types.contains(used) {
             continue;
         }
         // Gap 16: if this simple name corresponds to an inner class
