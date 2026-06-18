@@ -3,8 +3,8 @@
   "title": "Resolve Java var types through cross-file receiver method calls",
   "gap_kind": "refactor_primitive",
   "domain": "refactor-tools/java",
-  "wanted_capability": "methodRegions should provide resolved_type for Java var declarations initialized by a method call on a captured field or dependency when the callee return type can be found in the same project, so extract-method probes do not manually search callee declarations.",
-  "missing_primitive": "Project-index-backed Java var RHS return-type resolution for receiver method calls",
+  "wanted_capability": "Authoritative Java var type resolution for cross-file receiver method calls via a JDTLS-backed seam: methodRegions (facts) emits resolved_type for syntactically-derivable cases and null for cross-file/LSP-dependent cases; an analysis.resolveVarTypes reduction (or lsp.typeAt/hover follow-up) fills the nulls by querying a harness-owned JDTLS session. The facts module itself must NOT reach cross-file/LSP (charter).",
+  "missing_primitive": "jdtls-seam: bro-lsp Language::Java (JDTLS session pool) + a new lsp.typeAt/lsp.hover harness binding verb + an analysis.resolveVarTypes({file, spans}) reduction that calls the pool",
   "fallback_used": "Probe agent manually searched for the callee declaration and copied the declared return type into explicit helper parameters.",
   "evidence": [
     "thread-8d968b2d",
@@ -15,12 +15,12 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/java-var-cross-file-method-call-resolution",
-  "notes": "Generic finding from a private Java calculation-stage reprobe. The previously added same-file method-call inference is useful but not enough for dependency/field receiver calls whose declarations live elsewhere in the project.",
+  "notes": "REFRAMED (2026-06-18) to the JDTLS-backed implementation path. Original framing (\"methodRegions should provide resolved_type for cross-file receiver method calls\") is architecturally blocked: resolve_var_declaration_type lives in scope.rs, part of the bbox-refactor facts module, which is pure-bytes by charter (no LSP, no daemon state, no cross-file). It cannot reach cross-file declarations by construction.\n\nSolve = a harness-owned JDTLS seam (mirrors the existing rust-analyzer lsp.rename pattern in crates/bro-harness/src/bindings/lsp_facts.rs): (1) extend bro-lsp with Language::Java + JDTLS binary config + a JDTLS readiness handshake; (2) add an lsp.typeAt/lsp.hover verb (textDocument/hover) returning the resolved type at a hash-anchored span — the harness already does byte<->UTF-16 conversion and hash-anchored spans; (3) an analysis.resolveVarTypes({file, spans}) reduction that warms the JDTLS pool and returns authoritative types. JDTLS textDocument/hover at the var declarator resolves the cross-file receiver method return definitively because JDTLS indexes the whole project. methodRegions (facts) stays the fast syntactic first pass; unresolved vars get authoritative types via the seam.\n\nThis supersedes the index-backed recommendation in thread-8d968b2d Note 26: the corpus index is (a) unreachable from cells by decision af3c4783 (zero daemon reach-back), (b) name-level only — cannot resolve cross-file receiver return types authoritatively, and (c) symbol vertices aren't even searchable yet (gap-496fe07f). The seam keeps the container test passing (harness owns the JDTLS session, warm-pooled, fail-closed RX-V3). Caveat: JDTLS needs the Gradle/Maven project model, so the seam is real-worktree-viable (where the campaign runs) but not fixture-viable for the standalone isolate CLI — facts remain the fixture path.",
   "resolution": "unresolved",
   "task_id": "703b8a8b-d38d-4eff-97aa-1e14551f2a05",
   "session_id": "9ac4e4b9-79bc-40ff-948e-c9b9e7f40e07",
   "provider": "deepseek",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T05:42:21Z",
-  "updated_at": "2026-06-14T05:42:21Z"
+  "updated_at": "2026-06-18T01:47:54Z"
 }

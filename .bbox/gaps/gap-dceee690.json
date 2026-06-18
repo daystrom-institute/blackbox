@@ -3,8 +3,8 @@
   "title": "Resolve Java var types for jOOQ table new-record factories",
   "gap_kind": "refactor_primitive",
   "domain": "refactor-tools/java",
-  "wanted_capability": "methodRegions should provide resolved_type for Java var declarations initialized by table/factory new-record patterns where the receiver type or generic table record type implies the returned record type.",
-  "missing_primitive": "Java var RHS resolution for chained table new-record factory patterns",
+  "wanted_capability": "Authoritative Java var type resolution for jOOQ Table<R>.newRecord() (and generic static-factory) patterns via the JDTLS-backed seam (analysis.resolveVarTypes / lsp.typeAt over a harness-owned JDTLS session). JDTLS resolves the generic parameter R that facts heuristics and the name-level index cannot.",
+  "missing_primitive": "jdtls-seam: bro-lsp Language::Java (JDTLS session pool) + a new lsp.typeAt/lsp.hover harness binding verb + an analysis.resolveVarTypes({file, spans}) reduction that calls the pool",
   "fallback_used": "Probe agent inferred the record type manually after compile exposed an incorrect helper parameter type, then patched the helper signature.",
   "evidence": [
     "thread-8d968b2d",
@@ -15,12 +15,12 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/java-var-jooq-newrecord-resolution",
-  "notes": "Generic finding from a private Java calculation-stage reprobe. Keep public notes library-pattern-level only; do not include private table, record, package, or method names.",
+  "notes": "REFRAMED (2026-06-18) to the JDTLS-backed implementation path. Original framing (\"methodRegions should provide resolved_type for jOOQ table new-record factories\") is doubly blocked: (1) the facts module (scope.rs/resolve_var_declaration_type) is pure-bytes by charter — no LSP, no cross-file; (2) the jOOQ case needs generic-parameter inference (Table<R extends Record>.newRecord() returns R), which neither facts heuristics nor a name-level corpus index can resolve. The shipped static-factory heuristic (is_known_static_factory_method, scope.rs:713) only matches of/from/valueOf/copyOf/getInstance/newInstance and returns the RECEIVER type (a TableImpl), not R.\n\nSolve = the same JDTLS seam as gap-f9db476b: bro-lsp Language::Java + lsp.typeAt/lsp.hover + analysis.resolveVarTypes. JDTLS resolves the generic parameter R definitively (it is a full Java compiler frontend), so Table<R>.newRecord() yields the concrete record type. This is the one solve that covers both jOOQ generics and cross-file receiver calls in a single stroke.\n\nSupersedes the index-backed recommendation in thread-8d968b2d Note 26 (index cannot resolve generics; unreachable from cells per af3c4783). Pair with gap-f9db476b — they share one seam and should be delivered together.",
   "resolution": "unresolved",
   "task_id": "703b8a8b-d38d-4eff-97aa-1e14551f2a05",
   "session_id": "9ac4e4b9-79bc-40ff-948e-c9b9e7f40e07",
   "provider": "deepseek",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T05:42:21Z",
-  "updated_at": "2026-06-14T05:42:21Z"
+  "updated_at": "2026-06-18T01:47:54Z"
 }

@@ -1,0 +1,20 @@
+{
+  "id": "567332b5",
+  "title": "Java semantic type resolution routes through a harness-owned JDTLS seam, not the corpus index",
+  "content": "Java semantic type resolution for refactor-v2 cells (var types, cross-file receiver return types, generic static-factory/jOOQ Table<R>.newRecord() inference) routes through a harness-owned JDTLS seam, not the corpus index. The seam mirrors the existing rust-analyzer `lsp.rename` pattern (crates/bro-harness/src/bindings/lsp_facts.rs): (1) bro-lsp gains `Language::Java` + JDTLS binary config + a JDTLS readiness handshake; (2) a new `lsp.typeAt`/`lsp.hover` binding verb (textDocument/hover) returns the resolved type at a hash-anchored span, reusing the existing byte↔UTF-16 conversion and provenance ledger; (3) an `analysis.resolveVarTypes({file, spans})` reduction warms the JDTLS pool and fills the `resolved_type: null` cases that `methodRegions` (facts) correctly leaves open. The facts module (scope.rs/resolve_var_declaration_type) stays pure-bytes and remains the fast syntactic first pass; the seam is the authoritative fallback.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Three independent reasons. (1) Charter: the facts module is pure-bytes by invariant (bbox-refactor/AGENTS.md) — no LSP, no daemon state, no cross-file — so cross-file and generic var resolution cannot live there. (2) Zero daemon reach-back (decision af3c4783): the corpus index is daemon state and cannot be reached from cells, ruling out the index-backed path at the architectural level; and even via an analysis.* reduction the index is name-level only. (3) Capability: JDTLS is a full Java compiler frontend. It definitively resolves cross-file receiver method return types (gap-f9db476b) AND generic parameters like jOOQ Table<R extends Record>.newRecord() → R (gap-dceee690) in a single stroke — neither facts heuristics (is_known_static_factory_method returns the receiver, not R) nor a name-level index can. The seam keeps the container test passing: the harness owns the JDTLS session (warm pool keyed by root+language, idle-evicted, fail-closed RX-V3), exactly as it owns rust-analyzer today. Caveat acknowledged: JDTLS needs the Gradle/Maven project model, so the seam is real-worktree-viable (where the campaign probes run) but not fixture-viable for the standalone isolate CLI — facts stay the fixture path, consistent with the two-tier model.",
+  "source": "user",
+  "created_at": "2026-06-18T01:48:21Z",
+  "updated_at": "2026-06-18T01:48:21Z",
+  "recall_count": 0
+}
