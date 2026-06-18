@@ -16,9 +16,11 @@
   "dedupe_key": "mcp_surface/refactor-tools/hash-bound-apply-token",
   "suggested_owner": "blackbox",
   "notes": "confirm=true is easy for isolate code to pass accidentally; a token makes the approval boundary and exact reviewed artifact explicit.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "task_id": "a0143f51-0a2b-43e7-a300-4c9ce4d3fa80",
   "session_id": "da082ef9-697e-41e1-b321-f476006ce2a5",
   "created_at": "2026-06-12T15:51:14Z",
-  "updated_at": "2026-06-12T15:51:14Z"
+  "updated_at": "2026-06-18T00:51:28Z",
+  "resolved_at": "2026-06-18T00:51:28Z",
+  "resolution_note": "Not met as specified (still confirm-based: RefactorApplyParams at crates/bbox-refactor/src/lib.rs:624 uses confirm + plan/plan_path replay), but deliberately not pursued. The apply path already has plan_path for large payloads (avoids inline re-send) and internal hash verification (expected_content_sha256 / read_original_for_edit at lib.rs:5263, facts.rs). A token-bound two-phase flow would be new machinery on the v1 bbox_refactor_apply daemon surface, which is on the kill list (decision af3c4783 \"harness-native, zero daemon reach-back\" + b8dc263d; bbox-refactor/AGENTS.md). The harness-native future owns apply via the cell choke point (edits.apply / apply_text_edits), not a daemon token subsystem. Moot."
 }
