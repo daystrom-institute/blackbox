@@ -16,12 +16,13 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/refactor-tools/java-var-method-call-resolution",
   "notes": "Follow-on to gap-40d8c31a. Local syntax-only var resolution now covers simple literals/casts/constructors, but this reprobe still spent cells resolving method-call/static-factory RHS forms manually. Keep public notes generic; evidence came from a private Java calculation-stage probe.",
-  "resolution": "unresolved",
+  "resolution": "acknowledged",
   "task_id": "aa0647dd-9a3a-4eb6-83fe-62b688e54d0a",
   "session_id": "fc516b86-b68e-41cd-9e23-f14b8486b4b3",
   "provider": "deepseek",
   "thread_id": "thread-8d968b2d",
   "created_at": "2026-06-14T05:10:46Z",
-  "updated_at": "2026-06-14T05:42:21Z",
-  "resolution_note": "Reopened after the calculation reprobe. The implemented tranche resolved simple local forms, unambiguous same-file method-call returns, and simple static-factory receivers, but the reprobe still needed manual type tracing for a cross-file receiver method call and a chained table/factory new-record pattern."
+  "updated_at": "2026-06-18T01:36:06Z",
+  "resolved_at": "2026-06-18T01:36:06Z",
+  "resolution_note": "Tranche shipped: resolve_var_declaration_type (crates/bbox-refactor/src/java/scope.rs:591) via infer_expression_type (:603) now resolves var RHS for new/array/cast/parens/literals, same-file method calls (unique_same_file_method_return_type :670), and static-factory receivers (is_known_static_factory_method :713). Locked by tests method_regions_resolves_var_type_from_same_file_method_call (tests.rs:10355) and method_regions_resolves_var_type_from_known_static_factory_receiver (tests.rs:10395). Remaining scope (cross-file receiver method calls + jOOQ generic-R newRecord) is tracked in the two child gaps f9db476b and dceee690 — those need a non-facts surface (the facts charter forbids cross-file/LSP state), so this umbrella is closed in favor of the children."
 }
