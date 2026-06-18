@@ -39,12 +39,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Language {
     Rust,
+    Java,
 }
 
 impl Language {
-    fn language_id(self) -> &'static str {
+    pub fn language_id(self) -> &'static str {
         match self {
             Language::Rust => "rust",
+            Language::Java => "java",
         }
     }
 
@@ -60,6 +62,21 @@ impl Language {
                     .or_else(|| env_string("BLACKBOX_RUST_ANALYZER_BIN"))
                     .unwrap_or_else(|| "rust-analyzer".to_string()),
             ],
+            // JDTLS (Eclipse JDT.LS), launched via the `jdtls` wrapper script
+            // that ships with the distribution — it owns the launcher jar,
+            // config dir, and per-workspace `-data` directory, so the bare
+            // command is the whole argv (mirrors the daemon's bbox-lsp
+            // `launch_argv`). Env chain reuses BLACKBOX_JDTLS_BIN so an
+            // operator with the daemon backend configured needs no new var.
+            Language::Java => vec![
+                config
+                    .jdtls_bin
+                    .clone()
+                    .map(|path| path.display().to_string())
+                    .or_else(|| env_string("BRO_LSP_JDTLS_BIN"))
+                    .or_else(|| env_string("BLACKBOX_JDTLS_BIN"))
+                    .unwrap_or_else(|| "jdtls".to_string()),
+            ],
         }
     }
 }
@@ -72,6 +89,13 @@ pub struct LspConfig {
     pub ready_timeout: Duration,
     pub evict_tick: Duration,
     pub rust_analyzer_bin: Option<PathBuf>,
+    /// JDTLS (`jdtls` wrapper) binary; defaults to the env chain
+    /// (`BRO_LSP_JDTLS_BIN` → `BLACKBOX_JDTLS_BIN`) then PATH `jdtls`.
+    pub jdtls_bin: Option<PathBuf>,
+    /// JDTLS workspace-ready deadline. Gradle/Maven import is slow on a
+    /// cold workspace, so this is independent of the rust-analyzer
+    /// `ready_timeout`. Defaults to 60s (`BRO_LSP_JDTLS_READY_TIMEOUT_SECS`).
+    pub jdtls_ready_timeout: Duration,
 }
 
 impl Default for LspConfig {
@@ -88,6 +112,11 @@ impl Default for LspConfig {
             rust_analyzer_bin: env_path("BRO_LSP_RUST_ANALYZER_BIN")
                 .or_else(|| env_path("BRO_RUST_ANALYZER_BIN"))
                 .or_else(|| env_path("BLACKBOX_RUST_ANALYZER_BIN")),
+            jdtls_bin: env_path("BRO_LSP_JDTLS_BIN").or_else(|| env_path("BLACKBOX_JDTLS_BIN")),
+            jdtls_ready_timeout: Duration::from_secs(env_u64(
+                "BRO_LSP_JDTLS_READY_TIMEOUT_SECS",
+                60,
+            )),
         }
     }
 }
@@ -405,6 +434,56 @@ impl SessionPool {
                 }
                 Err(Error::Server { method, error })
                     if method == <lsp_types::request::Rename as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// `textDocument/hover` at `position` — authoritative resolved info for
+    /// the symbol under the cursor. This is the seam the harness uses for
+    /// Java `var` resolution: JDTLS resolves cross-file receiver return
+    /// types and generic parameters (e.g. jOOQ `Table<R>.newRecord()` → `R`)
+    /// that the pure-bytes facts module cannot. Retries on the same warming
+    /// codes as `rename`. `None` is a legitimate result (no hover info at
+    /// the position), not an error — callers distinguish it from failure.
+    pub async fn hover(
+        &self,
+        doc: &OpenDocument,
+        position: lsp_types::Position,
+    ) -> Result<Option<lsp_types::Hover>> {
+        let session = self.session(doc.root.clone(), doc.language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        if !session.documents.contains_key(&doc.uri) {
+            return Err(Error::DocumentNotOpen {
+                uri: doc.uri.clone(),
+            });
+        }
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc.uri.clone(),
+                },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        };
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::HoverRequest>(&params)
+                .await
+            {
+                Ok(hover) => return Ok(hover),
+                Err(Error::Server { method, error })
+                    if method == <lsp_types::request::HoverRequest as Request>::METHOD
                         && should_retry_while_warming(&error)
                         && Instant::now() < deadline =>
                 {
@@ -805,6 +884,16 @@ async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> 
     if matches!(key.language, Language::Rust) {
         wait_for_rust_analyzer_ready(&mut session, config.ready_timeout).await?;
     }
+    if matches!(key.language, Language::Java) {
+        // JDTLS's `initialize` returns immediately, then performs gradle /
+        // maven / Buildship workspace import asynchronously; hover /
+        // references / organize-imports degrade silently on a cold
+        // workspace (no classpath ⇒ no real types). Drain notifications
+        // for the workspace-ready signal before handing the session out. On
+        // timeout we proceed (matching the daemon policy) and let the
+        // caller observe the degraded result.
+        wait_for_jdtls_ready(&mut session, config.jdtls_ready_timeout).await;
+    }
     Ok(session)
 }
 
@@ -894,6 +983,64 @@ async fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) 
         if method == Some("textDocument/publishDiagnostics") {
             let _ = session.handle_notification(value)?;
             return Ok(());
+        }
+    }
+}
+
+/// Classify a JDT.LS server notification as a workspace-ready signal.
+///
+/// Two accepted shapes (ported from the daemon's `bbox-lsp`, which runs the
+/// same Eclipse JDT.LS + Buildship backend in production):
+///
+/// - `language/status` with `params.type == "Started"` or `"ServiceReady"` —
+///   emitted once Eclipse JDT.LS finishes bootstrapping the workspace.
+/// - `language/eventNotification` with `params.eventType == 100` —
+///   Buildship-specific signal that a Gradle project import finished.
+///
+/// Anything else (`window/showMessage`, `$/progress`, `language/status` with
+/// `type == "Starting"` or `"Error"`, …) is noise for ready-wait purposes.
+fn is_jdtls_ready_notification(value: &Value) -> bool {
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    match method {
+        "language/status" => {
+            let status_type = value
+                .get("params")
+                .and_then(|p| p.get("type"))
+                .and_then(Value::as_str);
+            matches!(status_type, Some("Started" | "ServiceReady"))
+        }
+        "language/eventNotification" => {
+            let event_type = value
+                .get("params")
+                .and_then(|p| p.get("eventType"))
+                .and_then(Value::as_u64);
+            event_type == Some(100)
+        }
+        _ => false,
+    }
+}
+
+/// Block until JDTLS signals it has finished workspace import (or until
+/// `timeout` elapses). Stashes any responses-by-id into `session.pending`
+/// so a later `read_response_with_timeout` won't lose them. On timeout we
+/// return and let the caller observe the degraded cold-workspace behavior,
+/// matching the daemon's `bbox-lsp` policy.
+async fn wait_for_jdtls_ready(session: &mut Session, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return;
+        }
+        let value = match session.read_message_before(deadline).await {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if let Some(id) = value.get("id").and_then(Value::as_i64) {
+            session.pending.insert(id, value);
+            continue;
+        }
+        if is_jdtls_ready_notification(&value) {
+            return;
         }
     }
 }

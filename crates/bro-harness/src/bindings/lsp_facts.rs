@@ -55,6 +55,20 @@ fn err(msg: impl std::fmt::Display) -> ToolResult {
     ToolResult::Error(msg.to_string())
 }
 
+/// Route a source file to its language-server backend by extension. Today
+/// Rust (rust-analyzer) and Java (JDTLS) are wired; everything else is an
+/// explicit error so a cell can't accidentally warm the wrong backend.
+fn language_for_file(abs: &Path) -> Result<Language, String> {
+    match abs.extension().and_then(|e| e.to_str()) {
+        Some("rs") => Ok(Language::Rust),
+        Some("java") => Ok(Language::Java),
+        Some(ext) => Err(format!(
+            "lsp: unsupported file extension `{ext}` — rust-analyzer (.rs) and jdtls (.java) are wired"
+        )),
+        None => Err("lsp: file has no extension".to_string()),
+    }
+}
+
 /// Byte offset → LSP position (UTF-16 line/character), per the LSP default
 /// position encoding.
 fn byte_to_position(source: &str, byte: usize) -> lsp_types::Position {
@@ -125,6 +139,7 @@ impl LspState {
         &self,
         root: &Path,
         abs: &Path,
+        language: Language,
         source: &str,
         sha: &str,
     ) -> Result<OpenDocument, String> {
@@ -144,7 +159,7 @@ impl LspState {
             None => {
                 let doc = self
                     .pool
-                    .open_document(root, Language::Rust, abs, 1, source.to_string())
+                    .open_document(root, language, abs, 1, source.to_string())
                     .await
                     .map_err(render_lsp_error)?;
                 docs.insert(
@@ -224,7 +239,7 @@ impl Tool for LspRename {
         };
         if abs.extension().and_then(|e| e.to_str()) != Some("rs") {
             return err(format!(
-                "lsp.rename: {} — rust only for now (rust-analyzer)",
+                "lsp.rename: {} — rust only for now (rust-analyzer); use lsp.hover for Java type resolution",
                 span.file
             ));
         }
@@ -240,7 +255,11 @@ impl Tool for LspRename {
             ));
         }
         let source = String::from_utf8_lossy(&bytes).to_string();
-        let doc = match self.0.ensure_current(&cx.root, &abs, &source, &sha).await {
+        let doc = match self
+            .0
+            .ensure_current(&cx.root, &abs, Language::Rust, &source, &sha)
+            .await
+        {
             Ok(d) => d,
             Err(e) => return err(format!("lsp.rename: {e}")),
         };
@@ -382,19 +401,145 @@ impl Tool for LspRename {
 /// The `lsp.*` binding set, sharing one session-scoped [`LspState`] and the
 /// session's provenance ledger.
 pub fn tools(state: Arc<LspState>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(LspRename(state, ledger)) as Arc<dyn Tool>]
+    vec![
+        Arc::new(LspRename(state.clone(), ledger)) as Arc<dyn Tool>,
+        Arc::new(LspHover(state)) as Arc<dyn Tool>,
+    ]
+}
+
+/// Flatten LSP `Hover` contents (any of the three `HoverContents` shapes)
+/// into a single string for the caller. MarkupContent value is taken
+/// verbatim (it already carries markdown fences); `MarkedString` language
+/// blocks are joined with blank lines.
+fn hover_text(contents: lsp_types::HoverContents) -> String {
+    use lsp_types::HoverContents;
+    match contents {
+        HoverContents::Scalar(s) => marked_string_to_string(s),
+        HoverContents::Array(arr) => arr
+            .into_iter()
+            .map(marked_string_to_string)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        HoverContents::Markup(m) => m.value,
+    }
+}
+
+fn marked_string_to_string(s: lsp_types::MarkedString) -> String {
+    match s {
+        lsp_types::MarkedString::String(s) => s,
+        lsp_types::MarkedString::LanguageString(ls) => ls.value,
+    }
+}
+
+/// `lsp.hover` — authoritative resolved type/info for the symbol a
+/// hash-anchored Span points at, via the language server (rust-analyzer for
+/// Rust, JDTLS for Java; warms on first use). THE Java `var` SEAM: point a
+/// Span at a `var x = ...` declarator and JDTLS returns the resolved type —
+/// cross-file receiver return types and generic parameters (e.g. jOOQ
+/// `Table<R>.newRecord()` → `R`) that the pure-bytes facts module cannot
+/// derive. Read-only: returns the raw hover contents for the caller to
+/// interpret (no provenance ledger — hover produces no edits). `null`
+/// contents when the server has no info at the position. Fails closed when
+/// the server is unavailable (never downgrades to text matching); stale_span
+/// on content drift.
+pub struct LspHover(pub Arc<LspState>);
+
+#[derive(Deserialize)]
+struct HoverBindingParams {
+    span: Span,
+}
+
+#[async_trait]
+impl Tool for LspHover {
+    fn name(&self) -> &str {
+        "lsp.hover"
+    }
+    fn description(&self) -> &str {
+        "Resolve the type/info for the symbol a hash-anchored Span points at, via the language server (rust-analyzer for Rust, JDTLS for Java; warms on first use). THE Java var SEAM: point a Span at a `var x = ...` declarator (or any symbol) and get the server's authoritative resolved type — JDTLS resolves cross-file receiver return types and generic parameters (e.g. jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot. Returns { contents, language, position }; contents is null when the server has no info there. Fails closed when the server is unavailable; stale_span if the file changed since the Span was minted."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "span": span_schema_pub(),
+            },
+            "required": ["span"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("lsp".to_string(), "hover".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: HoverBindingParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "lsp.hover: bad input — expected {{ span: Span }}; {e}"
+                ));
+            }
+        };
+        let span = params.span;
+        let abs = match bro_tools::workspace::resolve_in_root(&cx.root, &span.file) {
+            Ok(p) => p,
+            Err(e) => return err(format!("lsp.hover: {}: {e}", span.file)),
+        };
+        let language = match language_for_file(&abs) {
+            Ok(l) => l,
+            Err(e) => return err(format!("lsp.hover: {e}")),
+        };
+        let bytes = match tokio::fs::read(&abs).await {
+            Ok(b) => b,
+            Err(e) => return err(format!("lsp.hover: {}: {e}", span.file)),
+        };
+        let sha = bbox_refactor::sha256_hex(&bytes);
+        if sha != span.content_sha256 {
+            return err(format!(
+                "lsp.hover: stale_span: {} changed since the span was minted (span hash {}, current {sha}); re-derive the span from fresh facts",
+                span.file, span.content_sha256
+            ));
+        }
+        let source = String::from_utf8_lossy(&bytes).to_string();
+        let doc = match self
+            .0
+            .ensure_current(&cx.root, &abs, language, &source, &sha)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => return err(format!("lsp.hover: {e}")),
+        };
+        let position = byte_to_position(&source, span.byte_start);
+        let hover = match self.0.pool.hover(&doc, position).await {
+            Ok(h) => h,
+            Err(e) => return err(format!("lsp.hover: {}", render_lsp_error(e))),
+        };
+        let contents = hover.map(|h| hover_text(h.contents));
+        ToolResult::Json(json!({
+            "contents": contents,
+            "language": language.language_id(),
+            "position": position,
+        }))
+    }
 }
 
 /// Hand-authored namespace documentation + TS declarations (cell-dsl §5.2).
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "lsp".to_string(),
-        description: "Language-server authority (rust-analyzer; Rust only for now). Session-backed: the first call in a workspace warms the server (may take a few seconds on a cold crate — the call blocks, no need to poll); later calls are fast. Fails closed when the server is unavailable — there is deliberately no silent fallback to text matching (RX-V3). THE RENAME RECIPE: aim a Span at the symbol (e.g. a code.query name capture, or an item span start), then `const r = await lsp.rename({ span, newName: \"x\" })` → `await edits.merge({ es, changes: r.changes })` → `await edits.apply({ es })` — server-authored edits join the same EditSet artifact as cell-authored ones. Provenance: returned changes are ledgered host-side at lsp_verified; pass them through to edits.merge UNMODIFIED and the applied EditSet stamps semantic_status \"lsp_verified\" (filtering the array is fine, rewriting a change's bytes floors that edit at syntax_only — the ledger recognizes content, not claims)."
+        description: "Language-server authority. Session-backed: the first call in a workspace warms the backend for that language (may take a few seconds cold — rust-analyzer indexes the crate, JDTLS imports the gradle/maven workspace; the call blocks, no need to poll); later calls are fast. Backends: rust-analyzer (Rust, .rs) and JDTLS (Java, .java). Fails closed when the server is unavailable — there is deliberately no silent fallback to text matching (RX-V3). Two verbs: `lsp.rename` (rust only for now) and `lsp.hover` (rust + java). THE RENAME RECIPE: aim a Span at the symbol, then `const r = await lsp.rename({ span, newName: \"x\" })` → `await edits.merge({ es, changes: r.changes })` → `await edits.apply({ es })` — server-authored edits join the same EditSet artifact as cell-authored ones; the host ledgers them at lsp_verified, so pass them through UNMODIFIED (filtering is fine, rewriting a change's bytes floors it at syntax_only). THE Java var SEAM: `lsp.hover` resolves a `var x = ...` declarator's type authoritatively — JDTLS resolves cross-file receiver return types and generic parameters (jOOQ Table<R>.newRecord() -> R) that `analysis.methodRegions` (pure-bytes facts) leaves as resolved_type:null. Recipe shape: for each unresolved var, `const h = await lsp.hover({ span: varDeclaratorSpan });` and pass the parsed type as an explicit parameter to `java.extractMethodCodeBlock`."
             .to_string(),
         declarations: r#"type SpanChange = { span: Span; new_text: string };
+type HoverResult = { contents: string | null; language: string; position: { line: number; character: number } };
 declare const lsp: {
-  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Returns hash-anchored server-authored changes for edits.merge; the host ledgers them at lsp_verified, so an EditSet built purely from them applies with semantic_status "lsp_verified" (hand-editing a change drops it to syntax_only). Fails closed if rust-analyzer is unavailable; stale_span on content drift. */
+  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Rust only for now (rust-analyzer). Returns hash-anchored server-authored changes for edits.merge; the host ledgers them at lsp_verified, so an EditSet built purely from them applies with semantic_status "lsp_verified" (hand-editing a change drops it to syntax_only). Fails closed if rust-analyzer is unavailable; stale_span on content drift. */
   rename(args: { span: Span; newName: string }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
+  /** Resolve the type/info for the symbol a Span points at (rust-analyzer for .rs, JDTLS for .java; warms on first use). THE Java var SEAM: point a Span at a `var x = ...` declarator and JDTLS returns the authoritative resolved type — cross-file receiver returns and generic params (jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot derive. contents is the raw hover text (markdown/code blocks) for the caller to interpret, or null when the server has no info there. Read-only (no provenance ledger). Fails closed if the server is unavailable; stale_span on content drift. */
+  hover(args: { span: Span }): Promise<HoverResult>;
 };"#
             .to_string(),
     }
