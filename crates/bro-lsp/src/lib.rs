@@ -96,6 +96,13 @@ pub struct LspConfig {
     /// cold workspace, so this is independent of the rust-analyzer
     /// `ready_timeout`. Defaults to 60s (`BRO_LSP_JDTLS_READY_TIMEOUT_SECS`).
     pub jdtls_ready_timeout: Duration,
+    /// Optional gradle version JDTLS uses for the Buildship import instead
+    /// of the project wrapper — a workaround for gradle 9.x's configuration
+    /// exclusive-lock hardening, which trips JDTLS's injected
+    /// GradleAnnotationProcessorPatchPlugin and breaks the import. Pin a
+    /// pre-9 gradle (e.g. "8.14.3") via `BRO_LSP_JDTLS_GRADLE_VERSION`.
+    /// Defaults off (use the wrapper); opt in per project that needs it.
+    pub jdtls_gradle_version: Option<String>,
 }
 
 impl Default for LspConfig {
@@ -117,6 +124,7 @@ impl Default for LspConfig {
                 "BRO_LSP_JDTLS_READY_TIMEOUT_SECS",
                 60,
             )),
+            jdtls_gradle_version: env_string("BRO_LSP_JDTLS_GRADLE_VERSION"),
         }
     }
 }
@@ -860,7 +868,7 @@ async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> 
         last_used: Instant::now(),
     };
     let init_id = session.next_id();
-    let init_params = build_init_params(&key.root)?;
+    let init_params = build_init_params(&key.root, key.language, config)?;
     write_request(
         &mut session.stdin,
         Initialize::METHOD,
@@ -923,12 +931,37 @@ impl Session {
     }
 }
 
-fn build_init_params(root: &Path) -> anyhow::Result<InitializeParams> {
+fn build_init_params(
+    root: &Path,
+    language: Language,
+    config: &LspConfig,
+) -> anyhow::Result<InitializeParams> {
     let root_uri = Url::from_directory_path(root)
         .map_err(|_| anyhow!("failed to convert {} to file URL", root.display()))?;
+    // JDTLS workaround: gradle 9.x hardened configuration resolution to
+    // require an exclusive lock, which trips JDTLS's injected
+    // GradleAnnotationProcessorPatchPlugin during the Buildship model fetch
+    // (`annotationProcessor ... without an exclusive lock`) — breaking the
+    // whole gradle import and leaving the classpath unresolved. Pinning
+    // `java.import.gradle.version` makes JDTLS download + import with a
+    // pre-9 gradle that doesn't have the hardening. Opt-in via env so it
+    // imposes nothing on projects that import cleanly on their wrapper.
+    let initialization_options = match (language, config.jdtls_gradle_version.as_ref()) {
+        (Language::Java, Some(gv)) => Some(serde_json::json!({
+            // JDTLS reads config under initializationOptions.settings.java.*
+            // (the wrapper vscode-java uses), not a bare java.* key.
+            "settings": { "java": { "import": { "gradle": {
+                "version": gv,
+                // Force the pinned version over the project wrapper.
+                "wrapper": { "enabled": false }
+            } } } }
+        })),
+        _ => None,
+    };
     Ok(InitializeParams {
         process_id: Some(std::process::id()),
         root_uri: Some(root_uri.clone()),
+        initialization_options,
         capabilities: ClientCapabilities {
             workspace: Some(WorkspaceClientCapabilities::default()),
             text_document: Some(TextDocumentClientCapabilities {
