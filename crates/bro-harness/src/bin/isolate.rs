@@ -6,6 +6,11 @@
 //! daemon, no probe roundtrip. It builds a `ToolCx` rooted at `--root`,
 //! resolves the tool by name, calls it, and prints the result.
 //!
+//! Pass `--mcp-config <PATH>` to expose MCP servers' tools as
+//! `mcp__<server>__<tool>` alongside the builtins, so a cell can reach an
+//! installed capability (e.g. `@playwright/mcp` → `tools.mcp__playwright__*`)
+//! with no daemon — the same `load_mcp_tools` path the agent loop uses.
+//!
 //! Examples:
 //!
 //! ```text
@@ -16,6 +21,8 @@
 //! isolate --root /tmp/fix java.extractClassPreviewPlan --args-file args.json
 //! isolate --root /tmp/fix --cell 'const r = await tools.file_read({file_path:"src/Foo.java"}); text(r);'
 //! isolate --root /tmp/fix --cell-file setup.js --cell-file verify.js
+//! isolate --root /tmp/fix --mcp-config .mcp.json --cell \
+//!   'const r = await tools.mcp__playwright__browser_navigate({url:"https://example.com"}); text("ok");'
 //! ```
 
 use std::collections::BTreeMap;
@@ -32,6 +39,7 @@ use bro_harness::bindings::binding_tools;
 use bro_harness::bindings::namespace_descriptions;
 use bro_harness::capabilities::HostTools;
 use bro_harness::code_mode::{CodeMode, code_mode_tools};
+use bro_harness::mcp::{ToolFilter, load_mcp_tools};
 use bro_tools::builtin_tools;
 use bro_tools::{
     EditSink, SafetyPolicy, ShellSessions, TodoList, Tool, ToolArgDefaults, ToolCx, ToolResult,
@@ -87,15 +95,35 @@ struct Cli {
     /// empty file instead of erroring.
     #[arg(long)]
     strict: bool,
+
+    /// Load MCP servers from a `{"mcpServers":{...}}` JSON file and expose
+    /// their tools as `mcp__<server>__<tool>`, so a cell can reach an installed
+    /// capability (e.g. `@playwright/mcp` → `tools.mcp__playwright__*`) without
+    /// the daemon. Best-effort: a server that can't be reached or listed is
+    /// logged to stderr and skipped.
+    #[arg(long, value_name = "PATH")]
+    mcp_config: Option<PathBuf>,
 }
 
 /// The full isolate surface: generic builtins (file/shell/glob/git) plus the
-/// harness DSL bindings (code/edits/lsp/java/analysis). Mirrors the set a
-/// code-mode cell sees, minus the agent-loop-only `exec`/`wait` wrappers and
-/// the daemon capability tools (which fail closed without the daemon).
-fn tool_surface() -> Vec<Arc<dyn Tool>> {
+/// harness DSL bindings (code/edits/lsp/java/analysis), plus any MCP servers
+/// named in `--mcp-config`. Mirrors the set a code-mode cell sees, minus the
+/// agent-loop-only `exec`/`wait` wrappers. With `--mcp-config`, MCP tools
+/// stand in for the daemon capability tools: a standalone cell reaches an
+/// installed capability (`mcp__playwright__*`) directly, where the daemon path
+/// injects them through its own MCP registry.
+///
+/// MCP loading is best-effort: a server that can't be reached or listed is
+/// logged to stderr and skipped, so MCP unavailability never aborts a run.
+async fn build_surface(mcp_config: Option<&str>) -> Vec<Arc<dyn Tool>> {
     let mut tools = builtin_tools();
     tools.extend(binding_tools());
+    if let Some(cfg) = mcp_config {
+        // Permissive filter: a standalone validator admits everything a server
+        // lists. The recursion guard is agent-loop-only — no nested dispatch
+        // here to protect against.
+        tools.extend(load_mcp_tools(Some(cfg), &ToolFilter::default()).await);
+    }
     tools
 }
 
@@ -163,15 +191,18 @@ fn read_cell_sources(cli: &Cli) -> Result<Vec<String>> {
         .collect()
 }
 
-fn code_mode_exec_tool(cx: &ToolCx) -> Result<Arc<dyn Tool>> {
-    let callable = tool_surface();
-    let seam = Arc::new(HostTools::new(callable.clone(), cx.clone()));
-    let tools = code_mode_tools(&callable, seam, CodeMode::Only, &namespace_descriptions());
+fn code_mode_exec_tool(cx: &ToolCx, callable: &[Arc<dyn Tool>]) -> Result<Arc<dyn Tool>> {
+    let seam = Arc::new(HostTools::new(callable.to_vec(), cx.clone()));
+    let tools = code_mode_tools(callable, seam, CodeMode::Only, &namespace_descriptions());
     Ok(find_tool(&tools, bro_code_mode::PUBLIC_TOOL_NAME)?.clone())
 }
 
-async fn execute_cell_sources(sources: Vec<String>, cx: &ToolCx) -> Result<Vec<ToolResult>> {
-    let exec = code_mode_exec_tool(cx)?;
+async fn execute_cell_sources(
+    sources: Vec<String>,
+    cx: &ToolCx,
+    callable: &[Arc<dyn Tool>],
+) -> Result<Vec<ToolResult>> {
+    let exec = code_mode_exec_tool(cx, callable)?;
     let mut results = Vec::with_capacity(sources.len());
     for source in sources {
         let result = exec.call(json!({ "source": source }), cx).await;
@@ -217,7 +248,12 @@ fn emit_tool_result(result: ToolResult, field: Option<&str>) -> Result<bool> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tools = tool_surface();
+
+    let mcp_config = match &cli.mcp_config {
+        Some(path) => Some(read_cli_file(path)?),
+        None => None,
+    };
+    let tools = build_surface(mcp_config.as_deref()).await;
 
     if cli.list {
         let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -242,7 +278,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("--root <DIR> is required to evaluate a cell"))?;
         let sources = read_cell_sources(&cli)?;
         let cx = make_cx(root);
-        for result in execute_cell_sources(sources, &cx).await? {
+        for result in execute_cell_sources(sources, &cx, &tools).await? {
             if !emit_tool_result(result, None)? {
                 std::process::exit(1);
             }
@@ -295,6 +331,7 @@ mod tests {
     async fn cell_mode_preserves_kv_and_functions_across_cells() {
         let dir = tempfile::tempdir().unwrap();
         let cx = make_cx(dir.path().to_path_buf());
+        let surface = build_surface(None).await;
         let results = execute_cell_sources(
             vec![
                 "store('k', { n: 7 }); store('helpers.double', (n) => n * 2);".to_string(),
@@ -302,6 +339,7 @@ mod tests {
                     .to_string(),
             ],
             &cx,
+            &surface,
         )
         .await
         .unwrap();
@@ -318,18 +356,82 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("probe.txt"), "hello from cell").unwrap();
         let cx = make_cx(dir.path().to_path_buf());
+        let surface = build_surface(None).await;
         let results = execute_cell_sources(
             vec![
                 "const body = await tools.file_read({ file_path: 'probe.txt' }); text(body);"
                     .to_string(),
             ],
             &cx,
+            &surface,
         )
         .await
         .unwrap();
 
         match &results[0] {
             ToolResult::Text(t) => assert!(t.contains("hello from cell"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// `build_surface` wiring proof: an MCP server's tools merge into the
+    /// callable set and a cell dispatches one through the HostTools seam — the
+    /// same path a real `@playwright/mcp` tool takes. Uses an in-process
+    /// surface so it needs no spawned server.
+    #[tokio::test]
+    async fn cell_dispatches_an_mcp_tool_merged_into_the_surface() {
+        use async_trait::async_trait;
+        use bro_harness::mcp::{
+            McpConfig, McpServerConfig, McpSurface, McpToolSpec, ToolPlacementMap,
+            load_mcp_tools_from_config,
+        };
+
+        struct EchoSurface;
+        #[async_trait]
+        impl McpSurface for EchoSurface {
+            async fn list_tools(&self) -> anyhow::Result<Vec<McpToolSpec>> {
+                Ok(vec![McpToolSpec {
+                    name: "echo".to_string(),
+                    description: "echo the input".to_string(),
+                    input_schema: json!({"type": "object"}),
+                }])
+            }
+            async fn call_tool(&self, tool: &str, input: Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult::Json(json!({ "tool": tool, "got": input })))
+            }
+        }
+
+        let cfg = McpConfig {
+            servers: vec![McpServerConfig::InProcess {
+                name: "fake".to_string(),
+                server: Arc::new(EchoSurface),
+            }],
+            tool_placement: ToolPlacementMap::new(),
+        };
+        let mut tools = builtin_tools();
+        tools.extend(binding_tools());
+        tools.extend(load_mcp_tools_from_config(&cfg, &ToolFilter::default()).await);
+        assert!(
+            tools.iter().any(|t| t.name() == "mcp__fake__echo"),
+            "MCP tool must merge into the surface"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cx = make_cx(dir.path().to_path_buf());
+        let results = execute_cell_sources(
+            vec![
+                "const r = await tools.mcp__fake__echo({ a: 1 }); text(JSON.stringify(r));"
+                    .to_string(),
+            ],
+            &cx,
+            &tools,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ToolResult::Text(t) => assert!(t.contains("\"a\":1"), "got: {t}"),
             other => panic!("expected text, got {other:?}"),
         }
     }
