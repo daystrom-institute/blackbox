@@ -4,9 +4,12 @@
 //!
 //! Transport + call pattern mirror the daemon's own outbound client: streamable
 //! HTTP uses rmcp's reqwest transport, and stdio uses rmcp's `TokioChildProcess`.
-//! Connections are per-operation (one to list at startup, one per tool call) —
-//! simple and correct for short-lived harness sessions; a pooled/persistent
-//! connection is a later optimization.
+//! Connections are **persistent per server**: one connection is started when a
+//! server's tools are loaded and Arc-shared by every `McpTool` it produces, so a
+//! stateful server (e.g. `@playwright/mcp` holding a browser across calls) sees
+//! the same session on every call rather than a fresh subprocess per call.
+//! Dropping the last tool drops the connection; stdio children are reaped via
+//! `kill_on_drop(true)`.
 //!
 //! Failures are best-effort: a server that can't be reached or listed is
 //! logged (to stderr) and skipped — MCP unavailability never aborts the
@@ -15,14 +18,15 @@
 use async_trait::async_trait;
 use bro_tools::{Tool, ToolCx, ToolResult};
 use http::{HeaderName, HeaderValue};
+use rmcp::RoleClient;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
+use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Clone)]
 pub struct McpConfig {
@@ -179,14 +183,21 @@ pub async fn load_mcp_tools_from_config(
 ) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for server in &config.servers {
-        match list_server_tools(server).await {
-            Ok(listed) => {
-                let total = listed.len();
+        match server_backend_and_specs(server).await {
+            Ok((backend, specs)) => {
+                let total = specs.len();
                 let mut admitted = 0;
-                for t in listed {
-                    if !server.excludes(&t.call_name, t.name()) && filter.permits(t.name()) {
+                for (call_name, description, schema) in specs {
+                    let qname = format!("mcp__{}__{}", server.name(), call_name);
+                    if !server.excludes(&call_name, &qname) && filter.permits(&qname) {
                         admitted += 1;
-                        tools.push(Arc::new(t));
+                        tools.push(Arc::new(McpTool {
+                            backend: backend.clone(),
+                            call_name,
+                            name: qname,
+                            description,
+                            schema,
+                        }));
                     }
                 }
                 tracing::info!(
@@ -196,7 +207,7 @@ pub async fn load_mcp_tools_from_config(
                     "MCP tools loaded"
                 );
             }
-            Err(e) => tracing::warn!(server = %server.name(), "MCP tool listing failed: {e:#}"),
+            Err(e) => tracing::warn!(server = %server.name(), "MCP server unavailable: {e:#}"),
         }
     }
     tools
@@ -356,76 +367,95 @@ fn parse_string_map(v: Option<&Value>) -> BTreeMap<String, String> {
         .collect()
 }
 
-async fn list_server_tools(server: &McpServerConfig) -> anyhow::Result<Vec<McpTool>> {
-    let listed = match server {
-        McpServerConfig::Http { url, headers, .. } | McpServerConfig::Sse { url, headers, .. } => {
-            list_http_server_tools(url, headers).await?
-        }
+/// A persistent connection to one MCP server. Started once when its tools are
+/// loaded and Arc-shared by every `McpTool` it produces, so a stateful server
+/// (e.g. `@playwright/mcp` holding a browser across calls) sees the same
+/// session on every call instead of a fresh subprocess. Dropping the last tool
+/// drops the connection; stdio children are reaped via `kill_on_drop(true)`.
+struct ServerConn {
+    running: RunningService<RoleClient, ()>,
+}
+
+impl ServerConn {
+    async fn list_tools(&self) -> anyhow::Result<Vec<rmcp::model::Tool>> {
+        Ok(self.running.peer().list_all_tools().await?)
+    }
+    async fn call_tool(&self, params: CallToolRequestParams) -> anyhow::Result<CallToolResult> {
+        Ok(self.running.peer().call_tool(params).await?)
+    }
+}
+
+/// The shared backend an `McpTool` dispatches through. `Remote` is one
+/// persistent rmcp connection; `InProcess` is a shared `McpSurface` (already
+/// session-stable by construction). Cloned cheaply into each tool of a server.
+#[derive(Clone)]
+enum McpBackend {
+    Remote(Arc<ServerConn>),
+    InProcess(Arc<dyn McpSurface>),
+}
+
+/// Start one persistent connection to a remote (stdio/http/sse) MCP server.
+/// InProcess servers have no rmcp connection and are handled by the caller.
+async fn start_remote_server(server: &McpServerConfig) -> anyhow::Result<Arc<ServerConn>> {
+    let running = match server {
         McpServerConfig::Stdio {
             command, args, env, ..
-        } => list_stdio_server_tools(command, args, env).await?,
-        McpServerConfig::InProcess { name, server } => {
-            return Ok(server
+        } => {
+            let mut cmd = tokio::process::Command::new(command);
+            cmd.args(args).envs(env).kill_on_drop(true);
+            let transport = TokioChildProcess::new(cmd.configure(|_| {}))?;
+            ().serve(transport).await?
+        }
+        McpServerConfig::Http { url, headers, .. } | McpServerConfig::Sse { url, headers, .. } => {
+            let transport =
+                StreamableHttpClientTransport::from_config(http_transport_config(url, headers)?);
+            ().serve(transport).await?
+        }
+        McpServerConfig::InProcess { .. } => {
+            return Err(anyhow::anyhow!("in-process servers have no remote connection"));
+        }
+    };
+    Ok(Arc::new(ServerConn { running }))
+}
+
+/// Resolve a server's shared backend and its raw tool specs as `(call_name,
+/// description, input_schema)`. Remote servers start one persistent connection
+/// here; InProcess servers share the surface directly.
+async fn server_backend_and_specs(
+    server: &McpServerConfig,
+) -> anyhow::Result<(McpBackend, Vec<(String, String, Value)>)> {
+    match server {
+        McpServerConfig::InProcess { server: svc, .. } => Ok((
+            McpBackend::InProcess(svc.clone()),
+            svc.list_tools()
+                .await?
+                .into_iter()
+                .map(|s| (s.name, s.description, s.input_schema))
+                .collect(),
+        )),
+        remote => {
+            let conn = start_remote_server(remote).await?;
+            let specs = conn
                 .list_tools()
                 .await?
                 .into_iter()
-                .map(|t| McpTool {
-                    server: McpServerConfig::InProcess {
-                        name: name.clone(),
-                        server: server.clone(),
-                    },
-                    call_name: t.name.clone(),
-                    name: format!("mcp__{}__{}", name, t.name),
-                    description: t.description,
-                    schema: t.input_schema,
+                .map(|t| {
+                    (
+                        t.name.to_string(),
+                        t.description.map(|d| d.to_string()).unwrap_or_default(),
+                        Value::Object((*t.input_schema).clone()),
+                    )
                 })
-                .collect());
+                .collect();
+            Ok((McpBackend::Remote(conn), specs))
         }
-    };
-    Ok(listed
-        .into_iter()
-        .map(|t| McpTool {
-            server: server.clone(),
-            call_name: t.name.to_string(),
-            name: format!("mcp__{}__{}", server.name(), t.name),
-            description: t.description.map(|d| d.to_string()).unwrap_or_default(),
-            schema: Value::Object((*t.input_schema).clone()),
-        })
-        .collect())
+    }
 }
 
-async fn list_http_server_tools(
-    url: &str,
-    headers: &BTreeMap<String, String>,
-) -> anyhow::Result<Vec<rmcp::model::Tool>> {
-    let transport =
-        StreamableHttpClientTransport::from_config(http_transport_config(url, headers)?);
-    let client = ().serve(transport).await?;
-    let listed = client.list_all_tools().await;
-    let mut client = client;
-    let _ = client.close_with_timeout(Duration::from_secs(2)).await;
-    Ok(listed?)
-}
-
-async fn list_stdio_server_tools(
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-) -> anyhow::Result<Vec<rmcp::model::Tool>> {
-    let mut command_builder = tokio::process::Command::new(command);
-    command_builder.args(args);
-    command_builder.envs(env);
-    let transport = TokioChildProcess::new(command_builder.configure(|_| {}))?;
-    let client = ().serve(transport).await?;
-    let listed = client.list_all_tools().await;
-    let mut client = client;
-    let _ = client.close_with_timeout(Duration::from_secs(2)).await;
-    Ok(listed?)
-}
-
-/// A single MCP tool, dispatched by re-dialing its server per call.
+/// A single MCP tool. Dispatches through its server's shared backend (one
+/// persistent connection), not a per-call re-dial.
 struct McpTool {
-    server: McpServerConfig,
+    backend: McpBackend,
     call_name: String,
     name: String,
     description: String,
@@ -459,42 +489,17 @@ impl McpTool {
             Value::Object(m) => m,
             _ => serde_json::Map::new(),
         };
-        let resp = match &self.server {
-            McpServerConfig::Http { url, headers, .. }
-            | McpServerConfig::Sse { url, headers, .. } => {
+        let resp = match &self.backend {
+            McpBackend::Remote(conn) => {
                 let params = CallToolRequestParams::new(self.call_name.clone())
                     .with_arguments(input_args.into_iter().collect());
-                let transport = StreamableHttpClientTransport::from_config(http_transport_config(
-                    url, headers,
-                )?);
-                let client = ().serve(transport).await?;
-                let resp = client.call_tool(params).await;
-                let mut client = client;
-                let _ = client.close_with_timeout(Duration::from_secs(2)).await;
-                resp
+                conn.call_tool(params).await?
             }
-            McpServerConfig::Stdio {
-                command, args, env, ..
-            } => {
-                let mut command_builder = tokio::process::Command::new(command);
-                command_builder.args(args);
-                command_builder.envs(env);
-                let transport = TokioChildProcess::new(command_builder.configure(|_| {}))?;
-                let client = ().serve(transport).await?;
-                let params = CallToolRequestParams::new(self.call_name.clone())
-                    .with_arguments(input_args.into_iter().collect());
-                let resp = client.call_tool(params).await;
-                let mut client = client;
-                let _ = client.close_with_timeout(Duration::from_secs(2)).await;
-                resp
-            }
-            McpServerConfig::InProcess { server, .. } => {
-                return server
-                    .call_tool(&self.call_name, Value::Object(input_args))
-                    .await;
+            McpBackend::InProcess(svc) => {
+                return svc.call_tool(&self.call_name, Value::Object(input_args)).await;
             }
         };
-        Ok(to_tool_result(resp?))
+        Ok(to_tool_result(resp))
     }
 }
 
