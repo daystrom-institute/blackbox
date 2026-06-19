@@ -1,0 +1,19 @@
+{
+  "id": "a0178bb8",
+  "title": "macOS blackboxd/bro-harness redeploy (codesign + launchd reload)",
+  "content": "Replacing the installed blackboxd/bro-harness binary changes its code signature; `launchctl kickstart -k` alone fails with OS_REASON_CODESIGNING (the new cdhash violates launchd's cached LWCR). Full redeploy on this macOS host: `cp` new binary into ~/.local/bin -> `codesign -f -s - <binary>` (ad-hoc re-sign) -> `launchctl bootout gui/$(id -u)/com.daystrom.blackbox` -> `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daystrom.blackbox.plist` -> `launchctl kickstart -k gui/$(id -u)/com.daystrom.blackbox` -> verify port 7264 responds. Back up the prior binary to `.bak` first for rollback. Note KeepAlive{SuccessfulExit:false}: a clean exit 0 will NOT be auto-restarted. The daemon links bro-harness/bro-tools in-process, so rebuilding blackboxd captures library-crate changes; rebuild the standalone bro-harness bin too for consistency.",
+  "variants": {},
+  "category": "tool",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-06-18T01:43:59Z",
+  "updated_at": "2026-06-18T01:43:59Z",
+  "recall_count": 0
+}

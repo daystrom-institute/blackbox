@@ -392,8 +392,9 @@ fn enqueue_reembed_routes(
             }
             let entity_id = crate::index::knowledge_entity_id(&entry.id);
             let chunk_hash = crate::index::knowledge_chunk_hash(entry);
-            crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
-            enqueued += 1;
+            if crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash) {
+                enqueued += 1;
+            }
         }
         for item in state.roadmap.read().all_items() {
             if limit_reached(max_entities, enqueued) {
@@ -404,8 +405,9 @@ fn enqueue_reembed_routes(
             }
             let entity_id = crate::index::roadmap_entity_id(&item.id);
             let chunk_hash = crate::index::roadmap_chunk_hash(item);
-            crate::embed_queue::enqueue_roadmap(item, &entity_id, &chunk_hash);
-            enqueued += 1;
+            if crate::embed_queue::enqueue_roadmap(item, &entity_id, &chunk_hash) {
+                enqueued += 1;
+            }
         }
     }
     if buckets.contains(&Bucket::Notes) {
@@ -413,8 +415,9 @@ fn enqueue_reembed_routes(
             if limit_reached(max_entities, enqueued) {
                 return Ok(enqueued);
             }
-            crate::embed_queue::enqueue_note(note);
-            enqueued += 1;
+            if crate::embed_queue::enqueue_note(note) {
+                enqueued += 1;
+            }
         }
     }
     if buckets.contains(&Bucket::Threads) {
@@ -422,8 +425,9 @@ fn enqueue_reembed_routes(
             if limit_reached(max_entities, enqueued) {
                 return Ok(enqueued);
             }
-            crate::embed_queue::enqueue_thread(thread);
-            enqueued += 1;
+            if crate::embed_queue::enqueue_thread(thread) {
+                enqueued += 1;
+            }
         }
     }
     if buckets.contains(&Bucket::AgentManifest) {
@@ -440,7 +444,7 @@ fn enqueue_reembed_routes(
         state
             .idx
             .read()
-            .for_each_embedding_source_doc_for_doc_types(&doc_types, remaining, |doc| {
+            .for_each_embedding_source_doc_for_doc_types(&doc_types, None, |doc| {
                 if limit_reached(remaining, index_enqueued) {
                     return Ok(());
                 }
@@ -487,8 +491,7 @@ fn enqueue_agent_manifest_artifacts(
             name: entry.name,
             version,
         };
-        enqueued += agent_manifest_component_count(&manifest);
-        enqueue_agent_manifest(&agent, &manifest);
+        enqueued += enqueue_agent_manifest(&agent, &manifest);
     }
     Ok(enqueued)
 }
@@ -536,8 +539,7 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
                 return false;
             };
             let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
-            crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
-            true
+            crate::embed_queue::enqueue_project_file_as(&chunk, &entity_id, bucket)
         }
         Bucket::Transcripts => {
             let chunk_hash = doc
@@ -550,15 +552,13 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
                 doc.byte_offset,
                 &doc.content,
                 &chunk_hash,
-            );
-            true
+            )
         }
         Bucket::GitMessage => {
             let (Some(entity_id), Some(chunk_hash)) = (&doc.entity_id, &doc.chunk_hash) else {
                 return false;
             };
-            crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
-            true
+            crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content)
         }
         Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => false,
     }
@@ -810,20 +810,20 @@ pub(crate) fn agent_manifest_embedding(
     }
 }
 
-pub(crate) fn enqueue_agent_manifest(agent: &AgentRef, manifest: &AgentManifest) {
+pub(crate) fn enqueue_agent_manifest(agent: &AgentRef, manifest: &AgentManifest) -> usize {
+    let mut enqueued = 0usize;
     for component in agent_manifest_components(manifest) {
-        crate::embed_queue::enqueue(EmbedRequest {
+        if crate::embed_queue::enqueue(EmbedRequest {
             bucket: Bucket::AgentManifest,
             project_id: None,
             entity_id: agent_component_entity_id(agent, component.kind),
             chunk_hash: content_hash(&component.text),
             text: component.text,
-        });
+        }) {
+            enqueued += 1;
+        }
     }
-}
-
-pub(crate) fn agent_manifest_component_count(manifest: &AgentManifest) -> usize {
-    agent_manifest_components(manifest).len()
+    enqueued
 }
 
 pub(crate) fn agent_component_entity_id(
@@ -1170,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn reembed_index_enqueue_honors_max_entities() {
+    fn reembed_index_enqueue_counts_only_queue_accepted_items() {
         let docs = vec![
             EmbeddingSourceDoc {
                 doc_type: "transcript".into(),
@@ -1205,7 +1205,8 @@ mod tests {
         ];
         assert_eq!(
             enqueue_reembed_index_docs(&[Bucket::Transcripts], &docs, Some(1)),
-            1
+            0,
+            "an uninstalled or dedup-skipped queue item must not consume the reembed cap"
         );
     }
 

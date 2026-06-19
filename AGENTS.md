@@ -100,6 +100,17 @@ System memories must state current system invariants and operational runbooks, n
 
 
 
+## Tools
+
+**Macos Blackbox Host Setup**
+
+This machine is a macOS setup for blackbox. Production blackboxd is managed by launchd label `com.daystrom.blackbox` and normally runs `/Users/invidious/.local/bin/blackboxd`; restart with `launchctl kickstart -k gui/$(id -u)/com.daystrom.blackbox` after rebuilding/installing the binary. Config locations have a macOS nuance: Rust `dirs::config_dir()` resolves to `~/Library/Application Support`, so `bro fleet` may read `~/Library/Application Support/blackbox/fleet.json`, while this host also keeps the main `config.toml` and a mirrored `fleet.json` under `~/.config/blackbox/`. Check/update both fleet.json files when changing fleet-local settings unless `BLACKBOX_CONFIG` is explicitly set.
+
+**macOS blackboxd/bro-harness redeploy (codesign + launchd reload)**
+
+Replacing the installed blackboxd/bro-harness binary changes its code signature; `launchctl kickstart -k` alone fails with OS_REASON_CODESIGNING (the new cdhash violates launchd's cached LWCR). Full redeploy on this macOS host: `cp` new binary into ~/.local/bin -> `codesign -f -s - <binary>` (ad-hoc re-sign) -> `launchctl bootout gui/$(id -u)/com.daystrom.blackbox` -> `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daystrom.blackbox.plist` -> `launchctl kickstart -k gui/$(id -u)/com.daystrom.blackbox` -> verify port 7264 responds. Back up the prior binary to `.bak` first for rollback. Note KeepAlive{SuccessfulExit:false}: a clean exit 0 will NOT be auto-restarted. The daemon links bro-harness/bro-tools in-process, so rebuilding blackboxd captures library-crate changes; rebuild the standalone bro-harness bin too for consistency.
+
+
 ## Workflow
 
 **Fleet TUI validation uses tmux MCP and live probes**

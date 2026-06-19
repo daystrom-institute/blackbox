@@ -38,14 +38,14 @@ pub fn status_response() -> EmbedStatusResponse {
         })
 }
 
-pub fn enqueue_knowledge(entry: &KnowledgeEntry, entity_id: &str, chunk_hash: &str) {
+pub fn enqueue_knowledge(entry: &KnowledgeEntry, entity_id: &str, chunk_hash: &str) -> bool {
     enqueue(EmbedRequest {
         bucket: Bucket::Knowledge,
         project_id: None,
         entity_id: entity_id.to_string(),
         chunk_hash: chunk_hash.to_string(),
         text: format!("{}\n\n{}", entry.title, entry.content),
-    });
+    })
 }
 
 pub fn tombstone_knowledge(entity_id: &str) {
@@ -64,14 +64,14 @@ pub fn enqueue_roadmap(
     item: &bbox_stores::roadmap::RoadmapItem,
     entity_id: &str,
     chunk_hash: &str,
-) {
+) -> bool {
     enqueue(EmbedRequest {
         bucket: Bucket::Knowledge, // reuses knowledge bucket for vector search
         project_id: None,
         entity_id: entity_id.to_string(),
         chunk_hash: chunk_hash.to_string(),
         text: format!("{}\n\n{}", item.title, item.body),
-    });
+    })
 }
 
 pub fn tombstone_roadmap(entity_id: &str) {
@@ -91,38 +91,50 @@ pub fn tombstone_roadmap(entity_id: &str) {
 pub fn register_index_embed_hooks() {
     bbox_indexing::index::embed_hook::register_embed_hooks(
         bbox_indexing::index::embed_hook::EmbedHooks {
-            project_file: enqueue_project_file,
-            git_message: enqueue_git_message,
+            project_file: enqueue_project_file_hook,
+            git_message: enqueue_git_message_hook,
         },
     );
 }
 
-pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) {
+fn enqueue_project_file_hook(chunk: &Chunk, entity_id: &str) {
+    let _ = enqueue_project_file(chunk, entity_id);
+}
+
+fn enqueue_git_message_hook(entity_id: &str, chunk_hash: &str, message: &str) {
+    let _ = enqueue_git_message(entity_id, chunk_hash, message);
+}
+
+pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) -> bool {
     let bucket = if chunk.language.is_some() || chunk.chunk_kind == "code_block" {
         Bucket::Code
     } else {
         Bucket::Docs
     };
+    enqueue_project_file_as(chunk, entity_id, bucket)
+}
+
+pub fn enqueue_project_file_as(chunk: &Chunk, entity_id: &str, bucket: Bucket) -> bool {
     enqueue(EmbedRequest {
         bucket,
         project_id: Some(chunk.project_id.clone()),
         entity_id: entity_id.to_string(),
         chunk_hash: chunk.chunk_hash.clone(),
         text: chunk.content.clone(),
-    });
+    })
 }
 
-pub fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &str) {
+pub fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &str) -> bool {
     enqueue(EmbedRequest {
         bucket: Bucket::GitMessage,
         project_id: None,
         entity_id: entity_id.to_string(),
         chunk_hash: chunk_hash.to_string(),
         text: message.to_string(),
-    });
+    })
 }
 
-pub fn enqueue_note(note: &Note) {
+pub fn enqueue_note(note: &Note) -> bool {
     let entity_id = EntityRef::Note {
         note_id: note.id.clone(),
     }
@@ -133,10 +145,14 @@ pub fn enqueue_note(note: &Note) {
         entity_id,
         chunk_hash: note_chunk_hash(note),
         text: note_text(note),
-    });
+    })
 }
 
-pub fn enqueue_thread(thread: &Thread) {
+pub fn enqueue_note_hook(note: &Note) {
+    let _ = enqueue_note(note);
+}
+
+pub fn enqueue_thread(thread: &Thread) -> bool {
     let entity_id = EntityRef::Thread {
         thread_id: thread.id.clone(),
     }
@@ -147,7 +163,11 @@ pub fn enqueue_thread(thread: &Thread) {
         entity_id,
         chunk_hash: thread_chunk_hash(thread),
         text: thread_text(thread),
-    });
+    })
+}
+
+pub fn enqueue_thread_hook(thread: &Thread) {
+    let _ = enqueue_thread(thread);
 }
 
 pub fn enqueue_transcript(
@@ -156,7 +176,7 @@ pub fn enqueue_transcript(
     byte_offset: u64,
     content: &str,
     chunk_hash: &str,
-) {
+) -> bool {
     let entity_id = EntityRef::Transcript {
         provider: provider.to_string(),
         session_id: session_id.to_string(),
@@ -170,7 +190,7 @@ pub fn enqueue_transcript(
         entity_id,
         chunk_hash: chunk_hash.to_string(),
         text: content.to_string(),
-    });
+    })
 }
 
 // Entity-id construction for project-file chunks lives with the index
@@ -348,12 +368,13 @@ fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
     idx
 }
 
-pub fn enqueue(request: queue::EmbedRequest) {
+pub fn enqueue(request: queue::EmbedRequest) -> bool {
     let route = request.bucket.as_str();
     let entity_id = request.entity_id.clone();
     let chunk_hash = request.chunk_hash.clone();
     if let Some(queue) = queue_slot().read().as_ref() {
-        if !queue.enqueue(request) {
+        let accepted = queue.enqueue(request);
+        if !accepted {
             tracing::debug!(
                 route,
                 entity_id,
@@ -361,6 +382,7 @@ pub fn enqueue(request: queue::EmbedRequest) {
                 "embedding enqueue skipped or route unavailable"
             );
         }
+        accepted
     } else {
         tracing::debug!(
             route,
@@ -368,6 +390,7 @@ pub fn enqueue(request: queue::EmbedRequest) {
             chunk_hash,
             "embedding queue not installed; accepted enqueue as no-op"
         );
+        false
     }
 }
 

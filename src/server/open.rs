@@ -162,8 +162,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let th = Threads::open(&th_path)?;
     // Wire the store-side embed sinks to the embedding queue (dependency
     // inversion: the stores live below the embed pipeline in the crate DAG).
-    crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread);
-    crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note);
+    crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread_hook);
+    crate::notes::register_note_embed_hook(crate::embed_queue::enqueue_note_hook);
     crate::index::writer_actor::register_embed_bootstrap(
         crate::embed_queue::register_index_embed_hooks,
     );

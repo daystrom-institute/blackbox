@@ -1,0 +1,19 @@
+{
+  "id": "4980ec69",
+  "title": "Macos Blackbox Host Setup",
+  "content": "This machine is a macOS setup for blackbox. Production blackboxd is managed by launchd label `com.daystrom.blackbox` and normally runs `/Users/invidious/.local/bin/blackboxd`; restart with `launchctl kickstart -k gui/$(id -u)/com.daystrom.blackbox` after rebuilding/installing the binary. Config locations have a macOS nuance: Rust `dirs::config_dir()` resolves to `~/Library/Application Support`, so `bro fleet` may read `~/Library/Application Support/blackbox/fleet.json`, while this host also keeps the main `config.toml` and a mirrored `fleet.json` under `~/.config/blackbox/`. Check/update both fleet.json files when changing fleet-local settings unless `BLACKBOX_CONFIG` is explicitly set.",
+  "variants": {},
+  "category": "tool",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-06-18T01:43:59Z",
+  "updated_at": "2026-06-18T01:43:59Z",
+  "recall_count": 0
+}
