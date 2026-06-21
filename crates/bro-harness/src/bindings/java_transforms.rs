@@ -1823,6 +1823,154 @@ fn source_package(source: &str) -> Option<String> {
     extract_package_name(source)
 }
 
+fn java_lang_type(name: &str) -> bool {
+    matches!(
+        name,
+        "String"
+            | "Object"
+            | "Class"
+            | "Enum"
+            | "Iterable"
+            | "Throwable"
+            | "Exception"
+            | "RuntimeException"
+            | "Error"
+            | "Boolean"
+            | "Byte"
+            | "Short"
+            | "Integer"
+            | "Long"
+            | "Character"
+            | "Float"
+            | "Double"
+            | "Number"
+            | "Void"
+    )
+}
+
+fn import_fqcn(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("import static ") || !trimmed.starts_with("import ") {
+        return None;
+    }
+    trimmed
+        .strip_prefix("import ")?
+        .strip_suffix(';')
+        .map(str::trim)
+}
+
+fn import_simple_name(fqcn: &str) -> Option<&str> {
+    if fqcn.ends_with(".*") {
+        return None;
+    }
+    fqcn.rsplit('.').next().filter(|name| !name.is_empty())
+}
+
+fn target_type_parameter_names(type_decl_suffix: &str) -> BTreeSet<String> {
+    type_decl_suffix
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .split(',')
+        .filter_map(|part| {
+            part.split_whitespace()
+                .next()
+                .map(str::to_string)
+                .filter(|name| !name.is_empty())
+        })
+        .collect()
+}
+
+fn selected_signature_identifiers(
+    candidates: &[PullUpCandidate],
+    type_decl_suffix: &str,
+    annotation_policy: &str,
+) -> BTreeSet<String> {
+    let mut text = String::new();
+    text.push_str(type_decl_suffix);
+    for candidate in candidates {
+        text.push('\n');
+        let signature = if matches!(annotation_policy, "safe" | "omit") {
+            strip_signature_annotations(&candidate.signature_text)
+        } else {
+            candidate.signature_text.clone()
+        };
+        text.push_str(&signature);
+    }
+    java_type_identifiers(&text)
+}
+
+fn target_import_plan(
+    source: &str,
+    target_package: Option<&str>,
+    type_name: &str,
+    type_decl_suffix: &str,
+    candidates: &[PullUpCandidate],
+    annotation_policy: &str,
+) -> (Vec<String>, Vec<Value>) {
+    let source_package = source_package(source);
+    let identifiers =
+        selected_signature_identifiers(candidates, type_decl_suffix, annotation_policy);
+    let type_params = target_type_parameter_names(type_decl_suffix);
+    let mut imports = BTreeSet::new();
+    let mut imported_simple_names = BTreeSet::new();
+    let mut findings = Vec::new();
+
+    for line in source_imports(source) {
+        if line.trim_start().starts_with("import static ") {
+            findings.push(json!({
+                "finding": "target_import_review",
+                "kind": "static_import_omitted",
+                "detail": "static imports are not copied into extracted API types",
+            }));
+            continue;
+        }
+        let Some(fqcn) = import_fqcn(&line) else {
+            continue;
+        };
+        if fqcn.ends_with(".*") {
+            findings.push(json!({
+                "finding": "target_import_review",
+                "kind": "wildcard_import_review",
+                "import": line,
+                "detail": "wildcard imports are not copied; use explicit imports if the generated API needs one",
+            }));
+            continue;
+        }
+        let Some(simple) = import_simple_name(fqcn) else {
+            continue;
+        };
+        if identifiers.contains(simple) && simple != type_name {
+            let simple = simple.to_string();
+            imports.insert(line);
+            imported_simple_names.insert(simple);
+        }
+    }
+
+    if let (Some(source_package), Some(target_package)) =
+        (source_package.as_deref(), target_package)
+        && source_package != target_package
+    {
+        for ident in identifiers {
+            if ident == type_name
+                || type_params.contains(&ident)
+                || imported_simple_names.contains(&ident)
+                || java_lang_type(&ident)
+            {
+                continue;
+            }
+            imports.insert(format!("import {source_package}.{ident};"));
+            findings.push(json!({
+                "finding": "target_import_review",
+                "kind": "source_package_type_imported",
+                "type": ident,
+                "detail": "selected signature references an unimported source-package type; verify it is public and intended for the new API package",
+            }));
+        }
+    }
+
+    (imports.into_iter().collect(), findings)
+}
+
 fn insert_import_edit(source: &str, import_fqcn: &str) -> Option<bbox_refactor::TextEdit> {
     let import_line = format!("import {import_fqcn};");
     if source.lines().any(|line| line.trim() == import_line) {
@@ -2309,11 +2457,8 @@ fn abstract_signature(
     format!("{visibility} abstract {trimmed};")
 }
 
-fn java_target_prelude(source: &str, target_package: Option<&str>) -> String {
-    let pkg = target_package
-        .map(str::to_string)
-        .or_else(|| extract_package_name(source));
-    let imports = source_imports(source);
+fn java_target_prelude(target_package: Option<&str>, imports: &[String]) -> String {
+    let pkg = target_package.map(str::to_string);
     match (pkg, imports.is_empty()) {
         (Some(pkg), true) => format!("package {pkg};\n\n"),
         (Some(pkg), false) => format!("package {pkg};\n\n{}\n\n", imports.join("\n")),
@@ -2323,16 +2468,16 @@ fn java_target_prelude(source: &str, target_package: Option<&str>) -> String {
 }
 
 fn render_target_type(
-    source: &str,
     type_name: &str,
     type_decl_suffix: &str,
     target_kind: &str,
     target_package: Option<&str>,
+    imports: &[String],
     candidates: &[PullUpCandidate],
     comment_policy: &str,
     annotation_policy: &str,
 ) -> String {
-    let mut out = java_target_prelude(source, target_package);
+    let mut out = java_target_prelude(target_package, imports);
     if target_kind == "abstract_class" {
         out.push_str(&format!(
             "public abstract class {type_name}{type_decl_suffix} {{\n"
@@ -2754,6 +2899,19 @@ impl Tool for JavaExtractInterface {
                 .to_string();
             let (type_decl_suffix, type_ref_suffix) =
                 selected_type_parameters(&source, &class_name, &selected);
+            let source_pkg = source_package(&source);
+            let target_package = params
+                .target_package
+                .as_deref()
+                .or(source_pkg.as_deref());
+            let (target_imports, target_import_findings) = target_import_plan(
+                &source,
+                target_package,
+                &params.type_name,
+                &type_decl_suffix,
+                &selected,
+                annotation_policy,
+            );
             let type_ref = format!("{}{}", params.type_name, type_ref_suffix);
             let mut edits = Vec::new();
             match class_header_insert_edit(&source, &class_name, &target_kind, &type_ref) {
@@ -2794,11 +2952,11 @@ impl Tool for JavaExtractInterface {
                 Err(e) => return err(format!("java.extractInterface: source edit synthesis failed: {e:#}")),
             };
             let target_content = render_target_type(
-                &source,
                 &params.type_name,
                 &type_decl_suffix,
                 &target_kind,
-                params.target_package.as_deref(),
+                target_package,
+                &target_imports,
                 &selected,
                 comment_policy,
                 annotation_policy,
@@ -2814,7 +2972,7 @@ impl Tool for JavaExtractInterface {
             } else {
                 vec![json!({ "path": params.target, "content": target_content })]
             };
-            let findings: Vec<Value> = selected
+            let mut findings: Vec<Value> = selected
                 .iter()
                 .flat_map(|candidate| {
                     candidate.warnings.iter().map(|warning| {
@@ -2827,6 +2985,7 @@ impl Tool for JavaExtractInterface {
                     })
                 })
                 .collect();
+            findings.extend(target_import_findings);
             ToolResult::Json(json!({
                 "title": format!("extract {target_kind} `{}` from `{class_name}`", params.type_name),
                 "changes": changes,
@@ -5553,6 +5712,80 @@ public class OrderService<T extends Number> {
             target.contains("/** Finds a single order. */")
                 && target.contains("String find(String id) throws IOException;"),
             "{target}"
+        );
+    }
+
+    const TARGET_IMPORT_FIXTURE: &str = r#"package com.acme.impl;
+
+import java.time.Instant;
+import java.util.List;
+
+public class OrderService {
+    public List<OrderId> ids() { return List.of(new OrderId("1")); }
+}
+"#;
+
+    const TARGET_IMPORT_TYPE_FIXTURE: &str = r#"package com.acme.impl;
+
+public record OrderId(String value) {}
+"#;
+
+    #[tokio::test]
+    async fn extract_interface_imports_only_selected_signature_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/impl")).unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/api")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderService.java"),
+            TARGET_IMPORT_FIXTURE,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderId.java"),
+            TARGET_IMPORT_TYPE_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPullUpPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "className": "OrderService"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let result = json_of(
+            JavaExtractInterface
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "target": "src/com/acme/api/OrderApi.java",
+                        "typeName": "OrderApi",
+                        "className": "OrderService",
+                        "targetPackage": "com.acme.api",
+                        "memberRefs": [candidate_ref(&preview, "ids")]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let target = result["creates"][0]["content"].as_str().unwrap();
+        assert!(target.contains("import java.util.List;"), "{target}");
+        assert!(target.contains("import com.acme.impl.OrderId;"), "{target}");
+        assert!(!target.contains("java.time.Instant"), "{target}");
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["kind"] == "source_package_type_imported"),
+            "{result}"
         );
     }
 
