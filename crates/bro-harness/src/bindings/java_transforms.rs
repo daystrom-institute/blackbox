@@ -1602,6 +1602,13 @@ struct PullUpCandidate {
     warnings: Vec<Value>,
 }
 
+fn java_class_like_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration" | "record_declaration" | "interface_declaration" | "enum_declaration"
+    )
+}
+
 fn java_simple_name(type_text: &str) -> Option<&str> {
     let cleaned = type_text
         .trim()
@@ -1622,6 +1629,20 @@ fn java_simple_name(type_text: &str) -> Option<&str> {
         .next_back()
         .unwrap_or(cleaned);
     if ident.is_empty() { None } else { Some(ident) }
+}
+
+fn java_type_identifiers(type_text: &str) -> BTreeSet<String> {
+    const IGNORED: &[&str] = &[
+        "void", "boolean", "byte", "short", "int", "long", "char", "float", "double", "extends",
+        "super", "var",
+    ];
+    type_text
+        .split(|c: char| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()))
+        .filter(|part| !part.is_empty())
+        .filter(|part| !IGNORED.contains(part))
+        .filter(|part| part.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+        .map(str::to_string)
+        .collect()
 }
 
 fn java_builtin_or_publicish_type(type_text: &str) -> bool {
@@ -1649,6 +1670,53 @@ fn java_builtin_or_publicish_type(type_text: &str) -> bool {
             | "Iterable"
             | "Stream"
     ) || name.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+fn local_non_public_types(
+    items: &bbox_refactor::facts::FileItemsFacts,
+    source_type_name: &str,
+) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for item in &items.items {
+        if !java_class_like_kind(&item.item.kind) {
+            continue;
+        }
+        let Some(name) = item.item.name.as_deref() else {
+            continue;
+        };
+        if name == source_type_name || item.visibility.as_deref() == Some("public") {
+            continue;
+        }
+        out.insert(
+            name.to_string(),
+            json!({
+                "kind": item.item.kind,
+                "visibility": item.visibility.clone().unwrap_or_else(|| "package".to_string()),
+            }),
+        );
+    }
+    out
+}
+
+fn local_type_visibility_blockers(
+    type_text: &str,
+    position: &str,
+    local_non_public: &BTreeMap<String, Value>,
+) -> Vec<Value> {
+    java_type_identifiers(type_text)
+        .into_iter()
+        .filter_map(|type_name| {
+            local_non_public.get(&type_name).map(|fact| {
+                json!({
+                    "kind": "non_public_signature_type",
+                    "position": position,
+                    "type": type_name,
+                    "declaration": fact,
+                    "detail": "selected public contract would expose a non-public local type",
+                })
+            })
+        })
+        .collect()
 }
 
 fn signature_digest(signature_text: &str) -> String {
@@ -1681,8 +1749,12 @@ fn source_imports(source: &str) -> Vec<String> {
         .collect()
 }
 
-fn class_type_parameters(source: &str, class_name: &str) -> Option<(String, Vec<String>)> {
-    let needle = format!("class {class_name}");
+fn type_decl_type_parameters(
+    source: &str,
+    type_keyword: &str,
+    type_name: &str,
+) -> Option<(String, Vec<String>)> {
+    let needle = format!("{type_keyword} {type_name}");
     let class_at = source.find(&needle)?;
     let after_name = class_at + needle.len();
     let rest = source.get(after_name..)?;
@@ -1718,6 +1790,11 @@ fn class_type_parameters(source: &str, class_name: &str) -> Option<(String, Vec<
         }
     }
     None
+}
+
+fn class_type_parameters(source: &str, class_name: &str) -> Option<(String, Vec<String>)> {
+    type_decl_type_parameters(source, "class", class_name)
+        .or_else(|| type_decl_type_parameters(source, "record", class_name))
 }
 
 fn selected_type_parameters(
@@ -1817,10 +1894,8 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
         .items
         .iter()
         .find(|item| {
-            matches!(
-                item.item.kind.as_str(),
-                "class_declaration" | "record_declaration" | "interface_declaration"
-            ) && item.item.name.as_deref() == Some(class_name.as_str())
+            java_class_like_kind(item.item.kind.as_str())
+                && item.item.name.as_deref() == Some(class_name.as_str())
         })
         .cloned();
     let class_span = class_fact.as_ref().map(|item| {
@@ -1834,10 +1909,10 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
     let class_byte_range = class_fact
         .as_ref()
         .map(|item| (item.item.byte_start, item.item.byte_end));
-    let class_blockers = match class_fact.as_ref().map(|item| item.item.kind.as_str()) {
-        Some("record_declaration") => vec![json!({
-            "kind": "record_pullup_review",
-            "detail": "records can implement interfaces, but abstract-class pull-up is not supported",
+    let mut class_blockers = match class_fact.as_ref().map(|item| item.item.kind.as_str()) {
+        Some("record_declaration") if target_kind == "abstract_class" => vec![json!({
+            "kind": "record_abstract_pullup",
+            "detail": "records cannot extend an abstract superclass",
         })],
         Some("interface_declaration") => vec![json!({
             "kind": "source_is_interface",
@@ -1845,6 +1920,34 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
         })],
         _ => Vec::new(),
     };
+    let mut class_warnings = Vec::new();
+    if let Some(class_fact) = class_fact.as_ref() {
+        let class_text = source
+            .get(class_fact.item.byte_start..class_fact.item.byte_end)
+            .unwrap_or_default();
+        let class_header = class_text.split('{').next().unwrap_or(class_text);
+        if class_fact.item.kind == "record_declaration" && target_kind == "interface" {
+            class_warnings.push(json!({
+                "kind": "record_interface_review",
+                "detail": "records can implement interfaces; generated contracts should avoid record component leakage unless intentional",
+            }));
+        }
+        if class_header.contains("sealed ")
+            || class_header.contains(" non-sealed ")
+            || class_header.contains(" permits ")
+        {
+            class_warnings.push(json!({
+                "kind": "sealed_hierarchy_review",
+                "detail": "sealed hierarchy changes may require permits/module review outside this syntax-only transform",
+            }));
+        }
+    } else {
+        class_blockers.push(json!({
+            "kind": "source_type_not_found",
+            "detail": "requested className was not found in the source file",
+        }));
+    }
+    let local_non_public = local_non_public_types(&items, &class_name);
 
     let mut overloads: BTreeMap<String, usize> = BTreeMap::new();
     for item in &items.items {
@@ -1925,6 +2028,13 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
                     "detail": "verify this type is visible from the target API package/module",
                 }));
             }
+            if let Some(type_text) = param.type_text.as_deref() {
+                blockers.extend(local_type_visibility_blockers(
+                    type_text,
+                    "parameter",
+                    &local_non_public,
+                ));
+            }
         }
         if let Some(type_text) = sig.return_type.as_deref()
             && !java_builtin_or_publicish_type(type_text)
@@ -1936,6 +2046,13 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
                 "detail": "verify this type is visible from the target API package/module",
             }));
         }
+        if let Some(type_text) = sig.return_type.as_deref() {
+            blockers.extend(local_type_visibility_blockers(
+                type_text,
+                "return",
+                &local_non_public,
+            ));
+        }
         for thrown in &sig.throws {
             if !java_builtin_or_publicish_type(thrown) {
                 warnings.push(json!({
@@ -1945,6 +2062,11 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
                     "detail": "verify this exception type is visible from the target API package/module",
                 }));
             }
+            blockers.extend(local_type_visibility_blockers(
+                thrown,
+                "throws",
+                &local_non_public,
+            ));
         }
         if overloads.get(&name).copied().unwrap_or(0) > 1 {
             warnings.push(json!({
@@ -2017,6 +2139,7 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
             "name": class_name,
             "span": class_span,
             "blockers": class_blockers,
+            "warnings": class_warnings,
         },
         "target_kind": target_kind,
         "imports": source_imports(&source),
@@ -2254,19 +2377,27 @@ fn class_header_insert_edit(
     target_kind: &str,
     type_ref: &str,
 ) -> Result<bbox_refactor::TextEdit, String> {
-    let needle = format!("class {class_name}");
-    let class_at = source
-        .find(&needle)
-        .ok_or_else(|| format!("class `{class_name}` not found in source text"))?;
+    let (type_keyword, class_at) = [
+        ("class", format!("class {class_name}")),
+        ("record", format!("record {class_name}")),
+    ]
+    .into_iter()
+    .find_map(|(keyword, needle)| source.find(&needle).map(|at| (keyword, at)))
+    .ok_or_else(|| format!("class or record `{class_name}` not found in source text"))?;
     let brace_rel = source[class_at..]
         .find('{')
-        .ok_or_else(|| format!("class `{class_name}` has no body"))?;
+        .ok_or_else(|| format!("{type_keyword} `{class_name}` has no body"))?;
     let brace_at = class_at + brace_rel;
     let insert_at = source[..brace_at]
         .trim_end_matches(char::is_whitespace)
         .len();
     let header = &source[class_at..brace_at];
     if target_kind == "abstract_class" {
+        if type_keyword != "class" {
+            return Err(format!(
+                "abstract_class pull-up requires a class source, got {type_keyword}"
+            ));
+        }
         if header.contains(" extends ") {
             return Err(
                 "abstract_class pull-up refuses classes that already extend another type"
@@ -2288,6 +2419,15 @@ fn class_header_insert_edit(
             })
         }
     } else if header.contains(" implements ") {
+        if header
+            .split(" implements ")
+            .nth(1)
+            .is_some_and(|interfaces| interfaces.split(',').any(|it| it.trim() == type_ref))
+        {
+            return Err(format!(
+                "{type_keyword} `{class_name}` already implements `{type_ref}`"
+            ));
+        }
         Ok(bbox_refactor::TextEdit {
             byte_start: insert_at,
             byte_end: insert_at,
@@ -2426,6 +2566,33 @@ impl Tool for JavaExtractInterface {
             if let Err(e) = validate_java_identifier(&params.type_name, "typeName") {
                 return err(format!("java.extractInterface: {e}"));
             }
+            let comment_policy = params.comment_policy.as_deref().unwrap_or("copy");
+            if !matches!(comment_policy, "copy" | "omit") {
+                return err(format!(
+                    "java.extractInterface: commentPolicy must be copy or omit, got `{comment_policy}`"
+                ));
+            }
+            let annotation_policy = params.annotation_policy.as_deref().unwrap_or("safe");
+            if !matches!(annotation_policy, "safe" | "copy" | "omit") {
+                return err(format!(
+                    "java.extractInterface: annotationPolicy must be safe, copy, or omit, got `{annotation_policy}`"
+                ));
+            }
+            if let Some(target_package) = params.target_package.as_deref()
+                && let Err(e) = validate_java_package_name(target_package, "targetPackage")
+            {
+                return err(format!("java.extractInterface: {e}"));
+            }
+            let target_path = match resolve_workspace_file(&root, &params.target, "java.extractInterface") {
+                Ok(path) => path,
+                Err(e) => return err(e),
+            };
+            if target_path.exists() {
+                return err(format!(
+                    "java.extractInterface: target already exists: {}",
+                    params.target
+                ));
+            }
             let target_kind = params.target_kind.clone().unwrap_or_else(|| "interface".to_string());
             let preview_params = JavaPullUpPreviewParams {
                 file: params.file.clone(),
@@ -2443,6 +2610,23 @@ impl Tool for JavaExtractInterface {
                 .filter(|candidate| selected_refs.contains(&candidate.ref_id))
                 .cloned()
                 .collect();
+            let class_blockers = preview["class"]["blockers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if !class_blockers.is_empty() {
+                return ToolResult::Json(json!({
+                    "title": format!("extract {target_kind} `{}` from `{}`", params.type_name, preview["class"]["name"].as_str().unwrap_or("source")),
+                    "changes": [],
+                    "creates": [],
+                    "findings": class_blockers.into_iter().map(|blocker| json!({
+                        "finding": "class_blocker",
+                        "blocker": blocker,
+                    })).collect::<Vec<_>>(),
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
             if selected.len() != selected_refs.len() {
                 let found: BTreeSet<&str> = selected.iter().map(|c| c.ref_id.as_str()).collect();
                 let missing: Vec<&str> = selected_refs
@@ -2570,8 +2754,8 @@ impl Tool for JavaExtractInterface {
                 &target_kind,
                 params.target_package.as_deref(),
                 &selected,
-                params.comment_policy.as_deref().unwrap_or("copy"),
-                params.annotation_policy.as_deref().unwrap_or("safe"),
+                comment_policy,
+                annotation_policy,
             );
             let preview_only = params.preview_only.unwrap_or(false);
             let changes = if preview_only || new_source == source {
@@ -5356,6 +5540,182 @@ public class OrderService<T extends Number> {
                 .iter()
                 .any(|finding| finding["blocker"]["kind"] == "static_method"),
             "{result}"
+        );
+    }
+
+    const PRIVATE_SIGNATURE_TYPE_FIXTURE: &str = r#"package com.acme.impl;
+
+class InternalRequest {
+    final String id;
+    InternalRequest(String id) { this.id = id; }
+}
+
+public class OrderService {
+    public String find(InternalRequest request) { return request.id; }
+}
+"#;
+
+    #[tokio::test]
+    async fn pull_up_blocks_non_public_local_signature_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/impl")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderService.java"),
+            PRIVATE_SIGNATURE_TYPE_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPullUpPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "className": "OrderService"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let find = preview["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["name"] == "find")
+            .unwrap();
+        assert!(
+            find["blockers"].as_array().unwrap().iter().any(|blocker| {
+                blocker["kind"] == "non_public_signature_type" && blocker["position"] == "parameter"
+            }),
+            "{find}"
+        );
+
+        let result = json_of(
+            JavaExtractInterface
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "target": "src/com/acme/api/OrderApi.java",
+                        "typeName": "OrderApi",
+                        "className": "OrderService",
+                        "targetPackage": "com.acme.api",
+                        "memberRefs": [candidate_ref(&preview, "find")]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(result["blocked"], true, "{result}");
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["blocker"]["kind"] == "non_public_signature_type"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_interface_rejects_unknown_option_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/impl")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderService.java"),
+            PULLUP_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = JavaExtractInterface
+            .call(
+                json!({
+                    "file": "src/com/acme/impl/OrderService.java",
+                    "target": "src/com/acme/api/OrderApi.java",
+                    "typeName": "OrderApi",
+                    "className": "OrderService",
+                    "memberRefs": ["method:find:1-2:deadbeefdead"],
+                    "annotationPolicy": "maybe"
+                }),
+                &cx,
+            )
+            .await;
+
+        match result {
+            ToolResult::Error(e) => assert!(e.contains("annotationPolicy must be"), "{e}"),
+            other => panic!("expected option validation refusal, got {other:?}"),
+        }
+    }
+
+    const RECORD_PULLUP_FIXTURE: &str = r#"package com.acme.impl;
+
+public record OrderRecord<T extends Number>(T id) {
+    /** Label for display. */
+    public String label() { return String.valueOf(id); }
+}
+"#;
+
+    #[tokio::test]
+    async fn extract_interface_can_update_record_implements_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/impl")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderRecord.java"),
+            RECORD_PULLUP_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPullUpPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderRecord.java",
+                        "className": "OrderRecord"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(
+            preview["class"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["kind"] == "record_interface_review"),
+            "{preview}"
+        );
+
+        let result = json_of(
+            JavaExtractInterface
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderRecord.java",
+                        "target": "src/com/acme/api/OrderApi.java",
+                        "typeName": "OrderApi",
+                        "className": "OrderRecord",
+                        "targetPackage": "com.acme.api",
+                        "memberRefs": [candidate_ref(&preview, "label")]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let source = first_replacement(&result);
+        assert!(
+            source.contains("record OrderRecord<T extends Number>(T id) implements OrderApi"),
+            "{source}"
+        );
+        let target = result["creates"][0]["content"].as_str().unwrap();
+        assert!(
+            target.contains("public interface OrderApi")
+                && target.contains("/** Label for display. */")
+                && target.contains("String label();"),
+            "{target}"
         );
     }
 
