@@ -10625,7 +10625,16 @@ impl Tool for JavaExtractColumnSpec {
             // Derive class names.
             let target_stem = std::path::Path::new(&params.target)
                 .file_stem().and_then(|s| s.to_str()).unwrap_or("ColumnSpec");
-            let spec_class = params.spec_name.clone().unwrap_or_else(|| format!("{target_stem}"));
+            let spec_class = params
+                .spec_name
+                .clone()
+                .or_else(|| {
+                    params
+                        .class_name
+                        .as_ref()
+                        .map(|class_name| format!("{class_name}ColumnSpec"))
+                })
+                .unwrap_or_else(|| target_stem.to_string());
             let pkg = source.lines()
                 .find(|l| l.starts_with("package "))
                 .map(|l| l.trim_start_matches("package ").trim_end_matches(';').to_string())
