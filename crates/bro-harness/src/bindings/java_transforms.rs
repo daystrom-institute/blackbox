@@ -1595,6 +1595,8 @@ struct PullUpCandidate {
     ref_id: String,
     name: String,
     visibility: Option<String>,
+    member_byte_start: usize,
+    trivia_byte_start: usize,
     signature_byte_start: usize,
     signature_text: String,
     trivia: String,
@@ -2108,6 +2110,12 @@ fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<V
             "throws": sig.throws,
             "throws_text": sig.throws_text,
             "comment_trivia": member_leading_trivia(&source, &item.item),
+            "comment_trivia_span": {
+                "file": params.file,
+                "byte_start": item.item.leading_trivia_start,
+                "byte_end": item.item.byte_start,
+                "content_sha256": items.content_sha256,
+            },
             "span": {
                 "file": params.file,
                 "byte_start": sig.byte_start,
@@ -2330,7 +2338,7 @@ fn render_target_type(
             "public abstract class {type_name}{type_decl_suffix} {{\n"
         ));
         for candidate in candidates {
-            if comment_policy == "copy" && !candidate.trivia.trim().is_empty() {
+            if matches!(comment_policy, "copy" | "move") && !candidate.trivia.trim().is_empty() {
                 for line in candidate.trivia.trim_matches('\n').lines() {
                     if line.trim().is_empty() {
                         continue;
@@ -2349,7 +2357,7 @@ fn render_target_type(
             "public interface {type_name}{type_decl_suffix} {{\n"
         ));
         for candidate in candidates {
-            if comment_policy == "copy" && !candidate.trivia.trim().is_empty() {
+            if matches!(comment_policy, "copy" | "move") && !candidate.trivia.trim().is_empty() {
                 for line in candidate.trivia.trim_matches('\n').lines() {
                     if line.trim().is_empty() {
                         continue;
@@ -2476,6 +2484,30 @@ fn visibility_edit_for(
     })
 }
 
+fn moved_comment_edit_for(
+    source: &str,
+    trivia_byte_start: usize,
+    member_byte_start: usize,
+) -> Option<bbox_refactor::TextEdit> {
+    if trivia_byte_start >= member_byte_start || member_byte_start > source.len() {
+        return None;
+    }
+    let trivia = source.get(trivia_byte_start..member_byte_start)?;
+    if !(trivia.contains("//") || trivia.contains("/*")) {
+        return None;
+    }
+    let replacement = trivia
+        .rsplit_once('\n')
+        .map(|(_, indent)| indent)
+        .unwrap_or_default()
+        .to_string();
+    Some(bbox_refactor::TextEdit {
+        byte_start: trivia_byte_start,
+        byte_end: member_byte_start,
+        replacement,
+    })
+}
+
 fn pullup_candidates_from_preview(value: &Value) -> Vec<PullUpCandidate> {
     value["candidates"]
         .as_array()
@@ -2493,11 +2525,16 @@ fn pullup_candidates_from_preview(value: &Value) -> Vec<PullUpCandidate> {
                 .as_str()
                 .filter(|visibility| *visibility != "package")
                 .map(str::to_string);
+            let member_byte_start = candidate["span"]["byte_start"].as_u64()? as usize;
+            let trivia_byte_start =
+                candidate["comment_trivia_span"]["byte_start"].as_u64()? as usize;
             let signature_byte_start = candidate["signature_span"]["byte_start"].as_u64()? as usize;
             Some(PullUpCandidate {
                 ref_id,
                 name,
                 visibility,
+                member_byte_start,
+                trivia_byte_start,
                 signature_byte_start,
                 signature_text,
                 trivia,
@@ -2532,7 +2569,7 @@ impl Tool for JavaExtractInterface {
                 "className": { "type": "string" },
                 "targetKind": { "type": "string", "enum": ["interface", "abstract_class"] },
                 "memberRefs": { "type": "array", "items": { "type": "string" }, "description": "Refs returned by java.pullUpPreview, not graph IDs." },
-                "commentPolicy": { "type": "string", "enum": ["copy", "omit"] },
+                "commentPolicy": { "type": "string", "enum": ["copy", "move", "omit"] },
                 "annotationPolicy": { "type": "string", "enum": ["safe", "copy", "omit"] },
                 "targetPackage": { "type": "string" },
                 "previewOnly": { "type": "boolean" }
@@ -2567,9 +2604,9 @@ impl Tool for JavaExtractInterface {
                 return err(format!("java.extractInterface: {e}"));
             }
             let comment_policy = params.comment_policy.as_deref().unwrap_or("copy");
-            if !matches!(comment_policy, "copy" | "omit") {
+            if !matches!(comment_policy, "copy" | "move" | "omit") {
                 return err(format!(
-                    "java.extractInterface: commentPolicy must be copy or omit, got `{comment_policy}`"
+                    "java.extractInterface: commentPolicy must be copy, move, or omit, got `{comment_policy}`"
                 ));
             }
             let annotation_policy = params.annotation_policy.as_deref().unwrap_or("safe");
@@ -2733,6 +2770,15 @@ impl Tool for JavaExtractInterface {
                 }
             }
             for candidate in &selected {
+                if comment_policy == "move"
+                    && let Some(edit) = moved_comment_edit_for(
+                        &source,
+                        candidate.trivia_byte_start,
+                        candidate.member_byte_start,
+                    )
+                {
+                    edits.push(edit);
+                }
                 if let Some(edit) = visibility_edit_for(
                     &source,
                     candidate.signature_byte_start,
@@ -3102,7 +3148,7 @@ PARAMS
   className?: string
   targetKind?: "interface" | "abstract_class"
   memberRefs: string[]      refs returned by java.pullUpPreview
-  commentPolicy?: "copy" | "omit"       default copy
+  commentPolicy?: "copy" | "move" | "omit"       default copy
   annotationPolicy?: "safe" | "copy" | "omit"  default safe
   targetPackage?: string
   previewOnly?: boolean
@@ -4741,7 +4787,7 @@ type JavaExtractMethodResult = { title: string; changes: SpanChange[]; findings:
 type JavaDelete = { path: string; content_sha256: string };
 type JavaMoveResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: JavaDelete[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes?: number }[]; would_delete_files: { path: string }[]; provenance: "syntax_only" };
 type JavaRenameResult = { title: string; changes: SpanChange[]; creates: []; deletes: []; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; file_rename_advisory: { from: string; to: string }[]; provenance: "syntax_only" };
-type JavaPullUpCandidate = { ref: string; kind: string; name: string; signature_hash: string; signature: string; visibility: string; modifiers: string[]; annotations: string[]; params: Array<{ name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean }>; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; comment_trivia: string; span: Span; signature_span: Span; blockers: unknown[]; warnings: unknown[]; default_options: Record<string, string> };
+type JavaPullUpCandidate = { ref: string; kind: string; name: string; signature_hash: string; signature: string; visibility: string; modifiers: string[]; annotations: string[]; params: Array<{ name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean }>; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; comment_trivia: string; comment_trivia_span: Span; span: Span; signature_span: Span; blockers: unknown[]; warnings: unknown[]; default_options: Record<string, string> };
 type JavaPullUpPreview = { file: string; language: "java"; content_sha256: string; source_len: number; class: { name: string; span?: Span; blockers: unknown[] }; target_kind: "interface" | "abstract_class"; imports: string[]; candidates: JavaPullUpCandidate[]; ref_model: string; provenance: "syntax_only" };
 type JavaExtractInterfaceResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: []; findings: unknown[]; selected_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
@@ -4765,7 +4811,7 @@ declare const java: {
   /** Rich preview for pull-up/extract-interface. Refs are preview-local signature hashes, not graph IDs. */
   pullUpPreview(args: { file: string; className?: string; targetKind?: "interface" | "abstract_class" }): Promise<JavaPullUpPreview>;
   /** Consume java.pullUpPreview refs and create an interface or abstract class plus source-side implements/extends and visibility edits. */
-  extractInterface(args: { file: string; target: string; typeName: string; className?: string; targetKind?: "interface" | "abstract_class"; memberRefs: string[]; commentPolicy?: "copy" | "omit"; annotationPolicy?: "safe" | "copy" | "omit"; targetPackage?: string; previewOnly?: boolean }): Promise<JavaExtractInterfaceResult>;
+  extractInterface(args: { file: string; target: string; typeName: string; className?: string; targetKind?: "interface" | "abstract_class"; memberRefs: string[]; commentPolicy?: "copy" | "move" | "omit"; annotationPolicy?: "safe" | "copy" | "omit"; targetPackage?: string; previewOnly?: boolean }): Promise<JavaExtractInterfaceResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -5453,6 +5499,60 @@ public class OrderService<T extends Number> {
                 && source.contains("class OrderService<T extends Number> implements OrderApi<T>")
                 && source.contains("public String find(String id) throws IOException"),
             "{source}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_interface_can_move_attached_comments_to_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/impl")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderService.java"),
+            PULLUP_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPullUpPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "className": "OrderService"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let result = json_of(
+            JavaExtractInterface
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "target": "src/com/acme/api/OrderApi.java",
+                        "typeName": "OrderApi",
+                        "className": "OrderService",
+                        "targetPackage": "com.acme.api",
+                        "memberRefs": [candidate_ref(&preview, "find")],
+                        "commentPolicy": "move"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let source = first_replacement(&result);
+        assert!(
+            !source.contains("Finds a single order")
+                && source.contains("public String find(String id) throws IOException"),
+            "{source}"
+        );
+        let target = result["creates"][0]["content"].as_str().unwrap();
+        assert!(
+            target.contains("/** Finds a single order. */")
+                && target.contains("String find(String id) throws IOException;"),
+            "{target}"
         );
     }
 
