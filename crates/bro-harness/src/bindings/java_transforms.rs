@@ -3843,6 +3843,926 @@ impl Tool for JavaChangeSignature {
     }
 }
 
+/// `java.encapsulateFieldPreview` - preview Java field encapsulation.
+pub struct JavaEncapsulateFieldPreview;
+
+/// `java.encapsulateField` - apply a previewed Java field encapsulation.
+pub struct JavaEncapsulateField;
+
+#[derive(Deserialize)]
+struct JavaEncapsulateFieldPreviewParams {
+    file: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(rename = "fieldName", alias = "field_name")]
+    field_name: String,
+    #[serde(default, rename = "getterName", alias = "getter_name")]
+    getter_name: Option<String>,
+    #[serde(default, rename = "setterName", alias = "setter_name")]
+    setter_name: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct JavaEncapsulateFieldParams {
+    file: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(rename = "fieldName", alias = "field_name")]
+    field_name: String,
+    #[serde(rename = "fieldRef", alias = "field_ref")]
+    field_ref: String,
+    #[serde(default, rename = "getterName", alias = "getter_name")]
+    getter_name: Option<String>,
+    #[serde(default, rename = "setterName", alias = "setter_name")]
+    setter_name: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    #[serde(default, rename = "rewriteReferences", alias = "rewrite_references")]
+    rewrite_references: Option<String>,
+    #[serde(
+        default,
+        rename = "acknowledgeSyntaxOnlyReferences",
+        alias = "acknowledge_syntax_only_references"
+    )]
+    acknowledge_syntax_only_references: Option<bool>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Clone)]
+struct EncapsulateFieldInfo {
+    ref_id: String,
+    name: String,
+    type_text: String,
+    owner_class: String,
+    visibility: Option<String>,
+    modifiers: Vec<String>,
+    annotations: Vec<String>,
+    is_final: bool,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+#[derive(Clone)]
+struct EncapsulateFieldSite {
+    file: String,
+    byte_start: usize,
+    byte_end: usize,
+    kind: String,
+    text: String,
+    replacement: Option<String>,
+    blocker: Option<Value>,
+}
+
+fn java_property_suffix(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    out.extend(first.to_uppercase());
+    out.push_str(chars.as_str());
+    out
+}
+
+fn default_getter_name(field_name: &str, type_text: &str) -> String {
+    let suffix = java_property_suffix(field_name);
+    if matches!(type_text.trim(), "boolean" | "Boolean") {
+        format!("is{suffix}")
+    } else {
+        format!("get{suffix}")
+    }
+}
+
+fn default_setter_name(field_name: &str) -> String {
+    format!("set{}", java_property_suffix(field_name))
+}
+
+fn java_field_ref(field: &bbox_refactor::facts::JavaFieldFact, declaration_text: &str) -> String {
+    format!(
+        "field:{}:{}-{}:{}",
+        field.name,
+        field.byte_start,
+        field.byte_end,
+        signature_digest(declaration_text)
+    )
+}
+
+fn field_private_edit(
+    source: &str,
+    field: &EncapsulateFieldInfo,
+) -> Option<bbox_refactor::TextEdit> {
+    if field.visibility.as_deref() == Some("private") {
+        return None;
+    }
+    let declaration = source.get(field.byte_start..field.byte_end)?;
+    for vis in ["public", "protected"] {
+        if let Some(pos) = declaration.find(vis) {
+            let before_ok = declaration[..pos]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+            let after = pos + vis.len();
+            let after_ok = declaration[after..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+            if before_ok && after_ok {
+                let abs = field.byte_start + pos;
+                return Some(bbox_refactor::TextEdit {
+                    byte_start: abs,
+                    byte_end: abs + vis.len(),
+                    replacement: "private".to_string(),
+                });
+            }
+        }
+    }
+    let mut insert_at = field.byte_start;
+    let mut offset = field.byte_start;
+    for line in declaration.split_inclusive('\n') {
+        if line.trim_start().starts_with('@') {
+            offset += line.len();
+            insert_at = offset;
+        } else {
+            break;
+        }
+    }
+    Some(bbox_refactor::TextEdit {
+        byte_start: insert_at,
+        byte_end: insert_at,
+        replacement: "private ".to_string(),
+    })
+}
+
+fn render_field_accessors(
+    field: &EncapsulateFieldInfo,
+    getter_name: &str,
+    setter_name: Option<&str>,
+) -> String {
+    let static_kw = if field.modifiers.iter().any(|m| m == "static") {
+        " static"
+    } else {
+        ""
+    };
+    let mut out = format!(
+        "\n    public{static_kw} {} {}() {{\n        return {};\n    }}\n",
+        field.type_text, getter_name, field.name
+    );
+    if let Some(setter_name) = setter_name {
+        out.push_str(&format!(
+            "\n    public{static_kw} void {setter_name}({} {}) {{\n        this.{} = {};\n    }}\n",
+            field.type_text, field.name, field.name, field.name
+        ));
+    }
+    out
+}
+
+fn statement_end_after(source: &str, start: usize) -> Option<usize> {
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escaped = false;
+    for (rel, ch) in source[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string || in_char {
+            match ch {
+                '\\' => escaped = true,
+                '"' if in_string => in_string = false,
+                '\'' if in_char => in_char = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '\'' => in_char = true,
+            ';' => return Some(start + rel + 1),
+            '\n' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn line_snippet(source: &str, start: usize, end: usize) -> String {
+    let line_start = source[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let line_end = source[end..]
+        .find('\n')
+        .map(|idx| end + idx)
+        .unwrap_or(source.len());
+    source[line_start..line_end].trim().to_string()
+}
+
+fn field_site_rewrite(
+    source: &str,
+    pos: usize,
+    field: &EncapsulateFieldInfo,
+    getter_name: &str,
+    setter_name: Option<&str>,
+    allow_bare: bool,
+) -> Option<EncapsulateFieldSite> {
+    let name_end = pos + field.name.len();
+    let before = source[..pos].chars().next_back();
+    let after = source[name_end..].chars().next();
+    let boundary_before =
+        before.is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+    let boundary_after = after.is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+    if !boundary_before || !boundary_after {
+        return None;
+    }
+    if after == Some('(') {
+        return None;
+    }
+
+    let this_prefix_start = pos.checked_sub("this.".len()).filter(|start| {
+        source
+            .get(*start..pos)
+            .is_some_and(|prefix| prefix == "this.")
+    });
+    let selector_read = before == Some('.');
+    let bare = !selector_read;
+    if bare && !allow_bare {
+        return None;
+    }
+
+    let mut cursor = name_end;
+    while source
+        .as_bytes()
+        .get(cursor)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        cursor += 1;
+    }
+    let next_two = source
+        .get(cursor..cursor.saturating_add(2))
+        .unwrap_or_default();
+    if matches!(next_two, "++" | "--" | "+=" | "-=" | "*=" | "/=" | "%=") {
+        return Some(EncapsulateFieldSite {
+            file: String::new(),
+            byte_start: pos,
+            byte_end: name_end,
+            kind: "compound_write".to_string(),
+            text: line_snippet(source, pos, name_end),
+            replacement: None,
+            blocker: Some(json!({
+                "finding": "unsupported_field_write",
+                "severity": "blocker",
+                "detail": "compound assignments and increments need semantic-preserving rewrite support",
+            })),
+        });
+    }
+    let is_assignment = source.as_bytes().get(cursor) == Some(&b'=')
+        && !matches!(source.as_bytes().get(cursor + 1), Some(b'='));
+    if is_assignment {
+        let Some(setter_name) = setter_name else {
+            return Some(EncapsulateFieldSite {
+                file: String::new(),
+                byte_start: pos,
+                byte_end: name_end,
+                kind: "write".to_string(),
+                text: line_snippet(source, pos, name_end),
+                replacement: None,
+                blocker: Some(json!({
+                    "finding": "final_field_write",
+                    "severity": "blocker",
+                    "detail": "selected field is final/read-only, so writes cannot be rewritten through a setter",
+                })),
+            });
+        };
+        let Some(stmt_end) = statement_end_after(source, cursor) else {
+            return Some(EncapsulateFieldSite {
+                file: String::new(),
+                byte_start: pos,
+                byte_end: name_end,
+                kind: "write".to_string(),
+                text: line_snippet(source, pos, name_end),
+                replacement: None,
+                blocker: Some(json!({
+                    "finding": "unsupported_field_write",
+                    "severity": "blocker",
+                    "detail": "assignment statement boundary was not found",
+                })),
+            });
+        };
+        let rhs = source[cursor + 1..stmt_end - 1].trim();
+        let (replace_start, call_prefix) = if let Some(start) = this_prefix_start {
+            (start, "this.")
+        } else if bare {
+            (pos, "")
+        } else {
+            return Some(EncapsulateFieldSite {
+                file: String::new(),
+                byte_start: pos,
+                byte_end: name_end,
+                kind: "write".to_string(),
+                text: line_snippet(source, pos, name_end),
+                replacement: None,
+                blocker: Some(json!({
+                    "finding": "receiver_write_needs_jdtls",
+                    "severity": "blocker",
+                    "detail": "syntax-only rewrite cannot safely replace writes through an arbitrary receiver; use JDTLS-backed receiver resolution",
+                })),
+            });
+        };
+        return Some(EncapsulateFieldSite {
+            file: String::new(),
+            byte_start: replace_start,
+            byte_end: stmt_end,
+            kind: "write".to_string(),
+            text: line_snippet(source, replace_start, stmt_end),
+            replacement: Some(format!("{call_prefix}{setter_name}({rhs});")),
+            blocker: None,
+        });
+    }
+
+    if bare {
+        Some(EncapsulateFieldSite {
+            file: String::new(),
+            byte_start: pos,
+            byte_end: name_end,
+            kind: "read".to_string(),
+            text: line_snippet(source, pos, name_end),
+            replacement: Some(format!("{getter_name}()")),
+            blocker: None,
+        })
+    } else {
+        Some(EncapsulateFieldSite {
+            file: String::new(),
+            byte_start: pos,
+            byte_end: name_end,
+            kind: "read".to_string(),
+            text: line_snippet(source, pos, name_end),
+            replacement: Some(format!("{getter_name}()")),
+            blocker: None,
+        })
+    }
+}
+
+fn discover_encapsulate_field_sites(
+    root: &Path,
+    source_file: &str,
+    field: &EncapsulateFieldInfo,
+    getter_name: &str,
+    setter_name: Option<&str>,
+    files: Option<&[String]>,
+) -> Result<(Vec<EncapsulateFieldSite>, Vec<Value>), String> {
+    let file_list = if let Some(files) = files {
+        files.to_vec()
+    } else {
+        vec![source_file.to_string()]
+    };
+    let mut sites = Vec::new();
+    let mut findings = Vec::new();
+    for rel in file_list {
+        let path = resolve_workspace_file(root, &rel, "java.encapsulateFieldPreview")?;
+        let source = std::fs::read_to_string(&path)
+            .map_err(|e| format!("java.encapsulateFieldPreview: read {rel}: {e}"))?;
+        let allow_bare = rel == source_file;
+        let mut search = 0usize;
+        while let Some(found) = source[search..].find(&field.name) {
+            let pos = search + found;
+            let name_end = pos + field.name.len();
+            search = name_end;
+            if rel == source_file && pos >= field.byte_start && name_end <= field.byte_end {
+                continue;
+            }
+            let Some(mut site) =
+                field_site_rewrite(&source, pos, field, getter_name, setter_name, allow_bare)
+            else {
+                continue;
+            };
+            if site.kind == "write" {
+                search = site.byte_end;
+            }
+            site.file = rel.clone();
+            sites.push(site);
+        }
+    }
+    if !sites.is_empty() {
+        findings.push(json!({
+            "finding": "syntax_only_field_references",
+            "severity": "review",
+            "count": sites.len(),
+            "detail": "field references are matched syntactically; bare same-file names may be shadowed by locals or parameters",
+        }));
+    }
+    if sites.iter().any(|site| {
+        site.blocker
+            .as_ref()
+            .is_some_and(|b| b["finding"] == "receiver_write_needs_jdtls")
+    }) {
+        findings.push(json!({
+            "finding": "jdtls_recommended",
+            "severity": "review",
+            "detail": "arbitrary receiver writes are the first place to deepen this transform with JDTLS receiver/type resolution",
+        }));
+    }
+    Ok((sites, findings))
+}
+
+fn find_encapsulate_field(
+    root: &Path,
+    params: &JavaEncapsulateFieldPreviewParams,
+) -> Result<
+    (
+        PathBuf,
+        String,
+        bbox_refactor::facts::FileItemsFacts,
+        Option<EncapsulateFieldInfo>,
+        Vec<Value>,
+    ),
+    String,
+> {
+    let path = resolve_workspace_file(root, &params.file, "java.encapsulateFieldPreview")?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("java.encapsulateFieldPreview: read {}: {e}", params.file))?;
+    let items = bbox_refactor::facts::file_items(&path).map_err(|e| {
+        format!(
+            "java.encapsulateFieldPreview: inventory {}: {e:#}",
+            params.file
+        )
+    })?;
+    let class_name = params.class_name.clone().unwrap_or_else(|| {
+        Path::new(&params.file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string()
+    });
+    let fields = bbox_refactor::facts::java_fields(&path, Some(&class_name)).map_err(|e| {
+        format!(
+            "java.encapsulateFieldPreview: field inventory {}: {e:#}",
+            params.file
+        )
+    })?;
+    let matches = fields
+        .fields
+        .iter()
+        .filter(|field| field.name == params.field_name)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut findings = Vec::new();
+    if matches.is_empty() {
+        findings.push(json!({
+            "finding": "field_not_found",
+            "severity": "blocker",
+            "field": params.field_name,
+            "class": class_name,
+        }));
+        return Ok((path, source, items, None, findings));
+    }
+    if matches.len() > 1 {
+        findings.push(json!({
+            "finding": "ambiguous_field",
+            "severity": "blocker",
+            "field": params.field_name,
+            "count": matches.len(),
+        }));
+    }
+    let field = matches.into_iter().next().unwrap();
+    let declaration_text = source
+        .get(field.byte_start..field.byte_end)
+        .unwrap_or_default()
+        .to_string();
+    let declarators_in_same_decl = fields
+        .fields
+        .iter()
+        .filter(|other| other.byte_start == field.byte_start && other.byte_end == field.byte_end)
+        .count();
+    if declarators_in_same_decl > 1 {
+        findings.push(json!({
+            "finding": "multi_declarator_field",
+            "severity": "blocker",
+            "detail": "split `int a, b;` style declarations before encapsulating one field",
+        }));
+    }
+    if field.is_static {
+        findings.push(json!({
+            "finding": "static_field_review",
+            "severity": "review",
+            "detail": "static accessors are generated, but receiver-aware reference rewrites remain syntax-only",
+        }));
+    }
+    Ok((
+        path,
+        source,
+        items,
+        Some(EncapsulateFieldInfo {
+            ref_id: java_field_ref(&field, &declaration_text),
+            name: field.name,
+            type_text: field.type_text,
+            owner_class: field.owner_class.unwrap_or(class_name),
+            visibility: field.visibility,
+            modifiers: field.modifiers,
+            annotations: field.annotations,
+            is_final: field.is_final,
+            byte_start: field.byte_start,
+            byte_end: field.byte_end,
+        }),
+        findings,
+    ))
+}
+
+fn encapsulate_field_preview_value(
+    root: &Path,
+    params: &JavaEncapsulateFieldPreviewParams,
+) -> Result<Value, String> {
+    let (_path, _source, items, field, mut findings) = find_encapsulate_field(root, params)?;
+    let Some(field) = field else {
+        return Ok(json!({
+            "file": params.file,
+            "field_name": params.field_name,
+            "field_ref": null,
+            "references": [],
+            "findings": findings,
+            "blocked": true,
+            "ref_model": "preview-local refs derived from field declaration byte range and hash; not graph IDs",
+            "provenance": "syntax_only",
+        }));
+    };
+    let getter_name = params
+        .getter_name
+        .clone()
+        .unwrap_or_else(|| default_getter_name(&field.name, &field.type_text));
+    let setter_name = if field.is_final {
+        None
+    } else {
+        Some(
+            params
+                .setter_name
+                .clone()
+                .unwrap_or_else(|| default_setter_name(&field.name)),
+        )
+    };
+    for (label, name) in [("getterName", getter_name.as_str())]
+        .into_iter()
+        .chain(setter_name.as_deref().map(|name| ("setterName", name)))
+    {
+        if let Err(e) = validate_java_identifier(name, label) {
+            findings.push(json!({
+                "finding": "invalid_accessor_name",
+                "severity": "blocker",
+                "detail": e,
+            }));
+        }
+    }
+    for item in &items.items {
+        if item.item.kind != "method_declaration" {
+            continue;
+        }
+        if item.item.name.as_deref() == Some(getter_name.as_str())
+            || setter_name
+                .as_deref()
+                .is_some_and(|setter| item.item.name.as_deref() == Some(setter))
+        {
+            findings.push(json!({
+                "finding": "accessor_name_conflict",
+                "severity": "blocker",
+                "method": item.item.name,
+            }));
+        }
+    }
+    if !field.annotations.is_empty() {
+        findings.push(json!({
+            "finding": "field_annotations_stay_on_field",
+            "severity": "review",
+            "annotations": field.annotations,
+        }));
+    }
+    let (references, reference_findings) = discover_encapsulate_field_sites(
+        root,
+        &params.file,
+        &field,
+        &getter_name,
+        setter_name.as_deref(),
+        params.files.as_deref(),
+    )?;
+    findings.extend(reference_findings);
+    for site in &references {
+        if let Some(blocker) = site.blocker.clone() {
+            findings.push(blocker);
+        }
+    }
+    let blocked = findings
+        .iter()
+        .any(|finding| finding["severity"].as_str() == Some("blocker"));
+    Ok(json!({
+        "file": params.file,
+        "content_sha256": items.content_sha256,
+        "field_name": params.field_name,
+        "field_ref": field.ref_id,
+        "field": {
+            "name": field.name,
+            "type": field.type_text,
+            "owner_class": field.owner_class,
+            "visibility": field.visibility.clone().unwrap_or_else(|| "package".to_string()),
+            "modifiers": field.modifiers,
+            "annotations": field.annotations,
+            "is_final": field.is_final,
+        },
+        "accessors": {
+            "getter": getter_name,
+            "setter": setter_name,
+        },
+        "references": references.iter().map(|site| json!({
+            "file": site.file,
+            "byte_start": site.byte_start,
+            "byte_end": site.byte_end,
+            "kind": site.kind,
+            "text": site.text,
+            "replacement": site.replacement,
+            "blocked": site.blocker.is_some(),
+        })).collect::<Vec<_>>(),
+        "findings": findings,
+        "blocked": blocked,
+        "ref_model": "preview-local refs derived from field declaration byte range and hash; not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
+fn class_insert_before_closing_brace(
+    items: &bbox_refactor::facts::FileItemsFacts,
+    class_name: &str,
+) -> Option<usize> {
+    items
+        .items
+        .iter()
+        .find(|item| {
+            java_class_like_kind(&item.item.kind) && item.item.name.as_deref() == Some(class_name)
+        })
+        .map(|item| item.item.byte_end.saturating_sub(1))
+}
+
+#[async_trait]
+impl Tool for JavaEncapsulateFieldPreview {
+    fn name(&self) -> &str {
+        "java.encapsulateFieldPreview"
+    }
+    fn description(&self) -> &str {
+        "Preview Java field encapsulation: lightweight fieldRef, generated getter/setter names, field trivia/modifiers, and syntax-only direct reference rewrite sites. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "className": { "type": "string" },
+                "fieldName": { "type": "string" },
+                "getterName": { "type": "string" },
+                "setterName": { "type": "string" },
+                "files": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["file", "fieldName"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "encapsulateFieldPreview".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaEncapsulateFieldPreviewParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.encapsulateFieldPreview: bad input - expected {{ file, fieldName, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            match encapsulate_field_preview_value(&root, &params) {
+                Ok(v) => ToolResult::Json(v),
+                Err(e) => err(e),
+            }
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaEncapsulateField {
+    fn name(&self) -> &str {
+        "java.encapsulateField"
+    }
+    fn description(&self) -> &str {
+        "Apply java.encapsulateFieldPreview refs: make the field private, insert getter/setter accessors, and optionally rewrite acknowledged syntax-only direct references. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "className": { "type": "string" },
+                "fieldName": { "type": "string" },
+                "fieldRef": { "type": "string" },
+                "getterName": { "type": "string" },
+                "setterName": { "type": "string" },
+                "files": { "type": "array", "items": { "type": "string" } },
+                "rewriteReferences": { "type": "string", "enum": ["none", "same_file", "files"] },
+                "acknowledgeSyntaxOnlyReferences": { "type": "boolean" },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "fieldName", "fieldRef"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "encapsulateField".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaEncapsulateFieldParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.encapsulateField: bad input - expected {{ file, fieldName, fieldRef, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let preview_params = JavaEncapsulateFieldPreviewParams {
+                file: params.file.clone(),
+                class_name: params.class_name.clone(),
+                field_name: params.field_name.clone(),
+                getter_name: params.getter_name.clone(),
+                setter_name: params.setter_name.clone(),
+                files: params.files.clone(),
+            };
+            let preview = match encapsulate_field_preview_value(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.encapsulateFieldPreview", "java.encapsulateField")),
+            };
+            if preview["field_ref"].as_str() != Some(params.field_ref.as_str()) {
+                return err("java.encapsulateField: stale fieldRef; re-run java.encapsulateFieldPreview");
+            }
+            let blocked = preview["findings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|finding| finding["severity"].as_str() == Some("blocker"));
+            if blocked {
+                return ToolResult::Json(json!({
+                    "title": format!("encapsulate field `{}`", params.field_name),
+                    "changes": [],
+                    "findings": preview["findings"].clone(),
+                    "blocked": true,
+                    "preview_only": params.preview_only.unwrap_or(false),
+                    "would_change_files": [],
+                    "provenance": "syntax_only",
+                }));
+            }
+            let rewrite_references = params
+                .rewrite_references
+                .as_deref()
+                .unwrap_or("same_file");
+            if !matches!(rewrite_references, "none" | "same_file" | "files") {
+                return err(format!(
+                    "java.encapsulateField: rewriteReferences must be none, same_file, or files, got `{rewrite_references}`"
+                ));
+            }
+            let references = preview["references"].as_array().cloned().unwrap_or_default();
+            let rewriting_any = rewrite_references != "none"
+                && references.iter().any(|site| {
+                    rewrite_references == "files"
+                        || site["file"].as_str() == Some(params.file.as_str())
+                });
+            if rewriting_any && params.acknowledge_syntax_only_references != Some(true) {
+                let mut findings = preview["findings"].clone();
+                if let Some(items) = findings.as_array_mut() {
+                    items.push(json!({
+                        "finding": "acknowledgement_required",
+                        "severity": "blocker",
+                        "detail": "reference rewrites are syntax-only; pass acknowledgeSyntaxOnlyReferences:true or rewriteReferences:\"none\"",
+                    }));
+                }
+                return ToolResult::Json(json!({
+                    "title": format!("encapsulate field `{}`", params.field_name),
+                    "changes": [],
+                    "findings": findings,
+                    "blocked": true,
+                    "preview_only": params.preview_only.unwrap_or(false),
+                    "would_change_files": [],
+                    "provenance": "syntax_only",
+                }));
+            }
+
+            let (source_path, source, items, field, _) = match find_encapsulate_field(&root, &preview_params) {
+                Ok(found) => found,
+                Err(e) => return err(e.replace("java.encapsulateFieldPreview", "java.encapsulateField")),
+            };
+            let Some(field) = field else {
+                return err("java.encapsulateField: field disappeared; re-run preview");
+            };
+            let getter_name = preview["accessors"]["getter"].as_str().unwrap_or("getValue").to_string();
+            let setter_name = preview["accessors"]["setter"].as_str().map(str::to_string);
+            let insert_at = match class_insert_before_closing_brace(&items, &field.owner_class) {
+                Some(pos) => pos,
+                None => return err("java.encapsulateField: source class closing brace not found"),
+            };
+            let mut edits_by_file: BTreeMap<String, Vec<bbox_refactor::TextEdit>> = BTreeMap::new();
+            if let Some(edit) = field_private_edit(&source, &field) {
+                edits_by_file.entry(params.file.clone()).or_default().push(edit);
+            }
+            edits_by_file
+                .entry(params.file.clone())
+                .or_default()
+                .push(bbox_refactor::TextEdit {
+                    byte_start: insert_at,
+                    byte_end: insert_at,
+                    replacement: render_field_accessors(&field, &getter_name, setter_name.as_deref()),
+                });
+            if rewrite_references != "none" {
+                let (sites, _) = match discover_encapsulate_field_sites(
+                    &root,
+                    &params.file,
+                    &field,
+                    &getter_name,
+                    setter_name.as_deref(),
+                    params.files.as_deref(),
+                ) {
+                    Ok(found) => found,
+                    Err(e) => return err(e.replace("java.encapsulateFieldPreview", "java.encapsulateField")),
+                };
+                for site in sites {
+                    if rewrite_references == "same_file" && site.file != params.file {
+                        continue;
+                    }
+                    if let Some(replacement) = site.replacement {
+                        edits_by_file
+                            .entry(site.file)
+                            .or_default()
+                            .push(bbox_refactor::TextEdit {
+                                byte_start: site.byte_start,
+                                byte_end: site.byte_end,
+                                replacement,
+                            });
+                    }
+                }
+            }
+            let mut changes = Vec::new();
+            let mut would_change_files = Vec::new();
+            for (rel, mut edits) in edits_by_file {
+                edits.sort_by_key(|edit| edit.byte_start);
+                let path = if rel == params.file {
+                    source_path.clone()
+                } else {
+                    match resolve_workspace_file(&root, &rel, "java.encapsulateField") {
+                        Ok(path) => path,
+                        Err(e) => return err(e),
+                    }
+                };
+                let old = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => return err(format!("java.encapsulateField: read {rel}: {e}")),
+                };
+                let new_text = match bbox_refactor::apply_text_edits(&old, &edits) {
+                    Ok(text) => text,
+                    Err(e) => return err(format!("java.encapsulateField: edit synthesis failed for {rel}: {e:#}")),
+                };
+                if new_text != old {
+                    would_change_files.push(json!({
+                        "path": rel,
+                        "edit_count": edits.len(),
+                        "replacement_bytes": new_text.len(),
+                    }));
+                    if params.preview_only != Some(true) {
+                        changes.push(whole_file_change(&rel, &old, &new_text));
+                    }
+                }
+            }
+            ToolResult::Json(json!({
+                "title": format!("encapsulate field `{}`", params.field_name),
+                "changes": changes,
+                "findings": preview["findings"].clone(),
+                "selected_field_ref": params.field_ref,
+                "preview_only": params.preview_only.unwrap_or(false),
+                "would_change_files": would_change_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -4194,6 +5114,40 @@ RECIPE
     targetParams, acknowledgeSyntaxOnlyCallSites: true });
 "#;
 
+const ENCAPSULATE_FIELD_CONTRACT: &str = r#"java.encapsulateFieldPreview / java.encapsulateField - syntax-only Java field encapsulation.
+
+WHAT IT DOES
+  Preview inventories one field declaration, generates getter/setter names,
+  reports modifiers/annotations/visibility, and lists direct reference rewrite
+  sites. Apply re-runs preview, refuses stale fieldRef, makes the field private,
+  inserts accessors, and optionally rewrites direct references.
+
+REF MODEL
+  fieldRef is preview-local: field:<name>:<declaration-byte-range>:<hash>.
+  It is not a durable graph ID.
+
+IMPORTANT LIMITS
+  - reference rewrites are syntax_only and require acknowledgeSyntaxOnlyReferences:true.
+  - bare same-file names may be shadowed by locals or parameters.
+  - arbitrary receiver writes are blocked and should become a JDTLS-backed path.
+  - multi-declarator fields such as `int a, b;` are blocked until split.
+  - final fields get a getter only.
+
+PARAMS
+  file: string
+  className?: string
+  fieldName: string
+  getterName?: string
+  setterName?: string
+  files?: string[]       optional reference scan/apply file set
+  rewriteReferences?: "none" | "same_file" | "files"  default same_file
+
+RECIPE
+  const pv = await java.encapsulateFieldPreview({ file, className: "Order", fieldName: "count" });
+  const r = await java.encapsulateField({ file, className: "Order", fieldName: "count",
+    fieldRef: pv.field_ref, acknowledgeSyntaxOnlyReferences: true });
+"#;
+
 const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
 
 WHAT IT DOES
@@ -4290,6 +5244,9 @@ impl Tool for JavaDescribe {
             "changeSignaturePreview" | "changeSignature" => {
                 ToolResult::Json(json!({ "contract": CHANGE_SIGNATURE_CONTRACT }))
             }
+            "encapsulateFieldPreview" | "encapsulateField" => {
+                ToolResult::Json(json!({ "contract": ENCAPSULATE_FIELD_CONTRACT }))
+            }
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -4308,7 +5265,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -5799,6 +6756,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaExtractInterface) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignaturePreview) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignature) as Arc<dyn Tool>,
+        Arc::new(JavaEncapsulateFieldPreview) as Arc<dyn Tool>,
+        Arc::new(JavaEncapsulateField) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
@@ -5815,7 +6774,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -5829,6 +6788,8 @@ type JavaExtractInterfaceResult = { title: string; changes: SpanChange[]; create
 type JavaChangeParamSpec = { sourceName?: string; name: string; type?: string; defaultValue?: string };
 type JavaChangeSignaturePreview = { file: string; content_sha256?: string; method_name: string; method_ref?: string | null; old_signature?: string; old_params?: unknown[]; target_params: string[]; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaChangeSignatureResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
+type JavaEncapsulateFieldPreview = { file: string; content_sha256?: string; field_name: string; field_ref?: string | null; field?: unknown; accessors?: { getter: string; setter?: string | null }; references: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
+type JavaEncapsulateFieldResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_field_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -5855,6 +6816,10 @@ declare const java: {
   changeSignaturePreview(args: { file: string; className?: string; methodName: string; targetParams: JavaChangeParamSpec[]; files?: string[] }): Promise<JavaChangeSignaturePreview>;
   /** Apply a previewed method signature change. Same-name call-site rewrites require acknowledgeSyntaxOnlyCallSites:true. */
   changeSignature(args: { file: string; className?: string; methodName: string; methodRef: string; targetParams: JavaChangeParamSpec[]; files?: string[]; acknowledgeSyntaxOnlyCallSites?: boolean; previewOnly?: boolean }): Promise<JavaChangeSignatureResult>;
+  /** Preview Java field encapsulation. Refs are preview-local declaration hashes, not graph IDs. */
+  encapsulateFieldPreview(args: { file: string; className?: string; fieldName: string; getterName?: string; setterName?: string; files?: string[] }): Promise<JavaEncapsulateFieldPreview>;
+  /** Apply a previewed Java field encapsulation. Reference rewrites require acknowledgeSyntaxOnlyReferences:true. */
+  encapsulateField(args: { file: string; className?: string; fieldName: string; fieldRef: string; getterName?: string; setterName?: string; files?: string[]; rewriteReferences?: "none" | "same_file" | "files"; acknowledgeSyntaxOnlyReferences?: boolean; previewOnly?: boolean }): Promise<JavaEncapsulateFieldResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -6494,6 +7459,99 @@ public class Client {
         );
         let client = replacement_for_file(&result, "src/com/acme/Client.java");
         assert!(client.contains("service.find(7, \"a\", false)"), "{client}");
+    }
+
+    const ENCAPSULATE_FIELD_SERVICE: &str = r#"package com.acme;
+
+public class OrderService {
+    public int count;
+
+    public void bump() {
+        count = count + 1;
+    }
+
+    public int read() {
+        return this.count;
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn encapsulate_field_adds_accessors_and_rewrites_acknowledged_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            ENCAPSULATE_FIELD_SERVICE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaEncapsulateFieldPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "fieldName": "count"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview["blocked"], false, "{preview}");
+        assert!(
+            preview["field_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("field:count:"),
+            "{preview}"
+        );
+        assert_eq!(
+            preview["references"].as_array().unwrap().len(),
+            2,
+            "{preview}"
+        );
+
+        let refused = json_of(
+            JavaEncapsulateField
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "fieldName": "count",
+                        "fieldRef": preview["field_ref"].as_str().unwrap()
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(refused["blocked"], true, "{refused}");
+
+        let result = json_of(
+            JavaEncapsulateField
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "fieldName": "count",
+                        "fieldRef": preview["field_ref"].as_str().unwrap(),
+                        "acknowledgeSyntaxOnlyReferences": true
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = first_replacement(&result);
+        assert!(rewritten.contains("private int count;"), "{rewritten}");
+        assert!(rewritten.contains("public int getCount()"), "{rewritten}");
+        assert!(
+            rewritten.contains("public void setCount(int count)"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("setCount(count + 1);"), "{rewritten}");
+        assert!(rewritten.contains("return this.getCount();"), "{rewritten}");
     }
 
     const PULLUP_FIXTURE: &str = r#"package com.acme.impl;
