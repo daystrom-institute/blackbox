@@ -3003,6 +3003,846 @@ impl Tool for JavaExtractInterface {
     }
 }
 
+/// `java.changeSignaturePreview` - preview a Java method signature rewrite.
+pub struct JavaChangeSignaturePreview;
+
+/// `java.changeSignature` - apply a previewed Java method signature rewrite.
+pub struct JavaChangeSignature;
+
+#[derive(Clone, Deserialize)]
+struct JavaChangeParamSpec {
+    #[serde(default, rename = "sourceName", alias = "source_name", alias = "from")]
+    source_name: Option<String>,
+    name: String,
+    #[serde(default, rename = "type", alias = "typeText", alias = "type_text")]
+    type_text: Option<String>,
+    #[serde(default, rename = "defaultValue", alias = "default_value")]
+    default_value: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JavaChangeSignaturePreviewParams {
+    file: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(rename = "methodName", alias = "method_name")]
+    method_name: String,
+    #[serde(rename = "targetParams", alias = "target_params")]
+    target_params: Vec<JavaChangeParamSpec>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct JavaChangeSignatureParams {
+    file: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(rename = "methodName", alias = "method_name")]
+    method_name: String,
+    #[serde(rename = "methodRef", alias = "method_ref")]
+    method_ref: String,
+    #[serde(rename = "targetParams", alias = "target_params")]
+    target_params: Vec<JavaChangeParamSpec>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "acknowledgeSyntaxOnlyCallSites",
+        alias = "acknowledge_syntax_only_call_sites"
+    )]
+    acknowledge_syntax_only_call_sites: Option<bool>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Clone)]
+struct ChangeSignatureMethod {
+    ref_id: String,
+    name: String,
+    byte_end: usize,
+    signature_text: String,
+    params_span_start: usize,
+    params_span_end: usize,
+    params: Vec<ChangeSignatureParam>,
+}
+
+#[derive(Clone)]
+struct ChangeSignatureParam {
+    name: String,
+    type_text: Option<String>,
+    text: String,
+}
+
+#[derive(Clone)]
+struct ChangeSignatureCallSite {
+    file: String,
+    ref_id: String,
+    byte_start: usize,
+    byte_end: usize,
+    args_start: usize,
+    args_end: usize,
+    text: String,
+    args: Vec<String>,
+}
+
+fn split_top_level_csv(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth_angle = 0i32;
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    let mut depth_brace = 0i32;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escaped = false;
+    for (idx, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string || in_char {
+            match ch {
+                '\\' => escaped = true,
+                '"' if in_string => in_string = false,
+                '\'' if in_char => in_char = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '\'' => in_char = true,
+            '<' => depth_angle += 1,
+            '>' if depth_angle > 0 => depth_angle -= 1,
+            '(' => depth_paren += 1,
+            ')' if depth_paren > 0 => depth_paren -= 1,
+            '[' => depth_bracket += 1,
+            ']' if depth_bracket > 0 => depth_bracket -= 1,
+            '{' => depth_brace += 1,
+            '}' if depth_brace > 0 => depth_brace -= 1,
+            ',' if depth_angle == 0
+                && depth_paren == 0
+                && depth_bracket == 0
+                && depth_brace == 0 =>
+            {
+                let part = text[start..idx].trim();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let part = text[start..].trim();
+    if !part.is_empty() {
+        parts.push(part.to_string());
+    }
+    parts
+}
+
+fn replace_last_identifier(text: &str, old_name: &str, new_name: &str) -> String {
+    if old_name == new_name {
+        return text.to_string();
+    }
+    let Some(pos) = text.rfind(old_name) else {
+        return text.to_string();
+    };
+    let before_ok = text[..pos]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+    let after = pos + old_name.len();
+    let after_ok = text[after..]
+        .chars()
+        .next()
+        .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+    if before_ok && after_ok {
+        format!("{}{}{}", &text[..pos], new_name, &text[after..])
+    } else {
+        text.to_string()
+    }
+}
+
+fn replace_word_all(text: &str, old_name: &str, new_name: &str) -> String {
+    if old_name == new_name {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0usize;
+    while let Some(rel) = text[idx..].find(old_name) {
+        let pos = idx + rel;
+        let before_ok = text[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+        let after = pos + old_name.len();
+        let after_ok = text[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()));
+        out.push_str(&text[idx..pos]);
+        if before_ok && after_ok {
+            out.push_str(new_name);
+        } else {
+            out.push_str(old_name);
+        }
+        idx = after;
+    }
+    out.push_str(&text[idx..]);
+    out
+}
+
+fn java_method_ref(
+    name: &str,
+    sig: &bbox_refactor::facts::JavaSignatureFacts,
+    signature_text: &str,
+) -> String {
+    format!(
+        "method:{}:{}-{}:{}",
+        name,
+        sig.signature_span.byte_start,
+        sig.signature_span.byte_end,
+        signature_digest(signature_text)
+    )
+}
+
+fn change_signature_method_from_item(
+    source: &str,
+    path: &Path,
+    item: &bbox_refactor::facts::ItemFact,
+    content_sha256: &str,
+) -> Result<Option<ChangeSignatureMethod>, String> {
+    let sig = match bbox_refactor::facts::callable_signature(
+        path,
+        item.item.byte_start,
+        item.item.byte_end,
+        Some(content_sha256),
+    ) {
+        Ok(bbox_refactor::facts::SignatureFacts::Java(sig)) => sig,
+        Ok(_) => return Ok(None),
+        Err(e) => return Err(format!("{e:#}")),
+    };
+    let Some(name) = sig.name.clone() else {
+        return Ok(None);
+    };
+    let Some(params_span) = sig.params_span.as_ref() else {
+        return Err(format!("method `{name}` has no parameter span"));
+    };
+    let signature_text = signature_text_for(source, &sig);
+    let params = sig
+        .params
+        .iter()
+        .map(|param| ChangeSignatureParam {
+            name: param.name.clone().unwrap_or_default(),
+            type_text: param.type_text.clone(),
+            text: source
+                .get(param.byte_start..param.byte_end)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(ChangeSignatureMethod {
+        ref_id: java_method_ref(&name, &sig, &signature_text),
+        name,
+        byte_end: sig.byte_end,
+        signature_text,
+        params_span_start: params_span.byte_start,
+        params_span_end: params_span.byte_end,
+        params,
+    }))
+}
+
+fn find_change_signature_method(
+    root: &Path,
+    params: &JavaChangeSignaturePreviewParams,
+) -> Result<
+    (
+        PathBuf,
+        String,
+        bbox_refactor::facts::FileItemsFacts,
+        Option<ChangeSignatureMethod>,
+        Vec<Value>,
+    ),
+    String,
+> {
+    let path = resolve_workspace_file(root, &params.file, "java.changeSignaturePreview")?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("java.changeSignaturePreview: read {}: {e}", params.file))?;
+    let items = bbox_refactor::facts::file_items(&path).map_err(|e| {
+        format!(
+            "java.changeSignaturePreview: inventory {}: {e:#}",
+            params.file
+        )
+    })?;
+    let class_name = params.class_name.clone().unwrap_or_else(|| {
+        Path::new(&params.file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string()
+    });
+    let class_range = items
+        .items
+        .iter()
+        .find(|item| {
+            java_class_like_kind(&item.item.kind)
+                && item.item.name.as_deref() == Some(class_name.as_str())
+        })
+        .map(|item| (item.item.byte_start, item.item.byte_end));
+    let mut matches = Vec::new();
+    let mut findings = Vec::new();
+    if class_range.is_none() {
+        findings.push(json!({
+            "finding": "class_not_found",
+            "class": class_name,
+            "severity": "blocker",
+        }));
+    }
+    for item in &items.items {
+        if item.item.kind != "method_declaration" {
+            continue;
+        }
+        if let Some((start, end)) = class_range
+            && (item.item.byte_start < start || item.item.byte_end > end)
+        {
+            continue;
+        }
+        if item.item.name.as_deref() != Some(params.method_name.as_str()) {
+            continue;
+        }
+        match change_signature_method_from_item(&source, &path, item, &items.content_sha256) {
+            Ok(Some(method)) => matches.push(method),
+            Ok(None) => {}
+            Err(e) => findings.push(json!({
+                "finding": "signature_unavailable",
+                "severity": "blocker",
+                "detail": e,
+            })),
+        }
+    }
+    if matches.len() > 1 {
+        findings.push(json!({
+            "finding": "overloaded_method",
+            "severity": "blocker",
+            "detail": "syntax-only changeSignature currently refuses overloaded method names; narrow with a semantic backend before applying",
+            "count": matches.len(),
+        }));
+    }
+    Ok((path, source, items, matches.into_iter().next(), findings))
+}
+
+fn validate_change_signature_target(
+    method: &ChangeSignatureMethod,
+    specs: &[JavaChangeParamSpec],
+) -> (Vec<Value>, Vec<Value>) {
+    let old_names: BTreeSet<&str> = method.params.iter().map(|p| p.name.as_str()).collect();
+    let mut target_names = BTreeSet::new();
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    for spec in specs {
+        if let Err(e) = validate_java_identifier(&spec.name, "targetParams.name") {
+            blockers.push(
+                json!({ "finding": "invalid_param_name", "severity": "blocker", "detail": e }),
+            );
+        }
+        if !target_names.insert(spec.name.as_str()) {
+            blockers.push(json!({ "finding": "duplicate_target_param", "severity": "blocker", "name": spec.name }));
+        }
+        let source_name = spec.source_name.as_deref().unwrap_or(spec.name.as_str());
+        if !old_names.contains(source_name) {
+            if spec
+                .type_text
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                blockers.push(json!({
+                    "finding": "added_param_missing_type",
+                    "severity": "blocker",
+                    "name": spec.name,
+                    "detail": "new parameters require targetParams[].type",
+                }));
+            }
+            if spec
+                .default_value
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                blockers.push(json!({
+                    "finding": "added_param_missing_default",
+                    "severity": "blocker",
+                    "name": spec.name,
+                    "detail": "new parameters require targetParams[].defaultValue for call-site updates",
+                }));
+            }
+        } else if source_name != spec.name {
+            warnings.push(json!({
+                "finding": "parameter_rename",
+                "from": source_name,
+                "to": spec.name,
+                "detail": "method body references are rewritten by syntax-only word replacement inside the method body",
+            }));
+        }
+    }
+    for old in &method.params {
+        if !specs
+            .iter()
+            .any(|spec| spec.source_name.as_deref().unwrap_or(spec.name.as_str()) == old.name)
+        {
+            warnings.push(json!({
+                "finding": "parameter_removed",
+                "name": old.name,
+            }));
+        }
+    }
+    (blockers, warnings)
+}
+
+fn render_change_signature_params(
+    method: &ChangeSignatureMethod,
+    specs: &[JavaChangeParamSpec],
+) -> Vec<String> {
+    specs
+        .iter()
+        .map(|spec| {
+            let source_name = spec.source_name.as_deref().unwrap_or(spec.name.as_str());
+            if let Some(old) = method.params.iter().find(|param| param.name == source_name) {
+                if let Some(type_text) = spec.type_text.as_deref() {
+                    format!("{} {}", type_text.trim(), spec.name)
+                } else {
+                    replace_last_identifier(&old.text, source_name, &spec.name)
+                }
+            } else {
+                format!(
+                    "{} {}",
+                    spec.type_text.as_deref().unwrap_or("Object").trim(),
+                    spec.name
+                )
+            }
+        })
+        .collect()
+}
+
+fn invocation_name(text: &str) -> Option<&str> {
+    let paren = text.find('(')?;
+    let before = text[..paren].trim_end();
+    let end = before.len();
+    let start = before[..end]
+        .rfind(|c: char| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    before.get(start..end).filter(|name| !name.is_empty())
+}
+
+fn discover_change_signature_call_sites(
+    root: &Path,
+    source_file: &str,
+    method: &ChangeSignatureMethod,
+    files: Option<&[String]>,
+) -> Result<(Vec<ChangeSignatureCallSite>, Vec<Value>), String> {
+    let file_list = if let Some(files) = files {
+        files.to_vec()
+    } else {
+        collect_java_files(root)?
+            .into_iter()
+            .filter_map(|path| relativize(root, &path.to_string_lossy()).ok())
+            .collect()
+    };
+    let mut sites = Vec::new();
+    let mut findings = Vec::new();
+    for rel in file_list {
+        let path = resolve_workspace_file(root, &rel, "java.changeSignaturePreview")?;
+        let facts =
+            match bbox_refactor::facts::file_query(&path, "(method_invocation) @invoc", None) {
+                Ok(facts) => facts,
+                Err(e) => {
+                    findings.push(json!({
+                        "finding": "call_site_scan_error",
+                        "file": rel,
+                        "detail": format!("{e:#}"),
+                    }));
+                    continue;
+                }
+            };
+        for capture in facts.captures {
+            if capture.capture != "invoc" {
+                continue;
+            }
+            if invocation_name(&capture.text) != Some(method.name.as_str()) {
+                continue;
+            }
+            let Some(paren) = capture.text.find('(') else {
+                continue;
+            };
+            let Some(close) = capture.text.rfind(')') else {
+                continue;
+            };
+            if close < paren {
+                continue;
+            }
+            let args_text = &capture.text[paren + 1..close];
+            let args = split_top_level_csv(args_text);
+            if args.len() != method.params.len() {
+                findings.push(json!({
+                    "finding": "call_site_arity_mismatch",
+                    "severity": "blocker",
+                    "file": rel,
+                    "line_context": capture.text,
+                    "expected": method.params.len(),
+                    "actual": args.len(),
+                }));
+                continue;
+            }
+            let ref_id = format!(
+                "call:{}:{}-{}:{}",
+                rel,
+                capture.byte_start,
+                capture.byte_end,
+                signature_digest(&capture.text)
+            );
+            sites.push(ChangeSignatureCallSite {
+                file: rel.clone(),
+                ref_id,
+                byte_start: capture.byte_start,
+                byte_end: capture.byte_end,
+                args_start: capture.byte_start + paren + 1,
+                args_end: capture.byte_start + close,
+                text: capture.text,
+                args,
+            });
+        }
+    }
+    if !sites.is_empty() {
+        findings.push(json!({
+            "finding": "syntax_only_call_sites",
+            "severity": "review",
+            "count": sites.len(),
+            "detail": "call sites are matched by method invocation name and arity, not by JDT receiver resolution",
+        }));
+    }
+    if sites.iter().any(|site| site.file != source_file) {
+        findings.push(json!({
+            "finding": "external_call_sites",
+            "severity": "review",
+            "detail": "one or more same-name call sites outside the declaring file will be rewritten when acknowledged",
+        }));
+    }
+    Ok((sites, findings))
+}
+
+fn change_signature_preview_value(
+    root: &Path,
+    params: &JavaChangeSignaturePreviewParams,
+) -> Result<Value, String> {
+    let (_path, _source, items, method, mut findings) = find_change_signature_method(root, params)?;
+    let Some(method) = method else {
+        return Ok(json!({
+            "file": params.file,
+            "method_name": params.method_name,
+            "method_ref": null,
+            "changes": [],
+            "call_sites": [],
+            "findings": findings,
+            "blocked": true,
+            "ref_model": "preview-local refs derived from signature or call text hash; not graph IDs",
+            "provenance": "syntax_only",
+        }));
+    };
+    let (blockers, warnings) = validate_change_signature_target(&method, &params.target_params);
+    findings.extend(blockers);
+    findings.extend(warnings);
+    let (call_sites, call_findings) =
+        discover_change_signature_call_sites(root, &params.file, &method, params.files.as_deref())?;
+    findings.extend(call_findings);
+    let target_params = render_change_signature_params(&method, &params.target_params);
+    let blocked = findings
+        .iter()
+        .any(|finding| finding["severity"].as_str() == Some("blocker"));
+    Ok(json!({
+        "file": params.file,
+        "content_sha256": items.content_sha256,
+        "method_name": params.method_name,
+        "method_ref": method.ref_id,
+        "old_signature": method.signature_text,
+        "old_params": method.params.iter().map(|param| json!({
+            "name": param.name,
+            "type": param.type_text,
+            "text": param.text,
+        })).collect::<Vec<_>>(),
+        "target_params": target_params,
+        "call_sites": call_sites.iter().map(|site| json!({
+            "ref": site.ref_id,
+            "file": site.file,
+            "byte_start": site.byte_start,
+            "byte_end": site.byte_end,
+            "args": site.args,
+            "text": site.text,
+        })).collect::<Vec<_>>(),
+        "findings": findings,
+        "blocked": blocked,
+        "ref_model": "preview-local refs derived from signature or call text hash; not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
+fn rewritten_call_args(
+    method: &ChangeSignatureMethod,
+    specs: &[JavaChangeParamSpec],
+    args: &[String],
+) -> Vec<String> {
+    specs
+        .iter()
+        .map(|spec| {
+            let source_name = spec.source_name.as_deref().unwrap_or(spec.name.as_str());
+            if let Some(idx) = method
+                .params
+                .iter()
+                .position(|param| param.name == source_name)
+            {
+                args.get(idx).cloned().unwrap_or_default()
+            } else {
+                spec.default_value.clone().unwrap_or_default()
+            }
+        })
+        .collect()
+}
+
+#[async_trait]
+impl Tool for JavaChangeSignaturePreview {
+    fn name(&self) -> &str {
+        "java.changeSignaturePreview"
+    }
+    fn description(&self) -> &str {
+        "Preview a Java method signature rewrite with lightweight method/call refs, target params, call-site scan findings, and syntax-only blockers. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "className": { "type": "string" },
+                "methodName": { "type": "string" },
+                "targetParams": { "type": "array", "items": { "type": "object" } },
+                "files": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["file", "methodName", "targetParams"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "changeSignaturePreview".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaChangeSignaturePreviewParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.changeSignaturePreview: bad input - expected {{ file, methodName, targetParams, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            match change_signature_preview_value(&root, &params) {
+                Ok(v) => ToolResult::Json(v),
+                Err(e) => err(e),
+            }
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaChangeSignature {
+    fn name(&self) -> &str {
+        "java.changeSignature"
+    }
+    fn description(&self) -> &str {
+        "Apply java.changeSignaturePreview refs: rewrite declaration params, same-name call-site args, and simple renamed parameter references in the method body. Re-derives preview and refuses stale refs. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "className": { "type": "string" },
+                "methodName": { "type": "string" },
+                "methodRef": { "type": "string" },
+                "targetParams": { "type": "array", "items": { "type": "object" } },
+                "files": { "type": "array", "items": { "type": "string" } },
+                "acknowledgeSyntaxOnlyCallSites": { "type": "boolean" },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "methodName", "methodRef", "targetParams"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "changeSignature".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaChangeSignatureParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.changeSignature: bad input - expected {{ file, methodName, methodRef, targetParams, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let preview_params = JavaChangeSignaturePreviewParams {
+                file: params.file.clone(),
+                class_name: params.class_name.clone(),
+                method_name: params.method_name.clone(),
+                target_params: params.target_params.clone(),
+                files: params.files.clone(),
+            };
+            let preview = match change_signature_preview_value(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.changeSignaturePreview", "java.changeSignature")),
+            };
+            if preview["method_ref"].as_str() != Some(params.method_ref.as_str()) {
+                return err("java.changeSignature: stale methodRef; re-run java.changeSignaturePreview");
+            }
+            if preview["blocked"].as_bool() == Some(true) {
+                return ToolResult::Json(json!({
+                    "title": format!("change signature of `{}`", params.method_name),
+                    "changes": [],
+                    "findings": preview["findings"].clone(),
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+            let (_path, source, _items, method, _findings) = match find_change_signature_method(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+            let Some(method) = method else {
+                return err("java.changeSignature: method disappeared; re-run preview");
+            };
+            let (call_sites, mut call_findings) = match discover_change_signature_call_sites(
+                &root,
+                &params.file,
+                &method,
+                params.files.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(e) => return err(format!("java.changeSignature: {e}")),
+            };
+            if !call_sites.is_empty() && params.acknowledge_syntax_only_call_sites != Some(true) {
+                call_findings.push(json!({
+                    "finding": "acknowledgement_required",
+                    "severity": "blocker",
+                    "detail": "pass acknowledgeSyntaxOnlyCallSites:true to update same-name call sites matched without receiver resolution",
+                }));
+                return ToolResult::Json(json!({
+                    "title": format!("change signature of `{}`", params.method_name),
+                    "changes": [],
+                    "findings": call_findings,
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+
+            let mut edits_by_file: BTreeMap<String, Vec<bbox_refactor::TextEdit>> = BTreeMap::new();
+            let rendered_params = render_change_signature_params(&method, &params.target_params);
+            edits_by_file.entry(params.file.clone()).or_default().push(bbox_refactor::TextEdit {
+                byte_start: method.params_span_start + 1,
+                byte_end: method.params_span_end.saturating_sub(1),
+                replacement: rendered_params.join(", "),
+            });
+            if method.byte_end > method.params_span_end {
+                let body_start = method.params_span_end;
+                let body = source.get(body_start..method.byte_end).unwrap_or_default();
+                let mut rewritten = body.to_string();
+                for spec in &params.target_params {
+                    let source_name = spec.source_name.as_deref().unwrap_or(spec.name.as_str());
+                    if source_name != spec.name
+                        && method.params.iter().any(|param| param.name == source_name)
+                    {
+                        rewritten = replace_word_all(&rewritten, source_name, &spec.name);
+                    }
+                }
+                if rewritten != body {
+                    edits_by_file.entry(params.file.clone()).or_default().push(bbox_refactor::TextEdit {
+                        byte_start: body_start,
+                        byte_end: method.byte_end,
+                        replacement: rewritten,
+                    });
+                }
+            }
+            for site in &call_sites {
+                let new_args = rewritten_call_args(&method, &params.target_params, &site.args);
+                edits_by_file.entry(site.file.clone()).or_default().push(bbox_refactor::TextEdit {
+                    byte_start: site.args_start,
+                    byte_end: site.args_end,
+                    replacement: new_args.join(", "),
+                });
+            }
+
+            let mut changes = Vec::new();
+            let mut would_change_files = Vec::new();
+            for (rel, mut edits) in edits_by_file {
+                edits.sort_by_key(|edit| edit.byte_start);
+                let path = match resolve_workspace_file(&root, &rel, "java.changeSignature") {
+                    Ok(path) => path,
+                    Err(e) => return err(e),
+                };
+                let old = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => return err(format!("java.changeSignature: read {rel}: {e}")),
+                };
+                let new_text = match bbox_refactor::apply_text_edits(&old, &edits) {
+                    Ok(text) => text,
+                    Err(e) => return err(format!("java.changeSignature: edit synthesis failed for {rel}: {e:#}")),
+                };
+                if new_text != old {
+                    would_change_files.push(json!({
+                        "path": rel,
+                        "edit_count": edits.len(),
+                        "replacement_bytes": new_text.len(),
+                    }));
+                    if params.preview_only != Some(true) {
+                        changes.push(whole_file_change(&rel, &old, &new_text));
+                    }
+                }
+            }
+            ToolResult::Json(json!({
+                "title": format!("change signature of `{}`", params.method_name),
+                "changes": changes,
+                "findings": preview["findings"].clone(),
+                "selected_method_ref": params.method_ref,
+                "preview_only": params.preview_only.unwrap_or(false),
+                "would_change_files": would_change_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -3322,6 +4162,38 @@ RECIPE
   await edits.apply({ es });
 "#;
 
+const CHANGE_SIGNATURE_CONTRACT: &str = r#"java.changeSignaturePreview / java.changeSignature - syntax-only Java method signature rewrite.
+
+WHAT IT DOES
+  Preview inventories one non-overloaded method declaration, target parameter
+  shape, and same-name call sites. Apply re-runs preview, refuses stale methodRef,
+  rewrites the declaration parameter list, rewrites same-name call argument lists,
+  and does simple renamed-parameter word replacement inside the method body.
+
+REF MODEL
+  methodRef is preview-local: method:<name>:<signature-byte-range>:<hash>.
+  Call refs are preview-local call text hashes. These are not graph IDs.
+
+IMPORTANT LIMITS
+  - syntax_only call sites are matched by invocation name + arity, not receiver type.
+  - overloaded methods are blocked in this first harness-native slice.
+  - added params require type and defaultValue.
+  - apply requires acknowledgeSyntaxOnlyCallSites:true when call sites are present.
+
+PARAMS
+  file: string
+  className?: string
+  methodName: string
+  targetParams: { sourceName?: string, name: string, type?: string, defaultValue?: string }[]
+  files?: string[]       optional call-site scan/apply file set
+
+RECIPE
+  const pv = await java.changeSignaturePreview({ file, methodName: "find",
+    targetParams: [{ sourceName: "id", name: "key" }, { name: "limit", type: "int", defaultValue: "10" }] });
+  const r = await java.changeSignature({ file, methodName: "find", methodRef: pv.method_ref,
+    targetParams, acknowledgeSyntaxOnlyCallSites: true });
+"#;
+
 const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
 
 WHAT IT DOES
@@ -3415,6 +4287,9 @@ impl Tool for JavaDescribe {
             "extractInterface" => {
                 ToolResult::Json(json!({ "contract": EXTRACT_INTERFACE_CONTRACT }))
             }
+            "changeSignaturePreview" | "changeSignature" => {
+                ToolResult::Json(json!({ "contract": CHANGE_SIGNATURE_CONTRACT }))
+            }
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -3433,7 +4308,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -4922,6 +5797,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaMovePackage) as Arc<dyn Tool>,
         Arc::new(JavaPullUpPreview) as Arc<dyn Tool>,
         Arc::new(JavaExtractInterface) as Arc<dyn Tool>,
+        Arc::new(JavaChangeSignaturePreview) as Arc<dyn Tool>,
+        Arc::new(JavaChangeSignature) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
@@ -4938,7 +5815,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -4949,6 +5826,9 @@ type JavaRenameResult = { title: string; changes: SpanChange[]; creates: []; del
 type JavaPullUpCandidate = { ref: string; kind: string; name: string; signature_hash: string; signature: string; visibility: string; modifiers: string[]; annotations: string[]; params: Array<{ name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean }>; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; comment_trivia: string; comment_trivia_span: Span; span: Span; signature_span: Span; blockers: unknown[]; warnings: unknown[]; default_options: Record<string, string> };
 type JavaPullUpPreview = { file: string; language: "java"; content_sha256: string; source_len: number; class: { name: string; span?: Span; blockers: unknown[] }; target_kind: "interface" | "abstract_class"; imports: string[]; candidates: JavaPullUpCandidate[]; ref_model: string; provenance: "syntax_only" };
 type JavaExtractInterfaceResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: []; findings: unknown[]; selected_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; provenance: "syntax_only" };
+type JavaChangeParamSpec = { sourceName?: string; name: string; type?: string; defaultValue?: string };
+type JavaChangeSignaturePreview = { file: string; content_sha256?: string; method_name: string; method_ref?: string | null; old_signature?: string; old_params?: unknown[]; target_params: string[]; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
+type JavaChangeSignatureResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -4971,6 +5851,10 @@ declare const java: {
   pullUpPreview(args: { file: string; className?: string; targetKind?: "interface" | "abstract_class" }): Promise<JavaPullUpPreview>;
   /** Consume java.pullUpPreview refs and create an interface or abstract class plus source-side implements/extends and visibility edits. */
   extractInterface(args: { file: string; target: string; typeName: string; className?: string; targetKind?: "interface" | "abstract_class"; memberRefs: string[]; commentPolicy?: "copy" | "move" | "omit"; annotationPolicy?: "safe" | "copy" | "omit"; targetPackage?: string; previewOnly?: boolean }): Promise<JavaExtractInterfaceResult>;
+  /** Preview a method signature change. Refs are preview-local signature hashes, not graph IDs. */
+  changeSignaturePreview(args: { file: string; className?: string; methodName: string; targetParams: JavaChangeParamSpec[]; files?: string[] }): Promise<JavaChangeSignaturePreview>;
+  /** Apply a previewed method signature change. Same-name call-site rewrites require acknowledgeSyntaxOnlyCallSites:true. */
+  changeSignature(args: { file: string; className?: string; methodName: string; methodRef: string; targetParams: JavaChangeParamSpec[]; files?: string[]; acknowledgeSyntaxOnlyCallSites?: boolean; previewOnly?: boolean }): Promise<JavaChangeSignatureResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -5045,6 +5929,16 @@ public class OrderService {
 
     fn first_replacement(result: &Value) -> &str {
         result["changes"][0]["new_text"].as_str().unwrap()
+    }
+
+    fn replacement_for_file<'a>(result: &'a Value, file: &str) -> &'a str {
+        result["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["span"]["file"] == file)
+            .and_then(|change| change["new_text"].as_str())
+            .unwrap()
     }
 
     #[tokio::test]
@@ -5472,6 +6366,134 @@ public class Thing {
             result["dependency_projection"]["constructor_param_count"], 1,
             "{result}"
         );
+    }
+
+    const CHANGE_SIGNATURE_SERVICE: &str = r#"package com.acme;
+
+public class OrderService {
+    public String find(String id, int count) {
+        return id + count;
+    }
+}
+"#;
+
+    const CHANGE_SIGNATURE_CLIENT: &str = r#"package com.acme;
+
+public class Client {
+    public String run(OrderService service) {
+        return service.find("a", 7);
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn change_signature_preview_and_apply_rewrites_calls_when_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            CHANGE_SIGNATURE_SERVICE,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Client.java"),
+            CHANGE_SIGNATURE_CLIENT,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let target_params = json!([
+            { "sourceName": "count", "name": "limit" },
+            { "sourceName": "id", "name": "key" },
+            { "name": "trace", "type": "boolean", "defaultValue": "false" }
+        ]);
+        let preview = json_of(
+            JavaChangeSignaturePreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "methodName": "find",
+                        "targetParams": target_params,
+                        "files": ["src/com/acme/OrderService.java", "src/com/acme/Client.java"]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview["blocked"], false, "{preview}");
+        assert!(
+            preview["method_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("method:find:"),
+            "{preview}"
+        );
+        assert_eq!(
+            preview["call_sites"].as_array().unwrap().len(),
+            1,
+            "{preview}"
+        );
+        assert!(
+            preview["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["finding"] == "syntax_only_call_sites"),
+            "{preview}"
+        );
+
+        let refused = json_of(
+            JavaChangeSignature
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "methodName": "find",
+                        "methodRef": preview["method_ref"].as_str().unwrap(),
+                        "targetParams": target_params,
+                        "files": ["src/com/acme/OrderService.java", "src/com/acme/Client.java"]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(refused["blocked"], true, "{refused}");
+        assert!(
+            refused["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["finding"] == "acknowledgement_required"),
+            "{refused}"
+        );
+
+        let result = json_of(
+            JavaChangeSignature
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "methodName": "find",
+                        "methodRef": preview["method_ref"].as_str().unwrap(),
+                        "targetParams": target_params,
+                        "files": ["src/com/acme/OrderService.java", "src/com/acme/Client.java"],
+                        "acknowledgeSyntaxOnlyCallSites": true
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 2, "{result}");
+        let service = replacement_for_file(&result, "src/com/acme/OrderService.java");
+        assert!(
+            service.contains("public String find(int limit, String key, boolean trace)")
+                && service.contains("return key + limit;"),
+            "{service}"
+        );
+        let client = replacement_for_file(&result, "src/com/acme/Client.java");
+        assert!(client.contains("service.find(7, \"a\", false)"), "{client}");
     }
 
     const PULLUP_FIXTURE: &str = r#"package com.acme.impl;
