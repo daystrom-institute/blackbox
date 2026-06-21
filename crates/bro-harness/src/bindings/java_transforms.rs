@@ -6233,6 +6233,445 @@ impl Tool for JavaInlineMethod {
     }
 }
 
+/// `java.moveMemberPreview` - preview moving Java fields/constants to a target class.
+pub struct JavaMoveMemberPreview;
+
+/// `java.moveMember` - apply a previewed Java field/constant move.
+pub struct JavaMoveMember;
+
+#[derive(Deserialize)]
+struct JavaMoveMemberPreviewParams {
+    file: String,
+    target: String,
+    #[serde(rename = "memberNames", alias = "member_names", alias = "itemNames")]
+    member_names: Vec<String>,
+    #[serde(default, rename = "memberKind", alias = "member_kind")]
+    member_kind: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default, rename = "keepCopy", alias = "keep_copy")]
+    keep_copy: Option<bool>,
+    #[serde(default, rename = "targetPrelude", alias = "target_prelude")]
+    target_prelude: Option<String>,
+    #[serde(
+        default,
+        rename = "targetClassName",
+        alias = "target_class_name",
+        alias = "moduleName"
+    )]
+    target_class_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JavaMoveMemberParams {
+    file: String,
+    target: String,
+    #[serde(rename = "memberNames", alias = "member_names", alias = "itemNames")]
+    member_names: Vec<String>,
+    #[serde(rename = "memberRefs", alias = "member_refs")]
+    member_refs: Vec<String>,
+    #[serde(default, rename = "memberKind", alias = "member_kind")]
+    member_kind: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default, rename = "keepCopy", alias = "keep_copy")]
+    keep_copy: Option<bool>,
+    #[serde(default, rename = "targetPrelude", alias = "target_prelude")]
+    target_prelude: Option<String>,
+    #[serde(
+        default,
+        rename = "targetClassName",
+        alias = "target_class_name",
+        alias = "moduleName"
+    )]
+    target_class_name: Option<String>,
+    #[serde(
+        default,
+        rename = "acknowledgeRemainingAccessors",
+        alias = "acknowledge_remaining_accessors"
+    )]
+    acknowledge_remaining_accessors: Option<bool>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+fn normalize_move_member_kind(kind: Option<&str>) -> Result<&'static str, String> {
+    match kind.unwrap_or("field") {
+        "field" | "instance_field" => Ok("field"),
+        "constant" | "static_final" => Ok("constant"),
+        other => Err(format!(
+            "java.moveMemberPreview: memberKind must be field or constant, got `{other}`"
+        )),
+    }
+}
+
+fn java_member_ref(name: &str, item: &bbox_refactor::SyntaxItem, source: &str) -> String {
+    let text = source
+        .get(item.byte_start..item.byte_end)
+        .unwrap_or_default();
+    format!(
+        "member:{}:{}-{}:{}",
+        name,
+        item.byte_start,
+        item.byte_end,
+        signature_digest(text)
+    )
+}
+
+fn plan_move_member(
+    root: &Path,
+    params: &JavaMoveMemberPreviewParams,
+) -> Result<bbox_refactor::RefactorPlan, String> {
+    if params.member_names.is_empty() {
+        return Err("java.moveMemberPreview: memberNames must not be empty".to_string());
+    }
+    for name in &params.member_names {
+        validate_java_identifier(name, "memberNames")
+            .map_err(|e| format!("java.moveMemberPreview: {e}"))?;
+    }
+    let kind = normalize_move_member_kind(params.member_kind.as_deref())?;
+    let mut plan_input = json!({
+        "kind": if kind == "constant" { "move_java_constant" } else { "move_java_field" },
+        "project_dir": root.to_string_lossy(),
+        "source": params.file,
+        "target": params.target,
+        "item_names": params.member_names,
+        "deep_analysis": true,
+    });
+    if let Some(visibility) = params.visibility.as_ref() {
+        plan_input["visibility"] = json!(visibility);
+    }
+    if let Some(keep_copy) = params.keep_copy {
+        plan_input["keep_copy"] = json!(keep_copy);
+    }
+    if let Some(target_prelude) = params.target_prelude.as_ref() {
+        plan_input["target_prelude"] = json!(target_prelude);
+    }
+    if let Some(target_class_name) = params.target_class_name.as_ref() {
+        plan_input["module_name"] = json!(target_class_name);
+    }
+    let plan_params: bbox_refactor::RefactorPlanParams = serde_json::from_value(plan_input)
+        .map_err(|e| format!("java.moveMemberPreview: internal param shape: {e}"))?;
+    let plan_json =
+        bbox_refactor::plan(&plan_params).map_err(|e| format!("java.moveMemberPreview: {e:#}"))?;
+    serde_json::from_str(&plan_json)
+        .map_err(|e| format!("java.moveMemberPreview: plan decode: {e}"))
+}
+
+fn move_member_refs(
+    root: &Path,
+    params: &JavaMoveMemberPreviewParams,
+    plan: &bbox_refactor::RefactorPlan,
+) -> Result<Vec<Value>, String> {
+    let path = resolve_workspace_file(root, &params.file, "java.moveMemberPreview")?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("java.moveMemberPreview: read {}: {e}", params.file))?;
+    let mut refs = Vec::new();
+    for item in &plan.items {
+        let name = item.name.clone().unwrap_or_else(|| {
+            params
+                .member_names
+                .iter()
+                .find(|name| {
+                    source
+                        .get(item.byte_start..item.byte_end)
+                        .is_some_and(|text| text.contains(name.as_str()))
+                })
+                .cloned()
+                .unwrap_or_else(|| "(unknown)".to_string())
+        });
+        refs.push(json!({
+            "ref": java_member_ref(&name, item, &source),
+            "name": name,
+            "kind": item.kind,
+            "byte_start": item.byte_start,
+            "byte_end": item.byte_end,
+        }));
+    }
+    Ok(refs)
+}
+
+fn move_member_changes_from_plan(
+    root: &Path,
+    plan: &bbox_refactor::RefactorPlan,
+    preview_only: bool,
+) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>), String> {
+    let empty_sha = bbox_refactor::sha256_hex(&[]);
+    let mut changes = Vec::new();
+    let mut creates = Vec::new();
+    let mut would_change_files = Vec::new();
+    let mut would_create_files = Vec::new();
+    for file_edit in &plan.edits {
+        let rel = relativize(root, &file_edit.path)?;
+        let is_new_file = file_edit.original_sha256 == empty_sha
+            && file_edit
+                .edits
+                .iter()
+                .all(|edit| edit.byte_start == 0 && edit.byte_end == 0);
+        if is_new_file {
+            let content = file_edit
+                .edits
+                .iter()
+                .map(|edit| edit.replacement.as_str())
+                .collect::<String>();
+            would_create_files.push(json!({ "path": rel, "bytes": content.len() }));
+            if !preview_only {
+                creates.push(json!({ "path": rel, "content": content }));
+            }
+            continue;
+        }
+        if !file_edit.edits.is_empty() {
+            let replacement_bytes = file_edit
+                .edits
+                .iter()
+                .map(|edit| edit.replacement.len())
+                .sum::<usize>();
+            would_change_files.push(json!({
+                "path": rel,
+                "edit_count": file_edit.edits.len(),
+                "replacement_bytes": replacement_bytes,
+            }));
+        }
+        if !preview_only {
+            for edit in &file_edit.edits {
+                changes.push(json!({
+                    "span": {
+                        "file": rel,
+                        "byte_start": edit.byte_start,
+                        "byte_end": edit.byte_end,
+                        "content_sha256": file_edit.original_sha256,
+                    },
+                    "new_text": edit.replacement,
+                }));
+            }
+        }
+    }
+    Ok((changes, creates, would_change_files, would_create_files))
+}
+
+fn move_member_preview_value(
+    root: &Path,
+    params: &JavaMoveMemberPreviewParams,
+) -> Result<Value, String> {
+    let kind = normalize_move_member_kind(params.member_kind.as_deref())?;
+    let plan = plan_move_member(root, params)?;
+    let member_refs = move_member_refs(root, params, &plan)?;
+    let (_, _, would_change_files, would_create_files) =
+        move_member_changes_from_plan(root, &plan, true)?;
+    let mut findings = plan
+        .leftovers
+        .iter()
+        .map(|note| json!({ "finding": "planner_note", "detail": note }))
+        .collect::<Vec<_>>();
+    for accessor in &plan.remaining_source_accessors {
+        if accessor.accesses.is_empty() {
+            continue;
+        }
+        let mut value = serde_json::to_value(accessor).unwrap_or_default();
+        value["finding"] = json!("remaining_source_accessor");
+        value["severity"] = json!("blocker");
+        findings.push(value);
+    }
+    if kind == "constant" && params.keep_copy == Some(true) {
+        findings.push(json!({
+            "finding": "source_copy_kept",
+            "severity": "review",
+            "detail": "old owner remains as a compatibility copy; schedule cleanup when callers no longer need it",
+        }));
+    }
+    let blocked = findings
+        .iter()
+        .any(|finding| finding["severity"].as_str() == Some("blocker"));
+    Ok(json!({
+        "file": params.file,
+        "target": params.target,
+        "member_kind": kind,
+        "members": member_refs,
+        "findings": findings,
+        "blocked": blocked,
+        "would_change_files": would_change_files,
+        "would_create_files": would_create_files,
+        "ref_model": "preview-local member refs derived from declaration byte range and hash; not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
+#[async_trait]
+impl Tool for JavaMoveMemberPreview {
+    fn name(&self) -> &str {
+        "java.moveMemberPreview"
+    }
+    fn description(&self) -> &str {
+        "Preview moving Java instance fields or static final constants to a target class. Returns lightweight member refs, remaining-accessor findings, and edit/create summaries. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "target": { "type": "string" },
+                "memberNames": { "type": "array", "items": { "type": "string" } },
+                "memberKind": { "type": "string", "enum": ["field", "constant"] },
+                "visibility": { "type": "string" },
+                "keepCopy": { "type": "boolean" },
+                "targetPrelude": { "type": "string" },
+                "targetClassName": { "type": "string" }
+            },
+            "required": ["file", "target", "memberNames"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "moveMemberPreview".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaMoveMemberPreviewParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.moveMemberPreview: bad input - expected {{ file, target, memberNames, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || match move_member_preview_value(&root, &params) {
+            Ok(v) => ToolResult::Json(v),
+            Err(e) => err(e),
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaMoveMember {
+    fn name(&self) -> &str {
+        "java.moveMember"
+    }
+    fn description(&self) -> &str {
+        "Apply java.moveMemberPreview refs for field/constant moves. Re-plans, refuses stale member refs or unacknowledged remaining source accessors, and returns edit/create payloads. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "target": { "type": "string" },
+                "memberNames": { "type": "array", "items": { "type": "string" } },
+                "memberRefs": { "type": "array", "items": { "type": "string" } },
+                "memberKind": { "type": "string", "enum": ["field", "constant"] },
+                "visibility": { "type": "string" },
+                "keepCopy": { "type": "boolean" },
+                "targetPrelude": { "type": "string" },
+                "targetClassName": { "type": "string" },
+                "acknowledgeRemainingAccessors": { "type": "boolean" },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "target", "memberNames", "memberRefs"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "moveMember".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaMoveMemberParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.moveMember: bad input - expected {{ file, target, memberNames, memberRefs, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let preview_params = JavaMoveMemberPreviewParams {
+                file: params.file.clone(),
+                target: params.target.clone(),
+                member_names: params.member_names.clone(),
+                member_kind: params.member_kind.clone(),
+                visibility: params.visibility.clone(),
+                keep_copy: params.keep_copy,
+                target_prelude: params.target_prelude.clone(),
+                target_class_name: params.target_class_name.clone(),
+            };
+            let preview = match move_member_preview_value(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.moveMemberPreview", "java.moveMember")),
+            };
+            let current_refs = preview["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|member| member["ref"].as_str())
+                .collect::<BTreeSet<_>>();
+            let requested = params.member_refs.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            if current_refs != requested {
+                return err("java.moveMember: stale or mismatched memberRefs; re-run java.moveMemberPreview");
+            }
+            if preview["blocked"].as_bool() == Some(true)
+                && params.acknowledge_remaining_accessors != Some(true)
+            {
+                let mut findings = preview["findings"].clone();
+                if let Some(items) = findings.as_array_mut() {
+                    items.push(json!({
+                        "finding": "acknowledgement_required",
+                        "severity": "blocker",
+                        "detail": "remaining source accessors were reported; pass acknowledgeRemainingAccessors:true only after handling them",
+                    }));
+                }
+                return ToolResult::Json(json!({
+                    "title": "move Java member",
+                    "changes": [],
+                    "creates": [],
+                    "findings": findings,
+                    "blocked": true,
+                    "preview_only": params.preview_only.unwrap_or(false),
+                    "would_change_files": preview["would_change_files"].clone(),
+                    "would_create_files": preview["would_create_files"].clone(),
+                    "provenance": "syntax_only",
+                }));
+            }
+            let plan = match plan_move_member(&root, &preview_params) {
+                Ok(plan) => plan,
+                Err(e) => return err(e.replace("java.moveMemberPreview", "java.moveMember")),
+            };
+            let (changes, creates, would_change_files, would_create_files) =
+                match move_member_changes_from_plan(&root, &plan, params.preview_only == Some(true))
+                {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.moveMember: {e}")),
+                };
+            ToolResult::Json(json!({
+                "title": plan.title,
+                "changes": changes,
+                "creates": creates,
+                "findings": preview["findings"].clone(),
+                "selected_member_refs": params.member_refs,
+                "preview_only": params.preview_only.unwrap_or(false),
+                "would_change_files": would_change_files,
+                "would_create_files": would_create_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -6720,6 +7159,40 @@ RECIPE
     methodRef: pv.method_ref });
 "#;
 
+const MOVE_MEMBER_CONTRACT: &str = r#"java.moveMemberPreview / java.moveMember - syntax-only Java field/constant move.
+
+WHAT IT DOES
+  Preview wraps the existing move_java_field and move_java_constant planners.
+  It moves named instance fields or static final constants from one Java class
+  file to another, returning preview-local member refs, remaining-accessor
+  findings, and edit/create summaries. Apply re-runs the planner, refuses stale
+  refs, and returns edits/create payloads.
+
+REF MODEL
+  member refs are preview-local: member:<name>:<declaration-byte-range>:<hash>.
+  They are not durable graph IDs.
+
+IMPORTANT LIMITS
+  - memberKind:"field" handles instance fields and requires an existing target.
+  - memberKind:"constant" handles static final constants and can create target.
+  - method movement to an existing target is not implemented by this wrapper yet.
+  - remaining source accessors are blockers unless explicitly acknowledged.
+
+PARAMS
+  file: string
+  target: string
+  memberNames: string[]
+  memberKind?: "field" | "constant"  default field
+  memberRefs: string[]
+  acknowledgeRemainingAccessors?: boolean
+  previewOnly?: boolean
+
+RECIPE
+  const pv = await java.moveMemberPreview({ file, target, memberNames: ["count"], memberKind: "field" });
+  const r = await java.moveMember({ file, target, memberNames: ["count"],
+    memberKind: "field", memberRefs: pv.members.map(m => m.ref) });
+"#;
+
 const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
 
 WHAT IT DOES
@@ -6828,6 +7301,9 @@ impl Tool for JavaDescribe {
             "inlineMethodPreview" | "inlineMethod" => {
                 ToolResult::Json(json!({ "contract": INLINE_METHOD_CONTRACT }))
             }
+            "moveMemberPreview" | "moveMember" => {
+                ToolResult::Json(json!({ "contract": MOVE_MEMBER_CONTRACT }))
+            }
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -6846,7 +7322,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -8345,6 +8821,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaMigrateTypeUsages) as Arc<dyn Tool>,
         Arc::new(JavaInlineMethodPreview) as Arc<dyn Tool>,
         Arc::new(JavaInlineMethod) as Arc<dyn Tool>,
+        Arc::new(JavaMoveMemberPreview) as Arc<dyn Tool>,
+        Arc::new(JavaMoveMember) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
@@ -8361,7 +8839,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -8383,6 +8861,8 @@ type JavaMigrateTypeUsagesPreview = { file: string; content_sha256: string; old_
 type JavaMigrateTypeUsagesResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_migration_ref: string; selected_usage_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; provenance: "syntax_only" };
 type JavaInlineMethodPreview = { file: string; content_sha256: string; method_name: string; method_ref?: string | null; old_signature?: string | null; project_wide: boolean; call_sites: unknown[]; deletes: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaInlineMethodResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
+type JavaMoveMemberPreview = { file: string; target: string; member_kind: "field" | "constant"; members: Array<{ ref: string; name: string; kind: string; byte_start: number; byte_end: number }>; findings: unknown[]; blocked: boolean; would_change_files: unknown[]; would_create_files: unknown[]; ref_model: string; provenance: "syntax_only" };
+type JavaMoveMemberResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: unknown[]; selected_member_refs: string[]; preview_only: boolean; would_change_files: unknown[]; would_create_files: unknown[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -8425,6 +8905,10 @@ declare const java: {
   inlineMethodPreview(args: { file: string; methodName: string; className?: string; projectWide?: boolean }): Promise<JavaInlineMethodPreview>;
   /** Apply previewed Java method inlining. */
   inlineMethod(args: { file: string; methodName: string; methodRef: string; className?: string; projectWide?: boolean; previewOnly?: boolean }): Promise<JavaInlineMethodResult>;
+  /** Preview moving Java instance fields or static final constants to a target class. */
+  moveMemberPreview(args: { file: string; target: string; memberNames: string[]; memberKind?: "field" | "constant"; visibility?: "public" | "protected" | "private" | "package"; keepCopy?: boolean; targetPrelude?: string; targetClassName?: string }): Promise<JavaMoveMemberPreview>;
+  /** Apply a previewed Java field/constant move. */
+  moveMember(args: { file: string; target: string; memberNames: string[]; memberRefs: string[]; memberKind?: "field" | "constant"; visibility?: "public" | "protected" | "private" | "package"; keepCopy?: boolean; targetPrelude?: string; targetClassName?: string; acknowledgeRemainingAccessors?: boolean; previewOnly?: boolean }): Promise<JavaMoveMemberResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -9422,6 +9906,85 @@ public class Calc {
             changes
                 .iter()
                 .any(|change| change["new_text"].as_str() == Some("")),
+            "{result}"
+        );
+    }
+
+    const MOVE_MEMBER_SOURCE: &str = r#"package com.acme;
+
+public class Source {
+    private int count;
+
+    public int run() {
+        return 1;
+    }
+}
+"#;
+
+    const MOVE_MEMBER_TARGET: &str = r#"package com.acme;
+
+public class Target {
+}
+"#;
+
+    #[tokio::test]
+    async fn move_member_moves_instance_field_to_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(root.join("src/com/acme/Source.java"), MOVE_MEMBER_SOURCE).unwrap();
+        std::fs::write(root.join("src/com/acme/Target.java"), MOVE_MEMBER_TARGET).unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaMoveMemberPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/Source.java",
+                        "target": "src/com/acme/Target.java",
+                        "memberNames": ["count"],
+                        "memberKind": "field"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview["blocked"], false, "{preview}");
+        let refs = preview["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["ref"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(refs.len(), 1, "{preview}");
+
+        let result = json_of(
+            JavaMoveMember
+                .call(
+                    json!({
+                        "file": "src/com/acme/Source.java",
+                        "target": "src/com/acme/Target.java",
+                        "memberNames": ["count"],
+                        "memberRefs": refs,
+                        "memberKind": "field"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let changes = result["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2, "{result}");
+        assert!(
+            changes
+                .iter()
+                .any(|change| change["new_text"].as_str() == Some("")),
+            "{result}"
+        );
+        assert!(
+            changes.iter().any(|change| change["new_text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("private int count;")),
             "{result}"
         );
     }
