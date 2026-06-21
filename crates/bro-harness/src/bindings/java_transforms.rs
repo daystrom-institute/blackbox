@@ -5848,6 +5848,391 @@ impl Tool for JavaMigrateTypeUsages {
     }
 }
 
+/// `java.inlineMethodPreview` - preview Java method inlining.
+pub struct JavaInlineMethodPreview;
+
+/// `java.inlineMethod` - apply a previewed Java method inline.
+pub struct JavaInlineMethod;
+
+#[derive(Deserialize)]
+struct JavaInlineMethodPreviewParams {
+    file: String,
+    #[serde(rename = "methodName", alias = "method_name", alias = "moduleName")]
+    method_name: String,
+    #[serde(
+        default,
+        rename = "className",
+        alias = "class_name",
+        alias = "implName"
+    )]
+    class_name: Option<String>,
+    #[serde(default, rename = "projectWide", alias = "project_wide")]
+    project_wide: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct JavaInlineMethodParams {
+    file: String,
+    #[serde(rename = "methodName", alias = "method_name", alias = "moduleName")]
+    method_name: String,
+    #[serde(rename = "methodRef", alias = "method_ref")]
+    method_ref: String,
+    #[serde(
+        default,
+        rename = "className",
+        alias = "class_name",
+        alias = "implName"
+    )]
+    class_name: Option<String>,
+    #[serde(default, rename = "projectWide", alias = "project_wide")]
+    project_wide: Option<bool>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Clone)]
+struct InlineMethodInfo {
+    ref_id: String,
+    signature_text: String,
+    visibility: Option<String>,
+}
+
+fn find_inline_method_info(
+    root: &Path,
+    params: &JavaInlineMethodPreviewParams,
+) -> Result<
+    (
+        String,
+        bbox_refactor::facts::FileItemsFacts,
+        Option<InlineMethodInfo>,
+        Vec<Value>,
+    ),
+    String,
+> {
+    let path = resolve_workspace_file(root, &params.file, "java.inlineMethodPreview")?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("java.inlineMethodPreview: read {}: {e}", params.file))?;
+    let items = bbox_refactor::facts::file_items(&path)
+        .map_err(|e| format!("java.inlineMethodPreview: inventory {}: {e:#}", params.file))?;
+    let class_name = params.class_name.clone().unwrap_or_else(|| {
+        Path::new(&params.file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string()
+    });
+    let class_range = items
+        .items
+        .iter()
+        .find(|item| {
+            java_class_like_kind(&item.item.kind)
+                && item.item.name.as_deref() == Some(class_name.as_str())
+        })
+        .map(|item| (item.item.byte_start, item.item.byte_end));
+    let mut findings = Vec::new();
+    if class_range.is_none() {
+        findings.push(json!({
+            "finding": "class_not_found",
+            "severity": "blocker",
+            "class": class_name,
+        }));
+    }
+    let mut matches = Vec::new();
+    for item in &items.items {
+        if item.item.kind != "method_declaration"
+            || item.item.name.as_deref() != Some(params.method_name.as_str())
+        {
+            continue;
+        }
+        if let Some((start, end)) = class_range
+            && (item.item.byte_start < start || item.item.byte_end > end)
+        {
+            continue;
+        }
+        let sig = match bbox_refactor::facts::callable_signature(
+            &path,
+            item.item.byte_start,
+            item.item.byte_end,
+            Some(&items.content_sha256),
+        ) {
+            Ok(bbox_refactor::facts::SignatureFacts::Java(sig)) => sig,
+            Ok(_) => continue,
+            Err(e) => {
+                findings.push(json!({
+                    "finding": "signature_unavailable",
+                    "severity": "blocker",
+                    "detail": format!("{e:#}"),
+                }));
+                continue;
+            }
+        };
+        let signature_text = signature_text_for(&source, &sig);
+        matches.push(InlineMethodInfo {
+            ref_id: java_method_ref(&params.method_name, &sig, &signature_text),
+            signature_text,
+            visibility: sig.visibility,
+        });
+    }
+    if matches.len() > 1 {
+        findings.push(json!({
+            "finding": "overloaded_method",
+            "severity": "blocker",
+            "count": matches.len(),
+            "detail": "syntax-only inlineMethod selects by method name; overloads require a semantic backend or a narrower primitive",
+        }));
+    }
+    if matches.is_empty() {
+        findings.push(json!({
+            "finding": "method_not_found",
+            "severity": "blocker",
+            "method": params.method_name,
+        }));
+    }
+    Ok((source, items, matches.into_iter().next(), findings))
+}
+
+fn plan_inline_method(
+    root: &Path,
+    params: &JavaInlineMethodPreviewParams,
+) -> Result<bbox_refactor::RefactorPlan, String> {
+    let mut plan_input = json!({
+        "kind": "inline_java_method",
+        "project_dir": root.to_string_lossy(),
+        "source": params.file,
+        "module_name": params.method_name,
+    });
+    if let Some(class_name) = params.class_name.as_ref() {
+        plan_input["impl_name"] = json!(class_name);
+    }
+    if params.project_wide == Some(true) {
+        plan_input["toml_entries"] = json!({ "project_wide": true });
+    }
+    let plan_params: bbox_refactor::RefactorPlanParams = serde_json::from_value(plan_input)
+        .map_err(|e| format!("java.inlineMethodPreview: internal param shape: {e}"))?;
+    let plan_json = bbox_refactor::plan(&plan_params)
+        .map_err(|e| format!("java.inlineMethodPreview: {e:#}"))?;
+    serde_json::from_str(&plan_json)
+        .map_err(|e| format!("java.inlineMethodPreview: plan decode: {e}"))
+}
+
+fn inline_method_preview_value(
+    root: &Path,
+    params: &JavaInlineMethodPreviewParams,
+) -> Result<Value, String> {
+    let (_source, items, method, mut findings) = find_inline_method_info(root, params)?;
+    let method_ref = method.as_ref().map(|method| method.ref_id.clone());
+    if let Some(method) = method.as_ref()
+        && method.visibility.as_deref() != Some("private")
+        && params.project_wide != Some(true)
+    {
+        findings.push(json!({
+            "finding": "project_wide_required",
+            "severity": "blocker",
+            "detail": "non-private methods require projectWide:true so external callers are not left behind",
+        }));
+    }
+    let mut call_sites = Vec::new();
+    let mut deletes = Vec::new();
+    if !findings
+        .iter()
+        .any(|finding| finding["severity"].as_str() == Some("blocker"))
+    {
+        match plan_inline_method(root, params) {
+            Ok(plan) => {
+                for file_edit in &plan.edits {
+                    let rel = relativize(root, &file_edit.path)?;
+                    for edit in &file_edit.edits {
+                        if edit.replacement.is_empty() {
+                            deletes.push(json!({
+                                "file": rel,
+                                "byte_start": edit.byte_start,
+                                "byte_end": edit.byte_end,
+                            }));
+                        } else {
+                            call_sites.push(json!({
+                                "ref": format!("inline-call:{}:{}-{}:{}", rel, edit.byte_start, edit.byte_end, signature_digest(&edit.replacement)),
+                                "file": rel,
+                                "byte_start": edit.byte_start,
+                                "byte_end": edit.byte_end,
+                                "replacement": edit.replacement,
+                            }));
+                        }
+                    }
+                }
+                for note in plan.leftovers {
+                    findings.push(json!({ "finding": "planner_note", "detail": note }));
+                }
+            }
+            Err(e) => findings.push(json!({
+                "finding": "planner_refusal",
+                "severity": "blocker",
+                "detail": e,
+            })),
+        }
+    }
+    let blocked = findings
+        .iter()
+        .any(|finding| finding["severity"].as_str() == Some("blocker"));
+    Ok(json!({
+        "file": params.file,
+        "content_sha256": items.content_sha256,
+        "method_name": params.method_name,
+        "method_ref": method_ref,
+        "old_signature": method.map(|method| method.signature_text),
+        "project_wide": params.project_wide.unwrap_or(false),
+        "call_sites": call_sites,
+        "deletes": deletes,
+        "findings": findings,
+        "blocked": blocked,
+        "ref_model": "preview-local method refs derived from signature byte range and hash; not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
+#[async_trait]
+impl Tool for JavaInlineMethodPreview {
+    fn name(&self) -> &str {
+        "java.inlineMethodPreview"
+    }
+    fn description(&self) -> &str {
+        "Preview Java method inlining using the inline_java_method planner. Returns a methodRef, call-site replacements, declaration deletion spans, and safety/refusal findings. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "methodName": { "type": "string" },
+                "className": { "type": "string" },
+                "projectWide": { "type": "boolean" }
+            },
+            "required": ["file", "methodName"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "inlineMethodPreview".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaInlineMethodPreviewParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.inlineMethodPreview: bad input - expected {{ file, methodName, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || match inline_method_preview_value(&root, &params) {
+            Ok(v) => ToolResult::Json(v),
+            Err(e) => err(e),
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaInlineMethod {
+    fn name(&self) -> &str {
+        "java.inlineMethod"
+    }
+    fn description(&self) -> &str {
+        "Apply java.inlineMethodPreview refs: re-run the inline planner, refuse stale methodRef or blocked previews, and return hash-anchored edit changes. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "methodName": { "type": "string" },
+                "methodRef": { "type": "string" },
+                "className": { "type": "string" },
+                "projectWide": { "type": "boolean" },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "methodName", "methodRef"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "inlineMethod".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaInlineMethodParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.inlineMethod: bad input - expected {{ file, methodName, methodRef, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let preview_params = JavaInlineMethodPreviewParams {
+                file: params.file.clone(),
+                method_name: params.method_name.clone(),
+                class_name: params.class_name.clone(),
+                project_wide: params.project_wide,
+            };
+            let preview = match inline_method_preview_value(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.inlineMethodPreview", "java.inlineMethod")),
+            };
+            if preview["method_ref"].as_str() != Some(params.method_ref.as_str()) {
+                return err("java.inlineMethod: stale methodRef; re-run java.inlineMethodPreview");
+            }
+            if preview["blocked"].as_bool() == Some(true) {
+                return ToolResult::Json(json!({
+                    "title": format!("inline Java method `{}`", params.method_name),
+                    "changes": [],
+                    "findings": preview["findings"].clone(),
+                    "blocked": true,
+                    "preview_only": params.preview_only.unwrap_or(false),
+                    "would_change_files": [],
+                    "provenance": "syntax_only",
+                }));
+            }
+            let plan = match plan_inline_method(&root, &preview_params) {
+                Ok(plan) => plan,
+                Err(e) => return err(e.replace("java.inlineMethodPreview", "java.inlineMethod")),
+            };
+            let (mut changes, would_change_files) =
+                match file_edits_to_changes(&root, "java.inlineMethod", &plan.edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.inlineMethod: {e}")),
+                };
+            if params.preview_only == Some(true) {
+                changes.clear();
+            }
+            ToolResult::Json(json!({
+                "title": plan.title,
+                "changes": changes,
+                "findings": preview["findings"].clone(),
+                "selected_method_ref": params.method_ref,
+                "preview_only": params.preview_only.unwrap_or(false),
+                "would_change_files": would_change_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -6297,6 +6682,44 @@ RECIPE
     migrationRef: pv.migration_ref });
 "#;
 
+const INLINE_METHOD_CONTRACT: &str = r#"java.inlineMethodPreview / java.inlineMethod - syntax-only Java method inlining.
+
+WHAT IT DOES
+  Preview wraps the existing inline_java_method planner. It returns a
+  preview-local methodRef, call-site replacement previews, declaration deletion
+  spans, and safety findings. Apply re-runs preview/planning, refuses stale
+  methodRef or blocked previews, and returns hash-anchored edits.
+
+SUPPORTED BODY SHAPES
+  - private single-return non-void method.
+  - private single-statement void method when used in statement position.
+  - planner-supported projectWide mode for non-private methods.
+
+REF MODEL
+  methodRef is preview-local: method:<name>:<signature-byte-range>:<hash>.
+  It is not a durable graph ID.
+
+IMPORTANT LIMITS
+  - overloaded method names are blocked by the harness wrapper.
+  - method bodies that touch this/super/fields/other methods are refused.
+  - non-private methods require projectWide:true.
+  - syntax_only call discovery is planner-owned; use JDTLS for binding-precise
+    inline across overloads/inheritance.
+
+PARAMS
+  file: string
+  methodName: string
+  className?: string
+  projectWide?: boolean
+  methodRef: string
+  previewOnly?: boolean
+
+RECIPE
+  const pv = await java.inlineMethodPreview({ file, className: "Calc", methodName: "add" });
+  const r = await java.inlineMethod({ file, className: "Calc", methodName: "add",
+    methodRef: pv.method_ref });
+"#;
+
 const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
 
 WHAT IT DOES
@@ -6402,6 +6825,9 @@ impl Tool for JavaDescribe {
             "migrateTypeUsagesPreview" | "migrateTypeUsages" => {
                 ToolResult::Json(json!({ "contract": MIGRATE_TYPE_USAGES_CONTRACT }))
             }
+            "inlineMethodPreview" | "inlineMethod" => {
+                ToolResult::Json(json!({ "contract": INLINE_METHOD_CONTRACT }))
+            }
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -6420,7 +6846,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -7917,6 +8343,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaReplaceConstructorWithFactory) as Arc<dyn Tool>,
         Arc::new(JavaMigrateTypeUsagesPreview) as Arc<dyn Tool>,
         Arc::new(JavaMigrateTypeUsages) as Arc<dyn Tool>,
+        Arc::new(JavaInlineMethodPreview) as Arc<dyn Tool>,
+        Arc::new(JavaInlineMethod) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
@@ -7933,7 +8361,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -7953,6 +8381,8 @@ type JavaReplaceConstructorWithFactoryPreview = { file: string; content_sha256?:
 type JavaReplaceConstructorWithFactoryResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_constructor_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaMigrateTypeUsagesPreview = { file: string; content_sha256: string; old_type: string; new_type: string; migration_ref: string; usages: Array<{ ref: string; byte_start: number; byte_end: number; kind: string; context: string }>; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaMigrateTypeUsagesResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_migration_ref: string; selected_usage_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; provenance: "syntax_only" };
+type JavaInlineMethodPreview = { file: string; content_sha256: string; method_name: string; method_ref?: string | null; old_signature?: string | null; project_wide: boolean; call_sites: unknown[]; deletes: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
+type JavaInlineMethodResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -7991,6 +8421,10 @@ declare const java: {
   migrateTypeUsagesPreview(args: { file: string; oldType: string; newType: string }): Promise<JavaMigrateTypeUsagesPreview>;
   /** Apply a previewed Java type-use migration. usageRefs omitted means all previewed usages. */
   migrateTypeUsages(args: { file: string; oldType: string; newType: string; migrationRef: string; usageRefs?: string[]; previewOnly?: boolean }): Promise<JavaMigrateTypeUsagesResult>;
+  /** Preview Java method inlining. Refs are preview-local signature hashes, not graph IDs. */
+  inlineMethodPreview(args: { file: string; methodName: string; className?: string; projectWide?: boolean }): Promise<JavaInlineMethodPreview>;
+  /** Apply previewed Java method inlining. */
+  inlineMethod(args: { file: string; methodName: string; methodRef: string; className?: string; projectWide?: boolean; previewOnly?: boolean }): Promise<JavaInlineMethodResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -8912,6 +9346,84 @@ public class Bar {
         assert!(rewritten.contains("new Foo()"), "{rewritten}");
         assert!(rewritten.contains("instanceof Foo"), "{rewritten}");
         assert!(rewritten.contains("Foo.class"), "{rewritten}");
+    }
+
+    const INLINE_METHOD_FIXTURE: &str = r#"package com.acme;
+
+public class Calc {
+    public int run() {
+        return add(1, 2);
+    }
+
+    private int add(int a, int b) {
+        return a + b;
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn inline_method_preview_and_apply_returns_call_and_delete_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(root.join("src/com/acme/Calc.java"), INLINE_METHOD_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaInlineMethodPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/Calc.java",
+                        "className": "Calc",
+                        "methodName": "add"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview["blocked"], false, "{preview}");
+        assert!(
+            preview["method_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("method:add:"),
+            "{preview}"
+        );
+        assert_eq!(
+            preview["call_sites"].as_array().unwrap().len(),
+            1,
+            "{preview}"
+        );
+        assert_eq!(preview["deletes"].as_array().unwrap().len(), 1, "{preview}");
+
+        let result = json_of(
+            JavaInlineMethod
+                .call(
+                    json!({
+                        "file": "src/com/acme/Calc.java",
+                        "className": "Calc",
+                        "methodName": "add",
+                        "methodRef": preview["method_ref"].as_str().unwrap()
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let changes = result["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2, "{result}");
+        assert!(
+            changes.iter().any(|change| change["new_text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("(1) + (2)")),
+            "{result}"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change["new_text"].as_str() == Some("")),
+            "{result}"
+        );
     }
 
     const PULLUP_FIXTURE: &str = r#"package com.acme.impl;
