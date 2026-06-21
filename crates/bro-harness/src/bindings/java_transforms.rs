@@ -5445,6 +5445,409 @@ impl Tool for JavaReplaceConstructorWithFactory {
     }
 }
 
+/// `java.migrateTypeUsagesPreview` - preview Java type-use migration.
+pub struct JavaMigrateTypeUsagesPreview;
+
+/// `java.migrateTypeUsages` - apply a previewed Java type-use migration.
+pub struct JavaMigrateTypeUsages;
+
+#[derive(Deserialize)]
+struct JavaMigrateTypeUsagesPreviewParams {
+    file: String,
+    #[serde(
+        rename = "oldType",
+        alias = "old_type",
+        alias = "fromType",
+        alias = "from_type",
+        alias = "moduleName",
+        alias = "module_name"
+    )]
+    old_type: String,
+    #[serde(
+        rename = "newType",
+        alias = "new_type",
+        alias = "toType",
+        alias = "to_type",
+        alias = "newText",
+        alias = "new_text"
+    )]
+    new_type: String,
+}
+
+#[derive(Deserialize)]
+struct JavaMigrateTypeUsagesParams {
+    file: String,
+    #[serde(
+        rename = "oldType",
+        alias = "old_type",
+        alias = "fromType",
+        alias = "from_type",
+        alias = "moduleName",
+        alias = "module_name"
+    )]
+    old_type: String,
+    #[serde(
+        rename = "newType",
+        alias = "new_type",
+        alias = "toType",
+        alias = "to_type",
+        alias = "newText",
+        alias = "new_text"
+    )]
+    new_type: String,
+    #[serde(rename = "migrationRef", alias = "migration_ref")]
+    migration_ref: String,
+    #[serde(default, rename = "usageRefs", alias = "usage_refs")]
+    usage_refs: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Clone)]
+struct MigrateTypeUsage {
+    ref_id: String,
+    byte_start: usize,
+    byte_end: usize,
+    context: String,
+    kind: String,
+}
+
+fn java_type_migration_ref(
+    file: &str,
+    old_type: &str,
+    new_type: &str,
+    content_sha256: &str,
+    usages: &[MigrateTypeUsage],
+) -> String {
+    let mut seed = format!("{file}:{old_type}:{new_type}:{content_sha256}:");
+    for usage in usages {
+        seed.push_str(&format!("{}-{};", usage.byte_start, usage.byte_end));
+    }
+    format!(
+        "type-migration:{}:{}:{}",
+        old_type,
+        usages.len(),
+        signature_digest(&seed)
+    )
+}
+
+fn java_type_usage_ref(
+    old_type: &str,
+    byte_start: usize,
+    byte_end: usize,
+    context: &str,
+) -> String {
+    format!(
+        "type-use:{}:{}-{}:{}",
+        old_type,
+        byte_start,
+        byte_end,
+        signature_digest(context)
+    )
+}
+
+fn classify_type_usage_context(line: &str, old_type: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.starts_with("import ") {
+        "import".to_string()
+    } else if trimmed.contains('(') && trimmed.contains(')') && trimmed.contains(old_type) {
+        if trimmed.ends_with('{') || trimmed.ends_with(';') {
+            "method_signature".to_string()
+        } else {
+            "parameter_or_call_context".to_string()
+        }
+    } else if trimmed.ends_with(';') && (trimmed.contains('=') || trimmed.contains(old_type)) {
+        "field_or_local_type".to_string()
+    } else {
+        "type_use".to_string()
+    }
+}
+
+fn plan_java_type_migration(
+    root: &Path,
+    file: &str,
+    old_type: &str,
+    new_type: &str,
+) -> Result<(bbox_refactor::RefactorPlan, String), String> {
+    if old_type == new_type {
+        return Err("java.migrateTypeUsagesPreview: oldType and newType are identical".to_string());
+    }
+    validate_java_identifier(old_type, "oldType")
+        .map_err(|e| format!("java.migrateTypeUsagesPreview: {e}"))?;
+    validate_java_identifier(new_type, "newType")
+        .map_err(|e| format!("java.migrateTypeUsagesPreview: {e}"))?;
+    let mut plan_input = json!({
+        "kind": "migrate_java_type_usages",
+        "project_dir": root.to_string_lossy(),
+        "source": file,
+        "module_name": old_type,
+        "new_text": new_type,
+    });
+    let plan_params: bbox_refactor::RefactorPlanParams = serde_json::from_value(plan_input.take())
+        .map_err(|e| format!("java.migrateTypeUsagesPreview: internal param shape: {e}"))?;
+    let plan_json = bbox_refactor::plan(&plan_params)
+        .map_err(|e| format!("java.migrateTypeUsagesPreview: {e:#}"))?;
+    let plan: bbox_refactor::RefactorPlan = serde_json::from_str(&plan_json)
+        .map_err(|e| format!("java.migrateTypeUsagesPreview: plan decode: {e}"))?;
+    Ok((plan, plan_json))
+}
+
+fn migrate_type_usages_from_plan(
+    source: &str,
+    old_type: &str,
+    plan: &bbox_refactor::RefactorPlan,
+) -> Vec<MigrateTypeUsage> {
+    let mut usages = Vec::new();
+    for file_edit in &plan.edits {
+        for edit in &file_edit.edits {
+            let context = line_snippet(source, edit.byte_start, edit.byte_end);
+            usages.push(MigrateTypeUsage {
+                ref_id: java_type_usage_ref(old_type, edit.byte_start, edit.byte_end, &context),
+                byte_start: edit.byte_start,
+                byte_end: edit.byte_end,
+                kind: classify_type_usage_context(&context, old_type),
+                context,
+            });
+        }
+    }
+    usages
+}
+
+fn migrate_type_usages_preview_value(
+    root: &Path,
+    params: &JavaMigrateTypeUsagesPreviewParams,
+) -> Result<Value, String> {
+    let path = resolve_workspace_file(root, &params.file, "java.migrateTypeUsagesPreview")?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("java.migrateTypeUsagesPreview: read {}: {e}", params.file))?;
+    let content_sha256 = bbox_refactor::sha256_hex(source.as_bytes());
+    let (plan, _) =
+        plan_java_type_migration(root, &params.file, &params.old_type, &params.new_type)?;
+    let usages = migrate_type_usages_from_plan(&source, &params.old_type, &plan);
+    let migration_ref = java_type_migration_ref(
+        &params.file,
+        &params.old_type,
+        &params.new_type,
+        &content_sha256,
+        &usages,
+    );
+    let mut findings = Vec::new();
+    findings.push(json!({
+        "finding": "syntax_only_type_use_migration",
+        "severity": "review",
+        "detail": "migrates type-use positions only; constructor calls, casts, instanceof, .class literals, method calls, XML, and config are intentionally skipped",
+    }));
+    if usages.iter().any(|usage| {
+        matches!(
+            usage.kind.as_str(),
+            "method_signature" | "field_or_local_type"
+        )
+    }) {
+        findings.push(json!({
+            "finding": "public_api_review",
+            "severity": "review",
+            "detail": "preview includes signature-shaped type-use positions; run or honor a public API guard before applying public surface changes",
+        }));
+    }
+    Ok(json!({
+        "file": params.file,
+        "content_sha256": content_sha256,
+        "old_type": params.old_type,
+        "new_type": params.new_type,
+        "migration_ref": migration_ref,
+        "usages": usages.iter().map(|usage| json!({
+            "ref": usage.ref_id,
+            "byte_start": usage.byte_start,
+            "byte_end": usage.byte_end,
+            "kind": usage.kind,
+            "context": usage.context,
+        })).collect::<Vec<_>>(),
+        "findings": findings,
+        "blocked": false,
+        "ref_model": "preview-local refs derived from file hash, old/new type, and type-use byte ranges; not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
+#[async_trait]
+impl Tool for JavaMigrateTypeUsagesPreview {
+    fn name(&self) -> &str {
+        "java.migrateTypeUsagesPreview"
+    }
+    fn description(&self) -> &str {
+        "Preview Java type-use migration for one source file. Returns a migrationRef and per-usage refs for legal field/parameter/return/local type positions; intentionally skips constructors, casts, instanceof, and .class. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "oldType": { "type": "string" },
+                "newType": { "type": "string" }
+            },
+            "required": ["file", "oldType", "newType"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "migrateTypeUsagesPreview".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaMigrateTypeUsagesPreviewParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.migrateTypeUsagesPreview: bad input - expected {{ file, oldType, newType }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            match migrate_type_usages_preview_value(&root, &params) {
+                Ok(v) => ToolResult::Json(v),
+                Err(e) => err(e),
+            }
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaMigrateTypeUsages {
+    fn name(&self) -> &str {
+        "java.migrateTypeUsages"
+    }
+    fn description(&self) -> &str {
+        "Apply java.migrateTypeUsagesPreview refs: re-plan, refuse stale migrationRef, optionally filter usageRefs, and return hash-anchored edit changes. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "oldType": { "type": "string" },
+                "newType": { "type": "string" },
+                "migrationRef": { "type": "string" },
+                "usageRefs": { "type": "array", "items": { "type": "string" } },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "oldType", "newType", "migrationRef"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "migrateTypeUsages".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaMigrateTypeUsagesParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.migrateTypeUsages: bad input - expected {{ file, oldType, newType, migrationRef, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let preview_params = JavaMigrateTypeUsagesPreviewParams {
+                file: params.file.clone(),
+                old_type: params.old_type.clone(),
+                new_type: params.new_type.clone(),
+            };
+            let preview = match migrate_type_usages_preview_value(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.migrateTypeUsagesPreview", "java.migrateTypeUsages")),
+            };
+            if preview["migration_ref"].as_str() != Some(params.migration_ref.as_str()) {
+                return err("java.migrateTypeUsages: stale migrationRef; re-run java.migrateTypeUsagesPreview");
+            }
+            let path = match resolve_workspace_file(&root, &params.file, "java.migrateTypeUsages") {
+                Ok(path) => path,
+                Err(e) => return err(e),
+            };
+            let source = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.migrateTypeUsages: read {}: {e}", params.file)),
+            };
+            let (plan, _) = match plan_java_type_migration(&root, &params.file, &params.old_type, &params.new_type) {
+                Ok(planned) => planned,
+                Err(e) => return err(e.replace("java.migrateTypeUsagesPreview", "java.migrateTypeUsages")),
+            };
+            let usages = migrate_type_usages_from_plan(&source, &params.old_type, &plan);
+            let selected_refs: Option<BTreeSet<String>> = params
+                .usage_refs
+                .as_ref()
+                .map(|refs| refs.iter().cloned().collect());
+            if let Some(selected) = selected_refs.as_ref() {
+                let known: BTreeSet<&str> = usages.iter().map(|usage| usage.ref_id.as_str()).collect();
+                let missing = selected
+                    .iter()
+                    .filter(|ref_id| !known.contains(ref_id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    return err(format!(
+                        "java.migrateTypeUsages: stale or unknown usageRefs: {missing:?}; re-run preview"
+                    ));
+                }
+            }
+            let mut edits = Vec::new();
+            if let Some(file_edit) = plan.edits.first() {
+                for (usage, edit) in usages.iter().zip(file_edit.edits.iter()) {
+                    if selected_refs
+                        .as_ref()
+                        .is_none_or(|selected| selected.contains(&usage.ref_id))
+                    {
+                        edits.push(edit.clone());
+                    }
+                }
+            }
+            let new_text = match bbox_refactor::apply_text_edits(&source, &edits) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.migrateTypeUsages: edit synthesis failed: {e:#}")),
+            };
+            let mut changes = Vec::new();
+            let mut would_change_files = Vec::new();
+            if new_text != source {
+                would_change_files.push(json!({
+                    "path": params.file,
+                    "edit_count": edits.len(),
+                    "replacement_bytes": new_text.len(),
+                }));
+                if params.preview_only != Some(true) {
+                    changes.push(whole_file_change(&params.file, &source, &new_text));
+                }
+            }
+            ToolResult::Json(json!({
+                "title": format!("migrate Java type usages `{}` to `{}`", params.old_type, params.new_type),
+                "changes": changes,
+                "findings": preview["findings"].clone(),
+                "selected_migration_ref": params.migration_ref,
+                "selected_usage_refs": selected_refs.map(|refs| refs.into_iter().collect::<Vec<_>>()).unwrap_or_else(|| usages.iter().map(|usage| usage.ref_id.clone()).collect()),
+                "preview_only": params.preview_only.unwrap_or(false),
+                "would_change_files": would_change_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -5860,6 +6263,40 @@ RECIPE
     constructorRef: pv.constructor_ref, acknowledgeSyntaxOnlyCallSites: true });
 "#;
 
+const MIGRATE_TYPE_USAGES_CONTRACT: &str = r#"java.migrateTypeUsagesPreview / java.migrateTypeUsages - syntax-only Java type-use migration.
+
+WHAT IT DOES
+  Preview wraps the existing migrate_java_type_usages planner for one Java file.
+  It returns a migrationRef plus per-usage refs for legal type-use positions:
+  field types, method parameter types, return types, and local variable types.
+  Apply re-runs the planner, refuses stale refs, optionally filters usageRefs,
+  and returns one hash-anchored file change.
+
+REF MODEL
+  migrationRef is preview-local: type-migration:<old-type>:<count>:<hash>.
+  usage refs are preview-local byte-range refs. These are not graph IDs.
+
+IMPORTANT LIMITS
+  - intentionally skips `new`, casts, instanceof, .class literals, method calls,
+    XML, config, and generated source.
+  - syntax_only: type identity is simple-name based, not JDTLS binding based.
+  - signature-shaped usages get a public_api_review finding; run a public API
+    guard before applying public surface changes.
+
+PARAMS
+  file: string
+  oldType: string
+  newType: string
+  migrationRef: string
+  usageRefs?: string[]   optional subset from preview; omitted means all usages
+  previewOnly?: boolean
+
+RECIPE
+  const pv = await java.migrateTypeUsagesPreview({ file, oldType: "OrderService", newType: "OrderApi" });
+  const r = await java.migrateTypeUsages({ file, oldType: "OrderService", newType: "OrderApi",
+    migrationRef: pv.migration_ref });
+"#;
+
 const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
 
 WHAT IT DOES
@@ -5962,6 +6399,9 @@ impl Tool for JavaDescribe {
             "replaceConstructorWithFactoryPreview" | "replaceConstructorWithFactory" => {
                 ToolResult::Json(json!({ "contract": REPLACE_CONSTRUCTOR_WITH_FACTORY_CONTRACT }))
             }
+            "migrateTypeUsagesPreview" | "migrateTypeUsages" => {
+                ToolResult::Json(json!({ "contract": MIGRATE_TYPE_USAGES_CONTRACT }))
+            }
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -5980,7 +6420,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -7475,6 +7915,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaEncapsulateField) as Arc<dyn Tool>,
         Arc::new(JavaReplaceConstructorWithFactoryPreview) as Arc<dyn Tool>,
         Arc::new(JavaReplaceConstructorWithFactory) as Arc<dyn Tool>,
+        Arc::new(JavaMigrateTypeUsagesPreview) as Arc<dyn Tool>,
+        Arc::new(JavaMigrateTypeUsages) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
@@ -7491,7 +7933,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -7509,6 +7951,8 @@ type JavaEncapsulateFieldPreview = { file: string; content_sha256?: string; fiel
 type JavaEncapsulateFieldResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_field_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaReplaceConstructorWithFactoryPreview = { file: string; content_sha256?: string; class_name?: string; constructor_ref?: string | null; old_signature?: string; factory_name?: string; factory_signature?: string; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaReplaceConstructorWithFactoryResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_constructor_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
+type JavaMigrateTypeUsagesPreview = { file: string; content_sha256: string; old_type: string; new_type: string; migration_ref: string; usages: Array<{ ref: string; byte_start: number; byte_end: number; kind: string; context: string }>; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
+type JavaMigrateTypeUsagesResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_migration_ref: string; selected_usage_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -7543,6 +7987,10 @@ declare const java: {
   replaceConstructorWithFactoryPreview(args: { file: string; className?: string; factoryName?: string; files?: string[] }): Promise<JavaReplaceConstructorWithFactoryPreview>;
   /** Apply a previewed constructor-factory conversion. new-expression rewrites require acknowledgeSyntaxOnlyCallSites:true. */
   replaceConstructorWithFactory(args: { file: string; className?: string; constructorRef: string; factoryName?: string; files?: string[]; acknowledgeSyntaxOnlyCallSites?: boolean; previewOnly?: boolean }): Promise<JavaReplaceConstructorWithFactoryResult>;
+  /** Preview one-file Java type-use migration. Refs are preview-local byte/hash refs, not graph IDs. */
+  migrateTypeUsagesPreview(args: { file: string; oldType: string; newType: string }): Promise<JavaMigrateTypeUsagesPreview>;
+  /** Apply a previewed Java type-use migration. usageRefs omitted means all previewed usages. */
+  migrateTypeUsages(args: { file: string; oldType: string; newType: string; migrationRef: string; usageRefs?: string[]; previewOnly?: boolean }): Promise<JavaMigrateTypeUsagesResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -8380,6 +8828,90 @@ public class Client {
             client.contains("return OrderService.of(\"a\", 7);"),
             "{client}"
         );
+    }
+
+    const MIGRATE_TYPE_CLIENT: &str = r#"package com.acme;
+
+public class Client {
+    private Foo field;
+
+    public Foo run(Foo input) {
+        Foo local = input;
+        Object raw = new Foo();
+        boolean same = raw instanceof Foo;
+        Class<?> token = Foo.class;
+        return local;
+    }
+}
+"#;
+
+    const FOO_TYPE: &str = r#"package com.acme;
+
+public class Foo {
+}
+"#;
+
+    const BAR_TYPE: &str = r#"package com.acme;
+
+public class Bar {
+}
+"#;
+
+    #[tokio::test]
+    async fn migrate_type_usages_rewrites_type_positions_and_skips_construction_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(root.join("src/com/acme/Client.java"), MIGRATE_TYPE_CLIENT).unwrap();
+        std::fs::write(root.join("src/com/acme/Foo.java"), FOO_TYPE).unwrap();
+        std::fs::write(root.join("src/com/acme/Bar.java"), BAR_TYPE).unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaMigrateTypeUsagesPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/Client.java",
+                        "oldType": "Foo",
+                        "newType": "Bar"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview["blocked"], false, "{preview}");
+        assert!(
+            preview["migration_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("type-migration:Foo:"),
+            "{preview}"
+        );
+        assert_eq!(preview["usages"].as_array().unwrap().len(), 4, "{preview}");
+
+        let result = json_of(
+            JavaMigrateTypeUsages
+                .call(
+                    json!({
+                        "file": "src/com/acme/Client.java",
+                        "oldType": "Foo",
+                        "newType": "Bar",
+                        "migrationRef": preview["migration_ref"].as_str().unwrap()
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = first_replacement(&result);
+        assert!(rewritten.contains("private Bar field;"), "{rewritten}");
+        assert!(
+            rewritten.contains("public Bar run(Bar input)"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("Bar local = input;"), "{rewritten}");
+        assert!(rewritten.contains("new Foo()"), "{rewritten}");
+        assert!(rewritten.contains("instanceof Foo"), "{rewritten}");
+        assert!(rewritten.contains("Foo.class"), "{rewritten}");
     }
 
     const PULLUP_FIXTURE: &str = r#"package com.acme.impl;
