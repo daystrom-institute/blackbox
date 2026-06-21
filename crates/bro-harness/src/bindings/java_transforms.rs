@@ -267,6 +267,212 @@ fn file_edits_to_changes(
     Ok((changes, changed_files))
 }
 
+fn file_delete_value(root: &Path, path: &Path) -> Result<Value, String> {
+    let rel_path = if let Ok(rel) = path.strip_prefix(root) {
+        rel.to_path_buf()
+    } else if let Ok(canon) = root.canonicalize() {
+        path.strip_prefix(canon)
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                format!(
+                    "delete path `{}` is outside the worktree root",
+                    path.display()
+                )
+            })?
+    } else {
+        return Err(format!(
+            "delete path `{}` is outside the worktree root",
+            path.display()
+        ));
+    };
+    let rel = rel_path.to_string_lossy().to_string();
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(json!({
+        "path": rel,
+        "content_sha256": bbox_refactor::sha256_hex(&bytes),
+    }))
+}
+
+fn validate_java_package_name(pkg: &str, field: &str) -> Result<(), String> {
+    if pkg.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    for segment in pkg.split('.') {
+        if segment.is_empty() {
+            return Err(format!(
+                "{field} must be a valid Java package name: `{pkg}`"
+            ));
+        }
+        validate_java_identifier(segment, field)?;
+    }
+    Ok(())
+}
+
+fn validate_java_identifier(name: &str, field: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("{field} must not be empty"));
+    };
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return Err(format!(
+            "{field} must be a valid Java identifier, got `{name}`"
+        ));
+    }
+    if !chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "{field} must be a valid Java identifier, got `{name}`"
+        ));
+    }
+    Ok(())
+}
+
+fn extract_package_name(source: &str) -> Option<String> {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("package ") {
+            return rest
+                .trim_end_matches(';')
+                .split_whitespace()
+                .next()
+                .map(str::to_string);
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with("/*") {
+            break;
+        }
+    }
+    None
+}
+
+fn replace_package_decl(source: &str, target_package: &str) -> (String, bool) {
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        let trimmed_start = line.trim_start();
+        let leading = line.len() - trimmed_start.len();
+        if let Some(rest) = trimmed_start.strip_prefix("package ") {
+            if let Some(semi_rel) = rest.find(';') {
+                let name_start = offset + leading + "package ".len();
+                let name_end = offset + leading + "package ".len() + semi_rel;
+                let mut out = String::with_capacity(source.len() + target_package.len());
+                out.push_str(&source[..name_start]);
+                out.push_str(target_package);
+                out.push_str(&source[name_end..]);
+                return (out, true);
+            }
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with("/*") {
+            break;
+        }
+        offset += line.len();
+    }
+    (format!("package {target_package};\n\n{source}"), false)
+}
+
+fn package_path(pkg: &str) -> PathBuf {
+    pkg.split('.').collect()
+}
+
+fn default_target_for_package(source_rel: &str, old_pkg: &str, target_pkg: &str) -> PathBuf {
+    let old_parts: Vec<&str> = old_pkg.split('.').collect();
+    let target_parts: Vec<&str> = target_pkg.split('.').collect();
+    let components: Vec<String> = Path::new(source_rel)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    if components.is_empty() {
+        return package_path(target_pkg);
+    }
+
+    let file = components.last().cloned().unwrap_or_default();
+    let dirs = &components[..components.len().saturating_sub(1)];
+    if !old_parts.is_empty() && dirs.len() >= old_parts.len() {
+        for start in 0..=dirs.len() - old_parts.len() {
+            if dirs[start..start + old_parts.len()]
+                .iter()
+                .map(String::as_str)
+                .eq(old_parts.iter().copied())
+            {
+                let mut out = PathBuf::new();
+                for part in &dirs[..start] {
+                    out.push(part);
+                }
+                for part in &target_parts {
+                    out.push(part);
+                }
+                out.push(file);
+                return out;
+            }
+        }
+    }
+
+    if let Some(java_idx) = dirs.iter().rposition(|part| part == "java") {
+        let mut out = PathBuf::new();
+        for part in &dirs[..=java_idx] {
+            out.push(part);
+        }
+        for part in &target_parts {
+            out.push(part);
+        }
+        out.push(file);
+        return out;
+    }
+
+    let mut out = PathBuf::new();
+    for part in dirs {
+        out.push(part);
+    }
+    out.push(file);
+    out
+}
+
+fn replace_literal_all(source: &str, old: &str, new: &str) -> (String, usize) {
+    if old.is_empty() || old == new {
+        return (source.to_string(), 0);
+    }
+    let count = source.match_indices(old).count();
+    if count == 0 {
+        return (source.to_string(), 0);
+    }
+    (source.replace(old, new), count)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn collect_java_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in
+            std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?
+        {
+            let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", dir.display()))?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if name == ".git" || name == "target" || name == "build" || name == ".gradle" {
+                continue;
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("file_type {}: {e}", path.display()))?;
+            if file_type.is_dir() {
+                walk(&path, out)?;
+            } else if file_type.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("java")
+            {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(root, &mut files)?;
+    Ok(files)
+}
+
 #[derive(Deserialize)]
 struct JavaFilesParams {
     files: Vec<String>,
@@ -826,6 +1032,539 @@ impl Tool for JavaExtractMethodCodeBlock {
     }
 }
 
+/// `java.renameSymbol` — project-wide syntax-backed Java symbol rename.
+pub struct JavaRenameSymbol;
+
+#[derive(Deserialize)]
+struct JavaRenameSymbolParams {
+    #[serde(rename = "oldName", alias = "old_name")]
+    old_name: String,
+    #[serde(rename = "newName", alias = "new_name")]
+    new_name: String,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default, rename = "itemKinds", alias = "item_kinds")]
+    item_kinds: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[async_trait]
+impl Tool for JavaRenameSymbol {
+    fn name(&self) -> &str {
+        "java.renameSymbol"
+    }
+    fn description(&self) -> &str {
+        "Rename one Java simple symbol across the worktree using the v1 rename_java_symbol planner. Returns hash-anchored {changes} plus file_rename_advisory for public type/file renames; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "oldName": { "type": "string", "description": "Old simple Java identifier." },
+                "newName": { "type": "string", "description": "New simple Java identifier." },
+                "file": { "type": "string", "description": "Optional declaration file used as a validation hint." },
+                "itemKinds": { "type": "array", "items": { "type": "string" }, "description": "Optional v1 kind filter, e.g. [\"class_declaration\"] or [\"method_declaration\"]." },
+                "previewOnly": { "type": "boolean", "description": "Run the planner but omit edit payloads; returns would_change_files." }
+            },
+            "required": ["oldName", "newName"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "renameSymbol".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaRenameSymbolParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.renameSymbol: bad input — expected {{ oldName, newName, file?, itemKinds?, previewOnly? }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let mut plan_input = json!({
+                "kind": "rename_java_symbol",
+                "project_dir": root.to_string_lossy(),
+                "source": params.file.unwrap_or_default(),
+                "item_names": [params.old_name],
+                "new_text": params.new_name,
+            });
+            if let Some(item_kinds) = params.item_kinds {
+                plan_input["item_kinds"] = json!(item_kinds);
+            }
+            let plan_params: bbox_refactor::RefactorPlanParams =
+                match serde_json::from_value(plan_input) {
+                    Ok(p) => p,
+                    Err(e) => return err(format!("java.renameSymbol: internal param shape: {e}")),
+                };
+            let plan_json = match bbox_refactor::plan(&plan_params) {
+                Ok(s) => s,
+                Err(e) => return err(format!("java.renameSymbol: {e:#}")),
+            };
+            let raw: Value = match serde_json::from_str(&plan_json) {
+                Ok(v) => v,
+                Err(e) => return err(format!("java.renameSymbol: plan value decode: {e}")),
+            };
+            let plan: bbox_refactor::RefactorPlan = match serde_json::from_value(raw.clone()) {
+                Ok(p) => p,
+                Err(e) => return err(format!("java.renameSymbol: plan decode: {e}")),
+            };
+            if plan.plan_status != bbox_refactor::PlanStatus::Planned {
+                return err(format!(
+                    "java.renameSymbol: planner returned {:?} — {}",
+                    plan.plan_status,
+                    plan.leftovers.join("; ")
+                ));
+            }
+            let (mut changes, would_change_files) =
+                match file_edits_to_changes(&root, "java.renameSymbol", &plan.edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.renameSymbol: {e}")),
+                };
+            let preview_only = params.preview_only.unwrap_or(false);
+            if preview_only {
+                changes.clear();
+            }
+            let findings = plan
+                .leftovers
+                .iter()
+                .map(|note| json!({ "finding": "note", "detail": note }))
+                .collect::<Vec<_>>();
+            ToolResult::Json(json!({
+                "title": plan.title,
+                "changes": changes,
+                "creates": [],
+                "deletes": [],
+                "findings": findings,
+                "preview_only": preview_only,
+                "would_change_files": would_change_files,
+                "file_rename_advisory": raw.get("file_rename_advisory").cloned().unwrap_or_else(|| json!([])),
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
+/// `java.moveClass` — move one Java top-level class file to another package.
+pub struct JavaMoveClass;
+
+#[derive(Deserialize)]
+struct JavaMoveClassParams {
+    file: String,
+    #[serde(rename = "targetPackage", alias = "target_package")]
+    target_package: String,
+    #[serde(default, rename = "targetFile", alias = "target_file")]
+    target_file: Option<String>,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[async_trait]
+impl Tool for JavaMoveClass {
+    fn name(&self) -> &str {
+        "java.moveClass"
+    }
+    fn description(&self) -> &str {
+        "Move one Java source file to a target package: creates the relocated file with an updated package declaration, updates project imports/FQCN references from old package.Class to new package.Class, and returns a hash-guarded delete for the source file. Pure; apply via edits.createFile/deleteFile/merge/apply."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative Java file to move." },
+                "targetPackage": { "type": "string", "description": "Destination Java package." },
+                "targetFile": { "type": "string", "description": "Optional destination file. Defaults by replacing the old package path segment with targetPackage." },
+                "className": { "type": "string", "description": "Optional class name. Defaults from file stem." },
+                "previewOnly": { "type": "boolean", "description": "Return summaries and findings but omit changes/creates/deletes." }
+            },
+            "required": ["file", "targetPackage"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "moveClass".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaMoveClassParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.moveClass: bad input — expected {{ file, targetPackage, targetFile?, className?, previewOnly? }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            if let Err(e) = validate_java_package_name(&params.target_package, "targetPackage") {
+                return err(format!("java.moveClass: {e}"));
+            }
+            let source_path = match resolve_workspace_file(&root, &params.file, "java.moveClass") {
+                Ok(path) => path,
+                Err(e) => return err(e),
+            };
+            let source_text = match std::fs::read_to_string(&source_path) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.moveClass: read {}: {e}", params.file)),
+            };
+            let old_package = match extract_package_name(&source_text) {
+                Some(pkg) => pkg,
+                None => return err("java.moveClass: source file has no package declaration"),
+            };
+            let class_name = params.class_name.clone().unwrap_or_else(|| {
+                source_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string()
+            });
+            if let Err(e) = validate_java_identifier(&class_name, "className") {
+                return err(format!("java.moveClass: {e}"));
+            }
+            let target_rel = params.target_file.clone().unwrap_or_else(|| {
+                default_target_for_package(&params.file, &old_package, &params.target_package)
+                    .to_string_lossy()
+                    .to_string()
+            });
+            if target_rel == params.file {
+                return err("java.moveClass: targetFile resolves to the source file");
+            }
+            let (mut target_content, replaced_package) =
+                replace_package_decl(&source_text, &params.target_package);
+            let old_fqcn = format!("{old_package}.{class_name}");
+            let new_fqcn = format!("{}.{class_name}", params.target_package);
+            let (rewritten_target, target_refs) =
+                replace_literal_all(&target_content, &old_fqcn, &new_fqcn);
+            target_content = rewritten_target;
+
+            let mut file_edits = Vec::new();
+            let mut findings = Vec::new();
+            let java_files = match collect_java_files(&root) {
+                Ok(files) => files,
+                Err(e) => return err(format!("java.moveClass: {e}")),
+            };
+            for path in java_files {
+                if path == source_path {
+                    continue;
+                }
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+                let mut edits = Vec::new();
+                let mut search_start = 0usize;
+                while let Some(rel_start) = text[search_start..].find(&old_fqcn) {
+                    let start = search_start + rel_start;
+                    edits.push(bbox_refactor::TextEdit {
+                        byte_start: start,
+                        byte_end: start + old_fqcn.len(),
+                        replacement: new_fqcn.clone(),
+                    });
+                    search_start = start + old_fqcn.len();
+                }
+                if !edits.is_empty() {
+                    let bytes = text.as_bytes();
+                    file_edits.push(bbox_refactor::FileEdit {
+                        path: path.to_string_lossy().to_string(),
+                        original_sha256: bbox_refactor::sha256_hex(bytes),
+                        edits,
+                        new_text: None,
+                    });
+                }
+            }
+            let (mut changes, would_change_files) =
+                match file_edits_to_changes(&root, "java.moveClass", &file_edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.moveClass: {e}")),
+                };
+            let would_create_files =
+                vec![json!({ "path": target_rel, "bytes": target_content.len() })];
+            let mut creates = vec![json!({ "path": target_rel, "content": target_content })];
+            let mut deletes = match file_delete_value(&root, &source_path) {
+                Ok(delete) => vec![delete],
+                Err(e) => return err(format!("java.moveClass: {e}")),
+            };
+            findings.push(json!({
+                "finding": "package_decl",
+                "file": params.file,
+                "old_package": old_package,
+                "new_package": params.target_package,
+                "replaced_existing": replaced_package,
+            }));
+            if target_refs > 0 {
+                findings.push(json!({
+                    "finding": "target_self_reference_rewrites",
+                    "count": target_refs,
+                }));
+            }
+            let preview_only = params.preview_only.unwrap_or(false);
+            if preview_only {
+                changes.clear();
+                creates.clear();
+                deletes.clear();
+            }
+            ToolResult::Json(json!({
+                "title": format!("move Java class `{old_fqcn}` to `{new_fqcn}`"),
+                "changes": changes,
+                "creates": creates,
+                "deletes": deletes,
+                "findings": findings,
+                "preview_only": preview_only,
+                "would_change_files": would_change_files,
+                "would_create_files": would_create_files,
+                "would_delete_files": [{ "path": params.file }],
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
+/// `java.movePackage` — move all files declaring one package to another package.
+pub struct JavaMovePackage;
+
+#[derive(Deserialize)]
+struct JavaMovePackageParams {
+    #[serde(rename = "oldPackage", alias = "old_package")]
+    old_package: String,
+    #[serde(rename = "targetPackage", alias = "target_package")]
+    target_package: String,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[async_trait]
+impl Tool for JavaMovePackage {
+    fn name(&self) -> &str {
+        "java.movePackage"
+    }
+    fn description(&self) -> &str {
+        "Move every Java file declaring oldPackage to targetPackage. Creates relocated files with updated package declarations, updates project-wide oldPackage.* references/imports, and returns hash-guarded deletes for source files. Pure; apply through edits.*."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "oldPackage": { "type": "string", "description": "Package to move." },
+                "targetPackage": { "type": "string", "description": "Destination package." },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Optional explicit workspace-relative files to move; each must declare oldPackage." },
+                "previewOnly": { "type": "boolean", "description": "Return summaries and findings but omit changes/creates/deletes." }
+            },
+            "required": ["oldPackage", "targetPackage"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "movePackage".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaMovePackageParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.movePackage: bad input — expected {{ oldPackage, targetPackage, files?, previewOnly? }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            for (field, pkg) in [
+                ("oldPackage", params.old_package.as_str()),
+                ("targetPackage", params.target_package.as_str()),
+            ] {
+                if let Err(e) = validate_java_package_name(pkg, field) {
+                    return err(format!("java.movePackage: {e}"));
+                }
+            }
+            if params.old_package == params.target_package {
+                return err("java.movePackage: oldPackage and targetPackage are identical");
+            }
+
+            let candidate_paths = if let Some(files) = &params.files {
+                let mut paths = Vec::new();
+                for file in files {
+                    match resolve_workspace_file(&root, file, "java.movePackage") {
+                        Ok(path) => paths.push(path),
+                        Err(e) => return err(e),
+                    }
+                }
+                paths
+            } else {
+                match collect_java_files(&root) {
+                    Ok(files) => files,
+                    Err(e) => return err(format!("java.movePackage: {e}")),
+                }
+            };
+
+            let mut moving = Vec::new();
+            for path in candidate_paths {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+                let pkg = extract_package_name(&text);
+                if pkg.as_deref() == Some(params.old_package.as_str()) {
+                    moving.push((path, text));
+                } else if params.files.is_some() {
+                    return err(format!(
+                        "java.movePackage: {} declares package {:?}, not {}",
+                        path.display(),
+                        pkg,
+                        params.old_package
+                    ));
+                }
+            }
+            if moving.is_empty() {
+                return err(format!(
+                    "java.movePackage: no Java files declaring `{}` found",
+                    params.old_package
+                ));
+            }
+
+            let moving_paths: BTreeSet<PathBuf> =
+                moving.iter().map(|(path, _)| path.clone()).collect();
+            let old_prefix = format!("{}.", params.old_package);
+            let new_prefix = format!("{}.", params.target_package);
+            let mut creates = Vec::new();
+            let mut deletes = Vec::new();
+            let mut would_create_files = Vec::new();
+            let mut would_delete_files = Vec::new();
+            let mut findings = Vec::new();
+            for (path, text) in &moving {
+                let rel = match relativize(&root, &path.to_string_lossy()) {
+                    Ok(rel) => rel,
+                    Err(e) => return err(format!("java.movePackage: {e}")),
+                };
+                let target_rel = default_target_for_package(
+                    &rel,
+                    &params.old_package,
+                    &params.target_package,
+                )
+                .to_string_lossy()
+                .to_string();
+                if target_rel == rel {
+                    return err(format!(
+                        "java.movePackage: target path for {rel} resolves to itself"
+                    ));
+                }
+                let (package_rewritten, replaced_package) =
+                    replace_package_decl(text, &params.target_package);
+                let (target_content, refs_rewritten) =
+                    replace_literal_all(&package_rewritten, &old_prefix, &new_prefix);
+                creates.push(json!({ "path": target_rel, "content": target_content }));
+                would_create_files.push(json!({ "path": target_rel }));
+                match file_delete_value(&root, path) {
+                    Ok(delete) => deletes.push(delete),
+                    Err(e) => return err(format!("java.movePackage: {e}")),
+                }
+                would_delete_files.push(json!({ "path": rel }));
+                findings.push(json!({
+                    "finding": "moved_package_file",
+                    "source": rel,
+                    "target": target_rel,
+                    "replaced_existing_package_decl": replaced_package,
+                    "self_reference_rewrites": refs_rewritten,
+                }));
+            }
+
+            let mut file_edits = Vec::new();
+            let java_files = match collect_java_files(&root) {
+                Ok(files) => files,
+                Err(e) => return err(format!("java.movePackage: {e}")),
+            };
+            for path in java_files {
+                if moving_paths.contains(&path) {
+                    continue;
+                }
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+                let mut edits = Vec::new();
+                let mut search_start = 0usize;
+                while let Some(rel_start) = text[search_start..].find(&old_prefix) {
+                    let start = search_start + rel_start;
+                    edits.push(bbox_refactor::TextEdit {
+                        byte_start: start,
+                        byte_end: start + old_prefix.len(),
+                        replacement: new_prefix.clone(),
+                    });
+                    search_start = start + old_prefix.len();
+                }
+                if !edits.is_empty() {
+                    file_edits.push(bbox_refactor::FileEdit {
+                        path: path.to_string_lossy().to_string(),
+                        original_sha256: bbox_refactor::sha256_hex(text.as_bytes()),
+                        edits,
+                        new_text: None,
+                    });
+                }
+            }
+            let (mut changes, would_change_files) =
+                match file_edits_to_changes(&root, "java.movePackage", &file_edits) {
+                    Ok(converted) => converted,
+                    Err(e) => return err(format!("java.movePackage: {e}")),
+                };
+            let preview_only = params.preview_only.unwrap_or(false);
+            if preview_only {
+                changes.clear();
+                creates.clear();
+                deletes.clear();
+            }
+            ToolResult::Json(json!({
+                "title": format!("move Java package `{}` to `{}`", params.old_package, params.target_package),
+                "changes": changes,
+                "creates": creates,
+                "deletes": deletes,
+                "findings": findings,
+                "preview_only": preview_only,
+                "would_change_files": would_change_files,
+                "would_create_files": would_create_files,
+                "would_delete_files": would_delete_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -994,6 +1733,107 @@ RECIPE
   // compile, java.hygiene({ files: [file] }), compile again if hygiene changed
 "#;
 
+const RENAME_SYMBOL_CONTRACT: &str = r#"java.renameSymbol — project-wide syntax-backed Java symbol rename.
+
+WHAT IT DOES
+  Thin binding over the existing rename_java_symbol planner. It renames one
+  simple Java identifier across declaration and reference sites covered by the
+  v1 Java usage walker: type identifiers, method invocation names, field
+  accesses, method references, variable/formal/type parameter declarations, and
+  trailing import segments. It returns hash-anchored changes for edits.merge and
+  never writes. It does NOT rename files; public type renames return
+  file_rename_advisory so the operator can follow with java.moveClass or a
+  version-control-aware file move.
+
+PARAMS
+  oldName: string       old simple Java identifier
+  newName: string       new simple Java identifier
+  file?: string         optional declaration file used by the v1 planner as a
+                        validation hint
+  itemKinds?: string[]  optional v1 kind filter, e.g.
+                        ["class_declaration"], ["method_declaration"], or
+                        ["field_access", "variable_declarator"]
+  previewOnly?: boolean run the planner but omit changes
+
+RETURNS { title, changes, creates: [], deletes: [], findings, preview_only,
+          would_change_files, file_rename_advisory, provenance }
+
+RECIPE
+  const r = await java.renameSymbol({ oldName: "OldName", newName: "NewName",
+                                      itemKinds: ["class_declaration"] });
+  const es = await edits.begin();
+  await edits.merge({ es, changes: r.changes });
+  await edits.apply({ es });
+  // If file_rename_advisory is non-empty, follow with java.moveClass or git mv.
+"#;
+
+const MOVE_CLASS_CONTRACT: &str = r#"java.moveClass — move one Java source file to another package.
+
+WHAT IT DOES
+  Creates a relocated copy of one Java file with its package declaration changed
+  to targetPackage, rewrites project-wide imports/FQCN references from
+  old.package.ClassName to target.package.ClassName, and returns a hash-guarded
+  delete for the original source file. It is syntax-only and never writes.
+  Same-package simple-name references do not require edits and are left alone.
+
+PARAMS
+  file: string          workspace-relative Java source file to move
+  targetPackage: string destination Java package
+  targetFile?: string   destination file path. Default replaces the old package
+                        path segment in file with targetPackage's path, falling
+                        back to the nearest src/.../java root when needed.
+  className?: string    top-level type name. Default: source file stem.
+  previewOnly?: boolean run the planner but omit changes/creates/deletes
+
+RETURNS { title, changes, creates, deletes, findings, preview_only,
+          would_change_files, would_create_files, would_delete_files, provenance }
+  creates: {path, content}[] for edits.createFile
+  deletes: {path, content_sha256}[] for edits.deleteFile
+  changes: import/FQCN rewrites for edits.merge
+
+RECIPE
+  const r = await java.moveClass({
+    file: "src/main/java/com/acme/old/Foo.java",
+    targetPackage: "com.acme.new"
+  });
+  const es = await edits.begin();
+  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  for (const d of r.deletes) await edits.deleteFile({ es, path: d.path, contentSha256: d.content_sha256 });
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  await edits.apply({ es });
+"#;
+
+const MOVE_PACKAGE_CONTRACT: &str = r#"java.movePackage — move every file declaring one package to another package.
+
+WHAT IT DOES
+  Finds Java files declaring oldPackage (or validates the explicit files list),
+  creates relocated copies with package declarations changed to targetPackage,
+  rewrites project-wide oldPackage.* imports/FQCN references to targetPackage.*,
+  and returns hash-guarded deletes for the old files. It is syntax-only and
+  never writes. It does not update non-Java config.
+
+PARAMS
+  oldPackage: string    package to move
+  targetPackage: string destination package
+  files?: string[]      optional explicit files to move; each must declare
+                        oldPackage
+  previewOnly?: boolean run the planner but omit changes/creates/deletes
+
+RETURNS { title, changes, creates, deletes, findings, preview_only,
+          would_change_files, would_create_files, would_delete_files, provenance }
+
+RECIPE
+  const r = await java.movePackage({
+    oldPackage: "com.acme.old",
+    targetPackage: "com.acme.new"
+  });
+  const es = await edits.begin();
+  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  for (const d of r.deletes) await edits.deleteFile({ es, path: d.path, contentSha256: d.content_sha256 });
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  await edits.apply({ es });
+"#;
+
 const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
 
 WHAT IT DOES
@@ -1080,6 +1920,9 @@ impl Tool for JavaDescribe {
             "extractMethodCodeBlock" => {
                 ToolResult::Json(json!({ "contract": EXTRACT_METHOD_CODE_BLOCK_CONTRACT }))
             }
+            "renameSymbol" => ToolResult::Json(json!({ "contract": RENAME_SYMBOL_CONTRACT })),
+            "moveClass" => ToolResult::Json(json!({ "contract": MOVE_CLASS_CONTRACT })),
+            "movePackage" => ToolResult::Json(json!({ "contract": MOVE_PACKAGE_CONTRACT })),
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -1098,7 +1941,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -2582,6 +3425,9 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaExtractClass) as Arc<dyn Tool>,
         Arc::new(JavaExtractClassPreviewPlan) as Arc<dyn Tool>,
         Arc::new(JavaExtractMethodCodeBlock) as Arc<dyn Tool>,
+        Arc::new(JavaRenameSymbol) as Arc<dyn Tool>,
+        Arc::new(JavaMoveClass) as Arc<dyn Tool>,
+        Arc::new(JavaMovePackage) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
@@ -2598,11 +3444,14 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns {changes, creates, findings} for the edits algebra — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan — one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock — extract one contiguous code block into a helper method after analysis.methodRegions gates; removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers — post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs — never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass — move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan — one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock — extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol — project-wide Java simple-symbol rename via the v1 planner; moveClass — relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage — relocate every file declaring a package to another package; removeUnusedConstructorParams — drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers — post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene — routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaExtractMethodResult = { title: string; changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
+type JavaDelete = { path: string; content_sha256: string };
+type JavaMoveResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: JavaDelete[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes?: number }[]; would_delete_files: { path: string }[]; provenance: "syntax_only" };
+type JavaRenameResult = { title: string; changes: SpanChange[]; creates: []; deletes: []; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; file_rename_advisory: { from: string; to: string }[]; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -2615,6 +3464,12 @@ declare const java: {
   extractClass(args: { file: string; target: string; delegateField: string; methods: string[]; moveFields?: string[]; className?: string; wiring?: "own_construction" | "external_injection" | "none"; wrappers?: boolean; previewOnly?: boolean }): Promise<JavaTransformResult>;
   /** Extract one exact contiguous code block into a helper method. Run analysis.methodRegions first for contiguity/live-out gates. changes → edits.merge. Refuses mutated captures and non-local control flow. Multiple live-outs refuse by default; pass resultRecord:true only when they are real top-level outputs with explicit types. */
   extractMethodCodeBlock(args: { file: string; oldText: string; methodName: string; className?: string; visibility?: "private" | "package-private" | "protected" | "public"; newText?: string; parameters?: Array<{ type: string; name: string }>; arguments?: string[]; returnType?: string; returnVar?: string; resultRecord?: boolean; resultRecordName?: string; resultRecordVar?: string; previewOnly?: boolean }): Promise<JavaExtractMethodResult>;
+  /** Rename one Java simple symbol across declaration/reference sites. Does not rename files; inspect file_rename_advisory for public type renames. */
+  renameSymbol(args: { oldName: string; newName: string; file?: string; itemKinds?: string[]; previewOnly?: boolean }): Promise<JavaRenameResult>;
+  /** Move one Java source file to another package. Apply creates with edits.createFile, deletes with edits.deleteFile, and changes with edits.merge. */
+  moveClass(args: { file: string; targetPackage: string; targetFile?: string; className?: string; previewOnly?: boolean }): Promise<JavaMoveResult>;
+  /** Move every Java file declaring oldPackage to targetPackage. Optional files narrows and validates the set. */
+  movePackage(args: { oldPackage: string; targetPackage: string; files?: string[]; previewOnly?: boolean }): Promise<JavaMoveResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */

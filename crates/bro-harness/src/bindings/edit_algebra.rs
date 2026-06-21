@@ -58,11 +58,20 @@ struct CreateFile {
     content: String,
 }
 
+/// One pending file deletion, pinned to the file hash observed by the
+/// transform/fact producer.
+#[derive(Debug, Clone)]
+struct DeleteFile {
+    path: String,
+    expected_sha256: String,
+}
+
 /// A host-side EditSet under construction.
 #[derive(Debug, Clone, Default)]
 struct EditSetState {
     files: BTreeMap<String, FileAccum>,
     creates: Vec<CreateFile>,
+    deletes: Vec<DeleteFile>,
 }
 
 /// Session-scoped store of live EditSets. One store is constructed per
@@ -377,6 +386,76 @@ impl Tool for EditsCreateFile {
     }
 }
 
+/// `edits.deleteFile` — queue deletion of an existing file.
+pub struct EditsDeleteFile(pub Arc<EditStore>);
+
+#[derive(Deserialize)]
+struct DeleteFileParams {
+    es: String,
+    path: String,
+    #[serde(rename = "contentSha256", alias = "content_sha256")]
+    content_sha256: String,
+}
+
+#[async_trait]
+impl Tool for EditsDeleteFile {
+    fn name(&self) -> &str {
+        "edits.deleteFile"
+    }
+    fn description(&self) -> &str {
+        "Queue deletion of an existing file, hash-guarded like a Span edit (pure; builds, never writes). Apply bounces with `stale_delete` if the file changed or disappeared."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "es": { "type": "string", "description": "EditSet id from edits.begin." },
+                "path": { "type": "string", "description": "Existing file to delete. Relative paths resolve against the session worktree root." },
+                "contentSha256": { "type": "string", "description": "sha256 of the file content observed when the delete was planned." }
+            },
+            "required": ["es", "path", "contentSha256"]
+        })
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("edits".to_string(), "deleteFile".to_string()))
+    }
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let params: DeleteFileParams = match decode(
+            "edits.deleteFile",
+            "{ es: string, path: string, contentSha256: string }",
+            input,
+        ) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let result = self.0.with_set(&params.es, |set| {
+            if set.files.contains_key(&params.path)
+                || set.creates.iter().any(|c| c.path == params.path)
+            {
+                return Err(format!(
+                    "EditSet `{}` already edits or creates {}",
+                    params.es, params.path
+                ));
+            }
+            if set.deletes.iter().any(|d| d.path == params.path) {
+                return Err(format!(
+                    "EditSet `{}` already deletes {}",
+                    params.es, params.path
+                ));
+            }
+            set.deletes.push(DeleteFile {
+                path: params.path.clone(),
+                expected_sha256: params.content_sha256.clone(),
+            });
+            Ok(set.deletes.len())
+        });
+        match result {
+            Ok(deletes) => ToolResult::Json(json!({ "es": params.es, "deletes": deletes })),
+            Err(e) => err(format!("edits.deleteFile: {e}")),
+        }
+    }
+}
+
 /// `edits.merge` — fold span-shaped changes (e.g. lsp.rename output) into
 /// an EditSet: server-authored and cell-authored edits compose into ONE
 /// artifact (refactor-tools-v2 §3.2). The consumption point of the
@@ -540,7 +619,7 @@ impl Tool for EditsApply {
             Ok(s) => s,
             Err(e) => return err(format!("edits.apply: {e}")),
         };
-        if set.files.is_empty() && set.creates.is_empty() {
+        if set.files.is_empty() && set.creates.is_empty() && set.deletes.is_empty() {
             return err(format!("edits.apply: EditSet `{}` is empty", params.es));
         }
 
@@ -549,7 +628,7 @@ impl Tool for EditsApply {
         // semantic_status is the weakest link across every member; file
         // creations are cell-authored content, so they count syntax_only.
         let mut lineage_lsp = 0usize;
-        let mut lineage_syntax = set.creates.len();
+        let mut lineage_syntax = set.creates.len() + set.deletes.len();
         for accum in set.files.values() {
             for le in &accum.edits {
                 match le.tier {
@@ -580,6 +659,17 @@ impl Tool for EditsApply {
                     resolved_creates.push((create.path.clone(), path, create.content.clone()))
                 }
                 Err(e) => return err(format!("edits.apply: {}: {e}", create.path)),
+            }
+        }
+        let mut resolved_deletes: Vec<(String, PathBuf, String)> = Vec::new();
+        for delete in &set.deletes {
+            match bro_tools::workspace::resolve_in_root(&cx.root, &delete.path) {
+                Ok(path) => resolved_deletes.push((
+                    delete.path.clone(),
+                    path,
+                    delete.expected_sha256.clone(),
+                )),
+                Err(e) => return err(format!("edits.apply: {}: {e}", delete.path)),
             }
         }
 
@@ -641,6 +731,30 @@ impl Tool for EditsApply {
                     ));
                 }
             }
+            for (file, path, expected_sha256) in &resolved_deletes {
+                match read_file_bytes(path) {
+                    Ok(bytes) => {
+                        let current = sha256_hex(&bytes);
+                        if &current != expected_sha256 {
+                            findings.push(finding(
+                                "stale_delete",
+                                file,
+                                format!(
+                                    "content changed since delete was planned (delete hash {}, current {current})",
+                                    expected_sha256
+                                ),
+                                "re-plan the file move/delete from fresh file contents",
+                            ));
+                        }
+                    }
+                    Err(e) => findings.push(finding(
+                        "stale_delete",
+                        file,
+                        format!("file unreadable: {e}"),
+                        "re-plan the file move/delete from fresh file contents",
+                    )),
+                }
+            }
             if !findings.is_empty() {
                 // EditSet retained so a repair cell can inspect/rebuild.
                 return ToolResult::Json(json!({
@@ -654,8 +768,10 @@ impl Tool for EditsApply {
             // ---- Write pass (snapshot first, rollback on any failure) ----
             let mut written: Vec<(String, PathBuf, Vec<u8>, usize)> = Vec::new(); // pre_image kept for rollback
             let mut created: Vec<(String, PathBuf)> = Vec::new();
+            let mut deleted: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
             let rollback = |written: &[(String, PathBuf, Vec<u8>, usize)],
-                            created: &[(String, PathBuf)]|
+                            created: &[(String, PathBuf)],
+                            deleted: &[(String, PathBuf, Vec<u8>)]|
              -> Vec<String> {
                 let mut errors = Vec::new();
                 for (file, path, pre_image, _) in written {
@@ -668,12 +784,17 @@ impl Tool for EditsApply {
                         errors.push(format!("{file}: created-file removal failed: {e:#}"));
                     }
                 }
+                for (file, path, pre_image) in deleted {
+                    if let Err(e) = write_atomic(path, pre_image) {
+                        errors.push(format!("{file}: deleted-file restore failed: {e:#}"));
+                    }
+                }
                 errors
             };
 
             for (file, path, pre_image, new_text) in &planned {
                 if let Err(e) = write_atomic(path, new_text.as_bytes()) {
-                    let rollback_errors = rollback(&written, &created);
+                    let rollback_errors = rollback(&written, &created, &deleted);
                     return ToolResult::Json(json!({
                         "applied": false,
                         "es": es_id,
@@ -687,7 +808,7 @@ impl Tool for EditsApply {
             }
             for (file, path, content) in &resolved_creates {
                 if let Err(e) = write_atomic_noclobber(path, content.as_bytes()) {
-                    let rollback_errors = rollback(&written, &created);
+                    let rollback_errors = rollback(&written, &created, &deleted);
                     return ToolResult::Json(json!({
                         "applied": false,
                         "es": es_id,
@@ -698,6 +819,34 @@ impl Tool for EditsApply {
                     }));
                 }
                 created.push((file.clone(), path.clone()));
+            }
+            for (file, path, _expected_sha256) in &resolved_deletes {
+                let pre_image = match read_file_bytes(path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let rollback_errors = rollback(&written, &created, &deleted);
+                        return ToolResult::Json(json!({
+                            "applied": false,
+                            "es": es_id,
+                            "findings": [finding("stale_delete", file, format!("file unreadable: {e}"), "re-plan the file move/delete from fresh file contents")],
+                            "rolled_back": true,
+                            "rollback_errors": rollback_errors,
+                            "semantic_status": semantic_status,
+                        }));
+                    }
+                };
+                if let Err(e) = remove_created(path) {
+                    let rollback_errors = rollback(&written, &created, &deleted);
+                    return ToolResult::Json(json!({
+                        "applied": false,
+                        "es": es_id,
+                        "findings": [finding("delete_failed", file, format!("{e:#}"), "filesystem error — inspect and retry")],
+                        "rolled_back": true,
+                        "rollback_errors": rollback_errors,
+                        "semantic_status": semantic_status,
+                    }));
+                }
+                deleted.push((file.clone(), path.clone(), pre_image));
             }
 
             // ---- Post-write validation ----
@@ -724,7 +873,7 @@ impl Tool for EditsApply {
                     }
                 }
                 if !parse_findings.is_empty() {
-                    let rollback_errors = rollback(&written, &created);
+                    let rollback_errors = rollback(&written, &created, &deleted);
                     return ToolResult::Json(json!({
                         "applied": false,
                         "es": es_id,
@@ -773,6 +922,14 @@ impl Tool for EditsApply {
                         post_sha256: post_sha.clone(),
                     });
                 }
+                for (_file, path, pre_image) in &deleted {
+                    sink.push(bro_tools::edits::EditEvent {
+                        path: path.clone(),
+                        pre_image: pre_image.clone(),
+                        pre_sha256: sha256_hex(pre_image),
+                        post_sha256: sha256_hex(&[]),
+                    });
+                }
             }
             store.consume(&es_id);
 
@@ -789,6 +946,15 @@ impl Tool for EditsApply {
                 })
                 .chain(created_posts.iter().map(|(file, _, post_sha)| {
                     json!({ "file": file, "created": true, "content_sha256": post_sha })
+                }))
+                .chain(deleted.iter().map(|(file, _, pre_image)| {
+                    json!({
+                        "file": file,
+                        "deleted": true,
+                        "bytes_before": pre_image.len(),
+                        "bytes_after": 0,
+                        "content_sha256": sha256_hex(&[]),
+                    })
                 }))
                 .collect();
             ToolResult::Json(json!({
@@ -824,6 +990,7 @@ pub fn tools(store: Arc<EditStore>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dy
         Arc::new(EditsInsertBefore(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsDelete(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsCreateFile(Arc::clone(&store))) as Arc<dyn Tool>,
+        Arc::new(EditsDeleteFile(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsMerge(Arc::clone(&store), ledger)) as Arc<dyn Tool>,
         Arc::new(EditsApply(store)) as Arc<dyn Tool>,
     ]
@@ -1082,6 +1249,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_file_applies_hash_guarded_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let original = std::fs::read(root.join("probe.rs")).unwrap();
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        json_of(
+            EditsDeleteFile(store.clone())
+                .call(
+                    json!({
+                        "es": es,
+                        "path": "probe.rs",
+                        "contentSha256": bbox_refactor::sha256_hex(&original),
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["summary"][0]["deleted"], true, "{result}");
+        assert!(!root.join("probe.rs").exists());
+        let events = cx.edits.lock().unwrap().events().to_vec();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].pre_image, original);
+        assert_eq!(events[0].post_sha256, bbox_refactor::sha256_hex(&[]));
+    }
+
+    #[tokio::test]
     async fn span_hash_conflict_fails_at_algebra_time() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -1261,11 +1461,11 @@ mod tests {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "edits".to_string(),
-        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, invalid_edits, create_exists, parse_error_after_apply, write_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile content, and any hand-rewritten change floor at syntax_only. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
+        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / deleteFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, stale_delete, invalid_edits, create_exists, parse_error_after_apply, write_failed, delete_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile/deleteFile entries, and any hand-rewritten change floor at syntax_only. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
             .to_string(),
-        declarations: r#"type Finding = { kind: "stale_span" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed"; file: string; detail: string; resolution_hint: string };
+        declarations: r#"type Finding = { kind: "stale_span" | "stale_delete" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed" | "delete_failed"; file: string; detail: string; resolution_hint: string };
 type SemanticStatus = "lsp_verified" | "syntax_only";  // lineage-computed weakest link, recomputed host-side at apply — cell-supplied claims are ignored
-type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; content_sha256: string }[]; semantic_status: SemanticStatus; lineage: { lsp_verified: number; syntax_only: number }; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation — mint fresh Spans from it without re-calling code.items
+type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; deleted?: boolean; content_sha256: string }[]; semantic_status: SemanticStatus; lineage: { lsp_verified: number; syntax_only: number }; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation — mint fresh Spans from it without re-calling code.items
 type Bounced = { applied: false; es: string; findings: Finding[]; rolled_back?: boolean; semantic_status: SemanticStatus };
 declare const edits: {
   /** Open a fresh EditSet (host-side, session-scoped; survives across cells by id). */
@@ -1280,6 +1480,8 @@ declare const edits: {
   delete(args: { es: string; span: Span }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue creation of a new file (pure; never writes; bounces if it exists at apply). */
   createFile(args: { es: string; path: string; content: string }): Promise<{ es: string; creates: number }>;
+  /** Queue deletion of an existing file, hash-guarded like a Span edit (pure; never writes; bounces if it changed or disappeared). */
+  deleteFile(args: { es: string; path: string; contentSha256: string }): Promise<{ es: string; deletes: number }>;
   /** Fold span-shaped changes (e.g. lsp.rename().changes) into the set — server-authored edits join the same artifact (pure; never writes). `ledgered` counts changes the provenance ledger recognized as host-issued (they keep their authority tier at apply; unrecognized changes floor at syntax_only). */
   merge(args: { es: string; changes: { span: Span; new_text: string }[] }): Promise<{ es: string; merged: number; ledgered: number }>;
   /** THE choke point: apply the EditSet. Clean → Applied (EditSet consumed). Detected condition → Bounced with findings (EditSet retained for repair; writes rolled back). */
