@@ -76,7 +76,7 @@ impl ToolCategory {
                 "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run plans, hash-checked apply, transaction composition, file moves, and parse validation. Inspection is multi-language for supported grammars; writable plan kinds may be generic or language-scoped. Pull `sm-refactor` first, then any relevant language runbook via `bbox_knowledge` for exact plan kinds, arguments, and validation expectations. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
             }
             Self::Knowledge => {
-                "Memory lanes: `bbox_learn` for rendered rules, `bbox_remember` for cold recall, `bbox_decide` for durable commitments, and `bbox_pin` for scoped active context."
+                "Memory lanes: `bbox_learn` for operator-approved rendered rules, `bbox_remember` for approved cold recall, `bbox_decide` for approved durable commitments, and `bbox_pin` for scoped active context."
             }
             Self::Threads => {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
@@ -558,8 +558,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
-        summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
-        when_to_use: "Use for standing user rules that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing — that's arc-bound; route to `bbox_pin`. Not for one-off task constraints, not for facts you discovered yourself (that's `bbox_note(kind=\"learned\")`). Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
+        summary: "Persist an operator-approved rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\") only after the operator has approved the exact content and scope. If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism, use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
+        when_to_use: "Use only after the operator has approved the exact text and scope for a standing user rule that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing is arc-bound; route to `bbox_pin`. Not for one-off task constraints, not for facts you discovered yourself (that's `bbox_note(kind=\"learned\")`). Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
         ),
@@ -1822,7 +1822,7 @@ explicit operator confirmation: terminal status is not the same as done, so ask 
 before pruning terminal tasks with `bro_prune` (offer `retro=true`) or dissolving \
 ad hoc teams. Cleanup is operator-gated, not automatic.
 - Memory lanes: `bbox_thread` (investigation state), \
-`bbox_learn`/`bbox_decide` (standing rules / commitments), \
+`bbox_learn`/`bbox_decide` (operator-approved standing rules / commitments), \
 `bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \
 The one-year test picks between rendered and pin — would it still be correct \
 a year from now with current arcs done?
@@ -1832,7 +1832,7 @@ review — reach for `bro_orchestrate_run` with a mermaid-shaped spec \
 instead of pasting a discipline-protocol into an LLM and hoping it \
 won't drift. The daemon owns the state machine; the LLM is a turn. \
 See `sm-workflow-orchestration` via `bbox_knowledge`.
-- `bbox_learn` is for user-stated rules; `bbox_note(kind=learned)` is for \
+- `bbox_learn` is for operator-approved, user-stated rules; `bbox_note(kind=learned)` is for \
 agent-discovered facts.
 - For long-running bro work, instruct dispatched agents and workflow hook nodes \
 to call `bro_report` at major milestones. `bro_dashboard` should show the last \
@@ -1927,16 +1927,16 @@ pub fn render_markdown() -> String {
         "Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n",
     );
 
-    out.push_str("## CORE RULE: capture durable user directives\n\n");
-    out.push_str("**When the user states a rule, convention, or preference meant to bind future sessions, your response MUST include a `bbox_learn` (or `bbox_remember` / `bbox_decide`) call BEFORE you wrap up the task.** Mechanical enforcement — a `.gitignore` entry, a linter config, deleted code, a removed dependency — does not replace this. It enforces the rule for the current edit; it does NOT transmit the *intent* to a future session that won't see this turn. Skipping the call means the rule silently rots and a future agent re-derives the wrong answer.\n\n");
+    out.push_str("## CORE RULE: operator-approved persistence\n\n");
+    out.push_str("**When the user states a rule, convention, or preference that may need to bind future sessions, do not immediately call `bbox_learn`, `bbox_remember`, or `bbox_decide`.** First decide whether persistence is warranted, then present the proposed memory text, lane, and scope to the operator and wait for explicit approval. Mechanical enforcement in code/config can enforce the current edit but does not transmit intent to future sessions; persistence still requires approval unless the operator has already approved the exact memory write in the current turn.\n\n");
     out.push_str("Triggers (positive and negative bind equally): \"from now on\", \"always X\", \"never X\", \"we (don't) use Y\", \"prefer Y\", \"X is banned / retired / out of scope\", \"stop using X\", \"no more X\", \"house rule\", \"standing order\", \"keep X out of\", \"X must not\".\n\n");
-    out.push_str("Lane selection — once you've decided the content should persist, walk the ladder and stop at the first yes:\n\n");
+    out.push_str("Lane selection - when preparing a persistence proposal, walk the ladder and stop at the first yes:\n\n");
     out.push_str("1. Is this investigation state tied to one debug/QC walk? → `bbox_thread`\n");
-    out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → `bbox_learn` or `bbox_decide`\n");
-    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → `bbox_remember`\n");
-    out.push_str("4. Otherwise — arc-bound guidance that must stay hot for one execution lane — → `bbox_pin`\n\n");
+    out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → propose `bbox_learn` or `bbox_decide`\n");
+    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → propose `bbox_remember`\n");
+    out.push_str("4. Otherwise - arc-bound guidance that must stay hot for one execution lane - → `bbox_pin`\n\n");
     out.push_str("The one-year test at step 2 is the load-bearing filter. Content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing fails it and belongs in `bbox_pin`, not `bbox_learn`. Ephemeral task constraints (\"for this fix, skip tests\", \"just for today\") don't get persisted at all.\n\n");
-    out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, emit the storage call before replying.\n\n");
+    out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, propose the exact storage text, lane, and scope before replying; only emit the storage call after the operator approves it.\n\n");
 
     out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");
 
