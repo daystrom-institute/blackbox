@@ -7902,10 +7902,10 @@ impl Tool for JavaInlineMethod {
     }
 }
 
-/// `java.moveMemberPreview` - preview moving Java fields/constants to a target class.
+/// `java.moveMemberPreview` - preview moving Java fields/constants/methods to a target class.
 pub struct JavaMoveMemberPreview;
 
-/// `java.moveMember` - apply a previewed Java field/constant move.
+/// `java.moveMember` - apply a previewed Java field/constant/method move.
 pub struct JavaMoveMember;
 
 #[derive(Deserialize)]
@@ -7962,6 +7962,12 @@ struct JavaMoveMemberParams {
     acknowledge_remaining_accessors: Option<bool>,
     #[serde(
         default,
+        rename = "acknowledgeRemainingSourceReferences",
+        alias = "acknowledge_remaining_source_references"
+    )]
+    acknowledge_remaining_source_references: Option<bool>,
+    #[serde(
+        default,
         rename = "previewOnly",
         alias = "preview_only",
         alias = "preview"
@@ -7973,8 +7979,9 @@ fn normalize_move_member_kind(kind: Option<&str>) -> Result<&'static str, String
     match kind.unwrap_or("field") {
         "field" | "instance_field" => Ok("field"),
         "constant" | "static_final" => Ok("constant"),
+        "method" | "instance_method" => Ok("method"),
         other => Err(format!(
-            "java.moveMemberPreview: memberKind must be field or constant, got `{other}`"
+            "java.moveMemberPreview: memberKind must be field, constant, or method, got `{other}`"
         )),
     }
 }
@@ -8004,6 +8011,11 @@ fn plan_move_member(
             .map_err(|e| format!("java.moveMemberPreview: {e}"))?;
     }
     let kind = normalize_move_member_kind(params.member_kind.as_deref())?;
+    if kind == "method" {
+        return Err(
+            "java.moveMemberPreview: method moves use the harness-native method path".to_string(),
+        );
+    }
     let mut plan_input = json!({
         "kind": if kind == "constant" { "move_java_constant" } else { "move_java_field" },
         "project_dir": root.to_string_lossy(),
@@ -8123,11 +8135,110 @@ fn move_member_changes_from_plan(
     Ok((changes, creates, would_change_files, would_create_files))
 }
 
+fn move_method_preview_value(
+    root: &Path,
+    params: &JavaMoveMemberPreviewParams,
+) -> Result<Value, String> {
+    if params.member_names.is_empty() {
+        return Err("java.moveMemberPreview: memberNames must not be empty".to_string());
+    }
+    let preview_params = JavaPushDownMembersPreviewParams {
+        file: params.file.clone(),
+        target: params.target.clone(),
+        class_name: None,
+        target_type_name: params.target_class_name.clone(),
+    };
+    let preview = pushdown_preview_value(root, &preview_params)
+        .map_err(|e| e.replace("java.pushDownMembersPreview", "java.moveMemberPreview"))?;
+    let wanted = params
+        .member_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let members = preview["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|candidate| {
+            candidate["member_kind"].as_str() == Some("method")
+                && candidate["name"]
+                    .as_str()
+                    .is_some_and(|name| wanted.contains(name))
+        })
+        .map(|candidate| {
+            json!({
+                "ref": candidate["ref"].clone(),
+                "name": candidate["name"].clone(),
+                "kind": "method_declaration",
+                "byte_start": candidate["span"]["byte_start"].clone(),
+                "byte_end": candidate["span"]["byte_end"].clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut findings = Vec::new();
+    let found = members
+        .iter()
+        .filter_map(|member| member["name"].as_str())
+        .collect::<BTreeSet<_>>();
+    for missing in wanted.iter().filter(|name| !found.contains(**name)) {
+        findings.push(json!({
+            "finding": "member_not_found",
+            "severity": "blocker",
+            "name": missing,
+        }));
+    }
+    for candidate in preview["candidates"].as_array().into_iter().flatten() {
+        if candidate["member_kind"].as_str() != Some("method")
+            || !candidate["name"]
+                .as_str()
+                .is_some_and(|name| wanted.contains(name))
+        {
+            continue;
+        }
+        for blocker in candidate["blockers"].as_array().into_iter().flatten() {
+            findings.push(json!({
+                "finding": "member_blocker",
+                "severity": "blocker",
+                "ref": candidate["ref"],
+                "name": candidate["name"],
+                "blocker": blocker,
+            }));
+        }
+        for warning in candidate["warnings"].as_array().into_iter().flatten() {
+            findings.push(json!({
+                "finding": "member_warning",
+                "severity": "review",
+                "ref": candidate["ref"],
+                "name": candidate["name"],
+                "warning": warning,
+            }));
+        }
+    }
+    let blocked = findings
+        .iter()
+        .any(|finding| finding["severity"].as_str() == Some("blocker"));
+    Ok(json!({
+        "file": params.file,
+        "target": params.target,
+        "member_kind": "method",
+        "members": members,
+        "findings": findings,
+        "blocked": blocked,
+        "would_change_files": [],
+        "would_create_files": [],
+        "ref_model": "preview-local method refs derived from declaration byte range and hash; not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
 fn move_member_preview_value(
     root: &Path,
     params: &JavaMoveMemberPreviewParams,
 ) -> Result<Value, String> {
     let kind = normalize_move_member_kind(params.member_kind.as_deref())?;
+    if kind == "method" {
+        return move_method_preview_value(root, params);
+    }
     let plan = plan_move_member(root, params)?;
     let member_refs = move_member_refs(root, params, &plan)?;
     let (_, _, would_change_files, would_create_files) =
@@ -8176,7 +8287,7 @@ impl Tool for JavaMoveMemberPreview {
         "java.moveMemberPreview"
     }
     fn description(&self) -> &str {
-        "Preview moving Java instance fields or static final constants to a target class. Returns lightweight member refs, remaining-accessor findings, and edit/create summaries. Pure; never writes."
+        "Preview moving Java instance fields, static final constants, or concrete methods to a target class. Returns lightweight member refs, safety findings, and edit/create summaries. Pure; never writes."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -8185,7 +8296,7 @@ impl Tool for JavaMoveMemberPreview {
                 "file": { "type": "string" },
                 "target": { "type": "string" },
                 "memberNames": { "type": "array", "items": { "type": "string" } },
-                "memberKind": { "type": "string", "enum": ["field", "constant"] },
+                "memberKind": { "type": "string", "enum": ["field", "constant", "method"] },
                 "visibility": { "type": "string" },
                 "keepCopy": { "type": "boolean" },
                 "targetPrelude": { "type": "string" },
@@ -8227,7 +8338,7 @@ impl Tool for JavaMoveMember {
         "java.moveMember"
     }
     fn description(&self) -> &str {
-        "Apply java.moveMemberPreview refs for field/constant moves. Re-plans, refuses stale member refs or unacknowledged remaining source accessors, and returns edit/create payloads. Pure; never writes."
+        "Apply java.moveMemberPreview refs for field/constant/method moves. Re-plans, refuses stale refs or unacknowledged remaining source accessors/references, and returns edit/create payloads. Pure; never writes."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -8237,12 +8348,13 @@ impl Tool for JavaMoveMember {
                 "target": { "type": "string" },
                 "memberNames": { "type": "array", "items": { "type": "string" } },
                 "memberRefs": { "type": "array", "items": { "type": "string" } },
-                "memberKind": { "type": "string", "enum": ["field", "constant"] },
+                "memberKind": { "type": "string", "enum": ["field", "constant", "method"] },
                 "visibility": { "type": "string" },
                 "keepCopy": { "type": "boolean" },
                 "targetPrelude": { "type": "string" },
                 "targetClassName": { "type": "string" },
                 "acknowledgeRemainingAccessors": { "type": "boolean" },
+                "acknowledgeRemainingSourceReferences": { "type": "boolean" },
                 "previewOnly": { "type": "boolean" }
             },
             "required": ["file", "target", "memberNames", "memberRefs"]
@@ -8266,6 +8378,36 @@ impl Tool for JavaMoveMember {
                 ));
             }
         };
+        if normalize_move_member_kind(params.member_kind.as_deref()) == Ok("method") {
+            let push_args = json!({
+                "file": params.file,
+                "target": params.target,
+                "targetTypeName": params.target_class_name,
+                "memberRefs": params.member_refs,
+                "commentPolicy": "move",
+                "acknowledgeRemainingSourceReferences": params.acknowledge_remaining_source_references,
+                "previewOnly": params.preview_only,
+            });
+            let result = JavaPushDownMembers.call(push_args, cx).await;
+            return match result {
+                ToolResult::Json(mut value) => {
+                    if let Some(findings) = value["findings"].as_array_mut() {
+                        findings.retain(|finding| {
+                            finding["finding"].as_str() != Some("hierarchy_warning")
+                        });
+                    }
+                    if let Some(selected) = value.get("selected_refs").cloned() {
+                        value["selected_member_refs"] = selected;
+                    }
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("selected_refs");
+                    }
+                    value["title"] = json!("move Java method member");
+                    ToolResult::Json(value)
+                }
+                other => other,
+            };
+        }
         let root = cx.root.clone();
         bro_tools::tool::call_blocking(move || {
             let preview_params = JavaMoveMemberPreviewParams {
@@ -8899,14 +9041,15 @@ RECIPE
     methodRef: pv.method_ref });
 "#;
 
-const MOVE_MEMBER_CONTRACT: &str = r#"java.moveMemberPreview / java.moveMember - syntax-only Java field/constant move.
+const MOVE_MEMBER_CONTRACT: &str = r#"java.moveMemberPreview / java.moveMember - syntax-only Java field/constant/method move.
 
 WHAT IT DOES
-  Preview wraps the existing move_java_field and move_java_constant planners.
-  It moves named instance fields or static final constants from one Java class
-  file to another, returning preview-local member refs, remaining-accessor
-  findings, and edit/create summaries. Apply re-runs the planner, refuses stale
-  refs, and returns edits/create payloads.
+  Preview wraps the existing move_java_field and move_java_constant planners for
+  fields/constants, and the harness-native concrete-method mover for methods.
+  It moves named instance fields, static final constants, or concrete methods
+  from one Java class file to another, returning preview-local member refs,
+  safety findings, and edit/create summaries. Apply re-runs analysis, refuses
+  stale refs, and returns edits/create payloads.
 
 REF MODEL
   member refs are preview-local: member:<name>:<declaration-byte-range>:<hash>.
@@ -8915,16 +9058,18 @@ REF MODEL
 IMPORTANT LIMITS
   - memberKind:"field" handles instance fields and requires an existing target.
   - memberKind:"constant" handles static final constants and can create target.
-  - method movement to an existing target is not implemented by this wrapper yet.
-  - remaining source accessors are blockers unless explicitly acknowledged.
+  - memberKind:"method" handles concrete methods and requires an existing target.
+  - remaining source accessors/references are blockers unless acknowledged.
+  - method moves copy imports conservatively; run java.hygiene afterward.
 
 PARAMS
   file: string
   target: string
   memberNames: string[]
-  memberKind?: "field" | "constant"  default field
+  memberKind?: "field" | "constant" | "method"  default field
   memberRefs: string[]
   acknowledgeRemainingAccessors?: boolean
+  acknowledgeRemainingSourceReferences?: boolean
   previewOnly?: boolean
 
 RECIPE
@@ -10612,7 +10757,7 @@ type JavaMigrateTypeUsagesPreview = { file: string; content_sha256: string; old_
 type JavaMigrateTypeUsagesResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_migration_ref: string; selected_usage_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; provenance: "syntax_only" };
 type JavaInlineMethodPreview = { file: string; content_sha256: string; method_name: string; method_ref?: string | null; old_signature?: string | null; project_wide: boolean; call_sites: unknown[]; deletes: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaInlineMethodResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
-type JavaMoveMemberPreview = { file: string; target: string; member_kind: "field" | "constant"; members: Array<{ ref: string; name: string; kind: string; byte_start: number; byte_end: number }>; findings: unknown[]; blocked: boolean; would_change_files: unknown[]; would_create_files: unknown[]; ref_model: string; provenance: "syntax_only" };
+type JavaMoveMemberPreview = { file: string; target: string; member_kind: "field" | "constant" | "method"; members: Array<{ ref: string; name: string; kind: string; byte_start: number; byte_end: number }>; findings: unknown[]; blocked: boolean; would_change_files: unknown[]; would_create_files: unknown[]; ref_model: string; provenance: "syntax_only" };
 type JavaMoveMemberResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: unknown[]; selected_member_refs: string[]; preview_only: boolean; would_change_files: unknown[]; would_create_files: unknown[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
@@ -10663,9 +10808,9 @@ declare const java: {
   /** Apply previewed Java method inlining. */
   inlineMethod(args: { file: string; methodName: string; methodRef: string; className?: string; projectWide?: boolean; previewOnly?: boolean }): Promise<JavaInlineMethodResult>;
   /** Preview moving Java instance fields or static final constants to a target class. */
-  moveMemberPreview(args: { file: string; target: string; memberNames: string[]; memberKind?: "field" | "constant"; visibility?: "public" | "protected" | "private" | "package"; keepCopy?: boolean; targetPrelude?: string; targetClassName?: string }): Promise<JavaMoveMemberPreview>;
+  moveMemberPreview(args: { file: string; target: string; memberNames: string[]; memberKind?: "field" | "constant" | "method"; visibility?: "public" | "protected" | "private" | "package"; keepCopy?: boolean; targetPrelude?: string; targetClassName?: string }): Promise<JavaMoveMemberPreview>;
   /** Apply a previewed Java field/constant move. */
-  moveMember(args: { file: string; target: string; memberNames: string[]; memberRefs: string[]; memberKind?: "field" | "constant"; visibility?: "public" | "protected" | "private" | "package"; keepCopy?: boolean; targetPrelude?: string; targetClassName?: string; acknowledgeRemainingAccessors?: boolean; previewOnly?: boolean }): Promise<JavaMoveMemberResult>;
+  moveMember(args: { file: string; target: string; memberNames: string[]; memberRefs: string[]; memberKind?: "field" | "constant" | "method"; visibility?: "public" | "protected" | "private" | "package"; keepCopy?: boolean; targetPrelude?: string; targetClassName?: string; acknowledgeRemainingAccessors?: boolean; acknowledgeRemainingSourceReferences?: boolean; previewOnly?: boolean }): Promise<JavaMoveMemberResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -12335,6 +12480,79 @@ public class Base {
                 .unwrap()
                 .iter()
                 .any(|finding| finding["kind"] == "remaining_source_reference"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_member_moves_concrete_method_to_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Base.java"),
+            r#"package com.acme;
+
+public class Base {
+    /** Helper method. */
+    protected String helper() { return "base"; }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Target.java"),
+            "package com.acme;\n\npublic class Target {\n}\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaMoveMemberPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/Base.java",
+                        "target": "src/com/acme/Target.java",
+                        "targetClassName": "Target",
+                        "memberNames": ["helper"],
+                        "memberKind": "method"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview["member_kind"], "method", "{preview}");
+
+        let result = json_of(
+            JavaMoveMember
+                .call(
+                    json!({
+                        "file": "src/com/acme/Base.java",
+                        "target": "src/com/acme/Target.java",
+                        "targetClassName": "Target",
+                        "memberNames": ["helper"],
+                        "memberRefs": [preview["members"][0]["ref"].as_str().unwrap()],
+                        "memberKind": "method"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let source = replacement_for_file(&result, "src/com/acme/Base.java");
+        assert!(!source.contains("helper()"), "{source}");
+        let target = replacement_for_file(&result, "src/com/acme/Target.java");
+        assert!(
+            target.contains("/** Helper method. */")
+                && target.contains("protected String helper()"),
+            "{target}"
+        );
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|finding| finding["finding"] != "hierarchy_warning"),
             "{result}"
         );
     }
