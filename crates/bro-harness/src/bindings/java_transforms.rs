@@ -2467,6 +2467,13 @@ pub struct JavaExtractInterface;
 /// an existing interface or abstract class.
 pub struct JavaPullUpMembers;
 
+/// `java.pushDownMembersPreview` - preview Java members that can move from a
+/// source type into one existing target subtype.
+pub struct JavaPushDownMembersPreview;
+
+/// `java.pushDownMembers` - apply a previewed Java member push-down.
+pub struct JavaPushDownMembers;
+
 #[derive(Deserialize)]
 struct JavaExtractInterfaceParams {
     file: String,
@@ -2510,6 +2517,43 @@ struct JavaPullUpMembersParams {
     comment_policy: Option<String>,
     #[serde(default, rename = "annotationPolicy", alias = "annotation_policy")]
     annotation_policy: Option<String>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct JavaPushDownMembersPreviewParams {
+    file: String,
+    target: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(default, rename = "targetTypeName", alias = "target_type_name")]
+    target_type_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JavaPushDownMembersParams {
+    file: String,
+    target: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(default, rename = "targetTypeName", alias = "target_type_name")]
+    target_type_name: Option<String>,
+    #[serde(rename = "memberRefs", alias = "member_refs")]
+    member_refs: Vec<String>,
+    #[serde(default, rename = "commentPolicy", alias = "comment_policy")]
+    comment_policy: Option<String>,
+    #[serde(
+        default,
+        rename = "acknowledgeRemainingSourceReferences",
+        alias = "acknowledge_remaining_source_references"
+    )]
+    acknowledge_remaining_source_references: Option<bool>,
     #[serde(
         default,
         rename = "previewOnly",
@@ -2984,6 +3028,566 @@ fn target_abstract_modifier_edit(
         byte_end: class_at,
         replacement: "abstract ".to_string(),
     })
+}
+
+#[derive(Clone)]
+struct PushDownCandidate {
+    ref_id: String,
+    kind: String,
+    name: String,
+    byte_start: usize,
+    byte_end: usize,
+    trivia_start: usize,
+    text: String,
+    text_without_trivia: String,
+    signature_key: Option<String>,
+    blockers: Vec<Value>,
+    warnings: Vec<Value>,
+}
+
+fn pushdown_ref(kind: &str, name: &str, byte_start: usize, byte_end: usize, text: &str) -> String {
+    format!(
+        "member:{kind}:{name}:{byte_start}-{byte_end}:{}",
+        signature_digest(text)
+    )
+}
+
+fn class_or_interface_header(source: &str, item: &bbox_refactor::facts::ItemFact) -> String {
+    source
+        .get(item.item.byte_start..item.item.byte_end)
+        .unwrap_or_default()
+        .split('{')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn target_mentions_source_type(target_header: &str, source_type_name: &str) -> bool {
+    let Some(pos) = java_header_keyword_pos(target_header, "extends")
+        .or_else(|| java_header_keyword_pos(target_header, "implements"))
+    else {
+        return false;
+    };
+    target_header[pos..]
+        .split(|c: char| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()))
+        .any(|part| part == source_type_name)
+}
+
+fn item_within_range(item: &bbox_refactor::facts::ItemFact, range: Option<(usize, usize)>) -> bool {
+    range.is_none_or(|(start, end)| item.item.byte_start >= start && item.item.byte_end <= end)
+}
+
+fn pushdown_candidate_from_item(
+    path: &Path,
+    source: &str,
+    items: &bbox_refactor::facts::FileItemsFacts,
+    item: &bbox_refactor::facts::ItemFact,
+) -> Option<PushDownCandidate> {
+    let kind = match item.item.kind.as_str() {
+        "method_declaration" => "method",
+        "field_declaration" => "field",
+        _ => return None,
+    };
+    let name = item.item.name.as_deref()?.to_string();
+    let text = source
+        .get(item.item.leading_trivia_start..item.item.byte_end)?
+        .to_string();
+    let text_without_trivia = source
+        .get(item.item.byte_start..item.item.byte_end)?
+        .to_string();
+    let ref_id = pushdown_ref(kind, &name, item.item.byte_start, item.item.byte_end, &text);
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    let signature_key = if kind == "method" {
+        match bbox_refactor::facts::callable_signature(
+            path,
+            item.item.byte_start,
+            item.item.byte_end,
+            Some(&items.content_sha256),
+        ) {
+            Ok(bbox_refactor::facts::SignatureFacts::Java(sig)) => {
+                if sig.kind == "constructor_declaration" {
+                    return None;
+                }
+                if sig.modifiers.iter().any(|modifier| modifier == "abstract")
+                    || !text_without_trivia.contains('{')
+                {
+                    blockers.push(json!({
+                        "kind": "abstract_or_bodyless_method",
+                        "detail": "syntax-only push-down moves concrete method bodies; abstract signatures need an implementation synthesis step",
+                    }));
+                }
+                if sig.modifiers.iter().any(|modifier| modifier == "private") {
+                    warnings.push(json!({
+                        "kind": "private_member_moved",
+                        "detail": "private member remains private in the target subtype; verify callers do not require inherited access",
+                    }));
+                }
+                java_signature_key(&sig)
+            }
+            _ => None,
+        }
+    } else {
+        if text_without_trivia.contains("private ") {
+            warnings.push(json!({
+                "kind": "private_member_moved",
+                "detail": "private field remains private in the target subtype; verify callers do not require inherited access",
+            }));
+        }
+        Some(format!("field:{name}"))
+    };
+    Some(PushDownCandidate {
+        ref_id,
+        kind: kind.to_string(),
+        name,
+        byte_start: item.item.byte_start,
+        byte_end: item.item.byte_end,
+        trivia_start: item.item.leading_trivia_start,
+        text,
+        text_without_trivia,
+        signature_key,
+        blockers,
+        warnings,
+    })
+}
+
+fn simple_field_name_from_declaration(text: &str) -> Option<String> {
+    let body = text.trim().trim_end_matches(';').trim();
+    if body.contains(',') {
+        return None;
+    }
+    let before_init = body.split('=').next().unwrap_or(body).trim();
+    before_init
+        .split_whitespace()
+        .next_back()
+        .map(|name| name.trim_end_matches("[]").to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn simple_line_start(source: &str, byte_start: usize) -> usize {
+    source[..byte_start]
+        .rfind('\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0)
+}
+
+fn pushdown_field_candidate_from_span(
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+) -> Option<PushDownCandidate> {
+    let text_without_trivia = source.get(byte_start..byte_end)?.to_string();
+    let name = simple_field_name_from_declaration(&text_without_trivia)?;
+    let trivia_start = simple_line_start(source, byte_start);
+    let text = source.get(trivia_start..byte_end)?.to_string();
+    let ref_id = pushdown_ref("field", &name, byte_start, byte_end, &text);
+    let mut warnings = Vec::new();
+    if text_without_trivia.contains("private ") {
+        warnings.push(json!({
+            "kind": "private_member_moved",
+            "detail": "private field remains private in the target subtype; verify callers do not require inherited access",
+        }));
+    }
+    Some(PushDownCandidate {
+        ref_id,
+        kind: "field".to_string(),
+        name: name.clone(),
+        byte_start,
+        byte_end,
+        trivia_start,
+        text,
+        text_without_trivia,
+        signature_key: Some(format!("field:{name}")),
+        blockers: Vec::new(),
+        warnings,
+    })
+}
+
+fn pushdown_candidates_from_preview(value: &Value) -> Vec<PushDownCandidate> {
+    value["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| {
+            Some(PushDownCandidate {
+                ref_id: candidate["ref"].as_str()?.to_string(),
+                kind: candidate["member_kind"].as_str()?.to_string(),
+                name: candidate["name"].as_str()?.to_string(),
+                byte_start: candidate["span"]["byte_start"].as_u64()? as usize,
+                byte_end: candidate["span"]["byte_end"].as_u64()? as usize,
+                trivia_start: candidate["delete_span"]["byte_start"].as_u64()? as usize,
+                text: candidate["text_with_trivia"].as_str()?.to_string(),
+                text_without_trivia: candidate["text_without_trivia"].as_str()?.to_string(),
+                signature_key: candidate["signature_key"].as_str().map(str::to_string),
+                blockers: candidate["blockers"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+                warnings: candidate["warnings"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn target_member_keys(
+    target_path: &Path,
+    target_items: &bbox_refactor::facts::FileItemsFacts,
+    target_type_name: &str,
+) -> BTreeSet<String> {
+    let target_range = target_items
+        .items
+        .iter()
+        .find(|item| {
+            java_class_like_kind(&item.item.kind)
+                && item.item.name.as_deref() == Some(target_type_name)
+        })
+        .map(|item| (item.item.byte_start, item.item.byte_end));
+    let mut keys = BTreeSet::new();
+    for item in &target_items.items {
+        if !item_within_range(item, target_range) {
+            continue;
+        }
+        match item.item.kind.as_str() {
+            "method_declaration" => {
+                if let Ok(bbox_refactor::facts::SignatureFacts::Java(sig)) =
+                    bbox_refactor::facts::callable_signature(
+                        target_path,
+                        item.item.byte_start,
+                        item.item.byte_end,
+                        Some(&target_items.content_sha256),
+                    )
+                    && let Some(key) = java_signature_key(&sig)
+                {
+                    keys.insert(key);
+                }
+            }
+            "field_declaration" => {
+                if let Some(name) = item.item.name.as_deref() {
+                    keys.insert(format!("field:{name}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    keys
+}
+
+fn name_occurs_outside_ranges(
+    source: &str,
+    name: &str,
+    kind: &str,
+    excluded_ranges: &[(usize, usize)],
+) -> usize {
+    let bytes = source.as_bytes();
+    let needle = name.as_bytes();
+    let mut count = 0usize;
+    let mut idx = 0usize;
+    while idx + needle.len() <= bytes.len() {
+        if &bytes[idx..idx + needle.len()] != needle {
+            idx += 1;
+            continue;
+        }
+        let before_ok = idx == 0 || !is_java_ident_byte(bytes[idx - 1]);
+        let after = idx + needle.len();
+        let after_ok = after >= bytes.len() || !is_java_ident_byte(bytes[after]);
+        let in_excluded = excluded_ranges
+            .iter()
+            .any(|(start, end)| idx >= *start && idx < *end);
+        let method_call_ok = kind != "method"
+            || source
+                .get(after..)
+                .unwrap_or_default()
+                .trim_start()
+                .starts_with('(');
+        if before_ok && after_ok && !in_excluded && method_call_ok {
+            count += 1;
+        }
+        idx = after;
+    }
+    count
+}
+
+fn render_pushdown_member_text(candidate: &PushDownCandidate, comment_policy: &str) -> String {
+    if comment_policy == "omit" {
+        candidate.text_without_trivia.trim_matches('\n').to_string()
+    } else {
+        candidate.text.trim_matches('\n').to_string()
+    }
+}
+
+fn pushed_member_insert_edit(
+    target_source: &str,
+    insert_at: usize,
+    selected: &[PushDownCandidate],
+    comment_policy: &str,
+) -> bbox_refactor::TextEdit {
+    let before = target_source.get(..insert_at).unwrap_or_default();
+    let trimmed_before = before.trim_end();
+    let prefix = if trimmed_before.ends_with('{') {
+        if before.ends_with('\n') { "" } else { "\n" }
+    } else {
+        "\n\n"
+    };
+    let body = selected
+        .iter()
+        .map(|candidate| render_pushdown_member_text(candidate, comment_policy))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    bbox_refactor::TextEdit {
+        byte_start: insert_at,
+        byte_end: insert_at,
+        replacement: format!("{prefix}{body}\n"),
+    }
+}
+
+fn source_import_fqcns_for_target(
+    source: &str,
+    target_source: &str,
+) -> (BTreeSet<String>, Vec<Value>) {
+    let target_package = source_package(target_source);
+    let mut fqcns = BTreeSet::new();
+    let mut findings = Vec::new();
+    for line in source_imports(source) {
+        if line.trim_start().starts_with("import static ") {
+            findings.push(json!({
+                "finding": "target_import_review",
+                "kind": "static_import_omitted",
+                "detail": "static imports are not copied during syntax-only push-down",
+            }));
+            continue;
+        }
+        let Some(fqcn) = import_fqcn(&line) else {
+            continue;
+        };
+        if fqcn.ends_with(".*") {
+            findings.push(json!({
+                "finding": "target_import_review",
+                "kind": "wildcard_import_review",
+                "detail": "wildcard imports are not copied; add explicit imports if the pushed member needs one",
+            }));
+            continue;
+        }
+        if let Some((pkg, _)) = fqcn.rsplit_once('.')
+            && target_package.as_deref() == Some(pkg)
+        {
+            continue;
+        }
+        fqcns.insert(fqcn.to_string());
+    }
+    if !fqcns.is_empty() {
+        findings.push(json!({
+            "finding": "target_import_review",
+            "kind": "source_imports_copied",
+            "count": fqcns.len(),
+            "detail": "syntax-only push-down copies source imports conservatively; run java.hygiene afterward",
+        }));
+    }
+    (fqcns, findings)
+}
+
+fn pushdown_preview_value(
+    root: &Path,
+    params: &JavaPushDownMembersPreviewParams,
+) -> Result<Value, String> {
+    let source_path = resolve_workspace_file(root, &params.file, "java.pushDownMembersPreview")?;
+    let target_path = resolve_workspace_file(root, &params.target, "java.pushDownMembersPreview")?;
+    if source_path == target_path {
+        return Err(
+            "java.pushDownMembersPreview: source and target must be different files".to_string(),
+        );
+    }
+    let source = std::fs::read_to_string(&source_path)
+        .map_err(|e| format!("java.pushDownMembersPreview: read {}: {e}", params.file))?;
+    let target_source = std::fs::read_to_string(&target_path)
+        .map_err(|e| format!("java.pushDownMembersPreview: read {}: {e}", params.target))?;
+    let source_items = bbox_refactor::facts::file_items(&source_path).map_err(|e| {
+        format!(
+            "java.pushDownMembersPreview: inventory {}: {e:#}",
+            params.file
+        )
+    })?;
+    let target_items = bbox_refactor::facts::file_items(&target_path).map_err(|e| {
+        format!(
+            "java.pushDownMembersPreview: inventory {}: {e:#}",
+            params.target
+        )
+    })?;
+    if source_items.language != "java" || target_items.language != "java" {
+        return Err("java.pushDownMembersPreview: only Java files are supported".to_string());
+    }
+    let class_name = params.class_name.clone().unwrap_or_else(|| {
+        Path::new(&params.file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Source")
+            .to_string()
+    });
+    let target_type_name = params.target_type_name.clone().unwrap_or_else(|| {
+        Path::new(&params.target)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Target")
+            .to_string()
+    });
+    let source_type = source_items.items.iter().find(|item| {
+        java_class_like_kind(&item.item.kind)
+            && item.item.name.as_deref() == Some(class_name.as_str())
+    });
+    let target_type = target_items.items.iter().find(|item| {
+        java_class_like_kind(&item.item.kind)
+            && item.item.name.as_deref() == Some(target_type_name.as_str())
+    });
+    let mut class_blockers = Vec::new();
+    if source_type.is_none() {
+        class_blockers.push(json!({
+            "kind": "source_type_not_found",
+            "detail": "requested className was not found in the source file",
+        }));
+    }
+    if target_type.is_none() {
+        class_blockers.push(json!({
+            "kind": "target_type_not_found",
+            "detail": "requested targetTypeName was not found in the target file",
+        }));
+    }
+    let source_range = source_type.map(|item| (item.item.byte_start, item.item.byte_end));
+    let target_header = target_type
+        .map(|item| class_or_interface_header(&target_source, item))
+        .unwrap_or_default();
+    let mut relationship = json!({
+        "syntax_evidence": "unknown",
+        "warning": Value::Null,
+    });
+    if let Some(source_type) = source_type {
+        let mentions = target_mentions_source_type(&target_header, &class_name);
+        relationship = json!({
+            "syntax_evidence": if mentions { "direct_header_match" } else { "not_seen" },
+            "warning": if mentions {
+                Value::Null
+            } else {
+                json!({
+                    "kind": "hierarchy_not_verified",
+                    "detail": "target header does not directly mention the source type; syntax-only backend cannot prove indirect subtype relationships",
+                    "source_kind": source_type.item.kind,
+                })
+            },
+        });
+    }
+    let target_keys = target_member_keys(&target_path, &target_items, &target_type_name);
+    let mut candidates = Vec::new();
+    let mut candidate_starts = BTreeSet::new();
+    for item in &source_items.items {
+        if !item_within_range(item, source_range) {
+            continue;
+        }
+        let Some(mut candidate) =
+            pushdown_candidate_from_item(&source_path, &source, &source_items, item)
+        else {
+            continue;
+        };
+        candidate_starts.insert(candidate.byte_start);
+        if let Some(key) = candidate.signature_key.as_deref()
+            && target_keys.contains(key)
+        {
+            candidate.blockers.push(json!({
+                "kind": "target_member_exists",
+                "detail": "target already has a member with this name and parameter shape",
+            }));
+        }
+        candidates.push(json!({
+            "ref": candidate.ref_id,
+            "member_kind": candidate.kind,
+            "name": candidate.name,
+            "signature_key": candidate.signature_key,
+            "span": {
+                "file": params.file,
+                "byte_start": candidate.byte_start,
+                "byte_end": candidate.byte_end,
+                "content_sha256": source_items.content_sha256,
+            },
+            "delete_span": {
+                "file": params.file,
+                "byte_start": candidate.trivia_start,
+                "byte_end": candidate.byte_end,
+                "content_sha256": source_items.content_sha256,
+            },
+            "text_with_trivia": candidate.text,
+            "text_without_trivia": candidate.text_without_trivia,
+            "blockers": candidate.blockers,
+            "warnings": candidate.warnings,
+        }));
+    }
+    if let Ok(field_facts) =
+        bbox_refactor::facts::file_query(&source_path, "(field_declaration) @field", None)
+    {
+        for field in field_facts
+            .captures
+            .iter()
+            .filter(|capture| capture.capture == "field")
+        {
+            if !source_range
+                .is_none_or(|(start, end)| field.byte_start >= start && field.byte_end <= end)
+                || candidate_starts.contains(&field.byte_start)
+            {
+                continue;
+            }
+            let Some(mut candidate) =
+                pushdown_field_candidate_from_span(&source, field.byte_start, field.byte_end)
+            else {
+                continue;
+            };
+            if let Some(key) = candidate.signature_key.as_deref()
+                && target_keys.contains(key)
+            {
+                candidate.blockers.push(json!({
+                    "kind": "target_member_exists",
+                    "detail": "target already has a member with this name",
+                }));
+            }
+            candidates.push(json!({
+                "ref": candidate.ref_id,
+                "member_kind": candidate.kind,
+                "name": candidate.name,
+                "signature_key": candidate.signature_key,
+                "span": {
+                    "file": params.file,
+                    "byte_start": candidate.byte_start,
+                    "byte_end": candidate.byte_end,
+                    "content_sha256": source_items.content_sha256,
+                },
+                "delete_span": {
+                    "file": params.file,
+                    "byte_start": candidate.trivia_start,
+                    "byte_end": candidate.byte_end,
+                    "content_sha256": source_items.content_sha256,
+                },
+                "text_with_trivia": candidate.text,
+                "text_without_trivia": candidate.text_without_trivia,
+                "blockers": candidate.blockers,
+                "warnings": candidate.warnings,
+            }));
+        }
+    }
+    Ok(json!({
+        "file": params.file,
+        "target": params.target,
+        "language": "java",
+        "content_sha256": source_items.content_sha256,
+        "source_class": {
+            "name": class_name,
+            "blockers": class_blockers,
+        },
+        "target_class": {
+            "name": target_type_name,
+            "relationship": relationship,
+        },
+        "candidates": candidates,
+        "ref_model": "preview-local member refs: member:<kind>:<name>:<byte-range>:<hash12>; re-derived on apply, not graph IDs",
+        "provenance": "syntax_only",
+    }))
 }
 
 #[async_trait]
@@ -3711,6 +4315,349 @@ impl Tool for JavaPullUpMembers {
             }
             ToolResult::Json(json!({
                 "title": format!("pull up members from `{class_name}` into existing {target_kind} `{target_type_name}`"),
+                "changes": changes,
+                "creates": [],
+                "deletes": [],
+                "findings": findings,
+                "selected_refs": params.member_refs,
+                "preview_only": preview_only,
+                "would_change_files": would_change_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaPushDownMembersPreview {
+    fn name(&self) -> &str {
+        "java.pushDownMembersPreview"
+    }
+    fn description(&self) -> &str {
+        "Preview Java concrete methods/fields that can be pushed from a source type into one existing target subtype. Returns lightweight preview-local member refs, hierarchy evidence, blockers, warnings, and full member text. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "target": { "type": "string" },
+                "className": { "type": "string" },
+                "targetTypeName": { "type": "string" }
+            },
+            "required": ["file", "target"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "pushDownMembersPreview".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaPushDownMembersPreviewParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.pushDownMembersPreview: bad input - expected {{ file, target, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || match pushdown_preview_value(&root, &params) {
+            Ok(v) => ToolResult::Json(v),
+            Err(e) => err(e),
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaPushDownMembers {
+    fn name(&self) -> &str {
+        "java.pushDownMembers"
+    }
+    fn description(&self) -> &str {
+        "Apply java.pushDownMembersPreview refs: re-plan, refuse stale/blocked selections, require acknowledgement for remaining source references, delete source members, insert them into the target subtype, copy source imports conservatively, and return hash-anchored edit changes. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "target": { "type": "string" },
+                "className": { "type": "string" },
+                "targetTypeName": { "type": "string" },
+                "memberRefs": { "type": "array", "items": { "type": "string" } },
+                "commentPolicy": { "type": "string", "enum": ["move", "copy", "omit"] },
+                "acknowledgeRemainingSourceReferences": { "type": "boolean" },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "target", "memberRefs"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "pushDownMembers".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaPushDownMembersParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.pushDownMembers: bad input - expected {{ file, target, memberRefs, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            if params.member_refs.is_empty() {
+                return err("java.pushDownMembers: memberRefs must not be empty");
+            }
+            let comment_policy = params.comment_policy.as_deref().unwrap_or("move");
+            if !matches!(comment_policy, "move" | "copy" | "omit") {
+                return err(format!(
+                    "java.pushDownMembers: commentPolicy must be move, copy, or omit, got `{comment_policy}`"
+                ));
+            }
+            let preview_params = JavaPushDownMembersPreviewParams {
+                file: params.file.clone(),
+                target: params.target.clone(),
+                class_name: params.class_name.clone(),
+                target_type_name: params.target_type_name.clone(),
+            };
+            let preview = match pushdown_preview_value(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.pushDownMembersPreview", "java.pushDownMembers")),
+            };
+            let class_blockers = preview["source_class"]["blockers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if !class_blockers.is_empty() {
+                return ToolResult::Json(json!({
+                    "title": "push down Java members",
+                    "changes": [],
+                    "creates": [],
+                    "deletes": [],
+                    "findings": class_blockers.into_iter().map(|blocker| json!({
+                        "finding": "class_blocker",
+                        "blocker": blocker,
+                    })).collect::<Vec<_>>(),
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+            let all_candidates = pushdown_candidates_from_preview(&preview);
+            let selected_refs = params.member_refs.iter().cloned().collect::<BTreeSet<_>>();
+            let selected = all_candidates
+                .iter()
+                .filter(|candidate| selected_refs.contains(&candidate.ref_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.len() != selected_refs.len() {
+                let found = selected
+                    .iter()
+                    .map(|candidate| candidate.ref_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let missing = selected_refs
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|ref_id| !found.contains(ref_id))
+                    .collect::<Vec<_>>();
+                return err(format!(
+                    "java.pushDownMembers: stale or unknown memberRefs: {missing:?}; re-run java.pushDownMembersPreview"
+                ));
+            }
+            let blocked = selected
+                .iter()
+                .flat_map(|candidate| {
+                    candidate.blockers.iter().map(|blocker| {
+                        json!({
+                            "ref": candidate.ref_id,
+                            "name": candidate.name,
+                            "blocker": blocker,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !blocked.is_empty() {
+                return ToolResult::Json(json!({
+                    "title": "push down Java members",
+                    "changes": [],
+                    "creates": [],
+                    "deletes": [],
+                    "findings": blocked,
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+            let source_path = match resolve_workspace_file(&root, &params.file, "java.pushDownMembers") {
+                Ok(path) => path,
+                Err(e) => return err(e),
+            };
+            let target_path = match resolve_workspace_file(&root, &params.target, "java.pushDownMembers") {
+                Ok(path) => path,
+                Err(e) => return err(e),
+            };
+            let source = match std::fs::read_to_string(&source_path) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pushDownMembers: read {}: {e}", params.file)),
+            };
+            let target_source = match std::fs::read_to_string(&target_path) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pushDownMembers: read {}: {e}", params.target)),
+            };
+            let target_items = match bbox_refactor::facts::file_items(&target_path) {
+                Ok(items) => items,
+                Err(e) => return err(format!("java.pushDownMembers: inventory {}: {e:#}", params.target)),
+            };
+            let target_type_name = preview["target_class"]["name"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    Path::new(&params.target)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Target")
+                })
+                .to_string();
+
+            let selected_ranges = selected
+                .iter()
+                .map(|candidate| (candidate.trivia_start, candidate.byte_end))
+                .collect::<Vec<_>>();
+            let remaining_refs = selected
+                .iter()
+                .filter_map(|candidate| {
+                    let count = name_occurs_outside_ranges(
+                        &source,
+                        &candidate.name,
+                        &candidate.kind,
+                        &selected_ranges,
+                    );
+                    if count > 0 {
+                        Some(json!({
+                            "kind": "remaining_source_reference",
+                            "ref": candidate.ref_id,
+                            "name": candidate.name,
+                            "member_kind": candidate.kind,
+                            "count": count,
+                            "detail": "source file still references a moved member outside the selected member ranges",
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !remaining_refs.is_empty()
+                && !params
+                    .acknowledge_remaining_source_references
+                    .unwrap_or(false)
+            {
+                return ToolResult::Json(json!({
+                    "title": "push down Java members",
+                    "changes": [],
+                    "creates": [],
+                    "deletes": [],
+                    "findings": remaining_refs,
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+
+            let mut source_edits = selected
+                .iter()
+                .map(|candidate| {
+                    bbox_refactor::TextEdit {
+                        byte_start: candidate.trivia_start,
+                        byte_end: candidate.byte_end,
+                        replacement: String::new(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            source_edits.sort_by_key(|edit| edit.byte_start);
+            let new_source = match bbox_refactor::apply_text_edits(&source, &source_edits) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pushDownMembers: source edit synthesis failed: {e:#}")),
+            };
+
+            let mut target_edits = Vec::new();
+            let (import_fqcns, import_findings) = source_import_fqcns_for_target(&source, &target_source);
+            if let Some(edit) = insert_import_lines_edit(&target_source, import_fqcns) {
+                target_edits.push(edit);
+            }
+            let insert_at = match class_insert_before_closing_brace(&target_items, &target_type_name) {
+                Some(insert_at) => insert_at,
+                None => return err("java.pushDownMembers: target type closing brace not found"),
+            };
+            target_edits.push(pushed_member_insert_edit(
+                &target_source,
+                insert_at,
+                &selected,
+                comment_policy,
+            ));
+            target_edits.sort_by_key(|edit| edit.byte_start);
+            let new_target = match bbox_refactor::apply_text_edits(&target_source, &target_edits) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pushDownMembers: target edit synthesis failed: {e:#}")),
+            };
+            let preview_only = params.preview_only.unwrap_or(false);
+            let mut changes = Vec::new();
+            if !preview_only && new_source != source {
+                changes.push(whole_file_change(&params.file, &source, &new_source));
+            }
+            if !preview_only && new_target != target_source {
+                changes.push(whole_file_change(&params.target, &target_source, &new_target));
+            }
+            let mut findings = selected
+                .iter()
+                .flat_map(|candidate| {
+                    candidate.warnings.iter().map(|warning| {
+                        json!({
+                            "finding": "member_warning",
+                            "ref": candidate.ref_id,
+                            "name": candidate.name,
+                            "warning": warning,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            findings.extend(remaining_refs);
+            findings.extend(import_findings);
+            if let Some(warning) = preview["target_class"]["relationship"]["warning"].as_object() {
+                if !warning.is_empty() {
+                    findings.push(json!({
+                        "finding": "hierarchy_warning",
+                        "warning": preview["target_class"]["relationship"]["warning"].clone(),
+                    }));
+                }
+            }
+            let mut would_change_files = Vec::new();
+            if source != new_source {
+                would_change_files.push(json!({
+                    "path": params.file,
+                    "edit_count": source_edits.len(),
+                    "replacement_bytes": new_source.len(),
+                }));
+            }
+            if target_source != new_target {
+                would_change_files.push(json!({
+                    "path": params.target,
+                    "edit_count": target_edits.len(),
+                    "replacement_bytes": new_target.len(),
+                }));
+            }
+            ToolResult::Json(json!({
+                "title": "push down Java members",
                 "changes": changes,
                 "creates": [],
                 "deletes": [],
@@ -7747,6 +8694,43 @@ RECIPE
   await edits.apply({ es });
 "#;
 
+const PUSH_DOWN_MEMBERS_CONTRACT: &str = r#"java.pushDownMembersPreview / java.pushDownMembers - syntax-only member push-down.
+
+WHAT IT DOES
+  Preview inventories concrete methods and fields on a source type and returns
+  lightweight preview-local refs. Apply re-runs preview, refuses stale/blocked
+  refs, deletes selected source members, inserts them into one existing target
+  subtype, and copies source imports conservatively to the target.
+
+PARAMS
+  file: string
+  target: string
+  className?: string
+  targetTypeName?: string
+  memberRefs: string[]      refs returned by java.pushDownMembersPreview
+  commentPolicy?: "move" | "copy" | "omit"    default move; controls target text
+  acknowledgeRemainingSourceReferences?: boolean
+  previewOnly?: boolean
+
+REF MODEL
+  member refs are preview-local: member:<kind>:<name>:<byte-range>:<hash>.
+  They are re-derived on apply and are not graph IDs.
+
+IMPORTANT LIMITS
+  - moves concrete methods and fields only; abstract/bodyless methods are blocked.
+  - hierarchy validation is syntax-only direct-header evidence, not binding-aware.
+  - remaining source references block apply unless explicitly acknowledged.
+  - source imports are copied conservatively; run java.hygiene afterward.
+
+RECIPE
+  const pv = await java.pushDownMembersPreview({ file, target, className: "Base", targetTypeName: "Child" });
+  const refs = pv.candidates.filter(c => !c.blockers.length).map(c => c.ref);
+  const r = await java.pushDownMembers({ file, target, memberRefs: refs });
+  const es = await edits.begin();
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  await edits.apply({ es });
+"#;
+
 const CHANGE_SIGNATURE_CONTRACT: &str = r#"java.changeSignaturePreview / java.changeSignature - syntax-only Java method signature rewrite.
 
 WHAT IT DOES
@@ -8043,6 +9027,9 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": EXTRACT_INTERFACE_CONTRACT }))
             }
             "pullUpMembers" => ToolResult::Json(json!({ "contract": PULL_UP_MEMBERS_CONTRACT })),
+            "pushDownMembersPreview" | "pushDownMembers" => {
+                ToolResult::Json(json!({ "contract": PUSH_DOWN_MEMBERS_CONTRACT }))
+            }
             "changeSignaturePreview" | "changeSignature" => {
                 ToolResult::Json(json!({ "contract": CHANGE_SIGNATURE_CONTRACT }))
             }
@@ -8079,7 +9066,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -9569,6 +10556,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaPullUpPreview) as Arc<dyn Tool>,
         Arc::new(JavaExtractInterface) as Arc<dyn Tool>,
         Arc::new(JavaPullUpMembers) as Arc<dyn Tool>,
+        Arc::new(JavaPushDownMembersPreview) as Arc<dyn Tool>,
+        Arc::new(JavaPushDownMembers) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignaturePreview) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignature) as Arc<dyn Tool>,
         Arc::new(JavaEncapsulateFieldPreview) as Arc<dyn Tool>,
@@ -9597,7 +10586,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -9609,6 +10598,9 @@ type JavaPullUpCandidate = { ref: string; kind: string; name: string; signature_
 type JavaPullUpPreview = { file: string; language: "java"; content_sha256: string; source_len: number; class: { name: string; span?: Span; blockers: unknown[] }; target_kind: "interface" | "abstract_class"; imports: string[]; candidates: JavaPullUpCandidate[]; ref_model: string; provenance: "syntax_only" };
 type JavaExtractInterfaceResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: []; findings: unknown[]; selected_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; provenance: "syntax_only" };
 type JavaPullUpMembersResult = { title: string; changes: SpanChange[]; creates: []; deletes: []; findings: unknown[]; selected_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
+type JavaPushDownCandidate = { ref: string; member_kind: "method" | "field"; name: string; signature_key?: string; span: Span; delete_span: Span; text_with_trivia: string; text_without_trivia: string; blockers: unknown[]; warnings: unknown[] };
+type JavaPushDownPreview = { file: string; target: string; language: "java"; content_sha256: string; source_class: { name: string; blockers: unknown[] }; target_class: { name: string; relationship: unknown }; candidates: JavaPushDownCandidate[]; ref_model: string; provenance: "syntax_only" };
+type JavaPushDownResult = { title: string; changes: SpanChange[]; creates: []; deletes: []; findings: unknown[]; selected_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaChangeParamSpec = { sourceName?: string; name: string; type?: string; defaultValue?: string };
 type JavaChangeSignaturePreview = { file: string; content_sha256?: string; method_name: string; method_ref?: string | null; old_signature?: string; old_params?: unknown[]; target_params: string[]; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaChangeSignatureResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
@@ -9646,6 +10638,10 @@ declare const java: {
   extractInterface(args: { file: string; target: string; typeName: string; className?: string; targetKind?: "interface" | "abstract_class"; memberRefs: string[]; commentPolicy?: "copy" | "move" | "omit"; annotationPolicy?: "safe" | "copy" | "omit"; targetPackage?: string; previewOnly?: boolean }): Promise<JavaExtractInterfaceResult>;
   /** Consume java.pullUpPreview refs into an existing interface or abstract class plus source-side implements/extends and visibility edits. */
   pullUpMembers(args: { file: string; target: string; targetTypeName?: string; className?: string; targetKind?: "interface" | "abstract_class"; memberRefs: string[]; commentPolicy?: "copy" | "move" | "omit"; annotationPolicy?: "safe" | "copy" | "omit"; previewOnly?: boolean }): Promise<JavaPullUpMembersResult>;
+  /** Preview concrete methods/fields that can be pushed from a source type into one existing target subtype. */
+  pushDownMembersPreview(args: { file: string; target: string; className?: string; targetTypeName?: string }): Promise<JavaPushDownPreview>;
+  /** Apply previewed Java member push-down. Remaining source references require acknowledgement. */
+  pushDownMembers(args: { file: string; target: string; className?: string; targetTypeName?: string; memberRefs: string[]; commentPolicy?: "move" | "copy" | "omit"; acknowledgeRemainingSourceReferences?: boolean; previewOnly?: boolean }): Promise<JavaPushDownResult>;
   /** Preview a method signature change. Refs are preview-local signature hashes, not graph IDs. */
   changeSignaturePreview(args: { file: string; className?: string; methodName: string; targetParams: JavaChangeParamSpec[]; files?: string[] }): Promise<JavaChangeSignaturePreview>;
   /** Apply a previewed method signature change. Same-name call-site rewrites require acknowledgeSyntaxOnlyCallSites:true. */
@@ -11206,6 +12202,139 @@ public record OrderId(String value) {}
                 .unwrap()
                 .iter()
                 .any(|finding| finding["kind"] == "abstract_modifier_added"),
+            "{result}"
+        );
+    }
+
+    const PUSHDOWN_BASE_FIXTURE: &str = r#"package com.acme;
+
+import java.util.List;
+
+public class Base {
+    /** Names for display. */
+    protected List<String> names() { return List.of("a"); }
+
+    public String keep() { return "base"; }
+}
+"#;
+
+    const PUSHDOWN_CHILD_FIXTURE: &str = r#"package com.acme;
+
+public class Child extends Base {
+}
+"#;
+
+    #[tokio::test]
+    async fn push_down_members_moves_method_to_subclass_and_copies_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(root.join("src/com/acme/Base.java"), PUSHDOWN_BASE_FIXTURE).unwrap();
+        std::fs::write(root.join("src/com/acme/Child.java"), PUSHDOWN_CHILD_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPushDownMembersPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/Base.java",
+                        "target": "src/com/acme/Child.java",
+                        "className": "Base",
+                        "targetTypeName": "Child"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(
+            preview["target_class"]["relationship"]["syntax_evidence"], "direct_header_match",
+            "{preview}"
+        );
+
+        let result = json_of(
+            JavaPushDownMembers
+                .call(
+                    json!({
+                        "file": "src/com/acme/Base.java",
+                        "target": "src/com/acme/Child.java",
+                        "className": "Base",
+                        "targetTypeName": "Child",
+                        "memberRefs": [candidate_ref(&preview, "names")]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(result["blocked"], Value::Null, "{result}");
+        let source = replacement_for_file(&result, "src/com/acme/Base.java");
+        assert!(
+            !source.contains("Names for display") && !source.contains("List<String> names()"),
+            "{source}"
+        );
+        let target = replacement_for_file(&result, "src/com/acme/Child.java");
+        assert!(
+            target.contains("import java.util.List;")
+                && target.contains("/** Names for display. */")
+                && target.contains("protected List<String> names()"),
+            "{target}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_down_members_blocks_remaining_source_references_without_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Base.java"),
+            r#"package com.acme;
+
+public class Base {
+    protected String label() { return "base"; }
+    public String keep() { return label(); }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/com/acme/Child.java"), PUSHDOWN_CHILD_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPushDownMembersPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/Base.java",
+                        "target": "src/com/acme/Child.java",
+                        "className": "Base",
+                        "targetTypeName": "Child"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let result = json_of(
+            JavaPushDownMembers
+                .call(
+                    json!({
+                        "file": "src/com/acme/Base.java",
+                        "target": "src/com/acme/Child.java",
+                        "className": "Base",
+                        "targetTypeName": "Child",
+                        "memberRefs": [candidate_ref(&preview, "label")]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(result["blocked"], true, "{result}");
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["kind"] == "remaining_source_reference"),
             "{result}"
         );
     }
