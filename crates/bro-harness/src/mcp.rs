@@ -412,7 +412,9 @@ async fn start_remote_server(server: &McpServerConfig) -> anyhow::Result<Arc<Ser
             ().serve(transport).await?
         }
         McpServerConfig::InProcess { .. } => {
-            return Err(anyhow::anyhow!("in-process servers have no remote connection"));
+            return Err(anyhow::anyhow!(
+                "in-process servers have no remote connection"
+            ));
         }
     };
     Ok(Arc::new(ServerConn { running }))
@@ -496,7 +498,9 @@ impl McpTool {
                 conn.call_tool(params).await?
             }
             McpBackend::InProcess(svc) => {
-                return svc.call_tool(&self.call_name, Value::Object(input_args)).await;
+                return svc
+                    .call_tool(&self.call_name, Value::Object(input_args))
+                    .await;
             }
         };
         Ok(to_tool_result(resp))
