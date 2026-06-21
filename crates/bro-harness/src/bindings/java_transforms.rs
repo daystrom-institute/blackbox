@@ -4763,6 +4763,688 @@ impl Tool for JavaEncapsulateField {
     }
 }
 
+/// `java.replaceConstructorWithFactoryPreview` - preview constructor factory conversion.
+pub struct JavaReplaceConstructorWithFactoryPreview;
+
+/// `java.replaceConstructorWithFactory` - apply constructor factory conversion.
+pub struct JavaReplaceConstructorWithFactory;
+
+#[derive(Deserialize)]
+struct JavaReplaceConstructorWithFactoryPreviewParams {
+    file: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(default, rename = "factoryName", alias = "factory_name")]
+    factory_name: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct JavaReplaceConstructorWithFactoryParams {
+    file: String,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(rename = "constructorRef", alias = "constructor_ref")]
+    constructor_ref: String,
+    #[serde(default, rename = "factoryName", alias = "factory_name")]
+    factory_name: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "acknowledgeSyntaxOnlyCallSites",
+        alias = "acknowledge_syntax_only_call_sites"
+    )]
+    acknowledge_syntax_only_call_sites: Option<bool>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Clone)]
+struct ConstructorFactoryInfo {
+    ref_id: String,
+    class_name: String,
+    byte_end: usize,
+    signature_text: String,
+    signature_byte_start: usize,
+    visibility: Option<String>,
+    params: Vec<ChangeSignatureParam>,
+}
+
+#[derive(Clone)]
+struct ConstructorCallSite {
+    file: String,
+    ref_id: String,
+    byte_start: usize,
+    byte_end: usize,
+    text: String,
+    args: Vec<String>,
+}
+
+fn constructor_ref_id(
+    class_name: &str,
+    sig: &bbox_refactor::facts::JavaSignatureFacts,
+    signature_text: &str,
+) -> String {
+    format!(
+        "ctor:{}:{}-{}:{}",
+        class_name,
+        sig.signature_span.byte_start,
+        sig.signature_span.byte_end,
+        signature_digest(signature_text)
+    )
+}
+
+fn constructor_from_item(
+    source: &str,
+    path: &Path,
+    item: &bbox_refactor::facts::ItemFact,
+    content_sha256: &str,
+    class_name: &str,
+) -> Result<Option<ConstructorFactoryInfo>, String> {
+    let sig = match bbox_refactor::facts::callable_signature(
+        path,
+        item.item.byte_start,
+        item.item.byte_end,
+        Some(content_sha256),
+    ) {
+        Ok(bbox_refactor::facts::SignatureFacts::Java(sig)) => sig,
+        Ok(_) => return Ok(None),
+        Err(e) => return Err(format!("{e:#}")),
+    };
+    if sig.kind != "constructor_declaration" {
+        return Ok(None);
+    }
+    let signature_text = signature_text_for(source, &sig);
+    let params = sig
+        .params
+        .iter()
+        .map(|param| ChangeSignatureParam {
+            name: param.name.clone().unwrap_or_default(),
+            type_text: param.type_text.clone(),
+            text: source
+                .get(param.byte_start..param.byte_end)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(ConstructorFactoryInfo {
+        ref_id: constructor_ref_id(class_name, &sig, &signature_text),
+        class_name: class_name.to_string(),
+        byte_end: sig.byte_end,
+        signature_text,
+        signature_byte_start: sig.signature_span.byte_start,
+        visibility: sig.visibility,
+        params,
+    }))
+}
+
+fn find_constructor_factory_target(
+    root: &Path,
+    params: &JavaReplaceConstructorWithFactoryPreviewParams,
+) -> Result<
+    (
+        PathBuf,
+        String,
+        bbox_refactor::facts::FileItemsFacts,
+        Option<ConstructorFactoryInfo>,
+        Vec<Value>,
+    ),
+    String,
+> {
+    let path = resolve_workspace_file(
+        root,
+        &params.file,
+        "java.replaceConstructorWithFactoryPreview",
+    )?;
+    let source = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "java.replaceConstructorWithFactoryPreview: read {}: {e}",
+            params.file
+        )
+    })?;
+    let items = bbox_refactor::facts::file_items(&path).map_err(|e| {
+        format!(
+            "java.replaceConstructorWithFactoryPreview: inventory {}: {e:#}",
+            params.file
+        )
+    })?;
+    let class_name = params.class_name.clone().unwrap_or_else(|| {
+        Path::new(&params.file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string()
+    });
+    let class_item = items.items.iter().find(|item| {
+        java_class_like_kind(&item.item.kind)
+            && item.item.name.as_deref() == Some(class_name.as_str())
+    });
+    let mut findings = Vec::new();
+    let Some(class_item) = class_item else {
+        findings.push(json!({
+            "finding": "class_not_found",
+            "severity": "blocker",
+            "class": class_name,
+        }));
+        return Ok((path, source, items, None, findings));
+    };
+    let class_header = source
+        .get(class_item.item.byte_start..class_item.item.byte_end)
+        .unwrap_or_default()
+        .split('{')
+        .next()
+        .unwrap_or_default();
+    if class_header.contains('<') {
+        findings.push(json!({
+            "finding": "generic_class_review",
+            "severity": "review",
+            "detail": "factory return type uses the simple class name in this syntax-only slice; verify generic type inference before applying",
+        }));
+    }
+    let mut constructors = Vec::new();
+    for item in &items.items {
+        if item.item.kind != "constructor_declaration" {
+            continue;
+        }
+        if item.item.byte_start < class_item.item.byte_start
+            || item.item.byte_end > class_item.item.byte_end
+        {
+            continue;
+        }
+        match constructor_from_item(&source, &path, item, &items.content_sha256, &class_name) {
+            Ok(Some(ctor)) => constructors.push(ctor),
+            Ok(None) => {}
+            Err(e) => findings.push(json!({
+                "finding": "signature_unavailable",
+                "severity": "blocker",
+                "detail": e,
+            })),
+        }
+    }
+    if constructors.is_empty() {
+        findings.push(json!({
+            "finding": "constructor_not_found",
+            "severity": "blocker",
+            "detail": "only explicit constructors can be converted in this slice",
+        }));
+    }
+    if constructors.len() > 1 {
+        findings.push(json!({
+            "finding": "overloaded_constructors",
+            "severity": "blocker",
+            "count": constructors.len(),
+            "detail": "syntax-only factory conversion currently handles one constructor at a time",
+        }));
+    }
+    Ok((
+        path,
+        source,
+        items,
+        constructors.into_iter().next(),
+        findings,
+    ))
+}
+
+fn constructor_private_edit(
+    source: &str,
+    ctor: &ConstructorFactoryInfo,
+) -> Option<bbox_refactor::TextEdit> {
+    if ctor.visibility.as_deref() == Some("private") {
+        return None;
+    }
+    let start = ctor.signature_byte_start;
+    let end = start + ctor.signature_text.len();
+    let line_offset = ctor
+        .signature_text
+        .lines()
+        .take_while(|line| line.trim_start().starts_with('@'))
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    let insert_base = start + line_offset;
+    for vis in ["public", "protected"] {
+        if let Some(pos) = source[insert_base..end].find(vis) {
+            let abs = insert_base + pos;
+            return Some(bbox_refactor::TextEdit {
+                byte_start: abs,
+                byte_end: abs + vis.len(),
+                replacement: "private".to_string(),
+            });
+        }
+    }
+    Some(bbox_refactor::TextEdit {
+        byte_start: insert_base,
+        byte_end: insert_base,
+        replacement: "private ".to_string(),
+    })
+}
+
+fn render_factory_method(ctor: &ConstructorFactoryInfo, factory_name: &str) -> String {
+    let params = ctor
+        .params
+        .iter()
+        .map(|param| param.text.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let args = ctor
+        .params
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n\n    public static {} {}({}) {{\n        return new {}({});\n    }}",
+        ctor.class_name, factory_name, params, ctor.class_name, args
+    )
+}
+
+fn object_creation_class_name(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix("new ")?;
+    let name_end = rest
+        .find(|c: char| !(c == '_' || c == '$' || c == '.' || c.is_ascii_alphanumeric()))
+        .unwrap_or(rest.len());
+    rest.get(..name_end).filter(|name| !name.is_empty())
+}
+
+fn discover_constructor_call_sites(
+    root: &Path,
+    ctor: &ConstructorFactoryInfo,
+    files: Option<&[String]>,
+) -> Result<(Vec<ConstructorCallSite>, Vec<Value>), String> {
+    let file_list = if let Some(files) = files {
+        files.to_vec()
+    } else {
+        collect_java_files(root)?
+            .into_iter()
+            .filter_map(|path| relativize(root, &path.to_string_lossy()).ok())
+            .collect()
+    };
+    let mut sites = Vec::new();
+    let mut findings = Vec::new();
+    for rel in file_list {
+        let path = resolve_workspace_file(root, &rel, "java.replaceConstructorWithFactoryPreview")?;
+        let facts = match bbox_refactor::facts::file_query(
+            &path,
+            "(object_creation_expression) @creation",
+            None,
+        ) {
+            Ok(facts) => facts,
+            Err(e) => {
+                findings.push(json!({
+                    "finding": "constructor_call_scan_error",
+                    "file": rel,
+                    "detail": format!("{e:#}"),
+                }));
+                continue;
+            }
+        };
+        for capture in facts.captures {
+            if capture.capture != "creation" {
+                continue;
+            }
+            let Some(name) = object_creation_class_name(&capture.text) else {
+                continue;
+            };
+            if name.rsplit('.').next() != Some(ctor.class_name.as_str()) {
+                continue;
+            }
+            if capture.text.contains('{') {
+                findings.push(json!({
+                    "finding": "anonymous_class_creation",
+                    "severity": "blocker",
+                    "file": rel,
+                    "detail": "anonymous class creation cannot be rewritten to a factory call syntax-only",
+                }));
+                continue;
+            }
+            let Some(paren) = capture.text.find('(') else {
+                continue;
+            };
+            let Some(close) = capture.text.rfind(')') else {
+                continue;
+            };
+            let args = split_top_level_csv(&capture.text[paren + 1..close]);
+            if args.len() != ctor.params.len() {
+                findings.push(json!({
+                    "finding": "constructor_arity_mismatch",
+                    "severity": "blocker",
+                    "file": rel,
+                    "expected": ctor.params.len(),
+                    "actual": args.len(),
+                }));
+                continue;
+            }
+            sites.push(ConstructorCallSite {
+                file: rel.clone(),
+                ref_id: format!(
+                    "new:{}:{}-{}:{}",
+                    rel,
+                    capture.byte_start,
+                    capture.byte_end,
+                    signature_digest(&capture.text)
+                ),
+                byte_start: capture.byte_start,
+                byte_end: capture.byte_end,
+                text: capture.text,
+                args,
+            });
+        }
+    }
+    if !sites.is_empty() {
+        findings.push(json!({
+            "finding": "syntax_only_constructor_calls",
+            "severity": "review",
+            "count": sites.len(),
+            "detail": "constructor call sites are matched by object creation class name and arity, not JDTLS constructor binding",
+        }));
+    }
+    Ok((sites, findings))
+}
+
+fn replace_constructor_preview_value(
+    root: &Path,
+    params: &JavaReplaceConstructorWithFactoryPreviewParams,
+) -> Result<Value, String> {
+    let (_path, _source, items, ctor, mut findings) =
+        find_constructor_factory_target(root, params)?;
+    let Some(ctor) = ctor else {
+        return Ok(json!({
+            "file": params.file,
+            "constructor_ref": null,
+            "call_sites": [],
+            "findings": findings,
+            "blocked": true,
+            "ref_model": "preview-local constructor refs derived from signature bytes and hash; not graph IDs",
+            "provenance": "syntax_only",
+        }));
+    };
+    let factory_name = params
+        .factory_name
+        .clone()
+        .unwrap_or_else(|| "create".to_string());
+    if let Err(e) = validate_java_identifier(&factory_name, "factoryName") {
+        findings.push(json!({
+            "finding": "invalid_factory_name",
+            "severity": "blocker",
+            "detail": e,
+        }));
+    }
+    for item in &items.items {
+        if item.item.kind == "method_declaration"
+            && item.item.name.as_deref() == Some(factory_name.as_str())
+        {
+            findings.push(json!({
+                "finding": "factory_name_conflict",
+                "severity": "blocker",
+                "method": factory_name,
+            }));
+        }
+    }
+    let (call_sites, call_findings) =
+        discover_constructor_call_sites(root, &ctor, params.files.as_deref())?;
+    findings.extend(call_findings);
+    let blocked = findings
+        .iter()
+        .any(|finding| finding["severity"].as_str() == Some("blocker"));
+    Ok(json!({
+        "file": params.file,
+        "content_sha256": items.content_sha256,
+        "class_name": ctor.class_name,
+        "constructor_ref": ctor.ref_id,
+        "old_signature": ctor.signature_text,
+        "factory_name": factory_name,
+        "factory_signature": format!("public static {} {}({})", ctor.class_name, factory_name, ctor.params.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join(", ")),
+        "call_sites": call_sites.iter().map(|site| json!({
+            "ref": site.ref_id,
+            "file": site.file,
+            "byte_start": site.byte_start,
+            "byte_end": site.byte_end,
+            "args": site.args,
+            "text": site.text,
+        })).collect::<Vec<_>>(),
+        "findings": findings,
+        "blocked": blocked,
+        "ref_model": "preview-local constructor refs derived from signature bytes and hash; not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
+#[async_trait]
+impl Tool for JavaReplaceConstructorWithFactoryPreview {
+    fn name(&self) -> &str {
+        "java.replaceConstructorWithFactoryPreview"
+    }
+    fn description(&self) -> &str {
+        "Preview replacing one explicit Java constructor with a static factory: constructorRef, generated factory signature, and syntax-only new-expression call sites. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "className": { "type": "string" },
+                "factoryName": { "type": "string" },
+                "files": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["file"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some((
+            "java".to_string(),
+            "replaceConstructorWithFactoryPreview".to_string(),
+        ))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaReplaceConstructorWithFactoryPreviewParams = match serde_json::from_value(
+            input,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.replaceConstructorWithFactoryPreview: bad input - expected {{ file, className?, factoryName?, files? }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            match replace_constructor_preview_value(&root, &params) {
+                Ok(v) => ToolResult::Json(v),
+                Err(e) => err(e),
+            }
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaReplaceConstructorWithFactory {
+    fn name(&self) -> &str {
+        "java.replaceConstructorWithFactory"
+    }
+    fn description(&self) -> &str {
+        "Apply java.replaceConstructorWithFactoryPreview refs: make the constructor private, insert a static factory, and rewrite acknowledged `new Type(...)` call sites. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "className": { "type": "string" },
+                "constructorRef": { "type": "string" },
+                "factoryName": { "type": "string" },
+                "files": { "type": "array", "items": { "type": "string" } },
+                "acknowledgeSyntaxOnlyCallSites": { "type": "boolean" },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "constructorRef"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some((
+            "java".to_string(),
+            "replaceConstructorWithFactory".to_string(),
+        ))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaReplaceConstructorWithFactoryParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.replaceConstructorWithFactory: bad input - expected {{ file, constructorRef, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let preview_params = JavaReplaceConstructorWithFactoryPreviewParams {
+                file: params.file.clone(),
+                class_name: params.class_name.clone(),
+                factory_name: params.factory_name.clone(),
+                files: params.files.clone(),
+            };
+            let preview = match replace_constructor_preview_value(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.replaceConstructorWithFactoryPreview", "java.replaceConstructorWithFactory")),
+            };
+            if preview["constructor_ref"].as_str() != Some(params.constructor_ref.as_str()) {
+                return err("java.replaceConstructorWithFactory: stale constructorRef; re-run preview");
+            }
+            let blocked = preview["findings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|finding| finding["severity"].as_str() == Some("blocker"));
+            if blocked {
+                return ToolResult::Json(json!({
+                    "title": "replace constructor with factory",
+                    "changes": [],
+                    "findings": preview["findings"].clone(),
+                    "blocked": true,
+                    "preview_only": params.preview_only.unwrap_or(false),
+                    "would_change_files": [],
+                    "provenance": "syntax_only",
+                }));
+            }
+            let call_sites = preview["call_sites"].as_array().cloned().unwrap_or_default();
+            if !call_sites.is_empty() && params.acknowledge_syntax_only_call_sites != Some(true) {
+                let mut findings = preview["findings"].clone();
+                if let Some(items) = findings.as_array_mut() {
+                    items.push(json!({
+                        "finding": "acknowledgement_required",
+                        "severity": "blocker",
+                        "detail": "constructor call rewrites are syntax-only; pass acknowledgeSyntaxOnlyCallSites:true",
+                    }));
+                }
+                return ToolResult::Json(json!({
+                    "title": "replace constructor with factory",
+                    "changes": [],
+                    "findings": findings,
+                    "blocked": true,
+                    "preview_only": params.preview_only.unwrap_or(false),
+                    "would_change_files": [],
+                    "provenance": "syntax_only",
+                }));
+            }
+            let (source_path, source, _items, ctor, _) = match find_constructor_factory_target(&root, &preview_params) {
+                Ok(found) => found,
+                Err(e) => return err(e.replace("java.replaceConstructorWithFactoryPreview", "java.replaceConstructorWithFactory")),
+            };
+            let Some(ctor) = ctor else {
+                return err("java.replaceConstructorWithFactory: constructor disappeared; re-run preview");
+            };
+            let factory_name = preview["factory_name"].as_str().unwrap_or("create").to_string();
+            let mut edits_by_file: BTreeMap<String, Vec<bbox_refactor::TextEdit>> = BTreeMap::new();
+            if let Some(edit) = constructor_private_edit(&source, &ctor) {
+                edits_by_file.entry(params.file.clone()).or_default().push(edit);
+            }
+            edits_by_file
+                .entry(params.file.clone())
+                .or_default()
+                .push(bbox_refactor::TextEdit {
+                    byte_start: ctor.byte_end,
+                    byte_end: ctor.byte_end,
+                    replacement: render_factory_method(&ctor, &factory_name),
+                });
+            let (sites, _) = match discover_constructor_call_sites(&root, &ctor, params.files.as_deref()) {
+                Ok(found) => found,
+                Err(e) => return err(e.replace("java.replaceConstructorWithFactoryPreview", "java.replaceConstructorWithFactory")),
+            };
+            for site in sites {
+                edits_by_file
+                    .entry(site.file.clone())
+                    .or_default()
+                    .push(bbox_refactor::TextEdit {
+                        byte_start: site.byte_start,
+                        byte_end: site.byte_end,
+                        replacement: format!("{}.{}({})", ctor.class_name, factory_name, site.args.join(", ")),
+                    });
+            }
+            let mut changes = Vec::new();
+            let mut would_change_files = Vec::new();
+            for (rel, mut edits) in edits_by_file {
+                edits.sort_by_key(|edit| edit.byte_start);
+                let path = if rel == params.file {
+                    source_path.clone()
+                } else {
+                    match resolve_workspace_file(&root, &rel, "java.replaceConstructorWithFactory") {
+                        Ok(path) => path,
+                        Err(e) => return err(e),
+                    }
+                };
+                let old = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => return err(format!("java.replaceConstructorWithFactory: read {rel}: {e}")),
+                };
+                let new_text = match bbox_refactor::apply_text_edits(&old, &edits) {
+                    Ok(text) => text,
+                    Err(e) => return err(format!("java.replaceConstructorWithFactory: edit synthesis failed for {rel}: {e:#}")),
+                };
+                if new_text != old {
+                    would_change_files.push(json!({
+                        "path": rel,
+                        "edit_count": edits.len(),
+                        "replacement_bytes": new_text.len(),
+                    }));
+                    if params.preview_only != Some(true) {
+                        changes.push(whole_file_change(&rel, &old, &new_text));
+                    }
+                }
+            }
+            ToolResult::Json(json!({
+                "title": format!("replace `{}` constructor with `{}` factory", ctor.class_name, factory_name),
+                "changes": changes,
+                "findings": preview["findings"].clone(),
+                "selected_constructor_ref": params.constructor_ref,
+                "preview_only": params.preview_only.unwrap_or(false),
+                "would_change_files": would_change_files,
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
 /// `java.describe` — depth-on-demand contract for one transform (§6.5
 /// surface economics: the namespace index stays one line per transform;
 /// the full contract lives here, in the isolate, not in the exec prompt).
@@ -5148,6 +5830,36 @@ RECIPE
     fieldRef: pv.field_ref, acknowledgeSyntaxOnlyReferences: true });
 "#;
 
+const REPLACE_CONSTRUCTOR_WITH_FACTORY_CONTRACT: &str = r#"java.replaceConstructorWithFactoryPreview / java.replaceConstructorWithFactory - syntax-only Java constructor factory conversion.
+
+WHAT IT DOES
+  Preview inventories one explicit constructor, generates a static factory
+  method signature, and lists `new Type(...)` call sites. Apply re-runs preview,
+  refuses stale constructorRef, makes the constructor private, inserts the
+  factory, and rewrites acknowledged constructor call sites.
+
+REF MODEL
+  constructorRef is preview-local: ctor:<class>:<signature-byte-range>:<hash>.
+  It is not a durable graph ID.
+
+IMPORTANT LIMITS
+  - overloaded constructors are blocked in this first syntax-only slice.
+  - anonymous class creations are blocked.
+  - call sites are matched by object creation class name + arity, not JDTLS binding.
+  - generic classes report review friction because factory return typing may need adjustment.
+
+PARAMS
+  file: string
+  className?: string
+  factoryName?: string   default create
+  files?: string[]       optional call-site scan/apply file set
+
+RECIPE
+  const pv = await java.replaceConstructorWithFactoryPreview({ file, className: "Order" });
+  const r = await java.replaceConstructorWithFactory({ file, className: "Order",
+    constructorRef: pv.constructor_ref, acknowledgeSyntaxOnlyCallSites: true });
+"#;
+
 const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell seam-dependency preflight before java.extractClass.
 
 WHAT IT DOES
@@ -5247,6 +5959,9 @@ impl Tool for JavaDescribe {
             "encapsulateFieldPreview" | "encapsulateField" => {
                 ToolResult::Json(json!({ "contract": ENCAPSULATE_FIELD_CONTRACT }))
             }
+            "replaceConstructorWithFactoryPreview" | "replaceConstructorWithFactory" => {
+                ToolResult::Json(json!({ "contract": REPLACE_CONSTRUCTOR_WITH_FACTORY_CONTRACT }))
+            }
             "removeUnusedConstructorParams" => {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
@@ -5265,7 +5980,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -6758,6 +7473,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaChangeSignature) as Arc<dyn Tool>,
         Arc::new(JavaEncapsulateFieldPreview) as Arc<dyn Tool>,
         Arc::new(JavaEncapsulateField) as Arc<dyn Tool>,
+        Arc::new(JavaReplaceConstructorWithFactoryPreview) as Arc<dyn Tool>,
+        Arc::new(JavaReplaceConstructorWithFactory) as Arc<dyn Tool>,
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
@@ -6774,7 +7491,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -6790,6 +7507,8 @@ type JavaChangeSignaturePreview = { file: string; content_sha256?: string; metho
 type JavaChangeSignatureResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaEncapsulateFieldPreview = { file: string; content_sha256?: string; field_name: string; field_ref?: string | null; field?: unknown; accessors?: { getter: string; setter?: string | null }; references: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaEncapsulateFieldResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_field_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
+type JavaReplaceConstructorWithFactoryPreview = { file: string; content_sha256?: string; class_name?: string; constructor_ref?: string | null; old_signature?: string; factory_name?: string; factory_signature?: string; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
+type JavaReplaceConstructorWithFactoryResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_constructor_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -6820,6 +7539,10 @@ declare const java: {
   encapsulateFieldPreview(args: { file: string; className?: string; fieldName: string; getterName?: string; setterName?: string; files?: string[] }): Promise<JavaEncapsulateFieldPreview>;
   /** Apply a previewed Java field encapsulation. Reference rewrites require acknowledgeSyntaxOnlyReferences:true. */
   encapsulateField(args: { file: string; className?: string; fieldName: string; fieldRef: string; getterName?: string; setterName?: string; files?: string[]; rewriteReferences?: "none" | "same_file" | "files"; acknowledgeSyntaxOnlyReferences?: boolean; previewOnly?: boolean }): Promise<JavaEncapsulateFieldResult>;
+  /** Preview replacing one explicit constructor with a static factory. Refs are preview-local signature hashes, not graph IDs. */
+  replaceConstructorWithFactoryPreview(args: { file: string; className?: string; factoryName?: string; files?: string[] }): Promise<JavaReplaceConstructorWithFactoryPreview>;
+  /** Apply a previewed constructor-factory conversion. new-expression rewrites require acknowledgeSyntaxOnlyCallSites:true. */
+  replaceConstructorWithFactory(args: { file: string; className?: string; constructorRef: string; factoryName?: string; files?: string[]; acknowledgeSyntaxOnlyCallSites?: boolean; previewOnly?: boolean }): Promise<JavaReplaceConstructorWithFactoryResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
@@ -7552,6 +8275,111 @@ public class OrderService {
         );
         assert!(rewritten.contains("setCount(count + 1);"), "{rewritten}");
         assert!(rewritten.contains("return this.getCount();"), "{rewritten}");
+    }
+
+    const FACTORY_SERVICE: &str = r#"package com.acme;
+
+public class OrderService {
+    public OrderService(String id, int count) {
+    }
+}
+"#;
+
+    const FACTORY_CLIENT: &str = r#"package com.acme;
+
+public class Client {
+    public OrderService run() {
+        return new OrderService("a", 7);
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn replace_constructor_with_factory_rewrites_new_calls_when_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(root.join("src/com/acme/OrderService.java"), FACTORY_SERVICE).unwrap();
+        std::fs::write(root.join("src/com/acme/Client.java"), FACTORY_CLIENT).unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaReplaceConstructorWithFactoryPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "factoryName": "of",
+                        "files": ["src/com/acme/OrderService.java", "src/com/acme/Client.java"]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview["blocked"], false, "{preview}");
+        assert!(
+            preview["constructor_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("ctor:OrderService:"),
+            "{preview}"
+        );
+        assert_eq!(
+            preview["call_sites"].as_array().unwrap().len(),
+            1,
+            "{preview}"
+        );
+
+        let refused = json_of(
+            JavaReplaceConstructorWithFactory
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "constructorRef": preview["constructor_ref"].as_str().unwrap(),
+                        "factoryName": "of",
+                        "files": ["src/com/acme/OrderService.java", "src/com/acme/Client.java"]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(refused["blocked"], true, "{refused}");
+
+        let result = json_of(
+            JavaReplaceConstructorWithFactory
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "className": "OrderService",
+                        "constructorRef": preview["constructor_ref"].as_str().unwrap(),
+                        "factoryName": "of",
+                        "files": ["src/com/acme/OrderService.java", "src/com/acme/Client.java"],
+                        "acknowledgeSyntaxOnlyCallSites": true
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 2, "{result}");
+        let service = replacement_for_file(&result, "src/com/acme/OrderService.java");
+        assert!(
+            service.contains("private OrderService(String id, int count)"),
+            "{service}"
+        );
+        assert!(
+            service.contains("public static OrderService of(String id, int count)"),
+            "{service}"
+        );
+        assert!(
+            service.contains("return new OrderService(id, count);"),
+            "{service}"
+        );
+        let client = replacement_for_file(&result, "src/com/acme/Client.java");
+        assert!(
+            client.contains("return OrderService.of(\"a\", 7);"),
+            "{client}"
+        );
     }
 
     const PULLUP_FIXTURE: &str = r#"package com.acme.impl;
