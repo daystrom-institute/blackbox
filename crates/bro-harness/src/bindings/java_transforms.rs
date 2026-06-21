@@ -1819,6 +1819,72 @@ fn selected_type_parameters(
     }
 }
 
+fn existing_target_type_ref_suffix(
+    source: &str,
+    source_class_name: &str,
+    target_source: &str,
+    target_kind: &str,
+    target_type_name: &str,
+) -> String {
+    let target_keyword = if target_kind == "abstract_class" {
+        "class"
+    } else {
+        "interface"
+    };
+    let Some((_, target_names)) =
+        type_decl_type_parameters(target_source, target_keyword, target_type_name)
+    else {
+        return String::new();
+    };
+    let Some((_, source_names)) = class_type_parameters(source, source_class_name) else {
+        return String::new();
+    };
+    let source_names = source_names.into_iter().collect::<BTreeSet<_>>();
+    if target_names
+        .iter()
+        .all(|name| source_names.contains(name.as_str()))
+    {
+        format!("<{}>", target_names.join(", "))
+    } else {
+        String::new()
+    }
+}
+
+fn is_java_ident_byte(byte: u8) -> bool {
+    byte == b'_' || byte == b'$' || byte.is_ascii_alphanumeric()
+}
+
+fn java_header_keyword_pos(header: &str, keyword: &str) -> Option<usize> {
+    let bytes = header.as_bytes();
+    let key = keyword.as_bytes();
+    let mut angle_depth = 0i32;
+    let mut paren_depth = 0i32;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'<' => angle_depth += 1,
+            b'>' if angle_depth > 0 => angle_depth -= 1,
+            b'(' => paren_depth += 1,
+            b')' if paren_depth > 0 => paren_depth -= 1,
+            _ => {}
+        }
+        if angle_depth == 0
+            && paren_depth == 0
+            && idx + key.len() <= bytes.len()
+            && &bytes[idx..idx + key.len()] == key
+        {
+            let before_ok = idx == 0 || !is_java_ident_byte(bytes[idx - 1]);
+            let after = idx + key.len();
+            let after_ok = after >= bytes.len() || !is_java_ident_byte(bytes[after]);
+            if before_ok && after_ok {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
 fn source_package(source: &str) -> Option<String> {
     extract_package_name(source)
 }
@@ -1996,6 +2062,49 @@ fn insert_import_edit(source: &str, import_fqcn: &str) -> Option<bbox_refactor::
         byte_start: insert_at,
         byte_end: insert_at,
         replacement: format!("{prefix}{import_line}\n"),
+    })
+}
+
+fn insert_import_lines_edit(
+    source: &str,
+    import_fqcns: BTreeSet<String>,
+) -> Option<bbox_refactor::TextEdit> {
+    let import_lines = import_fqcns
+        .into_iter()
+        .map(|fqcn| format!("import {fqcn};"))
+        .filter(|line| !source.lines().any(|existing| existing.trim() == line))
+        .collect::<Vec<_>>();
+    if import_lines.is_empty() {
+        return None;
+    }
+    let mut insert_at = 0usize;
+    let mut saw_package = false;
+    let mut saw_import = false;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("package ") {
+            saw_package = true;
+            insert_at += line.len();
+            continue;
+        }
+        if trimmed.starts_with("import ") {
+            saw_import = true;
+            insert_at += line.len();
+            continue;
+        }
+        break;
+    }
+    let prefix = if saw_import {
+        ""
+    } else if saw_package {
+        "\n"
+    } else {
+        ""
+    };
+    Some(bbox_refactor::TextEdit {
+        byte_start: insert_at,
+        byte_end: insert_at,
+        replacement: format!("{prefix}{}\n", import_lines.join("\n")),
     })
 }
 
@@ -2354,6 +2463,10 @@ impl Tool for JavaPullUpPreview {
 /// `java.extractInterface` - apply stage for preview-issued pull-up refs.
 pub struct JavaExtractInterface;
 
+/// `java.pullUpMembers` - apply stage for preview-issued pull-up refs into
+/// an existing interface or abstract class.
+pub struct JavaPullUpMembers;
+
 #[derive(Deserialize)]
 struct JavaExtractInterfaceParams {
     file: String,
@@ -2372,6 +2485,31 @@ struct JavaExtractInterfaceParams {
     annotation_policy: Option<String>,
     #[serde(default, rename = "targetPackage", alias = "target_package")]
     target_package: Option<String>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct JavaPullUpMembersParams {
+    file: String,
+    target: String,
+    #[serde(default, rename = "targetTypeName", alias = "target_type_name")]
+    target_type_name: Option<String>,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+    #[serde(default, rename = "targetKind", alias = "target_kind")]
+    target_kind: Option<String>,
+    #[serde(rename = "memberRefs", alias = "member_refs")]
+    member_refs: Vec<String>,
+    #[serde(default, rename = "commentPolicy", alias = "comment_policy")]
+    comment_policy: Option<String>,
+    #[serde(default, rename = "annotationPolicy", alias = "annotation_policy")]
+    annotation_policy: Option<String>,
     #[serde(
         default,
         rename = "previewOnly",
@@ -2551,13 +2689,13 @@ fn class_header_insert_edit(
                 "abstract_class pull-up requires a class source, got {type_keyword}"
             ));
         }
-        if header.contains(" extends ") {
+        if java_header_keyword_pos(header, "extends").is_some() {
             return Err(
                 "abstract_class pull-up refuses classes that already extend another type"
                     .to_string(),
             );
         }
-        if let Some(implements_rel) = header.find(" implements ") {
+        if let Some(implements_rel) = java_header_keyword_pos(header, "implements") {
             let insert_at = class_at + implements_rel;
             Ok(bbox_refactor::TextEdit {
                 byte_start: insert_at,
@@ -2571,7 +2709,7 @@ fn class_header_insert_edit(
                 replacement: format!(" extends {type_ref}"),
             })
         }
-    } else if header.contains(" implements ") {
+    } else if java_header_keyword_pos(header, "implements").is_some() {
         if header
             .split(" implements ")
             .nth(1)
@@ -2611,7 +2749,10 @@ fn visibility_edit_for(
         .take_while(|line| line.trim_start().starts_with('@'))
         .map(|line| line.len() + 1)
         .sum::<usize>();
-    let insert_base = start + line_offset;
+    let mut insert_base = start + line_offset;
+    while insert_base < source.len() && matches!(source.as_bytes()[insert_base], b' ' | b'\t') {
+        insert_base += 1;
+    }
     for vis in ["private", "protected"] {
         if let Some(pos) = source[insert_base..end].find(vis) {
             let abs = insert_base + pos;
@@ -2694,6 +2835,155 @@ fn pullup_candidates_from_preview(value: &Value) -> Vec<PullUpCandidate> {
             })
         })
         .collect()
+}
+
+fn java_signature_key(sig: &bbox_refactor::facts::JavaSignatureFacts) -> Option<String> {
+    let name = sig.name.as_ref()?;
+    let params = sig
+        .params
+        .iter()
+        .map(|param| param.type_text.as_deref().unwrap_or("?").trim().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("{name}({params})"))
+}
+
+fn candidate_signature_key(candidate: &PullUpCandidate) -> String {
+    let params = candidate
+        .signature_text
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(params, _)| {
+            params
+                .split(',')
+                .filter_map(|param| {
+                    let mut words = param.split_whitespace().collect::<Vec<_>>();
+                    if words.is_empty() {
+                        return None;
+                    }
+                    words.pop();
+                    let ty = words.join(" ");
+                    Some(if ty.is_empty() { "?".to_string() } else { ty })
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    format!("{}({params})", candidate.name)
+}
+
+fn existing_target_method_keys(
+    target_path: &Path,
+    target_items: &bbox_refactor::facts::FileItemsFacts,
+    target_type_name: &str,
+) -> BTreeSet<String> {
+    let target_range = target_items
+        .items
+        .iter()
+        .find(|item| {
+            java_class_like_kind(&item.item.kind)
+                && item.item.name.as_deref() == Some(target_type_name)
+        })
+        .map(|item| (item.item.byte_start, item.item.byte_end));
+    target_items
+        .items
+        .iter()
+        .filter(|item| {
+            item.item.kind == "method_declaration"
+                && target_range.is_none_or(|(start, end)| {
+                    item.item.byte_start >= start && item.item.byte_end <= end
+                })
+        })
+        .filter_map(|item| {
+            bbox_refactor::facts::callable_signature(
+                target_path,
+                item.item.byte_start,
+                item.item.byte_end,
+                Some(&target_items.content_sha256),
+            )
+            .ok()
+            .and_then(|sig| match sig {
+                bbox_refactor::facts::SignatureFacts::Java(sig) => java_signature_key(&sig),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+fn render_existing_target_members(
+    target_kind: &str,
+    candidates: &[PullUpCandidate],
+    comment_policy: &str,
+    annotation_policy: &str,
+) -> String {
+    let mut out = String::new();
+    for (idx, candidate) in candidates.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        if matches!(comment_policy, "copy" | "move") && !candidate.trivia.trim().is_empty() {
+            for line in candidate.trivia.trim_matches('\n').lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                out.push_str("    ");
+                out.push_str(line.trim_start());
+                out.push('\n');
+            }
+        }
+        out.push_str("    ");
+        if target_kind == "abstract_class" {
+            out.push_str(&abstract_signature(candidate, annotation_policy, "public"));
+        } else {
+            out.push_str(&interface_signature(candidate, annotation_policy));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn existing_target_member_insert_edit(
+    target_source: &str,
+    insert_at: usize,
+    rendered_members: &str,
+) -> bbox_refactor::TextEdit {
+    let before = target_source.get(..insert_at).unwrap_or_default();
+    let trimmed_before = before.trim_end();
+    let prefix = if trimmed_before.ends_with('{') {
+        if before.ends_with('\n') { "" } else { "\n" }
+    } else {
+        "\n\n"
+    };
+    bbox_refactor::TextEdit {
+        byte_start: insert_at,
+        byte_end: insert_at,
+        replacement: format!("{prefix}{rendered_members}"),
+    }
+}
+
+fn target_abstract_modifier_edit(
+    target_source: &str,
+    target_items: &bbox_refactor::facts::FileItemsFacts,
+    target_type_name: &str,
+) -> Option<bbox_refactor::TextEdit> {
+    let item = target_items.items.iter().find(|item| {
+        item.item.kind == "class_declaration" && item.item.name.as_deref() == Some(target_type_name)
+    })?;
+    let header = target_source
+        .get(item.item.byte_start..item.item.byte_end)?
+        .split('{')
+        .next()
+        .unwrap_or_default();
+    if header.split_whitespace().any(|word| word == "abstract") {
+        return None;
+    }
+    let class_rel = header.find("class")?;
+    let class_at = item.item.byte_start + class_rel;
+    Some(bbox_refactor::TextEdit {
+        byte_start: class_at,
+        byte_end: class_at,
+        replacement: "abstract ".to_string(),
+    })
 }
 
 #[async_trait]
@@ -2996,6 +3286,438 @@ impl Tool for JavaExtractInterface {
                 "preview_only": preview_only,
                 "would_change_files": if source == new_source { json!([]) } else { json!([{ "path": params.file, "edit_count": edits.len(), "replacement_bytes": new_source.len() }]) },
                 "would_create_files": [{ "path": params.target, "bytes": target_content.len() }],
+                "provenance": "syntax_only",
+            }))
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaPullUpMembers {
+    fn name(&self) -> &str {
+        "java.pullUpMembers"
+    }
+    fn description(&self) -> &str {
+        "Apply java.pullUpPreview refs into an existing interface or abstract class. Re-derives refs, refuses stale/blocked selections, inserts selected signatures into the target, updates source implements/extends, widens selected source methods, and returns edit changes. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "target": { "type": "string" },
+                "targetTypeName": { "type": "string" },
+                "className": { "type": "string" },
+                "targetKind": { "type": "string", "enum": ["interface", "abstract_class"] },
+                "memberRefs": { "type": "array", "items": { "type": "string" }, "description": "Refs returned by java.pullUpPreview, not graph IDs." },
+                "commentPolicy": { "type": "string", "enum": ["copy", "move", "omit"] },
+                "annotationPolicy": { "type": "string", "enum": ["safe", "copy", "omit"] },
+                "previewOnly": { "type": "boolean" }
+            },
+            "required": ["file", "target", "memberRefs"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "pullUpMembers".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaPullUpMembersParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.pullUpMembers: bad input - expected {{ file, target, memberRefs, ... }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            if params.member_refs.is_empty() {
+                return err("java.pullUpMembers: memberRefs must not be empty");
+            }
+            let comment_policy = params.comment_policy.as_deref().unwrap_or("copy");
+            if !matches!(comment_policy, "copy" | "move" | "omit") {
+                return err(format!(
+                    "java.pullUpMembers: commentPolicy must be copy, move, or omit, got `{comment_policy}`"
+                ));
+            }
+            let annotation_policy = params.annotation_policy.as_deref().unwrap_or("safe");
+            if !matches!(annotation_policy, "safe" | "copy" | "omit") {
+                return err(format!(
+                    "java.pullUpMembers: annotationPolicy must be safe, copy, or omit, got `{annotation_policy}`"
+                ));
+            }
+            let source_path = match resolve_workspace_file(&root, &params.file, "java.pullUpMembers") {
+                Ok(path) => path,
+                Err(e) => return err(e),
+            };
+            let target_path = match resolve_workspace_file(&root, &params.target, "java.pullUpMembers") {
+                Ok(path) => path,
+                Err(e) => return err(e),
+            };
+            if source_path == target_path {
+                return err("java.pullUpMembers: source and target must be different files in the syntax-only backend");
+            }
+            if !target_path.exists() {
+                return err(format!("java.pullUpMembers: target does not exist: {}", params.target));
+            }
+            let target_source = match std::fs::read_to_string(&target_path) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pullUpMembers: read {}: {e}", params.target)),
+            };
+            let target_items = match bbox_refactor::facts::file_items(&target_path) {
+                Ok(items) => items,
+                Err(e) => return err(format!("java.pullUpMembers: inventory {}: {e:#}", params.target)),
+            };
+            if target_items.language != "java" {
+                return err("java.pullUpMembers: only Java targets are supported");
+            }
+            let target_type_name = params.target_type_name.clone().unwrap_or_else(|| {
+                Path::new(&params.target)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Target")
+                    .to_string()
+            });
+            if let Err(e) = validate_java_identifier(&target_type_name, "targetTypeName") {
+                return err(format!("java.pullUpMembers: {e}"));
+            }
+            let target_item = target_items.items.iter().find(|item| {
+                java_class_like_kind(&item.item.kind)
+                    && item.item.name.as_deref() == Some(target_type_name.as_str())
+            });
+            let Some(target_item) = target_item else {
+                return err(format!(
+                    "java.pullUpMembers: target type `{target_type_name}` not found in {}",
+                    params.target
+                ));
+            };
+            let inferred_target_kind = match target_item.item.kind.as_str() {
+                "interface_declaration" => "interface",
+                "class_declaration" => "abstract_class",
+                other => {
+                    return err(format!(
+                        "java.pullUpMembers: target type `{target_type_name}` must be an interface or class, got {other}"
+                    ));
+                }
+            };
+            let target_kind = params
+                .target_kind
+                .clone()
+                .unwrap_or_else(|| inferred_target_kind.to_string());
+            if !matches!(target_kind.as_str(), "interface" | "abstract_class") {
+                return err(format!(
+                    "java.pullUpMembers: targetKind must be interface or abstract_class, got `{target_kind}`"
+                ));
+            }
+            if target_kind != inferred_target_kind {
+                return err(format!(
+                    "java.pullUpMembers: targetKind `{target_kind}` does not match target declaration kind `{}`",
+                    target_item.item.kind
+                ));
+            }
+
+            let preview_params = JavaPullUpPreviewParams {
+                file: params.file.clone(),
+                class_name: params.class_name.clone(),
+                target_kind: Some(target_kind.clone()),
+            };
+            let preview = match preview_candidates(&root, &preview_params) {
+                Ok(v) => v,
+                Err(e) => return err(e.replace("java.pullUpPreview", "java.pullUpMembers")),
+            };
+            let all_candidates = pullup_candidates_from_preview(&preview);
+            let selected_refs: BTreeSet<String> = params.member_refs.iter().cloned().collect();
+            let selected: Vec<PullUpCandidate> = all_candidates
+                .iter()
+                .filter(|candidate| selected_refs.contains(&candidate.ref_id))
+                .cloned()
+                .collect();
+            let class_blockers = preview["class"]["blockers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if !class_blockers.is_empty() {
+                return ToolResult::Json(json!({
+                    "title": format!("pull up members into existing {target_kind} `{target_type_name}`"),
+                    "changes": [],
+                    "creates": [],
+                    "findings": class_blockers.into_iter().map(|blocker| json!({
+                        "finding": "class_blocker",
+                        "blocker": blocker,
+                    })).collect::<Vec<_>>(),
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+            if selected.len() != selected_refs.len() {
+                let found: BTreeSet<&str> = selected.iter().map(|c| c.ref_id.as_str()).collect();
+                let missing: Vec<&str> = selected_refs
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|r| !found.contains(r))
+                    .collect();
+                return err(format!(
+                    "java.pullUpMembers: stale or unknown memberRefs: {missing:?}; re-run java.pullUpPreview"
+                ));
+            }
+            let blocked: Vec<Value> = selected
+                .iter()
+                .flat_map(|candidate| {
+                    candidate.blockers.iter().map(|blocker| {
+                        json!({
+                            "ref": candidate.ref_id,
+                            "name": candidate.name,
+                            "blocker": blocker,
+                        })
+                    })
+                })
+                .collect();
+            if !blocked.is_empty() {
+                return ToolResult::Json(json!({
+                    "title": format!("pull up members into existing {target_kind} `{target_type_name}`"),
+                    "changes": [],
+                    "creates": [],
+                    "findings": blocked,
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+            let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
+            for candidate in &all_candidates {
+                *by_name.entry(candidate.name.clone()).or_default() += 1;
+            }
+            let selected_by_name: BTreeMap<String, usize> =
+                selected.iter().fold(BTreeMap::new(), |mut acc, candidate| {
+                    *acc.entry(candidate.name.clone()).or_default() += 1;
+                    acc
+                });
+            let overload_gaps: Vec<Value> = selected_by_name
+                .iter()
+                .filter_map(|(name, count)| {
+                    let total = by_name.get(name).copied().unwrap_or(0);
+                    if total > *count {
+                        Some(json!({
+                            "kind": "partial_overload_selection",
+                            "name": name,
+                            "selected": count,
+                            "available": total,
+                            "detail": "current syntax backend applies visibility by method name shape; select every overload or wait for semantic overload apply",
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !overload_gaps.is_empty() {
+                return ToolResult::Json(json!({
+                    "changes": [],
+                    "creates": [],
+                    "findings": overload_gaps,
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+            let target_keys = existing_target_method_keys(&target_path, &target_items, &target_type_name);
+            let duplicate_targets: Vec<Value> = selected
+                .iter()
+                .filter_map(|candidate| {
+                    let key = candidate_signature_key(candidate);
+                    if target_keys.contains(&key) {
+                        Some(json!({
+                            "kind": "target_signature_exists",
+                            "ref": candidate.ref_id,
+                            "name": candidate.name,
+                            "signature_key": key,
+                            "detail": "target already has a method with this name and parameter shape",
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !duplicate_targets.is_empty() {
+                return ToolResult::Json(json!({
+                    "changes": [],
+                    "creates": [],
+                    "findings": duplicate_targets,
+                    "blocked": true,
+                    "provenance": "syntax_only",
+                }));
+            }
+
+            let source = match std::fs::read_to_string(&source_path) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pullUpMembers: read {}: {e}", params.file)),
+            };
+            let class_name = preview["class"]["name"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    Path::new(&params.file)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Source")
+                })
+                .to_string();
+            let (type_decl_suffix, selected_type_ref_suffix) =
+                selected_type_parameters(&source, &class_name, &selected);
+            let type_ref_suffix = existing_target_type_ref_suffix(
+                &source,
+                &class_name,
+                &target_source,
+                &target_kind,
+                &target_type_name,
+            );
+            let type_ref_suffix = if type_ref_suffix.is_empty() {
+                selected_type_ref_suffix
+            } else {
+                type_ref_suffix
+            };
+            let target_package = source_package(&target_source);
+            let (target_imports, target_import_findings) = target_import_plan(
+                &source,
+                target_package.as_deref(),
+                &target_type_name,
+                &type_decl_suffix,
+                &selected,
+                annotation_policy,
+            );
+            let type_ref = format!("{target_type_name}{type_ref_suffix}");
+            let mut source_edits = Vec::new();
+            match class_header_insert_edit(&source, &class_name, &target_kind, &type_ref) {
+                Ok(edit) => source_edits.push(edit),
+                Err(e) => return err(format!("java.pullUpMembers: {e}")),
+            }
+            if let Some(target_package) = target_package.as_deref()
+                && source_package(&source).as_deref() != Some(target_package)
+                && let Some(edit) =
+                    insert_import_edit(&source, &format!("{target_package}.{target_type_name}"))
+            {
+                source_edits.push(edit);
+            }
+            for candidate in &selected {
+                if comment_policy == "move"
+                    && let Some(edit) = moved_comment_edit_for(
+                        &source,
+                        candidate.trivia_byte_start,
+                        candidate.member_byte_start,
+                    )
+                {
+                    source_edits.push(edit);
+                }
+                if let Some(edit) = visibility_edit_for(
+                    &source,
+                    candidate.signature_byte_start,
+                    &candidate.signature_text,
+                    candidate.visibility.as_deref(),
+                ) {
+                    source_edits.push(edit);
+                }
+            }
+            source_edits.sort_by_key(|edit| edit.byte_start);
+            let new_source = match bbox_refactor::apply_text_edits(&source, &source_edits) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pullUpMembers: source edit synthesis failed: {e:#}")),
+            };
+
+            let mut target_edits = Vec::new();
+            let target_import_fqcns = target_imports
+                .iter()
+                .filter_map(|import_line| import_fqcn(import_line).map(str::to_string))
+                .collect::<BTreeSet<_>>();
+            if let Some(edit) = insert_import_lines_edit(&target_source, target_import_fqcns) {
+                target_edits.push(edit);
+            }
+            let mut target_findings = Vec::new();
+            if target_kind == "abstract_class"
+                && let Some(edit) = target_abstract_modifier_edit(
+                    &target_source,
+                    &target_items,
+                    &target_type_name,
+                )
+            {
+                target_edits.push(edit);
+                target_findings.push(json!({
+                    "finding": "target_modifier_added",
+                    "kind": "abstract_modifier_added",
+                    "type": target_type_name,
+                    "detail": "target class must be abstract before abstract method signatures can be inserted",
+                }));
+            }
+            let insert_at = match class_insert_before_closing_brace(&target_items, &target_type_name) {
+                Some(insert_at) => insert_at,
+                None => return err("java.pullUpMembers: target type closing brace not found"),
+            };
+            let rendered_members = render_existing_target_members(
+                &target_kind,
+                &selected,
+                comment_policy,
+                annotation_policy,
+            );
+            target_edits.push(existing_target_member_insert_edit(
+                &target_source,
+                insert_at,
+                &rendered_members,
+            ));
+            target_edits.sort_by_key(|edit| edit.byte_start);
+            let new_target = match bbox_refactor::apply_text_edits(&target_source, &target_edits) {
+                Ok(text) => text,
+                Err(e) => return err(format!("java.pullUpMembers: target edit synthesis failed: {e:#}")),
+            };
+
+            let preview_only = params.preview_only.unwrap_or(false);
+            let mut changes = Vec::new();
+            if !preview_only && new_source != source {
+                changes.push(whole_file_change(&params.file, &source, &new_source));
+            }
+            if !preview_only && new_target != target_source {
+                changes.push(whole_file_change(&params.target, &target_source, &new_target));
+            }
+            let mut findings: Vec<Value> = selected
+                .iter()
+                .flat_map(|candidate| {
+                    candidate.warnings.iter().map(|warning| {
+                        json!({
+                            "finding": "member_warning",
+                            "ref": candidate.ref_id,
+                            "name": candidate.name,
+                            "warning": warning,
+                        })
+                    })
+                })
+                .collect();
+            findings.extend(target_import_findings);
+            findings.extend(target_findings);
+            let mut would_change_files = Vec::new();
+            if source != new_source {
+                would_change_files.push(json!({
+                    "path": params.file,
+                    "edit_count": source_edits.len(),
+                    "replacement_bytes": new_source.len(),
+                }));
+            }
+            if target_source != new_target {
+                would_change_files.push(json!({
+                    "path": params.target,
+                    "edit_count": target_edits.len(),
+                    "replacement_bytes": new_target.len(),
+                }));
+            }
+            ToolResult::Json(json!({
+                "title": format!("pull up members from `{class_name}` into existing {target_kind} `{target_type_name}`"),
+                "changes": changes,
+                "creates": [],
+                "deletes": [],
+                "findings": findings,
+                "selected_refs": params.member_refs,
+                "preview_only": preview_only,
+                "would_change_files": would_change_files,
                 "provenance": "syntax_only",
             }))
         })
@@ -6991,6 +7713,40 @@ RECIPE
   await edits.apply({ es });
 "#;
 
+const PULL_UP_MEMBERS_CONTRACT: &str = r#"java.pullUpMembers - apply java.pullUpPreview refs into an existing target type.
+
+WHAT IT DOES
+  Consumes preview-issued memberRefs, re-runs the preview, refuses stale refs or
+  blocked selections, inserts selected signatures into an existing interface or
+  abstract class, adds implements/extends to the concrete source, widens selected
+  source methods as needed, and returns {changes, findings} for edits.merge.
+
+PARAMS
+  file: string
+  target: string
+  targetTypeName?: string
+  className?: string
+  targetKind?: "interface" | "abstract_class"  inferred from target when omitted
+  memberRefs: string[]      refs returned by java.pullUpPreview
+  commentPolicy?: "copy" | "move" | "omit"       default copy
+  annotationPolicy?: "safe" | "copy" | "omit"  default safe
+  previewOnly?: boolean
+
+LIMITS
+  - source and target must be different files in the syntax-only backend.
+  - overload groups must currently be selected as a whole.
+  - duplicate target method detection is syntax-only name + parameter shape.
+  - binding-aware method identity and overload-specific widening are JDTLS work.
+
+RECIPE
+  const pv = await java.pullUpPreview({ file, className: "Service" });
+  const refs = pv.candidates.filter(c => !c.blockers.length).map(c => c.ref);
+  const r = await java.pullUpMembers({ file, target, targetTypeName: "ServiceApi", memberRefs: refs });
+  const es = await edits.begin();
+  if (r.changes.length) await edits.merge({ es, changes: r.changes });
+  await edits.apply({ es });
+"#;
+
 const CHANGE_SIGNATURE_CONTRACT: &str = r#"java.changeSignaturePreview / java.changeSignature - syntax-only Java method signature rewrite.
 
 WHAT IT DOES
@@ -7286,6 +8042,7 @@ impl Tool for JavaDescribe {
             "extractInterface" => {
                 ToolResult::Json(json!({ "contract": EXTRACT_INTERFACE_CONTRACT }))
             }
+            "pullUpMembers" => ToolResult::Json(json!({ "contract": PULL_UP_MEMBERS_CONTRACT })),
             "changeSignaturePreview" | "changeSignature" => {
                 ToolResult::Json(json!({ "contract": CHANGE_SIGNATURE_CONTRACT }))
             }
@@ -7322,7 +8079,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -8811,6 +9568,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaMovePackage) as Arc<dyn Tool>,
         Arc::new(JavaPullUpPreview) as Arc<dyn Tool>,
         Arc::new(JavaExtractInterface) as Arc<dyn Tool>,
+        Arc::new(JavaPullUpMembers) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignaturePreview) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignature) as Arc<dyn Tool>,
         Arc::new(JavaEncapsulateFieldPreview) as Arc<dyn Tool>,
@@ -8839,7 +9597,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -8850,6 +9608,7 @@ type JavaRenameResult = { title: string; changes: SpanChange[]; creates: []; del
 type JavaPullUpCandidate = { ref: string; kind: string; name: string; signature_hash: string; signature: string; visibility: string; modifiers: string[]; annotations: string[]; params: Array<{ name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean }>; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; comment_trivia: string; comment_trivia_span: Span; span: Span; signature_span: Span; blockers: unknown[]; warnings: unknown[]; default_options: Record<string, string> };
 type JavaPullUpPreview = { file: string; language: "java"; content_sha256: string; source_len: number; class: { name: string; span?: Span; blockers: unknown[] }; target_kind: "interface" | "abstract_class"; imports: string[]; candidates: JavaPullUpCandidate[]; ref_model: string; provenance: "syntax_only" };
 type JavaExtractInterfaceResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: []; findings: unknown[]; selected_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; provenance: "syntax_only" };
+type JavaPullUpMembersResult = { title: string; changes: SpanChange[]; creates: []; deletes: []; findings: unknown[]; selected_refs: string[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaChangeParamSpec = { sourceName?: string; name: string; type?: string; defaultValue?: string };
 type JavaChangeSignaturePreview = { file: string; content_sha256?: string; method_name: string; method_ref?: string | null; old_signature?: string; old_params?: unknown[]; target_params: string[]; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaChangeSignatureResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
@@ -8885,6 +9644,8 @@ declare const java: {
   pullUpPreview(args: { file: string; className?: string; targetKind?: "interface" | "abstract_class" }): Promise<JavaPullUpPreview>;
   /** Consume java.pullUpPreview refs and create an interface or abstract class plus source-side implements/extends and visibility edits. */
   extractInterface(args: { file: string; target: string; typeName: string; className?: string; targetKind?: "interface" | "abstract_class"; memberRefs: string[]; commentPolicy?: "copy" | "move" | "omit"; annotationPolicy?: "safe" | "copy" | "omit"; targetPackage?: string; previewOnly?: boolean }): Promise<JavaExtractInterfaceResult>;
+  /** Consume java.pullUpPreview refs into an existing interface or abstract class plus source-side implements/extends and visibility edits. */
+  pullUpMembers(args: { file: string; target: string; targetTypeName?: string; className?: string; targetKind?: "interface" | "abstract_class"; memberRefs: string[]; commentPolicy?: "copy" | "move" | "omit"; annotationPolicy?: "safe" | "copy" | "omit"; previewOnly?: boolean }): Promise<JavaPullUpMembersResult>;
   /** Preview a method signature change. Refs are preview-local signature hashes, not graph IDs. */
   changeSignaturePreview(args: { file: string; className?: string; methodName: string; targetParams: JavaChangeParamSpec[]; files?: string[] }): Promise<JavaChangeSignaturePreview>;
   /** Apply a previewed method signature change. Same-name call-site rewrites require acknowledgeSyntaxOnlyCallSites:true. */
@@ -8993,6 +9754,21 @@ public class OrderService {
             .find(|change| change["span"]["file"] == file)
             .and_then(|change| change["new_text"].as_str())
             .unwrap()
+    }
+
+    #[test]
+    fn visibility_widening_after_annotation_preserves_indentation() {
+        let source = "class X {\n    @Override\n    String find() { return \"\"; }\n}\n";
+        let signature_start = source.find("@Override").unwrap();
+        let signature = "@Override\n    String find()";
+        let edit = visibility_edit_for(source, signature_start, signature, Some("package"))
+            .expect("visibility edit");
+        let rewritten = bbox_refactor::apply_text_edits(source, &[edit]).unwrap();
+        assert!(
+            rewritten.contains("\n    public String find()"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("public     String"), "{rewritten}");
     }
 
     #[tokio::test]
@@ -10300,6 +11076,136 @@ public record OrderId(String value) {}
                 .unwrap()
                 .iter()
                 .any(|finding| finding["kind"] == "source_package_type_imported"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_up_members_inserts_into_existing_interface_and_updates_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/impl")).unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/api")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderService.java"),
+            PULLUP_FIXTURE,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/com/acme/api/OrderApi.java"),
+            "package com.acme.api;\n\npublic interface OrderApi<T extends Number> {\n}\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPullUpPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "className": "OrderService"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let result = json_of(
+            JavaPullUpMembers
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "target": "src/com/acme/api/OrderApi.java",
+                        "targetTypeName": "OrderApi",
+                        "className": "OrderService",
+                        "memberRefs": [candidate_ref(&preview, "find")]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(result["blocked"], Value::Null, "{result}");
+        assert_eq!(result["creates"].as_array().unwrap().len(), 0, "{result}");
+        let source = replacement_for_file(&result, "src/com/acme/impl/OrderService.java");
+        assert!(
+            source.contains("import com.acme.api.OrderApi;")
+                && source.contains("class OrderService<T extends Number> implements OrderApi<T>")
+                && source.contains("public String find(String id) throws IOException"),
+            "{source}"
+        );
+        let target = replacement_for_file(&result, "src/com/acme/api/OrderApi.java");
+        assert!(
+            target.contains("/** Finds a single order. */")
+                && target.contains("String find(String id) throws IOException;")
+                && !target.contains("@Override"),
+            "{target}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_up_members_marks_existing_class_abstract() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/impl")).unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme/base")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/impl/OrderService.java"),
+            PULLUP_FIXTURE,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/com/acme/base/OrderBase.java"),
+            "package com.acme.base;\n\npublic class OrderBase<T extends Number> {\n}\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaPullUpPreview
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "className": "OrderService",
+                        "targetKind": "abstract_class"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let result = json_of(
+            JavaPullUpMembers
+                .call(
+                    json!({
+                        "file": "src/com/acme/impl/OrderService.java",
+                        "target": "src/com/acme/base/OrderBase.java",
+                        "targetTypeName": "OrderBase",
+                        "className": "OrderService",
+                        "targetKind": "abstract_class",
+                        "memberRefs": [candidate_ref(&preview, "find")]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let source = replacement_for_file(&result, "src/com/acme/impl/OrderService.java");
+        assert!(
+            source.contains("import com.acme.base.OrderBase;")
+                && source.contains("class OrderService<T extends Number> extends OrderBase<T>"),
+            "{source}"
+        );
+        let target = replacement_for_file(&result, "src/com/acme/base/OrderBase.java");
+        assert!(
+            target.contains("public abstract class OrderBase<T extends Number>")
+                && target.contains("public abstract String find(String id) throws IOException;"),
+            "{target}"
+        );
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["kind"] == "abstract_modifier_added"),
             "{result}"
         );
     }
