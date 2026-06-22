@@ -1,0 +1,22 @@
+{
+  "id": "gap-bcced6fb",
+  "title": "Expose process and vector-store memory diagnostics",
+  "gap_kind": "mcp_surface",
+  "domain": "daemon-runtime",
+  "wanted_capability": "A read-only MCP/admin surface that reports daemon RSS/anonymous/swap/referenced memory plus vector partition active/deleted counts and approximate heap footprint so operators can distinguish leaks from expected steady-state without scraping /proc and store files.",
+  "missing_primitive": "process_memory_diagnostics / vector_partition_memory_metrics",
+  "fallback_used": "Read /proc/<pid>/status, /proc/<pid>/smaps_rollup, pmap, bbox_stats, bbox_embed_status, and vector store files manually.",
+  "evidence": [
+    "/proc/743610/status",
+    "/proc/743610/smaps_rollup",
+    "src/server/runtime_metrics.rs",
+    "crates/bbox-vectors/src/lib.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/daemon-runtime/process-memory-diagnostics",
+  "notes": "Observed prod blackboxd idle at ~11.7G RSS, ~11.6G anonymous, ~3.5G swap, with vector store persisted size 8.7G. /admin/runtime-metrics only exposes Tokio scheduler metrics.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-22T18:20:20Z",
+  "updated_at": "2026-06-22T18:20:20Z"
+}
