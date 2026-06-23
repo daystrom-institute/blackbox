@@ -9858,17 +9858,22 @@ impl Tool for JavaExtractClassPreviewPlan {
             //    parameter-type suffixes.
             let mut overloads: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let mut resolved_methods: Vec<String> = params.methods.clone();
-            let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
-            for name in &params.methods {
-                *name_counts.entry(name.as_str()).or_default() += 1;
-            }
-            let dupes: Vec<&str> = name_counts
+            // gap-eca8d439: mirror extract_class's select_java_methods_by_name. A
+            // BARE requested name (no signature suffix) that matches MORE THAN ONE
+            // method declaration in the SOURCE is an ambiguous overload, which
+            // extractClass refuses (method_overload_ambiguous). The old logic only
+            // flagged names the CALLER passed more than once, so a singly-passed
+            // but source-overloaded name slipped through as ready:true and then
+            // extractClass refused. Detect overloads from the source declaration
+            // count instead. (A name passed WITH a signature suffix is already
+            // disambiguated, so it is skipped.)
+            let bare_requested: Vec<&str> = params
+                .methods
                 .iter()
-                .filter(|(_, c)| **c > 1)
-                .map(|(&n, _)| n)
+                .filter(|m| !m.contains('('))
+                .map(String::as_str)
                 .collect();
-            if !dupes.is_empty() {
-                // Query for all method declarations in the file.
+            if !bare_requested.is_empty() {
                 // Captures: @name = method name, @params = formal_parameters.
                 match bbox_refactor::facts::file_query(
                     &path,
@@ -9876,31 +9881,33 @@ impl Tool for JavaExtractClassPreviewPlan {
                     None,
                 ) {
                     Ok(file_facts) => {
-                        for &dupe_name in &dupes {
+                        for &bare in &bare_requested {
                             let mut sigs: Vec<String> = Vec::new();
                             for cap in &file_facts.captures {
-                                if cap.capture == "name" && cap.text == dupe_name {
-                                    // Find the paired @params capture — it follows @name
-                                    // in the same match group. We accumulate by walking
-                                    // all captures and matching name→params pairs.
-                                    // Simpler: just collect all @params whose preceding
-                                    // @name matched this dupe_name.
-                                    let params_idx = file_facts.captures.iter().position(
-                                        |c| c.capture == "params" && c.byte_start > cap.byte_end
-                                            && c.byte_start < cap.byte_end + 200,
-                                    );
+                                if cap.capture == "name" && cap.text == bare {
+                                    // `>=`: in Java the `(` is immediately after the
+                                    // method name, so formal_parameters.byte_start ==
+                                    // name.byte_end (a `>` here found nothing — the
+                                    // latent reason overload detection was dead).
+                                    let params_idx = file_facts.captures.iter().position(|c| {
+                                        c.capture == "params"
+                                            && c.byte_start >= cap.byte_end
+                                            && c.byte_start < cap.byte_end + 200
+                                    });
                                     if let Some(idx) = params_idx {
                                         let params_text = &file_facts.captures[idx].text;
-                                        sigs.push(format!("{dupe_name}{params_text}"));
+                                        sigs.push(format!("{bare}{params_text}"));
                                     }
                                 }
                             }
                             sigs.sort();
                             sigs.dedup();
-                            if !sigs.is_empty() {
-                                overloads.insert(dupe_name.to_string(), sigs.clone());
+                            // Ambiguous only when the source declares the bare name
+                            // more than once; a single declaration extracts fine.
+                            if sigs.len() > 1 {
+                                overloads.insert(bare.to_string(), sigs.clone());
                                 for m in &mut resolved_methods {
-                                    if m == dupe_name {
+                                    if m == bare {
                                         *m = sigs[0].clone();
                                     }
                                 }
@@ -13527,6 +13534,62 @@ public class AggregationAdmin {
                 .unwrap()
                 .contains("no @Inject constructor"),
             "{result}"
+        );
+    }
+
+    const SOURCE_OVERLOAD_FIXTURE: &str = r#"package com.acme;
+
+class OrderService {
+    String describe(String s) {
+        return s;
+    }
+
+    String describe(int n) {
+        return Integer.toString(n);
+    }
+}
+"#;
+
+    // gap-eca8d439: a bare requested name OVERLOADED in the source (passed once,
+    // not duplicated by the caller) must block ready in the preview, matching
+    // extractClass's method_overload_ambiguous refusal — so the preview can't
+    // say ready:true and then have extractClass reject the same input.
+    #[tokio::test]
+    async fn preview_plan_flags_source_overloaded_bare_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            SOURCE_OVERLOAD_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "methods": ["describe"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(
+            result["ready"],
+            json!(false),
+            "a source-overloaded bare name must block ready (extractClass would refuse it): {result}"
+        );
+        assert_eq!(result["overloads_resolved"], json!(true), "{result}");
+        assert!(
+            result["overloads"]
+                .as_object()
+                .map(|o| o.contains_key("describe"))
+                .unwrap_or(false),
+            "describe must be reported as an overload with its signatures: {result}"
         );
     }
 
