@@ -4,9 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub(crate) struct JavaMethod {
-    #[allow(dead_code)]
+    /// Name of the directly-enclosing type (top-level class, or a nested
+    /// record/inner class). Used to reject nested-type members in
+    /// `select_java_methods_by_name` (gap-47a9ab04).
     parent_name: String,
-    #[allow(dead_code)]
+    /// `start_byte()` of the directly-enclosing type — matched against
+    /// `java_nested_classes()` starts to detect nested-type members.
     parent_byte_start: usize,
     item: SyntaxItem,
 }
@@ -1601,6 +1604,17 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
     if candidates.is_empty() {
         bail!("no Java methods found");
     }
+    // gap-47a9ab04: a method that lives inside a NESTED type (record / inner
+    // class) reads that type's fields, not the source class's. Moving it into the
+    // extracted class leaves those fields unbound (uncompilable), and the static
+    // dependency projection cannot see it (it tracks only source-class fields, so
+    // `fixme_count` stays 0). Exclude nested-type members from name resolution;
+    // when a requested name resolves ONLY to one, refuse at plan time so the
+    // failure surfaces in both preview and apply, not silently at the compile gate.
+    let nested_type_starts: HashSet<usize> = java_nested_classes(parsed)
+        .iter()
+        .map(|c| c.item.byte_start)
+        .collect();
     let mut selected = Vec::new();
     for expected in names {
         // Parse a signature suffix for overload disambiguation:
@@ -1621,10 +1635,27 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
         };
         let name_matches: Vec<&JavaMethod> = candidates
             .iter()
-            .filter(|m| m.item.name.as_deref() == Some(target_name))
+            .filter(|m| {
+                m.item.name.as_deref() == Some(target_name)
+                    && !nested_type_starts.contains(&m.parent_byte_start)
+            })
             .collect();
         match name_matches.as_slice() {
             [] => {
+                if let Some(m) = candidates.iter().find(|m| {
+                    m.item.name.as_deref() == Some(target_name)
+                        && nested_type_starts.contains(&m.parent_byte_start)
+                }) {
+                    bail!(
+                        "error.bad_input(code=nested_member_in_item_names): \
+                         `{expected}` is a method of nested type `{parent}`, not a \
+                         top-level method of the source class. Extracting it would leave \
+                         `{parent}`'s fields unbound in the new class (uncompilable). \
+                         Drop it from `item_names`; extract the nested type separately if \
+                         you need it.",
+                        parent = m.parent_name
+                    );
+                }
                 let nested_match = java_nested_classes(parsed)
                     .into_iter()
                     .any(|c| c.item.name.as_deref() == Some(target_name));

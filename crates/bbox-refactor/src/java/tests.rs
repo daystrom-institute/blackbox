@@ -3071,6 +3071,48 @@ fn extract_java_class_rejects_nested_class_in_item_names_with_directed_error() {
     );
 }
 
+#[test]
+fn extract_java_class_rejects_nested_record_member_in_item_names() {
+    // gap-47a9ab04: a method that lives inside a nested record reads that
+    // record's fields, not the source class's. Requesting it must be refused at
+    // plan time with a directed error — otherwise it is moved into the extracted
+    // class where the record's fields are unbound (uncompilable), and the static
+    // dependency projection cannot see it (`fixme_count` stays 0).
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("OrderService.java");
+    let target = dir.path().join("OrderQuery.java");
+    fs::write(
+        &source,
+        "package com.example;\n\
+             import java.util.List;\n\
+             class OrderService {\n\
+            \x20   List<String> listOpen() { return List.of(); }\n\
+            \x20   record Line(String sku, int qty) {\n\
+            \x20       String getSku() { return sku; }\n\
+            \x20   }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("OrderQuery".to_string());
+    params.delegate_field = Some("query".to_string());
+    params.item_names = Some(vec!["listOpen".to_string(), "getSku".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+
+    let err = plan_extract_java_class(&params).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nested_member_in_item_names"),
+        "expected directed error code: {msg}"
+    );
+    assert!(
+        msg.contains("Line"),
+        "error must name the nested type: {msg}"
+    );
+}
+
 // Mutable-capture-with-write refusal: when an extracted method writes
 // to a mutable source field that isn't in `move_fields`, the planner
 // would promote it to a `final` constructor parameter on the target —
