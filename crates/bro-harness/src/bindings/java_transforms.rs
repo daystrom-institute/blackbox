@@ -10389,7 +10389,6 @@ impl Tool for JavaSynthesizeHelperWrappers {
             // Skip methods that extractClass already wrapped.
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let mut wrapper_texts: Vec<String> = Vec::new();
-            let delegate_call = format!("{}.{}(", params.delegate_field, "");
             for sig in &sigs {
                 if !needs_wrappers.contains(&sig.bare_name) {
                     continue;
@@ -10398,8 +10397,12 @@ impl Tool for JavaSynthesizeHelperWrappers {
                 if !seen.insert(dedup_key) {
                     continue;
                 }
-                // Skip if source already has a delegating wrapper for this method.
-                let wrapper_call = format!("{}{}(", delegate_call, sig.bare_name);
+                // Skip if source already has a delegating wrapper for this method
+                // (extractClass wrappers:true already emitted one). gap-d4a676ac:
+                // this guard was dead — the delegate-call pattern was mis-formatted
+                // as `<field>.(` + name instead of `<field>.<name>(`, so it never
+                // matched and duplicate same-signature wrappers slipped through.
+                let wrapper_call = format!("{}.{}(", params.delegate_field, sig.bare_name);
                 if source.contains(&wrapper_call) {
                     continue;
                 }
@@ -13083,6 +13086,78 @@ class OrderService {
                 .unwrap_or_default()
                 .contains("unmoved PRIVATE helper"),
             "summary must warn about the unmoved private helpers: {projection}"
+        );
+    }
+
+    const EXISTING_WRAPPER_FIXTURE: &str = r#"package com.acme;
+
+class OrderService {
+    private final OrderFormatter fmt;
+
+    OrderService(OrderFormatter fmt) {
+        this.fmt = fmt;
+    }
+
+    String report(String raw) {
+        return format(raw);
+    }
+
+    private String format(String s) {
+        return this.fmt.format(s);
+    }
+}
+"#;
+
+    const DELEGATE_FORMATTER_FIXTURE: &str = r#"package com.acme;
+
+class OrderFormatter {
+    String format(String s) {
+        return s.trim();
+    }
+}
+"#;
+
+    // gap-d4a676ac: when the source already has a delegating wrapper (extractClass
+    // wrappers:true emitted it), synthesizeHelperWrappers must NOT add a duplicate
+    // same-signature wrapper. Before the fix the dedup guard was dead and a second
+    // `format` wrapper was emitted, causing a duplicate-method compile error.
+    #[tokio::test]
+    async fn synthesize_helper_wrappers_skips_existing_source_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            EXISTING_WRAPPER_FIXTURE,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderFormatter.java"),
+            DELEGATE_FORMATTER_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaSynthesizeHelperWrappers
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderFormatter.java",
+                        "delegateField": "fmt",
+                        "methods": ["format"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert!(
+            result["changes"]
+                .as_array()
+                .map(|c| c.is_empty())
+                .unwrap_or(false),
+            "source already has a `fmt.format(...)` wrapper; no duplicate must be synthesized: {result}"
         );
     }
 
