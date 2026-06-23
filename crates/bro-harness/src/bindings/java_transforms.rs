@@ -182,6 +182,46 @@ fn build_dependency_projection(
         capture_projections.push(projection);
     }
 
+    // gap-5fed070f: a moved method that calls an UNMOVED private source helper
+    // leaves that call unresolved in the extracted class. Today it only surfaces
+    // as a FIXME in the target content, which `previewOnly` suppresses — so the
+    // structured projection looked clean. Surface the unmoved private helpers
+    // here so the projection is a trustworthy pre-apply signal in preview too.
+    let private_helper_calls: Vec<&bbox_refactor::ExternalCall> = plan
+        .external_calls
+        .iter()
+        .filter(|call| call.source_visibility.as_deref() == Some("private"))
+        .collect();
+    let unmoved_private_helpers: Vec<Value> = private_helper_calls
+        .iter()
+        .map(|call| json!({ "method": call.method, "signature": call.signature }))
+        .collect();
+
+    let base_summary = match effective_wiring {
+        "external_injection" => {
+            "external_injection means target constructor params must be DI-resolvable; review non_injectable_params before apply"
+        }
+        "none" => "wiring none leaves target constructor params for the operator to wire manually",
+        _ => {
+            "own_construction passes constructor params from the source instance; review snapshot_mutable_capture risks before apply"
+        }
+    };
+    let summary = if private_helper_calls.is_empty() {
+        base_summary.to_string()
+    } else {
+        let names = private_helper_calls
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{base_summary}. WARNING: moved methods call {n} unmoved PRIVATE helper(s) ({names}) \
+             that will not resolve in the extracted class — move them in the same extract or \
+             refactor before apply.",
+            n = private_helper_calls.len(),
+        )
+    };
+
     let projection = json!({
         "wiring": effective_wiring,
         "constructor_param_count": constructor_params.len(),
@@ -189,11 +229,8 @@ fn build_dependency_projection(
         "non_injectable_params": non_injectable_params,
         "moved_captured_fields": moved_field_names,
         "static_final_constants": static_final_constants,
-        "summary": match effective_wiring {
-            "external_injection" => "external_injection means target constructor params must be DI-resolvable; review non_injectable_params before apply",
-            "none" => "wiring none leaves target constructor params for the operator to wire manually",
-            _ => "own_construction passes constructor params from the source instance; review snapshot_mutable_capture risks before apply",
-        },
+        "unmoved_private_helpers": unmoved_private_helpers,
+        "summary": summary,
     });
     (projection, capture_projections)
 }
@@ -642,6 +679,11 @@ impl Tool for JavaExtractClass {
                 "item_names": params.methods,
                 "delegate_field": params.delegate_field,
                 "module_name": module_name,
+                // gap-5fed070f: turn on the dependency analysis (external/inherited
+                // call resolution) so unmoved private helpers + external-call FIXMEs
+                // are computed for extractClass, matching move_java_field. Without
+                // this the preflight was blind to moved-method call dependencies.
+                "deep_analysis": true,
             });
             if let Some(fields) = &params.move_fields {
                 plan_input["move_fields"] = json!(fields);
@@ -12976,6 +13018,71 @@ class OrderService {
                         && finding["risk"] == "non_injectable_capture"
                 }),
             "captured_dependency finding should mirror projection: {result}"
+        );
+    }
+
+    const UNMOVED_PRIVATE_HELPER_FIXTURE: &str = r#"package com.acme;
+
+class OrderService {
+    String summarize(String raw) {
+        return decorate(normalize(raw));
+    }
+
+    private String normalize(String s) {
+        return s.trim();
+    }
+
+    private String decorate(String s) {
+        return "[" + s + "]";
+    }
+}
+"#;
+
+    // gap-5fed070f: a moved method calling an unmoved PRIVATE helper must surface
+    // in the structured projection, not only as a preview-suppressed target FIXME.
+    #[tokio::test]
+    async fn dependency_projection_flags_unmoved_private_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            UNMOVED_PRIVATE_HELPER_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderSummary.java",
+                        "delegateField": "summary",
+                        "methods": ["summarize"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let projection = &result["dependency_projection"];
+        let helpers = projection["unmoved_private_helpers"]
+            .as_array()
+            .expect("unmoved_private_helpers array")
+            .iter()
+            .filter_map(|h| h["method"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            helpers.contains(&"normalize") && helpers.contains(&"decorate"),
+            "moved summarize() calls unmoved private normalize/decorate; projection must list them: {projection}"
+        );
+        assert!(
+            projection["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unmoved PRIVATE helper"),
+            "summary must warn about the unmoved private helpers: {projection}"
         );
     }
 
