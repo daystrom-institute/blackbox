@@ -20,11 +20,13 @@ use lsp_types::request::{DocumentDiagnosticRequest, Initialize, Request, Shutdow
 use lsp_types::{
     ClientCapabilities, Diagnostic, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
-    DocumentDiagnosticReport, DocumentDiagnosticReportResult, InitializeParams, InitializeResult,
+    DocumentDiagnosticReport, DocumentDiagnosticReportResult, ExecuteCommandClientCapabilities,
+    ExecuteCommandParams, FailureHandlingKind, FileRename, InitializeParams, InitializeResult,
     PartialResultParams, PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-    WorkspaceClientCapabilities, WorkspaceFolder,
+    RenameFilesParams, ResourceOperationKind, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Url,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceClientCapabilities,
+    WorkspaceEditClientCapabilities, WorkspaceFileOperationsClientCapabilities, WorkspaceFolder,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -452,6 +454,136 @@ impl SessionPool {
         }
     }
 
+    /// `workspace/willRenameFiles` -> server-authored edits that must be
+    /// applied before the client performs the file rename.
+    pub async fn will_rename_files(
+        &self,
+        root: impl Into<PathBuf>,
+        language: Language,
+        renames: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Option<lsp_types::WorkspaceEdit>> {
+        let requested_root = root.into();
+        let root = requested_root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", requested_root.display()))?;
+        let mut files = Vec::new();
+        for (old_path, new_path) in renames {
+            let old_path = old_path
+                .canonicalize()
+                .with_context(|| format!("canonicalizing rename source {}", old_path.display()))?;
+            let new_path = if new_path.exists() {
+                new_path.canonicalize().with_context(|| {
+                    format!("canonicalizing rename target {}", new_path.display())
+                })?
+            } else if new_path.is_absolute() {
+                match new_path.strip_prefix(&requested_root) {
+                    Ok(rel) => absolutize_under_root(&root, rel)?,
+                    Err(_) => absolutize_under_root(&root, &new_path)?,
+                }
+            } else {
+                absolutize_under_root(&root, &new_path)?
+            };
+            files.push(FileRename {
+                old_uri: path_to_uri(&old_path)?.to_string(),
+                new_uri: path_to_uri(&new_path)?.to_string(),
+            });
+        }
+        let session = self.session(root, language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        let params = RenameFilesParams { files };
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::WillRenameFiles>(&params)
+                .await
+            {
+                Ok(edit) => return Ok(edit),
+                Err(Error::Server { method, error })
+                    if method == <lsp_types::request::WillRenameFiles as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    pub async fn execute_command(
+        &self,
+        root: impl Into<PathBuf>,
+        language: Language,
+        command: impl Into<String>,
+        arguments: Vec<Value>,
+    ) -> Result<Option<Value>> {
+        let root = root.into();
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", root.display()))?;
+        let session = self.session(root, language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        let params = ExecuteCommandParams {
+            command: command.into(),
+            arguments,
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        };
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::ExecuteCommand>(&params)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(Error::Server { method, error })
+                    if method == <lsp_types::request::ExecuteCommand as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    pub async fn request_raw(
+        &self,
+        root: impl Into<PathBuf>,
+        language: Language,
+        method: impl Into<String>,
+        params: Value,
+    ) -> Result<Value> {
+        let root = root.into();
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", root.display()))?;
+        let session = self.session(root, language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        let method = method.into();
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session.send_raw_request(&method, &params).await {
+                Ok(result) => return Ok(result),
+                Err(Error::Server {
+                    method: err_method,
+                    error,
+                }) if err_method == method
+                    && should_retry_while_warming(&error)
+                    && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// `textDocument/hover` at `position` — authoritative resolved info for
     /// the symbol under the cursor. This is the seam the harness uses for
     /// Java `var` resolution: JDTLS resolves cross-file receiver return
@@ -733,6 +865,19 @@ impl Session {
             .map_err(Into::into)
     }
 
+    async fn send_raw_request(&mut self, method: &str, params: &Value) -> Result<Value> {
+        let id = self.next_id();
+        write_request(&mut self.stdin, method, id, params)
+            .await
+            .with_context(|| format!("sending request {method}"))?;
+        let value = self.read_response(method, id).await?;
+        value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("LSP response for {method} missing result"))
+            .map_err(Into::into)
+    }
+
     async fn send_notification<N: Notification>(&mut self, params: &N::Params) -> Result<()> {
         write_notification(&mut self.stdin, N::METHOD, params)
             .await
@@ -963,7 +1108,29 @@ fn build_init_params(
         root_uri: Some(root_uri.clone()),
         initialization_options,
         capabilities: ClientCapabilities {
-            workspace: Some(WorkspaceClientCapabilities::default()),
+            workspace: Some(WorkspaceClientCapabilities {
+                apply_edit: Some(true),
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    document_changes: Some(true),
+                    resource_operations: Some(vec![
+                        ResourceOperationKind::Create,
+                        ResourceOperationKind::Rename,
+                        ResourceOperationKind::Delete,
+                    ]),
+                    failure_handling: Some(FailureHandlingKind::Transactional),
+                    ..Default::default()
+                }),
+                file_operations: Some(WorkspaceFileOperationsClientCapabilities {
+                    will_rename: Some(true),
+                    did_rename: Some(true),
+                    ..Default::default()
+                }),
+                execute_command: Some(ExecuteCommandClientCapabilities {
+                    dynamic_registration: Some(true),
+                }),
+                workspace_folders: Some(true),
+                ..Default::default()
+            }),
             text_document: Some(TextDocumentClientCapabilities {
                 publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                     related_information: Some(true),
@@ -986,6 +1153,42 @@ fn build_init_params(
         }]),
         ..Default::default()
     })
+}
+
+fn absolutize_under_root(root: &Path, path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            std::path::Component::RootDir => out.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return Err(anyhow!(
+                        "rename target escapes filesystem root: {}",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+            std::path::Component::Normal(part) => out.push(part),
+        }
+    }
+    if out.starts_with(root) {
+        Ok(out)
+    } else {
+        Err(anyhow!(
+            "rename target {} is outside project root {}",
+            out.display(),
+            root.display()
+        )
+        .into())
+    }
 }
 
 async fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) -> Result<()> {

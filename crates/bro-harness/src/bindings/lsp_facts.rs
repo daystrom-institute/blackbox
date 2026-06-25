@@ -173,16 +173,222 @@ impl LspState {
             }
         }
     }
+
+    pub(super) async fn will_rename_files(
+        &self,
+        root: &Path,
+        language: Language,
+        renames: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Option<lsp_types::WorkspaceEdit>, String> {
+        self.pool
+            .will_rename_files(root, language, renames)
+            .await
+            .map_err(render_lsp_error)
+    }
+
+    pub(super) async fn ensure_file_current(
+        &self,
+        root: &Path,
+        abs: &Path,
+        language: Language,
+    ) -> Result<OpenDocument, String> {
+        let bytes = tokio::fs::read(abs)
+            .await
+            .map_err(|e| format!("lsp: read {}: {e}", abs.display()))?;
+        let sha = bbox_refactor::sha256_hex(&bytes);
+        let source = String::from_utf8_lossy(&bytes).to_string();
+        self.ensure_current(root, abs, language, &source, &sha)
+            .await
+    }
+
+    async fn execute_command(
+        &self,
+        root: &Path,
+        language: Language,
+        command: String,
+        arguments: Vec<Value>,
+    ) -> Result<Option<Value>, String> {
+        self.pool
+            .execute_command(root, language, command, arguments)
+            .await
+            .map_err(render_lsp_error)
+    }
+
+    pub(super) async fn request_raw(
+        &self,
+        root: &Path,
+        language: Language,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        self.pool
+            .request_raw(root, language, method.to_string(), params)
+            .await
+            .map_err(render_lsp_error)
+    }
 }
 
 fn render_lsp_error(e: bro_lsp::Error) -> String {
     if e.is_lsp_unavailable() {
         format!(
-            "lsp_unavailable: {e} — refusing to proceed (RX-V3: no syntax-only downgrade); install/configure rust-analyzer or use code.*/edits.* with explicit spans"
+            "lsp_unavailable: {e} — refusing to proceed (no syntax-only downgrade); install/configure the language server or use code.*/edits.* with explicit spans"
         )
     } else {
         format!("{e}")
     }
+}
+
+pub(super) struct FlattenedWorkspaceEdit {
+    pub(super) text_edits: Vec<(lsp_types::Url, Vec<lsp_types::TextEdit>)>,
+    pub(super) resource_ops: Vec<Value>,
+}
+
+pub(super) fn flatten_workspace_edit(edit: lsp_types::WorkspaceEdit) -> FlattenedWorkspaceEdit {
+    let mut text_edits = Vec::new();
+    let mut resource_ops = Vec::new();
+    if let Some(changes) = edit.changes {
+        for (uri, edits) in changes {
+            text_edits.push((uri, edits));
+        }
+    }
+    if let Some(document_changes) = edit.document_changes {
+        match document_changes {
+            lsp_types::DocumentChanges::Edits(edits) => {
+                for doc_edit in edits {
+                    text_edits.push((
+                        doc_edit.text_document.uri,
+                        flatten_doc_edits(doc_edit.edits),
+                    ));
+                }
+            }
+            lsp_types::DocumentChanges::Operations(ops) => {
+                for op in ops {
+                    match op {
+                        lsp_types::DocumentChangeOperation::Edit(doc_edit) => {
+                            text_edits.push((
+                                doc_edit.text_document.uri,
+                                flatten_doc_edits(doc_edit.edits),
+                            ));
+                        }
+                        lsp_types::DocumentChangeOperation::Op(resource_op) => {
+                            resource_ops.push(resource_op_to_value(resource_op));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    FlattenedWorkspaceEdit {
+        text_edits,
+        resource_ops,
+    }
+}
+
+fn flatten_doc_edits(
+    edits: Vec<lsp_types::OneOf<lsp_types::TextEdit, lsp_types::AnnotatedTextEdit>>,
+) -> Vec<lsp_types::TextEdit> {
+    edits
+        .into_iter()
+        .map(|e| match e {
+            lsp_types::OneOf::Left(edit) => edit,
+            lsp_types::OneOf::Right(annotated) => annotated.text_edit,
+        })
+        .collect()
+}
+
+fn resource_op_to_value(op: lsp_types::ResourceOp) -> Value {
+    match op {
+        lsp_types::ResourceOp::Create(create) => {
+            json!({ "kind": "create", "uri": create.uri.to_string() })
+        }
+        lsp_types::ResourceOp::Rename(rename) => json!({
+            "kind": "rename",
+            "old_uri": rename.old_uri.to_string(),
+            "new_uri": rename.new_uri.to_string(),
+        }),
+        lsp_types::ResourceOp::Delete(delete) => {
+            json!({ "kind": "delete", "uri": delete.uri.to_string() })
+        }
+    }
+}
+
+pub(super) async fn text_edits_to_changes(
+    root: &Path,
+    context: &str,
+    by_uri: Vec<(lsp_types::Url, Vec<lsp_types::TextEdit>)>,
+) -> Result<Vec<(Span, String)>, String> {
+    let mut changes: Vec<(Span, String)> = Vec::new();
+    for (uri, edits) in by_uri {
+        let path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(()) => return Err(format!("{context}: non-file uri in WorkspaceEdit: {uri}")),
+        };
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => match root.canonicalize() {
+                Ok(canon) => match path.strip_prefix(&canon) {
+                    Ok(r) => r.to_string_lossy().to_string(),
+                    Err(_) => {
+                        return Err(format!(
+                            "{context}: WorkspaceEdit touches {} outside the worktree root",
+                            path.display()
+                        ));
+                    }
+                },
+                Err(e) => return Err(format!("{context}: {e}")),
+            },
+        };
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| format!("{context}: {rel}: {e}"))?;
+        let file_sha = bbox_refactor::sha256_hex(&bytes);
+        let file_source = String::from_utf8_lossy(&bytes).to_string();
+        for text_edit in edits {
+            let byte_start = position_to_byte(&file_source, text_edit.range.start)
+                .map_err(|e| format!("{context}: {rel}: {e}"))?;
+            let byte_end = position_to_byte(&file_source, text_edit.range.end)
+                .map_err(|e| format!("{context}: {rel}: {e}"))?;
+            changes.push((
+                Span {
+                    file: rel.clone(),
+                    byte_start,
+                    byte_end,
+                    content_sha256: file_sha.clone(),
+                },
+                text_edit.new_text,
+            ));
+        }
+    }
+    Ok(changes)
+}
+
+pub(super) fn apply_text_edits_to_source(
+    source: &str,
+    edits: &[lsp_types::TextEdit],
+    context: &str,
+) -> Result<String, String> {
+    let mut ranges = Vec::new();
+    for edit in edits {
+        let start = position_to_byte(source, edit.range.start)
+            .map_err(|e| format!("{context}: moved file: {e}"))?;
+        let end = position_to_byte(source, edit.range.end)
+            .map_err(|e| format!("{context}: moved file: {e}"))?;
+        if start > end {
+            return Err(format!("{context}: moved file edit has inverted range"));
+        }
+        ranges.push((start, end, edit.new_text.as_str()));
+    }
+    ranges.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut out = source.to_string();
+    let mut previous_start = source.len() + 1;
+    for (start, end, replacement) in ranges {
+        if end > previous_start {
+            return Err(format!("{context}: moved file edits overlap"));
+        }
+        out.replace_range(start..end, replacement);
+        previous_start = start;
+    }
+    Ok(out)
 }
 
 /// `lsp.rename` — server-authority rename, returning span-shaped changes
@@ -202,7 +408,7 @@ impl Tool for LspRename {
         "lsp.rename"
     }
     fn description(&self) -> &str {
-        "Rename the symbol a hash-anchored Span points at, across the workspace, via the language server (rust-analyzer; Rust only for now; warms on first use). Whole-item spans are fine — the binding snaps to the item's name identifier automatically. Returns server-authored changes as hash-anchored {span, new_text} entries — feed them to edits.merge, then edits.apply. Fails closed when the server is unavailable (never downgrades to text matching). Errors with stale_span if the file changed since the Span was minted."
+        "Rename the symbol a hash-anchored Span points at, across the workspace, via the language server (rust-analyzer for Rust, JDTLS for Java; warms on first use). Whole-item spans are fine — the binding snaps to the item's name identifier automatically. Returns server-authored changes as hash-anchored {span, new_text} entries — feed them to edits.merge, then edits.apply. Fails closed when the server is unavailable (never downgrades to text matching). Errors with stale_span if the file changed since the Span was minted."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -237,12 +443,10 @@ impl Tool for LspRename {
             Ok(p) => p,
             Err(e) => return err(format!("lsp.rename: {}: {e}", span.file)),
         };
-        if abs.extension().and_then(|e| e.to_str()) != Some("rs") {
-            return err(format!(
-                "lsp.rename: {} — rust only for now (rust-analyzer); use lsp.hover for Java type resolution",
-                span.file
-            ));
-        }
+        let language = match language_for_file(&abs) {
+            Ok(l) => l,
+            Err(e) => return err(format!("lsp.rename: {e}")),
+        };
         let bytes = match tokio::fs::read(&abs).await {
             Ok(b) => b,
             Err(e) => return err(format!("lsp.rename: {}: {e}", span.file)),
@@ -257,7 +461,7 @@ impl Tool for LspRename {
         let source = String::from_utf8_lossy(&bytes).to_string();
         let doc = match self
             .0
-            .ensure_current(&cx.root, &abs, Language::Rust, &source, &sha)
+            .ensure_current(&cx.root, &abs, language, &source, &sha)
             .await
         {
             Ok(d) => d,
@@ -289,90 +493,18 @@ impl Tool for LspRename {
             Err(e) => return err(format!("lsp.rename: {}", render_lsp_error(e))),
         };
 
-        // Flatten the WorkspaceEdit into per-file lsp edits.
-        let mut by_uri: Vec<(lsp_types::Url, Vec<lsp_types::TextEdit>)> = Vec::new();
-        if let Some(changes) = edit.changes {
-            for (uri, edits) in changes {
-                by_uri.push((uri, edits));
-            }
-        }
-        if let Some(document_changes) = edit.document_changes {
-            match document_changes {
-                lsp_types::DocumentChanges::Edits(edits) => {
-                    for doc_edit in edits {
-                        let flattened = doc_edit
-                            .edits
-                            .into_iter()
-                            .map(|e| match e {
-                                lsp_types::OneOf::Left(edit) => edit,
-                                lsp_types::OneOf::Right(annotated) => annotated.text_edit,
-                            })
-                            .collect();
-                        by_uri.push((doc_edit.text_document.uri, flattened));
-                    }
-                }
-                lsp_types::DocumentChanges::Operations(_) => {
-                    return err(
-                        "lsp.rename: server proposed file create/rename/delete operations — not supported by edits.merge yet; rename a symbol that does not move files",
-                    );
-                }
-            }
-        }
-        if by_uri.is_empty() {
+        let flattened = flatten_workspace_edit(edit);
+        if flattened.text_edits.is_empty() && flattened.resource_ops.is_empty() {
             return err("lsp.rename: server returned an empty WorkspaceEdit");
         }
 
         // Convert to hash-anchored span changes, reading each touched file
         // once to mint its generation hash.
-        let mut changes: Vec<(Span, String)> = Vec::new();
-        for (uri, edits) in by_uri {
-            let path = match uri.to_file_path() {
-                Ok(p) => p,
-                Err(()) => return err(format!("lsp.rename: non-file uri in WorkspaceEdit: {uri}")),
+        let changes =
+            match text_edits_to_changes(&cx.root, "lsp.rename", flattened.text_edits).await {
+                Ok(changes) => changes,
+                Err(e) => return err(e),
             };
-            let rel = match path.strip_prefix(&cx.root) {
-                Ok(r) => r.to_string_lossy().to_string(),
-                // resolve_in_root canonicalizes lexically; fall back to the
-                // canonicalized root for symlinked tempdirs (macOS /var).
-                Err(_) => match cx.root.canonicalize() {
-                    Ok(canon) => match path.strip_prefix(&canon) {
-                        Ok(r) => r.to_string_lossy().to_string(),
-                        Err(_) => {
-                            return err(format!(
-                                "lsp.rename: WorkspaceEdit touches {} outside the worktree root",
-                                path.display()
-                            ));
-                        }
-                    },
-                    Err(e) => return err(format!("lsp.rename: {e}")),
-                },
-            };
-            let bytes = match tokio::fs::read(&path).await {
-                Ok(b) => b,
-                Err(e) => return err(format!("lsp.rename: {rel}: {e}")),
-            };
-            let file_sha = bbox_refactor::sha256_hex(&bytes);
-            let file_source = String::from_utf8_lossy(&bytes).to_string();
-            for text_edit in edits {
-                let byte_start = match position_to_byte(&file_source, text_edit.range.start) {
-                    Ok(b) => b,
-                    Err(e) => return err(format!("lsp.rename: {rel}: {e}")),
-                };
-                let byte_end = match position_to_byte(&file_source, text_edit.range.end) {
-                    Ok(b) => b,
-                    Err(e) => return err(format!("lsp.rename: {rel}: {e}")),
-                };
-                changes.push((
-                    Span {
-                        file: rel.clone(),
-                        byte_start,
-                        byte_end,
-                        content_sha256: file_sha.clone(),
-                    },
-                    text_edit.new_text,
-                ));
-            }
-        }
         // Server-authored changes enter the ledger; edits.merge recognizes
         // them by content digest, so the EditSet's lineage carries
         // lsp_verified through to apply.
@@ -391,9 +523,230 @@ impl Tool for LspRename {
             "files": files,
             "edit_count": changes.len(),
             "authority": "lsp",
-            "language": "rust",
+            "language": language.language_id(),
+            "resource_ops": flattened.resource_ops,
             "issuance": issuance,
             "provenance": AuthorityTier::LspVerified.as_str(),
+        }))
+    }
+}
+
+/// `lsp.willRenameFiles` — ask the language server for edits that belong
+/// before a client-side file move/rename.
+pub struct LspWillRenameFiles(pub Arc<LspState>, pub Arc<ProvenanceLedger>);
+
+#[derive(Deserialize)]
+struct WillRenameFilesParams {
+    renames: Vec<FileRenameParam>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FileRenameParam {
+    #[serde(rename = "oldFile", alias = "old_file")]
+    old_file: String,
+    #[serde(rename = "newFile", alias = "new_file")]
+    new_file: String,
+}
+
+#[async_trait]
+impl Tool for LspWillRenameFiles {
+    fn name(&self) -> &str {
+        "lsp.willRenameFiles"
+    }
+    fn description(&self) -> &str {
+        "Ask the language server for workspace edits that must be applied before client-side file renames: provide oldFile/newFile pairs, get hash-anchored edits for edits.merge plus any resource ops the server reports. Fails closed when the server is unavailable."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "renames": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oldFile": { "type": "string" },
+                            "newFile": { "type": "string" }
+                        },
+                        "required": ["oldFile", "newFile"]
+                    }
+                },
+                "language": { "type": "string", "enum": ["java", "rust"], "description": "Defaults to java." }
+            },
+            "required": ["renames"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("lsp".to_string(), "willRenameFiles".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: WillRenameFilesParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "lsp.willRenameFiles: bad input — expected {{ renames: [{{oldFile, newFile}}], language? }}; {e}"
+                ));
+            }
+        };
+        if params.renames.is_empty() {
+            return err("lsp.willRenameFiles: renames must not be empty");
+        }
+        let language = match params.language.as_deref().unwrap_or("java") {
+            "java" => Language::Java,
+            "rust" => Language::Rust,
+            other => {
+                return err(format!(
+                    "lsp.willRenameFiles: unsupported language `{other}`"
+                ));
+            }
+        };
+        let mut renames = Vec::new();
+        for rename in &params.renames {
+            let old_abs = match bro_tools::workspace::resolve_in_root(&cx.root, &rename.old_file) {
+                Ok(p) => p,
+                Err(e) => return err(format!("lsp.willRenameFiles: {}: {e}", rename.old_file)),
+            };
+            let new_abs = match resolve_target_in_root(&cx.root, &rename.new_file) {
+                Ok(p) => p,
+                Err(e) => return err(format!("lsp.willRenameFiles: {e}")),
+            };
+            renames.push((old_abs, new_abs));
+        }
+        let edit = match self.0.will_rename_files(&cx.root, language, renames).await {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return err("lsp.willRenameFiles: server returned no WorkspaceEdit"),
+            Err(e) => return err(format!("lsp.willRenameFiles: {e}")),
+        };
+        let flattened = flatten_workspace_edit(edit);
+        if flattened.text_edits.is_empty() && flattened.resource_ops.is_empty() {
+            return err("lsp.willRenameFiles: server returned an empty WorkspaceEdit");
+        }
+        let changes = match text_edits_to_changes(
+            &cx.root,
+            "lsp.willRenameFiles",
+            flattened.text_edits,
+        )
+        .await
+        {
+            Ok(changes) => changes,
+            Err(e) => return err(e),
+        };
+        let issuance = self.1.record_changes(
+            "lsp.willRenameFiles",
+            AuthorityTier::LspVerified,
+            changes.iter().map(|(span, text)| (span, text.as_str())),
+        );
+        let files: std::collections::BTreeSet<&str> =
+            changes.iter().map(|(span, _)| span.file.as_str()).collect();
+        ToolResult::Json(json!({
+            "changes": changes
+                .iter()
+                .map(|(span, new_text)| json!({ "span": span, "new_text": new_text }))
+                .collect::<Vec<Value>>(),
+            "files": files,
+            "edit_count": changes.len(),
+            "resource_ops": flattened.resource_ops,
+            "authority": "lsp",
+            "language": language.language_id(),
+            "issuance": issuance,
+            "provenance": AuthorityTier::LspVerified.as_str(),
+        }))
+    }
+}
+
+fn resolve_target_in_root(root: &Path, file: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(file);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "target file must be a workspace-relative path without `..`: {file}"
+        ));
+    }
+    Ok(root.join(rel))
+}
+
+/// `lsp.executeCommand` — generic language-server command seam for
+/// server-specific refactor commands.
+pub struct LspExecuteCommand(pub Arc<LspState>);
+
+#[derive(Deserialize)]
+struct ExecuteCommandBindingParams {
+    command: String,
+    #[serde(default)]
+    arguments: Vec<Value>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[async_trait]
+impl Tool for LspExecuteCommand {
+    fn name(&self) -> &str {
+        "lsp.executeCommand"
+    }
+    fn description(&self) -> &str {
+        "Execute a language-server workspace command through workspace/executeCommand. Defaults to Java/JDTLS. This is the generic harness seam for server-specific refactor commands that are not modeled as standard LSP requests."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string" },
+                "arguments": { "type": "array", "items": {} },
+                "language": { "type": "string", "enum": ["java", "rust"], "description": "Defaults to java." }
+            },
+            "required": ["command"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("lsp".to_string(), "executeCommand".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: ExecuteCommandBindingParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "lsp.executeCommand: bad input — expected {{ command, arguments?, language? }}; {e}"
+                ));
+            }
+        };
+        let language = match params.language.as_deref().unwrap_or("java") {
+            "java" => Language::Java,
+            "rust" => Language::Rust,
+            other => {
+                return err(format!(
+                    "lsp.executeCommand: unsupported language `{other}`"
+                ));
+            }
+        };
+        let result = match self
+            .0
+            .execute_command(&cx.root, language, params.command.clone(), params.arguments)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => return err(format!("lsp.executeCommand: {e}")),
+        };
+        ToolResult::Json(json!({
+            "command": params.command,
+            "language": language.language_id(),
+            "result": result,
         }))
     }
 }
@@ -402,7 +755,9 @@ impl Tool for LspRename {
 /// session's provenance ledger.
 pub fn tools(state: Arc<LspState>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(LspRename(state.clone(), ledger)) as Arc<dyn Tool>,
+        Arc::new(LspRename(state.clone(), Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(LspWillRenameFiles(state.clone(), ledger)) as Arc<dyn Tool>,
+        Arc::new(LspExecuteCommand(state.clone())) as Arc<dyn Tool>,
         Arc::new(LspHover(state)) as Arc<dyn Tool>,
     ]
 }
@@ -531,13 +886,17 @@ impl Tool for LspHover {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "lsp".to_string(),
-        description: "Language-server authority. Session-backed: the first call in a workspace warms the backend for that language (may take a few seconds cold — rust-analyzer indexes the crate, JDTLS imports the gradle/maven workspace; the call blocks, no need to poll); later calls are fast. Backends: rust-analyzer (Rust, .rs) and JDTLS (Java, .java). Fails closed when the server is unavailable — there is deliberately no silent fallback to text matching (RX-V3). Two verbs: `lsp.rename` (rust only for now) and `lsp.hover` (rust + java). THE RENAME RECIPE: aim a Span at the symbol, then `const r = await lsp.rename({ span, newName: \"x\" })` → `await edits.merge({ es, changes: r.changes })` → `await edits.apply({ es })` — server-authored edits join the same EditSet artifact as cell-authored ones; the host ledgers them at lsp_verified, so pass them through UNMODIFIED (filtering is fine, rewriting a change's bytes floors it at syntax_only). THE Java var SEAM: `lsp.hover` resolves a `var x = ...` declarator's type authoritatively — JDTLS resolves cross-file receiver return types and generic parameters (jOOQ Table<R>.newRecord() -> R) that `analysis.methodRegions` (pure-bytes facts) leaves as resolved_type:null. Recipe shape: for each unresolved var, `const h = await lsp.hover({ span: varDeclaratorSpan });` and pass the parsed type as an explicit parameter to `java.extractMethodCodeBlock`."
+        description: "Language-server authority. Session-backed: the first call in a workspace warms the backend for that language (may take a few seconds cold — rust-analyzer indexes the crate, JDTLS imports the gradle/maven workspace; the call blocks, no need to poll); later calls are fast. Backends: rust-analyzer (Rust, .rs) and JDTLS (Java, .java). Fails closed when the server is unavailable — there is deliberately no silent fallback to text matching. Verbs: `lsp.rename` (rust + java), `lsp.willRenameFiles` (standard file move/rename preflight edits), `lsp.executeCommand` (server-specific command seam), and `lsp.hover` (rust + java). THE RENAME RECIPE: aim a Span at the symbol, then `const r = await lsp.rename({ span, newName: \"x\" })` → `await edits.merge({ es, changes: r.changes })` → `await edits.apply({ es })` — server-authored edits join the same EditSet artifact as cell-authored ones; the host ledgers them at lsp_verified, so pass them through UNMODIFIED (filtering is fine, rewriting a change's bytes floors it at syntax_only). THE JAVA MOVE SEAM: use `java.moveClass` / `java.movePackage`; those tools call JDTLS `java/getMoveDestinations` and `java/move` directly instead of the standard file-operation preflight when JDTLS does not supply edits there. THE Java var SEAM: `lsp.hover` resolves a `var x = ...` declarator's type authoritatively — JDTLS resolves cross-file receiver return types and generic parameters (jOOQ Table<R>.newRecord() -> R) that `analysis.methodRegions` (pure-bytes facts) leaves as resolved_type:null. Recipe shape: for each unresolved var, `const h = await lsp.hover({ span: varDeclaratorSpan });` and pass the parsed type as an explicit parameter to `java.extractMethodCodeBlock`."
             .to_string(),
         declarations: r#"type SpanChange = { span: Span; new_text: string };
 type HoverResult = { contents: string | null; language: string; position: { line: number; character: number } };
 declare const lsp: {
-  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Rust only for now (rust-analyzer). Returns hash-anchored server-authored changes for edits.merge; the host ledgers them at lsp_verified, so an EditSet built purely from them applies with semantic_status "lsp_verified" (hand-editing a change drops it to syntax_only). Fails closed if rust-analyzer is unavailable; stale_span on content drift. */
-  rename(args: { span: Span; newName: string }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
+  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Rust and Java. Returns hash-anchored server-authored changes for edits.merge; the host ledgers them at lsp_verified, so an EditSet built purely from them applies with semantic_status "lsp_verified" (hand-editing a change drops it to syntax_only). Fails closed if the language server is unavailable; stale_span on content drift. */
+  rename(args: { span: Span; newName: string }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; resource_ops: unknown[]; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
+  /** Ask the language server for edits that must be applied before standard file renames. */
+  willRenameFiles(args: { renames: Array<{ oldFile: string; newFile: string }>; language?: "java" | "rust" }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; resource_ops: unknown[]; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
+  /** Execute a language-server workspace command. Defaults to Java/JDTLS. Use for server-specific refactor commands not modeled as standard LSP requests. */
+  executeCommand(args: { command: string; arguments?: unknown[]; language?: "java" | "rust" }): Promise<{ command: string; language: string; result: unknown }>;
   /** Resolve the type/info for the symbol a Span points at (rust-analyzer for .rs, JDTLS for .java; warms on first use). THE Java var SEAM: point a Span at a `var x = ...` declarator and JDTLS returns the authoritative resolved type — cross-file receiver returns and generic params (jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot derive. contents is the raw hover text (markdown/code blocks) for the caller to interpret, or null when the server has no info there. Read-only (no provenance ledger). Fails closed if the server is unavailable; stale_span on content drift. */
   hover(args: { span: Span }): Promise<HoverResult>;
 };"#

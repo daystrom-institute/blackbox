@@ -18,7 +18,7 @@
 //! `syntax_only` tier (no ledger issuance — that tier is the floor anyway);
 //! `lsp_verified` Java kinds wait on jdtls in bro-lsp (v2 §7's named gate).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -330,6 +330,297 @@ fn file_delete_value(root: &Path, path: &Path) -> Result<Value, String> {
     }))
 }
 
+async fn jdtls_move_resources(
+    lsp_state: &super::lsp_facts::LspState,
+    root: &Path,
+    source_paths: &[PathBuf],
+    target_package: &str,
+) -> Result<lsp_types::WorkspaceEdit, String> {
+    let source_uris = source_paths
+        .iter()
+        .map(|path| {
+            let path = path
+                .canonicalize()
+                .map_err(|e| format!("java.move: canonicalize source {}: {e}", path.display()))?;
+            lsp_types::Url::from_file_path(&path)
+                .map_err(|_| format!("java.move: cannot convert {} to file uri", path.display()))
+                .map(|uri| uri.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let destinations = lsp_state
+        .request_raw(
+            root,
+            bro_lsp::Language::Java,
+            "java/getMoveDestinations",
+            json!({
+                "moveKind": "moveResource",
+                "sourceUris": source_uris,
+            }),
+        )
+        .await?;
+    let destination = select_jdtls_package_destination(&destinations, target_package)?;
+    let result =
+        jdtls_move_resources_to_destination(lsp_state, root, &source_uris, destination.clone())
+            .await?;
+    let result = if result
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .is_some_and(|msg| msg == "Cannot enable move operation.")
+        && let Some(uri) = destination.get("uri").and_then(Value::as_str)
+    {
+        jdtls_move_resources_to_destination(lsp_state, root, &source_uris, json!(uri)).await?
+    } else {
+        result
+    };
+    if let Some(msg) = result.get("errorMessage").and_then(Value::as_str)
+        && !msg.trim().is_empty()
+    {
+        return Err(format!("JDTLS java/move failed: {msg}"));
+    }
+    let Some(edit) = result.get("edit").cloned() else {
+        return Err(format!(
+            "JDTLS java/move returned no edit; raw result: {}",
+            serde_json::to_string(&result).unwrap_or_else(|_| "<unprintable>".to_string())
+        ));
+    };
+    serde_json::from_value(edit).map_err(|e| format!("decode JDTLS java/move edit: {e}"))
+}
+
+async fn jdtls_move_resources_to_destination(
+    lsp_state: &super::lsp_facts::LspState,
+    root: &Path,
+    source_uris: &[String],
+    destination: Value,
+) -> Result<Value, String> {
+    lsp_state
+        .request_raw(
+            root,
+            bro_lsp::Language::Java,
+            "java/move",
+            json!({
+                "moveKind": "moveResource",
+                "sourceUris": source_uris,
+                "destination": destination,
+                "updateReferences": true,
+            }),
+        )
+        .await
+}
+
+#[derive(Clone)]
+struct JdtlsPackageMoveSource {
+    source_path: PathBuf,
+    old_fqcn: String,
+    new_fqcn: String,
+}
+
+async fn jdtls_move_package_resources(
+    lsp_state: &super::lsp_facts::LspState,
+    root: &Path,
+    sources: &[JdtlsPackageMoveSource],
+    target_package: &str,
+) -> Result<(super::lsp_facts::FlattenedWorkspaceEdit, Vec<Value>), String> {
+    let all_paths = sources
+        .iter()
+        .map(|source| source.source_path.clone())
+        .collect::<Vec<_>>();
+    match jdtls_move_resources(lsp_state, root, &all_paths, target_package).await {
+        Ok(edit) => {
+            let flattened = super::lsp_facts::flatten_workspace_edit(edit);
+            if sources.len() == 1
+                || package_move_edit_covers_refs(root, &flattened, sources).await?
+            {
+                return Ok((flattened, Vec::new()));
+            }
+        }
+        Err(e) if sources.len() == 1 => return Err(e),
+        Err(_) => {}
+    }
+
+    let mut findings = vec![json!({
+        "finding": "jdtls_package_move_partitioned",
+        "detail": "JDTLS rejected or returned incomplete edits for the full package move; retried in smaller JDTLS-validated batches."
+    })];
+    let mut batch_count = 0usize;
+    let mut merged = super::lsp_facts::FlattenedWorkspaceEdit {
+        text_edits: Vec::new(),
+        resource_ops: Vec::new(),
+    };
+    let mut batch = Vec::<usize>::new();
+    let mut batch_edit: Option<super::lsp_facts::FlattenedWorkspaceEdit> = None;
+    for idx in 0..sources.len() {
+        let mut candidate = batch.clone();
+        candidate.push(idx);
+        match try_jdtls_package_batch(lsp_state, root, sources, &candidate, target_package).await? {
+            Some(edit) => {
+                batch = candidate;
+                batch_edit = Some(edit);
+            }
+            None => {
+                if batch.is_empty() {
+                    return Err(format!(
+                        "JDTLS returned incomplete edits for single-file package move of `{}`",
+                        sources[idx].old_fqcn
+                    ));
+                }
+                let edit = batch_edit.take().ok_or_else(|| {
+                    "internal error: package move batch missing validated edit".to_string()
+                })?;
+                merged.text_edits.extend(edit.text_edits);
+                merged.resource_ops.extend(edit.resource_ops);
+                batch_count += 1;
+                batch = vec![idx];
+                batch_edit = match try_jdtls_package_batch(
+                    lsp_state,
+                    root,
+                    sources,
+                    &batch,
+                    target_package,
+                )
+                .await?
+                {
+                    Some(edit) => Some(edit),
+                    None => {
+                        return Err(format!(
+                            "JDTLS returned incomplete edits for single-file package move of `{}`",
+                            sources[idx].old_fqcn
+                        ));
+                    }
+                };
+            }
+        }
+    }
+    if let Some(edit) = batch_edit {
+        merged.text_edits.extend(edit.text_edits);
+        merged.resource_ops.extend(edit.resource_ops);
+        batch_count += 1;
+    }
+    findings.push(json!({
+        "finding": "jdtls_package_move_batches",
+        "batch_count": batch_count,
+    }));
+    Ok((merged, findings))
+}
+
+async fn try_jdtls_package_batch(
+    lsp_state: &super::lsp_facts::LspState,
+    root: &Path,
+    sources: &[JdtlsPackageMoveSource],
+    indices: &[usize],
+    target_package: &str,
+) -> Result<Option<super::lsp_facts::FlattenedWorkspaceEdit>, String> {
+    let batch_sources = indices
+        .iter()
+        .map(|idx| sources[*idx].clone())
+        .collect::<Vec<_>>();
+    let paths = batch_sources
+        .iter()
+        .map(|source| source.source_path.clone())
+        .collect::<Vec<_>>();
+    let edit = match jdtls_move_resources(lsp_state, root, &paths, target_package).await {
+        Ok(edit) => edit,
+        Err(_) => return Ok(None),
+    };
+    let flattened = super::lsp_facts::flatten_workspace_edit(edit);
+    if batch_sources.len() == 1 {
+        return Ok(Some(flattened));
+    }
+    if package_move_edit_covers_refs(root, &flattened, &batch_sources).await? {
+        Ok(Some(flattened))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn package_move_edit_covers_refs(
+    root: &Path,
+    edit: &super::lsp_facts::FlattenedWorkspaceEdit,
+    sources: &[JdtlsPackageMoveSource],
+) -> Result<bool, String> {
+    let moving = sources
+        .iter()
+        .map(|source| {
+            source
+                .source_path
+                .canonicalize()
+                .unwrap_or_else(|_| source.source_path.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut edits_by_path: HashMap<PathBuf, Vec<lsp_types::TextEdit>> = HashMap::new();
+    for (uri, edits) in &edit.text_edits {
+        let path = uri
+            .to_file_path()
+            .map_err(|()| format!("java.movePackage: non-file uri in WorkspaceEdit: {uri}"))?;
+        let key = path.canonicalize().unwrap_or(path);
+        edits_by_path.entry(key).or_default().extend(edits.clone());
+    }
+    let java_files = collect_java_files(root)?;
+    for path in java_files {
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if moving.contains(&key) {
+            continue;
+        }
+        let source = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("java.movePackage: read {}: {e}", path.display()))?;
+        let checked = if let Some(edits) = edits_by_path.get(&key) {
+            super::lsp_facts::apply_text_edits_to_source(&source, edits, "java.movePackage")?
+        } else {
+            source
+        };
+        for moved in sources {
+            if checked.contains(&moved.old_fqcn) && !checked.contains(&moved.new_fqcn) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn select_jdtls_package_destination(
+    destinations: &Value,
+    target_package: &str,
+) -> Result<Value, String> {
+    let packages = destinations
+        .get("packages")
+        .and_then(Value::as_array)
+        .or_else(|| destinations.get("destinations").and_then(Value::as_array))
+        .or_else(|| destinations.as_array())
+        .ok_or_else(|| {
+            format!(
+                "JDTLS java/getMoveDestinations returned unexpected shape: {}",
+                serde_json::to_string(destinations).unwrap_or_else(|_| "<unprintable>".to_string())
+            )
+        })?;
+    let target_path = target_package.replace('.', "/");
+    packages
+        .iter()
+        .find(|package| {
+            package
+                .get("displayName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == target_package)
+                || package
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| {
+                        path == target_path || path.ends_with(&format!("/{target_path}"))
+                    })
+        })
+        .cloned()
+        .ok_or_else(|| {
+            let available = packages
+                .iter()
+                .filter_map(|package| package.get("displayName").and_then(Value::as_str))
+                .take(25)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "JDTLS did not offer target package `{target_package}` as a move destination. Available packages: [{available}]"
+            )
+        })
+}
+
 fn validate_java_package_name(pkg: &str, field: &str) -> Result<(), String> {
     if pkg.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
@@ -360,7 +651,71 @@ fn validate_java_identifier(name: &str, field: &str) -> Result<(), String> {
             "{field} must be a valid Java identifier, got `{name}`"
         ));
     }
+    if is_java_reserved_identifier(name) {
+        return Err(format!(
+            "{field} must be a valid Java identifier, got reserved token `{name}`"
+        ));
+    }
     Ok(())
+}
+
+fn is_java_reserved_identifier(name: &str) -> bool {
+    matches!(
+        name,
+        "_" | "abstract"
+            | "assert"
+            | "boolean"
+            | "break"
+            | "byte"
+            | "case"
+            | "catch"
+            | "char"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "extends"
+            | "false"
+            | "final"
+            | "finally"
+            | "float"
+            | "for"
+            | "goto"
+            | "if"
+            | "implements"
+            | "import"
+            | "instanceof"
+            | "int"
+            | "interface"
+            | "long"
+            | "native"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "short"
+            | "static"
+            | "strictfp"
+            | "super"
+            | "switch"
+            | "synchronized"
+            | "this"
+            | "throw"
+            | "throws"
+            | "transient"
+            | "true"
+            | "try"
+            | "void"
+            | "volatile"
+            | "while"
+    )
 }
 
 fn extract_package_name(source: &str) -> Option<String> {
@@ -378,31 +733,6 @@ fn extract_package_name(source: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn replace_package_decl(source: &str, target_package: &str) -> (String, bool) {
-    let mut offset = 0usize;
-    for line in source.split_inclusive('\n') {
-        let trimmed_start = line.trim_start();
-        let leading = line.len() - trimmed_start.len();
-        if let Some(rest) = trimmed_start.strip_prefix("package ") {
-            if let Some(semi_rel) = rest.find(';') {
-                let name_start = offset + leading + "package ".len();
-                let name_end = offset + leading + "package ".len() + semi_rel;
-                let mut out = String::with_capacity(source.len() + target_package.len());
-                out.push_str(&source[..name_start]);
-                out.push_str(target_package);
-                out.push_str(&source[name_end..]);
-                return (out, true);
-            }
-        }
-        let trimmed = line.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with("/*") {
-            break;
-        }
-        offset += line.len();
-    }
-    (format!("package {target_package};\n\n{source}"), false)
 }
 
 fn package_path(pkg: &str) -> PathBuf {
@@ -465,17 +795,6 @@ fn default_target_for_package(source_rel: &str, old_pkg: &str, target_pkg: &str)
     out
 }
 
-fn replace_literal_all(source: &str, old: &str, new: &str) -> (String, usize) {
-    if old.is_empty() || old == new {
-        return (source.to_string(), 0);
-    }
-    let count = source.match_indices(old).count();
-    if count == 0 {
-        return (source.to_string(), 0);
-    }
-    (source.replace(old, new), count)
-}
-
 fn whole_file_change(rel: &str, old_content: &str, new_content: &str) -> Value {
     json!({
         "span": {
@@ -500,7 +819,12 @@ fn collect_java_files(root: &Path) -> Result<Vec<PathBuf>, String> {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
-            if name == ".git" || name == "target" || name == "build" || name == ".gradle" {
+            if name.starts_with('.')
+                || name == "target"
+                || name == "build"
+                || name == "out"
+                || name == "node_modules"
+            {
                 continue;
             }
             let file_type = entry
@@ -1214,7 +1538,7 @@ impl Tool for JavaRenameSymbol {
 }
 
 /// `java.moveClass` — move one Java top-level class file to another package.
-pub struct JavaMoveClass;
+pub struct JavaMoveClass(pub Arc<super::lsp_facts::LspState>);
 
 #[derive(Deserialize)]
 struct JavaMoveClassParams {
@@ -1240,7 +1564,7 @@ impl Tool for JavaMoveClass {
         "java.moveClass"
     }
     fn description(&self) -> &str {
-        "Move one Java source file to a target package: creates the relocated file with an updated package declaration, updates project imports/FQCN references from old package.Class to new package.Class, and returns a hash-guarded delete for the source file. Pure; apply via edits.createFile/deleteFile/merge/apply."
+        "Move one Java source file to a target package through JDTLS java/getMoveDestinations + java/move. Creates the relocated file from server-authored moved-file edits, returns server-authored external changes, and returns a hash-guarded delete for the source file. Pure; apply via edits.createFile/deleteFile/merge/apply. Fails closed if JDTLS is unavailable or does not return moved-file package edits."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1274,133 +1598,159 @@ impl Tool for JavaMoveClass {
             }
         };
         let root = cx.root.clone();
-        bro_tools::tool::call_blocking(move || {
-            if let Err(e) = validate_java_package_name(&params.target_package, "targetPackage") {
-                return err(format!("java.moveClass: {e}"));
-            }
-            let source_path = match resolve_workspace_file(&root, &params.file, "java.moveClass") {
+        if let Err(e) = validate_java_package_name(&params.target_package, "targetPackage") {
+            return err(format!("java.moveClass: {e}"));
+        }
+        let source_path = match resolve_workspace_file(&root, &params.file, "java.moveClass") {
+            Ok(path) => path,
+            Err(e) => return err(e),
+        };
+        let source_text = match tokio::fs::read_to_string(&source_path).await {
+            Ok(text) => text,
+            Err(e) => return err(format!("java.moveClass: read {}: {e}", params.file)),
+        };
+        let old_package = match extract_package_name(&source_text) {
+            Some(pkg) => pkg,
+            None => return err("java.moveClass: source file has no package declaration"),
+        };
+        let class_name = params.class_name.clone().unwrap_or_else(|| {
+            source_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Unknown")
+                .to_string()
+        });
+        if let Err(e) = validate_java_identifier(&class_name, "className") {
+            return err(format!("java.moveClass: {e}"));
+        }
+        let target_rel = params.target_file.clone().unwrap_or_else(|| {
+            default_target_for_package(&params.file, &old_package, &params.target_package)
+                .to_string_lossy()
+                .to_string()
+        });
+        if target_rel == params.file {
+            return err("java.moveClass: targetFile resolves to the source file");
+        }
+        let target_path = match resolve_workspace_file(&root, &target_rel, "java.moveClass") {
+            Ok(path) => path,
+            Err(e) => return err(e),
+        };
+        let old_fqcn = format!("{old_package}.{class_name}");
+        let new_fqcn = format!("{}.{class_name}", params.target_package);
+        if let Err(e) = self
+            .0
+            .ensure_file_current(&root, &source_path, bro_lsp::Language::Java)
+            .await
+        {
+            return err(format!("java.moveClass: {e}"));
+        }
+        let workspace_edit = match jdtls_move_resources(
+            &self.0,
+            &root,
+            std::slice::from_ref(&source_path),
+            &params.target_package,
+        )
+        .await
+        {
+            Ok(edit) => edit,
+            Err(e) => return err(format!("java.moveClass: {e}")),
+        };
+        let flattened = super::lsp_facts::flatten_workspace_edit(workspace_edit);
+        let source_key = source_path
+            .canonicalize()
+            .unwrap_or_else(|_| source_path.clone());
+        let target_key = target_path.clone();
+        let mut moved_file_edits = Vec::new();
+        let mut external_edits = Vec::new();
+        for (uri, edits) in flattened.text_edits {
+            let path = match uri.to_file_path() {
                 Ok(path) => path,
+                Err(()) => {
+                    return err(format!(
+                        "java.moveClass: non-file uri in WorkspaceEdit: {uri}"
+                    ));
+                }
+            };
+            let key = path.canonicalize().unwrap_or(path);
+            if key == source_key || key == target_key {
+                moved_file_edits.extend(edits);
+            } else {
+                external_edits.push((uri, edits));
+            }
+        }
+        if moved_file_edits.is_empty() && old_package != params.target_package {
+            return err(
+                "java.moveClass: JDTLS did not return moved-file package edits; refusing syntax-only package rewrite",
+            );
+        }
+        let target_content = match super::lsp_facts::apply_text_edits_to_source(
+            &source_text,
+            &moved_file_edits,
+            "java.moveClass",
+        ) {
+            Ok(content) => content,
+            Err(e) => return err(e),
+        };
+        let mut changes =
+            match super::lsp_facts::text_edits_to_changes(&root, "java.moveClass", external_edits)
+                .await
+            {
+                Ok(changes) => changes
+                    .into_iter()
+                    .map(|(span, new_text)| json!({ "span": span, "new_text": new_text }))
+                    .collect::<Vec<_>>(),
                 Err(e) => return err(e),
             };
-            let source_text = match std::fs::read_to_string(&source_path) {
-                Ok(text) => text,
-                Err(e) => return err(format!("java.moveClass: read {}: {e}", params.file)),
-            };
-            let old_package = match extract_package_name(&source_text) {
-                Some(pkg) => pkg,
-                None => return err("java.moveClass: source file has no package declaration"),
-            };
-            let class_name = params.class_name.clone().unwrap_or_else(|| {
-                source_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string()
-            });
-            if let Err(e) = validate_java_identifier(&class_name, "className") {
-                return err(format!("java.moveClass: {e}"));
-            }
-            let target_rel = params.target_file.clone().unwrap_or_else(|| {
-                default_target_for_package(&params.file, &old_package, &params.target_package)
-                    .to_string_lossy()
-                    .to_string()
-            });
-            if target_rel == params.file {
-                return err("java.moveClass: targetFile resolves to the source file");
-            }
-            let (mut target_content, replaced_package) =
-                replace_package_decl(&source_text, &params.target_package);
-            let old_fqcn = format!("{old_package}.{class_name}");
-            let new_fqcn = format!("{}.{class_name}", params.target_package);
-            let (rewritten_target, target_refs) =
-                replace_literal_all(&target_content, &old_fqcn, &new_fqcn);
-            target_content = rewritten_target;
-
-            let mut file_edits = Vec::new();
-            let mut findings = Vec::new();
-            let java_files = match collect_java_files(&root) {
-                Ok(files) => files,
-                Err(e) => return err(format!("java.moveClass: {e}")),
-            };
-            for path in java_files {
-                if path == source_path {
-                    continue;
-                }
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                let mut edits = Vec::new();
-                let mut search_start = 0usize;
-                while let Some(rel_start) = text[search_start..].find(&old_fqcn) {
-                    let start = search_start + rel_start;
-                    edits.push(bbox_refactor::TextEdit {
-                        byte_start: start,
-                        byte_end: start + old_fqcn.len(),
-                        replacement: new_fqcn.clone(),
-                    });
-                    search_start = start + old_fqcn.len();
-                }
-                if !edits.is_empty() {
-                    let bytes = text.as_bytes();
-                    file_edits.push(bbox_refactor::FileEdit {
-                        path: path.to_string_lossy().to_string(),
-                        original_sha256: bbox_refactor::sha256_hex(bytes),
-                        edits,
-                        new_text: None,
-                    });
-                }
-            }
-            let (mut changes, would_change_files) =
-                match file_edits_to_changes(&root, "java.moveClass", &file_edits) {
-                    Ok(converted) => converted,
-                    Err(e) => return err(format!("java.moveClass: {e}")),
-                };
-            let would_create_files =
-                vec![json!({ "path": target_rel, "bytes": target_content.len() })];
-            let mut creates = vec![json!({ "path": target_rel, "content": target_content })];
-            let mut deletes = match file_delete_value(&root, &source_path) {
-                Ok(delete) => vec![delete],
-                Err(e) => return err(format!("java.moveClass: {e}")),
-            };
-            findings.push(json!({
-                "finding": "package_decl",
-                "file": params.file,
-                "old_package": old_package,
-                "new_package": params.target_package,
-                "replaced_existing": replaced_package,
-            }));
-            if target_refs > 0 {
-                findings.push(json!({
-                    "finding": "target_self_reference_rewrites",
-                    "count": target_refs,
-                }));
-            }
-            let preview_only = params.preview_only.unwrap_or(false);
-            if preview_only {
-                changes.clear();
-                creates.clear();
-                deletes.clear();
-            }
-            ToolResult::Json(json!({
-                "title": format!("move Java class `{old_fqcn}` to `{new_fqcn}`"),
-                "changes": changes,
-                "creates": creates,
-                "deletes": deletes,
-                "findings": findings,
-                "preview_only": preview_only,
-                "would_change_files": would_change_files,
-                "would_create_files": would_create_files,
-                "would_delete_files": [{ "path": params.file }],
-                "provenance": "syntax_only",
-            }))
-        })
-        .await
+        let would_change_files = changes
+            .iter()
+            .filter_map(|change| {
+                change
+                    .get("span")
+                    .and_then(|span| span.get("file"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| json!({ "path": path }))
+            .collect::<Vec<_>>();
+        let would_create_files = vec![json!({ "path": target_rel, "bytes": target_content.len() })];
+        let mut creates = vec![json!({ "path": target_rel, "content": target_content })];
+        let mut deletes = match file_delete_value(&root, &source_path) {
+            Ok(delete) => vec![delete],
+            Err(e) => return err(format!("java.moveClass: {e}")),
+        };
+        let findings = vec![json!({
+            "finding": "jdtls_file_rename",
+            "source": params.file,
+            "target": target_rel,
+            "old_package": old_package,
+            "new_package": params.target_package,
+            "resource_ops": flattened.resource_ops,
+        })];
+        let preview_only = params.preview_only.unwrap_or(false);
+        if preview_only {
+            changes.clear();
+            creates.clear();
+            deletes.clear();
+        }
+        ToolResult::Json(json!({
+            "title": format!("move Java class `{old_fqcn}` to `{new_fqcn}`"),
+            "changes": changes,
+            "creates": creates,
+            "deletes": deletes,
+            "findings": findings,
+            "preview_only": preview_only,
+            "would_change_files": would_change_files,
+            "would_create_files": would_create_files,
+            "would_delete_files": [{ "path": params.file }],
+            "provenance": "lsp_verified",
+        }))
     }
 }
 
 /// `java.movePackage` — move all files declaring one package to another package.
-pub struct JavaMovePackage;
+pub struct JavaMovePackage(pub Arc<super::lsp_facts::LspState>);
 
 #[derive(Deserialize)]
 struct JavaMovePackageParams {
@@ -1425,7 +1775,7 @@ impl Tool for JavaMovePackage {
         "java.movePackage"
     }
     fn description(&self) -> &str {
-        "Move every Java file declaring oldPackage to targetPackage. Creates relocated files with updated package declarations, updates project-wide oldPackage.* references/imports, and returns hash-guarded deletes for source files. Pure; apply through edits.*."
+        "Move every Java file declaring oldPackage to targetPackage through one JDTLS java/getMoveDestinations + java/move request. Creates relocated files from server-authored moved-file edits, returns server-authored external changes, and returns hash-guarded deletes for source files. Pure; apply through edits.*. Fails closed if JDTLS is unavailable or does not return moved-file package edits."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1458,164 +1808,244 @@ impl Tool for JavaMovePackage {
             }
         };
         let root = cx.root.clone();
-        bro_tools::tool::call_blocking(move || {
-            for (field, pkg) in [
-                ("oldPackage", params.old_package.as_str()),
-                ("targetPackage", params.target_package.as_str()),
-            ] {
-                if let Err(e) = validate_java_package_name(pkg, field) {
-                    return err(format!("java.movePackage: {e}"));
-                }
+        for (field, pkg) in [
+            ("oldPackage", params.old_package.as_str()),
+            ("targetPackage", params.target_package.as_str()),
+        ] {
+            if let Err(e) = validate_java_package_name(pkg, field) {
+                return err(format!("java.movePackage: {e}"));
             }
-            if params.old_package == params.target_package {
-                return err("java.movePackage: oldPackage and targetPackage are identical");
-            }
+        }
+        if params.old_package == params.target_package {
+            return err("java.movePackage: oldPackage and targetPackage are identical");
+        }
 
-            let candidate_paths = if let Some(files) = &params.files {
-                let mut paths = Vec::new();
-                for file in files {
-                    match resolve_workspace_file(&root, file, "java.movePackage") {
-                        Ok(path) => paths.push(path),
-                        Err(e) => return err(e),
-                    }
+        let candidate_paths = if let Some(files) = &params.files {
+            let mut paths = Vec::new();
+            for file in files {
+                match resolve_workspace_file(&root, file, "java.movePackage") {
+                    Ok(path) => paths.push(path),
+                    Err(e) => return err(e),
                 }
-                paths
-            } else {
-                match collect_java_files(&root) {
-                    Ok(files) => files,
-                    Err(e) => return err(format!("java.movePackage: {e}")),
-                }
+            }
+            paths
+        } else {
+            match collect_java_files(&root) {
+                Ok(files) => files,
+                Err(e) => return err(format!("java.movePackage: {e}")),
+            }
+        };
+
+        struct MovingFile {
+            source_path: PathBuf,
+            target_path: PathBuf,
+            source_rel: String,
+            target_rel: String,
+            source_text: String,
+            old_fqcn: String,
+            new_fqcn: String,
+        }
+
+        let mut moving = Vec::new();
+        for path in candidate_paths {
+            let text = match tokio::fs::read_to_string(&path).await {
+                Ok(text) => text,
+                Err(_) => continue,
             };
-
-            let mut moving = Vec::new();
-            for path in candidate_paths {
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                let pkg = extract_package_name(&text);
-                if pkg.as_deref() == Some(params.old_package.as_str()) {
-                    moving.push((path, text));
-                } else if params.files.is_some() {
-                    return err(format!(
-                        "java.movePackage: {} declares package {:?}, not {}",
-                        path.display(),
-                        pkg,
-                        params.old_package
-                    ));
-                }
-            }
-            if moving.is_empty() {
-                return err(format!(
-                    "java.movePackage: no Java files declaring `{}` found",
-                    params.old_package
-                ));
-            }
-
-            let moving_paths: BTreeSet<PathBuf> =
-                moving.iter().map(|(path, _)| path.clone()).collect();
-            let old_prefix = format!("{}.", params.old_package);
-            let new_prefix = format!("{}.", params.target_package);
-            let mut creates = Vec::new();
-            let mut deletes = Vec::new();
-            let mut would_create_files = Vec::new();
-            let mut would_delete_files = Vec::new();
-            let mut findings = Vec::new();
-            for (path, text) in &moving {
-                let rel = match relativize(&root, &path.to_string_lossy()) {
+            let pkg = extract_package_name(&text);
+            if pkg.as_deref() == Some(params.old_package.as_str()) {
+                let source_rel = match relativize(&root, &path.to_string_lossy()) {
                     Ok(rel) => rel,
                     Err(e) => return err(format!("java.movePackage: {e}")),
                 };
                 let target_rel = default_target_for_package(
-                    &rel,
+                    &source_rel,
                     &params.old_package,
                     &params.target_package,
                 )
                 .to_string_lossy()
                 .to_string();
-                if target_rel == rel {
+                if target_rel == source_rel {
                     return err(format!(
-                        "java.movePackage: target path for {rel} resolves to itself"
+                        "java.movePackage: target path for {source_rel} resolves to itself"
                     ));
                 }
-                let (package_rewritten, replaced_package) =
-                    replace_package_decl(text, &params.target_package);
-                let (target_content, refs_rewritten) =
-                    replace_literal_all(&package_rewritten, &old_prefix, &new_prefix);
-                creates.push(json!({ "path": target_rel, "content": target_content }));
-                would_create_files.push(json!({ "path": target_rel }));
-                match file_delete_value(&root, path) {
-                    Ok(delete) => deletes.push(delete),
-                    Err(e) => return err(format!("java.movePackage: {e}")),
-                }
-                would_delete_files.push(json!({ "path": rel }));
-                findings.push(json!({
-                    "finding": "moved_package_file",
-                    "source": rel,
-                    "target": target_rel,
-                    "replaced_existing_package_decl": replaced_package,
-                    "self_reference_rewrites": refs_rewritten,
-                }));
+                let target_path =
+                    match resolve_workspace_file(&root, &target_rel, "java.movePackage") {
+                        Ok(path) => path,
+                        Err(e) => return err(e),
+                    };
+                let class_name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+                moving.push(MovingFile {
+                    source_path: path,
+                    target_path,
+                    source_rel,
+                    target_rel,
+                    source_text: text,
+                    old_fqcn: format!("{}.{}", params.old_package, class_name),
+                    new_fqcn: format!("{}.{}", params.target_package, class_name),
+                });
+            } else if params.files.is_some() {
+                return err(format!(
+                    "java.movePackage: {} declares package {:?}, not {}",
+                    path.display(),
+                    pkg,
+                    params.old_package
+                ));
             }
+        }
+        if moving.is_empty() {
+            return err(format!(
+                "java.movePackage: no Java files declaring `{}` found",
+                params.old_package
+            ));
+        }
 
-            let mut file_edits = Vec::new();
-            let java_files = match collect_java_files(&root) {
-                Ok(files) => files,
-                Err(e) => return err(format!("java.movePackage: {e}")),
-            };
-            for path in java_files {
-                if moving_paths.contains(&path) {
-                    continue;
-                }
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                let mut edits = Vec::new();
-                let mut search_start = 0usize;
-                while let Some(rel_start) = text[search_start..].find(&old_prefix) {
-                    let start = search_start + rel_start;
-                    edits.push(bbox_refactor::TextEdit {
-                        byte_start: start,
-                        byte_end: start + old_prefix.len(),
-                        replacement: new_prefix.clone(),
-                    });
-                    search_start = start + old_prefix.len();
-                }
-                if !edits.is_empty() {
-                    file_edits.push(bbox_refactor::FileEdit {
-                        path: path.to_string_lossy().to_string(),
-                        original_sha256: bbox_refactor::sha256_hex(text.as_bytes()),
-                        edits,
-                        new_text: None,
-                    });
-                }
+        for file in &moving {
+            if let Err(e) = self
+                .0
+                .ensure_file_current(&root, &file.source_path, bro_lsp::Language::Java)
+                .await
+            {
+                return err(format!("java.movePackage: {e}"));
             }
-            let (mut changes, would_change_files) =
-                match file_edits_to_changes(&root, "java.movePackage", &file_edits) {
-                    Ok(converted) => converted,
-                    Err(e) => return err(format!("java.movePackage: {e}")),
-                };
-            let preview_only = params.preview_only.unwrap_or(false);
-            if preview_only {
-                changes.clear();
-                creates.clear();
-                deletes.clear();
-            }
-            ToolResult::Json(json!({
-                "title": format!("move Java package `{}` to `{}`", params.old_package, params.target_package),
-                "changes": changes,
-                "creates": creates,
-                "deletes": deletes,
-                "findings": findings,
-                "preview_only": preview_only,
-                "would_change_files": would_change_files,
-                "would_create_files": would_create_files,
-                "would_delete_files": would_delete_files,
-                "provenance": "syntax_only",
-            }))
-        })
+        }
+        let move_sources = moving
+            .iter()
+            .map(|file| JdtlsPackageMoveSource {
+                source_path: file.source_path.clone(),
+                old_fqcn: file.old_fqcn.clone(),
+                new_fqcn: file.new_fqcn.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (flattened, mut package_findings) = match jdtls_move_package_resources(
+            &self.0,
+            &root,
+            &move_sources,
+            &params.target_package,
+        )
         .await
+        {
+            Ok(result) => result,
+            Err(e) => return err(format!("java.movePackage: {e}")),
+        };
+        let mut moving_by_path = HashMap::new();
+        for (idx, file) in moving.iter().enumerate() {
+            moving_by_path.insert(
+                file.source_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| file.source_path.clone()),
+                idx,
+            );
+            moving_by_path.insert(file.target_path.clone(), idx);
+        }
+        let mut moved_edits: Vec<Vec<lsp_types::TextEdit>> = vec![Vec::new(); moving.len()];
+        let mut external_edits = Vec::new();
+        for (uri, edits) in flattened.text_edits {
+            let path = match uri.to_file_path() {
+                Ok(path) => path,
+                Err(()) => {
+                    return err(format!(
+                        "java.movePackage: non-file uri in WorkspaceEdit: {uri}"
+                    ));
+                }
+            };
+            let key = path.canonicalize().unwrap_or(path);
+            if let Some(idx) = moving_by_path.get(&key).copied() {
+                moved_edits[idx].extend(edits);
+            } else {
+                external_edits.push((uri, edits));
+            }
+        }
+
+        let mut creates = Vec::new();
+        let mut deletes = Vec::new();
+        let mut would_create_files = Vec::new();
+        let mut would_delete_files = Vec::new();
+        let mut findings = Vec::new();
+        findings.append(&mut package_findings);
+        for (idx, file) in moving.iter().enumerate() {
+            if moved_edits[idx].is_empty() {
+                return err(format!(
+                    "java.movePackage: JDTLS did not return moved-file package edits for {}; refusing syntax-only package rewrite",
+                    file.source_rel
+                ));
+            }
+            let target_content = match super::lsp_facts::apply_text_edits_to_source(
+                &file.source_text,
+                &moved_edits[idx],
+                "java.movePackage",
+            ) {
+                Ok(content) => content,
+                Err(e) => return err(e),
+            };
+            would_create_files
+                .push(json!({ "path": file.target_rel, "bytes": target_content.len() }));
+            creates.push(json!({ "path": file.target_rel, "content": target_content }));
+            match file_delete_value(&root, &file.source_path) {
+                Ok(delete) => deletes.push(delete),
+                Err(e) => return err(format!("java.movePackage: {e}")),
+            }
+            would_delete_files.push(json!({ "path": file.source_rel }));
+            findings.push(json!({
+                "finding": "jdtls_file_rename",
+                "source": file.source_rel,
+                "target": file.target_rel,
+            }));
+        }
+
+        let mut changes = match super::lsp_facts::text_edits_to_changes(
+            &root,
+            "java.movePackage",
+            external_edits,
+        )
+        .await
+        {
+            Ok(changes) => changes
+                .into_iter()
+                .map(|(span, new_text)| json!({ "span": span, "new_text": new_text }))
+                .collect::<Vec<_>>(),
+            Err(e) => return err(e),
+        };
+        let would_change_files = changes
+            .iter()
+            .filter_map(|change| {
+                change
+                    .get("span")
+                    .and_then(|span| span.get("file"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| json!({ "path": path }))
+            .collect::<Vec<_>>();
+        findings.push(json!({
+            "finding": "jdtls_resource_ops",
+            "resource_ops": flattened.resource_ops,
+        }));
+        let preview_only = params.preview_only.unwrap_or(false);
+        if preview_only {
+            changes.clear();
+            creates.clear();
+            deletes.clear();
+        }
+        ToolResult::Json(json!({
+            "title": format!("move Java package `{}` to `{}`", params.old_package, params.target_package),
+            "changes": changes,
+            "creates": creates,
+            "deletes": deletes,
+            "findings": findings,
+            "preview_only": preview_only,
+            "would_change_files": would_change_files,
+            "would_create_files": would_create_files,
+            "would_delete_files": would_delete_files,
+            "provenance": "lsp_verified",
+        }))
     }
 }
 
@@ -8730,11 +9160,11 @@ RECIPE
 const MOVE_CLASS_CONTRACT: &str = r#"java.moveClass — move one Java source file to another package.
 
 WHAT IT DOES
-  Creates a relocated copy of one Java file with its package declaration changed
-  to targetPackage, rewrites project-wide imports/FQCN references from
-  old.package.ClassName to target.package.ClassName, and returns a hash-guarded
-  delete for the original source file. It is syntax-only and never writes.
-  Same-package simple-name references do not require edits and are left alone.
+  Sends the source file to JDTLS via java/getMoveDestinations and java/move,
+  creates a relocated copy from the server-authored moved-file edits, returns
+  server-authored external changes for edits.merge, and returns a hash-guarded
+  delete for the original source file. It never writes. It fails closed if
+  JDTLS is unavailable or does not return moved-file package edits.
 
 PARAMS
   file: string          workspace-relative Java source file to move
@@ -8749,7 +9179,7 @@ RETURNS { title, changes, creates, deletes, findings, preview_only,
           would_change_files, would_create_files, would_delete_files, provenance }
   creates: {path, content}[] for edits.createFile
   deletes: {path, content_sha256}[] for edits.deleteFile
-  changes: import/FQCN rewrites for edits.merge
+  changes: JDTLS-authored external edits for edits.merge
 
 RECIPE
   const r = await java.moveClass({
@@ -8767,10 +9197,12 @@ const MOVE_PACKAGE_CONTRACT: &str = r#"java.movePackage — move every file decl
 
 WHAT IT DOES
   Finds Java files declaring oldPackage (or validates the explicit files list),
-  creates relocated copies with package declarations changed to targetPackage,
-  rewrites project-wide oldPackage.* imports/FQCN references to targetPackage.*,
-  and returns hash-guarded deletes for the old files. It is syntax-only and
-  never writes. It does not update non-Java config.
+  sends every source file to JDTLS in one java/getMoveDestinations + java/move
+  flow, creates relocated copies from server-authored moved-file edits,
+  returns server-authored external changes for edits.merge, and returns
+  hash-guarded deletes for the old files. It never writes. It fails closed if
+  JDTLS is unavailable or does not return moved-file package edits. It does not
+  update non-Java config.
 
 PARAMS
   oldPackage: string    package to move
@@ -9337,9 +9769,9 @@ WHAT IT DOES
   and adds uniquely-resolvable project-local type imports for simple names.
 
 WHY SYNTAX-ONLY
-  The code-mode binding does not currently carry a JDTLS session handle. This is
-  the same conservative heuristic used by extract-class target generation; it
-  returns hash-anchored edits for `edits.merge` and never writes.
+  This transform deliberately does not use the JDTLS session. It is the same
+  conservative heuristic used by extract-class target generation; it returns
+  hash-anchored edits for `edits.merge` and never writes.
 
 PARAMS  { files: string[] }   touched/created workspace-relative .java files
 RETURNS { changes, changed_files, findings, provenance }
@@ -10751,14 +11183,14 @@ impl Tool for JavaExtractColumnSpec {
 }
 
 /// The `java.*` binding set.
-pub fn tools() -> Vec<Arc<dyn Tool>> {
+pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(JavaExtractClass) as Arc<dyn Tool>,
         Arc::new(JavaExtractClassPreviewPlan) as Arc<dyn Tool>,
         Arc::new(JavaExtractMethodCodeBlock) as Arc<dyn Tool>,
         Arc::new(JavaRenameSymbol) as Arc<dyn Tool>,
-        Arc::new(JavaMoveClass) as Arc<dyn Tool>,
-        Arc::new(JavaMovePackage) as Arc<dyn Tool>,
+        Arc::new(JavaMoveClass(Arc::clone(&lsp_state))) as Arc<dyn Tool>,
+        Arc::new(JavaMovePackage(lsp_state)) as Arc<dyn Tool>,
         Arc::new(JavaPullUpPreview) as Arc<dyn Tool>,
         Arc::new(JavaExtractInterface) as Arc<dyn Tool>,
         Arc::new(JavaPullUpMembers) as Arc<dyn Tool>,
@@ -10792,13 +11224,13 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities (tree-sitter-backed; provenance syntax_only). Each transform runs real capture/wiring/hygiene analysis host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file to another package with import/FQCN rewrites and hash-guarded source delete; movePackage - relocate every file declaring a package to another package; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaExtractMethodResult = { title: string; changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaDelete = { path: string; content_sha256: string };
-type JavaMoveResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: JavaDelete[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes?: number }[]; would_delete_files: { path: string }[]; provenance: "syntax_only" };
+type JavaMoveResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; deletes: JavaDelete[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count?: number; replacement_bytes?: number }[]; would_create_files: { path: string; bytes?: number }[]; would_delete_files: { path: string }[]; provenance: "lsp_verified" };
 type JavaRenameResult = { title: string; changes: SpanChange[]; creates: []; deletes: []; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; file_rename_advisory: { from: string; to: string }[]; provenance: "syntax_only" };
 type JavaPullUpCandidate = { ref: string; kind: string; name: string; signature_hash: string; signature: string; visibility: string; modifiers: string[]; annotations: string[]; params: Array<{ name?: string; type?: string; modifiers: string[]; annotations: string[]; varargs: boolean }>; return_type?: string; type_parameters?: string; throws: string[]; throws_text?: string; comment_trivia: string; comment_trivia_span: Span; span: Span; signature_span: Span; blockers: unknown[]; warnings: unknown[]; default_options: Record<string, string> };
 type JavaPullUpPreview = { file: string; language: "java"; content_sha256: string; source_len: number; class: { name: string; span?: Span; blockers: unknown[] }; target_kind: "interface" | "abstract_class"; imports: string[]; candidates: JavaPullUpCandidate[]; ref_model: string; provenance: "syntax_only" };
@@ -10956,6 +11388,71 @@ public class OrderService {
             .find(|change| change["span"]["file"] == file)
             .and_then(|change| change["new_text"].as_str())
             .unwrap()
+    }
+
+    #[test]
+    fn jdtls_move_destination_accepts_destinations_payload() {
+        let destination = select_jdtls_package_destination(
+            &json!({
+                "destinations": [
+                    {
+                        "displayName": "com.acme.old",
+                        "path": "/project/src/main/java/com/acme/old",
+                        "uri": "file:///tmp/project/src/main/java/com/acme/old"
+                    },
+                    {
+                        "displayName": "com.acme.modern",
+                        "path": "/project/src/main/java/com/acme/modern",
+                        "uri": "file:///tmp/project/src/main/java/com/acme/modern"
+                    }
+                ]
+            }),
+            "com.acme.modern",
+        )
+        .unwrap();
+
+        assert_eq!(destination["displayName"], "com.acme.modern");
+    }
+
+    #[test]
+    fn java_package_validation_rejects_reserved_segments() {
+        let err = validate_java_package_name("com.acme.new", "targetPackage").unwrap_err();
+        assert!(
+            err.contains("reserved token `new`"),
+            "reserved keyword should be rejected before asking JDTLS: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_java_files_skips_hidden_peer_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/main/java/com/acme")).unwrap();
+        std::fs::create_dir_all(root.join(".claude/worktrees/peer/src/main/java/com/acme"))
+            .unwrap();
+        std::fs::write(
+            root.join("src/main/java/com/acme/Real.java"),
+            "package com.acme;\nclass Real {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".claude/worktrees/peer/src/main/java/com/acme/Peer.java"),
+            "package com.acme;\nclass Peer {}\n",
+        )
+        .unwrap();
+
+        let files = collect_java_files(&root).unwrap();
+        let mut rels = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        rels.sort();
+        assert_eq!(rels, vec!["src/main/java/com/acme/Real.java"]);
     }
 
     #[test]

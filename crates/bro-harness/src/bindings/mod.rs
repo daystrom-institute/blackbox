@@ -40,16 +40,14 @@ use bro_tools::Tool;
 /// `semantic_status` lineage-computed rather than cell-claimed.
 pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
     let ledger = Arc::new(ledger::ProvenanceLedger::default());
+    let lsp_state = Arc::new(lsp_facts::LspState::default());
     let mut tools = code_facts::tools();
     tools.extend(edit_algebra::tools(
         Arc::new(edit_algebra::EditStore::default()),
         Arc::clone(&ledger),
     ));
-    tools.extend(lsp_facts::tools(
-        Arc::new(lsp_facts::LspState::default()),
-        ledger,
-    ));
-    tools.extend(java_transforms::tools());
+    tools.extend(lsp_facts::tools(Arc::clone(&lsp_state), ledger));
+    tools.extend(java_transforms::tools(lsp_state));
     tools.extend(analysis::tools());
     tools
 }
