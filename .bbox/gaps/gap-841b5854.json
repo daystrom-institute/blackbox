@@ -1,0 +1,21 @@
+{
+  "id": "gap-841b5854",
+  "title": "No structural-survey/shape-count analysis reduction: skeleton surveys and arch ratchets run on rg + targeted reads",
+  "gap_kind": "refactor_primitive",
+  "domain": "isolate-analysis",
+  "wanted_capability": "see above",
+  "missing_primitive": "analysis.matchShape / analysis.structuralSurvey: repo-bounded count + file list + capped exemplars for a structural predicate",
+  "fallback_used": "Skeleton surveys run rg/grep/find + targeted file reads per detection signature; arch-ratchet calibration counts violations with an ad-hoc ArchUnit rule. analysis.references covers symbol-name reference counts only, not structural shapes; code.query is per-file tree-sitter, aggregate-capped, and returns heap-heavy spans.",
+  "evidence": [
+    "design/bro-harness/refactor-toolbox-gap-map.md:4",
+    "crates/bro-harness/src/bindings/analysis.rs:255",
+    "crates/bro-harness/src/bindings/code_facts.rs:396"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/isolate-analysis/structural-survey-shape-count",
+  "notes": "Tier 1 per the toolbox gap map (§5). Fits the facts-vs-analysis two-tier philosophy exactly: a structural question answered as a Rust-side reduction. Entry activity for the entire campaign portfolio (dozens of concerns), so leverage is breadth, not depth on one concern.",
+  "resolution": "unresolved",
+  "created_at": "2026-07-02T16:56:36Z",
+  "updated_at": "2026-07-02T16:56:36Z"
+}

@@ -1,0 +1,21 @@
+{
+  "id": "gap-231fbcd4",
+  "title": "No anchored/unique textual-edit atoms: seam fanouts hand-roll byte-offset math in JS",
+  "gap_kind": "refactor_primitive",
+  "domain": "isolate-edits",
+  "wanted_capability": "see above",
+  "missing_primitive": "edits.replaceText (unique find->Span, host-side byte-accurate) + java.addImport (idempotent, insertion-based, shadow-aware)",
+  "fallback_used": "Per-recipe recipes/functions/*.js helpers (write-seam-convert, workload-job-convert, event-dispatch-inversion lambdas) reinvent unique-string-match, anchor-line insertion, import insertion, and superclass/method-body replacement, computing byte offsets as char indices with an explicit \"correct for ASCII Java only\" caveat.",
+  "evidence": [
+    "design/bro-harness/refactor-toolbox-gap-map.md:3",
+    "crates/bro-harness/src/bindings/edit_algebra.rs:276",
+    "crates/bro-harness/src/bindings/java_transforms.rs:9918"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/isolate-edits/anchored-unique-textual-edit",
+  "notes": "Highest-leverage single gap per the toolbox gap map (§3, Tier 1): substrate under the largest observed mechanical campaign (a hundreds-of-sites write-command-seam fanout) and every seam-inversion recipe. Related but narrower already-filed: spacing-aware removal (gap-e3c9be8c), region-scoped whitespace (gap-eaddf7aa), LSP-backed organize-imports (gap-dd47427a). This gap is the missing convenience layer, distinct from all three.",
+  "resolution": "unresolved",
+  "created_at": "2026-07-02T16:56:25Z",
+  "updated_at": "2026-07-02T16:56:25Z"
+}
