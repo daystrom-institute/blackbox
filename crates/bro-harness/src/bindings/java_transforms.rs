@@ -852,6 +852,12 @@ struct JavaFilesParams {
 }
 
 #[derive(Deserialize)]
+struct JavaAddImportParams {
+    file: String,
+    imports: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct JavaHygieneParams {
     files: Vec<String>,
     #[serde(default)]
@@ -9671,6 +9677,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": REMOVE_UNUSED_PARAMS_CONTRACT }))
             }
             "organizeImports" => ToolResult::Json(json!({ "contract": ORGANIZE_IMPORTS_CONTRACT })),
+            "addImport" => ToolResult::Json(json!({ "contract": ADD_IMPORT_CONTRACT })),
             "normalizeWhitespace" => {
                 ToolResult::Json(json!({ "contract": NORMALIZE_WHITESPACE_CONTRACT }))
             }
@@ -9685,7 +9692,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, addImport, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -9781,6 +9788,35 @@ RETURNS { changes, changed_files, findings, provenance }
 RECIPE
   const r = await java.organizeImports({ files: touchedFiles });
   if (r.changes.length) { const es = await edits.begin(); await edits.merge({ es, changes: r.changes }); await edits.apply({ es }); }"#;
+
+const ADD_IMPORT_CONTRACT: &str = r#"java.addImport - insertion-only Java import helper.
+
+WHAT IT DOES
+  Normalizes each requested fully-qualified type or full import line to
+  `import ...;`, skips imports already present, skips imports whose simple name
+  is shadowed by a same-compilation-unit type declaration, and returns one
+  zero-width insertion change after the last existing import or package line.
+  It does not sort, prune, format, or block-replace the import region.
+
+PARAMS  { file: string, imports: string[] }
+  file: workspace-relative .java source file.
+  imports: fully-qualified type names like `java.util.List`, or full lines like
+           `import java.util.List;`.
+
+RETURNS { changes, findings, provenance }
+  changes: span changes for edits.merge. [] means every requested import was
+           already present, duplicate, or shadowed.
+  findings: import_added, import_already_present, duplicate_import_request, or
+            import_shadowed entries.
+  provenance: "syntax_only"
+
+RECIPE
+  const r = await java.addImport({ file, imports: ["java.util.List"] });
+  if (r.changes.length) {
+    const es = await edits.begin();
+    await edits.merge({ es, changes: r.changes });
+    await edits.apply({ es });
+  }"#;
 
 const NORMALIZE_WHITESPACE_CONTRACT: &str = r#"java.normalizeWhitespace — conservative Java whitespace hygiene for touched files.
 
@@ -9911,6 +9947,225 @@ impl Tool for JavaRemoveUnusedCtorParams {
 }
 
 pub struct JavaOrganizeImports;
+
+fn normalize_import_request(raw: &str) -> Result<(String, Option<String>), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty import request".to_string());
+    }
+    let mut body = trimmed.strip_prefix("import ").unwrap_or(trimmed).trim();
+    body = body.trim_end_matches(';').trim();
+    if body.is_empty() {
+        return Err(format!("empty import request `{raw}`"));
+    }
+    let is_static = body.strip_prefix("static ").is_some();
+    if !body.contains('.') {
+        return Err(format!(
+            "import request `{raw}` must be a fully-qualified type or a full import line"
+        ));
+    }
+    let simple = if is_static || body.ends_with(".*") {
+        None
+    } else {
+        body.rsplit('.')
+            .next()
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+    };
+    Ok((format!("import {body};"), simple))
+}
+
+fn compilation_unit_type_names(
+    items: &bbox_refactor::facts::FileItemsFacts,
+) -> BTreeMap<String, Value> {
+    let mut names = BTreeMap::new();
+    for item in &items.items {
+        if !java_class_like_kind(&item.item.kind) {
+            continue;
+        }
+        let Some(name) = item.item.name.as_deref() else {
+            continue;
+        };
+        names.entry(name.to_string()).or_insert_with(|| {
+            json!({
+                "kind": item.item.kind,
+                "line_start": item.item.line_start,
+                "byte_start": item.item.byte_start,
+            })
+        });
+    }
+    names
+}
+
+fn import_insertion_offset(source: &str) -> (usize, bool, bool) {
+    let mut offset = 0usize;
+    let mut insert_at = 0usize;
+    let mut saw_package = false;
+    let mut saw_import = false;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("package ") {
+            saw_package = true;
+            offset += line.len();
+            insert_at = offset;
+            continue;
+        }
+        if trimmed.starts_with("import ") {
+            saw_import = true;
+            offset += line.len();
+            insert_at = offset;
+            continue;
+        }
+        if trimmed.is_empty() && (saw_package || saw_import) {
+            offset += line.len();
+            continue;
+        }
+        break;
+    }
+    (insert_at, saw_package, saw_import)
+}
+
+fn java_add_import_value(root: &Path, params: JavaAddImportParams) -> Result<Value, String> {
+    if params.imports.is_empty() {
+        return Err("java.addImport: `imports` must not be empty".to_string());
+    }
+    let path = resolve_workspace_file(root, &params.file, "java.addImport")?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("java.addImport: read {}: {e}", params.file))?;
+    let content_sha256 = bbox_refactor::sha256_hex(source.as_bytes());
+    let existing = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("import "))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let items = bbox_refactor::facts::file_items(&path)
+        .map_err(|e| format!("java.addImport: {}: {e:#}", params.file))?;
+    let local_types = compilation_unit_type_names(&items);
+
+    let mut seen_requests = BTreeSet::new();
+    let mut missing_lines = Vec::new();
+    let mut findings = Vec::new();
+    for raw in params.imports {
+        let (line, simple_name) =
+            normalize_import_request(&raw).map_err(|e| format!("java.addImport: {e}"))?;
+        if !seen_requests.insert(line.clone()) {
+            findings.push(json!({
+                "finding": "duplicate_import_request",
+                "import": line,
+            }));
+            continue;
+        }
+        if existing.contains(&line) {
+            findings.push(json!({
+                "finding": "import_already_present",
+                "import": line,
+            }));
+            continue;
+        }
+        if let Some(simple_name) = simple_name.as_deref()
+            && let Some(local_type) = local_types.get(simple_name)
+        {
+            findings.push(json!({
+                "finding": "import_shadowed",
+                "import": line,
+                "simple_name": simple_name,
+                "local_type": local_type,
+                "detail": "same-compilation-unit type with this simple name would shadow the requested import",
+            }));
+            continue;
+        }
+        findings.push(json!({
+            "finding": "import_added",
+            "import": line,
+        }));
+        missing_lines.push(line);
+    }
+
+    let changes = if missing_lines.is_empty() {
+        Vec::new()
+    } else {
+        let (insert_at, saw_package, saw_import) = import_insertion_offset(&source);
+        let prefix = if saw_import {
+            ""
+        } else if saw_package {
+            "\n"
+        } else {
+            ""
+        };
+        vec![json!({
+            "span": {
+                "file": params.file,
+                "byte_start": insert_at,
+                "byte_end": insert_at,
+                "content_sha256": content_sha256,
+            },
+            "new_text": format!("{prefix}{}\n", missing_lines.join("\n")),
+        })]
+    };
+
+    Ok(json!({
+        "changes": changes,
+        "findings": findings,
+        "provenance": "syntax_only",
+    }))
+}
+
+pub struct JavaAddImport;
+
+#[async_trait]
+impl Tool for JavaAddImport {
+    fn name(&self) -> &str {
+        "java.addImport"
+    }
+
+    fn description(&self) -> &str {
+        "Insert missing Java imports after the package/import header without sorting or block-replacing the import region. Idempotent and same-compilation-unit type shadow aware. Returns {changes} for edits.merge; never writes."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Workspace-relative Java file." },
+                "imports": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Fully-qualified type names or full import lines."
+                }
+            },
+            "required": ["file", "imports"]
+        })
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "addImport".to_string()))
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaAddImportParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.addImport: bad input - expected {{ file: string, imports: string[] }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || match java_add_import_value(&root, params) {
+            Ok(value) => ToolResult::Json(value),
+            Err(e) => err(e),
+        })
+        .await
+    }
+}
 
 #[async_trait]
 impl Tool for JavaOrganizeImports {
@@ -11211,6 +11466,7 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaRemoveUnusedCtorParams) as Arc<dyn Tool>,
         Arc::new(JavaExtractColumnSpec) as Arc<dyn Tool>,
         Arc::new(JavaSynthesizeHelperWrappers) as Arc<dyn Tool>,
+        Arc::new(JavaAddImport) as Arc<dyn Tool>,
         Arc::new(JavaOrganizeImports) as Arc<dyn Tool>,
         Arc::new(JavaNormalizeWhitespace) as Arc<dyn Tool>,
         Arc::new(JavaHygiene) as Arc<dyn Tool>,
@@ -11224,7 +11480,7 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
@@ -11252,6 +11508,7 @@ type JavaInlineMethodPreview = { file: string; content_sha256: string; method_na
 type JavaInlineMethodResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaMoveMemberPreview = { file: string; target: string; member_kind: "field" | "constant" | "method"; members: Array<{ ref: string; name: string; kind: string; byte_start: number; byte_end: number }>; findings: unknown[]; blocked: boolean; would_change_files: unknown[]; would_create_files: unknown[]; ref_model: string; provenance: "syntax_only" };
 type JavaMoveMemberResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: unknown[]; selected_member_refs: string[]; preview_only: boolean; would_change_files: unknown[]; would_create_files: unknown[]; blocked?: boolean; provenance: "syntax_only" };
+type JavaAddImportResult = { changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
@@ -11306,6 +11563,8 @@ declare const java: {
   moveMember(args: { file: string; target: string; memberNames: string[]; memberRefs: string[]; memberKind?: "field" | "constant" | "method"; visibility?: "public" | "protected" | "private" | "package"; keepCopy?: boolean; targetPrelude?: string; targetClassName?: string; acknowledgeRemainingAccessors?: boolean; acknowledgeRemainingSourceReferences?: boolean; previewOnly?: boolean }): Promise<JavaMoveMemberResult>;
   /** Drop dead @Inject ctor params left by an extract (move the injection point). Returns {changes} → edits.merge. Run AFTER applying the extract. @Inject ctors only; refuses others with a note. */
   removeUnusedConstructorParams(args: { file: string }): Promise<{ changes: SpanChange[]; ctor_is_inject: boolean; removed: string[]; kept: string[]; findings: ({ finding: string } & Record<string, unknown>)[]; note: string | null; provenance: "syntax_only" }>;
+  /** Insert missing Java imports without sorting, pruning, or block-replacing the import region. Returns {changes} → edits.merge; [] means no insertions. */
+  addImport(args: { file: string; imports: string[] }): Promise<JavaAddImportResult>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
   organizeImports(args: { files: string[] }): Promise<JavaHygieneResult>;
   /** Conservative whitespace hygiene for touched files. Returns {changes} → edits.merge; [] means no whitespace edits. */
@@ -11453,6 +11712,109 @@ public class OrderService {
             .collect::<Vec<_>>();
         rels.sort();
         assert_eq!(rels, vec!["src/main/java/com/acme/Real.java"]);
+    }
+
+    #[tokio::test]
+    async fn add_import_inserts_after_package_without_block_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = "package com.acme;\n\nclass Example {\n}\n";
+        std::fs::write(root.join("src/com/acme/Example.java"), source).unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaAddImport
+                .call(
+                    json!({ "file": "src/com/acme/Example.java", "imports": ["java.util.List"] }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1, "{result}");
+        let change = &result["changes"][0];
+        let insert_at = "package com.acme;\n".len();
+        assert_eq!(change["span"]["byte_start"], insert_at);
+        assert_eq!(change["span"]["byte_end"], insert_at);
+        assert_eq!(change["new_text"], "\nimport java.util.List;\n");
+        assert_eq!(result["findings"][0]["finding"], "import_added");
+    }
+
+    #[tokio::test]
+    async fn add_import_is_idempotent_when_import_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Example.java"),
+            "package com.acme;\n\nimport java.util.List;\n\nclass Example {\n}\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaAddImport
+                .call(
+                    json!({ "file": "src/com/acme/Example.java", "imports": ["import java.util.List;"] }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert!(result["changes"].as_array().unwrap().is_empty(), "{result}");
+        assert_eq!(result["findings"][0]["finding"], "import_already_present");
+    }
+
+    #[tokio::test]
+    async fn add_import_skips_shadowed_nested_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Example.java"),
+            "package com.acme;\n\nclass Example {\n    class List {}\n}\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaAddImport
+                .call(
+                    json!({ "file": "src/com/acme/Example.java", "imports": ["java.util.List"] }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert!(result["changes"].as_array().unwrap().is_empty(), "{result}");
+        assert_eq!(result["findings"][0]["finding"], "import_shadowed");
+        assert_eq!(result["findings"][0]["simple_name"], "List");
+    }
+
+    #[tokio::test]
+    async fn add_import_inserts_after_last_existing_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = "package com.acme;\n\nimport java.time.Instant;\n\nclass Example {\n}\n";
+        std::fs::write(root.join("src/com/acme/Example.java"), source).unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaAddImport
+                .call(
+                    json!({ "file": "src/com/acme/Example.java", "imports": ["java.util.List"] }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let change = &result["changes"][0];
+        let insert_at = source.find("\n\nclass Example").unwrap() + 1;
+        assert_eq!(change["span"]["byte_start"], insert_at);
+        assert_eq!(change["span"]["byte_end"], insert_at);
+        assert_eq!(change["new_text"], "import java.util.List;\n");
     }
 
     #[test]

@@ -284,6 +284,139 @@ span_edit_tool!(
     }
 );
 
+/// `edits.replaceText` - resolve a unique source string to a fresh Span and
+/// queue the replacement through the same path as `edits.replace`.
+pub struct EditsReplaceText(pub Arc<EditStore>);
+
+#[derive(Deserialize)]
+struct ReplaceTextParams {
+    es: String,
+    file: String,
+    find: String,
+    #[serde(rename = "replace", alias = "text")]
+    replace: String,
+    #[serde(default)]
+    occurrence: Option<String>,
+}
+
+#[async_trait]
+impl Tool for EditsReplaceText {
+    fn name(&self) -> &str {
+        "edits.replaceText"
+    }
+
+    fn description(&self) -> &str {
+        "Resolve a unique find string to a byte-accurate hash-anchored Span, then queue a replacement into an existing EditSet. Pure; builds, never writes."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "es": { "type": "string", "description": "EditSet id from edits.begin." },
+                "file": { "type": "string", "description": "File to search. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
+                "find": { "type": "string", "description": "Text that must occur exactly once when occurrence is unique." },
+                "replace": { "type": "string", "description": "Replacement text queued for the matched bytes." },
+                "occurrence": { "type": "string", "enum": ["unique"], "description": "Currently only unique is supported; default unique." }
+            },
+            "required": ["es", "file", "find", "replace"]
+        })
+    }
+
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("edits".to_string(), "replaceText".to_string()))
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: ReplaceTextParams = match decode(
+            "edits.replaceText",
+            "{ es: string, file: string, find: string, replace: string, occurrence?: \"unique\" }",
+            input,
+        ) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if params.find.is_empty() {
+            return err("edits.replaceText: `find` must not be empty");
+        }
+        let occurrence = params
+            .occurrence
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("unique");
+        if occurrence != "unique" {
+            return err(format!(
+                "edits.replaceText: unsupported occurrence `{occurrence}`; only `unique` is supported"
+            ));
+        }
+
+        let root = cx.root.clone();
+        let store = Arc::clone(&self.0);
+        bro_tools::tool::call_blocking(move || {
+            let path = match bro_tools::workspace::resolve_in_root(&root, &params.file) {
+                Ok(path) => path,
+                Err(e) => {
+                    return err(format!(
+                        "edits.replaceText: resolve {}: {e:#}",
+                        params.file
+                    ));
+                }
+            };
+            let bytes = match read_file_bytes(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => return err(format!("edits.replaceText: read {}: {e}", params.file)),
+            };
+            let content_sha256 = sha256_hex(&bytes);
+            let source = match std::str::from_utf8(&bytes) {
+                Ok(source) => source,
+                Err(e) => {
+                    return err(format!(
+                        "edits.replaceText: {} is not valid UTF-8 source: {e}",
+                        params.file
+                    ));
+                }
+            };
+            let matches = source.match_indices(&params.find).collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return err(format!(
+                    "edits.replaceText: `find` matched {} times in {}; expected exactly 1 for occurrence `unique`",
+                    matches.len(),
+                    params.file
+                ));
+            }
+            let byte_start = matches[0].0;
+            let span = Span {
+                file: params.file.clone(),
+                byte_start,
+                byte_end: byte_start + params.find.len(),
+                content_sha256,
+            };
+            let edit = TextEdit {
+                byte_start: span.byte_start,
+                byte_end: span.byte_end,
+                replacement: params.replace,
+            };
+            match push_span_edit(
+                &store,
+                &params.es,
+                &span,
+                edit,
+                AuthorityTier::SyntaxOnly,
+            ) {
+                Ok(count) => ToolResult::Json(json!({
+                    "es": params.es,
+                    "file": span.file,
+                    "edit_count": count,
+                    "span": span,
+                    "match_count": 1,
+                })),
+                Err(e) => err(format!("edits.replaceText: {e}")),
+            }
+        })
+        .await
+    }
+}
+
 span_edit_tool!(
     EditsInsertAfter,
     "edits.insertAfter",
@@ -986,6 +1119,7 @@ pub fn tools(store: Arc<EditStore>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dy
     vec![
         Arc::new(EditsBegin(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsReplace(Arc::clone(&store))) as Arc<dyn Tool>,
+        Arc::new(EditsReplaceText(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsInsertAfter(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsInsertBefore(Arc::clone(&store))) as Arc<dyn Tool>,
         Arc::new(EditsDelete(Arc::clone(&store))) as Arc<dyn Tool>,
@@ -1081,6 +1215,111 @@ mod tests {
         // Consumed: a second apply must fail with unknown EditSet.
         let again = EditsApply(store).call(json!({ "es": es }), &cx).await;
         assert!(matches!(again, ToolResult::Error(e) if e.contains("unknown EditSet")));
+    }
+
+    #[tokio::test]
+    async fn replace_text_unique_match_queues_and_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let queued = json_of(
+            EditsReplaceText(store.clone())
+                .call(
+                    json!({ "es": es, "file": "probe.rs", "find": "    7", "replace": "    9" }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(queued["edit_count"], 1);
+        assert_eq!(queued["span"]["byte_start"], FIXTURE.find("    7").unwrap());
+
+        let applied = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(applied["applied"], true, "{applied}");
+        let on_disk = std::fs::read_to_string(root.join("probe.rs")).unwrap();
+        assert!(on_disk.contains("    9\n"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn replace_text_refuses_zero_matches_without_queueing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let result = EditsReplaceText(store)
+            .call(
+                json!({ "es": es, "file": "probe.rs", "find": "missing", "replace": "x" }),
+                &cx,
+            )
+            .await;
+        assert!(
+            matches!(result, ToolResult::Error(ref e) if e.contains("matched 0 times")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_text_refuses_multiple_matches_without_queueing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("probe.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let store = Arc::new(EditStore::default());
+        let cx = cx_in(&root);
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let result = EditsReplaceText(store)
+            .call(
+                json!({ "es": es, "file": "probe.rs", "find": "fn", "replace": "pub fn" }),
+                &cx,
+            )
+            .await;
+        assert!(
+            matches!(result, ToolResult::Error(ref e) if e.contains("matched 2 times")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_text_reports_multibyte_byte_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = "fn main() {\n    let label = \"caf\u{e9}\";\n}\n";
+        std::fs::write(root.join("probe.rs"), source).unwrap();
+        let store = Arc::new(EditStore::default());
+        let cx = cx_in(&root);
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let queued = json_of(
+            EditsReplaceText(store.clone())
+                .call(
+                    json!({ "es": es, "file": "probe.rs", "find": "\u{e9}\"", "replace": "e\"" }),
+                    &cx,
+                )
+                .await,
+        );
+        let expected = source.find("\u{e9}\"").unwrap();
+        assert_eq!(queued["span"]["byte_start"], expected);
+        assert_eq!(queued["span"]["byte_end"], expected + "\u{e9}\"".len());
+        assert!("\u{e9}\"".len() > "\u{e9}\"".chars().count());
+
+        let applied = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(applied["applied"], true, "{applied}");
+        let on_disk = std::fs::read_to_string(root.join("probe.rs")).unwrap();
+        assert!(on_disk.contains("\"cafe\""), "{on_disk}");
     }
 
     #[tokio::test]
@@ -1464,15 +1703,18 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
         description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / deleteFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, stale_delete, invalid_edits, create_exists, parse_error_after_apply, write_failed, delete_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile/deleteFile entries, and any hand-rewritten change floor at syntax_only. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
             .to_string(),
         declarations: r#"type Finding = { kind: "stale_span" | "stale_delete" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed" | "delete_failed"; file: string; detail: string; resolution_hint: string };
-type SemanticStatus = "lsp_verified" | "syntax_only";  // lineage-computed weakest link, recomputed host-side at apply — cell-supplied claims are ignored
-type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; deleted?: boolean; content_sha256: string }[]; semantic_status: SemanticStatus; lineage: { lsp_verified: number; syntax_only: number }; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation — mint fresh Spans from it without re-calling code.items
-type Bounced = { applied: false; es: string; findings: Finding[]; rolled_back?: boolean; semantic_status: SemanticStatus };
-declare const edits: {
+	type SemanticStatus = "lsp_verified" | "syntax_only";  // lineage-computed weakest link, recomputed host-side at apply; cell-supplied claims are ignored
+	type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; deleted?: boolean; content_sha256: string }[]; semantic_status: SemanticStatus; lineage: { lsp_verified: number; syntax_only: number }; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation; mint fresh Spans from it without re-calling code.items
+	type Bounced = { applied: false; es: string; findings: Finding[]; rolled_back?: boolean; semantic_status: SemanticStatus };
+	type ReplaceTextResult = { es: string; file: string; edit_count: number; span: Span; match_count: 1 };
+	declare const edits: {
   /** Open a fresh EditSet (host-side, session-scoped; survives across cells by id). */
   begin(args?: {}): Promise<string>;  // returns the EditSet id directly
-  /** Queue replacement of a Span's exact bytes (pure; never writes). */
-  replace(args: { es: string; span: Span; text: string }): Promise<{ es: string; file: string; edit_count: number }>;
-  /** Queue insertion immediately after a Span's end (pure; never writes). */
+	  /** Queue replacement of a Span's exact bytes (pure; never writes). */
+	  replace(args: { es: string; span: Span; text: string }): Promise<{ es: string; file: string; edit_count: number }>;
+	  /** Resolve one unique find string to a byte-accurate hash-anchored Span, then queue a replacement through edits.replace's path. Refuses on 0 or more than 1 match. */
+	  replaceText(args: { es: string; file: string; find: string; replace: string; occurrence?: "unique" }): Promise<ReplaceTextResult>;
+	  /** Queue insertion immediately after a Span's end (pure; never writes). */
   insertAfter(args: { es: string; span: Span; text: string }): Promise<{ es: string; file: string; edit_count: number }>;
   /** Queue insertion immediately before a Span's start — place text directly above an item without byte arithmetic (pure; never writes). */
   insertBefore(args: { es: string; span: Span; text: string }): Promise<{ es: string; file: string; edit_count: number }>;
