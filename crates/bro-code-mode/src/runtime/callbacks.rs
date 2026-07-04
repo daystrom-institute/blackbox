@@ -6,10 +6,12 @@ use super::RuntimeEvent;
 use super::RuntimeState;
 use super::timers;
 use super::value::json_to_v8;
+use super::value::json_to_v8_reviving_functions;
 use super::value::normalize_output_image;
 use super::value::serialize_output_text;
 use super::value::throw_type_error;
 use super::value::v8_value_to_json;
+use super::value::v8_value_to_json_preserving_functions;
 
 pub(super) fn tool_callback(
     scope: &mut v8::PinScope<'_, '_>,
@@ -155,36 +157,23 @@ pub(super) fn store_callback(
         return;
     }
     let value = args.get(1);
-    // Local addition (not vendored): the function store — store()/load() for
-    // lambdas. A function value persists as its SOURCE (self-contained
-    // functions only: captured closure variables do not survive the source
-    // round-trip); load() revives it into a callable. Session-scoped like
-    // every other stored value.
-    let serialized = if value.is_function() {
-        let Some(source) = value.to_string(scope) else {
+    // Local addition (not vendored): the function store: store()/load() for
+    // lambdas. Function values persist as SOURCE envelopes, including functions
+    // nested inside plain objects/arrays. Captured closure variables do not
+    // survive the source round-trip; revived functions throw ReferenceError at
+    // call time when they reference missing captures.
+    let serialized = match v8_value_to_json_preserving_functions(scope, value, FN_SOURCE_KEY) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
             throw_type_error(
                 scope,
-                &format!("Unable to capture source of function {key:?}."),
+                &format!("Unable to store {key:?}. Only plain serializable objects can be stored."),
             );
             return;
-        };
-        serde_json::json!({ FN_SOURCE_KEY: source.to_rust_string_lossy(scope) })
-    } else {
-        match v8_value_to_json(scope, value) {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                throw_type_error(
-                    scope,
-                    &format!(
-                        "Unable to store {key:?}. Only plain serializable objects can be stored."
-                    ),
-                );
-                return;
-            }
-            Err(error_text) => {
-                throw_type_error(scope, &error_text);
-                return;
-            }
+        }
+        Err(error_text) => {
+            throw_type_error(scope, &error_text);
+            return;
         }
     };
     if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
@@ -194,7 +183,7 @@ pub(super) fn store_callback(
 }
 
 /// Local addition (not vendored): JSON envelope marker for stored function
-/// source — the function-store sentinel store()/load() round-trip through.
+/// source: the function-store sentinel store()/load() round-trip through.
 pub(super) const FN_SOURCE_KEY: &str = "__bro_fn_source__";
 
 pub(super) fn load_callback(
@@ -217,37 +206,25 @@ pub(super) fn load_callback(
         retval.set(v8::undefined(scope).into());
         return;
     };
-    // Local addition (not vendored): revive a stored function from its source
-    // (the function-store half of load()). Compiles `(source)` in the current
-    // context — which is also what enforces the self-contained constraint: a
-    // revived function referencing lost closure variables throws
-    // ReferenceError at call time, loudly.
-    if let Some(source) = value.get(FN_SOURCE_KEY).and_then(serde_json::Value::as_str) {
-        let wrapped = format!("({source})");
-        let Some(code) = v8::String::new(scope, &wrapped) else {
-            throw_type_error(scope, "failed to allocate stored function source");
-            return;
-        };
-        let compiled = v8::Script::compile(scope, code, None)
-            .and_then(|script| script.run(scope))
-            .filter(|revived| revived.is_function());
-        let Some(revived) = compiled else {
+    // Local addition (not vendored): revive stored function-source envelopes at
+    // any depth. This compiles `(source)` in the current context, preserving the
+    // self-contained function constraint from the top-level function store.
+    match json_to_v8_reviving_functions(scope, &value, FN_SOURCE_KEY) {
+        Ok(Some(value)) => retval.set(value),
+        Ok(None) => {
+            let Some(value) = json_to_v8(scope, &value) else {
+                throw_type_error(scope, "failed to load stored value");
+                return;
+            };
+            retval.set(value);
+        }
+        Err(error_text) => {
             throw_type_error(
                 scope,
-                &format!(
-                    "stored function {key:?} failed to compile from source — it must be a self-contained function expression"
-                ),
+                &format!("stored value {key:?} failed to revive function source: {error_text}"),
             );
-            return;
-        };
-        retval.set(revived);
-        return;
+        }
     }
-    let Some(value) = json_to_v8(scope, &value) else {
-        throw_type_error(scope, "failed to load stored value");
-        return;
-    };
-    retval.set(value);
 }
 
 pub(super) fn notify_callback(

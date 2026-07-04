@@ -1183,6 +1183,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_bare_function_round_trips_between_cells() {
+        let service = CodeModeService::new();
+
+        let write_response = execute(
+            &service,
+            ExecuteRequest {
+                source: r#"store("helper", function double(n) { return n * 2; });"#.to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+        let read_response = execute(
+            &service,
+            ExecuteRequest {
+                source: r#"const double = load("helper"); text(String(double(21)));"#.to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+
+        assert_eq!(
+            write_response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+                error_text: None,
+            }
+        );
+        assert_eq!(
+            read_response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("2"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "42".to_string(),
+                }],
+                error_text: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_object_preserves_nested_function_and_siblings() {
+        let service = CodeModeService::new();
+
+        let write_response = execute(
+            &service,
+            ExecuteRequest {
+                source: r#"store("helpers", { n: 42, gate: function gate(n) { return n > 10; }, label: "ok" });"#.to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+        let read_response = execute(
+            &service,
+            ExecuteRequest {
+                source: r#"const helpers = load("helpers"); text(JSON.stringify({ n: helpers.n, label: helpers.label, gate: helpers.gate(11) }));"#.to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+
+        assert_eq!(
+            write_response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+                error_text: None,
+            }
+        );
+        assert_eq!(
+            read_response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("2"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: r#"{"n":42,"label":"ok","gate":true}"#.to_string(),
+                }],
+                error_text: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_array_preserves_nested_function_and_siblings() {
+        let service = CodeModeService::new();
+
+        let write_response = execute(
+            &service,
+            ExecuteRequest {
+                source:
+                    r#"store("items", [3, function triple(n) { return n * 3; }, { tag: "kept" }]);"#
+                        .to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+        let read_response = execute(
+            &service,
+            ExecuteRequest {
+                source: r#"const items = load("items"); text(JSON.stringify([items[0], items[1](14), items[2].tag]));"#.to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+
+        assert_eq!(
+            write_response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+                error_text: None,
+            }
+        );
+        assert_eq!(
+            read_response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("2"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: r#"[3,42,"kept"]"#.to_string(),
+                }],
+                error_text: None,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_interrupts_cpu_bound_cells() {
         let service = CodeModeService::new();
 

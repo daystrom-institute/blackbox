@@ -142,6 +142,12 @@ impl ShellSessions {
         self.map.keys().cloned().collect()
     }
 
+    pub fn shutdown_all(&mut self) -> usize {
+        let count = self.map.len();
+        self.map.clear();
+        count
+    }
+
     /// Insert a retained session, or hand it back (boxed; the session is large)
     /// if at the live cap so the caller can kill it and surface an error.
     fn insert(&mut self, s: ShellSession) -> Result<String, Box<ShellSession>> {

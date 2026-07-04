@@ -134,6 +134,12 @@ fn position_to_byte(source: &str, pos: lsp_types::Position) -> Result<usize, Str
 }
 
 impl LspState {
+    /// Local addition: explicitly close session-owned language servers.
+    pub async fn shutdown_all(&self) {
+        self.pool.shutdown_all().await;
+        self.docs.lock().await.clear();
+    }
+
     /// Ensure the server has the document open with the current disk content.
     async fn ensure_current(
         &self,

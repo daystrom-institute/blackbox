@@ -208,6 +208,69 @@ impl CodeModeSurface {
     }
 }
 
+/// Local addition: owned `exec`/`wait` pair plus the session lifecycle hook.
+///
+/// Most harness callers only need the tool vector returned by
+/// [`code_mode_tools`]. Standalone drivers such as `isolate --cell` also need a
+/// deliberate shutdown point so live cells and delegated child work are stopped
+/// before the process exits.
+pub struct CodeModeToolSession {
+    tools: Vec<Arc<dyn Tool>>,
+    surface: Arc<CodeModeSurface>,
+}
+
+impl CodeModeToolSession {
+    pub fn new(
+        callable: &[Arc<dyn Tool>],
+        seam: Arc<dyn ToolCapability>,
+        mode: CodeMode,
+        namespaces: &BTreeMap<String, ToolNamespaceDescription>,
+    ) -> Self {
+        let catalog: Vec<ToolDefinition> = callable
+            .iter()
+            .filter(|t| is_code_mode_nested_tool(t.name()))
+            .map(|t| ToolDefinition {
+                name: t.name().to_string(),
+                tool_name: ToolName::plain(t.name()),
+                description: t.description().to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: Some(t.input_schema()),
+                output_schema: None,
+                namespace_binding: t
+                    .namespace_binding()
+                    .map(|(namespace, method)| NamespaceBinding { namespace, method }),
+            })
+            .collect();
+
+        let description = build_exec_tool_description(
+            &catalog,
+            namespaces,
+            /*code_mode_only*/ mode == CodeMode::Only,
+            false,
+        );
+        let surface = Arc::new(CodeModeSurface::new(seam, catalog));
+        let tools = vec![
+            Arc::new(ExecTool {
+                surface: surface.clone(),
+                description,
+            }) as Arc<dyn Tool>,
+            Arc::new(WaitTool {
+                surface: surface.clone(),
+            }) as Arc<dyn Tool>,
+        ];
+
+        Self { tools, surface }
+    }
+
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.clone()
+    }
+
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.surface.service.shutdown().await
+    }
+}
+
 /// Join the model-facing content items of a runtime response into tool-result
 /// text. Images are noted but not yet forwarded (our `ToolResult` is single
 /// text/json; image-block passthrough is a follow-on transport change).
@@ -438,37 +501,7 @@ pub fn code_mode_tools(
     mode: CodeMode,
     namespaces: &BTreeMap<String, ToolNamespaceDescription>,
 ) -> Vec<Arc<dyn Tool>> {
-    let catalog: Vec<ToolDefinition> = callable
-        .iter()
-        .filter(|t| is_code_mode_nested_tool(t.name()))
-        .map(|t| ToolDefinition {
-            name: t.name().to_string(),
-            tool_name: ToolName::plain(t.name()),
-            description: t.description().to_string(),
-            kind: CodeModeToolKind::Function,
-            input_schema: Some(t.input_schema()),
-            output_schema: None,
-            namespace_binding: t
-                .namespace_binding()
-                .map(|(namespace, method)| NamespaceBinding { namespace, method }),
-        })
-        .collect();
-
-    let description = build_exec_tool_description(
-        &catalog,
-        namespaces,
-        /*code_mode_only*/ mode == CodeMode::Only,
-        false,
-    );
-    let surface = Arc::new(CodeModeSurface::new(seam, catalog));
-
-    vec![
-        Arc::new(ExecTool {
-            surface: surface.clone(),
-            description,
-        }) as Arc<dyn Tool>,
-        Arc::new(WaitTool { surface }) as Arc<dyn Tool>,
-    ]
+    CodeModeToolSession::new(callable, seam, mode, namespaces).tools()
 }
 
 #[cfg(test)]

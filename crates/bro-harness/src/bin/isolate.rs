@@ -30,15 +30,16 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde_json::{Value, json};
 
-use bro_harness::bindings::binding_tools;
+use bro_harness::bindings::BindingToolSession;
 use bro_harness::bindings::namespace_descriptions;
 use bro_harness::capabilities::HostTools;
-use bro_harness::code_mode::{CodeMode, code_mode_tools};
+use bro_harness::code_mode::{CodeMode, CodeModeToolSession};
 use bro_harness::mcp::{ToolFilter, load_mcp_tools};
 use bro_tools::builtin_tools;
 use bro_tools::{
@@ -103,6 +104,15 @@ struct Cli {
     /// logged to stderr and skipped.
     #[arg(long, value_name = "PATH")]
     mcp_config: Option<PathBuf>,
+
+    /// Max wall time per --cell/--cell-file, including automatic waits.
+    #[arg(long, value_name = "SECONDS", default_value_t = 900)]
+    cell_timeout: u64,
+}
+
+struct IsolateSurface {
+    tools: Vec<Arc<dyn Tool>>,
+    binding_session: BindingToolSession,
 }
 
 /// The full isolate surface: generic builtins (file/shell/glob/git) plus the
@@ -115,16 +125,20 @@ struct Cli {
 ///
 /// MCP loading is best-effort: a server that can't be reached or listed is
 /// logged to stderr and skipped, so MCP unavailability never aborts a run.
-async fn build_surface(mcp_config: Option<&str>) -> Vec<Arc<dyn Tool>> {
+async fn build_surface(mcp_config: Option<&str>) -> IsolateSurface {
+    let binding_session = BindingToolSession::new();
     let mut tools = builtin_tools();
-    tools.extend(binding_tools());
+    tools.extend(binding_session.tools());
     if let Some(cfg) = mcp_config {
         // Permissive filter: a standalone validator admits everything a server
         // lists. The recursion guard is agent-loop-only — no nested dispatch
         // here to protect against.
         tools.extend(load_mcp_tools(Some(cfg), &ToolFilter::default()).await);
     }
-    tools
+    IsolateSurface {
+        tools,
+        binding_session,
+    }
 }
 
 /// Minimal `ToolCx` rooted at `root` — same shape as the test helper, all
@@ -191,28 +205,124 @@ fn read_cell_sources(cli: &Cli) -> Result<Vec<String>> {
         .collect()
 }
 
-fn code_mode_exec_tool(cx: &ToolCx, callable: &[Arc<dyn Tool>]) -> Result<Arc<dyn Tool>> {
+fn code_mode_session(cx: &ToolCx, callable: &[Arc<dyn Tool>]) -> CodeModeToolSession {
     let seam = Arc::new(HostTools::new(callable.to_vec(), cx.clone()));
-    let tools = code_mode_tools(callable, seam, CodeMode::Only, &namespace_descriptions());
-    Ok(find_tool(&tools, bro_code_mode::PUBLIC_TOOL_NAME)?.clone())
+    CodeModeToolSession::new(callable, seam, CodeMode::Only, &namespace_descriptions())
 }
 
 async fn execute_cell_sources(
     sources: Vec<String>,
     cx: &ToolCx,
     callable: &[Arc<dyn Tool>],
+    cell_timeout: Duration,
 ) -> Result<Vec<ToolResult>> {
-    let exec = code_mode_exec_tool(cx, callable)?;
+    let code_mode = code_mode_session(cx, callable);
+    let code_mode_tools = code_mode.tools();
+    let exec = find_tool(&code_mode_tools, bro_code_mode::PUBLIC_TOOL_NAME)?.clone();
+    let wait = find_tool(&code_mode_tools, bro_code_mode::WAIT_TOOL_NAME)?.clone();
     let mut results = Vec::with_capacity(sources.len());
-    for source in sources {
-        let result = exec.call(json!({ "source": source }), cx).await;
-        let is_error = result.is_error();
-        results.push(result);
-        if is_error {
-            break;
+
+    let execution_result = async {
+        for source in sources {
+            let result = exec.call(json!({ "source": source }), cx).await;
+            let result = drive_cell_to_completion(result, &wait, cx, cell_timeout).await?;
+            let is_error = result.is_error();
+            results.push(result);
+            if is_error {
+                break;
+            }
         }
+        Ok(results)
     }
-    Ok(results)
+    .await;
+
+    let shutdown_result = code_mode.shutdown().await;
+    match (execution_result, shutdown_result) {
+        (Ok(results), Ok(())) => Ok(results),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(anyhow!("code-mode shutdown failed: {err}")),
+    }
+}
+
+async fn drive_cell_to_completion(
+    mut result: ToolResult,
+    wait: &Arc<dyn Tool>,
+    cx: &ToolCx,
+    cell_timeout: Duration,
+) -> Result<ToolResult> {
+    let started = Instant::now();
+    let mut accumulated = String::new();
+    while let Some((cell_id, yielded_body)) = yielded_cell(&result) {
+        append_cell_output(&mut accumulated, yielded_body);
+        let elapsed = started.elapsed();
+        if elapsed >= cell_timeout {
+            let _ = wait
+                .call(json!({ "cell_id": cell_id, "terminate": true }), cx)
+                .await;
+            bail!(
+                "isolate: cell {cell_id} exceeded --cell-timeout {}s after {:.1}s",
+                cell_timeout.as_secs(),
+                elapsed.as_secs_f64()
+            );
+        }
+        let remaining = cell_timeout.saturating_sub(elapsed);
+        let wait_ms = remaining
+            .as_millis()
+            .min(u128::from(bro_code_mode::DEFAULT_WAIT_YIELD_TIME_MS))
+            .max(1) as u64;
+        result = wait
+            .call(json!({ "cell_id": cell_id, "yield_time_ms": wait_ms }), cx)
+            .await;
+    }
+    Ok(prepend_cell_output(result, accumulated))
+}
+
+fn yielded_cell(result: &ToolResult) -> Option<(String, &str)> {
+    let ToolResult::Text(text) = result else {
+        return None;
+    };
+    const MARKER: &str = "\n\nScript running with cell ID ";
+    const SUFFIX: &str = ". Call `wait` with this cell_id for more output.";
+    let marker_start = text.rfind(MARKER)?;
+    let after_marker = &text[marker_start + MARKER.len()..];
+    let suffix_start = after_marker.find(SUFFIX)?;
+    if suffix_start + SUFFIX.len() != after_marker.len() {
+        return None;
+    }
+    Some((
+        after_marker[..suffix_start].to_string(),
+        &text[..marker_start],
+    ))
+}
+
+fn append_cell_output(accumulated: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if !accumulated.is_empty() {
+        accumulated.push('\n');
+    }
+    accumulated.push_str(chunk);
+}
+
+fn prepend_cell_output(result: ToolResult, accumulated: String) -> ToolResult {
+    if accumulated.is_empty() {
+        return result;
+    }
+    match result {
+        ToolResult::Text(text) if text.is_empty() => ToolResult::Text(accumulated),
+        ToolResult::Text(text) => ToolResult::Text(format!("{accumulated}\n{text}")),
+        ToolResult::Error(error) if error.is_empty() => ToolResult::Error(accumulated),
+        ToolResult::Error(error) => ToolResult::Error(format!("{accumulated}\n{error}")),
+        other => other,
+    }
+}
+
+async fn shutdown_session_owned_children(cx: &ToolCx, surface: &IsolateSurface) {
+    surface.binding_session.shutdown().await;
+    if let Ok(mut sessions) = cx.shell_sessions.lock() {
+        sessions.shutdown_all();
+    }
 }
 
 fn emit_tool_result(result: ToolResult, field: Option<&str>) -> Result<bool> {
@@ -267,10 +377,10 @@ async fn main() -> Result<()> {
         Some(path) => Some(read_cli_file(path)?),
         None => None,
     };
-    let tools = build_surface(mcp_config.as_deref()).await;
+    let surface = build_surface(mcp_config.as_deref()).await;
 
     if cli.list {
-        let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        let mut names: Vec<&str> = surface.tools.iter().map(|t| t.name()).collect();
         names.sort_unstable();
         for n in names {
             println!("{n}");
@@ -279,7 +389,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(name) = cli.describe {
-        let tool = find_tool(&tools, &name)?;
+        let tool = find_tool(&surface.tools, &name)?;
         println!("{}", serde_json::to_string_pretty(&tool.input_schema())?);
         return Ok(());
     }
@@ -292,7 +402,15 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("--root <DIR> is required to evaluate a cell"))?;
         let sources = read_cell_sources(&cli)?;
         let cx = make_cx(root);
-        for result in execute_cell_sources(sources, &cx, &tools).await? {
+        let execution = execute_cell_sources(
+            sources,
+            &cx,
+            &surface.tools,
+            Duration::from_secs(cli.cell_timeout),
+        )
+        .await;
+        shutdown_session_owned_children(&cx, &surface).await;
+        for result in execution? {
             if !emit_tool_result(result, None)? {
                 std::process::exit(1);
             }
@@ -306,7 +424,7 @@ async fn main() -> Result<()> {
     let root = cli
         .root
         .ok_or_else(|| anyhow!("--root <DIR> is required to run a tool"))?;
-    let tool = find_tool(&tools, &tool_name)?;
+    let tool = find_tool(&surface.tools, &tool_name)?;
 
     let input: Value = if let Some(path) = cli.args_file {
         let raw =
@@ -331,7 +449,9 @@ async fn main() -> Result<()> {
     }
 
     let cx = make_cx(root);
-    if !emit_tool_result(tool.call(input, &cx).await, cli.field.as_deref())? {
+    let result = tool.call(input, &cx).await;
+    shutdown_session_owned_children(&cx, &surface).await;
+    if !emit_tool_result(result, cli.field.as_deref())? {
         std::process::exit(1);
     }
     Ok(())
@@ -353,7 +473,8 @@ mod tests {
                     .to_string(),
             ],
             &cx,
-            &surface,
+            &surface.tools,
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -377,13 +498,41 @@ mod tests {
                     .to_string(),
             ],
             &cx,
-            &surface,
+            &surface.tools,
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
 
         match &results[0] {
             ToolResult::Text(t) => assert!(t.contains("hello from cell"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cell_mode_auto_waits_until_a_yielded_cell_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = make_cx(dir.path().to_path_buf());
+        let surface = build_surface(None).await;
+        let results = execute_cell_sources(
+            vec![
+                r#"// @exec: {"yield_time_ms": 1}
+text("before");
+await new Promise((resolve) => setTimeout(resolve, 20));
+text("after");"#
+                    .to_string(),
+            ],
+            &cx,
+            &surface.tools,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ToolResult::Text(t) => assert_eq!(t, "before\nafter"),
             other => panic!("expected text, got {other:?}"),
         }
     }
@@ -423,7 +572,7 @@ mod tests {
             tool_placement: ToolPlacementMap::new(),
         };
         let mut tools = builtin_tools();
-        tools.extend(binding_tools());
+        tools.extend(BindingToolSession::new().tools());
         tools.extend(load_mcp_tools_from_config(&cfg, &ToolFilter::default()).await);
         assert!(
             tools.iter().any(|t| t.name() == "mcp__fake__echo"),
@@ -439,6 +588,7 @@ mod tests {
             ],
             &cx,
             &tools,
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
