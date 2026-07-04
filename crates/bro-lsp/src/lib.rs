@@ -4,7 +4,7 @@
 //! harness and daemon may share this crate, but the harness must not call back
 //! into the daemon at runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -83,6 +83,36 @@ impl Language {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessState {
+    NotStarted,
+    Initializing,
+    Indexing,
+    Ready,
+    Failed,
+}
+
+impl ReadinessState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Initializing => "initializing",
+            Self::Indexing => "indexing",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReadinessStatus {
+    pub language: &'static str,
+    pub state: ReadinessState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LspConfig {
     pub idle_timeout: Duration,
@@ -158,6 +188,11 @@ pub enum Error {
         method: String,
         error: Value,
     },
+    NotReady {
+        state: ReadinessState,
+        detail: Option<String>,
+        waited: Duration,
+    },
     Protocol(anyhow::Error),
 }
 
@@ -204,6 +239,22 @@ impl fmt::Display for Error {
             Error::Server { method, error } => {
                 write!(f, "LSP server returned error for {method}: {error}")
             }
+            Error::NotReady {
+                state,
+                detail,
+                waited,
+            } => {
+                write!(
+                    f,
+                    "server still {} after {}; retry or raise wait_ready_ms",
+                    state.as_str(),
+                    format_wait_duration(*waited)
+                )?;
+                if let Some(detail) = detail {
+                    write!(f, " ({detail})")?;
+                }
+                Ok(())
+            }
             Error::Protocol(err) => write!(f, "lsp protocol error: {err:#}"),
         }
     }
@@ -243,6 +294,7 @@ struct SessionKey {
 }
 
 struct Session {
+    language: Language,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -255,6 +307,163 @@ struct Session {
     capabilities: InitializeResult,
     request_timeout: Duration,
     last_used: Instant,
+    readiness: ReadinessTracker,
+}
+
+#[derive(Clone, Debug)]
+struct ReadinessTracker {
+    state: ReadinessState,
+    detail: Option<String>,
+    observed_readiness_signal: bool,
+    active_progress: HashSet<String>,
+}
+
+impl ReadinessTracker {
+    fn initializing() -> Self {
+        Self {
+            state: ReadinessState::Initializing,
+            detail: Some("initialize returned; waiting for server readiness".to_string()),
+            observed_readiness_signal: false,
+            active_progress: HashSet::new(),
+        }
+    }
+
+    fn status(&self, language: Language) -> ReadinessStatus {
+        ReadinessStatus {
+            language: language.language_id(),
+            state: self.state,
+            detail: self.detail.clone(),
+        }
+    }
+
+    fn mark_ready(&mut self, detail: impl Into<String>) {
+        self.state = ReadinessState::Ready;
+        self.detail = Some(detail.into());
+        self.active_progress.clear();
+    }
+
+    fn mark_failed(&mut self, detail: impl Into<String>) {
+        self.state = ReadinessState::Failed;
+        self.detail = Some(detail.into());
+        self.active_progress.clear();
+    }
+
+    fn mark_indexing(&mut self, detail: impl Into<String>) {
+        if self.state != ReadinessState::Ready {
+            self.state = ReadinessState::Indexing;
+            self.detail = Some(detail.into());
+        }
+    }
+
+    fn mark_ready_from_success(&mut self, detail: impl Into<String>) {
+        if self.state != ReadinessState::Ready {
+            self.mark_ready(detail);
+        }
+    }
+
+    fn observe_notification(&mut self, language: Language, value: &Value) {
+        let Some(method) = value.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        match method {
+            "$/progress" => self.observe_progress(value),
+            "experimental/serverStatus" if matches!(language, Language::Rust) => {
+                self.observed_readiness_signal = true;
+                self.observe_rust_analyzer_status(value);
+            }
+            "language/status" if matches!(language, Language::Java) => {
+                self.observed_readiness_signal = true;
+                self.observe_jdtls_status(value);
+            }
+            "language/eventNotification" if matches!(language, Language::Java) => {
+                self.observed_readiness_signal = true;
+                if jdtls_event_type(value) == Some(100) {
+                    self.mark_ready("JDTLS Gradle import finished");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_progress(&mut self, value: &Value) {
+        let Some(params) = value.get("params") else {
+            return;
+        };
+        let token = params
+            .get("token")
+            .map(progress_token_key)
+            .unwrap_or_else(|| "<anonymous>".to_string());
+        let Some(progress_value) = params.get("value") else {
+            return;
+        };
+        let kind = progress_value.get("kind").and_then(Value::as_str);
+        let detail =
+            progress_detail(progress_value).unwrap_or_else(|| "server progress".to_string());
+        match kind {
+            Some("begin") => {
+                self.observed_readiness_signal = true;
+                self.active_progress.insert(token);
+                self.mark_indexing(detail);
+            }
+            Some("report") => {
+                self.observed_readiness_signal = true;
+                self.mark_indexing(detail);
+            }
+            Some("end") => {
+                self.observed_readiness_signal = true;
+                let tracked = self.active_progress.remove(&token);
+                if tracked && self.active_progress.is_empty() {
+                    self.mark_ready(detail);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_rust_analyzer_status(&mut self, value: &Value) {
+        let Some(params) = value.get("params") else {
+            return;
+        };
+        if params
+            .get("quiescent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.mark_ready("rust-analyzer reported quiescent");
+            return;
+        }
+        if let Some(status) = params.get("status").and_then(Value::as_str)
+            && status.eq_ignore_ascii_case("error")
+        {
+            self.mark_failed("rust-analyzer reported error");
+            return;
+        }
+        self.mark_indexing("rust-analyzer reported busy");
+    }
+
+    fn observe_jdtls_status(&mut self, value: &Value) {
+        let status_type = value
+            .get("params")
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str);
+        match status_type {
+            Some(status @ ("Started" | "ServiceReady")) => {
+                self.mark_ready(format!("JDTLS language/status {status}"));
+            }
+            Some("Error") => self.mark_failed("JDTLS language/status Error"),
+            Some(status @ ("Starting" | "Message" | "Busy")) => {
+                self.mark_indexing(format!("JDTLS language/status {status}"));
+            }
+            Some(other) => self.mark_indexing(format!("JDTLS language/status {other:?}")),
+            None => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadyWait {
+    Ready,
+    ProbeAllowed,
 }
 
 #[derive(Clone, Debug)]
@@ -283,6 +492,29 @@ impl SessionPool {
 
     pub fn config(&self) -> &LspConfig {
         &self.inner.config
+    }
+
+    pub async fn status(
+        &self,
+        root: impl Into<PathBuf>,
+        language: Language,
+    ) -> Result<ReadinessStatus> {
+        let root = root.into();
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", root.display()))?;
+        let key = SessionKey { root, language };
+        let sessions = self.inner.sessions.lock().await;
+        let Some(session) = sessions.get(&key).cloned() else {
+            return Ok(ReadinessStatus {
+                language: language.language_id(),
+                state: ReadinessState::NotStarted,
+                detail: Some("no pooled language server session".to_string()),
+            });
+        };
+        drop(sessions);
+        let session = session.lock().await;
+        Ok(session.readiness.status(language))
     }
 
     pub async fn open_document(
@@ -406,6 +638,7 @@ impl SessionPool {
         doc: &OpenDocument,
         position: lsp_types::Position,
         new_name: impl Into<String>,
+        wait_ready: Duration,
     ) -> Result<lsp_types::WorkspaceEdit> {
         let session = self.session(doc.root.clone(), doc.language).await?;
         let mut session = session.lock().await;
@@ -415,6 +648,13 @@ impl SessionPool {
                 uri: doc.uri.clone(),
             });
         }
+        session
+            .wait_until_ready(
+                doc.language,
+                <lsp_types::request::Rename as Request>::METHOD,
+                wait_ready,
+            )
+            .await?;
         let params = lsp_types::RenameParams {
             text_document_position: lsp_types::TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -433,7 +673,16 @@ impl SessionPool {
                 .send_request::<lsp_types::request::Rename>(&params)
                 .await
             {
-                Ok(Some(edit)) => return Ok(edit),
+                Ok(Some(edit)) => {
+                    // Older server builds may never emit the readiness signal
+                    // we watch. A real edit-producing response proves this
+                    // session can answer authoritatively, so it can promote the
+                    // session to ready instead of leaving later calls blocked.
+                    session
+                        .readiness
+                        .mark_ready_from_success("rename returned workspace edits");
+                    return Ok(edit);
+                }
                 Ok(None) => {
                     return Err(Error::Server {
                         method: <lsp_types::request::Rename as Request>::METHOD.to_string(),
@@ -595,6 +844,7 @@ impl SessionPool {
         &self,
         doc: &OpenDocument,
         position: lsp_types::Position,
+        wait_ready: Duration,
     ) -> Result<Option<lsp_types::Hover>> {
         let session = self.session(doc.root.clone(), doc.language).await?;
         let mut session = session.lock().await;
@@ -604,6 +854,13 @@ impl SessionPool {
                 uri: doc.uri.clone(),
             });
         }
+        let ready_wait = session
+            .wait_until_ready(
+                doc.language,
+                <lsp_types::request::HoverRequest as Request>::METHOD,
+                wait_ready,
+            )
+            .await?;
         let params = lsp_types::HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -621,7 +878,31 @@ impl SessionPool {
                 .send_request::<lsp_types::request::HoverRequest>(&params)
                 .await
             {
-                Ok(hover) => return Ok(hover),
+                Ok(hover) => {
+                    let non_empty = hover
+                        .as_ref()
+                        .map(|h| !hover_text_is_empty(&h.contents))
+                        .unwrap_or(false);
+                    if non_empty {
+                        // Older server builds may never emit the readiness
+                        // signal we watch. Only non-empty hover contents prove
+                        // readiness; an empty cold JDTLS hover is the gap this
+                        // guard prevents.
+                        session
+                            .readiness
+                            .mark_ready_from_success("hover returned non-empty contents");
+                    } else if ready_wait == ReadyWait::ProbeAllowed {
+                        return Err(Error::NotReady {
+                            state: session.readiness.state,
+                            detail: Some(
+                                "no readiness signal observed; hover returned empty contents"
+                                    .to_string(),
+                            ),
+                            waited: wait_ready,
+                        });
+                    }
+                    return Ok(hover);
+                }
                 Err(Error::Server { method, error })
                     if method == <lsp_types::request::HoverRequest as Request>::METHOD
                         && should_retry_while_warming(&error)
@@ -708,6 +989,69 @@ impl Default for SessionPool {
 }
 
 impl Session {
+    async fn wait_until_ready(
+        &mut self,
+        language: Language,
+        method: &'static str,
+        wait_ready: Duration,
+    ) -> Result<ReadyWait> {
+        if wait_ready.is_zero() || self.readiness.state == ReadinessState::Ready {
+            return Ok(ReadyWait::Ready);
+        }
+        if self.readiness.state == ReadinessState::Failed {
+            return Err(Error::NotReady {
+                state: self.readiness.state,
+                detail: self.readiness.detail.clone(),
+                waited: Duration::ZERO,
+            });
+        }
+        let deadline = Instant::now() + wait_ready;
+        loop {
+            if self.readiness.state == ReadinessState::Ready {
+                return Ok(ReadyWait::Ready);
+            }
+            if self.readiness.state == ReadinessState::Failed || Instant::now() >= deadline {
+                if !self.readiness.observed_readiness_signal
+                    && self.readiness.state != ReadinessState::Failed
+                {
+                    return Ok(ReadyWait::ProbeAllowed);
+                }
+                return Err(Error::NotReady {
+                    state: self.readiness.state,
+                    detail: self
+                        .readiness
+                        .detail
+                        .clone()
+                        .or_else(|| Some(method.to_string())),
+                    waited: wait_ready,
+                });
+            }
+            let value = match self.read_message_before(deadline).await {
+                Ok(value) => value,
+                Err(_err) if Instant::now() >= deadline => {
+                    if !self.readiness.observed_readiness_signal {
+                        return Ok(ReadyWait::ProbeAllowed);
+                    }
+                    return Err(Error::NotReady {
+                        state: self.readiness.state,
+                        detail: self
+                            .readiness
+                            .detail
+                            .clone()
+                            .or_else(|| Some(method.to_string())),
+                        waited: wait_ready,
+                    });
+                }
+                Err(err) => return Err(err),
+            };
+            if let Some(id) = value.get("id").and_then(Value::as_i64) {
+                self.pending.insert(id, value);
+                continue;
+            }
+            let _ = self.handle_notification_for_language(language, value)?;
+        }
+    }
+
     fn ensure_current_version(&self, uri: &Url, requested_version: i32) -> Result<()> {
         let current_version = self.documents.get(uri).map(|doc| doc.version);
         if current_version == Some(requested_version) {
@@ -832,7 +1176,9 @@ impl Session {
                 self.pending.insert(id, value);
                 continue;
             }
-            let Some((published_uri, snapshot)) = self.handle_notification(value)? else {
+            let Some((published_uri, snapshot)) =
+                self.handle_notification_for_language(self.language, value)?
+            else {
                 continue;
             };
             if published_uri != uri {
@@ -904,7 +1250,7 @@ impl Session {
                     self.pending.insert(other, value);
                 }
                 None => {
-                    let _ = self.handle_notification(value)?;
+                    let _ = self.handle_notification_for_language(self.language, value)?;
                 }
             }
         }
@@ -922,7 +1268,12 @@ impl Session {
             .map_err(Into::into)
     }
 
-    fn handle_notification(&mut self, value: Value) -> Result<Option<(Url, DiagnosticSnapshot)>> {
+    fn handle_notification_for_language(
+        &mut self,
+        language: Language,
+        value: Value,
+    ) -> Result<Option<(Url, DiagnosticSnapshot)>> {
+        self.readiness.observe_notification(language, &value);
         if value.get("method").and_then(Value::as_str) != Some("textDocument/publishDiagnostics") {
             return Ok(None);
         }
@@ -974,6 +1325,52 @@ fn should_retrigger_diagnostic_request(error: &Value) -> bool {
             != Some(false)
 }
 
+fn progress_token_key(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn progress_detail(value: &Value) -> Option<String> {
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("title").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn jdtls_event_type(value: &Value) -> Option<u64> {
+    value
+        .get("params")
+        .and_then(|p| p.get("eventType"))
+        .and_then(Value::as_u64)
+}
+
+fn hover_text_is_empty(contents: &lsp_types::HoverContents) -> bool {
+    use lsp_types::HoverContents;
+    match contents {
+        HoverContents::Scalar(s) => marked_string_is_empty(s),
+        HoverContents::Array(items) => items.iter().all(marked_string_is_empty),
+        HoverContents::Markup(markup) => markup.value.trim().is_empty(),
+    }
+}
+
+fn marked_string_is_empty(value: &lsp_types::MarkedString) -> bool {
+    match value {
+        lsp_types::MarkedString::String(value) => value.trim().is_empty(),
+        lsp_types::MarkedString::LanguageString(value) => value.value.trim().is_empty(),
+    }
+}
+
+fn format_wait_duration(duration: Duration) -> String {
+    if duration.as_millis() % 1000 == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
 async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> {
     let argv = key.language.launch_argv(config);
     let mut child = Command::new(&argv[0])
@@ -1011,6 +1408,8 @@ async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> 
         },
         request_timeout: config.request_timeout,
         last_used: Instant::now(),
+        readiness: ReadinessTracker::initializing(),
+        language: key.language,
     };
     let init_id = session.next_id();
     let init_params = build_init_params(&key.root, key.language, config)?;
@@ -1039,12 +1438,9 @@ async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> 
     }
     if matches!(key.language, Language::Java) {
         // JDTLS's `initialize` returns immediately, then performs gradle /
-        // maven / Buildship workspace import asynchronously; hover /
-        // references / organize-imports degrade silently on a cold
-        // workspace (no classpath ⇒ no real types). Drain notifications
-        // for the workspace-ready signal before handing the session out. On
-        // timeout we proceed (matching the daemon policy) and let the
-        // caller observe the degraded result.
+        // maven / Buildship workspace import asynchronously. Drain the early
+        // notifications into readiness state, then let guarded requests wait
+        // and fail closed if the workspace is still indexing.
         wait_for_jdtls_ready(&mut session, config.jdtls_ready_timeout).await;
     }
     Ok(session)
@@ -1069,7 +1465,7 @@ impl Session {
                     self.pending.insert(other, value);
                 }
                 None => {
-                    let _ = self.handle_notification(value)?;
+                    let _ = self.handle_notification_for_language(self.language, value)?;
                 }
             }
         }
@@ -1205,54 +1601,10 @@ async fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) 
             session.pending.insert(id, value);
             continue;
         }
-        let method = value.get("method").and_then(Value::as_str);
-        if method == Some("experimental/serverStatus") {
-            let quiescent = value
-                .get("params")
-                .and_then(|p| p.get("quiescent"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if quiescent {
-                return Ok(());
-            }
-        }
-        if method == Some("textDocument/publishDiagnostics") {
-            let _ = session.handle_notification(value)?;
+        let _ = session.handle_notification_for_language(Language::Rust, value)?;
+        if session.readiness.state == ReadinessState::Ready {
             return Ok(());
         }
-    }
-}
-
-/// Classify a JDT.LS server notification as a workspace-ready signal.
-///
-/// Two accepted shapes (ported from the daemon's `bbox-lsp`, which runs the
-/// same Eclipse JDT.LS + Buildship backend in production):
-///
-/// - `language/status` with `params.type == "Started"` or `"ServiceReady"` —
-///   emitted once Eclipse JDT.LS finishes bootstrapping the workspace.
-/// - `language/eventNotification` with `params.eventType == 100` —
-///   Buildship-specific signal that a Gradle project import finished.
-///
-/// Anything else (`window/showMessage`, `$/progress`, `language/status` with
-/// `type == "Starting"` or `"Error"`, …) is noise for ready-wait purposes.
-fn is_jdtls_ready_notification(value: &Value) -> bool {
-    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-    match method {
-        "language/status" => {
-            let status_type = value
-                .get("params")
-                .and_then(|p| p.get("type"))
-                .and_then(Value::as_str);
-            matches!(status_type, Some("Started" | "ServiceReady"))
-        }
-        "language/eventNotification" => {
-            let event_type = value
-                .get("params")
-                .and_then(|p| p.get("eventType"))
-                .and_then(Value::as_u64);
-            event_type == Some(100)
-        }
-        _ => false,
     }
 }
 
@@ -1275,7 +1627,8 @@ async fn wait_for_jdtls_ready(session: &mut Session, timeout: Duration) {
             session.pending.insert(id, value);
             continue;
         }
-        if is_jdtls_ready_notification(&value) {
+        let _ = session.handle_notification_for_language(Language::Java, value);
+        if session.readiness.state == ReadinessState::Ready {
             return;
         }
     }
@@ -1388,5 +1741,106 @@ mod tests {
         let config = LspConfig::default();
         assert!(config.idle_timeout > Duration::ZERO);
         assert!(config.request_timeout > Duration::ZERO);
+    }
+
+    #[test]
+    fn jdtls_readiness_tracks_status_and_progress_notifications() {
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Java,
+            &serde_json::json!({
+                "method": "language/status",
+                "params": { "type": "Starting" }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Indexing);
+
+        readiness.observe_notification(
+            Language::Java,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "jdtls-import",
+                    "value": { "kind": "begin", "title": "Importing Gradle project" }
+                }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Indexing);
+        readiness.observe_notification(
+            Language::Java,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "jdtls-import",
+                    "value": { "kind": "end", "message": "Import finished" }
+                }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Java,
+            &serde_json::json!({
+                "method": "language/status",
+                "params": { "type": "ServiceReady" }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Java,
+            &serde_json::json!({
+                "method": "language/eventNotification",
+                "params": { "eventType": 100 }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+    }
+
+    #[test]
+    fn rust_analyzer_readiness_tracks_status_and_progress_notifications() {
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "quiescent": false }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Indexing);
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "quiescent": true }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "rust-analyzer/indexing",
+                    "value": { "kind": "begin", "title": "Indexing" }
+                }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Indexing);
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "rust-analyzer/indexing",
+                    "value": { "kind": "end", "message": "Indexing finished" }
+                }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
     }
 }

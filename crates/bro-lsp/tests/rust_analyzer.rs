@@ -1,8 +1,8 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bro_lsp::{Language, LspConfig, SessionPool};
-use lsp_types::DiagnosticSeverity;
+use lsp_types::{Diagnostic, DiagnosticSeverity};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rust_analyzer_diagnostics_follow_document_versions() -> anyhow::Result<()> {
@@ -53,7 +53,12 @@ edition = "2024"
         stale.is_superseded(),
         "expected a superseded signal for old version 1, got {stale:?}"
     );
-    let broken_diagnostics = pool.diagnostics(&doc, 2).await?;
+    let broken_diagnostics = wait_for_diagnostics(&pool, &doc, 2, |diagnostics| {
+        diagnostics
+            .iter()
+            .any(|diag| diag.severity == Some(DiagnosticSeverity::ERROR))
+    })
+    .await?;
     assert!(
         broken_diagnostics
             .iter()
@@ -62,7 +67,8 @@ edition = "2024"
     );
 
     pool.apply_change(&mut doc, 3, clean.to_string()).await?;
-    let fixed_diagnostics = pool.diagnostics(&doc, 3).await?;
+    let fixed_diagnostics =
+        wait_for_diagnostics(&pool, &doc, 3, |diagnostics| diagnostics.is_empty()).await?;
     assert!(
         fixed_diagnostics.is_empty(),
         "expected clean diagnostics after fix, got {fixed_diagnostics:#?}"
@@ -70,6 +76,22 @@ edition = "2024"
 
     pool.shutdown_all().await;
     Ok(())
+}
+
+async fn wait_for_diagnostics(
+    pool: &SessionPool,
+    doc: &bro_lsp::OpenDocument,
+    version: i32,
+    predicate: impl Fn(&[Diagnostic]) -> bool,
+) -> anyhow::Result<Vec<Diagnostic>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let diagnostics = pool.diagnostics(doc, version).await?;
+        if predicate(&diagnostics) || Instant::now() >= deadline {
+            return Ok(diagnostics);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn rust_analyzer_bin() -> Option<PathBuf> {
