@@ -103,16 +103,27 @@ impl FactTargets {
 /// `code.items` — top-level syntax-item inventory with Spans.
 pub struct CodeItems;
 
-fn items_payload(file: &str, found: &facts::FileItemsFacts) -> Value {
+#[derive(Deserialize)]
+struct CodeItemsParams {
+    #[serde(flatten)]
+    targets: FactTargets,
+    #[serde(default, rename = "top_level_only", alias = "topLevelOnly")]
+    top_level_only: bool,
+}
+
+fn items_payload(file: &str, found: &facts::FileItemsFacts, top_level_only: bool) -> Value {
     let items: Vec<Value> = found
         .items
         .iter()
+        .filter(|fact| !top_level_only || !fact.nested)
         .map(|fact| {
             let item = &fact.item;
             json!({
                 "name": item.name,
                 "kind": item.kind,
                 "visibility": fact.visibility,
+                "declaring_type": fact.declaring_type,
+                "nested": fact.nested,
                 "span": Span {
                     file: file.to_string(),
                     byte_start: item.byte_start,
@@ -146,14 +157,15 @@ impl Tool for CodeItems {
         "code.items"
     }
     fn description(&self) -> &str {
-        "Inventory the top-level syntax items of source files (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans for every item. Pass `file` for one file (flat result) or `files` for a host-side batch (per-file results; a bad file becomes an `error` entry, not a failed call)."
+        "Inventory syntax items of source files (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans for every item. Pass `file` for one file (flat result) or `files` for a host-side batch (per-file results; a bad file becomes an `error` entry, not a failed call)."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "file": { "type": "string", "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape)." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); the host fans out (use instead of a cell for-loop)." }
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); the host fans out (use instead of a cell for-loop)." },
+                "top_level_only": { "type": "boolean", "description": "When true, drops items declared inside nested Java types. Alias: topLevelOnly." }
             }
         })
     }
@@ -167,11 +179,12 @@ impl Tool for CodeItems {
         Some(("code".to_string(), "items".to_string()))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let params: FactTargets = match serde_json::from_value(input) {
+        let params: CodeItemsParams = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return err(format!("code.items: {e}")),
         };
-        let (targets, multi) = match params.resolve("code.items") {
+        let top_level_only = params.top_level_only;
+        let (targets, multi) = match params.targets.resolve("code.items") {
             Ok(t) => t,
             Err(e) => return e,
         };
@@ -186,14 +199,14 @@ impl Tool for CodeItems {
             if !multi {
                 let (file, path) = &resolved[0];
                 return match facts::file_items(path) {
-                    Ok(found) => ToolResult::Json(items_payload(file, &found)),
+                    Ok(found) => ToolResult::Json(items_payload(file, &found, top_level_only)),
                     Err(e) => err(format!("code.items: {e:#}")),
                 };
             }
             let files: Vec<Value> = resolved
                 .iter()
                 .map(|(file, path)| match facts::file_items(path) {
-                    Ok(found) => items_payload(file, &found),
+                    Ok(found) => items_payload(file, &found, top_level_only),
                     Err(e) => json!({ "file": file, "error": format!("{e:#}") }),
                 })
                 .collect();
@@ -973,10 +986,10 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "code".to_string(),
-        description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The eight methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. Use `code.fields` for Java field declarations; do not hand-roll field_declaration queries just to learn modifiers/type/name. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. For line ranges from analysis.methodRegions, use `code.readLines({ file, startLine, endLine })` to produce exact oldText and a hash-anchored span. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
+            description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The eight methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. `code.items` carries Java `declaring_type` and `nested` facts; pass `top_level_only: true` to skip members declared inside nested Java types before the payload enters the isolate. Use `code.fields` for Java field declarations; do not hand-roll field_declaration queries just to learn modifiers/type/name. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. For line ranges from analysis.methodRegions, use `code.readLines({ file, startLine, endLine })` to produce exact oldText and a hash-anchored span. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
-type SyntaxItemFact = { name?: string; kind: string; visibility?: string; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
+	type SyntaxItemFact = { name?: string; kind: string; visibility?: string; declaring_type?: string; nested: boolean; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
 type JavaFieldFact = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static: boolean; is_final: boolean; is_static_final: boolean; is_mutable_instance: boolean; span: Span; name_span: Span };
 type QueryCapture = { capture: string; kind: string; text: string; span: Span };
 type FileItems = { file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] };
@@ -986,8 +999,8 @@ type JavaSignature = { language: "java"; kind: "method_declaration" | "construct
 declare const code: {
   /** Enumerate parseable source files (skips dot-dirs, target, node_modules, build, dist, vendor). Feed straight into items({files})/query({files}). */
   files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
-  /** Inventory top-level syntax items. visibility is "pub"/"public"/... or undefined = private. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
-  items(args: { file: string } | { files: string[] }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
+	  /** Inventory syntax items. visibility is "pub"/"public"/... or undefined = private. Java items include declaring_type and nested; top_level_only/topLevelOnly drops nested-type members. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
+	  items(args: ({ file: string } | { files: string[] }) & { top_level_only?: boolean; topLevelOnly?: boolean }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
   /** Inventory Java field declarations with type/modifiers/annotations/owner and hash-anchored declaration/name spans. Use this instead of raw field_declaration queries. */
   fields(args: { file: string; className?: string }): Promise<FileFields>;
   /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. The batch is aggregate-capped (~20k captures): a broad query over a large repo sets aggregate_capped + files_scanned/files_total + hint — narrow the query or the file set and re-run rather than widening blindly. */
@@ -1058,6 +1071,10 @@ class Probe {
 
     static class Inner {
         private String ignored;
+
+        String getIgnored() {
+            return ignored;
+        }
     }
 }
 "#,
@@ -1085,6 +1102,44 @@ class Probe {
         let span = &items[0]["span"];
         assert_eq!(span["file"], file);
         assert_eq!(span["content_sha256"], out["content_sha256"]);
+    }
+
+    #[tokio::test]
+    async fn items_reports_declaring_type_and_filters_nested_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = java_fixture(&root);
+        let out = json_of(CodeItems.call(json!({ "file": file }), &cx_in(&root)).await);
+        let items = out["items"].as_array().unwrap();
+        let load = items
+            .iter()
+            .find(|item| item["name"] == "load")
+            .expect("load item");
+        assert_eq!(load["declaring_type"], "Probe");
+        assert_eq!(load["nested"], false);
+        let nested_accessor = items
+            .iter()
+            .find(|item| item["name"] == "getIgnored")
+            .expect("nested accessor item");
+        assert_eq!(nested_accessor["declaring_type"], "Inner");
+        assert_eq!(nested_accessor["nested"], true);
+
+        let filtered = json_of(
+            CodeItems
+                .call(json!({ "file": file, "topLevelOnly": true }), &cx_in(&root))
+                .await,
+        );
+        let filtered_items = filtered["items"].as_array().unwrap();
+        assert!(
+            filtered_items.iter().any(|item| item["name"] == "load"),
+            "{filtered_items:?}"
+        );
+        assert!(
+            !filtered_items
+                .iter()
+                .any(|item| item["name"] == "getIgnored"),
+            "{filtered_items:?}"
+        );
     }
 
     #[tokio::test]
