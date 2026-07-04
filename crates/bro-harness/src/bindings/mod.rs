@@ -39,19 +39,44 @@ use bro_tools::Tool;
 /// between the producing bindings (`lsp.*`) and the consuming algebra
 /// (`edits.merge` / `edits.apply`) — that shared seam is what makes
 /// `semantic_status` lineage-computed rather than cell-claimed.
+pub struct BindingToolSession {
+    tools: Vec<Arc<dyn Tool>>,
+    lsp_state: Arc<lsp_facts::LspState>,
+}
+
+impl BindingToolSession {
+    pub fn new() -> Self {
+        let ledger = Arc::new(ledger::ProvenanceLedger::default());
+        let lsp_state = Arc::new(lsp_facts::LspState::default());
+        let mut tools = code_facts::tools();
+        tools.extend(edit_algebra::tools(
+            Arc::new(edit_algebra::EditStore::default()),
+            Arc::clone(&ledger),
+        ));
+        tools.extend(lsp_facts::tools(Arc::clone(&lsp_state), ledger));
+        tools.extend(java_transforms::tools(Arc::clone(&lsp_state)));
+        tools.extend(analysis::tools());
+        tools.extend(build_gate::tools());
+        Self { tools, lsp_state }
+    }
+
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.clone()
+    }
+
+    pub async fn shutdown(&self) {
+        self.lsp_state.shutdown_all().await;
+    }
+}
+
+impl Default for BindingToolSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
-    let ledger = Arc::new(ledger::ProvenanceLedger::default());
-    let lsp_state = Arc::new(lsp_facts::LspState::default());
-    let mut tools = code_facts::tools();
-    tools.extend(edit_algebra::tools(
-        Arc::new(edit_algebra::EditStore::default()),
-        Arc::clone(&ledger),
-    ));
-    tools.extend(lsp_facts::tools(Arc::clone(&lsp_state), ledger));
-    tools.extend(java_transforms::tools(lsp_state));
-    tools.extend(analysis::tools());
-    tools.extend(build_gate::tools());
-    tools
+    BindingToolSession::new().tools()
 }
 
 /// Namespace documentation + hand-authored TS declarations, keyed by

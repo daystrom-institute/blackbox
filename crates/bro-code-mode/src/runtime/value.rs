@@ -8,6 +8,18 @@ use crate::response::ImageDetail;
 const IMAGE_HELPER_EXPECTS_MESSAGE: &str = "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block";
 const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
 
+macro_rules! caught_or_unknown {
+    ($tc:expr) => {{
+        if $tc.has_caught() {
+            $tc.exception()
+                .map(|exception| value_to_error_text(&mut $tc, exception))
+                .unwrap_or_else(|| "unknown code mode exception".to_string())
+        } else {
+            "unknown code mode exception".to_string()
+        }
+    }};
+}
+
 pub(super) fn serialize_output_text(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
@@ -198,6 +210,50 @@ pub(super) fn v8_value_to_json(
         .map_err(|err| format!("failed to serialize JavaScript value: {err}"))
 }
 
+/// Local addition (not vendored): serialize a stored value while preserving
+/// function source at any depth reachable by JSON.stringify's replacer.
+pub(super) fn v8_value_to_json_preserving_functions(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    function_source_key: &str,
+) -> Result<Option<JsonValue>, String> {
+    let key = serde_json::to_string(function_source_key)
+        .map_err(|err| format!("failed to encode function source key: {err}"))?;
+    let source = format!(
+        r#"((value) => JSON.stringify(value, function (_key, current) {{
+            if (typeof current === "function") {{
+                return {{ [{key}]: Function.prototype.toString.call(current) }};
+            }}
+            return current;
+        }}))"#
+    );
+
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let Some(source) = v8::String::new(&tc, &source) else {
+        return Err("failed to allocate stored-value serializer".to_string());
+    };
+    let Some(serializer_value) = v8::Script::compile(&tc, source, None).and_then(|s| s.run(&tc))
+    else {
+        return Err(caught_or_unknown!(tc));
+    };
+    let serializer = v8::Local::<v8::Function>::try_from(serializer_value)
+        .map_err(|_| "stored-value serializer did not compile to a function".to_string())?;
+    let receiver = v8::undefined(&tc).into();
+    let Some(stringified) = serializer.call(&tc, receiver, &[value]) else {
+        return Err(caught_or_unknown!(tc));
+    };
+    if stringified.is_undefined() {
+        return Ok(None);
+    }
+    if !stringified.is_string() {
+        return Err("stored-value serializer did not return a JSON string".to_string());
+    }
+    serde_json::from_str(&stringified.to_rust_string_lossy(&tc))
+        .map(Some)
+        .map_err(|err| format!("failed to serialize JavaScript value: {err}"))
+}
+
 pub(super) fn json_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: &JsonValue,
@@ -205,6 +261,51 @@ pub(super) fn json_to_v8<'s>(
     let json = serde_json::to_string(value).ok()?;
     let json = v8::String::new(scope, &json)?;
     v8::json::parse(scope, json)
+}
+
+/// Local addition (not vendored): revive stored function-source envelopes at
+/// any depth while parsing a stored JSON value back into V8.
+pub(super) fn json_to_v8_reviving_functions<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: &JsonValue,
+    function_source_key: &str,
+) -> Result<Option<v8::Local<'s, v8::Value>>, String> {
+    let json =
+        serde_json::to_string(value).map_err(|err| format!("failed to encode JSON: {err}"))?;
+    let key = serde_json::to_string(function_source_key)
+        .map_err(|err| format!("failed to encode function source key: {err}"))?;
+    let source = format!(
+        r#"((json) => JSON.parse(json, function (_key, current) {{
+            if (current && typeof current === "object" && typeof current[{key}] === "string") {{
+                const revived = (0, eval)("(" + current[{key}] + ")");
+                if (typeof revived !== "function") {{
+                    throw new TypeError("stored function source did not compile to a function");
+                }}
+                return revived;
+            }}
+            return current;
+        }}))"#
+    );
+
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let Some(source) = v8::String::new(&tc, &source) else {
+        return Err("failed to allocate stored-value reviver".to_string());
+    };
+    let Some(reviver_value) = v8::Script::compile(&tc, source, None).and_then(|s| s.run(&tc))
+    else {
+        return Err(caught_or_unknown!(tc));
+    };
+    let reviver = v8::Local::<v8::Function>::try_from(reviver_value)
+        .map_err(|_| "stored-value reviver did not compile to a function".to_string())?;
+    let Some(json) = v8::String::new(&tc, &json) else {
+        return Err("failed to allocate stored JSON".to_string());
+    };
+    let receiver = v8::undefined(&tc).into();
+    match reviver.call(&tc, receiver, &[json.into()]) {
+        Some(revived) => Ok(Some(revived)),
+        None => Err(caught_or_unknown!(tc)),
+    }
 }
 
 pub(super) fn value_to_error_text(
