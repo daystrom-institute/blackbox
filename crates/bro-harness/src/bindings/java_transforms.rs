@@ -7546,6 +7546,10 @@ fn discover_field_inject_ctors(path: &Path, class_name: &str) -> Vec<FieldInject
         .collect()
 }
 
+// Sync fs read is sanctioned here: both callers run inside the call_blocking
+// closures of the fieldInjectToConstructor tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn field_inject_preview_data(
     root: &Path,
     params: &JavaFieldInjectPreviewParams,

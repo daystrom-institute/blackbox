@@ -14,7 +14,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/refactor-isolate/large-transform-payload-store-load",
   "notes": "A probe lost the changes array after storing a transform result and loading it in a later cell, forcing a full re-run of the transform. Genericized; no private file or symbol names recorded.",
-  "resolution": "unresolved",
+  "superseded_by": "gap-dbbdf9b5",
+  "resolution": "addressed",
   "created_at": "2026-06-13T21:39:26Z",
-  "updated_at": "2026-06-13T21:39:26Z"
+  "updated_at": "2026-07-04T19:57:37Z",
+  "resolved_at": "2026-07-04T19:57:37Z",
+  "resolution_note": "Root cause identified and fixed via gap-dbbdf9b5: \"large transform payloads unreliable across store/load cells\" was the silent drop of functions nested inside stored objects (pure-JSON payloads round-trip fine at 8MB, verified live). With deep function preservation shipped (commit 917f8bc3), the observed unreliability mechanism is gone. If a size-related failure ever reproduces with pure JSON payloads, file a fresh occurrence on this dedupe key."
 }
