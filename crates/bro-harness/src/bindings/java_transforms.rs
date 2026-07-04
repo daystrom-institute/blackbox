@@ -239,10 +239,21 @@ fn build_dependency_projection(
 struct JavaMethodRange {
     name: String,
     signature: String,
+    param_count: usize,
     byte_start: usize,
     byte_end: usize,
     line_start: usize,
     line_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct JavaInvocation {
+    name: String,
+    arg_count: usize,
+    call_start: usize,
+    call_end: usize,
+    invoc_start: usize,
+    invoc_end: usize,
 }
 
 fn byte_line(source: &str, byte: usize) -> usize {
@@ -276,10 +287,6 @@ fn java_param_types_from_formals(params: &str) -> Vec<String> {
         return Vec::new();
     }
     inside.split(',').map(normalize_java_param_type).collect()
-}
-
-fn method_selector_name(selector: &str) -> &str {
-    selector.split('(').next().unwrap_or(selector).trim()
 }
 
 fn method_selector_matches(selector: &str, method: &JavaMethodRange) -> bool {
@@ -337,9 +344,11 @@ fn java_method_ranges(path: &Path, source: &str) -> Result<Vec<JavaMethodRange>,
             .map(|cap| cap.text.as_str())
             .unwrap_or("()");
         let param_types = java_param_types_from_formals(params_text).join(",");
+        let param_count = java_param_types_from_formals(params_text).len();
         ranges.push(JavaMethodRange {
             name: name_cap.text.clone(),
             signature: format!("{}({})", name_cap.text, param_types),
+            param_count,
             byte_start: method_cap.byte_start,
             byte_end: method_cap.byte_end,
             line_start: byte_line(source, method_cap.byte_start),
@@ -361,6 +370,112 @@ fn residual_reference_hint() -> &'static str {
     "For moved-method references, pass wrappers:true, also move the referencing member, or run java.synthesizeHelperWrappers after apply. For moved-field references, also move the referencing member or review the generated delegate accessor rewrite; wrappers do not apply to fields."
 }
 
+fn java_invocations(path: &Path) -> Result<Vec<JavaInvocation>, String> {
+    let invoc_facts = bbox_refactor::facts::file_query(
+        path,
+        "(method_invocation name: (identifier) @call arguments: (argument_list) @args) @invoc",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let arg_facts = bbox_refactor::facts::file_query(path, "(argument_list (_) @arg) @args", None)
+        .map_err(|e| format!("{e:#}"))?;
+    let arg_list_ranges = arg_facts
+        .captures
+        .iter()
+        .filter(|cap| cap.capture == "args")
+        .map(|cap| (cap.byte_start, cap.byte_end))
+        .collect::<Vec<_>>();
+    let top_level_arg_counts = arg_list_ranges
+        .iter()
+        .map(|(args_start, args_end)| {
+            let count = arg_facts
+                .captures
+                .iter()
+                .filter(|cap| cap.capture == "arg")
+                .filter(|cap| cap.byte_start >= *args_start && cap.byte_end <= *args_end)
+                .filter(|cap| {
+                    arg_list_ranges
+                        .iter()
+                        .filter(|(start, end)| *start <= cap.byte_start && *end >= cap.byte_end)
+                        .min_by_key(|(start, end)| end - start)
+                        .is_some_and(|range| *range == (*args_start, *args_end))
+                })
+                .count();
+            ((*args_start, *args_end), count)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut invocations = Vec::new();
+    for invoc in invoc_facts
+        .captures
+        .iter()
+        .filter(|cap| cap.capture == "invoc")
+    {
+        let Some(call) = invoc_facts.captures.iter().find(|cap| {
+            cap.capture == "call"
+                && cap.byte_start >= invoc.byte_start
+                && cap.byte_end <= invoc.byte_end
+        }) else {
+            continue;
+        };
+        let Some(args) = invoc_facts.captures.iter().find(|cap| {
+            cap.capture == "args"
+                && cap.byte_start >= invoc.byte_start
+                && cap.byte_end <= invoc.byte_end
+        }) else {
+            continue;
+        };
+        invocations.push(JavaInvocation {
+            name: call.text.clone(),
+            arg_count: top_level_arg_counts
+                .get(&(args.byte_start, args.byte_end))
+                .copied()
+                .unwrap_or(0),
+            call_start: call.byte_start,
+            call_end: call.byte_end,
+            invoc_start: invoc.byte_start,
+            invoc_end: invoc.byte_end,
+        });
+    }
+    Ok(invocations)
+}
+
+fn moved_target_for_call<'a>(
+    call: &JavaInvocation,
+    moved_methods: &'a [&JavaMethodRange],
+    remaining_methods: &[&JavaMethodRange],
+) -> Option<&'a JavaMethodRange> {
+    let moved_same_name = moved_methods
+        .iter()
+        .copied()
+        .filter(|method| method.name == call.name)
+        .collect::<Vec<_>>();
+    if moved_same_name.is_empty() {
+        return None;
+    }
+    let remaining_same_name = remaining_methods
+        .iter()
+        .copied()
+        .filter(|method| method.name == call.name)
+        .collect::<Vec<_>>();
+    if remaining_same_name.is_empty() {
+        return moved_same_name.first().copied();
+    }
+
+    let moved_match = moved_same_name
+        .iter()
+        .copied()
+        .find(|method| method.param_count == call.arg_count);
+    let remaining_match = remaining_same_name
+        .iter()
+        .any(|method| method.param_count == call.arg_count);
+
+    // Syntax-only arity disambiguation cannot resolve same-arity overloads by
+    // type. Under-report ambiguous arities rather than warning on calls that may
+    // target a remaining overload.
+    if remaining_match { None } else { moved_match }
+}
+
 fn build_residual_reference_findings(
     path: &Path,
     source: &str,
@@ -377,57 +492,33 @@ fn build_residual_reference_findings(
     let mut counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
 
     if !wrappers && !moved_methods.is_empty() {
-        let moved_method_names = plan
-            .items
+        let moved_method_ranges = methods
             .iter()
-            .filter(|item| item.kind == "method_declaration")
-            .filter_map(|item| item.name.clone())
-            .collect::<BTreeSet<_>>();
-        if !moved_method_names.is_empty() {
-            let call_facts = bbox_refactor::facts::file_query(
-                path,
-                "(method_invocation name: (identifier) @call) @invoc",
-                None,
-            )
-            .map_err(|e| format!("{e:#}"))?;
-            let invoc_ranges = call_facts
-                .captures
-                .iter()
-                .filter(|cap| cap.capture == "invoc")
-                .map(|cap| (cap.byte_start, cap.byte_end))
-                .collect::<Vec<_>>();
-            for call in call_facts
-                .captures
-                .iter()
-                .filter(|cap| cap.capture == "call")
-            {
-                if !moved_method_names.contains(&call.text) {
-                    continue;
-                }
-                if !is_same_class_helper_call(enclosing_invocation_text(
-                    source,
-                    &invoc_ranges,
-                    call.byte_start,
-                    call.byte_end,
-                )) {
-                    continue;
-                }
-                if let Some(referencing) = remaining_methods.iter().find(|method| {
-                    call.byte_start >= method.byte_start && call.byte_end <= method.byte_end
-                }) {
-                    let moved_member = moved_methods
-                        .iter()
-                        .find(|selector| method_selector_name(selector) == call.text)
-                        .cloned()
-                        .unwrap_or_else(|| call.text.clone());
-                    *counts
-                        .entry((
-                            referencing.signature.clone(),
-                            moved_member,
-                            "method".to_string(),
-                        ))
-                        .or_default() += 1;
-                }
+            .filter(|method| is_plan_moved_method(plan, method))
+            .collect::<Vec<_>>();
+        for call in java_invocations(path)? {
+            if !is_same_class_helper_call(
+                source
+                    .get(call.invoc_start..call.invoc_end)
+                    .unwrap_or_default(),
+            ) {
+                continue;
+            }
+            let Some(moved) =
+                moved_target_for_call(&call, &moved_method_ranges, &remaining_methods)
+            else {
+                continue;
+            };
+            if let Some(referencing) = remaining_methods.iter().find(|method| {
+                call.call_start >= method.byte_start && call.call_end <= method.byte_end
+            }) {
+                *counts
+                    .entry((
+                        referencing.signature.clone(),
+                        moved.signature.clone(),
+                        "method".to_string(),
+                    ))
+                    .or_default() += 1;
             }
         }
     }
@@ -495,62 +586,27 @@ fn internal_helper_deps_for_preview_plan(
         .iter()
         .map(|method| method.name.as_str())
         .collect::<BTreeSet<_>>();
-    let call_facts = bbox_refactor::facts::file_query(
-        path,
-        "(method_invocation name: (identifier) @call) @invoc",
-        None,
-    )
-    .map_err(|e| format!("{e:#}"))?;
-    let invoc_ranges = call_facts
-        .captures
-        .iter()
-        .filter(|cap| cap.capture == "invoc")
-        .map(|cap| (cap.byte_start, cap.byte_end))
-        .collect::<Vec<_>>();
     let mut deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-    for call in call_facts
-        .captures
-        .iter()
-        .filter(|cap| cap.capture == "call")
-    {
-        if !is_same_class_helper_call(enclosing_invocation_text(
-            source,
-            &invoc_ranges,
-            call.byte_start,
-            call.byte_end,
-        )) {
+    for call in java_invocations(path)? {
+        if !is_same_class_helper_call(
+            source
+                .get(call.invoc_start..call.invoc_end)
+                .unwrap_or_default(),
+        ) {
             continue;
         }
 
         for moved in &moved_ranges {
-            if call.byte_start >= moved.byte_start
-                && call.byte_end <= moved.byte_end
-                && !moved_names.contains(call.text.as_str())
-                && source_method_names.contains(call.text.as_str())
+            if call.call_start >= moved.byte_start
+                && call.call_end <= moved.byte_end
+                && !moved_names.contains(call.name.as_str())
+                && source_method_names.contains(call.name.as_str())
             {
-                deps.entry(moved.signature.clone())
+                deps.entry(moved.name.clone())
                     .or_default()
-                    .insert(call.text.clone());
+                    .insert(call.name.clone());
             }
-        }
-
-        if moved_names.contains(call.text.as_str())
-            && let Some(referencing) = methods.iter().find(|method| {
-                call.byte_start >= method.byte_start && call.byte_end <= method.byte_end
-            })
-            && !moved_ranges.iter().any(|moved| {
-                moved.byte_start == referencing.byte_start && moved.byte_end == referencing.byte_end
-            })
-        {
-            let moved_key = moved_methods
-                .iter()
-                .find(|selector| method_selector_name(selector) == call.text)
-                .cloned()
-                .unwrap_or_else(|| call.text.clone());
-            deps.entry(moved_key)
-                .or_default()
-                .insert(referencing.signature.clone());
         }
     }
 
@@ -584,53 +640,28 @@ fn preview_residual_reference_findings(
             })
         })
         .collect::<Vec<_>>();
-    let moved_method_names = moved_ranges
-        .iter()
-        .map(|method| method.name.as_str())
-        .collect::<BTreeSet<_>>();
     let mut counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
 
-    if !moved_method_names.is_empty() {
-        let call_facts = bbox_refactor::facts::file_query(
-            path,
-            "(method_invocation name: (identifier) @call) @invoc",
-            None,
-        )
-        .map_err(|e| format!("{e:#}"))?;
-        let invoc_ranges = call_facts
-            .captures
-            .iter()
-            .filter(|cap| cap.capture == "invoc")
-            .map(|cap| (cap.byte_start, cap.byte_end))
-            .collect::<Vec<_>>();
-        for call in call_facts
-            .captures
-            .iter()
-            .filter(|cap| cap.capture == "call")
-        {
-            if !moved_method_names.contains(call.text.as_str()) {
+    if !moved_ranges.is_empty() {
+        for call in java_invocations(path)? {
+            if !is_same_class_helper_call(
+                source
+                    .get(call.invoc_start..call.invoc_end)
+                    .unwrap_or_default(),
+            ) {
                 continue;
             }
-            if !is_same_class_helper_call(enclosing_invocation_text(
-                source,
-                &invoc_ranges,
-                call.byte_start,
-                call.byte_end,
-            )) {
+            let Some(moved) = moved_target_for_call(&call, &moved_ranges, &remaining_methods)
+            else {
                 continue;
-            }
+            };
             if let Some(referencing) = remaining_methods.iter().find(|method| {
-                call.byte_start >= method.byte_start && call.byte_end <= method.byte_end
+                call.call_start >= method.byte_start && call.call_end <= method.byte_end
             }) {
-                let moved_member = moved_methods
-                    .iter()
-                    .find(|selector| method_selector_name(selector) == call.text)
-                    .cloned()
-                    .unwrap_or_else(|| call.text.clone());
                 *counts
                     .entry((
                         referencing.signature.clone(),
-                        moved_member,
+                        moved.signature.clone(),
                         "method".to_string(),
                     ))
                     .or_default() += 1;
@@ -10925,24 +10956,6 @@ fn is_same_class_helper_call(invoc_text: &str) -> bool {
     }
 }
 
-/// Slice the source text of the `method_invocation` node enclosing the
-/// `[start, end]` capture (matched against pre-collected `@invoc` ranges).
-/// Returns "" if no enclosing invocation is found (the `@call` is always
-/// nested in `@invoc` by the query, so this is a defensive default that
-/// preserves the prior count-it behavior rather than dropping a call).
-fn enclosing_invocation_text<'a>(
-    source: &'a str,
-    invoc_ranges: &[(usize, usize)],
-    start: usize,
-    end: usize,
-) -> &'a str {
-    invoc_ranges
-        .iter()
-        .find(|(s, e)| *s <= start && *e >= end)
-        .and_then(|(s, e)| source.get(*s..*e))
-        .unwrap_or("")
-}
-
 /// `java.extractClassPreviewPlan` — one-cell seam-dependency preflight that
 /// replaces exploratory preview loops. Bundles overload resolution, field
 /// initializer closure, external caller survey, and DI wireability checks into
@@ -12010,6 +12023,27 @@ public class OrderService {
         void commit(long id) {
         }
     }
+	}
+	"#;
+
+    const RESIDUAL_REMAINING_OVERLOAD_FIXTURE: &str = r#"package com.acme;
+
+public class OrderService {
+    public void submitLater(long id) {
+        submit(id);
+    }
+
+    public void submit(long id) {
+    }
+
+    public void submit(long id, Transaction tx) {
+        tx.commit(id);
+    }
+
+    static class Transaction {
+        void commit(long id) {
+        }
+    }
 }
 "#;
 
@@ -12396,6 +12430,55 @@ public class OrderService {
                     && finding["reference_count"] == 1
             }),
             "{plan_residual:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_residual_references_ignore_remaining_overload_arity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            RESIDUAL_REMAINING_OVERLOAD_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderSubmitter.java",
+                        "delegateField": "submitter",
+                        "methods": ["submit(long,Transaction)"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(residual_findings(&result).is_empty(), "{result}");
+
+        let preview_plan = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "methods": ["submit(long,Transaction)"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview_plan["ready"], json!(true), "{preview_plan}");
+        assert!(
+            preview_plan["residual_references"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{preview_plan}"
         );
     }
 
