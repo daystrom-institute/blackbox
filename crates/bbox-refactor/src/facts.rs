@@ -28,6 +28,10 @@ pub struct ItemFact {
     /// `None` = private/default visibility (or not derivable for the
     /// language).
     pub visibility: Option<String>,
+    /// Nearest declaring type name, when derivable.
+    pub declaring_type: Option<String>,
+    /// True when the item belongs to a nested type.
+    pub nested: bool,
 }
 
 /// Top-level syntax-item inventory of one source file — the same per-language
@@ -53,10 +57,22 @@ pub fn file_items(path: &Path) -> Result<FileItemsFacts> {
     let items = items
         .into_iter()
         .map(|item| {
-            let visibility = root
-                .named_descendant_for_byte_range(item.byte_start, item.byte_end)
-                .and_then(|node| item_visibility(node, parsed.language, &parsed.source));
-            ItemFact { item, visibility }
+            let node = root.named_descendant_for_byte_range(item.byte_start, item.byte_end);
+            let visibility =
+                node.and_then(|node| item_visibility(node, parsed.language, &parsed.source));
+            let (declaring_type, nested) = node
+                .and_then(|node| item_declaring_type(node, parsed.language, &parsed.source))
+                .map(|type_path| {
+                    let nested = type_path.len() > 1;
+                    (type_path.last().cloned(), nested)
+                })
+                .unwrap_or((None, false));
+            ItemFact {
+                item,
+                visibility,
+                declaring_type,
+                nested,
+            }
         })
         .collect();
     Ok(FileItemsFacts {
@@ -65,6 +81,51 @@ pub fn file_items(path: &Path) -> Result<FileItemsFacts> {
         source_len: parsed.source.len(),
         items,
     })
+}
+
+fn item_declaring_type(
+    node: tree_sitter::Node<'_>,
+    language: &str,
+    source: &str,
+) -> Option<Vec<String>> {
+    match language {
+        "java" => java_type_path(node, source),
+        _ => None,
+    }
+}
+
+fn java_type_path(mut node: tree_sitter::Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    loop {
+        if java_type_declaration_kind(node.kind())
+            && let Some(name) = java_type_name(node, source)
+        {
+            names.push(name);
+        }
+        match node.parent() {
+            Some(parent) => node = parent,
+            None => break,
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        names.reverse();
+        Some(names)
+    }
+}
+
+fn java_type_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration"
+    )
+}
+
+fn java_type_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|name| source.get(name.start_byte()..name.end_byte()))
+        .map(str::to_string)
 }
 
 /// Visibility modifier text of an item node, per language. Rust reads the
@@ -1467,6 +1528,46 @@ mod facts_tests {
             .find(|i| i.item.name.as_deref() == Some("gamma"))
             .unwrap();
         assert_eq!(gamma.visibility, None);
+    }
+
+    #[test]
+    fn file_items_marks_java_declaring_type_and_nested_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("OrderView.java");
+        fs::write(
+            &path,
+            r#"package com.acme;
+
+class OrderView {
+    void refresh() {}
+
+    record Row(String id) {
+        String label() {
+            return id;
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let facts = file_items(&path).unwrap();
+        let refresh = facts
+            .items
+            .iter()
+            .find(|item| item.item.name.as_deref() == Some("refresh"))
+            .expect("refresh item");
+        assert_eq!(refresh.declaring_type.as_deref(), Some("OrderView"));
+        assert!(!refresh.nested);
+
+        let label = facts
+            .items
+            .iter()
+            .find(|item| item.item.name.as_deref() == Some("label"))
+            .expect("label item");
+        assert_eq!(label.declaring_type.as_deref(), Some("Row"));
+        assert!(label.nested);
     }
 
     #[test]
