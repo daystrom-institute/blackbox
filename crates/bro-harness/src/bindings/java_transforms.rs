@@ -18,7 +18,7 @@
 //! `syntax_only` tier (no ledger issuance — that tier is the floor anyway);
 //! `lsp_verified` Java kinds wait on jdtls in bro-lsp (v2 §7's named gate).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -7381,6 +7381,704 @@ impl Tool for JavaChangeSignature {
     }
 }
 
+/// `java.fieldInjectToConstructorPreview` - preview field injection promotion.
+pub struct JavaFieldInjectToConstructorPreview;
+
+/// `java.fieldInjectToConstructor` - apply field injection promotion.
+pub struct JavaFieldInjectToConstructor;
+
+#[derive(Deserialize)]
+struct JavaFieldInjectPreviewParams {
+    file: String,
+    #[serde(default)]
+    fields: Option<Vec<String>>,
+    #[serde(default, rename = "className", alias = "class_name")]
+    class_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JavaFieldInjectParams {
+    file: String,
+    #[serde(rename = "fieldRefs", alias = "field_refs")]
+    field_refs: Vec<String>,
+    #[serde(
+        default,
+        rename = "previewOnly",
+        alias = "preview_only",
+        alias = "preview"
+    )]
+    preview_only: Option<bool>,
+}
+
+#[derive(Clone)]
+struct FieldInjectCandidate {
+    ref_id: String,
+    name: String,
+    type_text: String,
+    owner_class: String,
+    byte_start: usize,
+    byte_end: usize,
+    annotations: Vec<String>,
+    modifiers: Vec<String>,
+    is_final: bool,
+    writes: usize,
+    written_by: Vec<String>,
+    declaration_text: String,
+}
+
+#[derive(Clone)]
+struct FieldInjectCtor {
+    params_start: usize,
+    params_end: usize,
+    body_end: usize,
+    param_count: usize,
+    delegating: bool,
+}
+
+#[derive(Clone)]
+struct FieldInjectPreviewData {
+    rel: String,
+    source: String,
+    content_sha256: String,
+    class_name: String,
+    class_body_start: usize,
+    annotation_flavor: String,
+    inject_fqn: String,
+    candidates: Vec<FieldInjectCandidate>,
+    ctors: Vec<FieldInjectCtor>,
+    findings: Vec<Value>,
+    blocked: bool,
+}
+
+fn java_annotation_simple_name(annotation: &str) -> String {
+    let trimmed = annotation
+        .trim()
+        .trim_start_matches('@')
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    trimmed.rsplit('.').next().unwrap_or(trimmed).to_string()
+}
+
+fn java_annotation_is_inject_text(annotation: &str) -> bool {
+    java_annotation_simple_name(annotation) == "Inject"
+}
+
+fn java_inject_fqn_and_flavor(source: &str, annotations: &[String]) -> (String, String) {
+    for fqn in [
+        "com.google.inject.Inject",
+        "jakarta.inject.Inject",
+        "javax.inject.Inject",
+    ] {
+        if source.contains(&format!("import {fqn};"))
+            || annotations.iter().any(|ann| ann.contains(fqn))
+        {
+            let flavor = fqn.trim_end_matches(".Inject").to_string();
+            return (fqn.to_string(), flavor);
+        }
+    }
+    (
+        "com.google.inject.Inject".to_string(),
+        "com.google.inject".to_string(),
+    )
+}
+
+fn field_inject_ref(name: &str, byte_start: usize, byte_end: usize, text: &str) -> String {
+    format!(
+        "fieldInject:{name}:{byte_start}-{byte_end}:{}",
+        signature_digest(text)
+    )
+}
+
+fn find_class_name_and_body(
+    source: &str,
+    requested: Option<&str>,
+    fallback: &str,
+) -> (String, usize) {
+    let class_name = requested.unwrap_or(fallback).to_string();
+    let needle = format!("class {class_name}");
+    let class_pos = source.find(&needle).unwrap_or(0);
+    let body_start = source[class_pos..]
+        .find('{')
+        .map(|idx| class_pos + idx)
+        .unwrap_or(source.len());
+    (class_name, body_start)
+}
+
+fn discover_field_inject_ctors(path: &Path, class_name: &str) -> Vec<FieldInjectCtor> {
+    let Ok(facts) = bbox_refactor::facts::file_query(path, "(constructor_declaration) @ctor", None)
+    else {
+        return Vec::new();
+    };
+    facts
+        .captures
+        .into_iter()
+        .filter(|capture| capture.capture == "ctor")
+        .filter_map(|capture| {
+            let sig = match bbox_refactor::facts::callable_signature(
+                path,
+                capture.byte_start,
+                capture.byte_end,
+                None,
+            ) {
+                Ok(bbox_refactor::facts::SignatureFacts::Java(sig)) => sig,
+                _ => return None,
+            };
+            if sig.kind != "constructor_declaration" || sig.name.as_deref() != Some(class_name) {
+                return None;
+            }
+            let params_span = sig.params_span?;
+            let open_rel = capture.text.find('{')?;
+            let close_rel = capture.text.rfind('}')?;
+            let delegating = {
+                let body_inner = capture.text[open_rel + 1..close_rel].trim_start();
+                body_inner.starts_with("this(") || body_inner.starts_with("this (")
+            };
+            Some(FieldInjectCtor {
+                params_start: params_span.byte_start,
+                params_end: params_span.byte_end,
+                body_end: capture.byte_start + close_rel,
+                param_count: sig.params.len(),
+                delegating,
+            })
+        })
+        .collect()
+}
+
+fn field_inject_preview_data(
+    root: &Path,
+    params: &JavaFieldInjectPreviewParams,
+) -> Result<FieldInjectPreviewData, String> {
+    let abs = resolve_workspace_file(root, &params.file, "java.fieldInjectToConstructorPreview")?;
+    let source = std::fs::read_to_string(&abs).map_err(|e| {
+        format!(
+            "java.fieldInjectToConstructorPreview: read {}: {e}",
+            params.file
+        )
+    })?;
+    let classification = bbox_refactor::facts::java_field_classification(
+        &abs,
+        params.fields.as_deref(),
+        params.class_name.as_deref(),
+    )
+    .map_err(|e| {
+        format!(
+            "java.fieldInjectToConstructorPreview: classify {}: {e:#}",
+            params.file
+        )
+    })?;
+    let field_facts = bbox_refactor::facts::java_fields(&abs, params.class_name.as_deref())
+        .map_err(|e| {
+            format!(
+                "java.fieldInjectToConstructorPreview: fields {}: {e:#}",
+                params.file
+            )
+        })?;
+    let fact_by_name = field_facts
+        .fields
+        .iter()
+        .map(|field| (field.name.as_str(), field))
+        .collect::<BTreeMap<_, _>>();
+    let requested = params
+        .fields
+        .as_ref()
+        .map(|fields| fields.iter().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+
+    let mut candidates = Vec::new();
+    let mut findings = Vec::new();
+    for field in &classification.fields {
+        if !requested.is_empty() && !requested.contains(field.name.as_str()) {
+            continue;
+        }
+        let Some(decl) = fact_by_name.get(field.name.as_str()) else {
+            continue;
+        };
+        let field_annotation_injected = field
+            .annotations
+            .iter()
+            .any(|ann| java_annotation_is_inject_text(ann));
+        if !field.is_injected || !field_annotation_injected {
+            continue;
+        }
+        if decl.is_static {
+            findings.push(json!({
+                "finding": "static_field_skipped",
+                "field": field.name,
+                "severity": "review",
+            }));
+            continue;
+        }
+        let declaration_text = source
+            .get(decl.byte_start..decl.byte_end)
+            .unwrap_or_default()
+            .to_string();
+        candidates.push(FieldInjectCandidate {
+            ref_id: field_inject_ref(
+                &field.name,
+                decl.byte_start,
+                decl.byte_end,
+                &declaration_text,
+            ),
+            name: field.name.clone(),
+            type_text: field.type_text.clone(),
+            owner_class: field.owner_class.clone().unwrap_or_default(),
+            byte_start: decl.byte_start,
+            byte_end: decl.byte_end,
+            annotations: field.annotations.clone(),
+            modifiers: field.modifiers.clone(),
+            is_final: decl.is_final,
+            writes: field.writes,
+            written_by: field.written_by.clone(),
+            declaration_text,
+        });
+    }
+
+    let fallback_class = candidates
+        .first()
+        .map(|field| field.owner_class.as_str())
+        .filter(|name| !name.is_empty())
+        .or_else(|| params.class_name.as_deref())
+        .unwrap_or("Unknown");
+    let (class_name, class_body_start) =
+        find_class_name_and_body(&source, params.class_name.as_deref(), fallback_class);
+    let all_annotations = candidates
+        .iter()
+        .flat_map(|field| field.annotations.clone())
+        .collect::<Vec<_>>();
+    let (inject_fqn, annotation_flavor) = java_inject_fqn_and_flavor(&source, &all_annotations);
+    let ctors = discover_field_inject_ctors(&abs, &class_name);
+    let mut blocked = false;
+    if ctors.len() > 1 {
+        blocked = true;
+        findings.push(json!({
+            "finding": "unsupported_constructor_topology",
+            "severity": "blocker",
+            "topology": "multiple",
+            "detail": "multiple constructors are ambiguous; reduce to one constructor or handle manually before promotion",
+        }));
+    }
+    if ctors.iter().any(|ctor| ctor.delegating) {
+        blocked = true;
+        findings.push(json!({
+            "finding": "unsupported_constructor_topology",
+            "severity": "blocker",
+            "topology": "delegating",
+            "detail": "constructors beginning with this(...) are refused so parameter threading is not guessed",
+        }));
+    }
+    Ok(FieldInjectPreviewData {
+        rel: params.file.clone(),
+        source,
+        content_sha256: classification.content_sha256,
+        class_name,
+        class_body_start,
+        annotation_flavor,
+        inject_fqn,
+        candidates,
+        ctors,
+        findings,
+        blocked,
+    })
+}
+
+fn field_inject_preview_value(
+    root: &Path,
+    params: &JavaFieldInjectPreviewParams,
+) -> Result<Value, String> {
+    let data = field_inject_preview_data(root, params)?;
+    let topology = if data.ctors.is_empty() {
+        "zero"
+    } else if data.ctors.len() == 1 {
+        "single"
+    } else {
+        "multiple"
+    };
+    Ok(json!({
+        "file": data.rel,
+        "content_sha256": data.content_sha256,
+        "class_name": data.class_name,
+        "annotation_flavor": data.annotation_flavor,
+        "inject_fqn": data.inject_fqn,
+        "constructor_topology": {
+            "kind": topology,
+            "count": data.ctors.len(),
+            "delegating": data.ctors.iter().any(|ctor| ctor.delegating),
+            "param_count": data.ctors.first().map(|ctor| ctor.param_count),
+        },
+        "fields": data.candidates.iter().map(|field| json!({
+            "ref": field.ref_id,
+            "name": field.name,
+            "type": field.type_text,
+            "owner_class": field.owner_class,
+            "annotations": field.annotations,
+            "modifiers": field.modifiers,
+            "is_final": field.is_final,
+            "writes": field.writes,
+            "written_by": field.written_by,
+            "byte_start": field.byte_start,
+            "byte_end": field.byte_end,
+        })).collect::<Vec<_>>(),
+        "findings": data.findings,
+        "blocked": data.blocked,
+        "ref_model": "preview-local field refs: fieldInject:<name>:<byte-range>:<hash12>; re-derived on apply, not graph IDs",
+        "provenance": "syntax_only",
+    }))
+}
+
+fn qualifier_annotations(field: &FieldInjectCandidate) -> Vec<String> {
+    field
+        .annotations
+        .iter()
+        .filter(|ann| !java_annotation_is_inject_text(ann))
+        .cloned()
+        .collect()
+}
+
+fn strip_field_injection_annotations(field: &FieldInjectCandidate, make_final: bool) -> String {
+    let moved = field
+        .annotations
+        .iter()
+        .filter(|ann| java_annotation_is_inject_text(ann) || !java_annotation_is_inject_text(ann))
+        .map(|ann| ann.trim())
+        .collect::<HashSet<_>>();
+    let mut out = Vec::new();
+    for line in field.declaration_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('@')
+            && moved
+                .iter()
+                .any(|ann| trimmed == *ann || trimmed.starts_with(&format!("{ann} ")))
+        {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    let mut text = out.join("\n");
+    if make_final && !field.is_final {
+        if let Some(type_pos) = text.find(field.type_text.as_str()) {
+            text.insert_str(type_pos, "final ");
+        }
+    }
+    text
+}
+
+fn line_start(source: &str, pos: usize) -> usize {
+    source[..pos].rfind('\n').map(|idx| idx + 1).unwrap_or(0)
+}
+
+fn field_has_elsewhere_assignment(source: &str, field: &FieldInjectCandidate) -> bool {
+    let needles = [
+        format!("this.{} =", field.name),
+        format!("this.{}=", field.name),
+    ];
+    needles.iter().any(|needle| source.contains(needle))
+}
+
+fn render_field_inject_param(field: &FieldInjectCandidate) -> String {
+    let qualifiers = qualifier_annotations(field);
+    let prefix = if qualifiers.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", qualifiers.join(" "))
+    };
+    format!("{prefix}{} {}", field.type_text, field.name)
+}
+
+fn render_field_inject_assignments(fields: &[FieldInjectCandidate]) -> String {
+    fields
+        .iter()
+        .map(|field| format!("        this.{0} = {0};\n", field.name))
+        .collect::<String>()
+}
+
+fn ensure_inject_import_edit(data: &FieldInjectPreviewData) -> Option<bbox_refactor::TextEdit> {
+    if data
+        .source
+        .contains(&format!("import {};", data.inject_fqn))
+    {
+        return None;
+    }
+    let insert_at = data.source.find('\n').map(|idx| idx + 1).unwrap_or(0);
+    Some(bbox_refactor::TextEdit {
+        byte_start: insert_at,
+        byte_end: insert_at,
+        replacement: format!("\nimport {};\n", data.inject_fqn),
+    })
+}
+
+fn discover_constructor_call_counts(
+    root: &Path,
+    class_name: &str,
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut counts = BTreeMap::new();
+    for path in collect_java_files(root)? {
+        let rel = relativize(root, &path.to_string_lossy())?;
+        let facts = bbox_refactor::facts::file_query(
+            &path,
+            "(object_creation_expression type: (_) @type) @new",
+            None,
+        )
+        .map_err(|e| format!("java.fieldInjectToConstructor: scan constructors in {rel}: {e:#}"))?;
+        let count = facts
+            .captures
+            .iter()
+            .filter(|capture| capture.capture == "type" && capture.text.trim() == class_name)
+            .count();
+        if count > 0 {
+            counts.insert(rel, count);
+        }
+    }
+    Ok(counts)
+}
+
+fn field_inject_apply_value(root: &Path, params: &JavaFieldInjectParams) -> Result<Value, String> {
+    if params.field_refs.is_empty() {
+        return Err("java.fieldInjectToConstructor: `fieldRefs` must not be empty".to_string());
+    }
+    let preview_params = JavaFieldInjectPreviewParams {
+        file: params.file.clone(),
+        fields: None,
+        class_name: None,
+    };
+    let mut data = field_inject_preview_data(root, &preview_params)?;
+    let requested = params.field_refs.iter().cloned().collect::<HashSet<_>>();
+    let mut selected = Vec::new();
+    let mut findings = std::mem::take(&mut data.findings);
+    for field in &data.candidates {
+        if requested.contains(&field.ref_id) {
+            selected.push(field.clone());
+        }
+    }
+    if selected.len() != requested.len() {
+        let available = data
+            .candidates
+            .iter()
+            .map(|field| field.ref_id.clone())
+            .collect::<HashSet<_>>();
+        let stale = requested
+            .difference(&available)
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "java.fieldInjectToConstructor: stale or unknown fieldRefs: {}",
+            stale.join(", ")
+        ));
+    }
+    if data.blocked {
+        return Err(format!(
+            "java.fieldInjectToConstructor: unsupported constructor topology for {}; run preview for blockers",
+            data.class_name
+        ));
+    }
+
+    let mut edits = Vec::new();
+    for field in &selected {
+        let has_elsewhere_assignment = field_has_elsewhere_assignment(&data.source, field);
+        let make_final = !field.is_final && field.writes == 0 && !has_elsewhere_assignment;
+        if !make_final && !field.is_final {
+            findings.push(json!({
+                "finding": "field_left_mutable",
+                "severity": "review",
+                "field": field.name,
+                "writes": field.writes,
+                "assignment_detected": has_elsewhere_assignment,
+                "written_by": field.written_by,
+                "detail": "field has writes outside the injection declaration, so the declaration was not made final",
+            }));
+        }
+        edits.push(bbox_refactor::TextEdit {
+            byte_start: line_start(&data.source, field.byte_start),
+            byte_end: field.byte_end,
+            replacement: strip_field_injection_annotations(field, make_final),
+        });
+    }
+
+    let params_text = selected
+        .iter()
+        .map(render_field_inject_param)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(ctor) = data.ctors.first() {
+        let old_params = data
+            .source
+            .get(ctor.params_start..ctor.params_end)
+            .unwrap_or("()");
+        let inner = old_params
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let new_params = if inner.is_empty() {
+            format!("({params_text})")
+        } else {
+            format!("({inner}, {params_text})")
+        };
+        edits.push(bbox_refactor::TextEdit {
+            byte_start: ctor.params_start,
+            byte_end: ctor.params_end,
+            replacement: new_params,
+        });
+        edits.push(bbox_refactor::TextEdit {
+            byte_start: line_start(&data.source, ctor.body_end),
+            byte_end: line_start(&data.source, ctor.body_end),
+            replacement: render_field_inject_assignments(&selected),
+        });
+    } else {
+        if let Some(import_edit) = ensure_inject_import_edit(&data) {
+            edits.push(import_edit);
+        }
+        let ctor = format!(
+            "\n    @Inject\n    public {}({}) {{\n{}    }}\n",
+            data.class_name,
+            params_text,
+            render_field_inject_assignments(&selected)
+        );
+        edits.push(bbox_refactor::TextEdit {
+            byte_start: data.class_body_start + 1,
+            byte_end: data.class_body_start + 1,
+            replacement: ctor,
+        });
+    }
+    edits.sort_by_key(|edit| edit.byte_start);
+
+    if let Ok(call_counts) = discover_constructor_call_counts(root, &data.class_name) {
+        let total = call_counts.values().sum::<usize>();
+        if total > 0 {
+            findings.push(json!({
+                "finding": "constructor_arity_changed",
+                "severity": "review",
+                "class": data.class_name,
+                "total_callers": total,
+                "files": call_counts,
+                "detail": "constructor call sites are reported but not rewritten by this v1 transform",
+            }));
+        }
+    }
+
+    let changes = if params.preview_only.unwrap_or(false) {
+        Vec::new()
+    } else {
+        let file_edit = bbox_refactor::FileEdit {
+            path: path_string_for_change(root, &params.file),
+            original_sha256: data.content_sha256.clone(),
+            edits,
+            new_text: None,
+        };
+        file_edits_to_changes(root, "java.fieldInjectToConstructor", &[file_edit])?.0
+    };
+    Ok(json!({
+        "changes": changes,
+        "findings": findings,
+        "selected_refs": params.field_refs,
+        "preview_only": params.preview_only.unwrap_or(false),
+        "provenance": "syntax_only",
+    }))
+}
+
+fn path_string_for_change(root: &Path, rel: &str) -> String {
+    root.join(rel).to_string_lossy().to_string()
+}
+
+#[async_trait]
+impl Tool for JavaFieldInjectToConstructorPreview {
+    fn name(&self) -> &str {
+        "java.fieldInjectToConstructorPreview"
+    }
+    fn description(&self) -> &str {
+        "Preview promoting selected @Inject instance fields to constructor parameters. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "fields": { "type": "array", "items": { "type": "string" } },
+                "className": { "type": "string" },
+                "class_name": { "type": "string" }
+            },
+            "required": ["file"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some((
+            "java".to_string(),
+            "fieldInjectToConstructorPreview".to_string(),
+        ))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaFieldInjectPreviewParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.fieldInjectToConstructorPreview: bad input - expected {{ file, fields?, className? }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || match field_inject_preview_value(&root, &params) {
+            Ok(value) => ToolResult::Json(value),
+            Err(e) => err(e),
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Tool for JavaFieldInjectToConstructor {
+    fn name(&self) -> &str {
+        "java.fieldInjectToConstructor"
+    }
+    fn description(&self) -> &str {
+        "Apply java.fieldInjectToConstructorPreview refs: remove field injection annotations, add constructor params and assignments, and report constructor caller counts. Pure; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" },
+                "fieldRefs": { "type": "array", "items": { "type": "string" } },
+                "field_refs": { "type": "array", "items": { "type": "string" } },
+                "previewOnly": { "type": "boolean" },
+                "preview_only": { "type": "boolean" }
+            },
+            "required": ["file", "fieldRefs"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("java".to_string(), "fieldInjectToConstructor".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: JavaFieldInjectParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "java.fieldInjectToConstructor: bad input - expected {{ file, fieldRefs, previewOnly? }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || match field_inject_apply_value(&root, &params) {
+            Ok(value) => ToolResult::Json(value),
+            Err(e) => err(e),
+        })
+        .await
+    }
+}
+
 /// `java.encapsulateFieldPreview` - preview Java field encapsulation.
 pub struct JavaEncapsulateFieldPreview;
 
@@ -10781,8 +11479,54 @@ PARAMS
 RECIPE
   const pv = await java.changeSignaturePreview({ file, methodName: "find",
     targetParams: [{ sourceName: "id", name: "key" }, { name: "limit", type: "int", defaultValue: "10" }] });
-  const r = await java.changeSignature({ file, methodName: "find", methodRef: pv.method_ref,
-    targetParams, acknowledgeSyntaxOnlyCallSites: true });
+	  const r = await java.changeSignature({ file, methodName: "find", methodRef: pv.method_ref,
+	    targetParams, acknowledgeSyntaxOnlyCallSites: true });
+	"#;
+
+const FIELD_INJECT_TO_CONSTRUCTOR_CONTRACT: &str = r#"java.fieldInjectToConstructorPreview / java.fieldInjectToConstructor - promote @Inject fields to constructor parameters.
+
+WHAT IT DOES
+  Converts selected @Inject instance fields into constructor-injected fields.
+  Preview inventories candidate field-annotation injections using
+  bbox-refactor fieldClassification plus field spans, reports the detected
+  injection flavor (com.google.inject / jakarta.inject / javax.inject), current
+  constructor topology, and preview-local field refs.
+
+APPLY SYNTHESIS
+  - removes @Inject from the field declaration
+  - moves field annotations such as @Named onto the constructor parameter
+  - keeps the field declaration
+  - makes the field final only when fieldClassification reports no writes
+  - appends constructor parameters and assignments for a single constructor
+  - synthesizes an @Inject constructor when the class has no constructors
+
+TOPOLOGY RULES
+  Exactly one constructor: append params and append assignments before the
+  closing brace. Zero constructors: synthesize one @Inject constructor using
+  the matched annotation flavor. Multiple constructors or any constructor that
+  starts with this(...) are refused, because the transform will not guess
+  overload or delegation semantics.
+
+CALL-SITE SCOPE CUT
+  v1 does not rewrite `new ClassName(...)` call sites. Apply emits a
+  constructor_arity_changed finding with per-file caller counts so the agent can
+  see the blast radius. Use a changeSignature-style acknowledged call-site
+  rewrite as a follow-up only if probes demand it.
+
+PARAMS
+  preview: { file: string, fields?: string[], className?: string }
+  apply:   { file: string, fieldRefs: string[], previewOnly?: boolean }
+
+RETURNS
+  preview: { file, class_name, annotation_flavor, constructor_topology, fields,
+             findings, blocked, ref_model, provenance }
+  apply:   { changes, findings, selected_refs, preview_only, provenance }
+  Both are pure and never write; pass changes to edits.merge.
+
+REFS
+  Preview-local refs look like
+  fieldInject:<name>:<byte-range>:<hash12>. Apply re-derives preview and refuses
+  stale refs.
 "#;
 
 const ENCAPSULATE_FIELD_CONTRACT: &str = r#"java.encapsulateFieldPreview / java.encapsulateField - syntax-only Java field encapsulation.
@@ -11075,6 +11819,9 @@ impl Tool for JavaDescribe {
             "changeSignaturePreview" | "changeSignature" => {
                 ToolResult::Json(json!({ "contract": CHANGE_SIGNATURE_CONTRACT }))
             }
+            "fieldInjectToConstructorPreview" | "fieldInjectToConstructor" => {
+                ToolResult::Json(json!({ "contract": FIELD_INJECT_TO_CONSTRUCTOR_CONTRACT }))
+            }
             "encapsulateFieldPreview" | "encapsulateField" => {
                 ToolResult::Json(json!({ "contract": ENCAPSULATE_FIELD_CONTRACT }))
             }
@@ -11109,7 +11856,7 @@ impl Tool for JavaDescribe {
                 ToolResult::Json(json!({ "contract": SYNTH_WRAPPERS_CONTRACT }))
             }
             other => err(format!(
-                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, addImport, organizeImports, normalizeWhitespace, hygiene)"
+                "java.describe: unknown transform `{other}` (available: extractClass, extractClassPreviewPlan, extractColumnSpec, extractMethodCodeBlock, renameSymbol, moveClass, movePackage, moveMemberPreview, moveMember, pullUpPreview, extractInterface, pullUpMembers, pushDownMembersPreview, pushDownMembers, changeSignaturePreview, changeSignature, fieldInjectToConstructorPreview, fieldInjectToConstructor, encapsulateFieldPreview, encapsulateField, replaceConstructorWithFactoryPreview, replaceConstructorWithFactory, migrateTypeUsagesPreview, migrateTypeUsages, inlineMethodPreview, inlineMethod, removeUnusedConstructorParams, synthesizeHelperWrappers, addImport, organizeImports, normalizeWhitespace, hygiene)"
             )),
         }
     }
@@ -12849,6 +13596,8 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
         Arc::new(JavaPushDownMembers) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignaturePreview) as Arc<dyn Tool>,
         Arc::new(JavaChangeSignature) as Arc<dyn Tool>,
+        Arc::new(JavaFieldInjectToConstructorPreview) as Arc<dyn Tool>,
+        Arc::new(JavaFieldInjectToConstructor) as Arc<dyn Tool>,
         Arc::new(JavaEncapsulateFieldPreview) as Arc<dyn Tool>,
         Arc::new(JavaEncapsulateField) as Arc<dyn Tool>,
         Arc::new(JavaReplaceConstructorWithFactoryPreview) as Arc<dyn Tool>,
@@ -12876,7 +13625,7 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + nest access breaks + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; extractColumnSpec - deduplicate repeated grid/column construction into a spec table; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + nest access breaks + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; extractColumnSpec - deduplicate repeated grid/column construction into a spec table; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; fieldInjectToConstructorPreview/fieldInjectToConstructor - promote selected @Inject instance fields to constructor parameters without rewriting new call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaResidualReferenceFinding = { finding: "residual_reference"; referencing_member: string; moved_member: string; moved_member_kind: "method" | "field"; reference_count: number; resolution_hint: string };
@@ -12896,6 +13645,8 @@ type JavaPushDownResult = { title: string; changes: SpanChange[]; creates: []; d
 type JavaChangeParamSpec = { sourceName?: string; name: string; type?: string; defaultValue?: string };
 type JavaChangeSignaturePreview = { file: string; content_sha256?: string; method_name: string; method_ref?: string | null; old_signature?: string; old_params?: unknown[]; target_params: string[]; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaChangeSignatureResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_method_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
+type JavaFieldInjectToConstructorPreview = { file: string; content_sha256?: string; class_name: string; annotation_flavor: string; inject_fqn: string; constructor_topology: unknown; fields: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
+type JavaFieldInjectToConstructorResult = { changes: SpanChange[]; findings: unknown[]; selected_refs: string[]; preview_only: boolean; provenance: "syntax_only" };
 type JavaEncapsulateFieldPreview = { file: string; content_sha256?: string; field_name: string; field_ref?: string | null; field?: unknown; accessors?: { getter: string; setter?: string | null }; references: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
 type JavaEncapsulateFieldResult = { title: string; changes: SpanChange[]; findings: unknown[]; selected_field_ref?: string; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaReplaceConstructorWithFactoryPreview = { file: string; content_sha256?: string; class_name?: string; constructor_ref?: string | null; old_signature?: string; factory_name?: string; factory_signature?: string; call_sites: unknown[]; findings: unknown[]; blocked: boolean; ref_model: string; provenance: "syntax_only" };
@@ -12941,6 +13692,10 @@ declare const java: {
   changeSignaturePreview(args: { file: string; className?: string; methodName: string; targetParams: JavaChangeParamSpec[]; files?: string[] }): Promise<JavaChangeSignaturePreview>;
   /** Apply a previewed method signature change. Same-name call-site rewrites require acknowledgeSyntaxOnlyCallSites:true. */
   changeSignature(args: { file: string; className?: string; methodName: string; methodRef: string; targetParams: JavaChangeParamSpec[]; files?: string[]; acknowledgeSyntaxOnlyCallSites?: boolean; previewOnly?: boolean }): Promise<JavaChangeSignatureResult>;
+  /** Preview @Inject instance fields that can be promoted to constructor params. Refs are preview-local field hashes, not graph IDs. */
+  fieldInjectToConstructorPreview(args: { file: string; fields?: string[]; className?: string }): Promise<JavaFieldInjectToConstructorPreview>;
+  /** Apply previewed @Inject field promotion. Reports constructor caller counts but does not rewrite new call sites. */
+  fieldInjectToConstructor(args: { file: string; fieldRefs: string[]; previewOnly?: boolean }): Promise<JavaFieldInjectToConstructorResult>;
   /** Preview Java field encapsulation. Refs are preview-local declaration hashes, not graph IDs. */
   encapsulateFieldPreview(args: { file: string; className?: string; fieldName: string; getterName?: string; setterName?: string; files?: string[] }): Promise<JavaEncapsulateFieldPreview>;
   /** Apply a previewed Java field encapsulation. Reference rewrites require acknowledgeSyntaxOnlyReferences:true. */
@@ -14482,6 +15237,288 @@ public class Thing {
         assert_eq!(
             result["findings"][0]["routines_applied"],
             json!([]),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_inject_preview_inventories_flavors_and_ctor_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        for (file, import, class_name, ctor) in [
+            (
+                "GuiceService.java",
+                "com.google.inject.Inject",
+                "GuiceService",
+                "    public GuiceService() {}\n",
+            ),
+            (
+                "JakartaService.java",
+                "jakarta.inject.Inject",
+                "JakartaService",
+                "",
+            ),
+            (
+                "JavaxService.java",
+                "javax.inject.Inject",
+                "JavaxService",
+                "    public JavaxService() {}\n",
+            ),
+        ] {
+            std::fs::write(
+                root.join(format!("src/com/acme/{file}")),
+                format!(
+                    "package com.acme;\n\nimport {import};\n\npublic class {class_name} {{\n    @Inject\n    private Repo repo;\n\n{ctor}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let cx = cx_in(&root);
+
+        let guice = json_of(
+            JavaFieldInjectToConstructorPreview
+                .call(json!({ "file": "src/com/acme/GuiceService.java" }), &cx)
+                .await,
+        );
+        let jakarta = json_of(
+            JavaFieldInjectToConstructorPreview
+                .call(json!({ "file": "src/com/acme/JakartaService.java" }), &cx)
+                .await,
+        );
+        let javax = json_of(
+            JavaFieldInjectToConstructorPreview
+                .call(json!({ "file": "src/com/acme/JavaxService.java" }), &cx)
+                .await,
+        );
+        assert_eq!(guice["annotation_flavor"], "com.google.inject", "{guice}");
+        assert_eq!(jakarta["annotation_flavor"], "jakarta.inject", "{jakarta}");
+        assert_eq!(javax["annotation_flavor"], "javax.inject", "{javax}");
+        assert_eq!(guice["constructor_topology"]["kind"], "single", "{guice}");
+        assert_eq!(jakarta["constructor_topology"]["kind"], "zero", "{jakarta}");
+        assert_eq!(guice["fields"].as_array().unwrap().len(), 1, "{guice}");
+    }
+
+    #[tokio::test]
+    async fn field_inject_apply_single_ctor_promotes_param_and_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+
+import com.google.inject.Inject;
+import com.google.inject.name.Named;
+
+public class Service {
+    private final String name;
+    @Inject
+    @Named("main")
+    private Repo repo;
+
+    public Service(String name) {
+        this.name = name;
+    }
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Service.java"), source).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/Caller.java"),
+            "package com.acme;\n\npublic class Caller { Service s = new Service(\"a\"); }\n",
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+        let preview = json_of(
+            JavaFieldInjectToConstructorPreview
+                .call(json!({ "file": "src/com/acme/Service.java" }), &cx)
+                .await,
+        );
+        let field_ref = preview["fields"][0]["ref"].as_str().unwrap();
+
+        let result = json_of(
+            JavaFieldInjectToConstructor
+                .call(
+                    json!({
+                        "file": "src/com/acme/Service.java",
+                        "fieldRefs": [field_ref]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = apply_result_changes(source, &result);
+        assert!(
+            rewritten.contains("private final Repo repo;"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains(
+                "public Service(String name, @Named(\"main\") Repo repo) {\n        this.name = name;\n        this.repo = repo;\n    }"
+            ),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("@Inject\n    @Named(\"main\")\n    private Repo repo"));
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["finding"] == "constructor_arity_changed"
+                        && finding["files"]["src/com/acme/Caller.java"] == 1
+                }),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_inject_apply_zero_ctor_synthesizes_inject_ctor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+
+import com.google.inject.Inject;
+
+public class Service {
+    @Inject
+    private Repo repo;
+
+    public Repo repo() {
+        return repo;
+    }
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Service.java"), source).unwrap();
+        let cx = cx_in(&root);
+        let preview = json_of(
+            JavaFieldInjectToConstructorPreview
+                .call(json!({ "file": "src/com/acme/Service.java" }), &cx)
+                .await,
+        );
+        let field_ref = preview["fields"][0]["ref"].as_str().unwrap();
+
+        let result = json_of(
+            JavaFieldInjectToConstructor
+                .call(
+                    json!({
+                        "file": "src/com/acme/Service.java",
+                        "fieldRefs": [field_ref]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = apply_result_changes(source, &result);
+        assert!(
+            rewritten.contains(
+                "@Inject\n    public Service(Repo repo) {\n        this.repo = repo;\n    }"
+            ),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("private final Repo repo;"),
+            "{rewritten}"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_inject_apply_refuses_multi_ctor_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+
+import com.google.inject.Inject;
+
+public class Service {
+    @Inject
+    private Repo repo;
+
+    public Service() {}
+    public Service(String name) {}
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Service.java"), source).unwrap();
+        let cx = cx_in(&root);
+        let preview = json_of(
+            JavaFieldInjectToConstructorPreview
+                .call(json!({ "file": "src/com/acme/Service.java" }), &cx)
+                .await,
+        );
+        let field_ref = preview["fields"][0]["ref"].as_str().unwrap();
+        let result = JavaFieldInjectToConstructor
+            .call(
+                json!({
+                    "file": "src/com/acme/Service.java",
+                    "fieldRefs": [field_ref]
+                }),
+                &cx,
+            )
+            .await;
+        match result {
+            ToolResult::Error(message) => {
+                assert!(
+                    message.contains("unsupported constructor topology"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn field_inject_apply_leaves_elsewhere_assigned_field_mutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+
+import com.google.inject.Inject;
+
+public class Service {
+    @Inject
+    private Repo repo;
+
+    public Service() {}
+
+    public void reset(Repo repo) {
+        this.repo = repo;
+    }
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Service.java"), source).unwrap();
+        let cx = cx_in(&root);
+        let preview = json_of(
+            JavaFieldInjectToConstructorPreview
+                .call(json!({ "file": "src/com/acme/Service.java" }), &cx)
+                .await,
+        );
+        let field_ref = preview["fields"][0]["ref"].as_str().unwrap();
+        let result = json_of(
+            JavaFieldInjectToConstructor
+                .call(
+                    json!({
+                        "file": "src/com/acme/Service.java",
+                        "fieldRefs": [field_ref]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = apply_result_changes(source, &result);
+        assert!(rewritten.contains("private Repo repo;"), "{rewritten}");
+        assert!(
+            !rewritten.contains("private final Repo repo;"),
+            "{rewritten}"
+        );
+        assert!(
+            result["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["finding"] == "field_left_mutable" && finding["field"] == "repo"
+                }),
             "{result}"
         );
     }
