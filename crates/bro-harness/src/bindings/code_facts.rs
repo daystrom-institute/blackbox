@@ -186,7 +186,7 @@ impl Tool for CodeItems {
         "code.items"
     }
     fn description(&self) -> &str {
-        "Inventory syntax items of source files (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans for every item. Pass `file` for one file (flat result) or `files` for a host-side batch (per-file results; a bad file becomes an `error` entry, not a failed call)."
+        "Inventory syntax items of source files (tree-sitter; pure; syntax_only tier). Returns hash-anchored Spans for every item. Java field declarations are NOT items; use code.fields for field facts. Pass `file` for one file (flat result) or `files` for a host-side batch (per-file results; a bad file becomes an `error` entry, not a failed call)."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1047,7 +1047,7 @@ type JavaSignature = { language: "java"; kind: "method_declaration" | "construct
 declare const code: {
   /** Enumerate parseable source files (skips dot-dirs, target, node_modules, build, dist, vendor). Feed straight into items({files})/query({files}). */
   files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
-  /** Inventory syntax items. visibility is "pub"/"public"/... or undefined = private. Java items include declaring_type and nested; top_level_only/topLevelOnly drops nested-type members. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
+  /** Inventory syntax items. visibility is "pub"/"public"/... or undefined = private. Java items include declaring_type and nested; top_level_only/topLevelOnly drops nested-type members. Java field declarations are NOT items: use code.fields. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
   items(args: ({ file: string } | { files: string[] }) & { top_level_only?: boolean; topLevelOnly?: boolean }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
   /** Inventory Java field declarations with type/modifiers/annotations/owner and hash-anchored declaration/name spans. Use this instead of raw field_declaration queries. */
   fields(args: { file: string; className?: string }): Promise<FileFields>;
