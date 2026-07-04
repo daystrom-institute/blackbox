@@ -9508,14 +9508,14 @@ RETURNS { title, changes, creates, findings, dependency_projection, preview_only
     external_call         calls to source-class methods NOT in the moved set; recommended_resolution is one of
                           cross_class_static_call | add_to_item_names | add_to_callback_externals |
                           inject_source_instance | drop_the_call
-	    inherited_dependency  calls resolving to a superclass/interface method
-	    remaining_source_accessor  source-side accesses to moved fields that survive extraction
-	    residual_reference    source-side member left behind still references a moved method or field.
-	                          Moved-method refs are suppressed by wrappers:true; moved-field refs are
-	                          reported regardless because wrappers only preserve methods.
-	    note                  planner prose (synthesis decisions, conservative refusal context)
-	  fixme_count: number of FIXME markers in the synthesized text. residual_reference findings do
-	               not increment this because they are pre-apply JSON warnings, not inserted FIXME text.
+    inherited_dependency  calls resolving to a superclass/interface method
+    remaining_source_accessor  source-side accesses to moved fields that survive extraction
+    residual_reference    source-side member left behind still references a moved method or field.
+                          Moved-method refs are suppressed by wrappers:true; moved-field refs are
+                          reported regardless because wrappers only preserve methods.
+    note                  planner prose (synthesis decisions, conservative refusal context)
+  fixme_count: number of FIXME markers in the synthesized text. residual_reference findings do
+               not increment this because they are pre-apply JSON warnings, not inserted FIXME text.
 
 ERRORS (operator-actionable, fix and re-call)
   mutable_capture_with_write: extracted code writes mutable source field(s) — add them to moveFields
@@ -10038,6 +10038,10 @@ PARAMS
   memberNames: string[]
   memberKind?: "field" | "constant" | "method"  default field
   memberRefs: string[]
+  visibility?: "private" | "package" | "protected" | "public"  member visibility on the target
+  keepCopy?: boolean          keep the member on the source too (copy instead of move)
+  targetPrelude?: string      text inserted at the top of a newly created target file
+  targetClassName?: string    class name for a newly created target (default: from target filename)
   acknowledgeRemainingAccessors?: boolean
   acknowledgeRemainingSourceReferences?: boolean
   previewOnly?: boolean
@@ -10052,10 +10056,10 @@ const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell
 
 WHAT IT DOES
   Replaces exploratory previewOnly loops with a single compact preflight.
-	  Bundles: overload resolution, field initializer closure, external caller
-	  survey, residual references from remaining source members to moved members,
-	  and DI wireability checks. If ready:true, skip previewOnly and go directly
-	  to extractClass + edits.apply in the next cell.
+  Bundles: overload resolution, field initializer closure, external caller
+  survey, residual references from remaining source members to moved members,
+  and DI wireability checks. If ready:true, skip previewOnly and go directly
+  to extractClass + edits.apply in the next cell.
 
 PARAMS
   file: string         workspace-relative .java file
@@ -10063,27 +10067,31 @@ PARAMS
   moveFields?: string[] field names from cohesion cluster (seam.move_fields)
   className?: string   optional owner class name
 
-	RETURNS { file, methods, overloads, resolved_methods, field_closure,
-	          augmented_move_fields, augmented_fields_differ, external_callers,
-	          has_external_callers, non_injectable_mutable, internal_helper_deps,
-	          residual_references, wiring_recommendation, ready, blockers, provenance }
+RETURNS { file, methods, overloads, overloads_resolved, resolved_methods,
+          field_closure, augmented_move_fields, augmented_fields_differ,
+          external_callers, has_external_callers, non_injectable_mutable,
+          internal_helper_deps, residual_references, wiring_recommendation,
+          ready, blockers, provenance }
   overloads: { method: [signature, ...] }  only present if dupes detected
   resolved_methods: signature-qualified names ready for extractClass
   field_closure: { field: [dep, ...] }     transitive constant deps
   augmented_move_fields: move_fields + closure deps
   augmented_fields_differ: true if closure added fields
   external_callers: { method: [file, ...] }  callers outside the source file
-	  has_external_callers: true → use wrappers:true in extractClass
-	  non_injectable_mutable: mutable instance fields not DI-injectable
-	  internal_helper_deps: moved methods that call remaining helpers, and moved
-	                        methods called by remaining methods
-	  residual_references: findings with referencing_member, moved_member,
-	                       moved_member_kind, reference_count, resolution_hint
-	  wiring_recommendation: "external_injection" | "own_construction"
-	  ready: true if no blockers found; false → inspect blockers before applying
-	  blockers: ["overload_multiple_signatures" | "external_callers_on_moved_methods"
-	             | "non_injectable_mutable_fields" | "internal_helper_dependencies"
-	             | "residual_references"]
+  has_external_callers: true → use wrappers:true in extractClass
+  non_injectable_mutable: mutable instance fields not DI-injectable
+  internal_helper_deps: forward-only map keyed by bare moved method name →
+                        remaining same-class helpers that method calls
+  residual_references: reverse direction — findings with referencing_member,
+                       moved_member, moved_member_kind, reference_count,
+                       resolution_hint
+  wiring_recommendation: "external_injection" | "own_construction"
+  ready: true if no blockers found; false → inspect blockers before applying
+  blockers: ["overloads_resolved_use_resolved_methods"
+             | "non_injectable_mutable_fields" | "internal_helper_dependencies"
+             | "residual_references"]
+             (external callers are informational via has_external_callers,
+             never a blocker — wrappers:true is the remedy)
 
 RECIPE
   const pp = await java.extractClassPreviewPlan({
@@ -11853,7 +11861,7 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; extractColumnSpec - deduplicate repeated grid/column construction into a spec table; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaResidualReferenceFinding = { finding: "residual_reference"; referencing_member: string; moved_member: string; moved_member_kind: "method" | "field"; reference_count: number; resolution_hint: string };
@@ -11943,7 +11951,6 @@ declare const java: {
   organizeImports(args: { files: string[] }): Promise<JavaHygieneResult>;
   /** Conservative whitespace hygiene for touched files. Returns {changes} → edits.merge; [] means no whitespace edits. */
   normalizeWhitespace(args: { files: string[] }): Promise<JavaHygieneResult>;
-  /** Routine post-apply hygiene bundle: imports + whitespace by default. Returns {changes} → edits.merge; compile again if applied. */
   /** Post-extract: synthesize delegating wrapper methods for moved helpers that still have same-class callers. Run after extractClass + apply, before first compile. */
   synthesizeHelperWrappers(args: { file: string; target: string; delegateField: string; methods: string[] }): Promise<{ changes: SpanChange[]; wrappers_added: string[]; stale_calls_remaining: string[]; note?: string; provenance: "syntax_only" }>;
   /** Routine post-apply hygiene bundle: imports + whitespace by default. Returns {changes} → edits.merge; compile again if applied. */
@@ -11999,8 +12006,8 @@ public class OrderService {
     public int counted() {
         return counter;
     }
-	}
-	"#;
+}
+"#;
 
     const RESIDUAL_REFERENCE_FIXTURE: &str = r#"package com.acme;
 
@@ -12023,8 +12030,8 @@ public class OrderService {
         void commit(long id) {
         }
     }
-	}
-	"#;
+}
+"#;
 
     const RESIDUAL_REMAINING_OVERLOAD_FIXTURE: &str = r#"package com.acme;
 

@@ -316,7 +316,7 @@ impl Tool for EditsReplaceText {
                 "es": { "type": "string", "description": "EditSet id from edits.begin." },
                 "file": { "type": "string", "description": "File to search. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
                 "find": { "type": "string", "description": "Text that must occur exactly once when occurrence is unique." },
-                "replace": { "type": "string", "description": "Replacement text queued for the matched bytes." },
+                "replace": { "type": "string", "description": "Replacement text queued for the matched bytes. `text` is accepted as an alias (the key span-based edits.replace uses)." },
                 "occurrence": { "type": "string", "enum": ["unique"], "description": "Currently only unique is supported; default unique." }
             },
             "required": ["es", "file", "find", "replace"]
