@@ -235,6 +235,448 @@ fn build_dependency_projection(
     (projection, capture_projections)
 }
 
+#[derive(Debug, Clone)]
+struct JavaMethodRange {
+    name: String,
+    signature: String,
+    byte_start: usize,
+    byte_end: usize,
+    line_start: usize,
+    line_end: usize,
+}
+
+fn byte_line(source: &str, byte: usize) -> usize {
+    let capped = byte.min(source.len());
+    source[..capped].bytes().filter(|b| *b == b'\n').count() + 1
+}
+
+fn normalize_java_param_type(param: &str) -> String {
+    let trimmed = param.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut tokens = trimmed
+        .split_whitespace()
+        .filter(|part| !part.starts_with('@'))
+        .filter(|part| *part != "final")
+        .collect::<Vec<_>>();
+    if tokens.len() > 1 {
+        tokens.pop();
+    }
+    tokens.join(" ").replace("...", "[]")
+}
+
+fn java_param_types_from_formals(params: &str) -> Vec<String> {
+    let inside = params
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    if inside.is_empty() {
+        return Vec::new();
+    }
+    inside.split(',').map(normalize_java_param_type).collect()
+}
+
+fn method_selector_name(selector: &str) -> &str {
+    selector.split('(').next().unwrap_or(selector).trim()
+}
+
+fn method_selector_matches(selector: &str, method: &JavaMethodRange) -> bool {
+    let Some(open) = selector.find('(') else {
+        return selector.trim() == method.name;
+    };
+    if !selector.ends_with(')') {
+        return selector.trim() == method.name;
+    }
+    let name = selector[..open].trim();
+    if name != method.name {
+        return false;
+    }
+    let params = selector[open + 1..selector.len() - 1]
+        .split(',')
+        .filter_map(|param| {
+            let param = param.trim();
+            (!param.is_empty()).then(|| normalize_java_param_type(param))
+        })
+        .collect::<Vec<_>>();
+    params
+        == java_param_types_from_formals(
+            method
+                .signature
+                .split_once('(')
+                .map(|(_, params)| params)
+                .unwrap_or(""),
+        )
+}
+
+fn java_method_ranges(path: &Path, source: &str) -> Result<Vec<JavaMethodRange>, String> {
+    let facts = bbox_refactor::facts::file_query(
+        path,
+        "(method_declaration name: (identifier) @name parameters: (formal_parameters) @params) @method",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let mut ranges = Vec::new();
+    for method_cap in facts.captures.iter().filter(|cap| cap.capture == "method") {
+        let Some(name_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= method_cap.byte_start
+                && cap.byte_end <= method_cap.byte_end
+        }) else {
+            continue;
+        };
+        let params_text = facts
+            .captures
+            .iter()
+            .find(|cap| {
+                cap.capture == "params"
+                    && cap.byte_start >= method_cap.byte_start
+                    && cap.byte_end <= method_cap.byte_end
+            })
+            .map(|cap| cap.text.as_str())
+            .unwrap_or("()");
+        let param_types = java_param_types_from_formals(params_text).join(",");
+        ranges.push(JavaMethodRange {
+            name: name_cap.text.clone(),
+            signature: format!("{}({})", name_cap.text, param_types),
+            byte_start: method_cap.byte_start,
+            byte_end: method_cap.byte_end,
+            line_start: byte_line(source, method_cap.byte_start),
+            line_end: byte_line(source, method_cap.byte_end),
+        });
+    }
+    Ok(ranges)
+}
+
+fn is_plan_moved_method(plan: &bbox_refactor::RefactorPlan, range: &JavaMethodRange) -> bool {
+    plan.items.iter().any(|item| {
+        item.kind == "method_declaration"
+            && item.byte_start == range.byte_start
+            && item.byte_end == range.byte_end
+    })
+}
+
+fn residual_reference_hint() -> &'static str {
+    "For moved-method references, pass wrappers:true, also move the referencing member, or run java.synthesizeHelperWrappers after apply. For moved-field references, also move the referencing member or review the generated delegate accessor rewrite; wrappers do not apply to fields."
+}
+
+fn build_residual_reference_findings(
+    path: &Path,
+    source: &str,
+    plan: &bbox_refactor::RefactorPlan,
+    moved_methods: &[String],
+    moved_fields: &[String],
+    wrappers: bool,
+) -> Result<Vec<Value>, String> {
+    let methods = java_method_ranges(path, source)?;
+    let remaining_methods = methods
+        .iter()
+        .filter(|method| !is_plan_moved_method(plan, method))
+        .collect::<Vec<_>>();
+    let mut counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+
+    if !wrappers && !moved_methods.is_empty() {
+        let moved_method_names = plan
+            .items
+            .iter()
+            .filter(|item| item.kind == "method_declaration")
+            .filter_map(|item| item.name.clone())
+            .collect::<BTreeSet<_>>();
+        if !moved_method_names.is_empty() {
+            let call_facts = bbox_refactor::facts::file_query(
+                path,
+                "(method_invocation name: (identifier) @call) @invoc",
+                None,
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            let invoc_ranges = call_facts
+                .captures
+                .iter()
+                .filter(|cap| cap.capture == "invoc")
+                .map(|cap| (cap.byte_start, cap.byte_end))
+                .collect::<Vec<_>>();
+            for call in call_facts
+                .captures
+                .iter()
+                .filter(|cap| cap.capture == "call")
+            {
+                if !moved_method_names.contains(&call.text) {
+                    continue;
+                }
+                if !is_same_class_helper_call(enclosing_invocation_text(
+                    source,
+                    &invoc_ranges,
+                    call.byte_start,
+                    call.byte_end,
+                )) {
+                    continue;
+                }
+                if let Some(referencing) = remaining_methods.iter().find(|method| {
+                    call.byte_start >= method.byte_start && call.byte_end <= method.byte_end
+                }) {
+                    let moved_member = moved_methods
+                        .iter()
+                        .find(|selector| method_selector_name(selector) == call.text)
+                        .cloned()
+                        .unwrap_or_else(|| call.text.clone());
+                    *counts
+                        .entry((
+                            referencing.signature.clone(),
+                            moved_member,
+                            "method".to_string(),
+                        ))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
+    let moved_field_set = moved_fields.iter().cloned().collect::<BTreeSet<_>>();
+    for accessor in &plan.remaining_source_accessors {
+        if !moved_field_set.contains(&accessor.field) {
+            continue;
+        }
+        for access in &accessor.accesses {
+            if let Some(referencing) = remaining_methods
+                .iter()
+                .find(|method| access.line >= method.line_start && access.line <= method.line_end)
+            {
+                *counts
+                    .entry((
+                        referencing.signature.clone(),
+                        accessor.field.clone(),
+                        "field".to_string(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    Ok(counts
+        .into_iter()
+        .map(
+            |((referencing_member, moved_member, moved_member_kind), reference_count)| {
+                json!({
+                    "finding": "residual_reference",
+                    "referencing_member": referencing_member,
+                    "moved_member": moved_member,
+                    "moved_member_kind": moved_member_kind,
+                    "reference_count": reference_count,
+                    "resolution_hint": residual_reference_hint(),
+                })
+            },
+        )
+        .collect())
+}
+
+fn internal_helper_deps_for_preview_plan(
+    path: &Path,
+    source: &str,
+    moved_methods: &[String],
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let methods = java_method_ranges(path, source)?;
+    let moved_ranges = methods
+        .iter()
+        .filter(|method| {
+            moved_methods
+                .iter()
+                .any(|selector| method_selector_matches(selector, method))
+        })
+        .collect::<Vec<_>>();
+    if moved_ranges.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let moved_names = moved_ranges
+        .iter()
+        .map(|method| method.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let source_method_names = methods
+        .iter()
+        .map(|method| method.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let call_facts = bbox_refactor::facts::file_query(
+        path,
+        "(method_invocation name: (identifier) @call) @invoc",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let invoc_ranges = call_facts
+        .captures
+        .iter()
+        .filter(|cap| cap.capture == "invoc")
+        .map(|cap| (cap.byte_start, cap.byte_end))
+        .collect::<Vec<_>>();
+    let mut deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for call in call_facts
+        .captures
+        .iter()
+        .filter(|cap| cap.capture == "call")
+    {
+        if !is_same_class_helper_call(enclosing_invocation_text(
+            source,
+            &invoc_ranges,
+            call.byte_start,
+            call.byte_end,
+        )) {
+            continue;
+        }
+
+        for moved in &moved_ranges {
+            if call.byte_start >= moved.byte_start
+                && call.byte_end <= moved.byte_end
+                && !moved_names.contains(call.text.as_str())
+                && source_method_names.contains(call.text.as_str())
+            {
+                deps.entry(moved.signature.clone())
+                    .or_default()
+                    .insert(call.text.clone());
+            }
+        }
+
+        if moved_names.contains(call.text.as_str())
+            && let Some(referencing) = methods.iter().find(|method| {
+                call.byte_start >= method.byte_start && call.byte_end <= method.byte_end
+            })
+            && !moved_ranges.iter().any(|moved| {
+                moved.byte_start == referencing.byte_start && moved.byte_end == referencing.byte_end
+            })
+        {
+            let moved_key = moved_methods
+                .iter()
+                .find(|selector| method_selector_name(selector) == call.text)
+                .cloned()
+                .unwrap_or_else(|| call.text.clone());
+            deps.entry(moved_key)
+                .or_default()
+                .insert(referencing.signature.clone());
+        }
+    }
+
+    Ok(deps
+        .into_iter()
+        .map(|(method, deps)| (method, deps.into_iter().collect()))
+        .collect())
+}
+
+fn preview_residual_reference_findings(
+    path: &Path,
+    source: &str,
+    moved_methods: &[String],
+    moved_fields: &[String],
+    class_name: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let methods = java_method_ranges(path, source)?;
+    let moved_ranges = methods
+        .iter()
+        .filter(|method| {
+            moved_methods
+                .iter()
+                .any(|selector| method_selector_matches(selector, method))
+        })
+        .collect::<Vec<_>>();
+    let remaining_methods = methods
+        .iter()
+        .filter(|method| {
+            !moved_ranges.iter().any(|moved| {
+                moved.byte_start == method.byte_start && moved.byte_end == method.byte_end
+            })
+        })
+        .collect::<Vec<_>>();
+    let moved_method_names = moved_ranges
+        .iter()
+        .map(|method| method.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+
+    if !moved_method_names.is_empty() {
+        let call_facts = bbox_refactor::facts::file_query(
+            path,
+            "(method_invocation name: (identifier) @call) @invoc",
+            None,
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        let invoc_ranges = call_facts
+            .captures
+            .iter()
+            .filter(|cap| cap.capture == "invoc")
+            .map(|cap| (cap.byte_start, cap.byte_end))
+            .collect::<Vec<_>>();
+        for call in call_facts
+            .captures
+            .iter()
+            .filter(|cap| cap.capture == "call")
+        {
+            if !moved_method_names.contains(call.text.as_str()) {
+                continue;
+            }
+            if !is_same_class_helper_call(enclosing_invocation_text(
+                source,
+                &invoc_ranges,
+                call.byte_start,
+                call.byte_end,
+            )) {
+                continue;
+            }
+            if let Some(referencing) = remaining_methods.iter().find(|method| {
+                call.byte_start >= method.byte_start && call.byte_end <= method.byte_end
+            }) {
+                let moved_member = moved_methods
+                    .iter()
+                    .find(|selector| method_selector_name(selector) == call.text)
+                    .cloned()
+                    .unwrap_or_else(|| call.text.clone());
+                *counts
+                    .entry((
+                        referencing.signature.clone(),
+                        moved_member,
+                        "method".to_string(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    if !moved_fields.is_empty()
+        && let Ok(classification) =
+            bbox_refactor::facts::java_field_classification(path, Some(moved_fields), class_name)
+    {
+        for field in classification.fields {
+            for access in field.accesses {
+                let Some(referencing) = remaining_methods.iter().find(|method| {
+                    access.line >= method.line_start && access.line <= method.line_end
+                }) else {
+                    continue;
+                };
+                *counts
+                    .entry((
+                        referencing.signature.clone(),
+                        field.name.clone(),
+                        "field".to_string(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    Ok(counts
+        .into_iter()
+        .map(
+            |((referencing_member, moved_member, moved_member_kind), reference_count)| {
+                json!({
+                    "finding": "residual_reference",
+                    "referencing_member": referencing_member,
+                    "moved_member": moved_member,
+                    "moved_member_kind": moved_member_kind,
+                    "reference_count": reference_count,
+                    "resolution_hint": residual_reference_hint(),
+                })
+            },
+        )
+        .collect())
+}
+
 /// Workspace-relative form of a plan-emitted absolute path, tolerant of the
 /// canonicalized-root mismatch on symlinked tempdirs (same fallback as
 /// lsp_facts).
@@ -954,7 +1396,7 @@ impl Tool for JavaExtractClass {
         "java.extractClass"
     }
     fn description(&self) -> &str {
-        "Extract named methods (and optionally fields) from the first class in a Java file into a new delegate class. Runs capture/external-call analysis and synthesizes both sides (new class file + source-side delegate wiring). Returns hash-anchored {changes, creates, findings} for the edits algebra — never writes. Refusals (e.g. extracted code writing a mutable un-moved field) are errors naming the exact fix."
+        "Extract named methods (and optionally fields) from the first class in a Java file into a new delegate class. Runs capture/external-call/residual-reference analysis and synthesizes both sides (new class file + source-side delegate wiring). Returns hash-anchored {changes, creates, findings} for the edits algebra - never writes. Refusals (e.g. extracted code writing a mutable un-moved field) are errors naming the exact fix."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -995,6 +1437,7 @@ impl Tool for JavaExtractClass {
         bro_tools::tool::call_blocking(move || {
             // Derive module_name from target path stem — always set it so
             // the v1 planner doesn't fall back to the source class name.
+            let requested_methods = params.methods.clone();
             let module_name = params.class_name.clone().or_else(|| {
                 std::path::Path::new(&params.target)
                     .file_stem()
@@ -1006,7 +1449,7 @@ impl Tool for JavaExtractClass {
                 "source": params.file,
                 "target": params.target,
                 "project_dir": root.to_string_lossy(),
-                "item_names": params.methods,
+                "item_names": requested_methods,
                 "delegate_field": params.delegate_field,
                 "module_name": module_name,
                 // gap-5fed070f: turn on the dependency analysis (external/inherited
@@ -1115,6 +1558,17 @@ impl Tool for JavaExtractClass {
                 &effective_wiring,
                 field_classification.as_ref(),
             );
+            let residual_findings = match build_residual_reference_findings(
+                &root.join(&params.file),
+                &source_text,
+                &plan,
+                &params.methods,
+                &move_fields,
+                params.wrappers.unwrap_or(false),
+            ) {
+                Ok(findings) => findings,
+                Err(e) => return err(format!("java.extractClass: residual reference scan: {e}")),
+            };
 
             // FileEdits → hash-anchored span changes (the edits.merge shape).
             // The v1 planner emits NEW files as whole-content inserts against
@@ -1213,6 +1667,7 @@ impl Tool for JavaExtractClass {
                 f["finding"] = json!("remaining_source_accessor");
                 findings.push(f);
             }
+            findings.extend(residual_findings);
             for note in &plan.leftovers {
                 findings.push(json!({ "finding": "note", "detail": note }));
             }
@@ -9022,10 +9477,14 @@ RETURNS { title, changes, creates, findings, dependency_projection, preview_only
     external_call         calls to source-class methods NOT in the moved set; recommended_resolution is one of
                           cross_class_static_call | add_to_item_names | add_to_callback_externals |
                           inject_source_instance | drop_the_call
-    inherited_dependency  calls resolving to a superclass/interface method
-    remaining_source_accessor  source-side accesses to moved fields that survive extraction
-    note                  planner prose (synthesis decisions, conservative refusal context)
-  fixme_count: number of FIXME markers in the synthesized text — 0 means clean synthesis
+	    inherited_dependency  calls resolving to a superclass/interface method
+	    remaining_source_accessor  source-side accesses to moved fields that survive extraction
+	    residual_reference    source-side member left behind still references a moved method or field.
+	                          Moved-method refs are suppressed by wrappers:true; moved-field refs are
+	                          reported regardless because wrappers only preserve methods.
+	    note                  planner prose (synthesis decisions, conservative refusal context)
+	  fixme_count: number of FIXME markers in the synthesized text. residual_reference findings do
+	               not increment this because they are pre-apply JSON warnings, not inserted FIXME text.
 
 ERRORS (operator-actionable, fix and re-call)
   mutable_capture_with_write: extracted code writes mutable source field(s) — add them to moveFields
@@ -9562,9 +10021,10 @@ const PREVIEW_PLAN_CONTRACT: &str = r#"java.extractClassPreviewPlan — one-cell
 
 WHAT IT DOES
   Replaces exploratory previewOnly loops with a single compact preflight.
-  Bundles: overload resolution, field initializer closure, external caller
-  survey, and DI wireability checks. If ready:true, skip previewOnly and go
-  directly to extractClass + edits.apply in the next cell.
+	  Bundles: overload resolution, field initializer closure, external caller
+	  survey, residual references from remaining source members to moved members,
+	  and DI wireability checks. If ready:true, skip previewOnly and go directly
+	  to extractClass + edits.apply in the next cell.
 
 PARAMS
   file: string         workspace-relative .java file
@@ -9572,22 +10032,27 @@ PARAMS
   moveFields?: string[] field names from cohesion cluster (seam.move_fields)
   className?: string   optional owner class name
 
-RETURNS { file, methods, overloads, resolved_methods, field_closure,
-          augmented_move_fields, augmented_fields_differ, external_callers,
-          has_external_callers, non_injectable_mutable, wiring_recommendation,
-          ready, blockers, provenance }
+	RETURNS { file, methods, overloads, resolved_methods, field_closure,
+	          augmented_move_fields, augmented_fields_differ, external_callers,
+	          has_external_callers, non_injectable_mutable, internal_helper_deps,
+	          residual_references, wiring_recommendation, ready, blockers, provenance }
   overloads: { method: [signature, ...] }  only present if dupes detected
   resolved_methods: signature-qualified names ready for extractClass
   field_closure: { field: [dep, ...] }     transitive constant deps
   augmented_move_fields: move_fields + closure deps
   augmented_fields_differ: true if closure added fields
   external_callers: { method: [file, ...] }  callers outside the source file
-  has_external_callers: true → use wrappers:true in extractClass
-  non_injectable_mutable: mutable instance fields not DI-injectable
-  wiring_recommendation: "external_injection" | "own_construction"
-  ready: true if no blockers found; false → inspect blockers before applying
-  blockers: ["overload_multiple_signatures" | "external_callers_on_moved_methods"
-             | "non_injectable_mutable_fields"]
+	  has_external_callers: true → use wrappers:true in extractClass
+	  non_injectable_mutable: mutable instance fields not DI-injectable
+	  internal_helper_deps: moved methods that call remaining helpers, and moved
+	                        methods called by remaining methods
+	  residual_references: findings with referencing_member, moved_member,
+	                       moved_member_kind, reference_count, resolution_hint
+	  wiring_recommendation: "external_injection" | "own_construction"
+	  ready: true if no blockers found; false → inspect blockers before applying
+	  blockers: ["overload_multiple_signatures" | "external_callers_on_moved_methods"
+	             | "non_injectable_mutable_fields" | "internal_helper_dependencies"
+	             | "residual_references"]
 
 RECIPE
   const pp = await java.extractClassPreviewPlan({
@@ -10501,7 +10966,7 @@ impl Tool for JavaExtractClassPreviewPlan {
         "java.extractClassPreviewPlan"
     }
     fn description(&self) -> &str {
-        "Preflight a java.extractClass seam before applying: resolves overloaded method signatures, computes field initializer closure, surveys external callers of moved helpers, and reports DI wireability risks. One cell instead of 5+ previewOnly exploratory calls. Use when cohesionClusters returns a candidate cluster — run this first, then skip previewOnly if ready:true. Pure; syntax_only; never writes."
+        "Preflight a java.extractClass seam before applying: resolves overloaded method signatures, computes field initializer closure, surveys external callers of moved helpers, reports residual source references, and reports DI wireability risks. One cell instead of 5+ previewOnly exploratory calls. Use when cohesionClusters returns a candidate cluster - run this first, then skip previewOnly if ready:true. Pure; syntax_only; never writes."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -10731,139 +11196,30 @@ impl Tool for JavaExtractClassPreviewPlan {
             //    compile failures after extract unless the helpers are also
             //    moved or the calls are routed through the delegate.
             let mut internal_helper_deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            if !params.methods.is_empty() && !resolved_methods.is_empty() {
-                // Query method invocations in the source file.
-                if let Ok(file_facts) = bbox_refactor::facts::file_query(
-                    &path,
-                    "(method_invocation name: (identifier) @call) @invoc",
-                    None,
-                ) {
-                    let moved_bare: BTreeSet<&str> = params.methods.iter()
-                        .map(|m| m.split('(').next().unwrap_or(m))
-                        .collect();
-                    // Byte ranges of every method_invocation node, used below to
-                    // classify each call as same-class (unqualified or
-                    // `this.`/`super.`) vs. a call on another object. Without
-                    // this, bean accessors like `obj.setName(p.getName())`
-                    // collide with declared accessors and false-positive as
-                    // internal-helper deps.
-                    let invoc_ranges: Vec<(usize, usize)> = file_facts
-                        .captures
-                        .iter()
-                        .filter(|c| c.capture == "invoc")
-                        .map(|c| (c.byte_start, c.byte_end))
-                        .collect();
-                    // For each invocation, check if the called name is a moved
-                    // method — we need the inverse: what non-moved helpers do
-                    // moved methods call? We approximate by collecting all
-                    // invocations in moved methods' byte ranges.
-                    // Simpler: collect all method invocations, then check
-                    // which call targets are referenced by moved methods but
-                    // not in the move set.
-                    let mut moved_method_ranges: Vec<(usize, usize, String)> = Vec::new();
-                    // Re-query for method declarations to get byte ranges
-                    // and the set of all source method names.
-                    let mut source_method_names: BTreeSet<String> = BTreeSet::new();
-                    if let Ok(method_facts) = bbox_refactor::facts::file_query(
-                        &path,
-                        "(method_declaration name: (identifier) @name) @method",
-                        None,
-                    ) {
-                        for cap in &method_facts.captures {
-                            if cap.capture == "name" {
-                                source_method_names.insert(cap.text.clone());
-                                if moved_bare.contains(cap.text.as_str()) {
-                                    if let Some(method_cap) = method_facts.captures.iter()
-                                        .find(|mc| mc.capture == "method"
-                                            && mc.byte_start <= cap.byte_start
-                                            && mc.byte_end >= cap.byte_end)
-                                    {
-                                        moved_method_ranges.push((
-                                            method_cap.byte_start, method_cap.byte_end,
-                                            cap.text.clone(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for (start, end, moved_name) in &moved_method_ranges {
-                        let mut called: BTreeSet<String> = BTreeSet::new();
-                        for cap in &file_facts.captures {
-                            if cap.capture == "call"
-                                && cap.byte_start >= *start
-                                && cap.byte_end <= *end
-                                && !moved_bare.contains(cap.text.as_str())
-                                && is_same_class_helper_call(enclosing_invocation_text(
-                                    &source,
-                                    &invoc_ranges,
-                                    cap.byte_start,
-                                    cap.byte_end,
-                                ))
-                            {
-                                called.insert(cap.text.clone());
-                            }
-                        }
-                        if !called.is_empty() {
-                            let source_helpers: Vec<String> = called
-                                .into_iter()
-                                .filter(|c| source_method_names.contains(c.as_str()))
-                                .collect();
-                            if !source_helpers.is_empty() {
-                                internal_helper_deps.insert(
-                                    moved_name.clone(),
-                                    source_helpers,
-                                );
-                            }
-                        }
-                    }
-                    // 5b. Reverse: for each moved helper, find same-class callers
-                    //     NOT in the move set (these need wrappers post-extract).
-                    //     Add them to internal_helper_deps keyed by the helper.
-                    if let Ok(method_facts) = bbox_refactor::facts::file_query(
-                        &path,
-                        "(method_declaration name: (identifier) @name) @method",
-                        None,
-                    ) {
-                        for cap in &file_facts.captures {
-                            if cap.capture != "call" { continue; }
-                            if !moved_bare.contains(cap.text.as_str()) { continue; }
-                            // Only a same-class call (unqualified or `this.`/
-                            // `super.`) makes the enclosing method a wrapper
-                            // candidate; a call on another object
-                            // (`obj.movedName()`) does not.
-                            if !is_same_class_helper_call(enclosing_invocation_text(
-                                &source,
-                                &invoc_ranges,
-                                cap.byte_start,
-                                cap.byte_end,
-                            )) {
-                                continue;
-                            }
-                            // This invocation calls a moved method. Find the
-                            // enclosing method.
-                            if let Some(enc) = method_facts.captures.iter().find(
-                                |mc| mc.capture == "name"
-                                    && mc.byte_start <= cap.byte_start
-                                    && mc.byte_end >= cap.byte_end
-                            ) {
-                                if !moved_bare.contains(enc.text.as_str()) {
-                                    let moved_name = params.methods.iter()
-                                        .find(|m| m.starts_with(&format!("{}(", cap.text.as_str())))
-                                        .cloned()
-                                        .unwrap_or_else(|| cap.text.clone());
-                                    let entry = internal_helper_deps
-                                        .entry(moved_name)
-                                        .or_default();
-                                    if !entry.contains(&enc.text) {
-                                        entry.push(enc.text.clone());
-                                    }
-                                }
-                            }
-                        }
+            if !params.methods.is_empty() {
+                match internal_helper_deps_for_preview_plan(&path, &source, &resolved_methods) {
+                    Ok(deps) => internal_helper_deps = deps,
+                    Err(e) => {
+                        return err(format!(
+                            "java.extractClassPreviewPlan: internal helper dependency scan: {e}"
+                        ));
                     }
                 }
             }
+            let residual_references = match preview_residual_reference_findings(
+                &path,
+                &source,
+                &resolved_methods,
+                &augmented_move_fields,
+                class_name.as_deref(),
+            ) {
+                Ok(findings) => findings,
+                Err(e) => {
+                    return err(format!(
+                        "java.extractClassPreviewPlan: residual reference scan: {e}"
+                    ));
+                }
+            };
 
             let overloads_resolved = !overloads.is_empty();
             let blockers: Vec<&str> = {
@@ -10881,6 +11237,9 @@ impl Tool for JavaExtractClassPreviewPlan {
                 }
                 if !internal_helper_deps.is_empty() {
                     b.push("internal_helper_dependencies");
+                }
+                if !residual_references.is_empty() {
+                    b.push("residual_references");
                 }
                 b
             };
@@ -10902,6 +11261,7 @@ impl Tool for JavaExtractClassPreviewPlan {
                 "has_external_callers": has_external_callers,
                 "non_injectable_mutable": non_injectable_mutable,
                 "internal_helper_deps": internal_helper_deps,
+                "residual_references": residual_references,
                 "wiring_recommendation": wiring_recommendation,
                 "ready": ready,
                 "blockers": blockers,
@@ -11480,9 +11840,10 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
+type JavaResidualReferenceFinding = { finding: "residual_reference"; referencing_member: string; moved_member: string; moved_member_kind: "method" | "field"; reference_count: number; resolution_hint: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaExtractMethodResult = { title: string; changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaDelete = { path: string; content_sha256: string };
@@ -11513,8 +11874,8 @@ type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string;
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
-  /** Preflight a java.extractClass seam: overloads, field closure, external callers, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
-  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
+  /** Preflight a java.extractClass seam: overloads, field closure, external callers, residual references, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
+  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; residual_references: JavaResidualReferenceFinding[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
   /** Detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. */
   extractColumnSpec(args: { file: string; methods: string[]; target: string; className?: string; spec_name?: string }): Promise<{ changes: SpanChange[]; creates: { path: string; content: string }[]; common_columns: string[]; spec_class: string; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
@@ -11625,6 +11986,30 @@ public class OrderService {
     public int counted() {
         return counter;
     }
+	}
+	"#;
+
+    const RESIDUAL_REFERENCE_FIXTURE: &str = r#"package com.acme;
+
+public class OrderService {
+    private int sequence;
+
+    public void submit(long id) {
+        submit(id, new Transaction());
+    }
+
+    public void submit(long id, Transaction tx) {
+        tx.commit(id);
+    }
+
+    public int nextSequence() {
+        return sequence;
+    }
+
+    static class Transaction {
+        void commit(long id) {
+        }
+    }
 }
 "#;
 
@@ -11647,6 +12032,15 @@ public class OrderService {
             .find(|change| change["span"]["file"] == file)
             .and_then(|change| change["new_text"].as_str())
             .unwrap()
+    }
+
+    fn residual_findings(result: &Value) -> Vec<&Value> {
+        result["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["finding"] == "residual_reference")
+            .collect()
     }
 
     #[test]
@@ -11883,6 +12277,193 @@ public class OrderService {
             span["content_sha256"],
             bbox_refactor::sha256_hex(FIXTURE.as_bytes()),
             "{span}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_reports_residual_references_in_preview_and_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            RESIDUAL_REFERENCE_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderSubmitter.java",
+                        "delegateField": "submitter",
+                        "methods": ["submit(long,Transaction)"],
+                        "moveFields": ["sequence"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(
+            preview["changes"].as_array().unwrap().is_empty(),
+            "{preview}"
+        );
+        let preview_residual = residual_findings(&preview);
+        assert!(
+            preview_residual.iter().any(|finding| {
+                finding["referencing_member"] == "submit(long)"
+                    && finding["moved_member"] == "submit(long,Transaction)"
+                    && finding["moved_member_kind"] == "method"
+                    && finding["reference_count"] == 1
+            }),
+            "{preview_residual:?}"
+        );
+        assert!(
+            preview_residual.iter().any(|finding| {
+                finding["referencing_member"] == "nextSequence()"
+                    && finding["moved_member"] == "sequence"
+                    && finding["moved_member_kind"] == "field"
+                    && finding["reference_count"] == 1
+            }),
+            "{preview_residual:?}"
+        );
+        assert_eq!(preview["fixme_count"], 0, "{preview}");
+
+        let full = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderSubmitter.java",
+                        "delegateField": "submitter",
+                        "methods": ["submit(long,Transaction)"],
+                        "moveFields": ["sequence"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let full_residual = residual_findings(&full);
+        assert!(
+            full_residual.iter().any(|finding| {
+                finding["referencing_member"] == "submit(long)"
+                    && finding["moved_member"] == "submit(long,Transaction)"
+                    && finding["moved_member_kind"] == "method"
+                    && finding["reference_count"] == 1
+            }),
+            "{full_residual:?}"
+        );
+        assert!(
+            full_residual.iter().any(|finding| {
+                finding["referencing_member"] == "nextSequence()"
+                    && finding["moved_member"] == "sequence"
+                    && finding["moved_member_kind"] == "field"
+                    && finding["reference_count"] == 1
+            }),
+            "{full_residual:?}"
+        );
+
+        let preview_plan = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "methods": ["submit(long,Transaction)"],
+                        "moveFields": ["sequence"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview_plan["ready"], json!(false), "{preview_plan}");
+        assert!(
+            preview_plan["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker == "residual_references"),
+            "{preview_plan}"
+        );
+        let plan_residual = preview_plan["residual_references"].as_array().unwrap();
+        assert!(
+            plan_residual.iter().any(|finding| {
+                finding["referencing_member"] == "submit(long)"
+                    && finding["moved_member"] == "submit(long,Transaction)"
+                    && finding["moved_member_kind"] == "method"
+                    && finding["reference_count"] == 1
+            }),
+            "{plan_residual:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_clean_extract_emits_no_residual_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(root.join("src/com/acme/OrderService.java"), FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderPricing.java",
+                        "delegateField": "pricing",
+                        "methods": ["price", "discount"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        assert!(residual_findings(&result).is_empty(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn extract_class_wrappers_suppress_moved_method_residual_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            RESIDUAL_REFERENCE_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderSubmitter.java",
+                        "delegateField": "submitter",
+                        "methods": ["submit(long,Transaction)"],
+                        "moveFields": ["sequence"],
+                        "wrappers": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let residual = residual_findings(&result);
+        assert!(
+            residual
+                .iter()
+                .all(|finding| finding["moved_member_kind"] != "method"),
+            "{residual:?}"
+        );
+        assert!(
+            residual
+                .iter()
+                .any(|finding| finding["moved_member_kind"] == "field"),
+            "moved-field residuals are independent of wrappers: {residual:?}"
         );
     }
 
