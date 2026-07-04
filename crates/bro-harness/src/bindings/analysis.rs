@@ -191,9 +191,16 @@ impl Tool for AnalysisCohesionClusters {
             // (file_moves/edits/validations are all empty here).
             let clusters = v.get("suggested_clusters").cloned().unwrap_or(json!([]));
             let cluster_count = clusters.as_array().map(|a| a.len()).unwrap_or(0);
+            // gap-b241d431: the v1 class summary carries an absolute
+            // source_path; relativize like every other binding payload.
+            let mut class = v.get("class").cloned().unwrap_or(json!({}));
+            if let Some(sp) = class.get("source_path").and_then(Value::as_str) {
+                let rel = workspace_relative(&root, sp);
+                class["source_path"] = json!(rel);
+            }
             ToolResult::Json(json!({
                 "file": params.file,
-                "class": v.get("class").cloned().unwrap_or(json!({})),
+                "class": class,
                 "cluster_count": cluster_count,
                 "clusters": clusters,
                 "cross_cluster_calls": v.get("cross_cluster_calls").cloned().unwrap_or(json!([])),

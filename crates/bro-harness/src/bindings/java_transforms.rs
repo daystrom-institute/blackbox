@@ -11152,6 +11152,10 @@ impl Tool for JavaExtractClassPreviewPlan {
                                             .unwrap_or(&path)
                                             .to_string_lossy()
                                             .to_string();
+                                        // gap-b241d431: the v1 usage summary emits absolute
+                                        // paths; relativize so the payload matches the rest of
+                                        // the surface AND the self-file exclusion actually
+                                        // compares like with like.
                                         let ext: BTreeMap<String, Vec<String>> = files_by_name
                                             .iter()
                                             .filter_map(|(sym, files)| {
@@ -11161,7 +11165,11 @@ impl Tool for JavaExtractClassPreviewPlan {
                                                     .iter()
                                                     .filter_map(|f| {
                                                         let f = f.as_str().unwrap_or("");
-                                                        if f != rel_file { Some(f.to_string()) } else { None }
+                                                        let f_rel = std::path::Path::new(f)
+                                                            .strip_prefix(&root)
+                                                            .map(|p| p.to_string_lossy().to_string())
+                                                            .unwrap_or_else(|_| f.to_string());
+                                                        if f_rel != rel_file { Some(f_rel) } else { None }
                                                     })
                                                     .collect();
                                                 if external.is_empty() { None } else { Some((sym.clone(), external)) }

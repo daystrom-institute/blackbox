@@ -80,15 +80,44 @@ pub(super) fn read_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
 struct FactTargets {
     #[serde(default)]
     file: Option<String>,
+    /// Entries are path strings, but `{ file }` objects are accepted too so
+    /// `code.files` output feeds `files:` verbatim (gap-ab200743). Kept as
+    /// raw values so a bad entry errors with its index instead of an opaque
+    /// type mismatch.
     #[serde(default)]
-    files: Option<Vec<String>>,
+    files: Option<Vec<Value>>,
 }
 
 impl FactTargets {
     /// `(targets, multi)` — `multi` preserves the single-file return shape
     /// for `file:` callers while `files:` callers get the batched shape.
     fn resolve(self, tool: &str) -> Result<(Vec<String>, bool), ToolResult> {
-        match (self.file, self.files) {
+        let files = match self.files {
+            None => None,
+            Some(raw) => {
+                let mut out = Vec::with_capacity(raw.len());
+                for (i, entry) in raw.into_iter().enumerate() {
+                    match entry {
+                        Value::String(s) => out.push(s),
+                        Value::Object(ref o) => match o.get("file").and_then(Value::as_str) {
+                            Some(s) => out.push(s.to_string()),
+                            None => {
+                                return Err(err(format!(
+                                    "{tool}: files[{i}] is an object without a string `file` field — pass path strings or code.files entries ({{ file, language }})"
+                                )));
+                            }
+                        },
+                        other => {
+                            return Err(err(format!(
+                                "{tool}: files[{i}] must be a path string or a {{ file }} object, got {other}"
+                            )));
+                        }
+                    }
+                }
+                Some(out)
+            }
+        };
+        match (self.file, files) {
             (Some(f), None) => Ok((vec![f], false)),
             (None, Some(fs)) if !fs.is_empty() => Ok((fs, true)),
             (None, Some(_)) => Err(err(format!("{tool}: `files` must be non-empty"))),
@@ -164,7 +193,7 @@ impl Tool for CodeItems {
             "type": "object",
             "properties": {
                 "file": { "type": "string", "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape)." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); the host fans out (use instead of a cell for-loop)." },
+                "files": { "type": "array", "items": { "anyOf": [{ "type": "string" }, { "type": "object", "properties": { "file": { "type": "string" } }, "required": ["file"] }] }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); code.files entries ({ file, language } objects) are accepted verbatim; the host fans out (use instead of a cell for-loop)." },
                 "top_level_only": { "type": "boolean", "description": "When true, drops items declared inside nested Java types. Alias: topLevelOnly." }
             }
         })
@@ -416,7 +445,7 @@ impl Tool for CodeQuery {
             "type": "object",
             "properties": {
                 "file": { "type": "string", "description": "Source file path. Relative paths resolve against the session root; absolute paths are accepted as-is (single-file shape)." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); the host fans out and returns a flat captures array." },
+                "files": { "type": "array", "items": { "anyOf": [{ "type": "string" }, { "type": "object", "properties": { "file": { "type": "string" } }, "required": ["file"] }] }, "description": "Batch of paths (relative paths resolve against the session root, absolute paths are accepted as-is); code.files entries ({ file, language } objects) are accepted verbatim; the host fans out and returns a flat captures array." },
                 "query": { "type": "string", "description": "Tree-sitter query source, e.g. \"(function_item name: (identifier) @fn_name)\"." },
                 "within": {
                     "type": "object",
@@ -1121,6 +1150,35 @@ class Probe {
         let span = &items[0]["span"];
         assert_eq!(span["file"], file);
         assert_eq!(span["content_sha256"], out["content_sha256"]);
+    }
+
+    #[tokio::test]
+    async fn files_arrays_accept_code_files_entry_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = java_fixture(&root);
+        // gap-ab200743: code.files output entries feed `files:` verbatim.
+        let out = json_of(
+            CodeItems
+                .call(
+                    json!({ "files": [{ "file": file, "language": "java" }] }),
+                    &cx_in(&root),
+                )
+                .await,
+        );
+        let batch = out["files"].as_array().unwrap();
+        assert_eq!(batch.len(), 1, "{out}");
+        assert!(batch[0]["items"].as_array().is_some(), "{out}");
+        // A bad entry errors with its index, not an opaque type mismatch.
+        let bad = CodeItems
+            .call(json!({ "files": [file, 7] }), &cx_in(&root))
+            .await;
+        match bad {
+            ToolResult::Error(e) => {
+                assert!(e.contains("files[1]"), "{e}");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

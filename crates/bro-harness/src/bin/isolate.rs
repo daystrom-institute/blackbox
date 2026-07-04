@@ -247,7 +247,21 @@ fn emit_tool_result(result: ToolResult, field: Option<&str>) -> Result<bool> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // gap-3cc07165: a relative --root silently breaks shell spawns inside
+    // cells (the child cwd resolves against a different process cwd) with an
+    // opaque os error 2. Canonicalize once so every consumer sees an
+    // absolute, existing root.
+    if let Some(root) = cli.root.take() {
+        let canonical = root.canonicalize().map_err(|e| {
+            anyhow!(
+                "--root {}: cannot canonicalize ({e}); pass an existing directory",
+                root.display()
+            )
+        })?;
+        cli.root = Some(canonical);
+    }
 
     let mcp_config = match &cli.mcp_config {
         Some(path) => Some(read_cli_file(path)?),

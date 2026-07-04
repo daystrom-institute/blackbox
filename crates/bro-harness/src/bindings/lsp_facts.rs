@@ -810,7 +810,7 @@ impl Tool for LspHover {
         "lsp.hover"
     }
     fn description(&self) -> &str {
-        "Resolve the type/info for the symbol a hash-anchored Span points at, via the language server (rust-analyzer for Rust, JDTLS for Java; warms on first use). THE Java var SEAM: point a Span at a `var x = ...` declarator (or any symbol) and get the server's authoritative resolved type — JDTLS resolves cross-file receiver return types and generic parameters (e.g. jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot. Returns { contents, language, position }; contents is null when the server has no info there. Fails closed when the server is unavailable; stale_span if the file changed since the Span was minted."
+        "Resolve the type/info for the symbol a hash-anchored Span points at, via the language server (rust-analyzer for Rust, JDTLS for Java; warms on first use). Whole-item spans are fine — the binding snaps to the item's name identifier like lsp.rename. THE Java var SEAM: point a Span at a `var x = ...` declarator (or any symbol) and get the server's authoritative resolved type — JDTLS resolves cross-file receiver return types and generic parameters (e.g. jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot. Returns { contents, language, position }; contents is null when the server has no info there. Fails closed when the server is unavailable; stale_span if the file changed since the Span was minted."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -868,7 +868,26 @@ impl Tool for LspHover {
             Ok(d) => d,
             Err(e) => return err(format!("lsp.hover: {e}")),
         };
-        let position = byte_to_position(&source, span.byte_start);
+        // gap-e5023a54: same snap as lsp.rename — a whole-item span starts at
+        // annotations/modifiers, where the server hovers to nothing.
+        let aim_byte = {
+            let abs = abs.clone();
+            let (start, end) = (span.byte_start, span.byte_end);
+            let snapped = bro_tools::tool::call_blocking(move || {
+                let snapped = bbox_refactor::facts::name_span(&abs, start, end)
+                    .ok()
+                    .flatten()
+                    .map(|(name_start, _)| name_start)
+                    .unwrap_or(start);
+                ToolResult::Json(json!(snapped))
+            })
+            .await;
+            match snapped {
+                ToolResult::Json(v) => v.as_u64().map(|b| b as usize).unwrap_or(span.byte_start),
+                _ => span.byte_start,
+            }
+        };
+        let position = byte_to_position(&source, aim_byte);
         let hover = match self.0.pool.hover(&doc, position).await {
             Ok(h) => h,
             Err(e) => return err(format!("lsp.hover: {}", render_lsp_error(e))),
@@ -897,7 +916,7 @@ declare const lsp: {
   willRenameFiles(args: { renames: Array<{ oldFile: string; newFile: string }>; language?: "java" | "rust" }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; resource_ops: unknown[]; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
   /** Execute a language-server workspace command. Defaults to Java/JDTLS. Use for server-specific refactor commands not modeled as standard LSP requests. */
   executeCommand(args: { command: string; arguments?: unknown[]; language?: "java" | "rust" }): Promise<{ command: string; language: string; result: unknown }>;
-  /** Resolve the type/info for the symbol a Span points at (rust-analyzer for .rs, JDTLS for .java; warms on first use). THE Java var SEAM: point a Span at a `var x = ...` declarator and JDTLS returns the authoritative resolved type — cross-file receiver returns and generic params (jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot derive. contents is the raw hover text (markdown/code blocks) for the caller to interpret, or null when the server has no info there. Read-only (no provenance ledger). Fails closed if the server is unavailable; stale_span on content drift. */
+  /** Resolve the type/info for the symbol a Span points at (rust-analyzer for .rs, JDTLS for .java; warms on first use). Whole-item spans are fine — snaps to the item's name identifier like lsp.rename. THE Java var SEAM: point a Span at a `var x = ...` declarator and JDTLS returns the authoritative resolved type — cross-file receiver returns and generic params (jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot derive. contents is the raw hover text (markdown/code blocks) for the caller to interpret, or null when the server has no info there. Read-only (no provenance ledger). Fails closed if the server is unavailable; stale_span on content drift. */
   hover(args: { span: Span }): Promise<HoverResult>;
 };"#
             .to_string(),
