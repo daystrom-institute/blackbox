@@ -137,7 +137,7 @@ impl Tool for BuildGate {
         let shell_result = shell
             .call(
                 json!({
-                    "command": command,
+                    "command": command.clone(),
                     "cwd": args.cwd.unwrap_or_else(|| ".".to_string()),
                     "timeout_ms": timeout_ms,
                     "yield_time_ms": 0,
@@ -156,45 +156,47 @@ impl Tool for BuildGate {
                 return ToolResult::Error(format!("build.gate: unexpected shell result: {t}"));
             }
         };
-        let exit_code = shell_json
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .unwrap_or(-1);
-        let timed_out = shell_json
-            .get("timed_out")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let stdout = shell_json
-            .get("stdout")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let stderr = shell_json
-            .get("stderr")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let combined = combine_streams(stdout, stderr);
+        // Parsing is pure, but span anchoring reads files; run the tail on
+        // the blocking pool so no fs I/O lands on a tokio worker (I2).
+        let root = cx.root.clone();
+        let anchor_spans = args.anchor_spans;
+        bro_tools::tool::call_blocking(move || {
+            let exit_code = shell_json
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1);
+            let timed_out = shell_json
+                .get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let stdout = shell_json
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let stderr = shell_json
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let combined = combine_streams(stdout, stderr);
 
-        let mut parsed = parse_build_output(
-            &args.command,
-            &combined,
-            exit_code,
-            timed_out,
-            max_diagnostics,
-        );
-        if args.anchor_spans {
-            anchor_diagnostics(&cx.root, &cwd_abs, &mut parsed.diagnostics);
-        }
+            let mut parsed =
+                parse_build_output(&command, &combined, exit_code, timed_out, max_diagnostics);
+            if anchor_spans {
+                anchor_diagnostics(&root, &cwd_abs, &mut parsed.diagnostics);
+            }
 
-        ToolResult::Json(json!({
-            "ok": exit_code == 0 && !timed_out,
-            "exit_code": exit_code,
-            "tool": parsed.tool,
-            "diagnostics": parsed.diagnostics,
-            "counts": parsed.counts,
-            "truncated": parsed.truncated,
-            "status_lines": parsed.status_lines,
-            "duration_ms": duration_ms
-        }))
+            ToolResult::Json(json!({
+                "ok": exit_code == 0 && !timed_out,
+                "exit_code": exit_code,
+                "tool": parsed.tool,
+                "diagnostics": parsed.diagnostics,
+                "counts": parsed.counts,
+                "truncated": parsed.truncated,
+                "status_lines": parsed.status_lines,
+                "duration_ms": duration_ms
+            }))
+        })
+        .await
     }
 }
 
@@ -398,6 +400,10 @@ fn command_mentions_javac(command_lower: &str) -> bool {
         .any(|part| part == "javac")
 }
 
+// Sync fs read is sanctioned here: anchor_diagnostics only runs inside the
+// call_blocking tail of build.gate, never on a tokio worker (concurrency-model
+// section 5).
+#[allow(clippy::disallowed_methods)]
 fn anchor_diagnostics(root: &Path, cwd: &Path, diagnostics: &mut [BuildDiagnostic]) {
     let mut cache: BTreeMap<PathBuf, Option<(String, Vec<u8>)>> = BTreeMap::new();
     for diagnostic in diagnostics.iter_mut() {
