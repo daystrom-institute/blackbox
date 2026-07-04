@@ -14,6 +14,7 @@
 //! facts of design/bro-harness/refactor-v2-pressure-test.md §5.
 
 pub mod analysis;
+pub mod build_gate;
 pub mod code_facts;
 pub mod edit_algebra;
 pub mod java_transforms;
@@ -49,6 +50,7 @@ pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
     tools.extend(lsp_facts::tools(Arc::clone(&lsp_state), ledger));
     tools.extend(java_transforms::tools(lsp_state));
     tools.extend(analysis::tools());
+    tools.extend(build_gate::tools());
     tools
 }
 
@@ -57,6 +59,7 @@ pub fn binding_tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_descriptions() -> BTreeMap<String, ToolNamespaceDescription> {
     BTreeMap::from([
         ("analysis".to_string(), analysis::namespace_description()),
+        ("build".to_string(), build_gate::namespace_description()),
         ("code".to_string(), code_facts::namespace_description()),
         ("edits".to_string(), edit_algebra::namespace_description()),
         ("java".to_string(), java_transforms::namespace_description()),
