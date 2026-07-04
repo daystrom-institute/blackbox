@@ -256,6 +256,40 @@ struct JavaInvocation {
     invoc_end: usize,
 }
 
+#[derive(Debug, Clone)]
+struct JavaTypeRange {
+    name: String,
+    qualified_name: String,
+    is_private: bool,
+    is_source_class: bool,
+    byte_start: usize,
+    byte_end: usize,
+    body_start: usize,
+    body_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct JavaCallableDecl {
+    name: String,
+    signature: String,
+    param_count: usize,
+    is_private: bool,
+}
+
+#[derive(Debug, Clone)]
+struct JavaFieldDecl {
+    name: String,
+    is_private: bool,
+}
+
+#[derive(Debug, Clone)]
+struct JavaAccessType {
+    range: JavaTypeRange,
+    constructors: Vec<JavaCallableDecl>,
+    methods: Vec<JavaCallableDecl>,
+    fields: Vec<JavaFieldDecl>,
+}
+
 fn byte_line(source: &str, byte: usize) -> usize {
     let capped = byte.min(source.len());
     source[..capped].bytes().filter(|b| *b == b'\n').count() + 1
@@ -370,13 +404,7 @@ fn residual_reference_hint() -> &'static str {
     "For moved-method references, pass wrappers:true, also move the referencing member, or run java.synthesizeHelperWrappers after apply. For moved-field references, also move the referencing member or review the generated delegate accessor rewrite; wrappers do not apply to fields."
 }
 
-fn java_invocations(path: &Path) -> Result<Vec<JavaInvocation>, String> {
-    let invoc_facts = bbox_refactor::facts::file_query(
-        path,
-        "(method_invocation name: (identifier) @call arguments: (argument_list) @args) @invoc",
-        None,
-    )
-    .map_err(|e| format!("{e:#}"))?;
+fn java_top_level_arg_counts(path: &Path) -> Result<BTreeMap<(usize, usize), usize>, String> {
     let arg_facts = bbox_refactor::facts::file_query(path, "(argument_list (_) @arg) @args", None)
         .map_err(|e| format!("{e:#}"))?;
     let arg_list_ranges = arg_facts
@@ -404,6 +432,17 @@ fn java_invocations(path: &Path) -> Result<Vec<JavaInvocation>, String> {
             ((*args_start, *args_end), count)
         })
         .collect::<BTreeMap<_, _>>();
+    Ok(top_level_arg_counts)
+}
+
+fn java_invocations(path: &Path) -> Result<Vec<JavaInvocation>, String> {
+    let invoc_facts = bbox_refactor::facts::file_query(
+        path,
+        "(method_invocation name: (identifier) @call arguments: (argument_list) @args) @invoc",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let top_level_arg_counts = java_top_level_arg_counts(path)?;
 
     let mut invocations = Vec::new();
     for invoc in invoc_facts
@@ -474,6 +513,730 @@ fn moved_target_for_call<'a>(
     // type. Under-report ambiguous arities rather than warning on calls that may
     // target a remaining overload.
     if remaining_match { None } else { moved_match }
+}
+
+fn has_java_modifier(prefix: &str, wanted: &str) -> bool {
+    prefix
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == wanted)
+}
+
+fn type_query() -> &'static str {
+    "[
+      (class_declaration name: (identifier) @name body: (class_body) @body) @type
+      (record_declaration name: (identifier) @name body: (class_body) @body) @type
+      (enum_declaration name: (identifier) @name) @type
+      (interface_declaration name: (identifier) @name body: (interface_body) @body) @type
+    ]"
+}
+
+fn java_type_ranges(
+    path: &Path,
+    source: &str,
+    source_class_name: Option<&str>,
+) -> Result<(JavaTypeRange, Vec<JavaTypeRange>), String> {
+    let facts =
+        bbox_refactor::facts::file_query(path, type_query(), None).map_err(|e| format!("{e:#}"))?;
+    let mut ranges = Vec::new();
+    for type_cap in facts.captures.iter().filter(|cap| cap.capture == "type") {
+        let Some(name_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= type_cap.byte_start
+                && cap.byte_end <= type_cap.byte_end
+        }) else {
+            continue;
+        };
+        let body_cap = facts
+            .captures
+            .iter()
+            .filter(|cap| {
+                cap.capture == "body"
+                    && cap.byte_start >= name_cap.byte_end
+                    && cap.byte_end <= type_cap.byte_end
+            })
+            .min_by_key(|cap| cap.byte_start);
+        let (body_start, body_end) = body_cap
+            .map(|cap| (cap.byte_start, cap.byte_end))
+            .unwrap_or((type_cap.byte_start, type_cap.byte_end));
+        let prefix = source
+            .get(type_cap.byte_start..name_cap.byte_start)
+            .unwrap_or_default();
+        ranges.push(JavaTypeRange {
+            name: name_cap.text.clone(),
+            qualified_name: name_cap.text.clone(),
+            is_private: has_java_modifier(prefix, "private"),
+            is_source_class: false,
+            byte_start: type_cap.byte_start,
+            byte_end: type_cap.byte_end,
+            body_start,
+            body_end,
+        });
+    }
+    ranges.sort_by_key(|range| (range.byte_start, range.byte_end));
+    for idx in 0..ranges.len() {
+        let mut owners = ranges
+            .iter()
+            .enumerate()
+            .filter(|(owner_idx, owner)| {
+                *owner_idx != idx
+                    && owner.byte_start < ranges[idx].byte_start
+                    && owner.byte_end > ranges[idx].byte_end
+            })
+            .collect::<Vec<_>>();
+        owners.sort_by_key(|(_, owner)| owner.byte_end - owner.byte_start);
+        owners.reverse();
+        if !owners.is_empty() {
+            let mut parts = owners
+                .iter()
+                .map(|(_, owner)| owner.name.clone())
+                .collect::<Vec<_>>();
+            parts.push(ranges[idx].name.clone());
+            ranges[idx].qualified_name = parts.join(".");
+        }
+    }
+
+    let source_idx = if let Some(source_class_name) = source_class_name {
+        ranges
+            .iter()
+            .position(|range| range.name == source_class_name)
+            .ok_or_else(|| format!("source class `{source_class_name}` not found"))?
+    } else {
+        ranges
+            .iter()
+            .enumerate()
+            .find(|(idx, range)| {
+                !ranges.iter().enumerate().any(|(owner_idx, owner)| {
+                    owner_idx != *idx
+                        && owner.byte_start < range.byte_start
+                        && owner.byte_end > range.byte_end
+                })
+            })
+            .map(|(idx, _)| idx)
+            .ok_or_else(|| "source class not found".to_string())?
+    };
+    ranges[source_idx].is_source_class = true;
+    let source_class = ranges[source_idx].clone();
+    let nested = ranges
+        .iter()
+        .enumerate()
+        .filter(|(idx, range)| {
+            *idx != source_idx
+                && range.byte_start > source_class.body_start
+                && range.byte_end < source_class.body_end
+        })
+        .map(|(_, range)| range.clone())
+        .collect();
+    Ok((source_class, nested))
+}
+
+fn type_reference_text(text: &str) -> String {
+    let mut cleaned = String::new();
+    let mut generic_depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '<' => generic_depth += 1,
+            '>' => generic_depth = generic_depth.saturating_sub(1),
+            '[' | ']' if generic_depth == 0 => {}
+            _ if generic_depth == 0 => cleaned.push(ch),
+            _ => {}
+        }
+    }
+    cleaned.trim().trim_end_matches("...").trim().to_string()
+}
+
+fn type_ref_matches(range: &JavaTypeRange, text: &str, candidates: &[JavaAccessType]) -> bool {
+    let text = type_reference_text(text);
+    if text.contains('.') {
+        return text == range.qualified_name
+            || text.ends_with(&format!(".{}", range.qualified_name));
+    }
+    if text != range.name {
+        return false;
+    }
+    candidates
+        .iter()
+        .filter(|candidate| candidate.range.name == range.name)
+        .count()
+        == 1
+}
+
+fn access_type_for_ref<'a>(
+    text: &str,
+    candidates: &'a [JavaAccessType],
+) -> Option<&'a JavaAccessType> {
+    candidates
+        .iter()
+        .find(|candidate| type_ref_matches(&candidate.range, text, candidates))
+}
+
+fn method_contains(method: &JavaMethodRange, start: usize, end: usize) -> bool {
+    start >= method.byte_start && end <= method.byte_end
+}
+
+fn type_contains(range: &JavaTypeRange, start: usize, end: usize) -> bool {
+    start >= range.body_start && end <= range.body_end
+}
+
+fn nested_type_contains(nested_types: &[JavaTypeRange], start: usize, end: usize) -> bool {
+    nested_types
+        .iter()
+        .any(|range| type_contains(range, start, end))
+}
+
+fn source_class_method<'a>(
+    methods: &'a [JavaMethodRange],
+    source_class: &JavaTypeRange,
+    nested_types: &[JavaTypeRange],
+) -> Vec<&'a JavaMethodRange> {
+    methods
+        .iter()
+        .filter(|method| {
+            type_contains(source_class, method.byte_start, method.byte_end)
+                && !nested_type_contains(nested_types, method.byte_start, method.byte_end)
+        })
+        .collect()
+}
+
+fn callable_signature(name: &str, params_text: &str) -> (String, usize) {
+    let param_types = java_param_types_from_formals(params_text);
+    (
+        format!("{}({})", name, param_types.join(",")),
+        param_types.len(),
+    )
+}
+
+fn java_constructor_decls(
+    path: &Path,
+    source: &str,
+    owner: &JavaTypeRange,
+) -> Result<Vec<JavaCallableDecl>, String> {
+    let facts = bbox_refactor::facts::file_query(
+        path,
+        "(constructor_declaration name: (identifier) @name parameters: (formal_parameters) @params) @ctor",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let mut decls = Vec::new();
+    for ctor in facts.captures.iter().filter(|cap| cap.capture == "ctor") {
+        if !type_contains(owner, ctor.byte_start, ctor.byte_end) {
+            continue;
+        }
+        let Some(name_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= ctor.byte_start
+                && cap.byte_end <= ctor.byte_end
+        }) else {
+            continue;
+        };
+        let Some(params_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "params"
+                && cap.byte_start >= ctor.byte_start
+                && cap.byte_end <= ctor.byte_end
+        }) else {
+            continue;
+        };
+        let prefix = source
+            .get(ctor.byte_start..name_cap.byte_start)
+            .unwrap_or_default();
+        let (signature, param_count) = callable_signature(&owner.name, &params_cap.text);
+        decls.push(JavaCallableDecl {
+            name: name_cap.text.clone(),
+            signature,
+            param_count,
+            is_private: has_java_modifier(prefix, "private"),
+        });
+    }
+    Ok(decls)
+}
+
+fn java_method_decls(
+    path: &Path,
+    source: &str,
+    owner: &JavaTypeRange,
+) -> Result<Vec<JavaCallableDecl>, String> {
+    let facts = bbox_refactor::facts::file_query(
+        path,
+        "(method_declaration name: (identifier) @name parameters: (formal_parameters) @params) @method",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let mut decls = Vec::new();
+    for method in facts.captures.iter().filter(|cap| cap.capture == "method") {
+        if !type_contains(owner, method.byte_start, method.byte_end) {
+            continue;
+        }
+        let Some(name_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= method.byte_start
+                && cap.byte_end <= method.byte_end
+        }) else {
+            continue;
+        };
+        let Some(params_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "params"
+                && cap.byte_start >= method.byte_start
+                && cap.byte_end <= method.byte_end
+        }) else {
+            continue;
+        };
+        let prefix = source
+            .get(method.byte_start..name_cap.byte_start)
+            .unwrap_or_default();
+        let (signature, param_count) = callable_signature(&name_cap.text, &params_cap.text);
+        decls.push(JavaCallableDecl {
+            name: name_cap.text.clone(),
+            signature,
+            param_count,
+            is_private: has_java_modifier(prefix, "private"),
+        });
+    }
+    Ok(decls)
+}
+
+fn java_field_decls(
+    path: &Path,
+    source: &str,
+    owner: &JavaTypeRange,
+) -> Result<Vec<JavaFieldDecl>, String> {
+    let facts = bbox_refactor::facts::file_query(
+        path,
+        "(field_declaration declarator: (variable_declarator name: (identifier) @name)) @field",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let mut decls = Vec::new();
+    for field in facts.captures.iter().filter(|cap| cap.capture == "field") {
+        if !type_contains(owner, field.byte_start, field.byte_end) {
+            continue;
+        }
+        let Some(name_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= field.byte_start
+                && cap.byte_end <= field.byte_end
+        }) else {
+            continue;
+        };
+        let prefix = source
+            .get(field.byte_start..name_cap.byte_start)
+            .unwrap_or_default();
+        decls.push(JavaFieldDecl {
+            name: name_cap.text.clone(),
+            is_private: has_java_modifier(prefix, "private"),
+        });
+    }
+    Ok(decls)
+}
+
+fn source_field_type_env(
+    path: &Path,
+    source_class: &JavaTypeRange,
+    nested_types: &[JavaTypeRange],
+    candidates: &[JavaAccessType],
+) -> Result<BTreeMap<String, usize>, String> {
+    let facts = bbox_refactor::facts::file_query(
+        path,
+        "(field_declaration type: (_) @type declarator: (variable_declarator name: (identifier) @name)) @field",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let mut env = BTreeMap::new();
+    for field in facts.captures.iter().filter(|cap| cap.capture == "field") {
+        if !type_contains(source_class, field.byte_start, field.byte_end)
+            || nested_type_contains(nested_types, field.byte_start, field.byte_end)
+        {
+            continue;
+        }
+        let Some(type_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "type"
+                && cap.byte_start >= field.byte_start
+                && cap.byte_end <= field.byte_end
+        }) else {
+            continue;
+        };
+        let Some(name_cap) = facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= field.byte_start
+                && cap.byte_end <= field.byte_end
+        }) else {
+            continue;
+        };
+        if let Some(idx) = candidates
+            .iter()
+            .position(|candidate| type_ref_matches(&candidate.range, &type_cap.text, candidates))
+        {
+            env.insert(name_cap.text.clone(), idx);
+        }
+    }
+    Ok(env)
+}
+
+fn method_type_env(
+    path: &Path,
+    method: &JavaMethodRange,
+    base_env: &BTreeMap<String, usize>,
+    candidates: &[JavaAccessType],
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut env = base_env.clone();
+    let param_facts = bbox_refactor::facts::file_query(
+        path,
+        "(formal_parameter type: (_) @type name: (identifier) @name) @param",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    for param in param_facts
+        .captures
+        .iter()
+        .filter(|cap| cap.capture == "param")
+    {
+        if !method_contains(method, param.byte_start, param.byte_end) {
+            continue;
+        }
+        let Some(type_cap) = param_facts.captures.iter().find(|cap| {
+            cap.capture == "type"
+                && cap.byte_start >= param.byte_start
+                && cap.byte_end <= param.byte_end
+        }) else {
+            continue;
+        };
+        let Some(name_cap) = param_facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= param.byte_start
+                && cap.byte_end <= param.byte_end
+        }) else {
+            continue;
+        };
+        if let Some(idx) = candidates
+            .iter()
+            .position(|candidate| type_ref_matches(&candidate.range, &type_cap.text, candidates))
+        {
+            env.insert(name_cap.text.clone(), idx);
+        }
+    }
+
+    let local_facts = bbox_refactor::facts::file_query(
+        path,
+        "(local_variable_declaration type: (_) @type declarator: (variable_declarator name: (identifier) @name)) @local",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    for local in local_facts
+        .captures
+        .iter()
+        .filter(|cap| cap.capture == "local")
+    {
+        if !method_contains(method, local.byte_start, local.byte_end) {
+            continue;
+        }
+        let Some(type_cap) = local_facts.captures.iter().find(|cap| {
+            cap.capture == "type"
+                && cap.byte_start >= local.byte_start
+                && cap.byte_end <= local.byte_end
+        }) else {
+            continue;
+        };
+        let Some(name_cap) = local_facts.captures.iter().find(|cap| {
+            cap.capture == "name"
+                && cap.byte_start >= local.byte_start
+                && cap.byte_end <= local.byte_end
+        }) else {
+            continue;
+        };
+        if let Some(idx) = candidates
+            .iter()
+            .position(|candidate| type_ref_matches(&candidate.range, &type_cap.text, candidates))
+        {
+            env.insert(name_cap.text.clone(), idx);
+        }
+    }
+    Ok(env)
+}
+
+fn receiver_name(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('(') {
+        return None;
+    }
+    let last = trimmed.rsplit('.').next().unwrap_or(trimmed);
+    last.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        .then_some(last)
+}
+
+fn private_callable_match(
+    decls: &[JavaCallableDecl],
+    name: &str,
+    arg_count: usize,
+) -> Option<String> {
+    let same_arity = decls
+        .iter()
+        .filter(|decl| decl.name == name && decl.param_count == arg_count)
+        .collect::<Vec<_>>();
+    if same_arity.iter().any(|decl| !decl.is_private) {
+        return None;
+    }
+    same_arity
+        .into_iter()
+        .find(|decl| decl.is_private)
+        .map(|decl| decl.signature.clone())
+}
+
+fn nest_access_hint() -> &'static str {
+    "The extracted delegate is generated in the same package, so package-private access is sufficient. Relax the nested type or member to package-private, keep the referencing method behind, or add/use an accessible factory. Moving the referencing method is not a fix here because nested types stay on the source class."
+}
+
+fn nest_break_json(
+    referencing_member: String,
+    referenced_member: String,
+    referenced_member_kind: &'static str,
+    declaring_type: &JavaTypeRange,
+    reference_count: usize,
+) -> Value {
+    json!({
+        "finding": "nest_access_break",
+        "referencing_member": referencing_member,
+        "referenced_member": referenced_member,
+        "referenced_member_kind": referenced_member_kind,
+        "declaring_nested_type": (!declaring_type.is_source_class).then(|| declaring_type.qualified_name.clone()),
+        "declaring_type": declaring_type.qualified_name,
+        "reference_count": reference_count,
+        "resolution_hint": nest_access_hint(),
+    })
+}
+
+fn build_nest_access_break_findings(
+    path: &Path,
+    source: &str,
+    moved_method_ranges: &[&JavaMethodRange],
+    source_class_name: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    if moved_method_ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (source_class, nested_types) = java_type_ranges(path, source, source_class_name)?;
+    let mut candidate_ranges = nested_types.clone();
+    candidate_ranges.push(source_class.clone());
+    let mut candidates = Vec::new();
+    for range in candidate_ranges {
+        candidates.push(JavaAccessType {
+            constructors: java_constructor_decls(path, source, &range)?,
+            methods: java_method_decls(path, source, &range)?,
+            fields: java_field_decls(path, source, &range)?,
+            range,
+        });
+    }
+    let source_field_env = source_field_type_env(path, &source_class, &nested_types, &candidates)?;
+    let arg_counts = java_top_level_arg_counts(path)?;
+    let mut counts: BTreeMap<(String, String, &'static str, String), usize> = BTreeMap::new();
+
+    let type_facts = bbox_refactor::facts::file_query(
+        path,
+        "[(type_identifier) @type (scoped_type_identifier) @type]",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let new_facts = bbox_refactor::facts::file_query(
+        path,
+        "(object_creation_expression type: (_) @type arguments: (argument_list) @args) @new",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let method_facts = bbox_refactor::facts::file_query(
+        path,
+        "(method_invocation object: (_) @object name: (identifier) @name arguments: (argument_list) @args) @invoc",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let field_facts = bbox_refactor::facts::file_query(
+        path,
+        "(field_access object: (_) @object field: (identifier) @field) @access",
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+
+    for moved in moved_method_ranges {
+        let type_env = method_type_env(path, moved, &source_field_env, &candidates)?;
+        for type_cap in type_facts
+            .captures
+            .iter()
+            .filter(|cap| cap.capture == "type")
+        {
+            if !method_contains(moved, type_cap.byte_start, type_cap.byte_end) {
+                continue;
+            }
+            let Some(candidate) = access_type_for_ref(&type_cap.text, &candidates) else {
+                continue;
+            };
+            if candidate.range.is_private && !candidate.range.is_source_class {
+                *counts
+                    .entry((
+                        moved.signature.clone(),
+                        candidate.range.name.clone(),
+                        "type",
+                        candidate.range.qualified_name.clone(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+
+        for new_cap in new_facts.captures.iter().filter(|cap| cap.capture == "new") {
+            if !method_contains(moved, new_cap.byte_start, new_cap.byte_end) {
+                continue;
+            }
+            let Some(type_cap) = new_facts.captures.iter().find(|cap| {
+                cap.capture == "type"
+                    && cap.byte_start >= new_cap.byte_start
+                    && cap.byte_end <= new_cap.byte_end
+            }) else {
+                continue;
+            };
+            let Some(args_cap) = new_facts.captures.iter().find(|cap| {
+                cap.capture == "args"
+                    && cap.byte_start >= new_cap.byte_start
+                    && cap.byte_end <= new_cap.byte_end
+            }) else {
+                continue;
+            };
+            let Some(candidate) = access_type_for_ref(&type_cap.text, &candidates) else {
+                continue;
+            };
+            let arg_count = arg_counts
+                .get(&(args_cap.byte_start, args_cap.byte_end))
+                .copied()
+                .unwrap_or(0);
+            if let Some(signature) =
+                private_callable_match(&candidate.constructors, &candidate.range.name, arg_count)
+            {
+                *counts
+                    .entry((
+                        moved.signature.clone(),
+                        signature,
+                        "constructor",
+                        candidate.range.qualified_name.clone(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+
+        for invoc in method_facts
+            .captures
+            .iter()
+            .filter(|cap| cap.capture == "invoc")
+        {
+            if !method_contains(moved, invoc.byte_start, invoc.byte_end) {
+                continue;
+            }
+            let Some(object_cap) = method_facts.captures.iter().find(|cap| {
+                cap.capture == "object"
+                    && cap.byte_start >= invoc.byte_start
+                    && cap.byte_end <= invoc.byte_end
+            }) else {
+                continue;
+            };
+            let Some(name_cap) = method_facts.captures.iter().find(|cap| {
+                cap.capture == "name"
+                    && cap.byte_start >= invoc.byte_start
+                    && cap.byte_end <= invoc.byte_end
+            }) else {
+                continue;
+            };
+            let Some(args_cap) = method_facts.captures.iter().find(|cap| {
+                cap.capture == "args"
+                    && cap.byte_start >= invoc.byte_start
+                    && cap.byte_end <= invoc.byte_end
+            }) else {
+                continue;
+            };
+            let Some(receiver) = receiver_name(&object_cap.text) else {
+                continue;
+            };
+            let Some(candidate_idx) = type_env.get(receiver).copied() else {
+                continue;
+            };
+            let candidate = &candidates[candidate_idx];
+            let arg_count = arg_counts
+                .get(&(args_cap.byte_start, args_cap.byte_end))
+                .copied()
+                .unwrap_or(0);
+            if let Some(signature) =
+                private_callable_match(&candidate.methods, &name_cap.text, arg_count)
+            {
+                *counts
+                    .entry((
+                        moved.signature.clone(),
+                        signature,
+                        "method",
+                        candidate.range.qualified_name.clone(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+
+        for access in field_facts
+            .captures
+            .iter()
+            .filter(|cap| cap.capture == "access")
+        {
+            if !method_contains(moved, access.byte_start, access.byte_end) {
+                continue;
+            }
+            let Some(object_cap) = field_facts.captures.iter().find(|cap| {
+                cap.capture == "object"
+                    && cap.byte_start >= access.byte_start
+                    && cap.byte_end <= access.byte_end
+            }) else {
+                continue;
+            };
+            let Some(field_cap) = field_facts.captures.iter().find(|cap| {
+                cap.capture == "field"
+                    && cap.byte_start >= access.byte_start
+                    && cap.byte_end <= access.byte_end
+            }) else {
+                continue;
+            };
+            let Some(receiver) = receiver_name(&object_cap.text) else {
+                continue;
+            };
+            let Some(candidate_idx) = type_env.get(receiver).copied() else {
+                continue;
+            };
+            let candidate = &candidates[candidate_idx];
+            if candidate
+                .fields
+                .iter()
+                .any(|field| field.name == field_cap.text && field.is_private)
+            {
+                *counts
+                    .entry((
+                        moved.signature.clone(),
+                        field_cap.text.clone(),
+                        "field",
+                        candidate.range.qualified_name.clone(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    Ok(counts
+        .into_iter()
+        .filter_map(
+            |(
+                (referencing_member, referenced_member, referenced_member_kind, declaring_type),
+                reference_count,
+            )| {
+                let declaring = candidates
+                    .iter()
+                    .find(|candidate| candidate.range.qualified_name == declaring_type)?;
+                Some(nest_break_json(
+                    referencing_member,
+                    referenced_member,
+                    referenced_member_kind,
+                    &declaring.range,
+                    reference_count,
+                ))
+            },
+        )
+        .collect())
 }
 
 fn build_residual_reference_findings(
@@ -1600,6 +2363,23 @@ impl Tool for JavaExtractClass {
                 Ok(findings) => findings,
                 Err(e) => return err(format!("java.extractClass: residual reference scan: {e}")),
             };
+            let methods = match java_method_ranges(&root.join(&params.file), &source_text) {
+                Ok(methods) => methods,
+                Err(e) => return err(format!("java.extractClass: nest access scan: {e}")),
+            };
+            let moved_method_ranges = methods
+                .iter()
+                .filter(|method| is_plan_moved_method(&plan, method))
+                .collect::<Vec<_>>();
+            let nest_access_breaks = match build_nest_access_break_findings(
+                &root.join(&params.file),
+                &source_text,
+                &moved_method_ranges,
+                None,
+            ) {
+                Ok(findings) => findings,
+                Err(e) => return err(format!("java.extractClass: nest access scan: {e}")),
+            };
 
             // FileEdits → hash-anchored span changes (the edits.merge shape).
             // The v1 planner emits NEW files as whole-content inserts against
@@ -1699,6 +2479,7 @@ impl Tool for JavaExtractClass {
                 findings.push(f);
             }
             findings.extend(residual_findings);
+            findings.extend(nest_access_breaks);
             for note in &plan.leftovers {
                 findings.push(json!({ "finding": "note", "detail": note }));
             }
@@ -9513,9 +10294,14 @@ RETURNS { title, changes, creates, findings, dependency_projection, preview_only
     residual_reference    source-side member left behind still references a moved method or field.
                           Moved-method refs are suppressed by wrappers:true; moved-field refs are
                           reported regardless because wrappers only preserve methods.
+    nest_access_break     moved code references a private nested source type, a private constructor
+                          on a nested source type, or a syntactically-resolved private method/field
+                          on a nested source type instance. Same signal is used for uncovered
+                          private source-type member references such as private constructors.
     note                  planner prose (synthesis decisions, conservative refusal context)
-  fixme_count: number of FIXME markers in the synthesized text. residual_reference findings do
-               not increment this because they are pre-apply JSON warnings, not inserted FIXME text.
+  fixme_count: number of FIXME markers in the synthesized text. residual_reference and
+               nest_access_break findings do not increment this because they are pre-apply
+               JSON warnings, not inserted FIXME text.
 
 ERRORS (operator-actionable, fix and re-call)
   mutable_capture_with_write: extracted code writes mutable source field(s) — add them to moveFields
@@ -10058,6 +10844,7 @@ WHAT IT DOES
   Replaces exploratory previewOnly loops with a single compact preflight.
   Bundles: overload resolution, field initializer closure, external caller
   survey, residual references from remaining source members to moved members,
+  nest access breaks from moved members to private nested source types/members,
   and DI wireability checks. If ready:true, skip previewOnly and go directly
   to extractClass + edits.apply in the next cell.
 
@@ -10070,8 +10857,8 @@ PARAMS
 RETURNS { file, methods, overloads, overloads_resolved, resolved_methods,
           field_closure, augmented_move_fields, augmented_fields_differ,
           external_callers, has_external_callers, non_injectable_mutable,
-          internal_helper_deps, residual_references, wiring_recommendation,
-          ready, blockers, provenance }
+          internal_helper_deps, residual_references, nest_access_breaks,
+          wiring_recommendation, ready, blockers, provenance }
   overloads: { method: [signature, ...] }  only present if dupes detected
   resolved_methods: signature-qualified names ready for extractClass
   field_closure: { field: [dep, ...] }     transitive constant deps
@@ -10085,11 +10872,13 @@ RETURNS { file, methods, overloads, overloads_resolved, resolved_methods,
   residual_references: reverse direction — findings with referencing_member,
                        moved_member, moved_member_kind, reference_count,
                        resolution_hint
+  nest_access_breaks: moved members referencing private nested source types or
+                      private nested source members that the delegate cannot access
   wiring_recommendation: "external_injection" | "own_construction"
   ready: true if no blockers found; false → inspect blockers before applying
   blockers: ["overloads_resolved_use_resolved_methods"
              | "non_injectable_mutable_fields" | "internal_helper_dependencies"
-             | "residual_references"]
+             | "residual_references" | "nest_access_breaks"]
              (external callers are informational via has_external_callers,
              never a blocker — wrappers:true is the remedy)
 
@@ -11249,6 +12038,47 @@ impl Tool for JavaExtractClassPreviewPlan {
                     ));
                 }
             };
+            let nest_access_breaks = {
+                let methods = match java_method_ranges(&path, &source) {
+                    Ok(methods) => methods,
+                    Err(e) => {
+                        return err(format!(
+                            "java.extractClassPreviewPlan: nest access scan: {e}"
+                        ));
+                    }
+                };
+                let (source_class, nested_types) =
+                    match java_type_ranges(&path, &source, class_name.as_deref()) {
+                        Ok(types) => types,
+                        Err(e) => {
+                            return err(format!(
+                                "java.extractClassPreviewPlan: nest access scan: {e}"
+                            ));
+                        }
+                    };
+                let source_methods = source_class_method(&methods, &source_class, &nested_types);
+                let moved_ranges = source_methods
+                    .into_iter()
+                    .filter(|method| {
+                        resolved_methods
+                            .iter()
+                            .any(|selector| method_selector_matches(selector, method))
+                    })
+                    .collect::<Vec<_>>();
+                match build_nest_access_break_findings(
+                    &path,
+                    &source,
+                    &moved_ranges,
+                    class_name.as_deref(),
+                ) {
+                    Ok(findings) => findings,
+                    Err(e) => {
+                        return err(format!(
+                            "java.extractClassPreviewPlan: nest access scan: {e}"
+                        ));
+                    }
+                }
+            };
 
             let overloads_resolved = !overloads.is_empty();
             let blockers: Vec<&str> = {
@@ -11269,6 +12099,9 @@ impl Tool for JavaExtractClassPreviewPlan {
                 }
                 if !residual_references.is_empty() {
                     b.push("residual_references");
+                }
+                if !nest_access_breaks.is_empty() {
+                    b.push("nest_access_breaks");
                 }
                 b
             };
@@ -11291,6 +12124,7 @@ impl Tool for JavaExtractClassPreviewPlan {
                 "non_injectable_mutable": non_injectable_mutable,
                 "internal_helper_deps": internal_helper_deps,
                 "residual_references": residual_references,
+                "nest_access_breaks": nest_access_breaks,
                 "wiring_recommendation": wiring_recommendation,
                 "ready": ready,
                 "blockers": blockers,
@@ -11869,10 +12703,11 @@ pub fn tools(lsp_state: Arc<super::lsp_facts::LspState>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "java".to_string(),
-        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; extractColumnSpec - deduplicate repeated grid/column construction into a spec table; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
+        description: "Java transform authorities. Most transforms are tree-sitter-backed with provenance syntax_only; moveClass and movePackage are JDTLS-backed with provenance lsp_verified. Each transform runs host-side and returns edits-algebra inputs - never writes. Call java.describe({transform}) for the full contract before first use. For binding-aware Java rename, use lsp.rename with a symbol span; java.renameSymbol is the legacy simple-name planner. Transforms: extractClass - move methods/fields from a class into a new delegate class with source-side wiring (DI sources auto-wire external_injection so the delegate stays AOP-interceptable); extractClassPreviewPlan - one-cell seam-dependency preflight (overloads + field closure + external callers + residual references + nest access breaks + DI wireability) before extractClass; extractMethodCodeBlock - extract one contiguous code block into a helper method after analysis.methodRegions gates; extractColumnSpec - deduplicate repeated grid/column construction into a spec table; renameSymbol - project-wide Java simple-symbol rename via the v1 planner; moveClass - relocate one Java source file through JDTLS java/getMoveDestinations + java/move and hash-guarded source delete; movePackage - relocate every file declaring a package through one JDTLS java/getMoveDestinations + java/move flow; moveMemberPreview/moveMember - move instance fields or static final constants to a target class with preview-local refs; pullUpPreview - rich selectable method-contract view with preview-local signature refs; extractInterface - consume preview refs to create an interface or abstract type and update the source; pullUpMembers - consume preview refs into an existing interface or abstract class; pushDownMembersPreview/pushDownMembers - move concrete methods/fields from a source type into one existing target subtype; changeSignaturePreview/changeSignature - rewrite method parameter shape plus acknowledged syntax-only call sites; encapsulateFieldPreview/encapsulateField - make a field private, add accessors, and optionally rewrite acknowledged syntax-only references; replaceConstructorWithFactoryPreview/replaceConstructorWithFactory - privatize one constructor, add a static factory, and rewrite acknowledged new-expression call sites; migrateTypeUsagesPreview/migrateTypeUsages - migrate one-file Java type-use positions with preview-local refs; inlineMethodPreview/inlineMethod - inline a planner-approved Java method and delete its declaration; removeUnusedConstructorParams - drop dead @Inject ctor params after an extract (move the injection point); synthesizeHelperWrappers - post-extract: synthesize delegating wrapper methods for moved helpers with same-class callers; addImport - insertion-only Java import helper; organizeImports / normalizeWhitespace / hygiene - routine post-apply cleanup for touched Java files."
             .to_string(),
         declarations: r#"type JavaDependencyProjection = { wiring: "own_construction" | "external_injection" | "none"; constructor_param_count: number; constructor_params: ({ finding: "captured_dependency"; name: string; type: string; route: string; target_constructor_param: boolean; wireability: string; risk?: string; recommendation?: string } & Record<string, unknown>)[]; non_injectable_params: string[]; moved_captured_fields: string[]; static_final_constants: string[]; summary: string };
 type JavaResidualReferenceFinding = { finding: "residual_reference"; referencing_member: string; moved_member: string; moved_member_kind: "method" | "field"; reference_count: number; resolution_hint: string };
+type JavaNestAccessBreakFinding = { finding: "nest_access_break"; referencing_member: string; referenced_member: string; referenced_member_kind: "type" | "constructor" | "method" | "field"; declaring_nested_type: string | null; declaring_type: string; reference_count: number; resolution_hint: string };
 type JavaTransformResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: ({ finding: string } & Record<string, unknown>)[]; dependency_projection: JavaDependencyProjection; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; would_create_files: { path: string; bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaExtractMethodResult = { title: string; changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; would_change_files: { path: string; edit_count: number; replacement_bytes: number }[]; fixme_count: number; provenance: "syntax_only" };
 type JavaDelete = { path: string; content_sha256: string };
@@ -11903,8 +12738,8 @@ type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string;
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
-  /** Preflight a java.extractClass seam: overloads, field closure, external callers, residual references, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
-  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; residual_references: JavaResidualReferenceFinding[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
+  /** Preflight a java.extractClass seam: overloads, field closure, external callers, residual references, nest access breaks, DI wireability. One cell instead of previewOnly loops. If ready:true, skip previewOnly → extractClass + apply. */
+  extractClassPreviewPlan(args: { file: string; methods: string[]; moveFields?: string[]; className?: string }): Promise<{ file: string; methods: string[]; overloads: Record<string, string[]>; overloads_resolved: boolean; resolved_methods: string[]; field_closure: Record<string, string[]>; augmented_move_fields: string[]; augmented_fields_differ: boolean; external_callers: Record<string, string[]>; has_external_callers: boolean; non_injectable_mutable: string[]; internal_helper_deps: Record<string, string[]>; residual_references: JavaResidualReferenceFinding[]; nest_access_breaks: JavaNestAccessBreakFinding[]; wiring_recommendation: "external_injection" | "own_construction"; ready: boolean; blockers: string[]; provenance: "syntax_only" }>;
   /** Detect repeated Vaadin Grid addColumn chains, extract common columns into a ColumnSpec record + shared builder, rewrite one method. */
   extractColumnSpec(args: { file: string; methods: string[]; target: string; className?: string; spec_name?: string }): Promise<{ changes: SpanChange[]; creates: { path: string; content: string }[]; common_columns: string[]; spec_class: string; provenance: "syntax_only" }>;
   /** Extract methods/fields into a new delegate class. changes → edits.merge, creates → edits.createFile, then edits.apply. Pass wrappers: true to keep delegating stubs on the source (REQUIRED when callers outside the file use the moved methods — survey first). `wiring` auto-selects (Guice/DI source → external_injection, AOP-interceptable) — leave unset. Refusals are errors naming the exact fix. */
@@ -12041,6 +12876,108 @@ public class OrderService {
 }
 "#;
 
+    const NEST_ACCESS_PRIVATE_CTOR_FIXTURE: &str = r#"package com.acme;
+
+public class OrderService {
+    public String buildQuery() {
+        QueryHelper helper = new QueryHelper("open");
+        return helper.text();
+    }
+
+    static class QueryHelper {
+        private final String text;
+
+        private QueryHelper(String text) {
+            this.text = text;
+        }
+
+        String text() {
+            return text;
+        }
+    }
+}
+"#;
+
+    const NEST_ACCESS_PACKAGE_CTOR_FIXTURE: &str = r#"package com.acme;
+
+public class OrderService {
+    public String buildQuery() {
+        QueryHelper helper = new QueryHelper("open");
+        return helper.text();
+    }
+
+    static class QueryHelper {
+        private final String text;
+
+        QueryHelper(String text) {
+            this.text = text;
+        }
+
+        String text() {
+            return text;
+        }
+    }
+}
+"#;
+
+    const NEST_ACCESS_REMAINING_ONLY_FIXTURE: &str = r#"package com.acme;
+
+public class OrderService {
+    public String moved() {
+        return "ok";
+    }
+
+    public String remaining() {
+        QueryHelper helper = new QueryHelper();
+        return helper.secret();
+    }
+
+    static class QueryHelper {
+        QueryHelper() {
+        }
+
+        private String secret() {
+            return "hidden";
+        }
+    }
+}
+"#;
+
+    const NEST_ACCESS_PRIVATE_TYPE_FIXTURE: &str = r#"package com.acme;
+
+public class OrderService {
+    public Secret buildSecret() {
+        return new Secret();
+    }
+
+    private static class Secret {
+        Secret() {
+        }
+    }
+}
+"#;
+
+    const NEST_ACCESS_PRIVATE_METHOD_FIELD_FIXTURE: &str = r#"package com.acme;
+
+public class OrderService {
+    public String render() {
+        QueryHelper helper = new QueryHelper();
+        return helper.secret() + helper.code;
+    }
+
+    static class QueryHelper {
+        private String code = "A";
+
+        QueryHelper() {
+        }
+
+        private String secret() {
+            return "B";
+        }
+    }
+}
+"#;
+
     const RESIDUAL_REMAINING_OVERLOAD_FIXTURE: &str = r#"package com.acme;
 
 public class OrderService {
@@ -12089,6 +13026,15 @@ public class OrderService {
             .unwrap()
             .iter()
             .filter(|finding| finding["finding"] == "residual_reference")
+            .collect()
+    }
+
+    fn nest_access_findings(result: &Value) -> Vec<&Value> {
+        result["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["finding"] == "nest_access_break")
             .collect()
     }
 
@@ -12494,6 +13440,301 @@ public class OrderService {
                 .unwrap()
                 .is_empty(),
             "{preview_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_nest_access_flags_private_nested_constructor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            NEST_ACCESS_PRIVATE_CTOR_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let preview = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderQueries.java",
+                        "delegateField": "queries",
+                        "methods": ["buildQuery"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let preview_breaks = nest_access_findings(&preview);
+        assert!(
+            preview_breaks.iter().any(|finding| {
+                finding["referencing_member"] == "buildQuery()"
+                    && finding["referenced_member"] == "QueryHelper(String)"
+                    && finding["referenced_member_kind"] == "constructor"
+                    && finding["declaring_nested_type"] == "OrderService.QueryHelper"
+                    && finding["reference_count"] == 1
+            }),
+            "{preview_breaks:?}"
+        );
+        assert_eq!(preview["fixme_count"], 0, "{preview}");
+
+        let full = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderQueries.java",
+                        "delegateField": "queries",
+                        "methods": ["buildQuery"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let full_breaks = nest_access_findings(&full);
+        assert!(
+            full_breaks.iter().any(|finding| {
+                finding["referencing_member"] == "buildQuery()"
+                    && finding["referenced_member_kind"] == "constructor"
+                    && finding["declaring_nested_type"] == "OrderService.QueryHelper"
+            }),
+            "{full_breaks:?}"
+        );
+
+        let preview_plan = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "methods": ["buildQuery"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview_plan["ready"], json!(false), "{preview_plan}");
+        assert!(
+            preview_plan["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker == "nest_access_breaks"),
+            "{preview_plan}"
+        );
+        let plan_breaks = preview_plan["nest_access_breaks"].as_array().unwrap();
+        assert!(
+            plan_breaks.iter().any(|finding| {
+                finding["referencing_member"] == "buildQuery()"
+                    && finding["referenced_member"] == "QueryHelper(String)"
+                    && finding["referenced_member_kind"] == "constructor"
+                    && finding["reference_count"] == 1
+            }),
+            "{plan_breaks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_nest_access_ignores_package_private_nested_constructor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            NEST_ACCESS_PACKAGE_CTOR_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderQueries.java",
+                        "delegateField": "queries",
+                        "methods": ["buildQuery"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(nest_access_findings(&result).is_empty(), "{result}");
+
+        let preview_plan = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "methods": ["buildQuery"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview_plan["ready"], json!(true), "{preview_plan}");
+        assert!(
+            preview_plan["nest_access_breaks"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{preview_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_nest_access_ignores_remaining_only_private_nested_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            NEST_ACCESS_REMAINING_ONLY_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/MovedOrderService.java",
+                        "delegateField": "movedOrderService",
+                        "methods": ["moved"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(nest_access_findings(&result).is_empty(), "{result}");
+
+        let preview_plan = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "methods": ["moved"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview_plan["ready"], json!(true), "{preview_plan}");
+        assert!(
+            preview_plan["nest_access_breaks"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{preview_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_nest_access_flags_private_nested_type_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            NEST_ACCESS_PRIVATE_TYPE_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/SecretBuilder.java",
+                        "delegateField": "secretBuilder",
+                        "methods": ["buildSecret"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let breaks = nest_access_findings(&result);
+        assert!(
+            breaks.iter().any(|finding| {
+                finding["referenced_member"] == "Secret"
+                    && finding["referenced_member_kind"] == "type"
+                    && finding["declaring_nested_type"] == "OrderService.Secret"
+            }),
+            "{breaks:?}"
+        );
+
+        let preview_plan = json_of(
+            JavaExtractClassPreviewPlan
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "methods": ["buildSecret"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(preview_plan["ready"], json!(false), "{preview_plan}");
+        assert!(
+            preview_plan["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker == "nest_access_breaks"),
+            "{preview_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_class_nest_access_flags_resolved_private_nested_method_and_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            NEST_ACCESS_PRIVATE_METHOD_FIELD_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderRenderer.java",
+                        "delegateField": "renderer",
+                        "methods": ["render"],
+                        "previewOnly": true,
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let breaks = nest_access_findings(&result);
+        assert!(
+            breaks.iter().any(|finding| {
+                finding["referenced_member"] == "secret()"
+                    && finding["referenced_member_kind"] == "method"
+                    && finding["reference_count"] == 1
+            }),
+            "{breaks:?}"
+        );
+        assert!(
+            breaks.iter().any(|finding| {
+                finding["referenced_member"] == "code"
+                    && finding["referenced_member_kind"] == "field"
+                    && finding["reference_count"] == 1
+            }),
+            "{breaks:?}"
         );
     }
 
