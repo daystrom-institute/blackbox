@@ -316,6 +316,16 @@ struct ReadinessTracker {
     detail: Option<String>,
     observed_readiness_signal: bool,
     active_progress: HashSet<String>,
+    /// A server-specific status channel (rust-analyzer serverStatus, JDTLS
+    /// language/status) has been observed. Once true, that channel owns
+    /// readiness: generic progress pairs may no longer promote to Ready,
+    /// because rust-analyzer emits short-lived progress streams (Fetching)
+    /// long before it is quiescent.
+    status_authority: bool,
+    /// Ready was declared by the status channel itself. A non-quiescent /
+    /// busy status demotes any progress-induced Ready, but never a
+    /// status-declared one.
+    ready_from_status: bool,
 }
 
 impl ReadinessTracker {
@@ -325,6 +335,8 @@ impl ReadinessTracker {
             detail: Some("initialize returned; waiting for server readiness".to_string()),
             observed_readiness_signal: false,
             active_progress: HashSet::new(),
+            status_authority: false,
+            ready_from_status: false,
         }
     }
 
@@ -378,7 +390,9 @@ impl ReadinessTracker {
             "language/eventNotification" if matches!(language, Language::Java) => {
                 self.observed_readiness_signal = true;
                 if jdtls_event_type(value) == Some(100) {
+                    self.status_authority = true;
                     self.mark_ready("JDTLS Gradle import finished");
+                    self.ready_from_status = true;
                 }
             }
             _ => {}
@@ -412,7 +426,7 @@ impl ReadinessTracker {
             Some("end") => {
                 self.observed_readiness_signal = true;
                 let tracked = self.active_progress.remove(&token);
-                if tracked && self.active_progress.is_empty() {
+                if tracked && self.active_progress.is_empty() && !self.status_authority {
                     self.mark_ready(detail);
                 }
             }
@@ -420,7 +434,17 @@ impl ReadinessTracker {
         }
     }
 
+    /// Demote a progress-induced Ready when the status channel says the
+    /// server is still busy. Never demotes a status-declared Ready.
+    fn demote_to_indexing(&mut self, detail: impl Into<String>) {
+        if self.state == ReadinessState::Ready && !self.ready_from_status {
+            self.state = ReadinessState::Indexing;
+        }
+        self.mark_indexing(detail);
+    }
+
     fn observe_rust_analyzer_status(&mut self, value: &Value) {
+        self.status_authority = true;
         let Some(params) = value.get("params") else {
             return;
         };
@@ -430,6 +454,7 @@ impl ReadinessTracker {
             .unwrap_or(false)
         {
             self.mark_ready("rust-analyzer reported quiescent");
+            self.ready_from_status = true;
             return;
         }
         if let Some(status) = params.get("status").and_then(Value::as_str)
@@ -438,10 +463,11 @@ impl ReadinessTracker {
             self.mark_failed("rust-analyzer reported error");
             return;
         }
-        self.mark_indexing("rust-analyzer reported busy");
+        self.demote_to_indexing("rust-analyzer reported busy");
     }
 
     fn observe_jdtls_status(&mut self, value: &Value) {
+        self.status_authority = true;
         let status_type = value
             .get("params")
             .and_then(|p| p.get("type"))
@@ -449,10 +475,14 @@ impl ReadinessTracker {
         match status_type {
             Some(status @ ("Started" | "ServiceReady")) => {
                 self.mark_ready(format!("JDTLS language/status {status}"));
+                self.ready_from_status = true;
             }
             Some("Error") => self.mark_failed("JDTLS language/status Error"),
-            Some(status @ ("Starting" | "Message" | "Busy")) => {
-                self.mark_indexing(format!("JDTLS language/status {status}"));
+            Some(status @ ("Starting" | "Busy")) => {
+                self.demote_to_indexing(format!("JDTLS language/status {status}"));
+            }
+            Some("Message") => {
+                self.mark_indexing("JDTLS language/status Message");
             }
             Some(other) => self.mark_indexing(format!("JDTLS language/status {other:?}")),
             None => {}
@@ -1044,6 +1074,10 @@ impl Session {
                 }
                 Err(err) => return Err(err),
             };
+            if server_request_method(&value).is_some() {
+                self.answer_server_request(&value).await?;
+                continue;
+            }
             if let Some(id) = value.get("id").and_then(Value::as_i64) {
                 self.pending.insert(id, value);
                 continue;
@@ -1172,6 +1206,10 @@ impl Session {
         loop {
             self.ensure_current_version(&uri, version)?;
             let value = self.read_message_before(deadline).await?;
+            if server_request_method(&value).is_some() {
+                self.answer_server_request(&value).await?;
+                continue;
+            }
             if let Some(id) = value.get("id").and_then(Value::as_i64) {
                 self.pending.insert(id, value);
                 continue;
@@ -1244,6 +1282,10 @@ impl Session {
         let deadline = Instant::now() + self.request_timeout;
         loop {
             let value = self.read_message_before(deadline).await?;
+            if server_request_method(&value).is_some() {
+                self.answer_server_request(&value).await?;
+                continue;
+            }
             match value.get("id").and_then(Value::as_i64) {
                 Some(other) if other == id => return response_or_error(method, value),
                 Some(other) => {
@@ -1265,6 +1307,44 @@ impl Session {
         time::timeout(remaining, read_message(&mut self.stdout))
             .await
             .map_err(|_| anyhow!("timed out waiting for LSP message"))?
+            .map_err(Into::into)
+    }
+
+    /// Answer a server-initiated request so the server can proceed and the
+    /// id never enters our response correlation. Known housekeeping requests
+    /// get their protocol-shaped acks; anything else gets MethodNotFound.
+    async fn answer_server_request(&mut self, value: &Value) -> Result<()> {
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        let response = match method {
+            "workspace/configuration" => {
+                let count = value
+                    .pointer("/params/items")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len())
+                    .unwrap_or(1);
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": vec![Value::Null; count] })
+            }
+            "window/workDoneProgress/create"
+            | "client/registerCapability"
+            | "client/unregisterCapability"
+            | "window/showMessageRequest" => {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+            }
+            "workspace/applyEdit" => {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "applied": false } })
+            }
+            other => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("bro-lsp client does not handle {other}"),
+                }
+            }),
+        };
+        write_message(&mut self.stdin, &response)
+            .await
             .map_err(Into::into)
     }
 
@@ -1306,6 +1386,20 @@ fn response_or_error(method: &str, value: Value) -> Result<Value> {
         });
     }
     Ok(value)
+}
+
+/// A message carrying BOTH `id` and `method` is a server-initiated request,
+/// never a response. Server request ids are an independent numbering that
+/// collides with client ids, so parking one in `pending` (or matching it as
+/// a response) corrupts correlation: advertising `window.workDoneProgress`
+/// made rust-analyzer send `window/workDoneProgress/create` and the very
+/// next client request read it back as "missing result".
+fn server_request_method(value: &Value) -> Option<&str> {
+    if value.get("id").is_some() {
+        value.get("method").and_then(Value::as_str)
+    } else {
+        None
+    }
 }
 
 /// Whether a request error means "the server is still warming — try again":
@@ -1459,6 +1553,10 @@ impl Session {
         let deadline = Instant::now() + timeout;
         loop {
             let value = self.read_message_before(deadline).await?;
+            if server_request_method(&value).is_some() {
+                self.answer_server_request(&value).await?;
+                continue;
+            }
             match value.get("id").and_then(Value::as_i64) {
                 Some(other) if other == id => return response_or_error(method, value),
                 Some(other) => {
@@ -1541,6 +1639,17 @@ fn build_init_params(
                 }),
                 ..Default::default()
             }),
+            // Readiness signals only flow when asked for: $/progress needs
+            // window.workDoneProgress, and rust-analyzer sends
+            // experimental/serverStatus only when the client declares
+            // serverStatusNotification. Without these the readiness tracker
+            // never leaves `initializing` and request-time waits burn their
+            // full window (observed as a 120s cell rename).
+            window: Some(lsp_types::WindowClientCapabilities {
+                work_done_progress: Some(true),
+                ..Default::default()
+            }),
+            experimental: Some(serde_json::json!({ "serverStatusNotification": true })),
             ..Default::default()
         },
         workspace_folders: Some(vec![WorkspaceFolder {
@@ -1597,6 +1706,10 @@ async fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) 
             Ok(value) => value,
             Err(_) => return Ok(()),
         };
+        if server_request_method(&value).is_some() {
+            let _ = session.answer_server_request(&value).await;
+            continue;
+        }
         if let Some(id) = value.get("id").and_then(Value::as_i64) {
             session.pending.insert(id, value);
             continue;
@@ -1623,6 +1736,10 @@ async fn wait_for_jdtls_ready(session: &mut Session, timeout: Duration) {
             Ok(value) => value,
             Err(_) => return,
         };
+        if server_request_method(&value).is_some() {
+            let _ = session.answer_server_request(&value).await;
+            continue;
+        }
         if let Some(id) = value.get("id").and_then(Value::as_i64) {
             session.pending.insert(id, value);
             continue;
@@ -1776,6 +1893,16 @@ mod tests {
                 }
             }),
         );
+        // language/status was observed, so the status channel owns readiness:
+        // a progress pair may no longer promote. ServiceReady does.
+        assert_eq!(readiness.state, ReadinessState::Indexing);
+        readiness.observe_notification(
+            Language::Java,
+            &serde_json::json!({
+                "method": "language/status",
+                "params": { "type": "ServiceReady" }
+            }),
+        );
         assert_eq!(readiness.state, ReadinessState::Ready);
 
         let mut readiness = ReadinessTracker::initializing();
@@ -1839,6 +1966,85 @@ mod tests {
                     "token": "rust-analyzer/indexing",
                     "value": { "kind": "end", "message": "Indexing finished" }
                 }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+    }
+
+    #[test]
+    fn rust_analyzer_early_progress_pair_cannot_outrank_busy_server_status() {
+        // Live regression shape: rust-analyzer emits a short-lived progress
+        // stream (Fetching) that begins and ends long before quiescence. The
+        // premature Ready sent a rename at ~0.2s and the server answered
+        // with no edits.
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "rustAnalyzer/Fetching",
+                    "value": { "kind": "begin", "title": "Fetching" }
+                }
+            }),
+        );
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "rustAnalyzer/Fetching",
+                    "value": { "kind": "end" }
+                }
+            }),
+        );
+        // No status authority yet: the progress pair legitimately promotes.
+        assert_eq!(readiness.state, ReadinessState::Ready);
+        // The status channel arrives and says busy: demote.
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "quiescent": false }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Indexing);
+        // Later progress pairs may no longer promote past the status channel.
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "rustAnalyzer/Roots Scanned",
+                    "value": { "kind": "begin", "title": "Roots Scanned" }
+                }
+            }),
+        );
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "$/progress",
+                "params": {
+                    "token": "rustAnalyzer/Roots Scanned",
+                    "value": { "kind": "end" }
+                }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Indexing);
+        // Only quiescence promotes now, and it is sticky.
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "quiescent": true }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "quiescent": true }
             }),
         );
         assert_eq!(readiness.state, ReadinessState::Ready);
