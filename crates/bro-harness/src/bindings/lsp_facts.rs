@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bro_lsp::{Language, LspConfig, OpenDocument, SessionPool};
@@ -28,6 +29,8 @@ use serde_json::{Value, json};
 
 use super::code_facts::{Span, span_schema_pub};
 use super::ledger::{AuthorityTier, ProvenanceLedger};
+
+const DEFAULT_WAIT_READY_MS: u64 = 120_000;
 
 /// Session-scoped LSP binding state: the warm pool plus the documents this
 /// session has opened (with the content generation last sent to the server,
@@ -67,6 +70,20 @@ fn language_for_file(abs: &Path) -> Result<Language, String> {
         )),
         None => Err("lsp: file has no extension".to_string()),
     }
+}
+
+fn parse_language(value: &str) -> Result<Language, String> {
+    match value {
+        "rust" => Ok(Language::Rust),
+        "java" => Ok(Language::Java),
+        other => Err(format!(
+            "unsupported language `{other}`; expected `rust` or `java`"
+        )),
+    }
+}
+
+fn wait_ready_duration(value: Option<u64>) -> Duration {
+    Duration::from_millis(value.unwrap_or(DEFAULT_WAIT_READY_MS))
 }
 
 /// Byte offset → LSP position (UTF-16 line/character), per the LSP default
@@ -220,6 +237,17 @@ impl LspState {
             .map_err(render_lsp_error)
     }
 
+    async fn status(
+        &self,
+        root: &Path,
+        language: Language,
+    ) -> Result<bro_lsp::ReadinessStatus, String> {
+        self.pool
+            .status(root, language)
+            .await
+            .map_err(render_lsp_error)
+    }
+
     pub(super) async fn request_raw(
         &self,
         root: &Path,
@@ -237,7 +265,7 @@ impl LspState {
 fn render_lsp_error(e: bro_lsp::Error) -> String {
     if e.is_lsp_unavailable() {
         format!(
-            "lsp_unavailable: {e} — refusing to proceed (no syntax-only downgrade); install/configure the language server or use code.*/edits.* with explicit spans"
+            "lsp_unavailable: {e} - refusing to proceed (no syntax-only downgrade); install/configure the language server or use code.*/edits.* with explicit spans"
         )
     } else {
         format!("{e}")
@@ -406,6 +434,8 @@ struct RenameParams {
     span: Span,
     #[serde(rename = "newName", alias = "new_name")]
     new_name: String,
+    #[serde(default, rename = "wait_ready_ms", alias = "waitReadyMs")]
+    wait_ready_ms: Option<u64>,
 }
 
 #[async_trait]
@@ -421,7 +451,17 @@ impl Tool for LspRename {
             "type": "object",
             "properties": {
                 "span": span_schema_pub(),
-                "newName": { "type": "string", "description": "The new symbol name." }
+                "newName": { "type": "string", "description": "The new symbol name." },
+                "wait_ready_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Milliseconds to wait for the language server to report ready before sending the request. Defaults to 120000; 0 disables the readiness wait."
+                },
+                "waitReadyMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Alias for wait_ready_ms."
+                }
             },
             "required": ["span", "newName"]
         })
@@ -483,7 +523,8 @@ impl Tool for LspRename {
                 let snapped = bbox_refactor::facts::name_span(&abs, start, end)
                     .ok()
                     .flatten()
-                    .map(|(name_start, _)| name_start)
+                    .filter(|(name_start, name_end)| *name_start >= start && *name_end <= end)
+                    .map(|(name_start, _name_end)| name_start)
                     .unwrap_or(start);
                 ToolResult::Json(json!(snapped))
             })
@@ -494,7 +535,13 @@ impl Tool for LspRename {
             _ => span.byte_start,
         };
         let position = byte_to_position(&source, aim_byte);
-        let edit = match self.0.pool.rename(&doc, position, &params.new_name).await {
+        let wait_ready = wait_ready_duration(params.wait_ready_ms);
+        let edit = match self
+            .0
+            .pool
+            .rename(&doc, position, &params.new_name, wait_ready)
+            .await
+        {
             Ok(e) => e,
             Err(e) => return err(format!("lsp.rename: {}", render_lsp_error(e))),
         };
@@ -764,8 +811,100 @@ pub fn tools(state: Arc<LspState>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn
         Arc::new(LspRename(state.clone(), Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(LspWillRenameFiles(state.clone(), ledger)) as Arc<dyn Tool>,
         Arc::new(LspExecuteCommand(state.clone())) as Arc<dyn Tool>,
+        Arc::new(LspStatus(state.clone())) as Arc<dyn Tool>,
         Arc::new(LspHover(state)) as Arc<dyn Tool>,
     ]
+}
+
+pub struct LspStatus(pub Arc<LspState>);
+
+#[derive(Deserialize)]
+struct StatusBindingParams {
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+}
+
+#[async_trait]
+impl Tool for LspStatus {
+    fn name(&self) -> &str {
+        "lsp.status"
+    }
+    fn description(&self) -> &str {
+        "Report the readiness state for a pooled language-server session without spawning a server. Use file to infer language from an existing path, or language to inspect the workspace backend. Returns not_started when no session exists yet."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "enum": ["java", "rust"],
+                    "description": "Language backend to inspect. Defaults to java when file is omitted."
+                },
+                "file": {
+                    "type": "string",
+                    "description": "Workspace-relative file path used to infer the language backend."
+                }
+            }
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("lsp".to_string(), "status".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let input = if input.is_null() { json!({}) } else { input };
+        let params: StatusBindingParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "lsp.status: bad input - expected {{ language?: \"java\" | \"rust\", file?: string }}; {e}"
+                ));
+            }
+        };
+        let language = if let Some(file) = params.file.as_deref() {
+            let abs = match bro_tools::workspace::resolve_in_root(&cx.root, file) {
+                Ok(p) => p,
+                Err(e) => return err(format!("lsp.status: {file}: {e}")),
+            };
+            let inferred = match language_for_file(&abs) {
+                Ok(language) => language,
+                Err(e) => return err(format!("lsp.status: {e}")),
+            };
+            if let Some(language) = params.language.as_deref() {
+                let parsed = match parse_language(language) {
+                    Ok(language) => language,
+                    Err(e) => return err(format!("lsp.status: {e}")),
+                };
+                if parsed != inferred {
+                    return err(format!(
+                        "lsp.status: file `{file}` infers `{}`, but language was `{}`",
+                        inferred.language_id(),
+                        parsed.language_id()
+                    ));
+                }
+            }
+            inferred
+        } else if let Some(language) = params.language.as_deref() {
+            match parse_language(language) {
+                Ok(language) => language,
+                Err(e) => return err(format!("lsp.status: {e}")),
+            }
+        } else {
+            Language::Java
+        };
+        match self.0.status(&cx.root, language).await {
+            Ok(status) => ToolResult::Json(json!(status)),
+            Err(e) => err(format!("lsp.status: {e}")),
+        }
+    }
 }
 
 /// Flatten LSP `Hover` contents (any of the three `HoverContents` shapes)
@@ -808,6 +947,8 @@ pub struct LspHover(pub Arc<LspState>);
 #[derive(Deserialize)]
 struct HoverBindingParams {
     span: Span,
+    #[serde(default, rename = "wait_ready_ms", alias = "waitReadyMs")]
+    wait_ready_ms: Option<u64>,
 }
 
 #[async_trait]
@@ -823,6 +964,16 @@ impl Tool for LspHover {
             "type": "object",
             "properties": {
                 "span": span_schema_pub(),
+                "wait_ready_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Milliseconds to wait for the language server to report ready before sending the request. Defaults to 120000; 0 disables the readiness wait."
+                },
+                "waitReadyMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Alias for wait_ready_ms."
+                }
             },
             "required": ["span"]
         })
@@ -883,7 +1034,8 @@ impl Tool for LspHover {
                 let snapped = bbox_refactor::facts::name_span(&abs, start, end)
                     .ok()
                     .flatten()
-                    .map(|(name_start, _)| name_start)
+                    .filter(|(name_start, name_end)| *name_start >= start && *name_end <= end)
+                    .map(|(name_start, _name_end)| name_start)
                     .unwrap_or(start);
                 ToolResult::Json(json!(snapped))
             })
@@ -894,7 +1046,8 @@ impl Tool for LspHover {
             }
         };
         let position = byte_to_position(&source, aim_byte);
-        let hover = match self.0.pool.hover(&doc, position).await {
+        let wait_ready = wait_ready_duration(params.wait_ready_ms);
+        let hover = match self.0.pool.hover(&doc, position, wait_ready).await {
             Ok(h) => h,
             Err(e) => return err(format!("lsp.hover: {}", render_lsp_error(e))),
         };
@@ -911,20 +1064,24 @@ impl Tool for LspHover {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "lsp".to_string(),
-        description: "Language-server authority. Session-backed: the first call in a workspace warms the backend for that language (may take a few seconds cold — rust-analyzer indexes the crate, JDTLS imports the gradle/maven workspace; the call blocks, no need to poll); later calls are fast. Backends: rust-analyzer (Rust, .rs) and JDTLS (Java, .java). Fails closed when the server is unavailable — there is deliberately no silent fallback to text matching. Verbs: `lsp.rename` (rust + java), `lsp.willRenameFiles` (standard file move/rename preflight edits), `lsp.executeCommand` (server-specific command seam), and `lsp.hover` (rust + java). THE RENAME RECIPE: aim a Span at the symbol, then `const r = await lsp.rename({ span, newName: \"x\" })` → `await edits.merge({ es, changes: r.changes })` → `await edits.apply({ es })` — server-authored edits join the same EditSet artifact as cell-authored ones; the host ledgers them at lsp_verified, so pass them through UNMODIFIED (filtering is fine, rewriting a change's bytes floors it at syntax_only). THE JAVA MOVE SEAM: use `java.moveClass` / `java.movePackage`; those tools call JDTLS `java/getMoveDestinations` and `java/move` directly instead of the standard file-operation preflight when JDTLS does not supply edits there. THE Java var SEAM: `lsp.hover` resolves a `var x = ...` declarator's type authoritatively — JDTLS resolves cross-file receiver return types and generic parameters (jOOQ Table<R>.newRecord() -> R) that `analysis.methodRegions` (pure-bytes facts) leaves as resolved_type:null. Recipe shape: for each unresolved var, `const h = await lsp.hover({ span: varDeclaratorSpan });` and pass the parsed type as an explicit parameter to `java.extractMethodCodeBlock`."
+        description: "Language-server authority. Session-backed: the first call in a workspace warms the backend for that language (rust-analyzer indexes the crate, JDTLS imports the gradle/maven workspace); later calls are fast. Backends: rust-analyzer (Rust, .rs) and JDTLS (Java, .java). Fails closed when the server is unavailable or still indexing after the bounded ready wait. Verbs: `lsp.status` (non-spawning readiness check), `lsp.rename` (rust + java), `lsp.willRenameFiles` (standard file move/rename preflight edits), `lsp.executeCommand` (server-specific command seam), and `lsp.hover` (rust + java). THE RENAME RECIPE: aim a Span at the symbol, then `const r = await lsp.rename({ span, newName: \"x\" })`, `await edits.merge({ es, changes: r.changes })`, `await edits.apply({ es })`. Server-authored edits join the same EditSet artifact as cell-authored ones; the host ledgers them at lsp_verified, so pass them through UNMODIFIED (filtering is fine, rewriting a change's bytes floors it at syntax_only). THE JAVA MOVE SEAM: use `java.moveClass` / `java.movePackage`; those tools call JDTLS `java/getMoveDestinations` and `java/move` directly instead of the standard file-operation preflight when JDTLS does not supply edits there. THE Java var SEAM: `lsp.hover` resolves a `var x = ...` declarator's type authoritatively. JDTLS resolves cross-file receiver return types and generic parameters (jOOQ Table<R>.newRecord() -> R) that `analysis.methodRegions` (pure-bytes facts) leaves as resolved_type:null. Position requests wait up to 120000 ms by default; pass `wait_ready_ms: 0` only when intentionally bypassing readiness."
             .to_string(),
         declarations: r#"type SpanChange = { span: Span; new_text: string };
-type HoverResult = { contents: string | null; language: string; position: { line: number; character: number } };
-declare const lsp: {
-  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine — snaps to the name identifier). Rust and Java. Returns hash-anchored server-authored changes for edits.merge; the host ledgers them at lsp_verified, so an EditSet built purely from them applies with semantic_status "lsp_verified" (hand-editing a change drops it to syntax_only). Fails closed if the language server is unavailable; stale_span on content drift. */
-  rename(args: { span: Span; newName: string }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; resource_ops: unknown[]; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
-  /** Ask the language server for edits that must be applied before standard file renames. */
-  willRenameFiles(args: { renames: Array<{ oldFile: string; newFile: string }>; language?: "java" | "rust" }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; resource_ops: unknown[]; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
-  /** Execute a language-server workspace command. Defaults to Java/JDTLS. Use for server-specific refactor commands not modeled as standard LSP requests. */
-  executeCommand(args: { command: string; arguments?: unknown[]; language?: "java" | "rust" }): Promise<{ command: string; language: string; result: unknown }>;
-  /** Resolve the type/info for the symbol a Span points at (rust-analyzer for .rs, JDTLS for .java; warms on first use). Whole-item spans are fine — snaps to the item's name identifier like lsp.rename. THE Java var SEAM: point a Span at a `var x = ...` declarator and JDTLS returns the authoritative resolved type — cross-file receiver returns and generic params (jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot derive. contents is the raw hover text (markdown/code blocks) for the caller to interpret, or null when the server has no info there. Read-only (no provenance ledger). Fails closed if the server is unavailable; stale_span on content drift. */
-  hover(args: { span: Span }): Promise<HoverResult>;
-};"#
+	type HoverResult = { contents: string | null; language: string; position: { line: number; character: number } };
+	type LspReadinessState = "not_started" | "initializing" | "indexing" | "ready" | "failed";
+	type LspStatus = { language: "java" | "rust"; state: LspReadinessState; detail?: string };
+	declare const lsp: {
+	  /** Readiness for the pooled language-server session without spawning it. Defaults to the Java backend when neither file nor language is supplied. */
+	  status(args?: { language?: "java" | "rust"; file?: string }): Promise<LspStatus>;
+	  /** Workspace-wide rename of the symbol the span points at (whole-item spans fine, snaps to the name identifier). Rust and Java. Waits for server readiness by default (120000 ms; pass wait_ready_ms: 0 to bypass). Returns hash-anchored server-authored changes for edits.merge; the host ledgers them at lsp_verified, so an EditSet built purely from them applies with semantic_status "lsp_verified" (hand-editing a change drops it to syntax_only). Fails closed if the language server is unavailable or still not ready; stale_span on content drift. */
+	  rename(args: { span: Span; newName: string; wait_ready_ms?: number; waitReadyMs?: number }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; resource_ops: unknown[]; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
+	  /** Ask the language server for edits that must be applied before standard file renames. */
+	  willRenameFiles(args: { renames: Array<{ oldFile: string; newFile: string }>; language?: "java" | "rust" }): Promise<{ changes: SpanChange[]; files: string[]; edit_count: number; resource_ops: unknown[]; authority: "lsp"; language: string; issuance: string; provenance: "lsp_verified" }>;
+	  /** Execute a language-server workspace command. Defaults to Java/JDTLS. Use for server-specific refactor commands not modeled as standard LSP requests. */
+	  executeCommand(args: { command: string; arguments?: unknown[]; language?: "java" | "rust" }): Promise<{ command: string; language: string; result: unknown }>;
+	  /** Resolve the type/info for the symbol a Span points at (rust-analyzer for .rs, JDTLS for .java; warms on first use). Whole-item spans are fine, snaps to the item's name identifier like lsp.rename. THE Java var SEAM: point a Span at a `var x = ...` declarator and JDTLS returns the authoritative resolved type. Cross-file receiver returns and generic params (jOOQ Table<R>.newRecord() -> R) that pure-bytes facts cannot derive. contents is the raw hover text (markdown/code blocks) for the caller to interpret, or null when the ready server has no info there. Read-only (no provenance ledger). Waits for server readiness by default (120000 ms; pass wait_ready_ms: 0 to bypass). Fails closed if the server is unavailable or still not ready; stale_span on content drift. */
+	  hover(args: { span: Span; wait_ready_ms?: number; waitReadyMs?: number }): Promise<HoverResult>;
+	};"#
             .to_string(),
     }
 }
