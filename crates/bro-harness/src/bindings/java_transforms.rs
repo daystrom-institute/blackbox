@@ -2087,6 +2087,130 @@ struct JavaFilesParams {
     files: Vec<String>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum JavaWhitespaceFileInput {
+    Path(String),
+    Scoped(JavaScopedWhitespaceFileInput),
+}
+
+impl JavaWhitespaceFileInput {
+    fn file(&self) -> &str {
+        match self {
+            Self::Path(file) => file,
+            Self::Scoped(input) => &input.file,
+        }
+    }
+
+    fn ranges(&self) -> Vec<bbox_refactor::JavaWhitespaceRange> {
+        match self {
+            Self::Path(_) => Vec::new(),
+            Self::Scoped(input) => input
+                .ranges
+                .iter()
+                .map(JavaWhitespaceRangeInput::to_refactor_range)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct JavaScopedWhitespaceFileInput {
+    file: String,
+    #[serde(default)]
+    ranges: Vec<JavaWhitespaceRangeInput>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum JavaWhitespaceRangeInput {
+    Lines {
+        #[serde(rename = "startLine", alias = "start_line")]
+        start_line: usize,
+        #[serde(rename = "endLine", alias = "end_line")]
+        end_line: usize,
+    },
+    Bytes {
+        #[serde(rename = "byteStart", alias = "byte_start")]
+        byte_start: usize,
+        #[serde(rename = "byteEnd", alias = "byte_end")]
+        byte_end: usize,
+    },
+}
+
+impl JavaWhitespaceRangeInput {
+    fn to_refactor_range(&self) -> bbox_refactor::JavaWhitespaceRange {
+        match *self {
+            Self::Lines {
+                start_line,
+                end_line,
+            } => bbox_refactor::JavaWhitespaceRange::Lines {
+                start_line,
+                end_line,
+            },
+            Self::Bytes {
+                byte_start,
+                byte_end,
+            } => bbox_refactor::JavaWhitespaceRange::Bytes {
+                byte_start,
+                byte_end,
+            },
+        }
+    }
+}
+
+fn java_whitespace_file_input_schema() -> Value {
+    json!({
+        "anyOf": [
+            {
+                "type": "string",
+                "description": "Workspace-relative Java file. Whole-file whitespace behavior."
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Workspace-relative Java file."
+                    },
+                    "ranges": {
+                        "type": "array",
+                        "description": "Whitespace-only ranges. Line ranges are 1-based inclusive; byte ranges are 0-based half-open.",
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "startLine": { "type": "integer", "minimum": 1 },
+                                        "endLine": { "type": "integer", "minimum": 1 },
+                                        "start_line": { "type": "integer", "minimum": 1 },
+                                        "end_line": { "type": "integer", "minimum": 1 }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "byteStart": { "type": "integer", "minimum": 0 },
+                                        "byteEnd": { "type": "integer", "minimum": 0 },
+                                        "byte_start": { "type": "integer", "minimum": 0 },
+                                        "byte_end": { "type": "integer", "minimum": 0 }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                "required": ["file"]
+            }
+        ]
+    })
+}
+
+#[derive(Deserialize)]
+struct JavaWhitespaceFilesParams {
+    files: Vec<JavaWhitespaceFileInput>,
+}
+
 #[derive(Deserialize)]
 struct JavaAddImportParams {
     file: String,
@@ -2095,7 +2219,7 @@ struct JavaAddImportParams {
 
 #[derive(Deserialize)]
 struct JavaHygieneParams {
-    files: Vec<String>,
+    files: Vec<JavaWhitespaceFileInput>,
     #[serde(default)]
     imports: Option<bool>,
     #[serde(default)]
@@ -11111,7 +11235,7 @@ RECIPE
     await edits.apply({ es });
   }"#;
 
-const NORMALIZE_WHITESPACE_CONTRACT: &str = r#"java.normalizeWhitespace — conservative Java whitespace hygiene for touched files.
+const NORMALIZE_WHITESPACE_CONTRACT: &str = r#"java.normalizeWhitespace - conservative Java whitespace hygiene for touched files.
 
 WHAT IT DOES
   Normalizes the small formatting residues common after generated Java
@@ -11119,25 +11243,56 @@ WHAT IT DOES
   whitespace, and one-space indentation drift on common statement/declaration
   lines. It is intentionally not a full Java formatter.
 
-PARAMS  { files: string[] }   touched/created workspace-relative .java files
+PARAMS
+  files: Array<string | {
+    file: string,
+    ranges?: Array<
+      { startLine: number, endLine: number } |
+      { start_line: number, end_line: number } |
+      { byteStart: number, byteEnd: number } |
+      { byte_start: number, byte_end: number }
+    >
+  }>
+
+  A plain string keeps the historical whole-file whitespace behavior. An object
+  with ranges scopes whitespace cleanup to those regions only. Line ranges are
+  1-based inclusive; byte ranges are 0-based half-open. The natural source of
+  ranges is the span list a probe just merged through the edits algebra, usually
+  `changes.map(c => c.span)` or the subset of touched spans from a refactor.
+
 RETURNS { changes, changed_files, findings, provenance }
-  changes: one whole-file hash-anchored change per changed file; [] means clean.
+  changes: hash-anchored span changes for edits.merge; [] means clean. Scoped
+           entries emit only whitespace edits that overlap the requested ranges.
 
 RECIPE
   Run after the semantic transform compiles. If changes are returned, apply them
   and compile again."#;
 
-const HYGIENE_CONTRACT: &str = r#"java.hygiene — post-apply Java hygiene bundle for touched files.
+const HYGIENE_CONTRACT: &str = r#"java.hygiene - post-apply Java hygiene bundle for touched files.
 
 WHAT IT DOES
-  Runs import hygiene and whitespace hygiene in-memory per file, then returns at
-  most one whole-file change per changed file. This is the routine recipes should
-  call after the semantic transform applies and compiles.
+  Runs import hygiene and whitespace hygiene in-memory per file. This is the
+  routine recipes should call after the semantic transform applies and compiles.
+  Per-file ranges scope whitespace only; import cleanup is unaffected by ranges.
 
 PARAMS
-  files: string[]       touched/created workspace-relative .java files
+  files: Array<string | {
+    file: string,
+    ranges?: Array<
+      { startLine: number, endLine: number } |
+      { start_line: number, end_line: number } |
+      { byteStart: number, byteEnd: number } |
+      { byte_start: number, byte_end: number }
+    >
+  }>
   imports?: boolean     default true
   whitespace?: boolean  default true
+
+  A plain string keeps the historical whole-file whitespace behavior. An object
+  with ranges scopes whitespace cleanup to those regions only. Line ranges are
+  1-based inclusive; byte ranges are 0-based half-open. The natural source of
+  ranges is the span list a probe just merged through the edits algebra, usually
+  `changes.map(c => c.span)` or the subset of touched spans from a refactor.
 
 RETURNS { changes, changed_files, findings, provenance }
   findings includes per-file routines_applied; [] changes means no hygiene edits.
@@ -11474,8 +11629,8 @@ impl Tool for JavaOrganizeImports {
             "properties": {
                 "files": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Touched/created workspace-relative Java files."
+                    "items": java_whitespace_file_input_schema(),
+                    "description": "Touched/created workspace-relative Java files, or scoped entries with whitespace ranges."
                 }
             },
             "required": ["files"]
@@ -11576,11 +11731,11 @@ impl Tool for JavaNormalizeWhitespace {
         Some(("java".to_string(), "normalizeWhitespace".to_string()))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let params: JavaFilesParams = match serde_json::from_value(input) {
+        let params: JavaWhitespaceFilesParams = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => {
                 return err(format!(
-                    "java.normalizeWhitespace: bad input — expected {{ files: string[] }}; {e}"
+                    "java.normalizeWhitespace: bad input - expected {{ files: (string | {{ file, ranges }})[] }}; {e}"
                 ));
             }
         };
@@ -11591,16 +11746,24 @@ impl Tool for JavaNormalizeWhitespace {
         bro_tools::tool::call_blocking(move || {
             let mut file_edits = Vec::new();
             let mut findings = Vec::new();
-            for file in params.files {
+            for input in params.files {
+                let file = input.file().to_string();
+                let ranges = input.ranges();
                 let abs = match resolve_workspace_file(&root, &file, "java.normalizeWhitespace") {
                     Ok(path) => path,
                     Err(e) => return err(e),
                 };
-                match bbox_refactor::normalize_java_whitespace_file(&abs) {
+                let planned = if ranges.is_empty() {
+                    bbox_refactor::normalize_java_whitespace_file(&abs)
+                } else {
+                    bbox_refactor::normalize_java_whitespace_file_scoped(&abs, &ranges)
+                };
+                match planned {
                     Ok(mut edits) if !edits.is_empty() => {
                         findings.push(json!({
                             "finding": "whitespace_changed",
                             "file": file,
+                            "scoped": !ranges.is_empty(),
                             "edit_count": edits.iter().map(|e| e.edits.len()).sum::<usize>(),
                         }));
                         file_edits.append(&mut edits);
@@ -11636,7 +11799,7 @@ impl Tool for JavaHygiene {
         "java.hygiene"
     }
     fn description(&self) -> &str {
-        "Routine post-apply Java hygiene bundle for touched files. Runs import hygiene and conservative whitespace hygiene in-memory, returns at most one whole-file {changes} entry per changed file for edits.merge; never writes."
+        "Routine post-apply Java hygiene bundle for touched files. Runs import hygiene and conservative whitespace hygiene in-memory, returns {changes} for edits.merge; never writes."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -11644,8 +11807,8 @@ impl Tool for JavaHygiene {
             "properties": {
                 "files": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Touched/created workspace-relative Java files."
+                    "items": java_whitespace_file_input_schema(),
+                    "description": "Touched/created workspace-relative Java files, or scoped entries with whitespace ranges."
                 },
                 "imports": {
                     "type": "boolean",
@@ -11673,7 +11836,7 @@ impl Tool for JavaHygiene {
             Ok(p) => p,
             Err(e) => {
                 return err(format!(
-                    "java.hygiene: bad input — expected {{ files: string[], imports?: boolean, whitespace?: boolean }}; {e}"
+                    "java.hygiene: bad input - expected {{ files: (string | {{ file, ranges }})[], imports?: boolean, whitespace?: boolean }}; {e}"
                 ));
             }
         };
@@ -11696,16 +11859,26 @@ impl Tool for JavaHygiene {
         bro_tools::tool::call_blocking(move || {
             let mut file_edits = Vec::new();
             let mut findings = Vec::new();
-            for file in params.files {
+            for input in params.files {
+                let file = input.file().to_string();
+                let ranges = input.ranges();
                 let abs = match resolve_workspace_file(&root, &file, "java.hygiene") {
                     Ok(path) => path,
                     Err(e) => return err(e),
                 };
-                match bbox_refactor::java_hygiene_file(&root, &abs, imports, whitespace) {
+                let planned = if ranges.is_empty() {
+                    bbox_refactor::java_hygiene_file(&root, &abs, imports, whitespace)
+                } else {
+                    bbox_refactor::java_hygiene_file_scoped(
+                        &root, &abs, imports, whitespace, &ranges,
+                    )
+                };
+                match planned {
                     Ok((mut edits, routines_applied)) if !edits.is_empty() => {
                         findings.push(json!({
                             "finding": "hygiene_changed",
                             "file": file,
+                            "scoped_whitespace": !ranges.is_empty(),
                             "routines_applied": routines_applied,
                             "edit_count": edits.iter().map(|e| e.edits.len()).sum::<usize>(),
                         }));
@@ -12735,6 +12908,8 @@ type JavaMoveMemberPreview = { file: string; target: string; member_kind: "field
 type JavaMoveMemberResult = { title: string; changes: SpanChange[]; creates: { path: string; content: string }[]; findings: unknown[]; selected_member_refs: string[]; preview_only: boolean; would_change_files: unknown[]; would_create_files: unknown[]; blocked?: boolean; provenance: "syntax_only" };
 type JavaAddImportResult = { changes: SpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
 type JavaHygieneResult = { changes: SpanChange[]; changed_files: { path: string; edit_count: number; replacement_bytes: number }[]; findings: ({ finding: string; file: string } & Record<string, unknown>)[]; provenance: "syntax_only" };
+type JavaWhitespaceRange = { startLine: number; endLine: number } | { start_line: number; end_line: number } | { byteStart: number; byteEnd: number } | { byte_start: number; byte_end: number };
+type JavaWhitespaceFileInput = string | { file: string; ranges?: JavaWhitespaceRange[] };
 declare const java: {
   /** Full contract (params, findings vocabulary, recipe) for one transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
@@ -12792,13 +12967,13 @@ declare const java: {
   addImport(args: { file: string; imports: string[] }): Promise<JavaAddImportResult>;
   /** Prune/sort Java imports for touched files. Returns {changes} → edits.merge; [] means no import edits. */
   organizeImports(args: { files: string[] }): Promise<JavaHygieneResult>;
-  /** Conservative whitespace hygiene for touched files. Returns {changes} → edits.merge; [] means no whitespace edits. */
-  normalizeWhitespace(args: { files: string[] }): Promise<JavaHygieneResult>;
+	  /** Conservative whitespace hygiene for touched files. Returns {changes} → edits.merge; [] means no whitespace edits. */
+	  normalizeWhitespace(args: { files: JavaWhitespaceFileInput[] }): Promise<JavaHygieneResult>;
   /** Post-extract: synthesize delegating wrapper methods for moved helpers that still have same-class callers. Run after extractClass + apply, before first compile. */
   synthesizeHelperWrappers(args: { file: string; target: string; delegateField: string; methods: string[] }): Promise<{ changes: SpanChange[]; wrappers_added: string[]; stale_calls_remaining: string[]; note?: string; provenance: "syntax_only" }>;
-  /** Routine post-apply hygiene bundle: imports + whitespace by default. Returns {changes} → edits.merge; compile again if applied. */
-  hygiene(args: { files: string[]; imports?: boolean; whitespace?: boolean }): Promise<JavaHygieneResult>;
-};"#
+	  /** Routine post-apply hygiene bundle: imports + whitespace by default. Returns {changes} → edits.merge; compile again if applied. */
+	  hygiene(args: { files: JavaWhitespaceFileInput[]; imports?: boolean; whitespace?: boolean }): Promise<JavaHygieneResult>;
+	};"#
             .to_string(),
     }
 }
@@ -13008,6 +13183,21 @@ public class OrderService {
 
     fn first_replacement(result: &Value) -> &str {
         result["changes"][0]["new_text"].as_str().unwrap()
+    }
+
+    fn apply_result_changes(source: &str, result: &Value) -> String {
+        let mut text_edits = result["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|change| bbox_refactor::TextEdit {
+                byte_start: change["span"]["byte_start"].as_u64().unwrap() as usize,
+                byte_end: change["span"]["byte_end"].as_u64().unwrap() as usize,
+                replacement: change["new_text"].as_str().unwrap().to_string(),
+            })
+            .collect::<Vec<_>>();
+        text_edits.sort_by_key(|edit| edit.byte_start);
+        bbox_refactor::apply_text_edits(source, &text_edits).unwrap()
     }
 
     fn replacement_for_file<'a>(result: &'a Value, file: &str) -> &'a str {
@@ -14031,6 +14221,136 @@ public class Thing {
     }
 
     #[tokio::test]
+    async fn normalize_whitespace_line_range_leaves_distant_region_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+
+public class Thing {
+    public String first() {
+         return "first";   
+    }
+
+    public String second() {
+         return "second";   
+    }
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Thing.java"), source).unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaNormalizeWhitespace
+                .call(
+                    json!({
+                        "files": [{
+                            "file": "src/com/acme/Thing.java",
+                            "ranges": [{ "startLine": 5, "endLine": 5 }]
+                        }]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = apply_result_changes(source, &result);
+        assert!(
+            rewritten.contains("        return \"first\";\n"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("         return \"second\";   \n"),
+            "{rewritten}"
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1, "{result}");
+    }
+
+    #[tokio::test]
+    async fn normalize_whitespace_byte_range_leaves_distant_region_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+
+public class Thing {
+    public String first() {
+         return "first";   
+    }
+
+    public String second() {
+         return "second";   
+    }
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Thing.java"), source).unwrap();
+        let cx = cx_in(&root);
+        let needle = "         return \"second\";   ";
+        let byte_start = source.find(needle).unwrap();
+        let byte_end = byte_start + needle.len();
+
+        let result = json_of(
+            JavaNormalizeWhitespace
+                .call(
+                    json!({
+                        "files": [{
+                            "file": "src/com/acme/Thing.java",
+                            "ranges": [{ "byteStart": byte_start, "byteEnd": byte_end }]
+                        }]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = apply_result_changes(source, &result);
+        assert!(
+            rewritten.contains("         return \"first\";   \n"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("        return \"second\";\n"),
+            "{rewritten}"
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1, "{result}");
+    }
+
+    #[tokio::test]
+    async fn normalize_whitespace_without_ranges_still_cleans_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+
+public class Thing {
+    public String first() {
+         return "first";   
+    }
+
+    public String second() {
+         return "second";   
+    }
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Thing.java"), source).unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaNormalizeWhitespace
+                .call(json!({ "files": ["src/com/acme/Thing.java"] }), &cx)
+                .await,
+        );
+        let rewritten = first_replacement(&result);
+        assert!(
+            rewritten.contains("        return \"first\";\n"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("        return \"second\";\n"),
+            "{rewritten}"
+        );
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1, "{result}");
+    }
+
+    #[tokio::test]
     async fn hygiene_combines_import_and_whitespace_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -14074,6 +14394,55 @@ public class Thing {
         assert!(!rewritten.contains("\n\n\n"), "{rewritten}");
         assert!(
             rewritten.contains("\n        return List.of();"),
+            "{rewritten}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hygiene_imports_ignore_whitespace_range_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        let source = r#"package com.acme;
+import java.util.Set;
+import java.util.List;
+public class Thing {
+    public List<String> first() {
+         return List.of();   
+    }
+
+    public String second() {
+         return "second";   
+    }
+}
+"#;
+        std::fs::write(root.join("src/com/acme/Thing.java"), source).unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaHygiene
+                .call(
+                    json!({
+                        "files": [{
+                            "file": "src/com/acme/Thing.java",
+                            "ranges": [{ "startLine": 6, "endLine": 6 }]
+                        }],
+                        "imports": true,
+                        "whitespace": true
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let rewritten = apply_result_changes(source, &result);
+        assert!(!rewritten.contains("Set"), "{rewritten}");
+        assert!(rewritten.contains("import java.util.List;"), "{rewritten}");
+        assert!(
+            rewritten.contains("        return List.of();\n"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("         return \"second\";   \n"),
             "{rewritten}"
         );
     }

@@ -38,9 +38,11 @@ pub use java::{
     JavaMethodRegionExtractability, JavaMethodRegionFact, JavaMethodRegionRequest,
     JavaMethodRegionStatementFilterSummary, JavaMethodRegionStatementSummary,
     JavaMethodRegionsOptions, JavaNonLocalControlFlowFact, JavaRegionVariableFact,
-    UnusedCtorParamsPlan, analyze_java_method_regions, analyze_java_method_regions_with_options,
-    analyze_unused_constructor_params, java_hygiene_file, normalize_java_whitespace_file,
-    normalize_java_whitespace_text, organize_java_imports, organize_java_imports_text,
+    JavaWhitespaceRange, UnusedCtorParamsPlan, analyze_java_method_regions,
+    analyze_java_method_regions_with_options, analyze_unused_constructor_params, java_hygiene_file,
+    java_hygiene_file_scoped, normalize_java_whitespace_file,
+    normalize_java_whitespace_file_scoped, normalize_java_whitespace_text, organize_java_imports,
+    organize_java_imports_text,
 };
 pub(crate) mod csharp;
 pub(crate) mod csharp_sidecar;
