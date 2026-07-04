@@ -596,9 +596,19 @@ impl Tool for CodeRead {
         Some(("code".to_string(), "read".to_string()))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        // gap-f4fc31d3: a bare { file } call is the common misfire; the raw
+        // serde "missing field span" error gave no path back to the recipe.
+        let file_only_hint = input.get("span").is_none() && input.get("file").is_some();
         let params: CodeReadParams = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return err(format!("code.read: {e}")),
+            Err(e) => {
+                let hint = if file_only_hint {
+                    "; code.read takes a hash-anchored { span }, not { file }: for a line range use code.readLines({ file, startLine, endLine }); for the whole file mint a span from code.items ({ file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 })"
+                } else {
+                    ""
+                };
+                return err(format!("code.read: {e}{hint}"));
+            }
         };
         let path = match resolve(&cx.root, &params.span.file) {
             Ok(p) => p,
@@ -795,9 +805,18 @@ impl Tool for CodeSignature {
         Some(("code".to_string(), "signature".to_string()))
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        // gap-f4fc31d3: same { file }-only misfire shape as code.read.
+        let file_only_hint = input.get("span").is_none() && input.get("file").is_some();
         let params: CodeSignatureParams = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return err(format!("code.signature: {e}")),
+            Err(e) => {
+                let hint = if file_only_hint {
+                    "; code.signature takes a hash-anchored { span }, not { file }: derive item spans first (code.items({ file }).items[i].span) and pass one of those"
+                } else {
+                    ""
+                };
+                return err(format!("code.signature: {e}{hint}"));
+            }
         };
         let path = match resolve(&cx.root, &params.span.file) {
             Ok(p) => p,
@@ -989,7 +1008,7 @@ pub fn namespace_description() -> ToolNamespaceDescription {
             description: "Pure syntax facts over the working set (tree-sitter). FOR ANY span/hash/structure work on source files, prefer `code.*` over raw file reads, shell, or regex — it is the canonical syntax-fact surface. Provenance tier: syntax_only. Spans are hash-anchored at read time — a Span from stale file content fails closed at consumption, so re-derive facts after any write to the file. The eight methods below are the complete `code` surface. Cross-file work is self-contained and ONE call deep: `code.files({ language: \"rust\" })` enumerates the working set, and `code.items`/`code.query` accept `files: string[]` so the host fans out — \"find symbol X in the crate\" is `code.query({ files, query })`, never a cell for-loop. `code.items` carries Java `declaring_type` and `nested` facts; pass `top_level_only: true` to skip members declared inside nested Java types before the payload enters the isolate. Use `code.fields` for Java field declarations; do not hand-roll field_declaration queries just to learn modifiers/type/name. Keep intermediate facts in cell variables or `store()` — `text()` only the derived result, not raw inventories. THE RECIPE for signature predicates (\"public Rust fns returning Result\" or \"Java constructors with multiline params\"): `code.items` → filter callable kinds (`function_item`, `method_declaration`, `constructor_declaration`) → `Promise.all(items.map(i => code.signature({ span: i.span })))` → branch on `language`/`kind`. For Java formatting checks, read `params_span` rather than the whole file or raw regexing the constructor. Whole-file read: `code.read({ span: { file, byte_start: 0, byte_end: inv.source_len, content_sha256: inv.content_sha256 } })`. For line ranges from analysis.methodRegions, use `code.readLines({ file, startLine, endLine })` to produce exact oldText and a hash-anchored span. Query authoring: use real tree-sitter node kinds (the `kind` values returned by `code.items`/`code.query` are exactly those names) — e.g. Rust public functions are `(function_item (visibility_modifier)) @pub_fn`, function names `(function_item name: (identifier) @fn_name)`; Java callables are `method_declaration` / `constructor_declaration`. An `Invalid node type` error means the node name does not exist in that grammar, while an EMPTY `captures` array means the query is valid but matched nothing — do not read empty results as the surface being broken."
             .to_string(),
         declarations: r#"type Span = { file: string; byte_start: number; byte_end: number; content_sha256: string };
-	type SyntaxItemFact = { name?: string; kind: string; visibility?: string; declaring_type?: string; nested: boolean; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
+type SyntaxItemFact = { name?: string; kind: string; visibility?: string; declaring_type?: string; nested: boolean; span: Span; trivia_span: Span; line_start: number; line_end: number; attributes: string[] };
 type JavaFieldFact = { name: string; type: string; owner_class?: string; visibility?: string; modifiers: string[]; annotations: string[]; is_static: boolean; is_final: boolean; is_static_final: boolean; is_mutable_instance: boolean; span: Span; name_span: Span };
 type QueryCapture = { capture: string; kind: string; text: string; span: Span };
 type FileItems = { file: string; language: string; content_sha256: string; source_len: number; items: SyntaxItemFact[] };
@@ -999,8 +1018,8 @@ type JavaSignature = { language: "java"; kind: "method_declaration" | "construct
 declare const code: {
   /** Enumerate parseable source files (skips dot-dirs, target, node_modules, build, dist, vendor). Feed straight into items({files})/query({files}). */
   files(args?: { dir?: string; language?: string }): Promise<{ files: { file: string; language: string }[]; count: number; truncated: boolean }>;
-	  /** Inventory syntax items. visibility is "pub"/"public"/... or undefined = private. Java items include declaring_type and nested; top_level_only/topLevelOnly drops nested-type members. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
-	  items(args: ({ file: string } | { files: string[] }) & { top_level_only?: boolean; topLevelOnly?: boolean }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
+  /** Inventory syntax items. visibility is "pub"/"public"/... or undefined = private. Java items include declaring_type and nested; top_level_only/topLevelOnly drops nested-type members. source_len enables whole-file Spans. `file` → flat shape; `files` → host-side batch ({ files: (FileItems | { file; error })[] }). */
+  items(args: ({ file: string } | { files: string[] }) & { top_level_only?: boolean; topLevelOnly?: boolean }): Promise<FileItems | { files: (FileItems | { file: string; error: string })[] }>;
   /** Inventory Java field declarations with type/modifiers/annotations/owner and hash-anchored declaration/name spans. Use this instead of raw field_declaration queries. */
   fields(args: { file: string; className?: string }): Promise<FileFields>;
   /** Tree-sitter query; captures carry hash-anchored Spans. `file` → per-file shape (within allowed); `files` → batch: flat captures across all files (each span names its file) + per-file roll-up. The batch is aggregate-capped (~20k captures): a broad query over a large repo sets aggregate_capped + files_scanned/files_total + hint — narrow the query or the file set and re-run rather than widening blindly. */

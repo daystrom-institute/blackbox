@@ -4537,8 +4537,8 @@ impl Tool for JavaExtractInterface {
             "properties": {
                 "file": { "type": "string" },
                 "target": { "type": "string" },
-                "typeName": { "type": "string" },
-                "className": { "type": "string" },
+                "typeName": { "type": "string", "description": "Name of the NEW interface or abstract type to create. Not the source class (that is className)." },
+                "className": { "type": "string", "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class." },
                 "targetKind": { "type": "string", "enum": ["interface", "abstract_class"] },
                 "memberRefs": { "type": "array", "items": { "type": "string" }, "description": "Refs returned by java.pullUpPreview, not graph IDs." },
                 "commentPolicy": { "type": "string", "enum": ["copy", "move", "omit"] },
@@ -4563,7 +4563,7 @@ impl Tool for JavaExtractInterface {
             Ok(p) => p,
             Err(e) => {
                 return err(format!(
-                    "java.extractInterface: bad input - expected {{ file, target, typeName, memberRefs, ... }}; {e}"
+                    "java.extractInterface: bad input - expected {{ file, target, typeName, memberRefs, ... }}; {e} (typeName names the NEW type to create; className optionally names the SOURCE class, as in java.pullUpPreview)"
                 ));
             }
         };
@@ -4844,8 +4844,8 @@ impl Tool for JavaPullUpMembers {
             "properties": {
                 "file": { "type": "string" },
                 "target": { "type": "string" },
-                "targetTypeName": { "type": "string" },
-                "className": { "type": "string" },
+                "targetTypeName": { "type": "string", "description": "Name of the EXISTING interface or abstract class receiving the members; defaults from the target file. Not the source class (that is className)." },
+                "className": { "type": "string", "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class." },
                 "targetKind": { "type": "string", "enum": ["interface", "abstract_class"] },
                 "memberRefs": { "type": "array", "items": { "type": "string" }, "description": "Refs returned by java.pullUpPreview, not graph IDs." },
                 "commentPolicy": { "type": "string", "enum": ["copy", "move", "omit"] },
@@ -5276,8 +5276,8 @@ impl Tool for JavaPushDownMembersPreview {
             "properties": {
                 "file": { "type": "string" },
                 "target": { "type": "string" },
-                "className": { "type": "string" },
-                "targetTypeName": { "type": "string" }
+                "className": { "type": "string", "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class." },
+                "targetTypeName": { "type": "string", "description": "Name of the EXISTING subtype in the target file receiving the members; defaults from the target file. Not the source class (that is className)." }
             },
             "required": ["file", "target"]
         })
@@ -5323,8 +5323,8 @@ impl Tool for JavaPushDownMembers {
             "properties": {
                 "file": { "type": "string" },
                 "target": { "type": "string" },
-                "className": { "type": "string" },
-                "targetTypeName": { "type": "string" },
+                "className": { "type": "string", "description": "Optional SOURCE class name when the file declares multiple classes; defaults to the file's primary class." },
+                "targetTypeName": { "type": "string", "description": "Name of the EXISTING subtype in the target file receiving the members; defaults from the target file. Not the source class (that is className)." },
                 "memberRefs": { "type": "array", "items": { "type": "string" } },
                 "commentPolicy": { "type": "string", "enum": ["move", "copy", "omit"] },
                 "acknowledgeRemainingSourceReferences": { "type": "boolean" },
