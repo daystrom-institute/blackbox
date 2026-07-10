@@ -130,10 +130,11 @@ bbox_embed_status()
 bbox_reembed(route="<route>")
 ```
 
-Provider config lives in:
+Provider config lives in `embed.toml` under the platform config dir:
 
 ```text
-~/.config/blackbox/embed.toml
+~/.config/blackbox/embed.toml                        (Linux)
+~/Library/Application Support/blackbox/embed.toml    (macOS)
 ```
 
 Voyage uses `voyage-code-3` by default. Ollama can be used for local
@@ -144,10 +145,10 @@ routes such as `nomic-embed-text`.
 The daemon runs route-specific workers. Reindexing enqueues source docs;
 workers batch, send, retry, and persist vectors.
 
-Voyage batch cap:
+Queue batch cap:
 
 ```text
-64 documents or 80KB total per request
+128 documents or 100 KiB of input text per request
 ```
 
 The cap is intentionally below provider limits so a large restart does

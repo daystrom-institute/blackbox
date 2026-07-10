@@ -112,17 +112,18 @@ Environment=FORGEJO_WEBHOOK_SECRET=...
 
 ### Embedding provider config
 
-Override route providers in `~/.config/blackbox/embed.toml` (created on
-first edit; daemon reloads on restart):
+Override route providers in `embed.toml` under the platform config dir
+(`~/.config/blackbox/` on Linux; `~/Library/Application Support/blackbox/`
+on macOS). Created on first edit; daemon reloads on restart:
 
 ```toml
-[routes.knowledge]
-provider = "ollama"
-model    = "nomic-embed-text"
+[embed.providers.ollama]
+endpoint = "http://localhost:11434"
+model = "nomic-embed-text"
 
-[routes.transcripts]
-provider = "voyage"
-model    = "voyage-code-3"
+[embed.routes]
+knowledge = "ollama"
+transcripts = "voyage"
 ```
 
 Mixing providers across routes is fine. Changing a route's provider or

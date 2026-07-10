@@ -71,8 +71,9 @@ late.
 
 ### X-IMG — Standalone image chunker
 
-- VLM caption extraction. Requires multimodal embedding model
-  (gated on `multimodal-embedding-routing.md` open question §20.3).
+- Embed the image directly with `voyage-multimodal-3.5`; the model
+  selection is resolved in `multimodal-embedding-routing.md` (Layer 4).
+  VLM caption extraction is optional lexical enrichment, not a gate.
 - Edges: `DEPICTS`, `CAPTIONED_AS`.
 
 ## Picking the next one

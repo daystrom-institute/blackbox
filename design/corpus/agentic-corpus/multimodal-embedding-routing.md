@@ -10,13 +10,14 @@ topic:
 
 # Multimodal and Embedding Routing Design
 
-Date: 2026-06-12 (rewrite; supersedes the 2026-05-07 revision in-place)
+Date: 2026-07-09 (Voyage 4 alignment pass; supersedes the 2026-06-12
+revision in-place)
 
 ## Problem
 
 The embedding stack is well-partitioned but **single-model, role-unmarked,
-and a generation old**. Verified against code and the live daemon on
-2026-06-12:
+and a generation old**. Re-verified against code and the live daemon on
+2026-07-09:
 
 - Every bucket — `code`, `docs`, `knowledge`, `notes`, `threads`,
   `git_message`, `agent_manifest` — embeds with `voyage-code-3`, a
@@ -43,10 +44,12 @@ Two things from the prior revision have shipped since:
   (`crates/bbox-corpus-core/src/search/{rerank,metrics}.rs`) — the eval
   substrate the migration phases below lean on.
 
-And the prior revision's "zero coverage for knowledge/notes/threads" has
-mostly self-healed: live status 2026-06-12 shows knowledge 93%, threads
-100%, notes 68% (lagging — worth investigation), transcripts 0
-(`include_transcripts` opt-in).
+Live coverage (2026-07-09, `bbox_embed_status`): knowledge, notes, threads,
+and agent_manifest are healthy (99%+); code (32%), docs (11%), and
+git_message (87%) report stalled partial coverage with idle queues.
+Repair that residue before any model migration so backfill failures and
+model-quality changes are not conflated. Transcripts stay guarded behind
+the explicit `include_transcripts` opt-in.
 
 This doc supersedes only the embedding-model selection, routing, and
 ranking-pipeline parts of `agentic-corpus.md` / `agentic-corpus-impl.md`.
@@ -56,7 +59,7 @@ strategy stay. Chunker phases live in
 
 ## External Model Facts
 
-Checked against Voyage documentation on 2026-06-12.
+Checked against Voyage documentation on 2026-07-09.
 
 Text embeddings (`/v1/embeddings`):
 
@@ -71,17 +74,35 @@ Text embeddings (`/v1/embeddings`):
   this corpus than an unrelated local model (`nomic-embed-text`).
 - `voyage-code-3` remains the code-retrieval specialist; no documented
   compatibility with the voyage-4 space. Do not infer compatibility from
-  equal dimensions.
+  equal dimensions. It supports the same 256/512/1024/2048 dimensions and
+  quantized output options.
+- Request limits: at most 1,000 inputs per request, with model-specific
+  aggregate token caps (1M for `voyage-4-lite`, 320K for `voyage-4`, 120K
+  for `voyage-4-large` and `voyage-code-3`). The current queue guard
+  (128 inputs / 100 KiB) is a conservative byte heuristic well inside
+  those caps, not an exact token check; keep it conservative rather than
+  pretending bytes are tokens.
 
-Contextualized chunk embeddings (`voyage-context-3`, `voyage-context-4`
-preview) — **new since the prior revision**:
+Contextualized chunk embeddings (`voyage-context-4`):
 
+- `voyage-context-4` is now the current recommended contextualized model
+  (GA, announced 2026-06-29); it is no longer preview. Voyage documents no
+  vector-space compatibility between `voyage-context-3` and `-4`, so the
+  version choice is a new partition and full re-embed either way. Adopt
+  `-4` directly when Layer 2 lands.
 - Each chunk is encoded in the context of the other chunks of the same
-  document; chunk-level vectors, document-level semantics.
+  document; chunk-level vectors, document-level semantics. 32K-token
+  context per chunk.
 - API takes document-grouped input (`List[List[str]]`); queries stay flat
   `List[str]` with `input_type="query"`. Same flexible dims
   (256/512/1024/2048) and output formats.
-- Own vector space — its own compatibility family, not interchangeable
+- Request caps: 1,000 inputs, 120K aggregate tokens, 16K chunks.
+- Optional provider auto-chunking exists (`enable_auto_chunking`, off by
+  default; `chunk_size` defaults to 512 tokens and caps at 32K;
+  `chunk_overlap` defaults to 0 and must be smaller than chunk size).
+  Blackbox's default remains locally chunked document groups, which keep
+  stable entity refs, source anchors, and graph edges; see Layer 2.
+- Own vector space: its own compatibility family, not interchangeable
   with voyage-4 standard embeddings.
 
 Rerankers (`/v1/rerank`):
@@ -98,6 +119,13 @@ Multimodal (`/v1/multimodalembeddings`):
 - Limits: image ≤ 20 MB and ≤ 16M pixels; video ≤ 20 MB; ≤ 32K tokens per
   input, ≤ 320K per batch, ≤ 1,000 inputs per request (560 px per image
   token, 1120 px per video token).
+- `truncation` defaults to true, and when truncation lands inside an image
+  the entire image is silently discarded. Visual routes must set
+  `truncation=false` and preflight the limits locally; a dropped image is
+  not an acceptable silent degradation for visual retrieval.
+- The multimodal guide documents flexible dimensions but, unlike the text
+  and contextualized docs, does not document quantized output dtypes.
+  Treat multimodal quantization as unverified until probed.
 - **No documented compatibility with the voyage-4 text space.** Multimodal
   is a separate route family, not a text-model replacement.
 
@@ -105,6 +133,7 @@ Primary references:
 
 - https://docs.voyageai.com/docs/embeddings
 - https://docs.voyageai.com/docs/contextualized-chunk-embeddings
+- https://blog.voyageai.com/2026/06/29/voyage-context-4/
 - https://docs.voyageai.com/docs/reranker
 - https://docs.voyageai.com/docs/multimodal-embeddings
 - https://docs.voyageai.com/reference/multimodal-embeddings-api
@@ -151,15 +180,20 @@ document embeddings on `voyage-4-large` (one-time indexing cost), query
 embeddings on `voyage-4-lite` or local `voyage-4-nano` (per-search
 latency/cost). Expressed as `document_model` / `query_model` within one
 provider alias — both must derive the same compatibility family or the
-route loader rejects the config. The query cache key moves from
-`(provider_id, model, query)` to `(compatibility_family, query)`.
+route loader rejects the config. Note the asymmetry Voyage actually
+guarantees: family compatibility permits cross-model search, it does not
+make two query models' vectors identical. The query cache key therefore
+stays exact, `(provider_id, query_model, dim, dtype, query)`; the family
+governs which partitions a cached vector may search, never cache identity.
 
 ### Layer 2 — Contextualized chunk embeddings
 
-`voyage-context-3` (or `-4` once stable) becomes the document encoder for
+`voyage-context-4` (GA since 2026-06-29) becomes the document encoder for
 buckets whose chunks are document-grouped — `code`, `docs`, and
 transcript sessions are the strongest fits; chunk-in-document context is
 the known weakness of independent chunk embedding on exactly this corpus.
+`code` moves only on an eval win against `voyage-code-3`; Voyage's
+published aggregates do not establish that specialized comparison.
 
 Queue implication (the real work): the embed queue currently batches flat
 text across documents. Contextualized routes need a **document-grouped
@@ -169,9 +203,17 @@ across batches (subject to the per-batch token budget; oversized documents
 fall back to windowed grouping). `EmbedInput` anticipates this with a
 `DocumentChunks` variant from day one so Layer 0's shapes don't churn.
 
+Provider auto-chunking is not the ingestion default. Local semantic chunks
+keep stable entity refs, line/page/cell metadata, AST boundaries, and graph
+edges; send them as ordered document groups. Auto-chunking is at most an
+eval alternative for source kinds with a canonical whole-document text
+projection, and only if the returned chunk text and settings can be
+persisted alongside the vectors. It is never a chunker for raw binary
+formats.
+
 Queries against context partitions are flat text with `input_type=query` —
 no query-side grouping, so hybrid search needs no structural change beyond
-family-aware encoding.
+query-encoder-aware routing.
 
 ### Layer 3 — Cross-encoder rerank stage
 
@@ -241,7 +283,7 @@ output_dimension = 1024
 [embed.providers.voyage_context]
 type = "voyage_context"
 api_key_env = "VOYAGE_API_KEY"
-model = "voyage-context-3"
+model = "voyage-context-4"
 output_dimension = 1024
 
 [embed.providers.voyage_visual]
@@ -321,7 +363,8 @@ Derivation is code-owned (never operator-supplied):
 
 - voyage-4 family (incl. nano, local or hosted) → `voyage-4:<dim>:<dtype>`
 - `voyage-code-3` → `voyage-code-3:<dim>:<dtype>`
-- `voyage-context-3` → `voyage-context-3:<dim>:<dtype>`
+- `voyage-context-4` → `voyage-context-4:<dim>:<dtype>` (each exact
+  contextual model is its own family; no documented cross-version space)
 - `voyage-multimodal-3.5` → `voyage-multimodal-3.5:<dim>:<dtype>`
 - `nomic-embed-text` → `ollama:nomic-embed-text:768:float`
 - Unknown future models default to exact-model families until classified.
@@ -422,11 +465,13 @@ match current provider limits (image ≤ 20 MB / ≤ 16M px, video ≤ 20 MB,
 For a text query:
 
 1. Run BM25 as today.
-2. Resolve route metadata for every configured bucket; group active vector
-   partitions by compatibility family.
-3. Embed the query once per family with that family's `query_model`
-   (cache key: `(family, query)`).
-4. Search exact partitions per family; fuse BM25 + vector lists via RRF.
+2. Resolve route metadata for every configured bucket; reject query
+   encoders whose family does not match the target partition.
+3. Embed the query once per exact query encoder (provider, query_model,
+   dim, dtype); cache key `(provider_id, query_model, dim, dtype, query)`.
+   Compatibility decides which partitions a vector may search, not whether
+   two encoders share a cache entry.
+4. Search compatible partitions; fuse BM25 + vector lists via RRF.
 5. Optional model rerank: send fused top-k to `rerank-2.5-lite`, re-order
    by relevance score. On API failure fall back to heuristic rerank and
    report `degraded.rerank_unavailable`.
@@ -470,8 +515,9 @@ Phase 3 — Prose re-route + asymmetric retrieval (Layer 1):
   `voyage_code` pending eval.
 - `bbox_reembed` per bucket; old partitions pruned via Phase 2 tooling
   after verification.
-- Investigate the `notes` coverage lag (68% on 2026-06-12) before
-  re-routing so the backfill and the migration aren't conflated.
+- Repair the stalled partial coverage on `code`, `docs`, and `git_message`
+  (observed 2026-07-09) before re-routing so the backfill and the
+  migration aren't conflated.
 
 Phase 4 — Model rerank stage (Layer 3): `[embed.rerank]` config, opt-in
 param, eval A/B against heuristic-only using the metrics substrate; ship
@@ -500,8 +546,9 @@ Phase 6 — Multimodal provider + first visual chunker (Layer 4):
   `input_type=query`.
 - Route status reports provider id, endpoint kind, models (document/query),
   dim, dtype, and compatibility family.
-- Hybrid search embeds once per compatibility family; the query cache is
-  family-keyed.
+- Hybrid search embeds once per exact query encoder; the query cache key
+  includes the query model, dim, and dtype. Family compatibility alone
+  never aliases two query models in the cache.
 - An asymmetric route (document `voyage-4-large`, query `voyage-4-lite`)
   works end-to-end; a cross-family asymmetric pair is rejected at config
   load.
@@ -518,12 +565,14 @@ Phase 6 — Multimodal provider + first visual chunker (Layer 4):
 
 ## Open Questions
 
-- Quantization posture: at ~150K indexed vectors (2026-06-12), float at
+- Quantization posture: at ~60K indexed vectors (2026-07-09), float at
   1024d is cheap; int8/binary buys little until the corpus grows 10–50×.
   Defer a quantized family until partition size or memory pressure says
-  otherwise?
-- `voyage-context-4` is preview — adopt `-3` now and re-embed on `-4` GA
-  (new family either way), or wait?
+  otherwise? (Multimodal quantized output is additionally undocumented;
+  see External Model Facts.)
+- Contextualized chunking parameters: if Layer 2's eval ever exercises
+  auto-chunking, chunk size and overlap are recipe inputs to sweep, not
+  constants (overlap tokens are billed again).
 - Local query encoding via open-weight `voyage-4-nano`: worth the
   inference dependency for offline/latency wins, or keep queries hosted on
   `voyage-4-lite`?
