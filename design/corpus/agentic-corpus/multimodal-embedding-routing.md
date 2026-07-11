@@ -431,35 +431,88 @@ provider mocks/tests.
 
 ## Multimodal Chunk Model
 
-Unchanged from the prior revision. Text-first chunks ride the existing
-`project_file` path (`pdf_page`, `pdf_table`, `spreadsheet_sheet`,
-`notebook_cell`, `slide`, `web_section`, `transcript_segment`, …).
-Visual payload sidecars only where pixels are semantically load-bearing
-(`pdf_figure`, `spreadsheet_chart`, `slide_image`, `image_caption`,
+Text-first chunks ride the existing `project_file` path (`pdf_page`,
+`pdf_table`, `spreadsheet_sheet`, `notebook_cell`, `slide`, `web_section`,
+`transcript_segment`, …). Visual payload sidecars only where pixels are
+semantically load-bearing (`image` [X-IMG standalone images], `pdf_figure`,
+and - still unbuilt - `spreadsheet_chart`, `slide_image`, `image_caption`,
 `video_segment`).
 
-No raw image/video bytes in Tantivy; a content-hash-addressed sidecar:
+**Shipped 2026-07-11**: the sidecar path end to end for `image` and
+`pdf_figure` (`crates/bbox-visual-store` - new crate; `crates/bbox-chunker/
+src/ximg.rs`; `crates/bbox-chunker/src/pdf_figure.rs`; the visual queue lane
+in `crates/bbox-embed/src/embed/queue.rs` and `embed_queue.rs`; backfill/
+coverage wiring in `src/embed_runtime.rs`). No raw image/video bytes in
+Tantivy - a content-hash-addressed sidecar under the daemon state dir
+(`<state_dir>/blackbox/visual-payloads/<hash[0:2]>/<hash>.blob`, override
+`BLACKBOX_VISUAL_PAYLOAD_DIR`), sharded by hash prefix, deduped by hash
+(the same image bytes recurring across a corpus write once).
+
+The shipped `VisualPayloadRef` is deliberately smaller than the shape
+originally sketched here:
 
 ```rust
 struct VisualPayloadRef {
-    source_file: PathBuf,
-    source_hash: String,
-    chunk_entity_id: String,
-    mime: String,
-    byte_range: Option<(u64, u64)>,
-    page: Option<u32>,
-    bbox: Option<[f32; 4]>,
-    timestamp_ms: Option<u64>,
-    frame_idx: Option<u32>,
-    extracted_path: PathBuf,
-    pixel_hash: String,
+    content_hash: String, // sha256 hex; the store's lookup key
+    media_type: String,   // e.g. "image/png"
+    byte_len: u64,
 }
 ```
 
-Sidecar anchoring should use the `file:` virtual entity once it lands
-(gap-ab3ef97f) rather than the chunk[0]-as-file proxy. Payload guards
-match current provider limits (image ≤ 20 MB / ≤ 16M px, video ≤ 20 MB,
-≤ 32K tokens per input by provider accounting).
+The dropped fields (`source_file`, `chunk_entity_id`, `byte_range`, `page`,
+`bbox`, `timestamp_ms`, `frame_idx`, `extracted_path`) are not lost:
+they're either already carried by the owning `Chunk`
+(`file_path`/`project_id`/`chunk_hash`, and `line_start`/`line_end` repurposed
+for page number exactly as `pdf_page` does) or not yet needed by any shipped
+producer (`bbox`/`timestamp_ms`/`frame_idx` are for chunk kinds like
+`slide_image`/`video_segment` that haven't shipped). `VisualPayloadRef`'s
+one job is "locate and describe the payload blob"; chunk-level anchoring
+stays on `Chunk`, not duplicated onto the ref. `source_hash`/`pixel_hash`
+collapse into the single `content_hash` (hash-of-raw-bytes is both the
+store key and the identity check; a separate "pixel hash" would only
+differ if the store ever normalized/re-encoded on write, which it does
+not - DCTDecode is a byte-exact passthrough and the FlateDecode-to-PNG
+path is deterministic, so a second hash would always equal the first).
+
+**Anchoring interim (gap-ab3ef97f)**: the `file:` virtual entity this doc
+originally called for does not exist yet. Every shipped producer uses the
+sanctioned interim instead - the chunk[0]-as-file proxy - via the
+`VisualPayloadRef::encode`/`decode` round trip riding `Chunk::symbol` (an
+existing plain-text tantivy field, not a schema bump): the chunker encodes
+the ref into `symbol` at chunk time; the backfill/reembed path
+(`embed_runtime.rs::chunk_from_embedding_doc`) decodes it back out when
+reconstructing a `Chunk` from stored fields, since backfill never
+re-chunks the source file. Migrate this encoding to the `file:` entity
+once it lands; until then `symbol` is the sanctioned carrier for this
+one purpose (X-IMG/pdf_figure only - no other chunk kind's `symbol` usage
+changes).
+
+**Pixel-export policy**: visual embedding is opt-in per chunk kind via
+`[embed.routes.visual]` (absent means the kind never embeds - chunks still
+exist for text/graph purposes, just unembedded). When a kind IS routed,
+raw image bytes leave the host as base64 data URLs in the
+`voyage-multimodal-3.5` request body (`voyage_multimodal.rs`'s
+`content_item`) - the same pixels stored in the local sidecar, sent once
+per unique content hash (dedup at the store layer means a re-chunked or
+duplicated image is not re-sent). No other export path exists: the
+sidecar itself is never served over HTTP, and `bbox_ref_size`/evidence
+bundling never include visual payload bytes. This is the same corpus-
+export-policy posture text buckets already have (§ Design Principles,
+"multimodal makes image/video/PDF pixel export explicit and opt-in"),
+called out explicitly here because it is the first bucket whose export is
+literal pixels rather than text an operator already wrote.
+
+**GC (deferred)**: payloads are dedup-by-hash but have no reference
+counting or mark-sweep - a blob for a since-deleted or re-chunked chunk
+stays on disk indefinitely. See `crates/bbox-visual-store/src/lib.rs`'s
+module doc comment for the two follow-up shapes (live refcount vs.
+mark-sweep over current chunks' decoded refs); not built in this pass.
+
+Payload guards match current provider limits (image ≤ 20 MB / ≤ 16M px,
+video ≤ 20 MB, ≤ 32K tokens per input by provider accounting) - enforced
+both at the project-file walker (`MAX_IMAGE_FILE_BYTES`, so an oversized
+file is never even read into the payload store) and at the provider layer
+(`voyage_multimodal.rs`'s local preflight, `truncation=false` always).
 
 ## Search Semantics
 
@@ -580,15 +633,32 @@ comparison when the corpus or query suite changes materially. Original
 scope:
 
 Phase 6 — Multimodal provider + first visual chunker (Layer 4) —
-**partially shipped 2026-07-11**: `VoyageMultimodalProvider`
-(voyage-multimodal-3.5, `truncation=false` always, local preflight guards
-for image bytes/pixels and video bytes as typed poison), `voyage_visual`
-builtin alias, `[embed.routes.visual]` parsing with multimodal-only alias
-validation, and the X-PDF text-first chunker (`pdf_page` chunks via
-pdf-extract, riding the docs bucket; scanned/corrupt PDFs degrade to zero
-chunks, no OCR). Still open: `pdf_figure`/visual payload sidecar
-(gap-ab3ef97f `file:` entity anchoring), pixel-export policy docs, and
-the visual eval. Original scope:
+**partially shipped 2026-07-11, sidecar path completed 2026-07-11**:
+`VoyageMultimodalProvider` (voyage-multimodal-3.5, `truncation=false`
+always, local preflight guards for image bytes/pixels and video bytes as
+typed poison), `voyage_visual` builtin alias, `[embed.routes.visual]`
+parsing with multimodal-only alias validation, and the X-PDF text-first
+chunker (`pdf_page` chunks via pdf-extract, riding the docs bucket;
+scanned/corrupt PDFs degrade to zero chunks, no OCR) shipped first. The
+visual sidecar path landed in a follow-up pass the same day: the
+content-hash-addressed payload store (`bbox-visual-store`), the X-IMG
+standalone-image chunker, the `pdf_figure` embedded-XObject extractor
+(DCTDecode/JPEG and unpredicted FlateDecode DeviceGray/RGB only), the
+visual embed queue lane (`EmbedRequest::visual_kind`/`visual_payload`,
+`PackMode::Visual` batch packing weighted by payload byte length rather
+than caption text length, `embed_visual_requests` loading bytes from the
+sidecar at request-build time), index-time enqueue
+(`enqueue_project_file` routes visual chunk kinds through
+`enqueue_visual_project_file`), and backfill/coverage wiring
+(`record_index_doc_coverage`/`enqueue_reembed_index_doc` piggyback on the
+existing project_file scan for visual chunk kinds, reporting under
+`visual:<kind>` route keys). Anchoring uses the sanctioned chunk[0]-as-
+file-proxy interim per gap-ab3ef97f (see "Multimodal Chunk Model" above);
+pixel-export policy is documented there too. Still open: the visual eval
+(figure/table/chart query set) - no eval run yet compares text-only vs.
+visual-sidecar retrieval quality, so `[embed.routes.visual]` stays
+unconfigured by default (opt-in, per Design Principle 4) rather than
+becoming a recommended default for any visual kind. Original scope:
 
 - `VoyageMultimodalProvider` against `/v1/multimodalembeddings` with the
   payload guards above; export-policy docs for pixels leaving the host.
