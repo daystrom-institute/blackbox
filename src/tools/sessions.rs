@@ -98,14 +98,15 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_embed_partitions",
-        description = "Vector partition lifecycle: list partitions with route mapping, dims, dtype, compatibility family, active_count, last_write; prune orphaned partitions (dry-run default)."
+        description = "Vector partition lifecycle: list partitions with route mapping, dims, dtype, compatibility family, active_count, last_write; prune orphaned partitions; scrub misattributed vectors from a mapped partition (dry-run default)."
     )]
     pub(crate) async fn bbox_embed_partitions(
         &self,
         Parameters(p): Parameters<EmbedPartitionsParams>,
     ) -> CallToolResult {
+        let server = self.clone();
         Self::run_blocking("bbox_embed_partitions", move || {
-            crate::embed_runtime::embed_partitions(&p)
+            crate::embed_runtime::embed_partitions(&p, &server.state)
         })
         .await
     }

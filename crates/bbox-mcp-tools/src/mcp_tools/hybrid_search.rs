@@ -61,13 +61,13 @@ pub struct HybridSearchParams {
     /// bbox_corpus_core::search::metrics); not intended for normal callers.
     #[serde(default)]
     pub rerank_cap: Option<f32>,
-    /// Rerank stage selection. "heuristic" (default) applies the
-    /// type/temporal multipliers to the fused RRF scores. "model" sends the
-    /// fused top-k candidates to the configured cross-encoder
-    /// (`[embed.rerank]`, default rerank-2.5-lite), orders by relevance,
-    /// and applies the heuristic multipliers after; on rerank API failure
-    /// it falls back to heuristic and reports
-    /// `degraded.rerank_unavailable`. "none" returns raw fusion order.
+    /// Rerank stage selection. "model" (default) sends the fused top-k
+    /// candidates to the configured cross-encoder (`[embed.rerank]`,
+    /// default rerank-2.5-lite), orders by relevance, and applies the
+    /// heuristic type/temporal multipliers after; on rerank API failure it
+    /// falls back to heuristic and reports `degraded.rerank_unavailable`.
+    /// "heuristic" skips the cross-encoder (multipliers only, no API call,
+    /// lower latency). "none" returns raw fusion order.
     #[serde(default)]
     pub rerank: Option<String>,
 }
@@ -801,9 +801,14 @@ enum RerankMode {
 }
 
 fn parse_rerank_mode(raw: Option<&str>) -> Result<RerankMode> {
-    match raw.map(str::trim).unwrap_or("heuristic") {
-        "" | "heuristic" => Ok(RerankMode::Heuristic),
-        "model" => Ok(RerankMode::Model),
+    // Model rerank is the DEFAULT since 2026-07-11: the eval A/B measured
+    // MRR 0.1667 vs heuristic 0.1067 (recall@1 2.5x) and the operator
+    // accepted the added per-search cross-encoder latency. API failure
+    // still degrades to the heuristic path per call, so a missing key or
+    // provider outage costs the boost, never the search.
+    match raw.map(str::trim).unwrap_or("model") {
+        "" | "model" => Ok(RerankMode::Model),
+        "heuristic" => Ok(RerankMode::Heuristic),
         "none" => Ok(RerankMode::None),
         other => anyhow::bail!("unknown rerank mode `{other}`; expected model, heuristic, or none"),
     }
@@ -1108,7 +1113,7 @@ mod tests {
 
     #[test]
     fn rerank_mode_parses_and_rejects_unknown() {
-        assert_eq!(parse_rerank_mode(None).unwrap(), RerankMode::Heuristic);
+        assert_eq!(parse_rerank_mode(None).unwrap(), RerankMode::Model);
         assert_eq!(
             parse_rerank_mode(Some("heuristic")).unwrap(),
             RerankMode::Heuristic

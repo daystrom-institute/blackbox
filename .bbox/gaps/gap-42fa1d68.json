@@ -1,0 +1,19 @@
+{
+  "id": "gap-42fa1d68",
+  "title": "No admin sweep for misattributed vectors inside a still-mapped partition",
+  "gap_kind": "tooling",
+  "domain": "embedding-routing",
+  "wanted_capability": "bbox_embed_partitions prunes only whole unmapped partitions. When bucket attribution changes (2026-07-11: markdown language=md mislabel plus the enqueue/backfill rule split routed prose chunks into the voyage_code partition for ~20 minutes, ~10K vectors), the wrong-partition vectors persist as unattributed residue that neither backfill nor compaction removes: they inflate active_count and double-represent entities in the wrong vector lane. Want a scrub action (partition x current-attribution diff -> delete entities whose attributed route differs), dry-run default, reusing embed_iterate_internal + the shared is_code_chunk rule.",
+  "fallback_used": "Accepted the ~10K stale vectors as benign double-representation; nightly compaction keeps the partition healthy otherwise.",
+  "evidence": [
+    "crates/bbox-embed/src/embed_queue.rs is_code_chunk (the now-shared rule)",
+    "commit 41f4f65b",
+    "voyage_code partition active_count vs code bucket source_count delta"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "tooling/embedding-routing/misattributed-vector-scrub",
+  "resolution": "unresolved",
+  "created_at": "2026-07-11T18:18:47Z",
+  "updated_at": "2026-07-11T18:18:47Z"
+}

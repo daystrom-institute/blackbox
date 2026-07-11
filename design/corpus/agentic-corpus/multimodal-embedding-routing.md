@@ -554,9 +554,10 @@ existing cap, and API failure degrades to heuristic with
 `degraded.rerank_unavailable`. **Eval A/B run 2026-07-11**
 (`eval/scripts/rerank_mode_ab.py`, 30-query suite, refreshed refs, live
 daemon): model rerank MRR 0.1667 vs heuristic 0.1067 vs raw fusion
-0.0288; recall@1 0.167 vs 0.067. The measured-win condition for the
-default flip is met; the flip still awaits the design's second condition,
-operator acceptance of the added per-search rerank API latency. Original
+0.0288; recall@1 0.167 vs 0.067. Both flip conditions met: the win was
+measured and the operator accepted the per-search latency on 2026-07-11,
+so **model rerank is now the default** (heuristic and none remain as
+per-call opt-outs; API failure still degrades to heuristic). Original
 scope:
 
 Phase 5 — Contextualized embeddings (Layer 2) — **capability shipped

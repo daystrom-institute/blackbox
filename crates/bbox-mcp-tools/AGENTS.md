@@ -1,13 +1,13 @@
 # bbox-mcp-tools — graph retrieval pipeline (hybrid search, discover, paths)
 
 - Hybrid pipeline order: BM25 field boosts → RRF fusion (k=60, vector weight
-  0.6 default) → OPTIONAL model rerank (rerank="model": fused top-k to the
-  [embed.rerank] cross-encoder, default rerank-2.5-lite; scores land in a
-  strictly higher band than the unsent tail; API failure degrades to the
-  heuristic path with degraded.rerank_unavailable) → per-hit heuristic
-  rerank (type × temporal, capped) → file aggregation / per-file dedup /
-  modal diversification. Heuristic stays the default until the eval suite
-  shows a model-rerank win. Every constant in that chain is either derived
+  0.6 default) → model rerank (DEFAULT since the measured 2026-07-11
+  eval win: fused top-k to the [embed.rerank] cross-encoder, default
+  rerank-2.5-lite; scores land in a strictly higher band than the unsent
+  tail; API failure degrades to the heuristic path with
+  degraded.rerank_unavailable; rerank="heuristic"/"none" are the per-call
+  opt-outs) → per-hit heuristic rerank (type × temporal, capped) → file
+  aggregation / per-file dedup / modal diversification. Every constant in that chain is either derived
   or empirically swept; change them with the metrics harness
   (bbox-corpus-core search/metrics.rs), not by feel. `rerank_cap` on
   HybridSearchParams is the operator probe for re-sweeping — it is not a

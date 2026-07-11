@@ -129,14 +129,22 @@ pub struct EmbedPartitionsParams {
     /// Prune is dry-run by default; pass apply=true to delete.
     #[serde(default)]
     pub apply: bool,
+    /// Required for scrub: the mapped partition to sweep for vectors whose
+    /// entities now attribute to a different route (e.g. after a bucket
+    /// attribution rule change).
+    #[serde(default)]
+    pub route: Option<String>,
 }
 
 /// Partition lifecycle (`bbox_embed_partitions`). Deliberately separate
 /// from `bbox_reembed`, which never prunes: re-embedding and reclaiming
 /// orphaned vector spaces are different operator decisions
 /// (design/corpus/agentic-corpus/multimodal-embedding-routing.md Layer 5).
-pub fn embed_partitions(p: &EmbedPartitionsParams) -> Result<String> {
+pub fn embed_partitions(p: &EmbedPartitionsParams, state: &SharedState) -> Result<String> {
     let router = EmbeddingRouter::load_default().unwrap_or_default();
+    if p.action.as_deref().map(str::trim) == Some("scrub") {
+        return embed_partitions_scrub(p, state, &router);
+    }
     let infos = crate::vectors::partition_infos()?
         .context("vector store is still warming up; retry shortly")?;
     embed_partitions_with(
@@ -146,6 +154,119 @@ pub fn embed_partitions(p: &EmbedPartitionsParams) -> Result<String> {
         chrono::Utc::now(),
         crate::vectors::remove_partition,
     )
+}
+
+/// How one vector row in a scrubbed partition classifies against CURRENT
+/// bucket attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrubClass {
+    /// Entity attributes to this partition; keep.
+    Matched,
+    /// Entity attributes to a different route now; delete on apply.
+    Mismatched,
+    /// Entity no longer resolvable in the index; kept (conservative:
+    /// index lag must not delete vectors).
+    Missing,
+    /// Not a project_file entity; scrub only reclassifies project files.
+    Foreign,
+}
+
+/// Pure classification pass, injected lookups for testability.
+fn partition_scrub_plan(
+    entities: &[String],
+    classify: impl Fn(&str) -> ScrubClass,
+) -> (Vec<String>, usize, usize, usize) {
+    let mut mismatched = Vec::new();
+    let (mut matched, mut missing, mut foreign) = (0usize, 0usize, 0usize);
+    for entity in entities {
+        match classify(entity) {
+            ScrubClass::Matched => matched += 1,
+            ScrubClass::Missing => missing += 1,
+            ScrubClass::Foreign => foreign += 1,
+            ScrubClass::Mismatched => mismatched.push(entity.clone()),
+        }
+    }
+    (mismatched, matched, missing, foreign)
+}
+
+/// `action="scrub"`: sweep one MAPPED partition for vectors whose entities
+/// attribute to a different route under the current shared code-vs-prose
+/// rule (gap-42fa1d68: attribution changes strand vectors in the wrong
+/// partition; prune only handles whole unmapped partitions). Dry-run by
+/// default; apply=true deletes the mismatched rows.
+fn embed_partitions_scrub(
+    p: &EmbedPartitionsParams,
+    state: &SharedState,
+    router: &EmbeddingRouter,
+) -> Result<String> {
+    let Some(route) = p.route.as_deref().map(str::trim).filter(|r| !r.is_empty()) else {
+        bail!("scrub requires `route` (the mapped partition to sweep)");
+    };
+    let mapped: std::collections::BTreeSet<String> = router
+        .configured_routes()
+        .iter()
+        .map(|r| r.vector_route_id())
+        .collect();
+    if !mapped.contains(route) {
+        bail!(
+            "partition `{route}` is not mapped by current route config;              unmapped partitions are pruned whole via action=\"prune\""
+        );
+    }
+    let entities: Vec<String> = crate::vectors::iter_active(route, None)?
+        .map(|entry| entry.entity_id)
+        .collect();
+    let idx = state.idx.read();
+    let (mismatched, matched, missing, foreign) = partition_scrub_plan(&entities, |entity| {
+        let Some(project_id) = entity
+            .strip_prefix("project_file:")
+            .and_then(|rest| rest.split(':').next())
+        else {
+            return ScrubClass::Foreign;
+        };
+        let Ok(Some(props)) = idx.entity_properties(entity) else {
+            return ScrubClass::Missing;
+        };
+        let bucket = if crate::embed_queue::is_code_chunk(
+            props.get("language").map(String::as_str),
+            props.get("chunk_kind").map(String::as_str).unwrap_or(""),
+        ) {
+            Bucket::Code
+        } else {
+            Bucket::Docs
+        };
+        match router.route(bucket, Some(project_id)) {
+            Ok(expected) if expected.vector_route_id() == route => ScrubClass::Matched,
+            Ok(_) => ScrubClass::Mismatched,
+            Err(_) => ScrubClass::Missing,
+        }
+    });
+    drop(idx);
+    let mut deleted = 0usize;
+    let mut errors = Vec::new();
+    if p.apply {
+        for entity in &mismatched {
+            match crate::vectors::delete(route, entity) {
+                Ok(()) => deleted += 1,
+                Err(err) => errors.push(json!({
+                    "entity": entity,
+                    "error": format!("{err:#}"),
+                })),
+            }
+        }
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "action": "scrub",
+        "route": route,
+        "dry_run": !p.apply,
+        "examined": entities.len(),
+        "matched": matched,
+        "mismatched": mismatched.len(),
+        "missing_from_index_kept": missing,
+        "foreign_kept": foreign,
+        "deleted": deleted,
+        "errors": errors,
+        "mismatched_sample": mismatched.iter().take(10).collect::<Vec<_>>(),
+    }))?)
 }
 
 fn embed_partitions_with(
@@ -1210,6 +1331,7 @@ mod tests {
             action: Some("list".into()),
             older_than_days: None,
             apply: false,
+            route: None,
         };
         let rendered =
             embed_partitions_with(&params, &router, infos, now, |_| unreachable!()).unwrap();
@@ -1233,12 +1355,32 @@ mod tests {
     }
 
     #[test]
+    fn scrub_plan_classifies_and_only_mismatches_are_candidates() {
+        let entities = vec![
+            "project_file:p1:f:h:0".to_string(),
+            "project_file:p1:f:h:1".to_string(),
+            "project_file:p1:gone:h:2".to_string(),
+            "knowledge:abcd1234".to_string(),
+        ];
+        let (mismatched, matched, missing, foreign) =
+            partition_scrub_plan(&entities, |entity| match entity {
+                "project_file:p1:f:h:0" => ScrubClass::Matched,
+                "project_file:p1:f:h:1" => ScrubClass::Mismatched,
+                "project_file:p1:gone:h:2" => ScrubClass::Missing,
+                _ => ScrubClass::Foreign,
+            });
+        assert_eq!(mismatched, vec!["project_file:p1:f:h:1".to_string()]);
+        assert_eq!((matched, missing, foreign), (1, 1, 1));
+    }
+
+    #[test]
     fn embed_partitions_prune_requires_age_threshold() {
         let router = EmbeddingRouter::default();
         let params = EmbedPartitionsParams {
             action: Some("prune".into()),
             older_than_days: None,
             apply: false,
+            route: None,
         };
         let err = embed_partitions_with(
             &params,
@@ -1260,6 +1402,7 @@ mod tests {
             action: Some("prune".into()),
             older_than_days: Some(30),
             apply: false,
+            route: None,
         };
         let rendered = embed_partitions_with(&params, &router, infos, now, |_| {
             panic!("dry run must not delete")
@@ -1293,6 +1436,7 @@ mod tests {
             action: Some("prune".into()),
             older_than_days: Some(30),
             apply: true,
+            route: None,
         };
         let mut removed = Vec::new();
         let rendered = embed_partitions_with(&params, &router, infos, now, |route| {

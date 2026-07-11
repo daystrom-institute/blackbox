@@ -50,7 +50,9 @@ out explicitly under `Changed` or `Removed`.
   orders the top-k by relevance above the unsent tail, applies the
   heuristic type/temporal multipliers after under the existing cap, and
   degrades to the heuristic path with `degraded.rerank_unavailable` on API
-  failure. Heuristic remains the default pending an eval win.
+  failure. After the measured eval win (MRR +56%, recall@1 2.5x) and
+  operator latency acceptance, model rerank is the DEFAULT; heuristic and
+  none remain per-call opt-outs.
 - Contextualized chunk embeddings (Layer 2): `type = "voyage_context"`
   provider aliases (voyage-context-4, its own compatibility family), with
   document-grouped queue batching: chunks of one document embed together
