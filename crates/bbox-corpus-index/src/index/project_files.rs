@@ -22,6 +22,14 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// caps, per-page chunks, catch_unwind degradation), so the input budget
 /// only guards parse cost, not index bloat.
 const MAX_DOCUMENT_FILE_BYTES: u64 = 25 * 1024 * 1024;
+/// X-IMG standalone images. Capped at the multimodal provider's own
+/// per-image byte limit (design/corpus/agentic-corpus/
+/// multimodal-embedding-routing.md: "image <= 20 MB and <= 16M pixels"):
+/// admitting a larger file through the walker only to have
+/// `voyage_multimodal`'s local preflight guard reject it later is wasted
+/// disk I/O and a wasted visual-payload-store write for a chunk that can
+/// never embed.
+const MAX_IMAGE_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
 fn max_bytes_for_path(path: &Path) -> u64 {
     match path
@@ -33,6 +41,7 @@ fn max_bytes_for_path(path: &Path) -> u64 {
         Some("pdf" | "docx" | "pptx" | "xlsx" | "xlsm" | "xlam" | "xlsb" | "xls" | "ods") => {
             MAX_DOCUMENT_FILE_BYTES
         }
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp") => MAX_IMAGE_FILE_BYTES,
         _ => MAX_FILE_BYTES,
     }
 }
@@ -598,6 +607,15 @@ fn is_supported_text_path(path: &Path) -> bool {
                 // explicitly here for the X-HTML chunker
                 // (design/corpus/agentic-corpus/agentic-corpus-multimodal-chunkers.md).
                 | "xhtml"
+                // X-IMG (crates/bbox-chunker/src/ximg.rs): standalone
+                // image files. The chunker's own magic-byte scan is the
+                // real content gate; extension only decides whether the
+                // walker even reads the file.
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
         )
     ) || bbox_chunker::code::language_for_path(path).is_some()
 }
@@ -957,11 +975,29 @@ fn chunk_ref(chunk: &Chunk, snapshot_id: Option<&str>) -> EntityRef {
 /// `XlsxChunker::claims` (crates/bbox-chunker/src/xlsx.rs) are the real
 /// gates for whether such a file's content is extractable, so the blanket
 /// binary sniff is bypassed by extension here rather than tightened
-/// generically.
+/// generically. Raster images (X-IMG) are exempted for the same reason:
+/// they are byte-diverse compressed binary by construction, and
+/// `XImgChunker::claims` (crates/bbox-chunker/src/ximg.rs) is the real
+/// gate (extension + magic-byte scan).
 fn is_binary(path: &Path, bytes: &[u8]) -> bool {
     if matches!(
         path.extension().and_then(|ext| ext.to_str()),
-        Some("pdf" | "xlsx" | "xlsm" | "xlam" | "xlsb" | "xls" | "ods" | "docx" | "pptx")
+        Some(
+            "pdf"
+                | "xlsx"
+                | "xlsm"
+                | "xlam"
+                | "xlsb"
+                | "xls"
+                | "ods"
+                | "docx"
+                | "pptx"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+        )
     ) {
         return false;
     }
@@ -1167,6 +1203,37 @@ mod tests {
     }
 
     #[test]
+    fn images_get_the_provider_capped_byte_budget() {
+        use std::path::Path;
+        for name in [
+            "figure.png",
+            "shot.JPG",
+            "photo.jpeg",
+            "anim.gif",
+            "icon.webp",
+        ] {
+            assert_eq!(
+                max_bytes_for_path(Path::new(name)),
+                MAX_IMAGE_FILE_BYTES,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn images_are_supported_and_exempted_from_the_binary_sniff() {
+        use std::path::Path;
+        assert!(is_supported_text_path(Path::new("figure.png")));
+        assert!(is_supported_text_path(Path::new("shot.jpeg")));
+        // Real image bytes are byte-diverse binary (NUL bytes included);
+        // the extension bypass must apply even though the content sniff
+        // alone would call it binary.
+        assert!(!is_binary(Path::new("figure.png"), &[0u8; 16]));
+        // A non-image file with the same NUL-heavy content is still binary.
+        assert!(is_binary(Path::new("figure.bin"), &[0u8; 16]));
+    }
+
+    #[test]
     fn project_file_doc_includes_agentic_fields() {
         let (_schema, fields) = build_schema();
         let project = ProjectRecord {
@@ -1195,6 +1262,7 @@ mod tests {
             content: "agentic-corpus design".into(),
             byte_start: 10,
             byte_end: 32,
+            visual_payload: None,
         };
 
         let commit_sha = "a".repeat(40);
@@ -1246,6 +1314,7 @@ mod tests {
             content: "fn helper() {}".into(),
             byte_start: 0,
             byte_end: 14,
+            visual_payload: None,
         };
 
         let commit_sha = "a".repeat(40);

@@ -1073,6 +1073,7 @@ mod tests {
             content: "pub struct KnowledgeStore;".into(),
             byte_start: 0,
             byte_end: 26,
+            visual_payload: None,
         };
         let doc = project_files::build_project_file_doc(
             &chunk,
@@ -1224,6 +1225,7 @@ mod tests {
             content: "fn run(&self) {}".into(),
             byte_start: 19,
             byte_end: 35,
+            visual_payload: None,
         };
         let doc = project_files::build_project_file_doc(
             &chunk,
@@ -1309,6 +1311,7 @@ mod tests {
             content: content.into(),
             byte_start: 0,
             byte_end: content.len() as u64,
+            visual_payload: None,
         };
         let doc = project_files::build_project_file_doc(
             &chunk,

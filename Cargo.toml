@@ -48,6 +48,7 @@ members = [
     "crates/bbox-providers",
     "crates/bbox-embed",
     "crates/bbox-mcp-tools",
+    "crates/bbox-visual-store",
 ]
 
 [package]
@@ -209,6 +210,9 @@ bbox-indexing = { path = "crates/bbox-indexing" }
 bbox-providers = { path = "crates/bbox-providers" }
 bbox-embed = { path = "crates/bbox-embed" }
 bbox-mcp-tools = { path = "crates/bbox-mcp-tools" }
+# Visual payload sidecar (Layer 4 visual chunk backfill decode): the
+# daemon-side reembed path decodes VisualPayloadRef off stored chunks.
+bbox-visual-store = { path = "crates/bbox-visual-store" }
 
 [dev-dependencies]
 filetime = "0.2"
@@ -220,6 +224,9 @@ bbox-vectors = { path = "crates/bbox-vectors", features = ["test-support"] }
 # per-test vector store must pin route derivation too, or partition ids
 # drift with the host's real embed.toml.
 bbox-embed = { path = "crates/bbox-embed", features = ["test-support"] }
+# Same pattern for bbox-visual-store's install_test_global: visual-chunk
+# tests must pin the payload store to a tempdir, never the real state dir.
+bbox-visual-store = { path = "crates/bbox-visual-store", features = ["test-support"] }
 # ServiceExt::oneshot for exercising axum route tables in tests.
 tower = { version = "0.5", features = ["util"] }
 

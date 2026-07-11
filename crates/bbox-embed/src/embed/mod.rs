@@ -284,32 +284,74 @@ impl Route {
     /// existing partitions are not orphaned by this metadata change; any
     /// non-float dtype forces a new partition.
     pub fn vector_route_id(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.provider_id.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.document_model.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.dimensions.to_string().as_bytes());
-        if self.output_dtype != OutputDType::Float {
-            hasher.update([0]);
-            hasher.update(self.output_dtype.as_str().as_bytes());
-        }
-        let digest = hasher.finalize();
-        let dtype_component = if self.output_dtype == OutputDType::Float {
-            String::new()
-        } else {
-            format!("{}-", self.output_dtype.as_str())
-        };
-        format!(
-            "{}-{}-{}-{}{:02x}{:02x}{:02x}{:02x}",
-            sanitize_route_component(&self.provider_id),
-            sanitize_route_component(&self.document_model),
+        vector_route_id_for(
+            &self.provider_id,
+            &self.document_model,
             self.dimensions,
-            dtype_component,
-            digest[0],
-            digest[1],
-            digest[2],
-            digest[3]
+            self.output_dtype,
+        )
+    }
+}
+
+/// The partition-id hashing logic `Route::vector_route_id` delegates to,
+/// extracted so visual routing (chunk-kind-keyed, not `Bucket`-keyed, see
+/// `EmbeddingRouter::visual_route`) can derive the same identity from a
+/// resolved `&dyn EmbeddingProvider` without needing a `Route`/`Bucket`.
+pub fn vector_route_id_for(
+    provider_id: &str,
+    document_model: &str,
+    dimensions: usize,
+    output_dtype: OutputDType,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(provider_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(document_model.as_bytes());
+    hasher.update([0]);
+    hasher.update(dimensions.to_string().as_bytes());
+    if output_dtype != OutputDType::Float {
+        hasher.update([0]);
+        hasher.update(output_dtype.as_str().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let dtype_component = if output_dtype == OutputDType::Float {
+        String::new()
+    } else {
+        format!("{}-", output_dtype.as_str())
+    };
+    format!(
+        "{}-{}-{}-{}{:02x}{:02x}{:02x}{:02x}",
+        sanitize_route_component(provider_id),
+        sanitize_route_component(document_model),
+        dimensions,
+        dtype_component,
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3]
+    )
+}
+
+/// Route metadata for one visual chunk kind: the visual-routing analog of
+/// [`Route`], minus `bucket`/`project_id`/`query_model` (visual routes are
+/// keyed by chunk kind string, never `Bucket`, and are always symmetric:
+/// `voyage-multimodal-3.5` has no asymmetric document/query model story).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualRouteMeta {
+    pub provider_id: String,
+    pub document_model: String,
+    pub dimensions: usize,
+    pub output_dtype: OutputDType,
+    pub compatibility_family: String,
+}
+
+impl VisualRouteMeta {
+    pub fn vector_route_id(&self) -> String {
+        vector_route_id_for(
+            &self.provider_id,
+            &self.document_model,
+            self.dimensions,
+            self.output_dtype,
         )
     }
 }
@@ -683,23 +725,66 @@ impl EmbeddingRouter {
         self.config.rerank.clone().unwrap_or_default()
     }
 
-    /// Provider for one visual chunk kind (`[embed.routes.visual]`).
-    /// Ok(None) when the kind is unrouted (visual embedding is opt-in per
-    /// kind); an alias that is not multimodal-typed is a config error —
-    /// visual payloads must never silently route into a text space.
-    pub fn visual_provider(&self, kind: &str) -> Result<Option<Box<dyn EmbeddingProvider>>> {
+    /// Cheap route metadata for one visual chunk kind
+    /// (`[embed.routes.visual]`): the visual-routing analog of `route()`:
+    /// no HTTP client, no provider construction, just enough to derive a
+    /// partition id and report status. `Ok(None)` when the kind is unrouted
+    /// (visual embedding is opt-in per kind); an alias that is not
+    /// multimodal-typed is a config error: visual payloads must never
+    /// silently route into a text space.
+    pub fn visual_route(&self, kind: &str) -> Result<Option<VisualRouteMeta>> {
         let Some(alias) = self.config.routes.visual.get(kind) else {
             return Ok(None);
         };
         match self.config.providers.get(alias) {
-            Some(ProviderAliasConfig::VoyageMultimodal(config)) => Ok(Some(Box::new(
-                voyage_multimodal::VoyageMultimodalProvider::from_config(alias.clone(), &config)?,
-            ))),
+            Some(ProviderAliasConfig::VoyageMultimodal(config)) => {
+                config.validate(alias)?;
+                let compatibility_family = derive_compatibility_family(
+                    EmbedEndpointKind::Multimodal,
+                    &config.model,
+                    config.output_dimension,
+                    config.output_dtype,
+                );
+                Ok(Some(VisualRouteMeta {
+                    provider_id: alias.clone(),
+                    document_model: config.model.clone(),
+                    dimensions: config.output_dimension,
+                    output_dtype: config.output_dtype,
+                    compatibility_family,
+                }))
+            }
             Some(_) => bail!(
                 "visual route `{kind}` maps to provider `{alias}`, which is not a \
                  multimodal provider; visual kinds require a multimodal route family"
             ),
             None => bail!("unknown embedding provider `{alias}` for visual route `{kind}`"),
+        }
+    }
+
+    /// Provider for one visual chunk kind (`[embed.routes.visual]`). See
+    /// `visual_route` for the metadata-only, provider-construction-free
+    /// variant; use that one when only the partition id / status fields are
+    /// needed (e.g. once per enqueue) and reserve this one for the
+    /// once-per-worker provider build (matches the `route()`/`route_for()`
+    /// split for the bucket-keyed text routes).
+    pub fn visual_provider(&self, kind: &str) -> Result<Option<Box<dyn EmbeddingProvider>>> {
+        if self.visual_route(kind)?.is_none() {
+            return Ok(None);
+        }
+        // Re-resolve the alias config: visual_route() already validated it
+        // is a VoyageMultimodal alias, so the arms below are exhaustive in
+        // practice even though the match stays defensive.
+        let alias = self
+            .config
+            .routes
+            .visual
+            .get(kind)
+            .expect("visual_route confirmed this alias exists");
+        match self.config.providers.get(alias) {
+            Some(ProviderAliasConfig::VoyageMultimodal(config)) => Ok(Some(Box::new(
+                voyage_multimodal::VoyageMultimodalProvider::from_config(alias.clone(), &config)?,
+            ))),
+            _ => unreachable!("visual_route already validated this alias is VoyageMultimodal"),
         }
     }
 
@@ -1124,6 +1209,33 @@ code = "voyage_context"
         assert_eq!(route.compatibility_family, "voyage-context-4:1024:float");
         // Its own partition, never shared with voyage-4 text or code-3.
         assert!(route.vector_route_id().starts_with("voyage_context-"));
+    }
+
+    #[test]
+    fn visual_route_metadata_matches_the_constructed_provider() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+pdf_figure = "voyage_visual"
+"#,
+        )
+        .unwrap();
+        let meta = router.visual_route("pdf_figure").unwrap().unwrap();
+        let provider = router.visual_provider("pdf_figure").unwrap().unwrap();
+        assert_eq!(meta.provider_id, provider.id());
+        assert_eq!(meta.document_model, provider.document_model());
+        assert_eq!(meta.dimensions, provider.dimensions());
+        assert_eq!(meta.compatibility_family, provider.compatibility_family());
+        assert_eq!(
+            meta.vector_route_id(),
+            vector_route_id_for(
+                provider.id(),
+                provider.document_model(),
+                provider.dimensions(),
+                provider.output_dtype(),
+            )
+        );
+        assert!(router.visual_route("video_segment").unwrap().is_none());
     }
 
     #[test]

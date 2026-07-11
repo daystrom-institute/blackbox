@@ -115,8 +115,25 @@ out explicitly under `Changed` or `Removed`.
   64 KiB and two windows of one document never share a batch.
 - X-PDF text-first chunker: `.pdf` files now index as per-page `pdf_page`
   chunks (pdf-extract) into the docs bucket; encrypted/scanned/corrupt
-  PDFs degrade to zero chunks without failing the reindex pass. Tables,
-  figures, OCR, and visual sidecars are deferred.
+  PDFs degrade to zero chunks without failing the reindex pass. Tables
+  and OCR remain deferred; figures shipped separately below.
+- Visual sidecar path (Layer 4 completion): a new content-hash-addressed
+  payload store (`bbox-visual-store`, outside tantivy, deduped by hash,
+  under the daemon state dir) backs two new visual chunk kinds. X-IMG
+  claims standalone `.png`/`.jpg`/`.jpeg`/`.gif`/`.webp` files (extension
+  plus magic-byte scan) and emits one `image` chunk per file with the file
+  name stem as its only text content. `pdf_figure` extracts embedded
+  raster XObjects from PDFs via `lopdf` (DCTDecode/JPEG passthrough and
+  unpredicted FlateDecode DeviceGray/RGB re-encoded into a minimal
+  hand-built PNG; other encodings are skipped rather than mis-decoded).
+  Both route through a new visual embed queue lane
+  (`[embed.routes.visual]`, opt-in per chunk kind) that loads payload
+  bytes from the sidecar at request-build time and batches by payload
+  byte size rather than caption text length; index-time enqueue and
+  backfill/reembed coverage both recognize visual chunk kinds and report
+  status under `visual:<kind>` route keys. Sidecar anchoring uses the
+  interim chunk[0]-as-file proxy (gap-ab3ef97f tracks the eventual
+  `file:` entity migration).
 - `bbox_embed_partitions`: vector partition lifecycle tool (Layer 5 of the
   same design). `action="list"` inventories every on-disk partition with
   dims, active count, last write, disk bytes, and whether any configured

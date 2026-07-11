@@ -1429,6 +1429,8 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
         entity_id: "knowledge:aaaabbbb".into(),
         chunk_hash: "h-new".into(),
         text: "use provider A for embeddings".into(),
+        visual_kind: None,
+        visual_payload: None,
     };
     crate::embed_runtime::maybe_detect_knowledge_contradiction(
         &request,

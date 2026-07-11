@@ -16,6 +16,11 @@ anyhow = "1"
 bbox-vectors = { path = "../bbox-vectors" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-chunker = { path = "../bbox-chunker" }
+# Visual payload sidecar: EmbedRequest carries a VisualPayloadRef (not
+# inline bytes); the queue worker loads bytes from this store at
+# embed-request-build time (design/corpus/agentic-corpus/
+# multimodal-embedding-routing.md "Multimodal Chunk Model").
+bbox-visual-store = { path = "../bbox-visual-store" }
 parking_lot = "0.12"
 tracing = "0.1"
 chrono = "0.4"
@@ -60,3 +65,4 @@ test-support = []
 
 [dev-dependencies]
 bbox-vectors = { path = "../bbox-vectors", features = ["test-support"] }
+bbox-visual-store = { path = "../bbox-visual-store", features = ["test-support"] }

@@ -12,6 +12,10 @@ edition = "2024"
 
 [dependencies]
 bbox-corpus-core = { path = "../bbox-corpus-core" }
+# Content-hash-addressed sidecar store for visual payload bytes (X-IMG
+# chunker writes into it; design/corpus/agentic-corpus/
+# multimodal-embedding-routing.md "Multimodal Chunk Model").
+bbox-visual-store = { path = "../bbox-visual-store" }
 anyhow = "1"
 # Text-first PDF extraction for the X-PDF chunker (design/corpus/agentic-corpus/
 # agentic-corpus-multimodal-chunkers.md). Pinned to the current published
@@ -24,6 +28,24 @@ pdf-extract = "0.12"
 # children render/recognize into the same auto-cleaned dir. Same "3" range
 # the rest of the workspace uses.
 tempfile = "3"
+# pdf_figure (design/corpus/agentic-corpus/agentic-corpus-multimodal-chunkers.md
+# X-PDF section): extracts embedded raster XObjects for the visual payload
+# sidecar. `pdf-extract` already depends on `lopdf` for its own parsing, and
+# neither dependent needs lopdf's default features (chrono/jiff/rayon/time
+# date-metadata helpers) or `embed_image` (pulls in the `image` crate; an
+# XObject-*creation* helper this chunker never uses; only the page/XObject-
+# *reading* API, `Document::get_page_images`, is used). `default-features =
+# false` here confirmed via `git diff Cargo.lock` that this dependency adds
+# NOTHING to the lockfile beyond this crate itself: lopdf was already
+# resolved (transitively, via pdf-extract) and Cargo unifies to one shared
+# build. Pinned to match the version pdf-extract 0.12 already resolves.
+lopdf = { version = "0.42", default-features = false }
+# FlateDecode raster payloads (uncompressed RGB/Gray only, no PNG predictor)
+# are re-encoded into a minimal hand-built PNG; both crates are already
+# transitively present (lopdf itself depends on flate2; crc32fast arrives via
+# the zip/deflate stack below), so this is likewise zero new dependency tree.
+flate2 = "1"
+crc32fast = "1"
 # Spreadsheet extraction for the X-XLSX chunker (design/corpus/agentic-corpus/
 # agentic-corpus-multimodal-chunkers.md). Pinned to the current published
 # release (0.36.0, 2026-07-06). `open_workbook_auto_from_rs` auto-detects
@@ -71,3 +93,8 @@ tree-sitter-typescript = "0.23.2"
 # Build a minimal .xlsx fixture byte-for-byte in the xlsx.rs test module
 # (no checked-in binary fixture). Same major version calamine itself pins
 # (0.36.0 -> zip ^8.6), so this doesn't pull in a second zip implementation.
+tempfile = "3"
+# ximg.rs tests pin the visual payload store to a tempdir rather than the
+# real state dir; cfg(test) doesn't cross crate boundaries so this needs
+# the feature turned on as a dev-dependency.
+bbox-visual-store = { path = "../bbox-visual-store", features = ["test-support"] }
