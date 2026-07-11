@@ -1,0 +1,30 @@
+[package]
+name = "bbox-visual-store"
+version = "0.0.1"
+edition = "2024"
+
+# Content-hash-addressed sidecar store for visual (image/video) payload
+# bytes, kept OUTSIDE tantivy per the multimodal embedding design
+# (design/corpus/agentic-corpus/multimodal-embedding-routing.md, Multimodal
+# Chunk Model). Pure leaf: depends only on external crates, never on
+# blackbox internals, so bbox-chunker (writes payloads while chunking) and
+# bbox-embed (reads payload bytes at embed-request-build time) can both
+# depend on it without a cycle.
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+parking_lot = "0.12"
+sha2 = "0.10"
+tracing = "0.1"
+
+[features]
+# Exposes the test-global-store helpers (install_test_global /
+# TestGlobalStoreGuard) to downstream crates' tests, matching bbox-vectors'
+# test-support feature: `#[cfg(test)]` does not cross crate boundaries, so a
+# downstream crate's tests need this feature to install an isolated
+# per-test store instead of touching the real state dir.
+test-support = []
+
+[dev-dependencies]
+tempfile = "3"

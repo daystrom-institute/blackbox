@@ -311,8 +311,12 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-corpus-core",
+ "bbox-visual-store",
  "calamine",
+ "crc32fast",
  "ego-tree",
+ "flate2",
+ "lopdf",
  "pdf-extract",
  "quick-xml 0.38.4",
  "regex",
@@ -320,6 +324,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "toml",
  "tracing",
  "tree-sitter",
@@ -465,6 +470,7 @@ dependencies = [
  "bbox-stores",
  "bbox-threads",
  "bbox-vectors",
+ "bbox-visual-store",
  "chrono",
  "dirs",
  "futures",
@@ -817,6 +823,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-visual-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "parking_lot",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-whiteboards"
 version = "0.0.1"
 dependencies = [
@@ -943,6 +961,7 @@ dependencies = [
  "bbox-tool-docs",
  "bbox-util",
  "bbox-vectors",
+ "bbox-visual-store",
  "bbox-whiteboards",
  "bro-capabilities",
  "bro-core",
