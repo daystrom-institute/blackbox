@@ -186,7 +186,12 @@ fn expansions(
     edge_filter: Option<&HashSet<String>>,
 ) -> Vec<(String, PathDirection, EntityRef)> {
     let mut out = Vec::new();
-    for edge in edge_index.forward_edges(current) {
+    // forward_edges_with_synthesis surfaces the transcript -> session
+    // IN_SESSION edge at query time (see its doc comment on EdgeIndex) so a
+    // transcript ref is reachable to its session even without a materialized
+    // edge. Forward only: the reverse enumeration isn't a pure function of
+    // the session ref, so it isn't synthesized here.
+    for edge in edge_index.forward_edges_with_synthesis(current) {
         if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
             out.push((edge.kind.clone(), PathDirection::Out, edge.target.clone()));
         }
@@ -310,5 +315,35 @@ mod tests {
         let paths = bfs(&index, a, Some(&b), None, None, 3, 5);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0][0].direction, PathDirection::Out);
+    }
+
+    #[test]
+    fn bfs_finds_synthesized_transcript_in_session_edge() {
+        // gap-edc84378: a transcript ref with zero materialized edges must
+        // still be traversable to its session via the query-time synthesized
+        // IN_SESSION edge (EdgeIndex::forward_edges_with_synthesis).
+        let transcript = EntityRef::parse("transcript:claude:sess-1:42:0").unwrap();
+        let session = EntityRef::parse("session:claude:sess-1").unwrap();
+        let index = EdgeIndex::default();
+
+        let paths = bfs(&index, transcript.clone(), Some(&session), None, None, 3, 5);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].len(), 1);
+        assert_eq!(paths[0][0].edge_kind, "IN_SESSION");
+        assert_eq!(paths[0][0].direction, PathDirection::Out);
+        assert_eq!(paths[0][0].to, session);
+
+        // Reachable by to_type too (mirrors the max-depth/limit-boundary
+        // traversal an agent would actually run).
+        let by_type = bfs(
+            &index,
+            transcript,
+            None,
+            Some(EntityType::Session),
+            None,
+            3,
+            5,
+        );
+        assert_eq!(by_type.len(), 1);
     }
 }

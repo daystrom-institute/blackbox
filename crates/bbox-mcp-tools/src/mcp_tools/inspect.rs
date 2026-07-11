@@ -225,7 +225,10 @@ fn parse_edge_filter(raw: Option<&str>) -> Option<HashSet<String>> {
 
 fn full_neighborhood(edge_index: &EdgeIndex, r: &EntityRef) -> Neighborhood {
     Neighborhood {
-        forward: edge_index.forward_edges(r).into_iter().cloned().collect(),
+        // forward_edges_with_synthesis fills in the transcript -> session
+        // IN_SESSION edge at query time when it isn't materialized (see its
+        // doc comment). This is forward only; reverse has no counterpart.
+        forward: edge_index.forward_edges_with_synthesis(r),
         reverse: edge_index.reverse_edges(r).into_iter().cloned().collect(),
     }
 }
@@ -463,6 +466,47 @@ mod tests {
         );
         assert_eq!(value["properties"]["id"], "sm-agentic-opening-sequence");
         assert!(value["properties"].get("content").is_none());
+    }
+
+    #[test]
+    fn inspect_entity_synthesizes_transcript_in_session_edge() {
+        // gap-edc84378: a transcript ref with zero materialized edges must
+        // still surface an IN_SESSION out-edge via
+        // EdgeIndex::forward_edges_with_synthesis, and the (required) edge
+        // family coverage row must report it present.
+        let params = InspectEntityParams {
+            entity_ref: "transcript:claude:sess-1:42:0".into(),
+            edge_types: None,
+            direction: None,
+            per_type_limit: None,
+            property_mode: Some("summary".into()),
+        };
+        let r = EntityRef::parse(&params.entity_ref).unwrap();
+        let rendered = inspect_entity(
+            &params,
+            &ProviderContext::empty_for_tests(),
+            &r,
+            &EdgeIndex::default(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "ok");
+        let out_edges = value["edges"]["out"].as_array().unwrap();
+        assert!(
+            out_edges
+                .iter()
+                .any(|edge| edge["kind"] == "IN_SESSION"
+                    && edge["target"] == "session:claude:sess-1"),
+            "expected synthesized IN_SESSION out-edge, got {out_edges:?}"
+        );
+        let coverage = value["edge_family_coverage"].as_array().unwrap();
+        assert!(
+            coverage
+                .iter()
+                .any(|row| row["family"] == "IN_SESSION" && row["count"] == 1),
+            "expected IN_SESSION coverage row with count=1, got {coverage:?}"
+        );
     }
 
     #[test]
