@@ -342,6 +342,18 @@ struct Edge {
 store on startup (`SUPERSEDES` from `KnowledgeEntry.supersedes`, `IN_SESSION`
 from tantivy `session_id`, etc.). The EdgeIndex is ephemeral for these.
 
+> Current-state note (gap-edc84378, post-archival): the bulk Tantivy
+> stored-doc projection this section describes for `IN_SESSION` is opt-in
+> (`EdgeStoreRefs::include_tantivy_projection`) and every caller now passes
+> `false` to avoid materializing a multi-GB edge set at every rebuild.
+> `IN_SESSION` for a `transcript:` ref is instead synthesized at query time,
+> forward only, from the ref itself (`EdgeIndex::forward_edges_with_synthesis`
+> in `crates/bbox-edge-index/src/edge_index.rs`): a transcript ref carries its
+> own provider/session_id, so the edge is a pure function of the ref and needs
+> no index lookup. The reverse direction (session -> enumerate every
+> transcript chunk `IN_SESSION` it) is NOT a pure function of the session ref
+> alone and stays unsupported.
+
 **Edges that are authored** (Contradicts, RelatesTo, TensionWith, Supports,
 DependsOn, semantic auto-edges from M5) live as durable fields on their
 source entity:

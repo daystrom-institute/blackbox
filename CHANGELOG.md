@@ -755,6 +755,43 @@ out explicitly under `Changed` or `Removed`.
   (`src/cells.rs`), the `CellRegistryCapability` / `DurableCellCapability`
   capabilities, and the `cell` artifact kind.
 
+### Fixed
+
+- The transcript modality is back in the agentic graph (gap-edc84378). A prior
+  commit (ffd9027e) made the Tantivy stored-doc edge projection that produced
+  transcript -> session `IN_SESSION` edges opt-in
+  (`include_tantivy_projection`), and every caller ended up passing `false`
+  (avoiding the deliberate multi-GB-materialization cost), so no caller ever
+  ran it: `bbox_describe_schema` reported `transcript: 0 entities`, session
+  vertices had zero `IN_SESSION` edges, and `bbox_find_paths`/
+  `bbox_inspect_entity` could not hop transcript -> session. Fixed with
+  query-time synthesis instead of re-enabling bulk materialization:
+  `EdgeIndex::forward_edges_with_synthesis` derives the `IN_SESSION` edge
+  straight from a `transcript:` ref's own provider/session_id (a pure
+  function, no index lookup) and dedupes against any materialized edge;
+  `bbox_inspect_entity` and `bbox_find_paths` both ride it. This is forward
+  only: enumerating every transcript chunk in a session from a `session:`
+  ref is not a pure function of the ref and stays unsupported.
+  `bbox_describe_schema`'s transcript population count now comes from a
+  cheap Tantivy `doc_type` count instead of the EdgeIndex (which deliberately
+  excludes transcript from its active-graph counts).
+- `bbox_inspect_entity` on a `transcript:` ref could 404 even when the doc
+  demonstrably existed (hybrid search had just returned it): the property
+  lookup (`TranscriptIndex::transcript_properties`) scanned a session's docs
+  through a scored, capped collector (`TopDocs::with_limit(500)`) over a
+  same-score term query, so any session with more chunks than the cap could
+  silently drop the target doc depending on tie-break order. Switched to an
+  unscored, unbounded collector over the session's postings so every doc in
+  the session is checked. A ref whose (session, byte_offset) matches no doc
+  still 404s as before.
+- `eval/scripts/refresh_expected_refs.py` no longer just liveness-checks a
+  dead `transcript:` expected ref and gives up: it now searches
+  `bbox_hybrid_search` (`doc_type=transcript`) for the locator's
+  `transcript_hint` and adopts a hit landing back in the SAME session as
+  drift repair. A hit only in a different session is reported as a candidate
+  re-target for manual review, not auto-adopted (that would silently change
+  what the query is provenance for).
+
 ## 0.0.1 - 2026-05-14
 
 ### Added
