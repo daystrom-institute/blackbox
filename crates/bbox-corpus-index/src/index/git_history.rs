@@ -376,6 +376,7 @@ mod tests {
             content: "body".into(),
             byte_start: 0,
             byte_end: 4,
+            visual_payload: None,
         };
         let targets = current_chunk_targets(&[chunk], None);
         assert!(targets.contains_key("src/main.rs"));

@@ -6,7 +6,9 @@ pub mod ipynb;
 pub mod markdown;
 pub mod office;
 pub mod pdf;
+pub mod pdf_figure;
 pub mod text;
+pub mod ximg;
 pub mod xlsx;
 
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use bbox_corpus_core::entity_ref::EntityRef;
+pub use bbox_visual_store::VisualPayloadRef;
 
 pub const MAX_CHUNK_BYTES: usize = 12 * 1024;
 
@@ -48,6 +51,15 @@ pub struct Chunk {
     pub content: String,
     pub byte_start: u64,
     pub byte_end: u64,
+    /// Set only by visual-payload-bearing chunk kinds (X-IMG's `image`, and
+    /// eventually `pdf_figure`/`slide_image`/etc): a reference to the raw
+    /// bytes stored in the content-hash-addressed visual payload sidecar
+    /// (`bbox-visual-store`), never the bytes themselves. `None` for every
+    /// text chunk kind. Also encoded into `symbol` (see
+    /// `VisualPayloadRef::encode`) so the backfill/reembed path, which
+    /// reconstructs a `Chunk` from stored tantivy fields rather than
+    /// re-chunking the file, can decode it without a schema change.
+    pub visual_payload: Option<VisualPayloadRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,6 +113,7 @@ pub fn default_registry() -> Vec<Box<dyn SourceFormatChunker>> {
         Box::new(ipynb::IpynbChunker),
         Box::new(xlsx::XlsxChunker),
         Box::new(av_transcript::AvTranscriptChunker),
+        Box::new(ximg::XImgChunker),
         Box::new(text::PlainTextChunker),
     ]
 }
@@ -131,5 +144,6 @@ pub fn placeholder_chunk(
         content: content.into(),
         byte_start,
         byte_end,
+        visual_payload: None,
     }
 }

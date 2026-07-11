@@ -29,6 +29,11 @@ const MAGIC_SCAN_WINDOW: usize = 1024;
 /// on ordinary prose and code listings. Shipping that would violate the
 /// "no flaky heuristics" scope constraint, so table chunks are deferred to
 /// a future pass with real layout access (e.g. glyph positions).
+///
+/// `pdf_figure` chunks (embedded raster XObjects) are a separate module,
+/// `pdf_figure.rs`: text extraction here stays OCR-free and independent of
+/// any visual embedding model; figure extraction is additive, appended
+/// below, and never affects `pdf_page` chunk output.
 pub struct PdfChunker;
 
 impl SourceFormatChunker for PdfChunker {
@@ -45,7 +50,9 @@ impl SourceFormatChunker for PdfChunker {
     }
 
     fn chunk(&self, path: &Path, bytes: &[u8]) -> Result<(Vec<Chunk>, Vec<Edge>)> {
-        Ok((extract_page_chunks(path, bytes), Vec::new()))
+        let mut chunks = extract_page_chunks(path, bytes);
+        chunks.extend(super::pdf_figure::extract_figure_chunks(path, bytes));
+        Ok((chunks, Vec::new()))
     }
 }
 

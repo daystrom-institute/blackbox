@@ -83,6 +83,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
         content: "fn run(&self) {}".into(),
         byte_start: 19,
         byte_end: 35,
+        visual_payload: None,
     };
     let toplevel_chunk = bbox_chunker::Chunk {
         project_id: "proj-impl-test".into(),
@@ -101,6 +102,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
         content: "fn top() {}".into(),
         byte_start: 50,
         byte_end: 61,
+        visual_payload: None,
     };
 
     let mut writer = index.index_handle().writer(50_000_000).unwrap();
