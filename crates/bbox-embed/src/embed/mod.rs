@@ -3,7 +3,10 @@
 pub mod ollama;
 pub mod query_cache;
 pub mod queue;
+pub mod rerank;
 pub mod voyage;
+pub mod voyage_context;
+pub mod voyage_multimodal;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,6 +23,8 @@ pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
 pub const VOYAGE_CODE_PROVIDER_ID: &str = "voyage_code";
 pub const VOYAGE_TEXT_PROVIDER_ID: &str = "voyage_text";
+pub const VOYAGE_CONTEXT_PROVIDER_ID: &str = "voyage_context";
+pub const VOYAGE_VISUAL_PROVIDER_ID: &str = "voyage_visual";
 
 /// Retrieval role of an embed call. Stored corpus content is `Document`;
 /// live search strings are `Query`. Providers that support role-marked
@@ -334,6 +339,11 @@ pub struct EmbedConfig {
     pub providers: ProviderConfigs,
     #[serde(default)]
     pub routes: RoutesConfig,
+    /// `[embed.rerank]` — model rerank stage config. Absent means
+    /// defaults (rerank-2.5-lite); the stage only runs when a search
+    /// call opts in.
+    #[serde(default)]
+    pub rerank: Option<rerank::RerankConfig>,
 }
 
 /// Typed provider config for one alias. The alias (table key) is the
@@ -343,6 +353,8 @@ pub struct EmbedConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderAliasConfig {
     VoyageText(voyage::VoyageConfig),
+    VoyageContext(voyage_context::VoyageContextConfig),
+    VoyageMultimodal(voyage_multimodal::VoyageMultimodalConfig),
     Ollama(ollama::OllamaConfig),
 }
 
@@ -379,6 +391,12 @@ fn builtin_alias(alias: &str) -> Option<ProviderAliasConfig> {
         )),
         VOYAGE_TEXT_PROVIDER_ID => Some(ProviderAliasConfig::VoyageText(
             voyage::VoyageConfig::voyage4_prose_default(),
+        )),
+        VOYAGE_CONTEXT_PROVIDER_ID => Some(ProviderAliasConfig::VoyageContext(
+            voyage_context::VoyageContextConfig::default(),
+        )),
+        VOYAGE_VISUAL_PROVIDER_ID => Some(ProviderAliasConfig::VoyageMultimodal(
+            voyage_multimodal::VoyageMultimodalConfig::default(),
         )),
         OLLAMA_PROVIDER_ID => Some(ProviderAliasConfig::Ollama(ollama::OllamaConfig::default())),
         _ => None,
@@ -431,6 +449,12 @@ pub struct RoutesConfig {
     pub agent_manifest: Option<String>,
     #[serde(default)]
     pub per_project: BTreeMap<String, BucketRoutes>,
+    /// `[embed.routes.visual]` — visual chunk kind (`pdf_figure`,
+    /// `slide_image`, ...) to provider alias. Visual retrieval is a
+    /// separate route family: these must reference multimodal-typed
+    /// aliases, and no text bucket ever falls back here.
+    #[serde(default)]
+    pub visual: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -480,8 +504,40 @@ pub struct EmbeddingRouter {
     config: EmbedConfig,
 }
 
+/// Process-wide test override for `load_default()`. Tests that install a
+/// per-test vector store must also pin the router: route derivation
+/// otherwise reads the HOST's real embed.toml and the derived partition
+/// ids drift with operator config (the same isolation invariant as
+/// `bbox_vectors::install_test_global`).
+#[cfg(any(test, feature = "test-support"))]
+fn test_router_slot() -> &'static parking_lot::RwLock<Option<EmbeddingRouter>> {
+    static SLOT: std::sync::OnceLock<parking_lot::RwLock<Option<EmbeddingRouter>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestRouterGuard;
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestRouterGuard {
+    fn drop(&mut self) {
+        *test_router_slot().write() = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_test_router(router: EmbeddingRouter) -> TestRouterGuard {
+    *test_router_slot().write() = Some(router);
+    TestRouterGuard
+}
+
 impl EmbeddingRouter {
     pub fn load_default() -> Result<Self> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(router) = test_router_slot().read().clone() {
+            return Ok(router);
+        }
         let path = config_path();
         if !path.exists() {
             return Ok(Self::default());
@@ -513,6 +569,26 @@ impl EmbeddingRouter {
                         EmbedEndpointKind::Text,
                         document_model,
                         query_model,
+                        config.output_dimension,
+                        config.output_dtype,
+                    )
+                }
+                ProviderAliasConfig::VoyageContext(config) => {
+                    config.validate(provider_id)?;
+                    (
+                        EmbedEndpointKind::ContextualizedText,
+                        config.model.clone(),
+                        config.model.clone(),
+                        config.output_dimension,
+                        config.output_dtype,
+                    )
+                }
+                ProviderAliasConfig::VoyageMultimodal(config) => {
+                    config.validate(provider_id)?;
+                    (
+                        EmbedEndpointKind::Multimodal,
+                        config.model.clone(),
+                        config.model.clone(),
                         config.output_dimension,
                         config.output_dtype,
                     )
@@ -563,6 +639,18 @@ impl EmbeddingRouter {
             Some(ProviderAliasConfig::VoyageText(config)) => Ok(Box::new(
                 voyage::VoyageProvider::from_config(provider_id.to_string(), &config)?,
             )),
+            Some(ProviderAliasConfig::VoyageContext(config)) => Ok(Box::new(
+                voyage_context::VoyageContextProvider::from_config(
+                    provider_id.to_string(),
+                    &config,
+                )?,
+            )),
+            Some(ProviderAliasConfig::VoyageMultimodal(config)) => Ok(Box::new(
+                voyage_multimodal::VoyageMultimodalProvider::from_config(
+                    provider_id.to_string(),
+                    &config,
+                )?,
+            )),
             Some(ProviderAliasConfig::Ollama(config)) => Ok(Box::new(
                 ollama::OllamaProvider::from_config(provider_id.to_string(), &config)?,
             )),
@@ -584,7 +672,34 @@ impl EmbeddingRouter {
     pub fn rate_limit_per_min(&self, provider_id: &str) -> Option<u32> {
         match self.config.providers.get(provider_id) {
             Some(ProviderAliasConfig::VoyageText(config)) => Some(config.rate_limit_per_min),
+            Some(ProviderAliasConfig::VoyageContext(config)) => Some(config.rate_limit_per_min),
+            Some(ProviderAliasConfig::VoyageMultimodal(config)) => Some(config.rate_limit_per_min),
             Some(ProviderAliasConfig::Ollama(_)) | None => None,
+        }
+    }
+
+    /// Model-rerank stage config (`[embed.rerank]`), defaulted when absent.
+    pub fn rerank_config(&self) -> rerank::RerankConfig {
+        self.config.rerank.clone().unwrap_or_default()
+    }
+
+    /// Provider for one visual chunk kind (`[embed.routes.visual]`).
+    /// Ok(None) when the kind is unrouted (visual embedding is opt-in per
+    /// kind); an alias that is not multimodal-typed is a config error —
+    /// visual payloads must never silently route into a text space.
+    pub fn visual_provider(&self, kind: &str) -> Result<Option<Box<dyn EmbeddingProvider>>> {
+        let Some(alias) = self.config.routes.visual.get(kind) else {
+            return Ok(None);
+        };
+        match self.config.providers.get(alias) {
+            Some(ProviderAliasConfig::VoyageMultimodal(config)) => Ok(Some(Box::new(
+                voyage_multimodal::VoyageMultimodalProvider::from_config(alias.clone(), &config)?,
+            ))),
+            Some(_) => bail!(
+                "visual route `{kind}` maps to provider `{alias}`, which is not a \
+                 multimodal provider; visual kinds require a multimodal route family"
+            ),
+            None => bail!("unknown embedding provider `{alias}` for visual route `{kind}`"),
         }
     }
 
@@ -650,8 +765,19 @@ pub fn embed_iterate_internal(
     bucket: &str,
     project_id: &str,
     since: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<impl Iterator<Item = (EntityRef, Vec<f32>)>> {
-    let route = internal_bucket_route(bucket, project_id)?;
+) -> Result<impl Iterator<Item = (EntityRef, Vec<f32>)> + use<>> {
+    embed_iterate_internal_with(&EmbeddingRouter::load_default()?, bucket, project_id, since)
+}
+
+/// Router-injected variant so tests never resolve routes through the
+/// host's real embed.toml (per-test stores must pair with a fixed router).
+pub fn embed_iterate_internal_with(
+    router: &EmbeddingRouter,
+    bucket: &str,
+    project_id: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<impl Iterator<Item = (EntityRef, Vec<f32>)> + use<>> {
+    let route = internal_bucket_route(router, bucket, project_id)?;
     let rows = bbox_vectors::iter_active(&route, since)?
         .filter_map(|entry| {
             vector_entity_ref(&entry.entity_id).map(|entity| (entity, entry.vector))
@@ -665,7 +791,22 @@ pub fn cluster_neighbors_within(
     project_id: &str,
     similarity_threshold: f32,
 ) -> Result<Vec<ClusterId>> {
-    let route = internal_bucket_route(bucket, project_id)?;
+    cluster_neighbors_within_router(
+        &EmbeddingRouter::load_default()?,
+        bucket,
+        project_id,
+        similarity_threshold,
+    )
+}
+
+/// Router-injected variant; see `embed_iterate_internal_with`.
+pub fn cluster_neighbors_within_router(
+    router: &EmbeddingRouter,
+    bucket: &str,
+    project_id: &str,
+    similarity_threshold: f32,
+) -> Result<Vec<ClusterId>> {
+    let route = internal_bucket_route(router, bucket, project_id)?;
     let clusters = bbox_vectors::cluster_neighbors_within_route(&route, similarity_threshold)?
         .into_iter()
         .filter_map(|cluster| {
@@ -687,16 +828,18 @@ pub fn cluster_neighbors_within(
     Ok(clusters)
 }
 
-fn internal_bucket_route(bucket: &str, project_id: &str) -> Result<String> {
+fn internal_bucket_route(
+    router: &EmbeddingRouter,
+    bucket: &str,
+    project_id: &str,
+) -> Result<String> {
     let bucket = bucket_from_str(bucket)?;
     let project = if project_id.trim().is_empty() {
         None
     } else {
         Some(project_id.trim())
     };
-    Ok(EmbeddingRouter::load_default()?
-        .route(bucket, project)?
-        .vector_route_id())
+    Ok(router.route(bucket, project)?.vector_route_id())
 }
 
 fn bucket_from_str(bucket: &str) -> Result<Bucket> {
@@ -966,6 +1109,51 @@ threads = "ollama"
     }
 
     #[test]
+    fn contextualized_alias_routes_with_own_family() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes]
+code = "voyage_context"
+"#,
+        )
+        .unwrap();
+        let route = router.route(Bucket::Code, None).unwrap();
+        assert_eq!(route.endpoint_kind, EmbedEndpointKind::ContextualizedText);
+        assert_eq!(route.document_model, "voyage-context-4");
+        assert_eq!(route.query_model, "voyage-context-4");
+        assert_eq!(route.compatibility_family, "voyage-context-4:1024:float");
+        // Its own partition, never shared with voyage-4 text or code-3.
+        assert!(route.vector_route_id().starts_with("voyage_context-"));
+    }
+
+    #[test]
+    fn visual_routes_resolve_multimodal_aliases_only() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+pdf_figure = "voyage_visual"
+slide_image = "voyage_text"
+"#,
+        )
+        .unwrap();
+        let provider = router.visual_provider("pdf_figure").unwrap().unwrap();
+        assert_eq!(provider.endpoint_kind(), EmbedEndpointKind::Multimodal);
+        assert_eq!(provider.document_model(), "voyage-multimodal-3.5");
+        assert_eq!(
+            provider.compatibility_family(),
+            "voyage-multimodal-3.5:1024:float"
+        );
+        // Unrouted kinds are opt-out, not errors.
+        assert!(router.visual_provider("video_segment").unwrap().is_none());
+        // A text alias behind a visual kind is a hard config error.
+        let err = match router.visual_provider("slide_image") {
+            Err(err) => err,
+            Ok(_) => panic!("text alias behind a visual kind must be rejected"),
+        };
+        assert!(err.to_string().contains("not a multimodal provider"));
+    }
+
+    #[test]
     fn compatibility_family_derivation_matrix() {
         let cases = [
             ("voyage-4", "voyage-4:1024:float"),
@@ -1061,9 +1249,14 @@ threads = "ollama"
             )
             .unwrap();
 
-        let rows = embed_iterate_internal("transcripts", "", Some(cutoff))
-            .unwrap()
-            .collect::<Vec<_>>();
+        let rows = embed_iterate_internal_with(
+            &EmbeddingRouter::default(),
+            "transcripts",
+            "",
+            Some(cutoff),
+        )
+        .unwrap()
+        .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].0,
@@ -1105,7 +1298,13 @@ threads = "ollama"
             .upsert(&route, "agent_embed:writer:v1:primary", "c", vec![0.0, 1.0])
             .unwrap();
 
-        let clusters = cluster_neighbors_within("agent_manifest", "", 0.99).unwrap();
+        let clusters = cluster_neighbors_within_router(
+            &EmbeddingRouter::default(),
+            "agent_manifest",
+            "",
+            0.99,
+        )
+        .unwrap();
         assert_eq!(clusters.len(), 1);
         assert_eq!(
             clusters[0].members,

@@ -9,6 +9,7 @@ use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::search::rerank::{self, RerankFeatures};
 use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
 use bbox_embed::embed::queue::EmbedStatusResponse;
+use bbox_embed::embed::rerank::{RerankConfig, RerankHit, rerank_blocking};
 use bbox_embed::embed::{Bucket, EmbeddingRouter, query_cache};
 use bbox_embed::embed_queue;
 use bbox_indexing::index::{HybridBm25Hit, TranscriptIndex};
@@ -60,6 +61,15 @@ pub struct HybridSearchParams {
     /// bbox_corpus_core::search::metrics); not intended for normal callers.
     #[serde(default)]
     pub rerank_cap: Option<f32>,
+    /// Rerank stage selection. "heuristic" (default) applies the
+    /// type/temporal multipliers to the fused RRF scores. "model" sends the
+    /// fused top-k candidates to the configured cross-encoder
+    /// (`[embed.rerank]`, default rerank-2.5-lite), orders by relevance,
+    /// and applies the heuristic multipliers after; on rerank API failure
+    /// it falls back to heuristic and reports
+    /// `degraded.rerank_unavailable`. "none" returns raw fusion order.
+    #[serde(default)]
+    pub rerank: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,12 +136,19 @@ pub struct HybridDegraded {
     pub vector_errors: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub skipped_partitions: BTreeMap<String, String>,
+    /// Set when rerank="model" was requested but the rerank API call
+    /// failed; scoring fell back to the heuristic path for this response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_unavailable: Option<String>,
 }
 
 impl HybridDegraded {
-    /// True when nothing degraded — no vector errors and no skipped partitions.
+    /// True when nothing degraded — no vector errors, no skipped
+    /// partitions, and no rerank fallback.
     pub fn is_empty(&self) -> bool {
-        self.vector_errors.is_empty() && self.skipped_partitions.is_empty()
+        self.vector_errors.is_empty()
+            && self.skipped_partitions.is_empty()
+            && self.rerank_unavailable.is_none()
     }
 }
 
@@ -255,11 +272,43 @@ pub fn hybrid_search_typed(
         .rerank_cap
         .unwrap_or(rerank::DEFAULT_COMBINED_CAP)
         .clamp(1.0, 4.0);
+    let rerank_mode = parse_rerank_mode(p.rerank.as_deref())?;
+    let model_scores = if rerank_mode == RerankMode::Model {
+        let config = EmbeddingRouter::load_default()
+            .unwrap_or_default()
+            .rerank_config();
+        match model_rerank_scores(
+            query,
+            &fused,
+            &bm25_hits,
+            &loaded_properties,
+            &config,
+            |q, docs| rerank_blocking(config.clone(), q, docs),
+        ) {
+            Ok(scores) => Some(scores),
+            Err(err) => {
+                // Model stage degrades to the heuristic path — never fail
+                // the whole search because a hosted reranker hiccuped.
+                degraded.rerank_unavailable = Some(sanitize_error(&err));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut results = fused
         .into_iter()
         .map(|hit| {
             let feature = features.get(&hit.entity_id).cloned().unwrap_or_default();
-            let score = rerank::apply_rerank_with_cap(hit.score, &feature, now, rerank_cap);
+            let score = stage_score(
+                rerank_mode,
+                model_scores.as_ref(),
+                &hit.entity_id,
+                hit.score,
+                &feature,
+                now,
+                rerank_cap,
+            );
             let bm25 = bm25_hits
                 .iter()
                 .find(|bm25| bm25.entity_id == hit.entity_id);
@@ -744,6 +793,132 @@ fn enrich_knowledge_features(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RerankMode {
+    Heuristic,
+    Model,
+    None,
+}
+
+fn parse_rerank_mode(raw: Option<&str>) -> Result<RerankMode> {
+    match raw.map(str::trim).unwrap_or("heuristic") {
+        "" | "heuristic" => Ok(RerankMode::Heuristic),
+        "model" => Ok(RerankMode::Model),
+        "none" => Ok(RerankMode::None),
+        other => anyhow::bail!("unknown rerank mode `{other}`; expected model, heuristic, or none"),
+    }
+}
+
+/// Send the fused top-k to the cross-encoder and map its relevance scores
+/// back to entity ids. The rerank call is injected so tests exercise the
+/// candidate/document assembly and score mapping without a live provider.
+fn model_rerank_scores(
+    query: &str,
+    fused: &[rrf::FusedHit],
+    bm25_hits: &[HybridBm25Hit],
+    loaded_properties: &BTreeMap<String, BTreeMap<String, String>>,
+    config: &RerankConfig,
+    rerank_call: impl FnOnce(&str, &[String]) -> Result<Vec<RerankHit>>,
+) -> Result<BTreeMap<String, f32>> {
+    let candidates = &fused[..config.top_k.clamp(1, 1_000).min(fused.len())];
+    if candidates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let documents = candidates
+        .iter()
+        .map(|hit| {
+            candidate_document(
+                &hit.entity_id,
+                bm25_hits
+                    .iter()
+                    .find(|bm25| bm25.entity_id == hit.entity_id),
+                loaded_properties.get(&hit.entity_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    let hits = rerank_call(query, &documents)?;
+    Ok(hits
+        .into_iter()
+        .map(|hit| (candidates[hit.index].entity_id.clone(), hit.relevance_score))
+        .collect())
+}
+
+/// Final per-candidate score for one rerank mode. Model-reranked
+/// candidates score in a strictly higher band (base 1.0 + relevance vs
+/// RRF's <=~0.05) so the cross-encoder ordering owns the top-k and the
+/// unsent tail keeps its fusion order below; heuristic multipliers apply
+/// after, under the same cap machinery (multiplier bounds — type >= 0.85,
+/// temporal clamped to [0.50, 1.25] — keep the bands from crossing).
+#[allow(clippy::too_many_arguments)]
+fn stage_score(
+    mode: RerankMode,
+    model_scores: Option<&BTreeMap<String, f32>>,
+    entity_id: &str,
+    fused_score: f32,
+    feature: &RerankFeatures,
+    now: chrono::DateTime<Utc>,
+    cap: f32,
+) -> f32 {
+    match (mode, model_scores) {
+        (RerankMode::None, _) => fused_score,
+        (RerankMode::Model, Some(scores)) => match scores.get(entity_id) {
+            Some(relevance) => rerank::apply_rerank_with_cap(1.0 + relevance, feature, now, cap),
+            None => rerank::apply_rerank_with_cap(fused_score, feature, now, cap),
+        },
+        // Heuristic, or model requested but degraded.
+        _ => rerank::apply_rerank_with_cap(fused_score, feature, now, cap),
+    }
+}
+
+/// Best text available for one rerank candidate without extra index round
+/// trips: title/path identity, the stored content preview, and the BM25
+/// excerpt when the BM25 lane surfaced this entity. Vector-only hits are
+/// thinner (preview only) — acceptable for a cross-encoder, and the eval
+/// suite is the judge of whether richer loading is worth it.
+fn candidate_document(
+    entity_id: &str,
+    bm25: Option<&HybridBm25Hit>,
+    properties: Option<&BTreeMap<String, String>>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(properties) = properties {
+        for key in ["title", "file_path", "symbol"] {
+            if let Some(value) = properties.get(key) {
+                parts.push(value.clone());
+            }
+        }
+        for key in ["content_preview", "content"] {
+            if let Some(value) = properties.get(key) {
+                parts.push(value.clone());
+                break;
+            }
+        }
+    }
+    if let Some(bm25) = bm25 {
+        if let Some(title) = &bm25.title {
+            if !parts.iter().any(|part| part == title) {
+                parts.push(title.clone());
+            }
+        }
+        if !bm25.excerpt.is_empty() {
+            parts.push(bm25.excerpt.replace("**", ""));
+        }
+    }
+    if parts.is_empty() {
+        parts.push(entity_id.to_string());
+    }
+    let mut document = parts.join("\n");
+    // Stay far inside the 32K-combined-token pair cap even at k=100.
+    document.truncate(
+        document
+            .char_indices()
+            .nth(2_000)
+            .map(|(idx, _)| idx)
+            .unwrap_or(document.len()),
+    );
+    document
+}
+
 fn enrich_fused_features<'a>(
     index: &TranscriptIndex,
     knowledge: &Knowledge,
@@ -930,6 +1105,160 @@ mod tests {
     use bbox_knowledge::knowledge::{
         Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,
     };
+
+    #[test]
+    fn rerank_mode_parses_and_rejects_unknown() {
+        assert_eq!(parse_rerank_mode(None).unwrap(), RerankMode::Heuristic);
+        assert_eq!(
+            parse_rerank_mode(Some("heuristic")).unwrap(),
+            RerankMode::Heuristic
+        );
+        assert_eq!(parse_rerank_mode(Some("model")).unwrap(), RerankMode::Model);
+        assert_eq!(parse_rerank_mode(Some("none")).unwrap(), RerankMode::None);
+        assert!(parse_rerank_mode(Some("llm")).is_err());
+    }
+
+    fn fused_hit(entity_id: &str, score: f32) -> FusedHit {
+        FusedHit {
+            entity_id: entity_id.into(),
+            score,
+            sources: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn model_rerank_maps_scores_and_builds_documents() {
+        let fused = vec![
+            fused_hit("knowledge:a", 0.05),
+            fused_hit("project_file:p:f:h:1", 0.04),
+            fused_hit("commit:p:sha", 0.03),
+        ];
+        let bm25 = vec![HybridBm25Hit {
+            entity_id: "knowledge:a".into(),
+            score: 1.0,
+            rank: 1,
+            doc_type: "knowledge".into(),
+            chunk_kind: String::new(),
+            role: String::new(),
+            title: Some("retry policy".into()),
+            excerpt: "the **retry** policy is exponential".into(),
+        }];
+        let properties = BTreeMap::from([(
+            "project_file:p:f:h:1".to_string(),
+            BTreeMap::from([
+                ("file_path".to_string(), "src/retry.rs".to_string()),
+                (
+                    "content_preview".to_string(),
+                    "fn retry_backoff()".to_string(),
+                ),
+            ]),
+        )]);
+        let config = RerankConfig {
+            top_k: 2, // third candidate stays unsent
+            ..RerankConfig::default()
+        };
+        let mut seen_documents = Vec::new();
+        let scores = model_rerank_scores(
+            "retry policy",
+            &fused,
+            &bm25,
+            &properties,
+            &config,
+            |query, documents| {
+                assert_eq!(query, "retry policy");
+                seen_documents = documents.to_vec();
+                Ok(vec![
+                    RerankHit {
+                        index: 1,
+                        relevance_score: 0.9,
+                    },
+                    RerankHit {
+                        index: 0,
+                        relevance_score: 0.4,
+                    },
+                ])
+            },
+        )
+        .unwrap();
+        assert_eq!(seen_documents.len(), 2);
+        assert!(seen_documents[0].contains("retry policy is exponential"));
+        assert!(!seen_documents[0].contains("**"), "highlights stripped");
+        assert!(seen_documents[1].contains("src/retry.rs"));
+        assert!(seen_documents[1].contains("fn retry_backoff()"));
+        assert_eq!(scores.get("project_file:p:f:h:1"), Some(&0.9));
+        assert_eq!(scores.get("knowledge:a"), Some(&0.4));
+        assert_eq!(scores.get("commit:p:sha"), None);
+    }
+
+    /// Model-reranked candidates must outrank the unsent tail regardless of
+    /// heuristic multipliers, and relevance order must own the reranked
+    /// band; rerank=none returns raw fusion scores.
+    #[test]
+    fn stage_score_bands_keep_model_order_above_tail() {
+        let now = Utc::now();
+        let cap = rerank::DEFAULT_COMBINED_CAP;
+        let scores = BTreeMap::from([
+            ("knowledge:a".to_string(), 0.9_f32),
+            ("commit:c".to_string(), 0.1_f32),
+        ]);
+        let feature = RerankFeatures::default();
+        let top = stage_score(
+            RerankMode::Model,
+            Some(&scores),
+            "knowledge:a",
+            0.01,
+            &feature,
+            now,
+            cap,
+        );
+        let low_model = stage_score(
+            RerankMode::Model,
+            Some(&scores),
+            "commit:c",
+            0.05,
+            &feature,
+            now,
+            cap,
+        );
+        let tail = stage_score(
+            RerankMode::Model,
+            Some(&scores),
+            "note:tail",
+            0.05,
+            &feature,
+            now,
+            cap,
+        );
+        assert!(top > low_model, "relevance order owns the model band");
+        assert!(low_model > tail, "unsent tail stays below the model band");
+
+        // Degraded model (no scores) behaves exactly like heuristic.
+        let degraded = stage_score(
+            RerankMode::Model,
+            None,
+            "knowledge:a",
+            0.01,
+            &feature,
+            now,
+            cap,
+        );
+        let heuristic = stage_score(
+            RerankMode::Heuristic,
+            None,
+            "knowledge:a",
+            0.01,
+            &feature,
+            now,
+            cap,
+        );
+        assert_eq!(degraded, heuristic);
+
+        // rerank=none is raw fusion order.
+        assert_eq!(
+            stage_score(RerankMode::None, None, "x", 0.42, &feature, now, cap),
+            0.42
+        );
+    }
 
     #[test]
     fn response_shape_includes_vector_status() {

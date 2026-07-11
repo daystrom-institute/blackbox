@@ -208,7 +208,7 @@ pub fn resolve_current_chunk_entity(
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };
-    if is_binary(&bytes) {
+    if is_binary(absolute_path, &bytes) {
         return Ok(None);
     }
     let registry = chunker::default_registry();
@@ -335,7 +335,7 @@ fn index_project(
                 continue;
             }
         };
-        if is_binary(&bytes) {
+        if is_binary(&path, &bytes) {
             ctx.stats.skipped += 1;
             continue;
         }
@@ -545,7 +545,16 @@ fn is_supported_text_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
         Some(
-            "md" | "markdown" | "mdown" | "json" | "toml" | "yaml" | "yml" | "txt" | "text" | "log"
+            "md" | "markdown"
+                | "mdown"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "txt"
+                | "text"
+                | "log"
+                | "pdf"
         )
     ) || bbox_chunker::code::language_for_path(path).is_some()
 }
@@ -894,7 +903,18 @@ fn chunk_ref(chunk: &Chunk, snapshot_id: Option<&str>) -> EntityRef {
     }
 }
 
-fn is_binary(bytes: &[u8]) -> bool {
+/// PDFs are legitimately binary (embedded streams, xref/trailer binary
+/// markers, font/image data) and are expected to contain NUL bytes in their
+/// first 4096 bytes; the null-byte heuristic below would otherwise exclude
+/// nearly every real-world PDF before it ever reaches the chunker
+/// registry's own `claims()` (magic-header) check. `PdfChunker::claims`
+/// (crates/bbox-chunker/src/pdf.rs) is the real gate for whether a `.pdf`
+/// file's content is extractable, so the blanket binary sniff is bypassed
+/// by extension here rather than tightened generically.
+fn is_binary(path: &Path, bytes: &[u8]) -> bool {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("pdf") {
+        return false;
+    }
     bytes.iter().take(4096).any(|byte| *byte == 0)
 }
 

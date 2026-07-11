@@ -87,6 +87,7 @@ pub fn discover_seed_entities(
             query_vector: p.query_vector.clone(),
             project: p.project.clone(),
             rerank_cap: None,
+            rerank: None,
         },
     )?;
     let seeds = hybrid

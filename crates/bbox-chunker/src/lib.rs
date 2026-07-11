@@ -1,6 +1,7 @@
 pub mod code;
 pub mod config;
 pub mod markdown;
+pub mod pdf;
 pub mod text;
 
 use std::path::{Path, PathBuf};
@@ -82,6 +83,7 @@ pub fn default_registry() -> Vec<Box<dyn SourceFormatChunker>> {
         Box::new(config::JsonChunker),
         Box::new(config::TomlChunker),
         Box::new(config::YamlChunker),
+        Box::new(pdf::PdfChunker),
         Box::new(text::PlainTextChunker),
     ]
 }

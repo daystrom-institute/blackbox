@@ -41,11 +41,22 @@ axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 futures = "0.3"
 sha2 = "0.10"
+base64 = "0.22"
+# Header-only image dimension sniffing for the multimodal payload guard
+# (image pixel cap); no decode, no transitive deps.
+imagesize = "0.13"
 tempfile = "3"
 bbox-stores = { path = "../bbox-stores" }
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-indexing = { path = "../bbox-indexing" }
+
+[features]
+# Exposes install_test_router to DOWNSTREAM crates' tests (cfg(test) does
+# not cross crate boundaries): tests that pair a per-test vector store
+# with route derivation must pin the router instead of letting
+# load_default() read the host's real embed.toml.
+test-support = []
 
 [dev-dependencies]
 bbox-vectors = { path = "../bbox-vectors", features = ["test-support"] }

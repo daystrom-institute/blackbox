@@ -13,6 +13,12 @@ edition = "2024"
 [dependencies]
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 anyhow = "1"
+# Text-first PDF extraction for the X-PDF chunker (design/corpus/agentic-corpus/
+# agentic-corpus-multimodal-chunkers.md). Pinned to the current published
+# release (0.12.0, 2026-06-26) rather than a loose "0" range since it is a
+# net-new dependency and the extraction API (extract_text_from_mem_by_pages)
+# is worth pinning close to what was validated.
+pdf-extract = "0.12"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

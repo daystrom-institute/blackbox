@@ -1,7 +1,7 @@
 ---
 title: "Agentic Corpus \u2014 Multimodal Chunkers"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - corpus
@@ -36,6 +36,17 @@ Original priority from the impl skeleton: PDF first; HTML / AV / IMG
 late.
 
 ### X-PDF — PDF chunker
+
+Text-first pass **shipped 2026-07-11** (`crates/bbox-chunker/src/pdf.rs`):
+`pdf-extract` per-page extraction into `pdf_page` chunks (1-based page
+number carried in the position fields), `.pdf` admitted through the
+project-file walker with a magic-header claim, docs-bucket routing, and
+graceful degradation (encrypted/scanned/corrupt PDFs yield zero chunks and
+a warning, never a failed reindex pass). Deliberately deferred from that
+pass: `pdf_table` (pdf-extract's flat text discards layout; a text-only
+table detector would misfire), OCR shell-outs, `pdf_figure` + edges.
+
+Original scope:
 
 - `pdf-extract` for text PDFs; `tesseract` shell-out for scanned PDFs.
 - Chunk types: `pdf_page`, `pdf_figure`, `pdf_table`.

@@ -216,6 +216,10 @@ filetime = "0.2"
 # cfg(test) doesn't cross crate boundaries, so this dev-dep turns on the
 # `test-support` feature only when building blackbox's tests (off in release).
 bbox-vectors = { path = "crates/bbox-vectors", features = ["test-support"] }
+# Same pattern for bbox-embed's install_test_router: tests that pin a
+# per-test vector store must pin route derivation too, or partition ids
+# drift with the host's real embed.toml.
+bbox-embed = { path = "crates/bbox-embed", features = ["test-support"] }
 # ServiceExt::oneshot for exercising axum route tables in tests.
 tower = { version = "0.5", features = ["util"] }
 

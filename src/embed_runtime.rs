@@ -1508,6 +1508,7 @@ mod tests {
         let vector_tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
         let _guard = install_test_global(store.clone());
+        let _router_guard = crate::embed::install_test_router(EmbeddingRouter::default());
         let created = state
             .threads
             .write()

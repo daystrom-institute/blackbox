@@ -89,6 +89,157 @@ async fn embed_document_texts(
         .collect()
 }
 
+/// Document identity for contextualized grouping: the chunk entity id
+/// minus its trailing numeric chunk index (`project_file:p:f:h:3` and
+/// `:4` share a document; ids without a numeric tail are their own
+/// document). Derived here so enqueue sites don't have to thread a
+/// grouping key through every corpus enumerator.
+fn document_group_key(entity_id: &str) -> &str {
+    match entity_id.rsplit_once(':') {
+        Some((prefix, suffix))
+            if !prefix.is_empty()
+                && !suffix.is_empty()
+                && suffix.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            prefix
+        }
+        _ => entity_id,
+    }
+}
+
+/// Embed one packed batch with the role and shape its provider expects.
+/// Text/Ollama providers take flat `Text` inputs; contextualized providers
+/// take consecutive same-document runs as `DocumentChunks` groups so each
+/// chunk is encoded with its document context. Returns one vector per
+/// request, in batch order.
+async fn embed_batch_requests(
+    provider: &dyn EmbeddingProvider,
+    batch: &[EmbedRequest],
+) -> Result<Vec<Vec<f32>>> {
+    if provider.endpoint_kind() != EmbedEndpointKind::ContextualizedText {
+        let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
+        return embed_document_texts(provider, &texts).await;
+    }
+    let mut inputs: Vec<EmbedInput> = Vec::new();
+    let mut group_sizes: Vec<usize> = Vec::new();
+    let mut current_key: Option<&str> = None;
+    let mut current: Vec<String> = Vec::new();
+    for request in batch {
+        let key = document_group_key(&request.entity_id);
+        if current_key != Some(key) && !current.is_empty() {
+            group_sizes.push(current.len());
+            inputs.push(EmbedInput::DocumentChunks(std::mem::take(&mut current)));
+        }
+        current_key = Some(key);
+        current.push(request.text.clone());
+    }
+    if !current.is_empty() {
+        group_sizes.push(current.len());
+        inputs.push(EmbedInput::DocumentChunks(current));
+    }
+    let outputs = provider
+        .embed_batch(&inputs, EmbedInputType::Document)
+        .await?;
+    if outputs.len() != group_sizes.len() {
+        anyhow::bail!(
+            "contextualized provider returned {} document outputs, expected {}",
+            outputs.len(),
+            group_sizes.len()
+        );
+    }
+    let mut vectors = Vec::with_capacity(batch.len());
+    for (output, expected) in outputs.into_iter().zip(group_sizes) {
+        if output.vectors.len() != expected {
+            anyhow::bail!(
+                "contextualized provider returned {} vectors for a {expected}-chunk document",
+                output.vectors.len()
+            );
+        }
+        vectors.extend(output.vectors);
+    }
+    Ok(vectors)
+}
+
+/// Pop one batch off the pending queue under the count/byte caps.
+/// `grouped` (contextualized routes) additionally never splits one
+/// document's consecutive chunk run across batches: a run that would
+/// straddle the cap closes the batch instead, and a run that exceeds the
+/// caps on its own falls back to windowed sub-documents (each window is
+/// embedded as its own document, trading context width for progress).
+fn pack_batch(pending: &mut VecDeque<EmbedRequest>, grouped: bool) -> Vec<EmbedRequest> {
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    if !grouped {
+        while let Some(req) = pending.pop_front() {
+            let req_bytes = req.text.len();
+            if !batch.is_empty()
+                && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES)
+            {
+                pending.push_front(req);
+                break;
+            }
+            bytes += req_bytes;
+            batch.push(req);
+            if batch.len() >= MAX_BATCH_DOCS {
+                break;
+            }
+        }
+        return batch;
+    }
+    while let Some(front) = pending.front() {
+        let key = document_group_key(&front.entity_id).to_string();
+        let mut group = Vec::new();
+        let mut group_bytes = 0usize;
+        while pending
+            .front()
+            .is_some_and(|req| document_group_key(&req.entity_id) == key)
+        {
+            let req = pending.pop_front().expect("front checked");
+            group_bytes += req.text.len();
+            group.push(req);
+        }
+        let fits =
+            batch.len() + group.len() <= MAX_BATCH_DOCS && bytes + group_bytes <= MAX_BATCH_BYTES;
+        if fits {
+            bytes += group_bytes;
+            batch.extend(group);
+            if batch.len() >= MAX_BATCH_DOCS {
+                break;
+            }
+            continue;
+        }
+        if !batch.is_empty() {
+            // Close the batch at the document boundary; the whole run
+            // goes back to the queue head in order.
+            for req in group.into_iter().rev() {
+                pending.push_front(req);
+            }
+            break;
+        }
+        // The run alone exceeds the caps: windowed fallback. Take a
+        // cap-sized window as this batch's single document, requeue the
+        // rest of the run (it becomes the next window).
+        let mut rest = Vec::new();
+        for req in group {
+            let req_bytes = req.text.len();
+            if !rest.is_empty()
+                || batch.len() >= MAX_BATCH_DOCS
+                || (!batch.is_empty() && bytes + req_bytes > MAX_BATCH_BYTES)
+            {
+                rest.push(req);
+                continue;
+            }
+            bytes += req_bytes;
+            batch.push(req);
+        }
+        for req in rest.into_iter().rev() {
+            pending.push_front(req);
+        }
+        break;
+    }
+    batch
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbedRequest {
     pub bucket: Bucket,
@@ -638,7 +789,8 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
             // First batch blocks for input; subsequent batches only
             // contribute if pending has more work right away (so we
             // don't add latency waiting for a second batch to fill).
-            match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce).await {
+            let grouped = spec.provider.endpoint_kind() == EmbedEndpointKind::ContextualizedText;
+            match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce, grouped).await {
                 Some(b) => acc.push(b),
                 None => return,
             }
@@ -646,22 +798,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                 if pending.is_empty() {
                     break;
                 }
-                let mut batch = Vec::new();
-                let mut bytes = 0usize;
-                while let Some(req) = pending.pop_front() {
-                    let req_bytes = req.text.len();
-                    if !batch.is_empty()
-                        && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES)
-                    {
-                        pending.push_front(req);
-                        break;
-                    }
-                    bytes += req_bytes;
-                    batch.push(req);
-                    if batch.len() >= MAX_BATCH_DOCS {
-                        break;
-                    }
-                }
+                let batch = pack_batch(&mut pending, grouped);
                 if !batch.is_empty() {
                     acc.push(batch);
                 }
@@ -671,8 +808,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
         if let Some(limiter) = &mut rate_limiter {
             for batch in batches {
                 limiter.acquire(1).await;
-                let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
-                let result = embed_document_texts(spec.provider.as_ref(), &texts).await;
+                let result = embed_batch_requests(spec.provider.as_ref(), &batch).await;
                 process_batch_outcome(
                     &spec,
                     &mut retry_batch,
@@ -692,10 +828,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
         let mut results: Vec<(Vec<EmbedRequest>, anyhow::Result<Vec<Vec<f32>>>)> = {
             let futures = batches
                 .iter()
-                .map(|batch| {
-                    let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
-                    async move { embed_document_texts(provider.as_ref(), &texts).await }
-                })
+                .map(|batch| async move { embed_batch_requests(provider.as_ref(), batch).await })
                 .collect::<Vec<_>>();
             let outcomes = futures::future::join_all(futures).await;
             batches.into_iter().zip(outcomes).collect()
@@ -844,8 +977,7 @@ async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
             continue;
         }
         budget -= 1;
-        let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
-        match embed_document_texts(spec.provider.as_ref(), &texts).await {
+        match embed_batch_requests(spec.provider.as_ref(), &batch).await {
             Ok(vectors) => {
                 if spec.persist_vectors {
                     if let Err(err) = persist_vectors(spec, &batch, vectors) {
@@ -975,6 +1107,7 @@ async fn collect_quiescent_batch(
     rx: &mut mpsc::UnboundedReceiver<WorkerCommand>,
     pending: &mut VecDeque<EmbedRequest>,
     debounce: Duration,
+    grouped: bool,
 ) -> Option<Vec<EmbedRequest>> {
     while pending.is_empty() {
         match rx.recv().await? {
@@ -989,23 +1122,7 @@ async fn collect_quiescent_batch(
             Err(_) => break,
         }
     }
-    let mut batch = Vec::new();
-    let mut bytes = 0usize;
-    while let Some(req) = pending.pop_front() {
-        let req_bytes = req.text.len();
-        if !batch.is_empty()
-            && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES)
-        {
-            pending.push_front(req);
-            break;
-        }
-        bytes += req_bytes;
-        batch.push(req);
-        if batch.len() >= MAX_BATCH_DOCS {
-            break;
-        }
-    }
-    Some(batch)
+    Some(pack_batch(pending, grouped))
 }
 
 fn persist_vectors(
@@ -1618,6 +1735,137 @@ mod tests {
 
     fn request(bucket: Bucket, entity_id: &str, chunk_hash: &str) -> EmbedRequest {
         request_with_text(bucket, entity_id, chunk_hash, "hello")
+    }
+
+    #[test]
+    fn document_group_key_strips_only_numeric_chunk_index() {
+        assert_eq!(
+            document_group_key("project_file:p:f:hash:3"),
+            "project_file:p:f:hash"
+        );
+        assert_eq!(
+            document_group_key("knowledge:abcd1234"),
+            "knowledge:abcd1234"
+        );
+        assert_eq!(document_group_key("plain"), "plain");
+        assert_eq!(document_group_key("thing:"), "thing:");
+    }
+
+    fn ctx_request(doc: &str, idx: usize, text: &str) -> EmbedRequest {
+        request_with_text(
+            Bucket::Docs,
+            &format!("project_file:p:{doc}:hash:{idx}"),
+            &format!("h-{doc}-{idx}"),
+            text,
+        )
+    }
+
+    #[test]
+    fn grouped_pack_never_splits_a_document_run_across_batches() {
+        // Doc A: 100 chunks, doc B: 100 chunks. Cap is 128 docs, so A fits
+        // but A+B does not; the batch must close at the A/B boundary.
+        let mut pending: VecDeque<EmbedRequest> = VecDeque::new();
+        for idx in 0..100 {
+            pending.push_back(ctx_request("aaa", idx, "x"));
+        }
+        for idx in 0..100 {
+            pending.push_back(ctx_request("bbb", idx, "x"));
+        }
+        let first = pack_batch(&mut pending, true);
+        assert_eq!(first.len(), 100);
+        assert!(
+            first.iter().all(|req| req.entity_id.contains(":aaa:")),
+            "batch must close at the document boundary"
+        );
+        let second = pack_batch(&mut pending, true);
+        assert_eq!(second.len(), 100);
+        assert!(second.iter().all(|req| req.entity_id.contains(":bbb:")));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn grouped_pack_windows_an_oversized_document() {
+        let mut pending: VecDeque<EmbedRequest> = VecDeque::new();
+        for idx in 0..(MAX_BATCH_DOCS + 40) {
+            pending.push_back(ctx_request("huge", idx, "x"));
+        }
+        let first = pack_batch(&mut pending, true);
+        assert_eq!(first.len(), MAX_BATCH_DOCS);
+        let second = pack_batch(&mut pending, true);
+        assert_eq!(second.len(), 40);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn ungrouped_pack_matches_caps_regardless_of_documents() {
+        let mut pending: VecDeque<EmbedRequest> = VecDeque::new();
+        for idx in 0..(MAX_BATCH_DOCS + 10) {
+            pending.push_back(ctx_request("aaa", idx, "x"));
+        }
+        let first = pack_batch(&mut pending, false);
+        assert_eq!(first.len(), MAX_BATCH_DOCS);
+    }
+
+    struct GroupRecordingProvider {
+        seen: std::sync::Mutex<Vec<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for GroupRecordingProvider {
+        async fn embed_batch(
+            &self,
+            inputs: &[EmbedInput],
+            _input_type: EmbedInputType,
+        ) -> Result<Vec<EmbedOutput>> {
+            let shape = inputs
+                .iter()
+                .map(|input| match input {
+                    EmbedInput::DocumentChunks(chunks) => chunks.len(),
+                    _ => panic!("contextualized batches must be DocumentChunks"),
+                })
+                .collect::<Vec<_>>();
+            self.seen.lock().unwrap().push(shape.clone());
+            Ok(shape
+                .into_iter()
+                .map(|chunks| EmbedOutput {
+                    vectors: (0..chunks).map(|_| vec![0.0_f32; 4]).collect(),
+                })
+                .collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        fn document_model(&self) -> &str {
+            "mock-context"
+        }
+
+        fn endpoint_kind(&self) -> EmbedEndpointKind {
+            EmbedEndpointKind::ContextualizedText
+        }
+
+        fn id(&self) -> &str {
+            "mock-context"
+        }
+    }
+
+    #[tokio::test]
+    async fn contextualized_batches_group_consecutive_chunks_per_document() {
+        let provider = GroupRecordingProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let batch = vec![
+            ctx_request("aaa", 0, "a0"),
+            ctx_request("aaa", 1, "a1"),
+            ctx_request("aaa", 2, "a2"),
+            ctx_request("bbb", 0, "b0"),
+            ctx_request("bbb", 1, "b1"),
+        ];
+        let vectors = embed_batch_requests(&provider, &batch).await.unwrap();
+        assert_eq!(vectors.len(), 5, "one vector per request, in order");
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![vec![3, 2]], "two documents, chunks grouped");
     }
 
     fn request_with_text(

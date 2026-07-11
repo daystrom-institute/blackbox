@@ -1778,6 +1778,7 @@ mod tests {
         let vector_store =
             std::sync::Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
         let _guard = vectors::install_test_global(vector_store.clone());
+        let _router_guard = embed::install_test_router(embed::EmbeddingRouter::default());
         let route = embed::EmbeddingRouter::default()
             .route(embed::Bucket::AgentManifest, None)
             .unwrap()

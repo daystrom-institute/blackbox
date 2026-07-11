@@ -44,6 +44,31 @@ out explicitly under `Changed` or `Removed`.
   float routes; a non-float dtype forces a new partition. `bbox_embed_status`
   reports the new route identity fields. The query-embedding cache key now
   includes query model, dimension, and dtype.
+- Model rerank stage (Layer 3): `bbox_hybrid_search` accepts
+  `rerank="model"|"heuristic"|"none"`. Model mode sends the fused top-k to
+  the `[embed.rerank]` cross-encoder (default `rerank-2.5-lite`, top_k 64),
+  orders the top-k by relevance above the unsent tail, applies the
+  heuristic type/temporal multipliers after under the existing cap, and
+  degrades to the heuristic path with `degraded.rerank_unavailable` on API
+  failure. Heuristic remains the default pending an eval win.
+- Contextualized chunk embeddings (Layer 2): `type = "voyage_context"`
+  provider aliases (voyage-context-4, its own compatibility family), with
+  document-grouped queue batching: chunks of one document embed together
+  (`inputs: [[chunk, ...]]`), batches never split a document's consecutive
+  run, and oversized documents fall back to windowed sub-documents.
+  Queries encode as single-chunk documents against the same partition.
+  No bucket routes there by default; the code/docs migration stays
+  eval-gated.
+- Multimodal route family (Layer 4, opt-in): `type = "voyage_multimodal"`
+  provider aliases (voyage-multimodal-3.5, own family), interleaved
+  text/image/video content with `truncation=false` always and local
+  payload preflight (image byte/pixel caps, video byte cap) rejected as
+  typed poison. `[embed.routes.visual]` maps visual chunk kinds to
+  multimodal aliases only; text buckets never fall back there.
+- X-PDF text-first chunker: `.pdf` files now index as per-page `pdf_page`
+  chunks (pdf-extract) into the docs bucket; encrypted/scanned/corrupt
+  PDFs degrade to zero chunks without failing the reindex pass. Tables,
+  figures, OCR, and visual sidecars are deferred.
 - `bbox_embed_partitions`: vector partition lifecycle tool (Layer 5 of the
   same design). `action="list"` inventories every on-disk partition with
   dims, active count, last write, disk bytes, and whether any configured

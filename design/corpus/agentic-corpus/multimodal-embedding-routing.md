@@ -545,15 +545,35 @@ and un-backfilled by choice. Original scope:
   (observed 2026-07-09) before re-routing so the backfill and the
   migration aren't conflated.
 
-Phase 4 — Model rerank stage (Layer 3): `[embed.rerank]` config, opt-in
-param, eval A/B against heuristic-only using the metrics substrate; ship
-as default only on a measured win.
+Phase 4 — Model rerank stage (Layer 3) — **capability shipped
+2026-07-11**: `[embed.rerank]` config (default rerank-2.5-lite, top_k 64),
+`rerank="model"|"heuristic"|"none"` on bbox_hybrid_search (heuristic
+remains the default), reranked candidates score in a strictly higher band
+than the unsent tail with heuristic multipliers applied after under the
+existing cap, and API failure degrades to heuristic with
+`degraded.rerank_unavailable`. Still open: the eval A/B (MRR/recall@k)
+that would justify flipping the default. Original scope:
 
-Phase 5 — Contextualized embeddings (Layer 2): document-grouped queue
-batching, `DocumentChunks` input, `voyage_context` route for `code`/`docs`
-behind an eval comparison vs their Layer-1 routes.
+Phase 5 — Contextualized embeddings (Layer 2) — **capability shipped
+2026-07-11**: `voyage_context` provider type + builtin alias
+(voyage-context-4, own family/partition), document-grouped queue batching
+(group key derived from the chunk entity id's trailing index; batches
+never split a document's consecutive run, oversized runs fall back to
+windowed sub-documents), and flat single-chunk query encoding against the
+same partition. Still open: the eval comparison that would actually move
+`code`/`docs` onto the route (routing there today is one config line, but
+it stays eval-gated by design). Original scope:
 
-Phase 6 — Multimodal provider + first visual chunker (Layer 4):
+Phase 6 — Multimodal provider + first visual chunker (Layer 4) —
+**partially shipped 2026-07-11**: `VoyageMultimodalProvider`
+(voyage-multimodal-3.5, `truncation=false` always, local preflight guards
+for image bytes/pixels and video bytes as typed poison), `voyage_visual`
+builtin alias, `[embed.routes.visual]` parsing with multimodal-only alias
+validation, and the X-PDF text-first chunker (`pdf_page` chunks via
+pdf-extract, riding the docs bucket; scanned/corrupt PDFs degrade to zero
+chunks, no OCR). Still open: `pdf_figure`/visual payload sidecar
+(gap-ab3ef97f `file:` entity anchoring), pixel-export policy docs, and
+the visual eval. Original scope:
 
 - `VoyageMultimodalProvider` against `/v1/multimodalembeddings` with the
   payload guards above; export-policy docs for pixels leaving the host.
