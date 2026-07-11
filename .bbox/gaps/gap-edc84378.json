@@ -1,0 +1,23 @@
+{
+  "id": "gap-edc84378",
+  "title": "Transcript modality absent from agentic graph: no path ever runs the tantivy edge projection",
+  "gap_kind": "ontology",
+  "domain": "agentic-corpus/edge-index",
+  "wanted_capability": "Transcript chunk vertices and IN_SESSION edges present in the agentic graph so transcript_provenance queries, bbox_blame transcript hops, and eval required_evidence=IN_SESSION can resolve. Since commit ffd9027e made the tantivy stored-doc projection opt-in, every remaining caller of rebuild_edge_index_from_shared passes include_tantivy_projection=false (the last true caller, rebuild_edge_index_from_stores, was flipped in the spawn_blocking sweep; boot rebuild hardcodes false in src/server/open.rs). Result: describe_schema reports transcript: 0 entities, sessions carry zero IN_SESSION edges, and the whole transcript_provenance eval class is structurally zeroed. The hybrid BM25 lane still surfaces transcript docs (hybrid_entity_id synthesizes transcript: refs), so the hole is specifically the edge/vertex layer.",
+  "missing_primitive": "Query-time IN_SESSION synthesis for transcript refs (forward direction is purely derivable from the ref; no materialization needed), plus a tantivy-backed transcript count for describe_schema",
+  "fallback_used": "None; discovered while root-causing the six permanently-zero transcript eval manifests (4 of 5 referenced sessions additionally purged from the corpus)",
+  "evidence": [
+    "src/server/open.rs:458",
+    "src/server/store_helpers.rs:41",
+    "crates/bbox-edge-index/src/edge_index.rs:522",
+    "commit ffd9027e",
+    "thread-21b42125"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "ontology/agentic-corpus/transcript-projection-never-runs",
+  "resolution": "unresolved",
+  "thread_id": "thread-21b42125",
+  "created_at": "2026-07-11T20:13:30Z",
+  "updated_at": "2026-07-11T20:13:30Z"
+}
