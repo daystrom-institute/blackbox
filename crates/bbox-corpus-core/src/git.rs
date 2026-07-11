@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -532,24 +533,56 @@ pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
     Ok(commits)
 }
 
+/// Hard ceiling on any git child spawned through this module's output
+/// helpers. Session cwds can point into dead automounts (autofs NFS lanes):
+/// an unbounded `Command::output()` there polls forever and wedges whatever
+/// thread spawned it - observed live 2026-07-11, where
+/// `git rev-parse --git-common-dir` against a torn-down NFS lane hung 20+
+/// minutes at zero CPU inside the IndexWriterActor's reindex pass, stalling
+/// all indexing until the child was killed by hand. 10s is generous for
+/// every metadata/log invocation these helpers make against healthy repos.
+const GIT_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<Output> {
-    match Command::new("git").arg("-C").arg(path).args(args).output() {
-        Ok(output) => Some(output),
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                action,
-                "failed to execute git"
-            );
-            None
-        }
-    }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(path).args(args);
+    run_git_bounded(cmd, path, action)
 }
 
 fn git_output_strings(path: &Path, args: &[String], action: &'static str) -> Option<Output> {
-    match Command::new("git").arg("-C").arg(path).args(args).output() {
-        Ok(output) => Some(output),
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(path).args(args);
+    run_git_bounded(cmd, path, action)
+}
+
+/// `Command::output()` with a kill-on-timeout deadline. Stdout/stderr drain
+/// on detached threads so a chatty child (git log) can never deadlock the
+/// poll loop on a full pipe. On the timeout path the child is killed and
+/// the drain threads are deliberately NOT joined: a child stuck in
+/// uninterruptible NFS sleep may never be reapable, and a bounded zombie or
+/// leaked drain thread is strictly better than re-wedging the caller the
+/// timeout exists to protect.
+// Blocking spawn/sleep on caller threads that already do git subprocess
+// I/O (writer actor passes, resolver memo fills) - never a tokio worker
+// hot path; the deadline is the point of this helper.
+fn run_git_bounded(cmd: Command, path: &Path, action: &'static str) -> Option<Output> {
+    run_bounded_with_timeout(cmd, path, action, GIT_OUTPUT_TIMEOUT)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn run_bounded_with_timeout(
+    mut cmd: Command,
+    path: &Path,
+    action: &'static str,
+    timeout: Duration,
+) -> Option<Output> {
+    use std::io::Read;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -557,7 +590,69 @@ fn git_output_strings(path: &Path, args: &[String], action: &'static str) -> Opt
                 action,
                 "failed to execute git"
             );
-            None
+            return None;
+        }
+    };
+    let mut stdout_pipe = child.stdout.take()?;
+    let mut stderr_pipe = child.stderr.take()?;
+    let stdout_drain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_drain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_drain.join().unwrap_or_default();
+                let stderr = stderr_drain.join().unwrap_or_default();
+                return Some(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    // Bounded reap attempt only: a D-state NFS child can be
+                    // unkillable, and an indefinite wait() here would
+                    // reintroduce the hang. try_wait polls for up to 2s,
+                    // then the zombie (if any) is abandoned.
+                    let reap_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while std::time::Instant::now() < reap_deadline {
+                        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        action,
+                        timeout_secs = timeout.as_secs(),
+                        "git timed out and was killed (dead mount or hung child); treating as failure"
+                    );
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    action,
+                    "failed to wait on git"
+                );
+                return None;
+            }
         }
     }
 }
@@ -566,6 +661,38 @@ fn git_output_strings(path: &Path, args: &[String], action: &'static str) -> Opt
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn run_bounded_kills_hung_child_at_the_deadline() {
+        // gap context: session cwds can point into dead NFS automounts,
+        // where a spawned git polls forever and wedges the writer actor.
+        // The bounded runner must kill and return None instead of hanging.
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let out = run_bounded_with_timeout(
+            cmd,
+            Path::new("/tmp"),
+            "test-hang",
+            Duration::from_millis(300),
+        );
+        assert!(out.is_none(), "hung child must yield None");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must return promptly after the deadline, not wait for the child"
+        );
+    }
+
+    #[test]
+    fn run_bounded_returns_full_output_for_fast_child() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("bounded-ok");
+        let out =
+            run_bounded_with_timeout(cmd, Path::new("/tmp"), "test-fast", Duration::from_secs(10))
+                .expect("fast child must succeed");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bounded-ok");
+    }
 
     #[test]
     fn parse_commit_log_handles_messages_and_parents() {

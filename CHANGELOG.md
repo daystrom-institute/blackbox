@@ -10,6 +10,14 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Git subprocesses spawned by the corpus resolvers (`git_output` /
+  `git_output_strings`, e.g. session-cwd base-project resolution during
+  reindex) now run under a 10s kill-on-timeout deadline. A transcript
+  session whose cwd points into a dead autofs/NFS automount previously
+  hung `git rev-parse` forever inside the IndexWriterActor, wedging all
+  indexing until the child was killed by hand (observed live against a
+  torn-down NFS lane). Timed-out children are killed with a bounded reap
+  so an unkillable D-state child can never re-wedge the caller.
 - `bbox_hybrid_search` doc_type filtering no longer collapses to zero
   results at small limits: the type filter ran only after RRF fusion,
   whose candidate pool (capped at `fetch`) filled with off-type vector
