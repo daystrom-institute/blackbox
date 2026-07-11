@@ -813,10 +813,13 @@ fn score_candidate(
         // lane model, else the provider's default model. gpt-5.6 Sol/Terra
         // expose `ultra` while Luna does not, so gating on the flat provider
         // effort list would wrongly admit `ultra`+Luna.
-        let effective_model = lane
-            .model
-            .as_deref()
-            .or_else(|| lane.provider.models().iter().find(|m| m.default).map(|m| m.id));
+        let effective_model = lane.model.as_deref().or_else(|| {
+            lane.provider
+                .models()
+                .iter()
+                .find(|m| m.default)
+                .map(|m| m.id)
+        });
         let valid = match effective_model {
             Some(model) => lane.provider.model_efforts(model),
             None => lane.provider.efforts().iter().map(|e| e.id).collect(),

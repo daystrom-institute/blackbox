@@ -716,7 +716,10 @@ fn roster_shift_tab_cycles_next_provider() {
     );
     assert_eq!(
         app.next_effort.as_deref(),
-        default_effort_for_model(Provider::VibeBh, default_model_for(Provider::VibeBh).unwrap())
+        default_effort_for_model(
+            Provider::VibeBh,
+            default_model_for(Provider::VibeBh).unwrap()
+        )
     );
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
@@ -757,7 +760,10 @@ fn standalone_pre_prompt_shift_tab_cycles_next_provider() {
     );
     assert_eq!(
         app.next_effort.as_deref(),
-        default_effort_for_model(Provider::VibeBh, default_model_for(Provider::VibeBh).unwrap())
+        default_effort_for_model(
+            Provider::VibeBh,
+            default_model_for(Provider::VibeBh).unwrap()
+        )
     );
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
