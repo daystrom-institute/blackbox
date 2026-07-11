@@ -284,10 +284,14 @@ impl Default for BaseInstructions {
 /// clone.
 pub fn base_instructions_for(model: &str) -> BaseInstructions {
     let slug = normalize_model_slug(model);
-    if slug == "gpt-5.5" {
-        BaseInstructions::new(BASE_INSTRUCTIONS_GPT_5_5)
-    } else if is_gpt_5_codex_family(&slug) {
+    if is_gpt_5_codex_family(&slug) {
         BaseInstructions::new(BASE_INSTRUCTIONS_GPT_5_CODEX)
+    } else if slug == "gpt-5.5" || slug.starts_with("gpt-5.6") {
+        // gpt-5.6 (Sol/Terra/Luna) are general GPT-5-family agentic models, not
+        // `-codex` flavored. We can't vendor their proprietary base prose, so
+        // route them to the general GPT-5.5 family template — the closest
+        // vendored base — rather than the generic unknown-model fallback.
+        BaseInstructions::new(BASE_INSTRUCTIONS_GPT_5_5)
     } else {
         BaseInstructions::default()
     }

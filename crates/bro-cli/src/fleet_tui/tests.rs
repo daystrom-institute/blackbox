@@ -667,8 +667,17 @@ fn fleet_defaults_to_brodex_high_effort() {
         FLEET_PROVIDERS[default_fleet_provider_cursor()],
         Provider::Brodex
     );
-    assert_eq!(default_effort_for(Provider::Brodex), Some("high"));
-    assert_eq!(default_effort_for(Provider::Glm), Some("high"));
+    assert_eq!(
+        default_effort_for_model(
+            Provider::Brodex,
+            default_model_for(Provider::Brodex).unwrap()
+        ),
+        Some("high")
+    );
+    assert_eq!(
+        default_effort_for_model(Provider::Glm, default_model_for(Provider::Glm).unwrap()),
+        Some("high")
+    );
 }
 
 #[test]
@@ -707,7 +716,7 @@ fn roster_shift_tab_cycles_next_provider() {
     );
     assert_eq!(
         app.next_effort.as_deref(),
-        default_effort_for(Provider::VibeBh)
+        default_effort_for_model(Provider::VibeBh, default_model_for(Provider::VibeBh).unwrap())
     );
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
@@ -748,7 +757,7 @@ fn standalone_pre_prompt_shift_tab_cycles_next_provider() {
     );
     assert_eq!(
         app.next_effort.as_deref(),
-        default_effort_for(Provider::VibeBh)
+        default_effort_for_model(Provider::VibeBh, default_model_for(Provider::VibeBh).unwrap())
     );
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
@@ -924,7 +933,10 @@ fn selector_enter_commits_from_each_depth() {
     assert_eq!(app.zone, Zone::Roster);
     assert_eq!(app.next_provider, provider);
     assert_eq!(app.next_model.as_deref(), default_model_for(provider));
-    assert_eq!(app.next_effort.as_deref(), default_effort_for(provider));
+    assert_eq!(
+        app.next_effort.as_deref(),
+        default_effort_for_model(provider, default_model_for(provider).unwrap_or(""))
+    );
 
     // Space from ModelSelector: commits provider + model, takes default effort
     let model_idx = (provider.models().len() > 1) as usize;
@@ -941,11 +953,18 @@ fn selector_enter_commits_from_each_depth() {
     assert_eq!(app.zone, Zone::Roster);
     assert_eq!(app.next_provider, provider);
     assert_eq!(app.next_model.as_deref(), Some(selected_model));
-    assert_eq!(app.next_effort.as_deref(), default_effort_for(provider));
+    assert_eq!(
+        app.next_effort.as_deref(),
+        default_effort_for_model(provider, selected_model)
+    );
 
-    // Enter from EffortSelector: commits full provider + model + effort
-    let effort_idx = provider.efforts().len().saturating_sub(1);
-    let selected_effort = provider.efforts().get(effort_idx).map(|e| e.id);
+    // Enter from EffortSelector: commits full provider + model + effort. The
+    // effort list here MUST be scoped to `selected_model` — this is the
+    // load-bearing invariant: the rendered list, the cursor wrap length, and
+    // this commit's indexing all reference the same model-scoped set.
+    let model_efforts = provider.model_effort_infos(selected_model);
+    let effort_idx = model_efforts.len().saturating_sub(1);
+    let selected_effort = model_efforts.get(effort_idx).map(|e| e.id);
     app.zone = Zone::EffortSelector;
     app.provider_cursor = provider_idx;
     app.model_cursor = model_idx;

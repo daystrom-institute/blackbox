@@ -114,7 +114,8 @@ impl Provider {
     /// flag) — when that becomes a real distinction (e.g. only
     /// Opus 4.7 has true 1M context vs. 4.6's [1m] variant), promote
     /// `LongContext` to be model-keyed and update this method's signature
-    /// to take a model id.
+    /// to take a model id. (Effort validity *is* already model-keyed — see
+    /// [`Provider::model_efforts`].)
     pub fn capabilities(&self) -> std::collections::HashSet<Capability> {
         use Capability::*;
         let v: &[Capability] = match self {
@@ -170,8 +171,56 @@ impl Provider {
         models_for(*self)
     }
 
+    /// The provider-wide effort catalog: every effort id any of this
+    /// provider's models may support, carrying the human-facing descriptions.
+    /// This is the *union*, not a per-model validity list — use
+    /// [`Provider::model_efforts`] / [`Provider::model_effort_infos`] to get the
+    /// set valid for a specific model (e.g. gpt-5.6 Sol/Terra expose `ultra`
+    /// while Luna does not, and pre-5.6 codex models expose neither `max` nor
+    /// `ultra`).
     pub fn efforts(&self) -> &'static [EffortInfo] {
         efforts_for(*self)
+    }
+
+    /// Effort ids valid for a specific model of this provider. Uses the model's
+    /// declared override ([`ModelInfo::efforts`]) when non-empty, else the
+    /// provider-wide effort set. Unknown model ids fall back to the
+    /// provider-wide set (fail open — the allocator validates the model id
+    /// separately).
+    pub fn model_efforts(&self, model_id: &str) -> Vec<&'static str> {
+        if let Some(mi) = self.models().iter().find(|m| m.id == model_id) {
+            if !mi.efforts.is_empty() {
+                return mi.efforts.to_vec();
+            }
+        }
+        self.efforts().iter().map(|e| e.id).collect()
+    }
+
+    /// `EffortInfo` descriptions filtered to a specific model's valid effort
+    /// set, preserving the provider-wide description ordering. For selector
+    /// rendering (fleet cockpit) and roster enrichment.
+    pub fn model_effort_infos(&self, model_id: &str) -> Vec<&'static EffortInfo> {
+        let ids = self.model_efforts(model_id);
+        self.efforts()
+            .iter()
+            .filter(|e| ids.iter().any(|id| *id == e.id))
+            .collect()
+    }
+
+    /// Default effort for a specific model: the model's declared
+    /// [`ModelInfo::default_effort`], else the provider effort flagged
+    /// `default`, else the first provider effort.
+    pub fn model_default_effort(&self, model_id: &str) -> Option<&'static str> {
+        if let Some(mi) = self.models().iter().find(|m| m.id == model_id) {
+            if let Some(d) = mi.default_effort {
+                return Some(d);
+            }
+        }
+        self.efforts()
+            .iter()
+            .find(|e| e.default)
+            .or_else(|| self.efforts().first())
+            .map(|e| e.id)
     }
 
     pub fn prompt_cache(&self) -> PromptCacheCapability {
@@ -189,11 +238,27 @@ impl std::fmt::Display for Provider {
 // Model/Effort catalog (pure static data)
 // ---------------------------------------------------------------------------
 
+/// serde predicate: skip serializing an empty static effort override so the
+/// (common) inherit-from-provider case adds no noise to roster JSON.
+fn effort_slice_is_empty(s: &&'static [&'static str]) -> bool {
+    s.is_empty()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInfo {
     pub id: &'static str,
     pub description: &'static str,
     pub default: bool,
+    /// Effort ids valid for THIS model, overriding the provider-wide effort
+    /// list. Empty ⇒ inherit the provider's [`Provider::efforts`]. This is the
+    /// model-keyed effort control: gpt-5.6 Sol/Terra expose `ultra`, Luna
+    /// exposes `max` but not `ultra`, and pre-5.6 codex models expose neither.
+    #[serde(default, skip_serializing_if = "effort_slice_is_empty")]
+    pub efforts: &'static [&'static str],
+    /// This model's default effort id. `None` ⇒ fall back to the provider
+    /// effort flagged `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,71 +353,99 @@ static GLM_MODELS: &[ModelInfo] = &[
         id: "glm-5.2",
         description: "Z.AI Coding Plan flagship GLM model via Claude Code",
         default: true,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-5.1",
         description: "Prior flagship GLM model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-5",
         description: "General-purpose frontier GLM model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-5-turbo",
         description: "Fast high-end GLM model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.7",
         description: "Strong balanced GLM model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.7-flashx",
         description: "Cheap accelerated GLM-4.7 variant via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.6",
         description: "Previous balanced GLM model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.5",
         description: "Balanced GLM-4.5 model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.5-air",
         description: "Low-cost helper model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.5v",
         description: "Vision-capable GLM-4.5 model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.6v",
         description: "Vision-capable GLM-4.6 model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.7-flash",
         description: "Free GLM-4.7 flash model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-4.5-flash",
         description: "Free GLM flash model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "glm-5v-turbo",
         description: "Vision-capable GLM model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
 ];
 
@@ -361,21 +454,29 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
         id: "deepseek-v4-pro",
         description: "DeepSeek 4.1 Pro / V4 Pro reasoning model via Claude Code",
         default: true,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "deepseek-v4-flash",
         description: "Fast DeepSeek V4 model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "deepseek-reasoner",
         description: "DeepSeek reasoning model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "deepseek-chat",
         description: "DeepSeek chat model via Claude Code",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
 ];
 
@@ -383,61 +484,122 @@ static MINIMAX_MODELS: &[ModelInfo] = &[ModelInfo {
     id: "MiniMax-M3",
     description: "MiniMax M3 via Anthropic-compatible bro-harness transport",
     default: true,
+    efforts: &[],
+    default_effort: None,
 }];
+
+// Codex/Brodex model efforts are model-keyed (live-probed from codex CLI
+// 0.144.1 `~/.codex/models_cache.json`). The GPT-5.6 generation ships three
+// sibling tier variants — Sol (frontier), Terra (balanced), Luna (fast) —
+// distinguished purely by slug suffix, and introduces two new reasoning levels:
+//   - `max`   ("Maximum reasoning depth for the hardest problems")
+//   - `ultra` ("Maximum reasoning with automatic task delegation")
+// `ultra` is exposed by Sol/Terra but NOT Luna, and neither is exposed by the
+// pre-5.6 models. That per-model divergence is why effort validity is keyed on
+// `ModelInfo::efforts` rather than the flat provider list. Pre-5.6 models keep
+// the established `{minimal,low,medium,high,xhigh}` set (non-regressing).
+const CODEX_PRE_56_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+const CODEX_56_SOL_TERRA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const CODEX_56_LUNA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 static CODEX_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "gpt-5.5",
-        description: "Latest frontier agentic coding model (subsumes codex flavor)",
+        id: "gpt-5.6-sol",
+        description: "GPT-5.6 Sol: latest frontier agentic coding model (Sol/Terra/Luna tier: frontier)",
         default: true,
+        efforts: CODEX_56_SOL_TERRA_EFFORTS,
+        default_effort: Some("medium"),
+    },
+    ModelInfo {
+        id: "gpt-5.6-terra",
+        description: "GPT-5.6 Terra: balanced agentic coding model for everyday work (tier: balanced)",
+        default: false,
+        efforts: CODEX_56_SOL_TERRA_EFFORTS,
+        default_effort: Some("medium"),
+    },
+    ModelInfo {
+        id: "gpt-5.6-luna",
+        description: "GPT-5.6 Luna: fast and affordable agentic coding model (tier: fast; no `ultra`)",
+        default: false,
+        efforts: CODEX_56_LUNA_EFFORTS,
+        default_effort: Some("medium"),
+    },
+    ModelInfo {
+        id: "gpt-5.5",
+        description: "Prior frontier agentic coding model (subsumes codex flavor)",
+        default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.5-mini",
         description: "Smaller 5.5-family model (API-direct only; not available on ChatGPT account)",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.4",
         description: "Prior-generation frontier agentic coding model (subsumes codex flavor)",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.4-mini",
         description: "Smaller 5.4-family model",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.3-codex",
         description: "Frontier Codex-optimized agentic coding model",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.3-codex-spark",
         description: "Ultra-fast coding model",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("high"),
     },
     ModelInfo {
         id: "gpt-5.2-codex",
         description: "Frontier agentic coding model",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.2",
         description: "Optimized for professional work and long-running agents",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.1-codex-max",
         description: "Deep and fast reasoning, xhigh effort",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
     ModelInfo {
         id: "gpt-5.1-codex-mini",
         description: "Cheaper, faster, less capable",
         default: false,
+        efforts: CODEX_PRE_56_EFFORTS,
+        default_effort: Some("medium"),
     },
 ];
 
+// Provider-wide union of every effort id any codex model may support — the
+// description source for `Provider::efforts()` and the fallback for models
+// without a specific override. Per-model validity is enforced via
+// `ModelInfo::efforts` (see `CODEX_*_EFFORTS` above).
 static CODEX_EFFORTS: &[EffortInfo] = &[
     EffortInfo {
         id: "minimal",
@@ -461,7 +623,17 @@ static CODEX_EFFORTS: &[EffortInfo] = &[
     },
     EffortInfo {
         id: "xhigh",
-        description: "Maximum depth (gpt-5.4 / gpt-5.5 / gpt-5.1-codex-max / gpt-5.2-codex)",
+        description: "Extra high reasoning depth (gpt-5.4 / gpt-5.5 / gpt-5.1-codex-max / gpt-5.2-codex)",
+        default: false,
+    },
+    EffortInfo {
+        id: "max",
+        description: "Maximum reasoning depth for the hardest problems (gpt-5.6)",
+        default: false,
+    },
+    EffortInfo {
+        id: "ultra",
+        description: "Maximum reasoning with automatic task delegation (gpt-5.6 Sol/Terra)",
         default: false,
     },
 ];
@@ -474,26 +646,36 @@ static VIBEBH_MODELS: &[ModelInfo] = &[
         id: "mistral-medium-3.5",
         description: "Mistral Medium 3.5, reasoning-capable flagship via bro-harness",
         default: true,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "mistral-vibe-cli-latest",
         description: "Mistral vibe-CLI-tuned model via bro-harness",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "magistral-medium-latest",
         description: "Magistral Medium, dedicated reasoning model via bro-harness",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "devstral-medium-latest",
         description: "Devstral Medium, coding-tuned model via bro-harness",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
     ModelInfo {
         id: "devstral-small-latest",
         description: "Devstral Small, fast low-cost coding model via bro-harness",
         default: false,
+        efforts: &[],
+        default_effort: None,
     },
 ];
 
@@ -537,5 +719,52 @@ mod tests {
             Provider::VibeBh.prompt_cache(),
             PromptCacheCapability::ChatCompletionsPromptCacheKey
         );
+    }
+
+    #[test]
+    fn gpt_56_variants_are_catalogued_with_keyed_efforts() {
+        let models = Provider::Brodex.models();
+        // Sol is the default codex model.
+        let default_model = models.iter().find(|m| m.default).unwrap();
+        assert_eq!(default_model.id, "gpt-5.6-sol");
+        for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(
+                models.iter().any(|m| m.id == slug),
+                "missing gpt-5.6 variant {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn ultra_is_model_keyed_sol_terra_yes_luna_no() {
+        let p = Provider::Brodex;
+        assert!(p.model_efforts("gpt-5.6-sol").contains(&"ultra"));
+        assert!(p.model_efforts("gpt-5.6-terra").contains(&"ultra"));
+        // Luna supports `max` but not `ultra`.
+        assert!(p.model_efforts("gpt-5.6-luna").contains(&"max"));
+        assert!(!p.model_efforts("gpt-5.6-luna").contains(&"ultra"));
+        // Pre-5.6 models expose neither.
+        assert!(!p.model_efforts("gpt-5.5").contains(&"max"));
+        assert!(!p.model_efforts("gpt-5.5").contains(&"ultra"));
+    }
+
+    #[test]
+    fn model_effort_infos_filters_to_model_and_default_resolves() {
+        let p = Provider::Brodex;
+        let luna = p.model_effort_infos("gpt-5.6-luna");
+        assert!(luna.iter().any(|e| e.id == "max"));
+        assert!(!luna.iter().any(|e| e.id == "ultra"));
+        assert_eq!(p.model_default_effort("gpt-5.6-sol"), Some("medium"));
+        assert_eq!(p.model_default_effort("gpt-5.3-codex-spark"), Some("high"));
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_provider_wide_efforts() {
+        let p = Provider::Brodex;
+        let wide: Vec<&str> = p.efforts().iter().map(|e| e.id).collect();
+        assert_eq!(p.model_efforts("gpt-does-not-exist"), wide);
+        // Providers with uniform efforts inherit for every model.
+        let glm_wide: Vec<&str> = Provider::Glm.efforts().iter().map(|e| e.id).collect();
+        assert_eq!(Provider::Glm.model_efforts("glm-5.2"), glm_wide);
     }
 }

@@ -717,9 +717,12 @@ pub(super) fn render_responses_transcript(items: &[Value], tool_cap: usize) -> S
 }
 
 /// Map an effort token onto codex's `ReasoningEffort` range
-/// (`none/minimal/low/medium/high/xhigh`). `max` stays conservative at `high`
-/// (universally supported); callers wanting `xhigh` (newer, model-specific)
-/// pass it explicitly.
+/// (`none/minimal/low/medium/high/xhigh/max/ultra`). GPT-5.6 introduced real
+/// `max` and `ultra` reasoning levels (Sol/Terra expose `ultra`; Luna exposes
+/// `max`), so they pass through verbatim rather than collapsing to `high`. The
+/// daemon allocator gate ([`Provider::model_efforts`]) ensures `max`/`ultra`
+/// only reach models that accept them; an unrecognized token falls back to
+/// `medium`.
 pub(super) fn normalize_effort(e: &str) -> &'static str {
     match e.trim().to_ascii_lowercase().as_str() {
         "none" => "none",
@@ -728,7 +731,8 @@ pub(super) fn normalize_effort(e: &str) -> &'static str {
         "medium" | "med" => "medium",
         "high" => "high",
         "xhigh" | "x-high" | "extra-high" => "xhigh",
-        "max" => "high",
+        "max" => "max",
+        "ultra" => "ultra",
         _ => "medium",
     }
 }
@@ -1378,7 +1382,9 @@ mod tests {
     #[test]
     fn pure_helpers() {
         assert_eq!(normalize_effort("minimal"), "minimal");
-        assert_eq!(normalize_effort("max"), "high");
+        // gpt-5.6 max/ultra pass through verbatim (no longer collapsed to high).
+        assert_eq!(normalize_effort("max"), "max");
+        assert_eq!(normalize_effort("ultra"), "ultra");
         assert_eq!(normalize_effort("xhigh"), "xhigh");
         assert_eq!(normalize_effort("bogus"), "medium");
         assert!(model_supports_reasoning("gpt-5-codex"));

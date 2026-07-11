@@ -610,9 +610,9 @@ pub(super) fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
         let effort = if *p == app.next_provider {
             app.next_effort
                 .as_deref()
-                .or_else(|| default_effort_for(*p))
+                .or_else(|| default_effort_for_model(*p, model))
         } else {
-            default_effort_for(*p)
+            default_effort_for_model(*p, model)
         };
         lines.push(Line::from(vec![
             Span::raw(marker),
@@ -685,7 +685,7 @@ pub(super) fn draw_effort_selector(f: &mut Frame, area: Rect, app: &App) {
     let provider = FLEET_PROVIDERS[app.provider_cursor];
     let models = provider.models();
     let model_id = models.get(app.model_cursor).map(|m| m.id).unwrap_or("—");
-    let efforts = provider.efforts();
+    let efforts = provider.model_effort_infos(model_id);
     let title = format!(" effort · {} · {} ", provider.as_str(), model_id);
     let block = Block::default()
         .borders(Borders::RIGHT | Borders::TOP)

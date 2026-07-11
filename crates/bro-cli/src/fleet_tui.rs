@@ -614,8 +614,13 @@ impl App {
             .iter()
             .position(|m| m.default)
             .unwrap_or(0);
+        let default_model_id = default_provider
+            .models()
+            .get(model_cursor)
+            .map(|m| m.id)
+            .unwrap_or("");
         let effort_cursor = default_provider
-            .efforts()
+            .model_effort_infos(default_model_id)
             .iter()
             .position(|e| e.default)
             .unwrap_or(0);
@@ -639,7 +644,8 @@ impl App {
             selector_visited_effort: false,
             next_provider: default_provider,
             next_model: default_model_for(default_provider).map(str::to_string),
-            next_effort: default_effort_for(default_provider).map(str::to_string),
+            next_effort: default_effort_for_model(default_provider, default_model_id)
+                .map(str::to_string),
             fast_mode: false,
             provider_flash_until: None,
             slash_cursor: 0,
@@ -1521,14 +1527,20 @@ fn default_model_for(provider: Provider) -> Option<&'static str> {
         .map(|m| m.id)
 }
 
-fn default_effort_for(provider: Provider) -> Option<&'static str> {
+/// Default effort for a specific model of `provider`: `high` when that model
+/// supports it, else the model's declared default effort, else the model's
+/// first valid effort. Model-keyed because effort validity is model-keyed
+/// (gpt-5.6 Sol/Terra expose `ultra`, Luna does not; pre-5.6 codex models
+/// expose neither `max` nor `ultra`) — pass `""` when no model is resolvable
+/// to fall back to the provider-wide set.
+fn default_effort_for_model(provider: Provider, model_id: &str) -> Option<&'static str> {
+    let ids = provider.model_efforts(model_id);
+    if ids.contains(&"high") {
+        return Some("high");
+    }
     provider
-        .efforts()
-        .iter()
-        .find(|e| e.id == "high")
-        .or_else(|| provider.efforts().iter().find(|e| e.default))
-        .or_else(|| provider.efforts().first())
-        .map(|e| e.id)
+        .model_default_effort(model_id)
+        .or_else(|| ids.first().copied())
 }
 
 fn default_fleet_provider_cursor() -> usize {
@@ -1540,8 +1552,9 @@ fn default_fleet_provider_cursor() -> usize {
 
 fn set_next_provider(app: &mut App, provider: Provider) {
     app.next_provider = provider;
-    app.next_model = default_model_for(provider).map(str::to_string);
-    app.next_effort = default_effort_for(provider).map(str::to_string);
+    let model = default_model_for(provider);
+    app.next_model = model.map(str::to_string);
+    app.next_effort = default_effort_for_model(provider, model.unwrap_or("")).map(str::to_string);
 }
 
 fn cycle_roster_tab(app: &mut App) {
@@ -2832,7 +2845,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     }
                 }
                 Zone::EffortSelector => {
-                    let efforts = FLEET_PROVIDERS[app.provider_cursor].efforts();
+                    let provider = FLEET_PROVIDERS[app.provider_cursor];
+                    let model_id = provider
+                        .models()
+                        .get(app.model_cursor)
+                        .map(|m| m.id)
+                        .unwrap_or("");
+                    let efforts = provider.model_effort_infos(model_id);
                     let n = efforts.len();
                     if n > 0 {
                         app.effort_cursor = (app.effort_cursor + 1) % n;
@@ -4184,7 +4203,14 @@ fn select_effort(app: &mut App, arg: &str) {
             .unwrap_or(app.next_provider),
         _ => app.next_provider,
     };
-    let values: Vec<&'static str> = provider.efforts().iter().map(|e| e.id).collect();
+    let model_id: String = match app.zone {
+        Zone::SingleAgent => app
+            .selected_agent()
+            .and_then(|idx| app.agents[idx].selected_model.clone())
+            .unwrap_or_default(),
+        _ => app.next_model.clone().unwrap_or_default(),
+    };
+    let values: Vec<&'static str> = provider.model_efforts(&model_id);
     let mut current = match app.zone {
         Zone::SingleAgent => app
             .selected_agent()
@@ -4665,10 +4691,17 @@ fn sync_model_cursor(app: &mut App) {
     }
 }
 
-/// Sync `effort_cursor` to match `next_effort` within the selected provider's catalog.
+/// Sync `effort_cursor` to match `next_effort` within the selected provider's
+/// catalog, scoped to the model at `model_cursor` (the same model the effort
+/// selector renders and `commit_full_selection` indexes against).
 fn sync_effort_cursor(app: &mut App) {
     let provider = FLEET_PROVIDERS[app.provider_cursor];
-    let efforts = provider.efforts();
+    let model_id = provider
+        .models()
+        .get(app.model_cursor)
+        .map(|m| m.id)
+        .unwrap_or("");
+    let efforts = provider.model_effort_infos(model_id);
     if let Some(idx) = app
         .next_effort
         .as_deref()
@@ -4745,7 +4778,8 @@ fn commit_model_without_flash(app: &mut App) {
         .get(app.model_cursor)
         .map(|m| m.id.to_string())
         .or_else(|| default_model_for(provider).map(str::to_string));
-    app.next_effort = default_effort_for(provider).map(str::to_string);
+    let model_id = app.next_model.as_deref().unwrap_or("");
+    app.next_effort = default_effort_for_model(provider, model_id).map(str::to_string);
 }
 
 /// Commit the full provider + model + effort selection and flash.
@@ -4759,12 +4793,13 @@ fn commit_full_selection(app: &mut App) {
     } else {
         app.next_model = default_model_for(provider).map(str::to_string);
     }
+    let model_id = app.next_model.as_deref().unwrap_or("");
 
-    let efforts = provider.efforts();
+    let efforts = provider.model_effort_infos(model_id);
     if let Some(ei) = efforts.get(app.effort_cursor) {
         app.next_effort = Some(ei.id.to_string());
     } else {
-        app.next_effort = default_effort_for(provider).map(str::to_string);
+        app.next_effort = default_effort_for_model(provider, model_id).map(str::to_string);
     }
 
     app.flash_provider();
@@ -4773,7 +4808,13 @@ fn commit_full_selection(app: &mut App) {
 fn vertical(app: &mut App, delta: isize) {
     match app.zone {
         Zone::EffortSelector => {
-            let efforts = FLEET_PROVIDERS[app.provider_cursor].efforts();
+            let provider = FLEET_PROVIDERS[app.provider_cursor];
+            let model_id = provider
+                .models()
+                .get(app.model_cursor)
+                .map(|m| m.id)
+                .unwrap_or("");
+            let efforts = provider.model_effort_infos(model_id);
             let n = efforts.len() as isize;
             if n == 0 {
                 return;
@@ -5219,7 +5260,7 @@ fn provider_tuple(a: &Agent, v: &AgentView) -> String {
     let mut tuple = match a
         .selected_effort
         .as_deref()
-        .or_else(|| default_effort_for(a.provider))
+        .or_else(|| default_effort_for_model(a.provider, &model))
     {
         Some(effort) => format!("{} {model} {effort}", a.provider),
         None => format!("{} {model}", a.provider),
@@ -5287,7 +5328,7 @@ fn next_tuple(app: &App) -> String {
     let mut tuple = match app
         .next_effort
         .as_deref()
-        .or_else(|| default_effort_for(app.next_provider))
+        .or_else(|| default_effort_for_model(app.next_provider, model))
     {
         Some(effort) => format!("{} {model} {effort}", app.next_provider),
         None => format!("{} {model}", app.next_provider),

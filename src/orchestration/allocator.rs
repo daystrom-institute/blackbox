@@ -809,8 +809,19 @@ fn score_candidate(
         }
     }
     if let Some(effort) = &lane.effort {
-        let efforts = lane.provider.efforts();
-        if efforts.is_empty() || !efforts.iter().any(|info| info.id == effort) {
+        // Effort validity is model-keyed: the effective model is the explicit
+        // lane model, else the provider's default model. gpt-5.6 Sol/Terra
+        // expose `ultra` while Luna does not, so gating on the flat provider
+        // effort list would wrongly admit `ultra`+Luna.
+        let effective_model = lane
+            .model
+            .as_deref()
+            .or_else(|| lane.provider.models().iter().find(|m| m.default).map(|m| m.id));
+        let valid = match effective_model {
+            Some(model) => lane.provider.model_efforts(model),
+            None => lane.provider.efforts().iter().map(|e| e.id).collect(),
+        };
+        if valid.is_empty() || !valid.iter().any(|id| *id == effort.as_str()) {
             candidate.exclusion_reason = Some("provider_disallows_effort".into());
             return candidate;
         }
@@ -1675,9 +1686,20 @@ mod tests {
                 let Some(effort) = entry.effort.as_deref() else {
                     continue;
                 };
+                // Effort validity is model-keyed: check the tier's mapped model
+                // (else the provider default) so a tier can't pair an effort
+                // with a model that doesn't support it (e.g. `ultra` + Luna).
+                let model = entry
+                    .model
+                    .as_deref()
+                    .or_else(|| provider.models().iter().find(|m| m.default).map(|m| m.id));
+                let valid = match model {
+                    Some(model) => provider.model_efforts(model),
+                    None => provider.efforts().iter().map(|e| e.id).collect(),
+                };
                 assert!(
-                    provider.efforts().iter().any(|info| info.id == effort),
-                    "{tier}.{provider} maps unknown effort `{effort}`"
+                    valid.iter().any(|id| *id == effort),
+                    "{tier}.{provider} maps effort `{effort}` unsupported by model {model:?}"
                 );
             }
         }
@@ -1967,6 +1989,71 @@ mod tests {
                     .is_some_and(|err| err.contains("no lane satisfied")),
                 "{:?}",
                 allocation.trace.error
+            );
+        });
+    }
+
+    #[test]
+    fn effort_gate_is_model_keyed_for_gpt_56_ultra() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            // gpt-5.6 Luna does not expose `ultra` — pinning it must fail closed
+            // through the model-keyed gate (allocator.rs `provider_disallows_effort`),
+            // even though `ultra` IS valid for Sol/Terra on the same provider.
+            let luna = allocate(
+                RuntimeRequest {
+                    pin: Some(RuntimePin {
+                        provider: Some(Provider::Brodex),
+                        model: Some("gpt-5.6-luna".into()),
+                        effort: Some("ultra".into()),
+                        authority: PinAuthority::Operator,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                luna.trace
+                    .candidates
+                    .iter()
+                    .any(|c| c.exclusion_reason.as_deref() == Some("provider_disallows_effort")),
+                "ultra+luna should be excluded: {:?}",
+                luna.trace.candidates
+            );
+
+            // The same effort on Sol is admitted — the gate must not reject it
+            // for effort reasons.
+            let sol = allocate(
+                RuntimeRequest {
+                    pin: Some(RuntimePin {
+                        provider: Some(Provider::Brodex),
+                        model: Some("gpt-5.6-sol".into()),
+                        effort: Some("ultra".into()),
+                        authority: PinAuthority::Operator,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !sol.trace
+                    .candidates
+                    .iter()
+                    .any(|c| c.exclusion_reason.as_deref() == Some("provider_disallows_effort")),
+                "ultra+sol must not be excluded for effort: {:?}",
+                sol.trace.candidates
             );
         });
     }
