@@ -1,7 +1,7 @@
 {
   "id": "a0178bb8",
-  "title": "macOS blackboxd/bro-harness redeploy (codesign + launchd reload)",
-  "content": "Replacing the installed blackboxd/bro-harness binary changes its code signature; `launchctl kickstart -k` alone fails with OS_REASON_CODESIGNING (the new cdhash violates launchd's cached LWCR). Full redeploy on this macOS host: `cp` new binary into ~/.local/bin -> `codesign -f -s - <binary>` (ad-hoc re-sign) -> `launchctl bootout gui/$(id -u)/com.daystrom.blackbox` -> `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daystrom.blackbox.plist` -> `launchctl kickstart -k gui/$(id -u)/com.daystrom.blackbox` -> verify port 7264 responds. Back up the prior binary to `.bak` first for rollback. Note KeepAlive{SuccessfulExit:false}: a clean exit 0 will NOT be auto-restarted. The daemon links bro-harness/bro-tools in-process, so rebuilding blackboxd captures library-crate changes; rebuild the standalone bro-harness bin too for consistency.",
+  "title": "macOS blackboxd/bro-harness redeploy (stablesign + launchd)",
+  "content": "Redeploy signing now uses the operator's stablesign helper (shell alias `stablesign`) instead of ad-hoc `codesign -f -s -`: it signs with a persistent self-signed codesigning identity from the login keychain, so the designated requirement is stable across binary swaps. Consequences: TCC privacy grants (notably network volumes - an invalidated grant makes daemon-spawned git/fs calls on automounts hang silently, wedging the IndexWriterActor) and launchd's cached LWCR both survive redeploys. Flow: back up prior binary to `.bak` -> cp new binary into ~/.local/bin -> `stablesign ~/.local/bin/blackboxd` -> `launchctl kickstart -k gui/$(id -u)/com.daystrom.blackbox` (bootout/bootstrap dance only as fallback if kickstart still refuses) -> verify port 7264 responds. If indexing goes quiet after any signing change, check System Settings for a pending TCC consent. Note KeepAlive{SuccessfulExit:false}: a clean exit 0 will NOT be auto-restarted. The daemon links bro-harness/bro-tools in-process, so rebuilding blackboxd captures library-crate changes; rebuild + stablesign the standalone bro-harness bin too for consistency.",
   "variants": {},
   "category": "tool",
   "scope": "project",
@@ -14,6 +14,6 @@
   "decay": true,
   "source": "user",
   "created_at": "2026-06-18T01:43:59Z",
-  "updated_at": "2026-06-18T01:43:59Z",
+  "updated_at": "2026-07-11T22:02:40Z",
   "recall_count": 0
 }
