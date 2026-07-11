@@ -42,9 +42,22 @@ Text-first pass **shipped 2026-07-11** (`crates/bbox-chunker/src/pdf.rs`):
 number carried in the position fields), `.pdf` admitted through the
 project-file walker with a magic-header claim, docs-bucket routing, and
 graceful degradation (encrypted/scanned/corrupt PDFs yield zero chunks and
-a warning, never a failed reindex pass). Deliberately deferred from that
-pass: `pdf_table` (pdf-extract's flat text discards layout; a text-only
-table detector would misfire), OCR shell-outs, `pdf_figure` + edges.
+a warning, never a failed reindex pass).
+
+OCR fallback **shipped 2026-07-11** (same file, `mod ocr`): pages with no
+extractable text rasterize through `pdftoppm` (poppler, 200 DPI grayscale)
+and recognize through `tesseract`, both as availability-gated shell-outs
+(silently disabled when either binary is off PATH; the text-first behavior
+is unchanged there). Budgeted per design: per-child kill-on-timeout (60s
+per rasterize batch of up to 10 contiguous pages, 30s per page
+recognition), a 300s per-document wall-clock budget, and a 100-page OCR
+cap. When text extraction fails wholesale (exotic encodings), OCR probes
+from page 1 and stops at the first batch that renders nothing. OCR-sourced
+chunks stay `pdf_page` (Docs bucket) and carry `symbol = "ocr"` as a
+queryable provenance marker. Validated against real scanned documents
+(single and multi-page, 1-3s per document). Still deferred: `pdf_table`
+(pdf-extract's flat text discards layout; a text-only table detector would
+misfire), `pdf_figure` + edges (visual sidecar path).
 
 Original scope:
 

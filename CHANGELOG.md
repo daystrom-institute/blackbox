@@ -30,6 +30,14 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- PDF OCR fallback (X-PDF, `agentic-corpus-multimodal-chunkers.md`): pages
+  with no extractable text now rasterize via `pdftoppm` and recognize via
+  `tesseract` when both are on PATH (availability-gated shell-outs; hosts
+  without them keep text-first behavior unchanged). Kill-on-timeout per
+  child, 300s per-document budget, 100-page cap; wholesale extraction
+  failures probe from page 1 and stop at the first empty batch. OCR-sourced
+  chunks stay `pdf_page` in the Docs bucket and carry `symbol = "ocr"` as a
+  provenance marker.
 - Embedding routing substrate (Layer 0 of
   `design/corpus/agentic-corpus/multimodal-embedding-routing.md`):
   `[embed.providers]` is now a typed alias map (`type = "voyage_text" |

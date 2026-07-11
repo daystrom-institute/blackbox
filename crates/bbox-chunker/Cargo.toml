@@ -19,6 +19,11 @@ anyhow = "1"
 # net-new dependency and the extraction API (extract_text_from_mem_by_pages)
 # is worth pinning close to what was validated.
 pdf-extract = "0.12"
+# Scratch dirs for the X-PDF OCR fallback shell-out (pdftoppm rasterize +
+# tesseract recognize): the indexed bytes are written to a temp .pdf and the
+# children render/recognize into the same auto-cleaned dir. Same "3" range
+# the rest of the workspace uses.
+tempfile = "3"
 # Spreadsheet extraction for the X-XLSX chunker (design/corpus/agentic-corpus/
 # agentic-corpus-multimodal-chunkers.md). Pinned to the current published
 # release (0.36.0, 2026-07-06). `open_workbook_auto_from_rs` auto-detects
