@@ -477,10 +477,18 @@ impl TranscriptIndex {
 
     fn hybrid_entity_id(&self, doc: &TantivyDocument) -> String {
         let explicit = self.doc_text(doc, self.fields.entity_id);
-        if !explicit.is_empty() {
+        let is_transcript = self.doc_text(doc, self.fields.doc_type) == "transcript";
+        // Transcript docs store a legacy unprefixed entity_id
+        // (`<provider>:<session>:<offset>:<idx>`, jsonl_entity_id in
+        // transcripts/types.rs) that is not a parseable EntityRef, so
+        // downstream tools (inspect, find_paths, bundle_evidence) and eval
+        // expected refs can never match it. Canonicalize transcript ids at
+        // read time from the doc fields instead of trusting the stored
+        // form; non-transcript docs keep their explicit id verbatim.
+        if !explicit.is_empty() && (!is_transcript || explicit.starts_with("transcript:")) {
             return explicit;
         }
-        if self.doc_text(doc, self.fields.doc_type) == "transcript" {
+        if is_transcript {
             let provider = self.doc_text(doc, self.fields.account);
             let session_id = self.doc_text(doc, self.fields.session_id);
             let line_offset = doc

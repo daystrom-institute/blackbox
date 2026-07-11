@@ -8,6 +8,22 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Fixed
+
+- `bbox_hybrid_search` doc_type filtering no longer collapses to zero
+  results at small limits: the type filter ran only after RRF fusion,
+  whose candidate pool (capped at `fetch`) filled with off-type vector
+  hits, so a filtered query could return nothing while dozens of on-type
+  BM25 matches existed (observed with `doc_type=transcript`, limit 3).
+  Ranked lanes are now scoped to the requested type before fusion, with
+  the post-fusion retain kept as backstop.
+- Hybrid search transcript hits now carry canonical, parseable
+  `transcript:<provider>:<session>:<offset>:<idx>` entity refs. Transcript
+  docs store a legacy unprefixed entity_id shape that EntityRef cannot
+  parse, so inspect/find_paths/bundle handoffs and eval expected refs
+  could never match a hybrid transcript hit; the id is now canonicalized
+  at read time from the doc fields (no reindex required).
+
 ### Changed
 
 - File tools no longer pretend to confine to the session worktree

@@ -834,6 +834,63 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_bm25_canonicalizes_legacy_transcript_entity_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+
+        // Transcript doc carrying the legacy UNPREFIXED entity_id shape
+        // (`<provider>:<session>:<offset>:<idx>`): the hit must come back
+        // with the canonical parseable `transcript:` ref synthesized from
+        // the doc fields, not the stored string.
+        let mut transcript = TantivyDocument::new();
+        transcript.add_text(fields.doc_type, "transcript");
+        transcript.add_text(fields.account, "claude");
+        transcript.add_text(fields.session_id, "sess-legacy");
+        transcript.add_u64(fields.byte_offset, 1234);
+        transcript.add_text(fields.content, "quantum flux capacitor alignment");
+        transcript.add_text(fields.entity_id, "claude:sess-legacy:1234:0");
+        writer.add_document(transcript).unwrap();
+
+        // Non-transcript doc: explicit entity_id passes through verbatim.
+        let mut chunk = TantivyDocument::new();
+        chunk.add_text(fields.doc_type, "project_file");
+        chunk.add_text(fields.file_path, "src/flux.rs");
+        chunk.add_text(fields.content, "quantum flux capacitor alignment");
+        chunk.add_text(fields.entity_id, "project_file:proj1234:aa:bb:0");
+        writer.add_document(chunk).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let hits = index
+            .hybrid_bm25_hits("quantum flux capacitor", 10, None)
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|hit| hit.entity_id.as_str()).collect();
+        assert!(
+            ids.contains(&"transcript:claude:sess-legacy:1234:0"),
+            "legacy transcript id must canonicalize: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"project_file:proj1234:aa:bb:0"),
+            "explicit non-transcript id must pass through: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"claude:sess-legacy:1234:0"),
+            "unprefixed transcript id must not leak through: {ids:?}"
+        );
+    }
+
+    #[test]
     fn for_each_edge_projection_doc_callback_error_propagates() {
         let dir = tempfile::tempdir().unwrap();
         let index = TranscriptIndex::open_or_create(

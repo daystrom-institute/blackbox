@@ -258,6 +258,9 @@ pub fn hybrid_search_typed(
         lists.extend(vector_lists);
     }
 
+    if let Some(doc_type) = p.doc_type.as_deref().filter(|value| !value.is_empty()) {
+        scope_lists_to_doc_type(&mut lists, doc_type);
+    }
     let fused = rrf::fuse_rrf(&lists, RRF_K, fetch);
     let mut loaded_properties = BTreeMap::new();
     enrich_fused_features(
@@ -388,6 +391,23 @@ pub fn hybrid_search_typed(
         vector_status,
         degraded,
     })
+}
+
+/// Pre-fusion doc_type scoping: the BM25 lane is already filtered at the
+/// tantivy query, but the vector lanes are not, so without this the fused
+/// pool (capped at `fetch`) fills with off-type vector hits and the
+/// post-fusion doc_type retain empties small-limit results entirely
+/// (observed live: doc_type=transcript at limit 3 returned 0 while 50+
+/// filtered BM25 matches existed; limit 20 returned 20). doc_type equals
+/// the entity-ref type prefix for every current doc_type value, so a
+/// prefix retain per lane is exact; original per-lane ranks are kept (RRF
+/// handles sparse ranks fine). The post-fusion doc_type retain stays as
+/// the authoritative backstop.
+fn scope_lists_to_doc_type(lists: &mut [RankedList], doc_type: &str) {
+    let prefix = format!("{doc_type}:");
+    for list in lists {
+        list.hits.retain(|hit| hit.entity_id.starts_with(&prefix));
+    }
 }
 
 /// Build response breadcrumbs naming the top-seed ref(s) and the next tools in
@@ -1129,6 +1149,48 @@ mod tests {
             score,
             sources: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn doc_type_scoping_drops_off_type_lane_hits_before_fusion() {
+        let ranked = |entity_id: &str, rank: usize| bbox_corpus_core::search::rrf::RankedHit {
+            entity_id: entity_id.into(),
+            rank,
+            score: 1.0,
+            source: "test".into(),
+        };
+        let mut lists = vec![
+            RankedList {
+                source: "bm25".into(),
+                weight: 0.4,
+                hits: vec![
+                    ranked("transcript:claude:sess-1:100:0", 1),
+                    ranked("transcript:claude:sess-1:200:0", 2),
+                ],
+            },
+            RankedList {
+                source: "vector:voyage-1024".into(),
+                weight: 0.6,
+                hits: vec![
+                    ranked("project_file:p:f:h:1", 1),
+                    ranked("knowledge:abc", 2),
+                    ranked("transcript:claude:sess-2:300:0", 3),
+                ],
+            },
+        ];
+        scope_lists_to_doc_type(&mut lists, "transcript");
+        assert_eq!(lists[0].hits.len(), 2, "on-type BM25 lane must survive");
+        assert_eq!(
+            lists[1]
+                .hits
+                .iter()
+                .map(|hit| hit.entity_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["transcript:claude:sess-2:300:0"],
+            "vector lane must keep only on-type hits"
+        );
+        // Original rank is preserved for surviving hits (RRF handles gaps).
+        assert_eq!(lists[1].hits[0].rank, 3);
     }
 
     #[test]
