@@ -14,6 +14,28 @@ use bbox_corpus_core::entity_ref::{self, EntityRef};
 use bbox_corpus_core::project_record::{ProjectRecord, load_project_records};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Binary document containers (PDF, OOXML, spreadsheets) get a larger
+/// byte budget: their size is dominated by embedded images/fonts, not
+/// extractable text, so the 2 MiB text-file guard silently dropped
+/// real-world documents (a 5 MB scanned-letterhead PDF can carry 20 KB
+/// of text). The chunkers bound their own OUTPUT (per-sheet row/char
+/// caps, per-page chunks, catch_unwind degradation), so the input budget
+/// only guards parse cost, not index bloat.
+const MAX_DOCUMENT_FILE_BYTES: u64 = 25 * 1024 * 1024;
+
+fn max_bytes_for_path(path: &Path) -> u64 {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("pdf" | "docx" | "pptx" | "xlsx" | "xlsm" | "xlam" | "xlsb" | "xls" | "ods") => {
+            MAX_DOCUMENT_FILE_BYTES
+        }
+        _ => MAX_FILE_BYTES,
+    }
+}
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "_build", ".worktrees"];
 
 #[derive(Debug, Default)]
@@ -514,7 +536,7 @@ fn scan_project_files(root: &Path, out: &mut Vec<(String, u64, u64)>) -> Result<
             Ok(meta) => meta,
             Err(_) => continue,
         };
-        if meta.len() > MAX_FILE_BYTES {
+        if meta.len() > max_bytes_for_path(path) {
             continue;
         }
         let mtime = meta
@@ -1128,6 +1150,21 @@ mod tests {
     use crate::index::build_schema;
     use bbox_chunker::SourceFormatChunker;
     use tantivy::schema::Field;
+
+    #[test]
+    fn document_containers_get_the_larger_byte_budget() {
+        use std::path::Path;
+        assert_eq!(
+            max_bytes_for_path(Path::new("deck.pdf")),
+            MAX_DOCUMENT_FILE_BYTES
+        );
+        assert_eq!(
+            max_bytes_for_path(Path::new("Board.DOCX")),
+            MAX_DOCUMENT_FILE_BYTES
+        );
+        assert_eq!(max_bytes_for_path(Path::new("main.rs")), MAX_FILE_BYTES);
+        assert_eq!(max_bytes_for_path(Path::new("notes.md")), MAX_FILE_BYTES);
+    }
 
     #[test]
     fn project_file_doc_includes_agentic_fields() {
