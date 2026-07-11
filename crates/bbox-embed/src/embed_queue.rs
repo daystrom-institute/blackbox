@@ -45,6 +45,8 @@ pub fn enqueue_knowledge(entry: &KnowledgeEntry, entity_id: &str, chunk_hash: &s
         entity_id: entity_id.to_string(),
         chunk_hash: chunk_hash.to_string(),
         text: format!("{}\n\n{}", entry.title, entry.content),
+        visual_kind: None,
+        visual_payload: None,
     })
 }
 
@@ -71,6 +73,8 @@ pub fn enqueue_roadmap(
         entity_id: entity_id.to_string(),
         chunk_hash: chunk_hash.to_string(),
         text: format!("{}\n\n{}", item.title, item.body),
+        visual_kind: None,
+        visual_payload: None,
     })
 }
 
@@ -121,7 +125,33 @@ pub fn is_code_chunk(language: Option<&str>, chunk_kind: &str) -> bool {
     matches!(language, Some(lang) if !matches!(lang, "md" | "markdown" | "mdown"))
 }
 
+/// Visual (image-payload-bearing) chunk kinds: the routing analog of
+/// `is_code_chunk` for the visual lane. `image` (X-IMG) and `pdf_figure`
+/// (X-PDF's embedded-XObject extractor) are shipped; the rest are the
+/// design's remaining visual sidecar kinds
+/// (`design/corpus/agentic-corpus/multimodal-embedding-routing.md`
+/// "Multimodal Chunk Model") reserved here so a future chunker (slide_image,
+/// ...) needs no changes to this shared list beyond adding its kind string.
+/// Shared by the index-time enqueue hook and the coverage/backfill
+/// attribution in `embed_runtime`, same one-rule-one-place reasoning as
+/// `is_code_chunk`'s doc comment.
+pub const VISUAL_CHUNK_KINDS: &[&str] = &[
+    "image",
+    "pdf_figure",
+    "spreadsheet_chart",
+    "slide_image",
+    "image_caption",
+    "video_segment",
+];
+
+pub fn is_visual_chunk_kind(chunk_kind: &str) -> bool {
+    VISUAL_CHUNK_KINDS.contains(&chunk_kind)
+}
+
 pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) -> bool {
+    if is_visual_chunk_kind(&chunk.chunk_kind) {
+        return enqueue_visual_project_file(chunk, entity_id);
+    }
     let bucket = if is_code_chunk(chunk.language.as_deref(), &chunk.chunk_kind) {
         Bucket::Code
     } else {
@@ -137,6 +167,35 @@ pub fn enqueue_project_file_as(chunk: &Chunk, entity_id: &str, bucket: Bucket) -
         entity_id: entity_id.to_string(),
         chunk_hash: chunk.chunk_hash.clone(),
         text: chunk.content.clone(),
+        visual_kind: None,
+        visual_payload: None,
+    })
+}
+
+/// Visual lane: routes through `[embed.routes.visual]` (chunk-kind-keyed,
+/// never `Bucket`-keyed) instead of the bucket-keyed text route machinery.
+/// `false` when the chunk carries no `visual_payload`: a visual chunk kind
+/// with no payload ref is a chunker bug, not a route-config absence (that
+/// case is handled downstream: an unconfigured `[embed.routes.visual]`
+/// entry degrades to a per-route error status, not a panic here).
+pub fn enqueue_visual_project_file(chunk: &Chunk, entity_id: &str) -> bool {
+    let Some(payload) = &chunk.visual_payload else {
+        tracing::warn!(
+            entity_id,
+            chunk_kind = %chunk.chunk_kind,
+            "visual chunk kind has no visual_payload; skipping enqueue"
+        );
+        return false;
+    };
+    enqueue(EmbedRequest {
+        // Ignored: visual_kind below overrides bucket-based routing.
+        bucket: Bucket::Docs,
+        project_id: Some(chunk.project_id.clone()),
+        entity_id: entity_id.to_string(),
+        chunk_hash: chunk.chunk_hash.clone(),
+        text: chunk.content.clone(),
+        visual_kind: Some(chunk.chunk_kind.clone()),
+        visual_payload: Some(payload.clone()),
     })
 }
 
@@ -147,6 +206,8 @@ pub fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &str) -> 
         entity_id: entity_id.to_string(),
         chunk_hash: chunk_hash.to_string(),
         text: message.to_string(),
+        visual_kind: None,
+        visual_payload: None,
     })
 }
 
@@ -161,6 +222,8 @@ pub fn enqueue_note(note: &Note) -> bool {
         entity_id,
         chunk_hash: note_chunk_hash(note),
         text: note_text(note),
+        visual_kind: None,
+        visual_payload: None,
     })
 }
 
@@ -179,6 +242,8 @@ pub fn enqueue_thread(thread: &Thread) -> bool {
         entity_id,
         chunk_hash: thread_chunk_hash(thread),
         text: thread_text(thread),
+        visual_kind: None,
+        visual_payload: None,
     })
 }
 
@@ -206,6 +271,8 @@ pub fn enqueue_transcript(
         entity_id,
         chunk_hash: chunk_hash.to_string(),
         text: content.to_string(),
+        visual_kind: None,
+        visual_payload: None,
     })
 }
 
@@ -426,6 +493,58 @@ mod tests {
         assert!(!is_code_chunk(None, "pdf_page"));
         assert!(!is_code_chunk(None, "office_section"));
         assert!(!is_code_chunk(None, "spreadsheet_sheet"));
+    }
+
+    #[test]
+    fn visual_chunk_kinds_cover_x_img_and_reserved_future_kinds() {
+        assert!(is_visual_chunk_kind("image"));
+        assert!(is_visual_chunk_kind("pdf_figure"));
+        assert!(is_visual_chunk_kind("spreadsheet_chart"));
+        assert!(is_visual_chunk_kind("slide_image"));
+        assert!(is_visual_chunk_kind("image_caption"));
+        assert!(is_visual_chunk_kind("video_segment"));
+        assert!(!is_visual_chunk_kind("pdf_page"));
+        assert!(!is_visual_chunk_kind("doc_section"));
+        assert!(!is_visual_chunk_kind("code_block"));
+    }
+
+    fn image_chunk(visual_payload: Option<bbox_visual_store::VisualPayloadRef>) -> Chunk {
+        let mut chunk = bbox_chunker::placeholder_chunk(
+            std::path::Path::new("assets/figure.png"),
+            "image",
+            None,
+            "figure",
+            0,
+            4,
+            0,
+        );
+        chunk.project_id = "proj1234".into();
+        chunk.rel_path_hash = "abcd1234".into();
+        chunk.chunk_hash = "f".repeat(64);
+        chunk.visual_payload = visual_payload;
+        chunk
+    }
+
+    #[test]
+    fn enqueue_project_file_routes_image_chunks_through_the_visual_lane() {
+        // No queue installed in this test process: enqueue_visual_project_file
+        // short-circuits on the missing visual_payload before ever touching
+        // the (uninstalled) global queue, so this exercises the routing
+        // decision in enqueue_project_file without needing queue plumbing.
+        let chunk = image_chunk(None);
+        assert!(!enqueue_project_file(
+            &chunk,
+            "project_file:proj1234:abcd1234:hash:0"
+        ));
+    }
+
+    #[test]
+    fn enqueue_visual_project_file_without_payload_is_a_noop() {
+        let chunk = image_chunk(None);
+        assert!(!enqueue_visual_project_file(
+            &chunk,
+            "project_file:proj1234:abcd1234:hash:0"
+        ));
     }
 
     use bbox_threads::threads::{

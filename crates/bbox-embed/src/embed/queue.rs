@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use bbox_visual_store::VisualPayloadRef;
 use parking_lot::RwLock;
 use rmcp::schemars;
 use serde::Serialize;
@@ -11,7 +12,7 @@ use tokio::sync::mpsc;
 
 use super::{
     Bucket, EmbedEndpointKind, EmbedInput, EmbedInputType, EmbedOutput, EmbeddingProvider,
-    EmbeddingRouter,
+    EmbeddingRouter, MultimodalPart,
 };
 
 const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -89,6 +90,13 @@ async fn embed_document_texts(
         .collect()
 }
 
+/// Queue route label for a visual chunk kind. A dedicated function (rather
+/// than inlining `format!`) so the label is spelled identically everywhere
+/// it's constructed (`resolve_visual_route`, status reporting).
+fn visual_queue_route(kind: &str) -> String {
+    format!("visual:{kind}")
+}
+
 /// Document identity for contextualized grouping: the chunk entity id
 /// minus its trailing numeric chunk index (`project_file:p:f:h:3` and
 /// `:4` share a document; ids without a numeric tail are their own
@@ -110,12 +118,18 @@ fn document_group_key(entity_id: &str) -> &str {
 /// Embed one packed batch with the role and shape its provider expects.
 /// Text/Ollama providers take flat `Text` inputs; contextualized providers
 /// take consecutive same-document runs as `DocumentChunks` groups so each
-/// chunk is encoded with its document context. Returns one vector per
-/// request, in batch order.
+/// chunk is encoded with its document context; multimodal providers take
+/// interleaved `Multimodal` parts built from the request's
+/// `VisualPayloadRef` (bytes loaded from the visual payload sidecar at this
+/// point, not held in the pending queue). Returns one vector per request,
+/// in batch order.
 async fn embed_batch_requests(
     provider: &dyn EmbeddingProvider,
     batch: &[EmbedRequest],
 ) -> Result<Vec<Vec<f32>>> {
+    if provider.endpoint_kind() == EmbedEndpointKind::Multimodal {
+        return embed_visual_requests(provider, batch).await;
+    }
     if provider.endpoint_kind() != EmbedEndpointKind::ContextualizedText {
         let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
         return embed_document_texts(provider, &texts).await;
@@ -160,27 +174,96 @@ async fn embed_batch_requests(
     Ok(vectors)
 }
 
+/// Multimodal batches: load each request's payload bytes from the visual
+/// sidecar store at request-build time (never held earlier: `EmbedRequest`
+/// carries only the small `VisualPayloadRef`, per the design's "chunks and
+/// embed requests carry a ref instead of inline bytes"), build interleaved
+/// `Multimodal` parts, and embed. A request with no `visual_payload` is a
+/// caller bug (only the visual enqueue path should route here), not a
+/// transient failure: bail rather than silently skipping it.
+async fn embed_visual_requests(
+    provider: &dyn EmbeddingProvider,
+    batch: &[EmbedRequest],
+) -> Result<Vec<Vec<f32>>> {
+    let store = bbox_visual_store::global();
+    let mut inputs = Vec::with_capacity(batch.len());
+    for request in batch {
+        let Some(payload) = &request.visual_payload else {
+            bail!(
+                "visual embed route received a request with no visual payload \
+                 (entity_id={})",
+                request.entity_id
+            );
+        };
+        let path = store.path_for(&payload.content_hash);
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("reading visual payload {}", path.display()))?;
+        let mut parts = Vec::with_capacity(2);
+        if !request.text.trim().is_empty() {
+            parts.push(MultimodalPart::Text(request.text.clone()));
+        }
+        parts.push(MultimodalPart::ImageBytes {
+            mime: payload.media_type.clone(),
+            bytes,
+        });
+        inputs.push(EmbedInput::Multimodal(parts));
+    }
+    provider
+        .embed_batch(&inputs, EmbedInputType::Document)
+        .await?
+        .into_iter()
+        .map(EmbedOutput::into_single)
+        .collect()
+}
+
+/// Which packing shape a route's provider needs. `Grouped` (contextualized
+/// routes) never splits one document's consecutive chunk run across
+/// batches; `Flat` and `Visual` are both simple count/byte-capped runs,
+/// differing only in caps and how request weight is measured (`Visual`
+/// weighs by payload byte length, not caption text length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackMode {
+    Flat,
+    Grouped,
+    Visual,
+}
+
+/// Byte weight of one request for batch-cap accounting. Visual requests
+/// carry the real payload size on `visual_payload`; their `text` is only a
+/// filename-stem caption and would grossly understate the request's actual
+/// network weight.
+fn request_weight_bytes(request: &EmbedRequest) -> usize {
+    request
+        .visual_payload
+        .as_ref()
+        .map(|payload| payload.byte_len as usize)
+        .unwrap_or(request.text.len())
+}
+
 /// Pop one batch off the pending queue under the count/byte caps.
-/// `grouped` (contextualized routes) additionally never splits one
-/// document's consecutive chunk run across batches: a run that would
+/// `PackMode::Grouped` (contextualized routes) additionally never splits
+/// one document's consecutive chunk run across batches: a run that would
 /// straddle the cap closes the batch instead, and a run that exceeds the
 /// caps on its own falls back to windowed sub-documents (each window is
 /// embedded as its own document, trading context width for progress).
-fn pack_batch(pending: &mut VecDeque<EmbedRequest>, grouped: bool) -> Vec<EmbedRequest> {
+fn pack_batch(pending: &mut VecDeque<EmbedRequest>, mode: PackMode) -> Vec<EmbedRequest> {
     let mut batch = Vec::new();
     let mut bytes = 0usize;
-    if !grouped {
+    if mode != PackMode::Grouped {
+        let (max_docs, max_bytes) = match mode {
+            PackMode::Visual => (MAX_VISUAL_BATCH_DOCS, MAX_VISUAL_BATCH_BYTES),
+            _ => (MAX_BATCH_DOCS, MAX_BATCH_BYTES),
+        };
         while let Some(req) = pending.pop_front() {
-            let req_bytes = req.text.len();
-            if !batch.is_empty()
-                && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES)
-            {
+            let req_bytes = request_weight_bytes(&req);
+            if !batch.is_empty() && (batch.len() >= max_docs || bytes + req_bytes > max_bytes) {
                 pending.push_front(req);
                 break;
             }
             bytes += req_bytes;
             batch.push(req);
-            if batch.len() >= MAX_BATCH_DOCS {
+            if batch.len() >= max_docs {
                 break;
             }
         }
@@ -263,11 +346,26 @@ fn pack_batch(pending: &mut VecDeque<EmbedRequest>, grouped: bool) -> Vec<EmbedR
 
 #[derive(Debug, Clone)]
 pub struct EmbedRequest {
+    /// Ignored when `visual_kind` is `Some`: visual routing resolves
+    /// through `EmbeddingRouter::visual_route`/`visual_provider` (keyed by
+    /// chunk kind, not `Bucket`), not the bucket-keyed text route machinery.
     pub bucket: Bucket,
     pub project_id: Option<String>,
     pub entity_id: String,
     pub chunk_hash: String,
+    /// For text requests: the content to embed. For visual requests
+    /// (`visual_payload` is `Some`): optional caption text (e.g. the file
+    /// name stem) sent alongside the image as a `MultimodalPart::Text`
+    /// part; may be empty.
     pub text: String,
+    /// `Some(chunk_kind)` routes this request through the visual embedding
+    /// lane (`[embed.routes.visual]`) instead of the bucket-keyed text
+    /// route. Requires `visual_payload` to also be `Some`.
+    pub visual_kind: Option<String>,
+    /// Reference to the raw image/video bytes in the content-hash-addressed
+    /// visual payload sidecar (`bbox-visual-store`); the queue worker loads
+    /// the bytes from disk at request-build time, never earlier.
+    pub visual_payload: Option<VisualPayloadRef>,
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -585,6 +683,9 @@ impl EmbedQueueHandle {
     }
 
     fn resolve_route(&self, request: &EmbedRequest) -> Result<ResolvedRoute> {
+        if let Some(kind) = &request.visual_kind {
+            return self.resolve_visual_route(kind);
+        }
         let Some(router) = &self.inner.router else {
             let route = request.bucket.as_str().to_string();
             return Ok(ResolvedRoute {
@@ -597,6 +698,31 @@ impl EmbedQueueHandle {
         Ok(ResolvedRoute {
             queue_route,
             vector_route,
+        })
+    }
+
+    /// Visual routing is chunk-kind-keyed (`[embed.routes.visual]`), never
+    /// `Bucket`-keyed, see `EmbeddingRouter::visual_route`. Mirrors
+    /// `resolve_route`'s router-absent fallback: without a router, the
+    /// queue and vector route both collapse to the `visual:<kind>` label
+    /// (matches test scaffolding that constructs a queue with no router).
+    fn resolve_visual_route(&self, kind: &str) -> Result<ResolvedRoute> {
+        let queue_route = visual_queue_route(kind);
+        let Some(router) = &self.inner.router else {
+            return Ok(ResolvedRoute {
+                queue_route: queue_route.clone(),
+                vector_route: queue_route,
+            });
+        };
+        let Some(meta) = router.visual_route(kind)? else {
+            bail!(
+                "visual chunk kind `{kind}` has no configured route; add \
+                 [embed.routes.visual] `{kind} = \"<alias>\"` to embed.toml to opt in"
+            );
+        };
+        Ok(ResolvedRoute {
+            queue_route,
+            vector_route: meta.vector_route_id(),
         })
     }
 
@@ -631,12 +757,29 @@ impl EmbedQueueHandle {
             return Some(sender);
         }
         let router = self.inner.router.as_ref()?;
-        let provider = match router.route_for(request.bucket, request.project_id.as_deref()) {
-            Ok(provider) => provider,
-            Err(err) => {
-                mark_error(&self.inner.statuses, route, &sanitize_error(&err));
-                return None;
-            }
+        let provider = match &request.visual_kind {
+            Some(kind) => match router.visual_provider(kind) {
+                Ok(Some(provider)) => provider,
+                Ok(None) => {
+                    mark_error(
+                        &self.inner.statuses,
+                        route,
+                        &format!("visual chunk kind `{kind}` has no configured route"),
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    mark_error(&self.inner.statuses, route, &sanitize_error(&err));
+                    return None;
+                }
+            },
+            None => match router.route_for(request.bucket, request.project_id.as_deref()) {
+                Ok(provider) => provider,
+                Err(err) => {
+                    mark_error(&self.inner.statuses, route, &sanitize_error(&err));
+                    return None;
+                }
+            },
         };
         let provider: Arc<dyn EmbeddingProvider> = provider.into();
         let rate_limit_per_min = router.rate_limit_per_min(provider.id());
@@ -793,6 +936,14 @@ fn spawn_worker_loop(route: &str, spec: WorkerSpec, rx: mpsc::UnboundedReceiver<
     }
 }
 
+fn pack_mode_for(endpoint_kind: EmbedEndpointKind) -> PackMode {
+    match endpoint_kind {
+        EmbedEndpointKind::ContextualizedText => PackMode::Grouped,
+        EmbedEndpointKind::Multimodal => PackMode::Visual,
+        EmbedEndpointKind::Text | EmbedEndpointKind::Ollama => PackMode::Flat,
+    }
+}
+
 async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCommand>) {
     let mut pending = VecDeque::new();
     let mut retry_batch = Vec::new();
@@ -810,8 +961,8 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
             // First batch blocks for input; subsequent batches only
             // contribute if pending has more work right away (so we
             // don't add latency waiting for a second batch to fill).
-            let grouped = spec.provider.endpoint_kind() == EmbedEndpointKind::ContextualizedText;
-            match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce, grouped).await {
+            let mode = pack_mode_for(spec.provider.endpoint_kind());
+            match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce, mode).await {
                 Some(b) => acc.push(b),
                 None => return,
             }
@@ -819,7 +970,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                 if pending.is_empty() {
                     break;
                 }
-                let batch = pack_batch(&mut pending, grouped);
+                let batch = pack_batch(&mut pending, mode);
                 if !batch.is_empty() {
                     acc.push(batch);
                 }
@@ -1121,6 +1272,16 @@ async fn schedule_retry_or_drop(
 const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 const MAX_BATCH_DOCS: usize = 128;
 const MAX_BATCH_BYTES: usize = 100 * 1024;
+// Visual (multimodal) packing: images are heavy per item (up to the
+// provider's 20 MB single-image cap, design/corpus/agentic-corpus/
+// multimodal-embedding-routing.md) and the request's `text` is just a
+// filename-stem caption, so the text-byte heuristic above does not reflect
+// actual request weight. Cap the batch far below Voyage's 1,000-input/
+// 320K-token multimodal ceiling: a handful of large images is already a
+// multi-ten-MB HTTP body, and there is no benefit to batching harder than
+// the debounce window already buys.
+const MAX_VISUAL_BATCH_DOCS: usize = 8;
+const MAX_VISUAL_BATCH_BYTES: usize = 64 * 1024 * 1024;
 // Per-worker concurrency: we dispatch multiple full batches in parallel
 // before awaiting any of them. With 4 in-flight batches at ~1.5s each =
 // ~2.7 batches/sec/worker = ~162 RPM/worker. Across 6 routes that's below
@@ -1133,7 +1294,7 @@ async fn collect_quiescent_batch(
     rx: &mut mpsc::UnboundedReceiver<WorkerCommand>,
     pending: &mut VecDeque<EmbedRequest>,
     debounce: Duration,
-    grouped: bool,
+    mode: PackMode,
 ) -> Option<Vec<EmbedRequest>> {
     while pending.is_empty() {
         match rx.recv().await? {
@@ -1148,7 +1309,7 @@ async fn collect_quiescent_batch(
             Err(_) => break,
         }
     }
-    Some(pack_batch(pending, grouped))
+    Some(pack_batch(pending, mode))
 }
 
 fn persist_vectors(
@@ -1168,7 +1329,11 @@ fn persist_vectors(
         .iter()
         .zip(vectors)
         .map(|(request, vector)| {
-            if request.bucket == Bucket::Knowledge {
+            // `bucket` is an ignored placeholder on visual requests
+            // (routing goes through `visual_kind` instead), so gate on it
+            // explicitly rather than relying on the placeholder value never
+            // colliding with `Bucket::Knowledge`.
+            if request.visual_kind.is_none() && request.bucket == Bucket::Knowledge {
                 contradiction_checks.push((request.clone(), vector.clone()));
             }
             bbox_vectors::VectorUpsert {
@@ -1797,13 +1962,13 @@ mod tests {
         for idx in 0..100 {
             pending.push_back(ctx_request("bbb", idx, "x"));
         }
-        let first = pack_batch(&mut pending, true);
+        let first = pack_batch(&mut pending, PackMode::Grouped);
         assert_eq!(first.len(), 100);
         assert!(
             first.iter().all(|req| req.entity_id.contains(":aaa:")),
             "batch must close at the document boundary"
         );
-        let second = pack_batch(&mut pending, true);
+        let second = pack_batch(&mut pending, PackMode::Grouped);
         assert_eq!(second.len(), 100);
         assert!(second.iter().all(|req| req.entity_id.contains(":bbb:")));
         assert!(pending.is_empty());
@@ -1824,10 +1989,10 @@ mod tests {
 
         // 30KB + 30KB fits the 64KB document budget; the third chunk
         // starts a new window, which must NOT share this batch.
-        let first = pack_batch(&mut pending, true);
+        let first = pack_batch(&mut pending, PackMode::Grouped);
         assert_eq!(first.len(), 2);
         assert!(first.iter().all(|req| req.entity_id.contains(":dense:")));
-        let second = pack_batch(&mut pending, true);
+        let second = pack_batch(&mut pending, PackMode::Grouped);
         assert_eq!(second.len(), 2, "remainder window plus the next document");
         assert!(second[0].entity_id.contains(":dense:"));
         assert!(second[1].entity_id.contains(":small:"));
@@ -1840,9 +2005,9 @@ mod tests {
         for idx in 0..(MAX_BATCH_DOCS + 40) {
             pending.push_back(ctx_request("huge", idx, "x"));
         }
-        let first = pack_batch(&mut pending, true);
+        let first = pack_batch(&mut pending, PackMode::Grouped);
         assert_eq!(first.len(), MAX_BATCH_DOCS);
-        let second = pack_batch(&mut pending, true);
+        let second = pack_batch(&mut pending, PackMode::Grouped);
         assert_eq!(second.len(), 40);
         assert!(pending.is_empty());
     }
@@ -1853,8 +2018,50 @@ mod tests {
         for idx in 0..(MAX_BATCH_DOCS + 10) {
             pending.push_back(ctx_request("aaa", idx, "x"));
         }
-        let first = pack_batch(&mut pending, false);
+        let first = pack_batch(&mut pending, PackMode::Flat);
         assert_eq!(first.len(), MAX_BATCH_DOCS);
+    }
+
+    fn visual_request(entity_id: &str, byte_len: u64) -> EmbedRequest {
+        let mut req = request(Bucket::Docs, entity_id, "h");
+        req.visual_kind = Some("image".into());
+        req.visual_payload = Some(VisualPayloadRef {
+            content_hash: format!("hash-{entity_id}"),
+            media_type: "image/png".into(),
+            byte_len,
+        });
+        req
+    }
+
+    /// Visual packing weighs by `visual_payload.byte_len`, not the caption
+    /// text length: the whole point of `request_weight_bytes`, since a
+    /// caption is a few bytes but the image can be tens of megabytes.
+    #[test]
+    fn visual_pack_caps_by_doc_count_when_payloads_are_small() {
+        let mut pending: VecDeque<EmbedRequest> = VecDeque::new();
+        for idx in 0..(MAX_VISUAL_BATCH_DOCS + 3) {
+            pending.push_back(visual_request(&format!("img-{idx}"), 1024));
+        }
+        let first = pack_batch(&mut pending, PackMode::Visual);
+        assert_eq!(first.len(), MAX_VISUAL_BATCH_DOCS);
+        let second = pack_batch(&mut pending, PackMode::Visual);
+        assert_eq!(second.len(), 3);
+    }
+
+    #[test]
+    fn visual_pack_caps_by_byte_budget_when_payloads_are_large() {
+        let mut pending: VecDeque<EmbedRequest> = VecDeque::new();
+        // Each payload alone is just over half the visual byte budget, so
+        // no two can share a batch even though the doc-count cap is not
+        // reached.
+        let half_plus_one = (MAX_VISUAL_BATCH_BYTES / 2) as u64 + 1;
+        for idx in 0..4 {
+            pending.push_back(visual_request(&format!("img-{idx}"), half_plus_one));
+        }
+        let first = pack_batch(&mut pending, PackMode::Visual);
+        assert_eq!(first.len(), 1);
+        let second = pack_batch(&mut pending, PackMode::Visual);
+        assert_eq!(second.len(), 1);
     }
 
     struct GroupRecordingProvider {
@@ -1919,6 +2126,145 @@ mod tests {
         assert_eq!(seen, vec![vec![3, 2]], "two documents, chunks grouped");
     }
 
+    struct VisualRecordingProvider {
+        seen: std::sync::Mutex<Vec<Vec<MultimodalPart>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for VisualRecordingProvider {
+        async fn embed_batch(
+            &self,
+            inputs: &[EmbedInput],
+            _input_type: EmbedInputType,
+        ) -> Result<Vec<EmbedOutput>> {
+            let mut seen = self.seen.lock().unwrap();
+            for input in inputs {
+                match input {
+                    EmbedInput::Multimodal(parts) => seen.push(parts.clone()),
+                    other => panic!("expected Multimodal input, got {}", other.kind()),
+                }
+            }
+            Ok(inputs
+                .iter()
+                .map(|_| EmbedOutput::single(vec![0.0_f32; 4]))
+                .collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        fn document_model(&self) -> &str {
+            "mock-visual"
+        }
+
+        fn endpoint_kind(&self) -> EmbedEndpointKind {
+            EmbedEndpointKind::Multimodal
+        }
+
+        fn id(&self) -> &str {
+            "mock-visual"
+        }
+    }
+
+    /// `embed_batch_requests` for a multimodal provider must load payload
+    /// bytes from the visual sidecar store at request-build time (not
+    /// hold bytes on the pending queue earlier) and build interleaved
+    /// text+image parts, caption first.
+    #[tokio::test]
+    async fn visual_requests_load_bytes_and_build_multimodal_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(bbox_visual_store::VisualPayloadStore::open(
+            dir.path().to_path_buf(),
+        ));
+        let _guard = bbox_visual_store::install_test_global(store.clone());
+        let payload = store.put(b"pretend png bytes", "image/png").unwrap();
+
+        let provider = VisualRecordingProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut req = request(Bucket::Docs, "project_file:p:f:h:0", "h1");
+        req.text = "figure-3".into();
+        req.visual_kind = Some("image".into());
+        req.visual_payload = Some(payload.clone());
+
+        let vectors = embed_batch_requests(&provider, &[req]).await.unwrap();
+        assert_eq!(vectors.len(), 1);
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].len(), 2, "caption text part + image bytes part");
+        assert!(matches!(&seen[0][0], MultimodalPart::Text(text) if text == "figure-3"));
+        assert!(matches!(
+            &seen[0][1],
+            MultimodalPart::ImageBytes { mime, bytes }
+                if mime == "image/png" && bytes == b"pretend png bytes"
+        ));
+    }
+
+    #[tokio::test]
+    async fn visual_requests_without_a_payload_ref_are_rejected() {
+        let provider = VisualRecordingProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut req = request(Bucket::Docs, "project_file:p:f:h:0", "h1");
+        req.visual_kind = Some("image".into());
+        let err = embed_batch_requests(&provider, &[req]).await.unwrap_err();
+        assert!(err.to_string().contains("no visual payload"));
+    }
+
+    /// End-to-end through `EmbedQueueHandle`: a visual enqueue resolves via
+    /// the `visual:<kind>` queue route (not a `Bucket` route), packs
+    /// through `PackMode::Visual`, and persists a vector: exercising
+    /// `resolve_route`'s visual branch and the contradiction-check bucket
+    /// guard together.
+    #[tokio::test]
+    async fn visual_enqueue_routes_through_the_visual_queue_key_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload_store = std::sync::Arc::new(bbox_visual_store::VisualPayloadStore::open(
+            dir.path().join("payloads"),
+        ));
+        let _payload_guard = bbox_visual_store::install_test_global(payload_store.clone());
+        let payload = payload_store
+            .put(b"pretend png bytes", "image/png")
+            .unwrap();
+
+        let vector_store = std::sync::Arc::new(
+            bbox_vectors::VectorStore::open(dir.path().join("vectors")).unwrap(),
+        );
+        let provider = Arc::new(VisualRecordingProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let queue = EmbedQueueHandle::from_providers(
+            vec![(
+                "visual:image".to_string(),
+                provider.clone() as Arc<dyn EmbeddingProvider>,
+                None,
+                "visual:image".to_string(),
+            )],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            None,
+            Some(vector_store.clone()),
+        );
+
+        let mut req = request(Bucket::Docs, "project_file:p:f:h:0", "h1");
+        req.text = "figure-3".into();
+        req.visual_kind = Some("image".into());
+        req.visual_payload = Some(payload);
+        assert!(queue.enqueue(req));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let status = queue.status().routes["visual:image"].clone();
+        assert!(status.available, "{status:?}");
+        assert_eq!(status.indexed_count, 1);
+        assert!(
+            vector_store
+                .contains_active("visual:image", "project_file:p:f:h:0", "h1")
+                .unwrap()
+        );
+        queue.shutdown();
+    }
+
     fn request_with_text(
         bucket: Bucket,
         entity_id: &str,
@@ -1931,6 +2277,8 @@ mod tests {
             entity_id: entity_id.into(),
             chunk_hash: chunk_hash.into(),
             text: text.into(),
+            visual_kind: None,
+            visual_payload: None,
         }
     }
 }

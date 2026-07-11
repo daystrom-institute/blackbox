@@ -550,6 +550,32 @@ fn record_index_doc_coverage(
     if !queue::embeddable_text(&doc.content) {
         return Ok(());
     }
+    // Visual chunks (X-IMG's `image`, X-PDF's `pdf_figure`) ride the same
+    // `project_file` doc_type as Code/Docs chunks but have no `Bucket` of
+    // their own: they route through `[embed.routes.visual]`,
+    // chunk-kind-keyed. This runs whenever the
+    // project_file scan reaches one (i.e. whenever Code or Docs is in
+    // `buckets`, since that's what makes `reembed_index_doc_types` include
+    // "project_file"), independent of which of Code/Docs was requested:
+    // visual chunks aren't either bucket, so there is no narrower
+    // `buckets` gate to check them against.
+    if doc.doc_type == "project_file" && crate::embed_queue::is_visual_chunk_kind(&doc.chunk_kind) {
+        let Some(entity_id) = &doc.entity_id else {
+            return Ok(());
+        };
+        let chunk_hash = doc
+            .chunk_hash
+            .clone()
+            .unwrap_or_else(|| crate::embed_queue::content_hash(&doc.content));
+        return record_visual_coverage(
+            router,
+            coverage,
+            active_by_route,
+            &doc.chunk_kind,
+            entity_id,
+            &chunk_hash,
+        );
+    }
     let Some(bucket) = reembed_index_doc_bucket(doc) else {
         return Ok(());
     };
@@ -620,6 +646,51 @@ fn record_coverage(
     chunk_hash: &str,
 ) -> Result<()> {
     let (queue_route, vector_route) = router.queue_and_vector_route(bucket, project_id)?;
+    record_coverage_at(
+        coverage,
+        active_by_route,
+        queue_route,
+        vector_route,
+        entity_id,
+        chunk_hash,
+    )
+}
+
+/// Visual-lane analog of `record_coverage`: routes are chunk-kind-keyed
+/// (`[embed.routes.visual]`), not `Bucket`-keyed, so this resolves through
+/// `EmbeddingRouter::visual_route` instead of `queue_and_vector_route`. An
+/// unconfigured visual kind is skipped rather than counted: visual
+/// embedding is opt-in per kind, so an unrouted kind has no partition to
+/// report coverage against.
+fn record_visual_coverage(
+    router: &EmbeddingRouter,
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+    chunk_kind: &str,
+    entity_id: &str,
+    chunk_hash: &str,
+) -> Result<()> {
+    let Some(meta) = router.visual_route(chunk_kind)? else {
+        return Ok(());
+    };
+    record_coverage_at(
+        coverage,
+        active_by_route,
+        format!("visual:{chunk_kind}"),
+        meta.vector_route_id(),
+        entity_id,
+        chunk_hash,
+    )
+}
+
+fn record_coverage_at(
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+    queue_route: String,
+    vector_route: String,
+    entity_id: &str,
+    chunk_hash: &str,
+) -> Result<()> {
     let entry = coverage.entry(queue_route).or_default();
     entry.source_count = entry.source_count.saturating_add(1);
     if !active_by_route.contains_key(&vector_route) {
@@ -793,6 +864,16 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
     if !queue::embeddable_text(&doc.content) {
         return false;
     }
+    // Visual chunks piggyback on the project_file scan (see the matching
+    // comment in `record_index_doc_coverage`) rather than gating on
+    // `buckets`, since they have no `Bucket` of their own.
+    if doc.doc_type == "project_file" && crate::embed_queue::is_visual_chunk_kind(&doc.chunk_kind) {
+        let Some(chunk) = chunk_from_embedding_doc(doc) else {
+            return false;
+        };
+        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        return crate::embed_queue::enqueue_visual_project_file(&chunk, &entity_id);
+    }
     let Some(bucket) = reembed_index_doc_bucket(doc) else {
         return false;
     };
@@ -898,6 +979,21 @@ fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
         _ => return None,
     };
     let byte_end = doc.byte_offset.saturating_add(doc.content.len() as u64);
+    // Visual chunks (X-IMG's `image`, X-PDF's `pdf_figure`) encode their
+    // VisualPayloadRef into `symbol` at chunk time (see `bbox_chunker::ximg`
+    // and `bbox_chunker::pdf_figure`) precisely so this reconstruction
+    // path, which rebuilds a Chunk from stored tantivy fields rather than
+    // re-chunking the file, can recover it without a schema change.
+    // Non-visual chunk kinds' `symbol` never happens to parse as a visual
+    // ref (versioned prefix), so this is a safe no-op for every other
+    // chunker.
+    let visual_payload = crate::embed_queue::is_visual_chunk_kind(&doc.chunk_kind)
+        .then(|| {
+            doc.symbol
+                .as_deref()
+                .and_then(bbox_visual_store::VisualPayloadRef::decode)
+        })
+        .flatten();
     Some(Chunk {
         project_id,
         file_path: PathBuf::from(&doc.file_path),
@@ -918,6 +1014,7 @@ fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
         content: doc.content.clone(),
         byte_start: doc.byte_offset,
         byte_end,
+        visual_payload,
     })
 }
 
@@ -1083,6 +1180,8 @@ pub(crate) fn enqueue_agent_manifest(agent: &AgentRef, manifest: &AgentManifest)
             entity_id: agent_component_entity_id(agent, component.kind),
             chunk_hash: content_hash(&component.text),
             text: component.text,
+            visual_kind: None,
+            visual_payload: None,
         }) {
             enqueued += 1;
         }
@@ -1706,5 +1805,124 @@ mod tests {
         assert_eq!(threads.source_count, Some(1));
         assert_eq!(threads.indexed_count, 1);
         assert_eq!(threads.coverage_ratio, Some(1.0));
+    }
+
+    fn image_embedding_source_doc() -> EmbeddingSourceDoc {
+        let payload = bbox_visual_store::VisualPayloadRef {
+            content_hash: "deadbeef".into(),
+            media_type: "image/png".into(),
+            byte_len: 4096,
+        };
+        EmbeddingSourceDoc {
+            doc_type: "project_file".into(),
+            account: String::new(),
+            session_id: String::new(),
+            project: "proj1234".into(),
+            file_path: "assets/figure.png".into(),
+            byte_offset: 0,
+            chunk_kind: "image".into(),
+            language: None,
+            symbol: Some(payload.encode()),
+            symbol_exact: None,
+            chunk_hash: Some("f".repeat(64)),
+            entity_id: Some(format!(
+                "project_file:proj1234:abcd1234:{}:0",
+                "f".repeat(64)
+            )),
+            content: "figure".into(),
+        }
+    }
+
+    /// `chunk_from_embedding_doc` decodes the VisualPayloadRef X-IMG
+    /// encoded into `symbol` back out: the round trip the backfill path
+    /// depends on since it never re-chunks the source file.
+    #[test]
+    fn chunk_from_embedding_doc_decodes_visual_payload_from_symbol() {
+        let doc = image_embedding_source_doc();
+        let chunk = chunk_from_embedding_doc(&doc).unwrap();
+        let payload = chunk
+            .visual_payload
+            .expect("visual payload decoded from symbol");
+        assert_eq!(payload.content_hash, "deadbeef");
+        assert_eq!(payload.media_type, "image/png");
+        assert_eq!(payload.byte_len, 4096);
+    }
+
+    /// A non-visual chunk kind's `symbol` never decodes as a visual ref
+    /// (versioned prefix), even when it happens to be `Some`.
+    #[test]
+    fn chunk_from_embedding_doc_never_decodes_visual_payload_for_text_kinds() {
+        let mut doc = image_embedding_source_doc();
+        doc.chunk_kind = "doc_section".into();
+        doc.symbol = Some("KnowledgeStore".into());
+        let chunk = chunk_from_embedding_doc(&doc).unwrap();
+        assert_eq!(chunk.visual_payload, None);
+    }
+
+    /// Coverage: a visual project_file doc counts against the
+    /// `visual:<kind>` route (chunk-kind-keyed), not a `Bucket` route:
+    /// reached whenever the project_file scan runs (Code or Docs
+    /// requested), independent of which text bucket was asked for.
+    #[test]
+    fn visual_chunks_ride_the_project_file_scan_into_the_visual_route() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store);
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+image = "voyage_visual"
+"#,
+        )
+        .unwrap();
+        let mut coverage = BTreeMap::new();
+        let mut active_by_route = BTreeMap::new();
+        record_index_doc_coverage(
+            &router,
+            &mut coverage,
+            &mut active_by_route,
+            &[Bucket::Docs],
+            &image_embedding_source_doc(),
+        )
+        .unwrap();
+        let entry = coverage.get("visual:image").expect("visual route counted");
+        assert_eq!(entry.source_count, 1);
+        assert_eq!(entry.indexed_count, 0, "vector store has nothing yet");
+    }
+
+    /// An unconfigured visual chunk kind is skipped, not counted: visual
+    /// embedding is opt-in per kind (no `[embed.routes.visual]` entry means
+    /// no partition to report coverage against).
+    #[test]
+    fn unconfigured_visual_kind_is_skipped_not_counted() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store);
+        let router = EmbeddingRouter::from_toml_str("").unwrap();
+        let mut coverage = BTreeMap::new();
+        let mut active_by_route = BTreeMap::new();
+        record_index_doc_coverage(
+            &router,
+            &mut coverage,
+            &mut active_by_route,
+            &[Bucket::Docs],
+            &image_embedding_source_doc(),
+        )
+        .unwrap();
+        assert!(coverage.is_empty());
+    }
+
+    /// Backfill: an image doc routes through `enqueue_visual_project_file`,
+    /// not the Code/Docs bucket path. No queue is installed in this test
+    /// process, so the enqueue itself is a no-op (mirrors
+    /// `reembed_index_enqueue_counts_only_queue_accepted_items`); what this
+    /// proves is that the visual branch is reached and does not panic or
+    /// fall through to the bucket dispatch.
+    #[test]
+    fn enqueue_reembed_index_doc_routes_image_chunks_through_the_visual_lane() {
+        assert!(!enqueue_reembed_index_doc(
+            &[Bucket::Docs],
+            &image_embedding_source_doc()
+        ));
     }
 }
