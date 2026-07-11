@@ -30,6 +30,20 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Embedding routing substrate (Layer 0 of
+  `design/corpus/agentic-corpus/multimodal-embedding-routing.md`):
+  `[embed.providers]` is now a typed alias map (`type = "voyage_text" |
+  "ollama"`), so multiple Voyage-backed routes with different models can
+  coexist; legacy `voyage`/`ollama` tables without `type` still parse.
+  Every embed call is role-marked (`input_type=document` for stored
+  content, `input_type=query` for live search), Voyage requests pin
+  `output_dimension`, and routes carry `endpoint_kind`, `output_dtype`,
+  and a code-derived `compatibility_family`. Asymmetric
+  `document_model`/`query_model` pairs (voyage-4 family) are supported and
+  family-checked at config load. Partition ids are unchanged for existing
+  float routes; a non-float dtype forces a new partition. `bbox_embed_status`
+  reports the new route identity fields. The query-embedding cache key now
+  includes query model, dimension, and dtype.
 - `isolate` now has code-mode cell execution via repeated `--cell` or
   `--cell-file` flags, using the same harness `exec` runtime so nested
   `tools.*` / namespace calls and session `store()` / `load()` work during

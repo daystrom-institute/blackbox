@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -17,15 +18,204 @@ use bbox_corpus_core::entity_ref::EntityRef;
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
+pub const VOYAGE_CODE_PROVIDER_ID: &str = "voyage_code";
+pub const VOYAGE_TEXT_PROVIDER_ID: &str = "voyage_text";
+
+/// Retrieval role of an embed call. Stored corpus content is `Document`;
+/// live search strings are `Query`. Providers that support role-marked
+/// embeddings (Voyage `input_type`) send it; others ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedInputType {
+    Query,
+    Document,
+}
+
+impl EmbedInputType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Document => "document",
+        }
+    }
+}
+
+/// One embeddable unit. Text-only providers accept `Text`; contextualized
+/// providers (Layer 2) additionally accept `DocumentChunks`; multimodal
+/// providers (Layer 4) accept `Multimodal`. Declared up front so the queue
+/// and provider seams don't churn when those layers land.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbedInput {
+    Text(String),
+    /// Ordered chunks of one document, embedded together so each chunk's
+    /// vector carries document context. Never split across batches.
+    DocumentChunks(Vec<String>),
+    Multimodal(Vec<MultimodalPart>),
+}
+
+impl EmbedInput {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::DocumentChunks(_) => "document_chunks",
+            Self::Multimodal(_) => "multimodal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MultimodalPart {
+    Text(String),
+    ImageBytes { mime: String, bytes: Vec<u8> },
+    VideoBytes { mime: String, bytes: Vec<u8> },
+}
+
+/// Vectors produced for one `EmbedInput`. `Text` yields exactly one;
+/// `DocumentChunks` yields one per chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbedOutput {
+    pub vectors: Vec<Vec<f32>>,
+}
+
+impl EmbedOutput {
+    pub fn single(vector: Vec<f32>) -> Self {
+        Self {
+            vectors: vec![vector],
+        }
+    }
+
+    pub fn into_single(self) -> Result<Vec<f32>> {
+        let mut vectors = self.vectors;
+        match vectors.len() {
+            1 => Ok(vectors.remove(0)),
+            n => bail!("expected exactly one vector for a text input, got {n}"),
+        }
+    }
+}
+
+/// Typed marker for an input shape the provider does not support (e.g.
+/// `Multimodal` sent to a text provider). Routing to the wrong endpoint
+/// kind fails identically on retry, so the queue must treat it as poison.
+#[derive(Debug, Clone, Copy)]
+pub struct UnsupportedEmbedInput {
+    pub provider_kind: EmbedEndpointKind,
+    pub input_kind: &'static str,
+}
+
+impl std::fmt::Display for UnsupportedEmbedInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} embedding provider does not support {} inputs",
+            self.provider_kind, self.input_kind
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedEmbedInput {
+    /// Sourced from the queue's non-retryable marker: routing an input
+    /// shape to the wrong provider fails identically on retry, so the
+    /// queue must treat it as poison rather than backing off.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        static MARKER: queue::NonRetryableBatchError = queue::NonRetryableBatchError;
+        Some(&MARKER)
+    }
+}
+
+/// Which provider API family a route talks to. Distinct from the
+/// compatibility family: two endpoint kinds never share a vector space,
+/// but one endpoint kind can host several incompatible families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbedEndpointKind {
+    Text,
+    ContextualizedText,
+    Multimodal,
+    Ollama,
+}
+
+/// Stored vector element encoding. Part of compatibility-family identity:
+/// binary-quantized vectors are not comparable with float vectors of the
+/// same model and dimension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputDType {
+    #[default]
+    Float,
+    Int8,
+    Uint8,
+    Binary,
+    Ubinary,
+}
+
+impl OutputDType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Float => "float",
+            Self::Int8 => "int8",
+            Self::Uint8 => "uint8",
+            Self::Binary => "binary",
+            Self::Ubinary => "ubinary",
+        }
+    }
+}
 
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Embed a batch once. Transient errors propagate to the caller;
     /// retry policy and exponential backoff are owned by the E2 queue.
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    /// Unsupported input shapes fail with `UnsupportedEmbedInput` in the
+    /// error chain (poison, never retryable).
+    async fn embed_batch(
+        &self,
+        inputs: &[EmbedInput],
+        input_type: EmbedInputType,
+    ) -> Result<Vec<EmbedOutput>>;
     fn dimensions(&self) -> usize;
-    fn model_name(&self) -> &str;
+    /// Model used for `Document` inputs.
+    fn document_model(&self) -> &str;
+    /// Model used for `Query` inputs; equals `document_model()` unless the
+    /// route is asymmetric within one compatibility family.
+    fn query_model(&self) -> &str {
+        self.document_model()
+    }
+    fn endpoint_kind(&self) -> EmbedEndpointKind;
+    fn output_dtype(&self) -> OutputDType {
+        OutputDType::Float
+    }
+    fn compatibility_family(&self) -> String {
+        derive_compatibility_family(
+            self.endpoint_kind(),
+            self.document_model(),
+            self.dimensions(),
+            self.output_dtype(),
+        )
+    }
     fn id(&self) -> &str;
+}
+
+/// Code-owned compatibility-family derivation (never operator-supplied).
+/// Family identity = model family + dimension + dtype; provider aliases and
+/// hosting (hosted voyage-4-nano vs local open-weight) do not change it.
+/// Unknown models default to exact-model families until classified.
+pub fn derive_compatibility_family(
+    endpoint_kind: EmbedEndpointKind,
+    model: &str,
+    dimensions: usize,
+    dtype: OutputDType,
+) -> String {
+    let dtype = dtype.as_str();
+    if endpoint_kind == EmbedEndpointKind::Ollama {
+        return format!("ollama:{model}:{dimensions}:{dtype}");
+    }
+    // The voyage-4 text family shares one embedding space across
+    // large/base/lite/nano; every other model is its own space. Never
+    // inferred from equal dimensions.
+    let family_model = if model == "voyage-4" || model.starts_with("voyage-4-") {
+        "voyage-4"
+    } else {
+        model
+    };
+    format!("{family_model}:{dimensions}:{dtype}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -72,24 +262,45 @@ pub struct Route {
     pub bucket: Bucket,
     pub project_id: Option<String>,
     pub provider_id: String,
-    pub model: String,
+    pub endpoint_kind: EmbedEndpointKind,
+    pub document_model: String,
+    /// Equals `document_model` unless the route is asymmetric; asymmetric
+    /// pairs must share a compatibility family (enforced at config load).
+    pub query_model: String,
     pub dimensions: usize,
+    pub output_dtype: OutputDType,
+    pub compatibility_family: String,
 }
 
 impl Route {
+    /// Exact partition identity. Partitions are keyed by what produced the
+    /// stored vectors: provider alias + document model + dimension + dtype.
+    /// Float dtype hashes byte-identically to the pre-dtype algorithm so
+    /// existing partitions are not orphaned by this metadata change; any
+    /// non-float dtype forces a new partition.
     pub fn vector_route_id(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.provider_id.as_bytes());
         hasher.update([0]);
-        hasher.update(self.model.as_bytes());
+        hasher.update(self.document_model.as_bytes());
         hasher.update([0]);
         hasher.update(self.dimensions.to_string().as_bytes());
+        if self.output_dtype != OutputDType::Float {
+            hasher.update([0]);
+            hasher.update(self.output_dtype.as_str().as_bytes());
+        }
         let digest = hasher.finalize();
+        let dtype_component = if self.output_dtype == OutputDType::Float {
+            String::new()
+        } else {
+            format!("{}-", self.output_dtype.as_str())
+        };
         format!(
-            "{}-{}-{}-{:02x}{:02x}{:02x}{:02x}",
+            "{}-{}-{}-{}{:02x}{:02x}{:02x}{:02x}",
             sanitize_route_component(&self.provider_id),
-            sanitize_route_component(&self.model),
+            sanitize_route_component(&self.document_model),
             self.dimensions,
+            dtype_component,
             digest[0],
             digest[1],
             digest[2],
@@ -125,12 +336,87 @@ pub struct EmbedConfig {
     pub routes: RoutesConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Typed provider config for one alias. The alias (table key) is the
+/// route-facing provider id; `type` selects the implementation. Multiple
+/// aliases of the same type with different models are the point.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderAliasConfig {
+    VoyageText(voyage::VoyageConfig),
+    Ollama(ollama::OllamaConfig),
+}
+
+/// Provider alias map. Legacy `[embed.providers.voyage]` and
+/// `[embed.providers.ollama]` tables (no `type` field) still parse as their
+/// historical shapes; any other alias must carry an explicit `type`.
+/// Built-in aliases (`voyage`, `voyage_code`, `voyage_text`, `ollama`) are
+/// synthesized at lookup when the config does not define them.
+#[derive(Debug, Clone, Default)]
 pub struct ProviderConfigs {
-    #[serde(default)]
-    pub voyage: voyage::VoyageConfig,
-    #[serde(default)]
-    pub ollama: ollama::OllamaConfig,
+    aliases: BTreeMap<String, ProviderAliasConfig>,
+}
+
+impl ProviderConfigs {
+    pub fn get(&self, alias: &str) -> Option<ProviderAliasConfig> {
+        if let Some(config) = self.aliases.get(alias) {
+            return Some(config.clone());
+        }
+        builtin_alias(alias)
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, alias: impl Into<String>, config: ProviderAliasConfig) {
+        self.aliases.insert(alias.into(), config);
+    }
+}
+
+fn builtin_alias(alias: &str) -> Option<ProviderAliasConfig> {
+    match alias {
+        // `voyage` is the legacy default alias every existing partition id
+        // is keyed under; `voyage_code` is its explicit modern name.
+        VOYAGE_PROVIDER_ID | VOYAGE_CODE_PROVIDER_ID => Some(ProviderAliasConfig::VoyageText(
+            voyage::VoyageConfig::default(),
+        )),
+        VOYAGE_TEXT_PROVIDER_ID => Some(ProviderAliasConfig::VoyageText(
+            voyage::VoyageConfig::voyage4_prose_default(),
+        )),
+        OLLAMA_PROVIDER_ID => Some(ProviderAliasConfig::Ollama(ollama::OllamaConfig::default())),
+        _ => None,
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfigs {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let raw = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+        let mut aliases = BTreeMap::new();
+        for (alias, value) in raw {
+            let config = if value.get("type").is_some() {
+                value
+                    .try_into::<ProviderAliasConfig>()
+                    .map_err(|err| D::Error::custom(format!("provider alias `{alias}`: {err}")))?
+            } else if alias == VOYAGE_PROVIDER_ID {
+                value
+                    .try_into::<voyage::VoyageConfig>()
+                    .map(ProviderAliasConfig::VoyageText)
+                    .map_err(|err| D::Error::custom(format!("provider alias `{alias}`: {err}")))?
+            } else if alias == OLLAMA_PROVIDER_ID {
+                value
+                    .try_into::<ollama::OllamaConfig>()
+                    .map(ProviderAliasConfig::Ollama)
+                    .map_err(|err| D::Error::custom(format!("provider alias `{alias}`: {err}")))?
+            } else {
+                return Err(D::Error::custom(format!(
+                    "embedding provider alias `{alias}` is missing required field `type`"
+                )));
+            };
+            aliases.insert(alias, config);
+        }
+        Ok(Self { aliases })
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -212,26 +498,55 @@ impl EmbeddingRouter {
 
     pub fn route(&self, bucket: Bucket, project_id: Option<&str>) -> Result<Route> {
         let provider_id = self.provider_id(bucket, project_id);
-        let (model, dimensions) = match provider_id {
-            VOYAGE_PROVIDER_ID => (
-                self.config.providers.voyage.model.clone(),
-                voyage::VOYAGE_DIMENSIONS,
-            ),
-            OLLAMA_PROVIDER_ID => (
-                self.config.providers.ollama.model.clone(),
-                ollama::OLLAMA_DIMENSIONS,
-            ),
-            other => bail!(
-                "unknown embedding provider `{other}` for bucket {}",
+        let Some(alias_config) = self.config.providers.get(provider_id) else {
+            bail!(
+                "unknown embedding provider `{provider_id}` for bucket {}",
                 bucket.as_str()
-            ),
+            );
         };
+        let (endpoint_kind, document_model, query_model, dimensions, output_dtype) =
+            match &alias_config {
+                ProviderAliasConfig::VoyageText(config) => {
+                    config.validate(provider_id)?;
+                    let (document_model, query_model) = config.resolved_models(provider_id)?;
+                    (
+                        EmbedEndpointKind::Text,
+                        document_model,
+                        query_model,
+                        config.output_dimension,
+                        config.output_dtype,
+                    )
+                }
+                ProviderAliasConfig::Ollama(config) => (
+                    EmbedEndpointKind::Ollama,
+                    config.model.clone(),
+                    config.model.clone(),
+                    ollama::OLLAMA_DIMENSIONS,
+                    OutputDType::Float,
+                ),
+            };
+        let compatibility_family =
+            derive_compatibility_family(endpoint_kind, &document_model, dimensions, output_dtype);
+        let query_family =
+            derive_compatibility_family(endpoint_kind, &query_model, dimensions, output_dtype);
+        if compatibility_family != query_family {
+            bail!(
+                "embedding provider `{provider_id}`: document_model `{document_model}` \
+                 (family {compatibility_family}) and query_model `{query_model}` (family \
+                 {query_family}) are not in the same compatibility family; asymmetric \
+                 retrieval requires a shared vector space"
+            );
+        }
         Ok(Route {
             bucket,
             project_id: project_id.map(str::to_string),
             provider_id: provider_id.to_string(),
-            model,
+            endpoint_kind,
+            document_model,
+            query_model,
             dimensions,
+            output_dtype,
+            compatibility_family,
         })
     }
 
@@ -240,16 +555,19 @@ impl EmbeddingRouter {
         bucket: Bucket,
         project_id: Option<&str>,
     ) -> Result<Box<dyn EmbeddingProvider>> {
-        let provider_id = self.provider_id(bucket, project_id);
-        match provider_id {
-            VOYAGE_PROVIDER_ID => Ok(Box::new(voyage::VoyageProvider::from_config(
-                self.config.providers.voyage.clone(),
-            )?)),
-            OLLAMA_PROVIDER_ID => Ok(Box::new(ollama::OllamaProvider::from_config(
-                self.config.providers.ollama.clone(),
-            )?)),
-            other => bail!(
-                "unknown embedding provider `{other}` for bucket {}",
+        // route() owns validation (family agreement, dtype support);
+        // provider construction reuses its resolved metadata.
+        let route = self.route(bucket, project_id)?;
+        let provider_id = route.provider_id.as_str();
+        match self.config.providers.get(provider_id) {
+            Some(ProviderAliasConfig::VoyageText(config)) => Ok(Box::new(
+                voyage::VoyageProvider::from_config(provider_id.to_string(), &config)?,
+            )),
+            Some(ProviderAliasConfig::Ollama(config)) => Ok(Box::new(
+                ollama::OllamaProvider::from_config(provider_id.to_string(), &config)?,
+            )),
+            None => bail!(
+                "unknown embedding provider `{provider_id}` for bucket {}",
                 bucket.as_str()
             ),
         }
@@ -264,10 +582,9 @@ impl EmbeddingRouter {
     }
 
     pub fn rate_limit_per_min(&self, provider_id: &str) -> Option<u32> {
-        match provider_id {
-            VOYAGE_PROVIDER_ID => Some(self.config.providers.voyage.rate_limit_per_min),
-            OLLAMA_PROVIDER_ID => None,
-            _ => None,
+        match self.config.providers.get(provider_id) {
+            Some(ProviderAliasConfig::VoyageText(config)) => Some(config.rate_limit_per_min),
+            Some(ProviderAliasConfig::Ollama(_)) | None => None,
         }
     }
 
@@ -279,9 +596,8 @@ impl EmbeddingRouter {
         let route = self.route(bucket, project_id)?;
         let default = self.route(bucket, None)?;
         let queue_route = if project_id.is_some()
-            && (route.provider_id != default.provider_id
-                || route.model != default.model
-                || route.dimensions != default.dimensions)
+            && (route.vector_route_id() != default.vector_route_id()
+                || route.query_model != default.query_model)
         {
             format!("{}:{}", bucket.as_str(), project_id.unwrap_or_default())
         } else {
@@ -423,6 +739,209 @@ mod tests {
         let route = router.route(Bucket::Knowledge, None).unwrap();
         assert_eq!(route.provider_id, VOYAGE_PROVIDER_ID);
         assert_eq!(route.dimensions, voyage::VOYAGE_DIMENSIONS);
+        assert_eq!(route.document_model, "voyage-code-3");
+        assert_eq!(route.query_model, "voyage-code-3");
+        assert_eq!(route.endpoint_kind, EmbedEndpointKind::Text);
+        assert_eq!(route.output_dtype, OutputDType::Float);
+        assert_eq!(route.compatibility_family, "voyage-code-3:1024:float");
+    }
+
+    /// The default route's partition id must not move: this is the live
+    /// partition every pre-existing vector sits in. Golden, not derived —
+    /// if this changes, deployed corpora orphan silently.
+    #[test]
+    fn default_vector_route_id_is_stable_across_metadata_growth() {
+        let route = EmbeddingRouter::default()
+            .route(Bucket::Knowledge, None)
+            .unwrap();
+        assert_eq!(
+            route.vector_route_id(),
+            "voyage-voyage-code-3-1024-0103683e"
+        );
+    }
+
+    #[test]
+    fn non_float_dtype_forces_a_new_partition_and_family() {
+        let float = EmbeddingRouter::default()
+            .route(Bucket::Knowledge, None)
+            .unwrap();
+        let quantized = Route {
+            output_dtype: OutputDType::Int8,
+            compatibility_family: derive_compatibility_family(
+                float.endpoint_kind,
+                &float.document_model,
+                float.dimensions,
+                OutputDType::Int8,
+            ),
+            ..float.clone()
+        };
+        assert_ne!(float.vector_route_id(), quantized.vector_route_id());
+        assert_ne!(float.compatibility_family, quantized.compatibility_family);
+        assert!(quantized.vector_route_id().contains("int8"));
+    }
+
+    #[test]
+    fn legacy_voyage_and_ollama_tables_still_parse() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.providers.voyage]
+model = "voyage-code-2"
+rate_limit_per_min = 500
+
+[embed.providers.ollama]
+model = "custom-local"
+
+[embed.routes]
+notes = "ollama"
+"#,
+        )
+        .unwrap();
+        let route = router.route(Bucket::Knowledge, None).unwrap();
+        assert_eq!(route.provider_id, VOYAGE_PROVIDER_ID);
+        assert_eq!(route.document_model, "voyage-code-2");
+        assert_eq!(router.rate_limit_per_min(VOYAGE_PROVIDER_ID), Some(500));
+        let notes = router.route(Bucket::Notes, None).unwrap();
+        assert_eq!(notes.document_model, "custom-local");
+        assert_eq!(notes.endpoint_kind, EmbedEndpointKind::Ollama);
+        assert_eq!(notes.compatibility_family, "ollama:custom-local:768:float");
+    }
+
+    /// Two Voyage-backed aliases with different models — the core Layer 0
+    /// capability the old `ProviderConfigs { voyage, ollama }` shape could
+    /// not express.
+    #[test]
+    fn two_voyage_aliases_route_to_different_models_and_partitions() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.providers.voyage_code]
+type = "voyage_text"
+model = "voyage-code-3"
+
+[embed.providers.voyage_text]
+type = "voyage_text"
+document_model = "voyage-4-large"
+query_model = "voyage-4-lite"
+
+[embed.routes]
+code = "voyage_code"
+knowledge = "voyage_text"
+"#,
+        )
+        .unwrap();
+        let code = router.route(Bucket::Code, None).unwrap();
+        let knowledge = router.route(Bucket::Knowledge, None).unwrap();
+        assert_eq!(code.document_model, "voyage-code-3");
+        assert_eq!(knowledge.document_model, "voyage-4-large");
+        assert_eq!(knowledge.query_model, "voyage-4-lite");
+        assert_eq!(knowledge.compatibility_family, "voyage-4:1024:float");
+        assert_ne!(code.vector_route_id(), knowledge.vector_route_id());
+        assert_ne!(code.compatibility_family, knowledge.compatibility_family);
+    }
+
+    #[test]
+    fn asymmetric_pair_across_families_is_rejected_at_load() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.providers.bad_pair]
+type = "voyage_text"
+document_model = "voyage-4-large"
+query_model = "voyage-code-3"
+
+[embed.routes]
+knowledge = "bad_pair"
+"#,
+        )
+        .unwrap();
+        let err = router.route(Bucket::Knowledge, None).unwrap_err();
+        assert!(
+            err.to_string().contains("compatibility family"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_route_alias_is_an_error_not_a_fallback() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes]
+knowledge = "no_such_provider"
+"#,
+        )
+        .unwrap();
+        let err = router.route(Bucket::Knowledge, None).unwrap_err();
+        assert!(err.to_string().contains("no_such_provider"));
+    }
+
+    #[test]
+    fn new_alias_without_type_is_rejected() {
+        let err = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.providers.mystery]
+model = "who-knows"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing required field `type`")
+                || err
+                    .root_cause()
+                    .to_string()
+                    .contains("missing required field `type`"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn builtin_aliases_resolve_without_config() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes]
+knowledge = "voyage_text"
+code = "voyage_code"
+"#,
+        )
+        .unwrap();
+        let knowledge = router.route(Bucket::Knowledge, None).unwrap();
+        assert_eq!(knowledge.document_model, "voyage-4-large");
+        assert_eq!(knowledge.query_model, "voyage-4-lite");
+        assert_eq!(knowledge.compatibility_family, "voyage-4:1024:float");
+        let code = router.route(Bucket::Code, None).unwrap();
+        assert_eq!(code.document_model, "voyage-code-3");
+    }
+
+    #[test]
+    fn compatibility_family_derivation_matrix() {
+        let cases = [
+            ("voyage-4", "voyage-4:1024:float"),
+            ("voyage-4-large", "voyage-4:1024:float"),
+            ("voyage-4-lite", "voyage-4:1024:float"),
+            ("voyage-4-nano", "voyage-4:1024:float"),
+            ("voyage-code-3", "voyage-code-3:1024:float"),
+            ("voyage-context-4", "voyage-context-4:1024:float"),
+            ("voyage-multimodal-3.5", "voyage-multimodal-3.5:1024:float"),
+            ("voyage-40", "voyage-40:1024:float"), // prefix must not overmatch
+        ];
+        for (model, expected) in cases {
+            assert_eq!(
+                derive_compatibility_family(
+                    EmbedEndpointKind::Text,
+                    model,
+                    1024,
+                    OutputDType::Float
+                ),
+                expected,
+                "model {model}"
+            );
+        }
+        assert_eq!(
+            derive_compatibility_family(
+                EmbedEndpointKind::Text,
+                "voyage-4-large",
+                512,
+                OutputDType::Binary
+            ),
+            "voyage-4:512:binary"
+        );
     }
 
     #[test]

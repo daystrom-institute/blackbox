@@ -2,9 +2,12 @@
 //!
 //! Query strings repeat heavily across searches (agents re-running the same
 //! probe, retry loops, multi-route fan-out), and the embed call is a blocking
-//! HTTP round-trip per route. The cache is keyed by (provider, model, query)
-//! so a route change or model bump misses naturally; vectors for the same
-//! provider+model are identical regardless of which bucket routed there.
+//! HTTP round-trip per route. The cache is keyed by the exact query encoder
+//! (provider, query_model, dim, dtype, query) so a route change, model bump,
+//! or dtype change misses naturally; vectors for the same encoder are
+//! identical regardless of which bucket routed there. Compatibility families
+//! govern which partitions a cached vector may SEARCH, never cache identity —
+//! two same-family query models still produce different vectors.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -13,7 +16,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 
-use super::{Bucket, EmbeddingProvider, EmbeddingRouter};
+use super::{Bucket, EmbedInput, EmbedInputType, EmbeddingProvider, EmbeddingRouter};
 
 const CACHE_CAP: usize = 256;
 
@@ -72,7 +75,14 @@ pub fn embed_query_cached(
     query: &str,
 ) -> Result<Vec<f32>> {
     let route = router.route(bucket, project_id)?;
-    let key = format!("{}:{}:{}", route.provider_id, route.model, query);
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        route.provider_id,
+        route.query_model,
+        route.dimensions,
+        route.output_dtype.as_str(),
+        query
+    );
     embed_query_cached_with(&key, || {
         let provider = router.route_for(bucket, project_id)?;
         let started = Instant::now();
@@ -80,7 +90,7 @@ pub fn embed_query_cached(
         tracing::debug!(
             target: "blackbox::embed",
             provider = %route.provider_id,
-            model = %route.model,
+            model = %route.query_model,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             "query embed cache miss"
         );
@@ -104,18 +114,21 @@ fn embed_query_cached_with(
 }
 
 fn embed_single_blocking(provider: &dyn EmbeddingProvider, query: &str) -> Result<Vec<f32>> {
-    let texts = vec![query.to_string()];
-    let vectors = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts))),
+    let inputs = vec![EmbedInput::Text(query.to_string())];
+    let outputs = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(provider.embed_batch(&inputs, EmbedInputType::Query))
+        }),
         Err(_) => {
             let runtime = tokio::runtime::Runtime::new().context("creating embedding runtime")?;
-            runtime.block_on(provider.embed_batch(&texts))
+            runtime.block_on(provider.embed_batch(&inputs, EmbedInputType::Query))
         }
     }?;
-    vectors
+    outputs
         .into_iter()
         .next()
-        .context("embedding provider returned no query vector")
+        .context("embedding provider returned no query vector")?
+        .into_single()
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 ---
 title: "Multimodal and Embedding Routing Design"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - corpus
@@ -493,7 +493,16 @@ Never:
 
 ## Migration Plan
 
-Phase 1 — Routing substrate (Layer 0):
+Phase 1 — Routing substrate (Layer 0) — **shipped 2026-07-10**
+(`crates/bbox-embed`): typed provider alias map with legacy parsing,
+role-marked `embed_batch(&[EmbedInput], EmbedInputType)`, route metadata
+with endpoint kind / dtype / derived compatibility family, asymmetric
+document/query models with load-time family enforcement, encoder-exact
+query-cache key, and status reporting. Float partition ids intentionally
+unchanged (dtype joins the hash only when non-float) so no partition
+orphaned. Non-float `output_dtype` config is rejected until quantized
+response decoding exists; the family/partition machinery already honors
+dtype. Original scope for the phase:
 
 - Provider alias map with `type`; legacy `[embed.providers.voyage]` still
   parses.

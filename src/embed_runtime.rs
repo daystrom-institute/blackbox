@@ -777,7 +777,7 @@ pub(crate) fn agent_manifest_embedding(
         .ok();
     let model = route
         .as_ref()
-        .map(|route| route.model.clone())
+        .map(|route| route.document_model.clone())
         .unwrap_or_else(|| "unavailable".into());
     let vector_route = route.map(|route| route.vector_route_id());
     let primary = agent_component_entity_id(agent, AgentManifestComponent::Primary);

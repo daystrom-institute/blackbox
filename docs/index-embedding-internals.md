@@ -119,9 +119,12 @@ Common routes:
 | `notes` | Side-channel notes |
 | `transcripts` | Transcript blocks |
 
-Each route is keyed by provider, model, and dimension. A dimension
-mismatch is a hard error because old vectors cannot be mixed with new
-vectors safely.
+Each route is keyed by provider alias, document model, dimension, and
+output dtype (float is omitted from the partition id for backward
+compatibility). A dimension mismatch is a hard error because old vectors
+cannot be mixed with new vectors safely, and vectors are only comparable
+within one compatibility family (model family + dimension + dtype —
+equal dimensions across different models prove nothing).
 
 Operator tools:
 
@@ -137,8 +140,36 @@ Provider config lives in `embed.toml` under the platform config dir:
 ~/Library/Application Support/blackbox/embed.toml    (macOS)
 ```
 
-Voyage uses `voyage-code-3` by default. Ollama can be used for local
-routes such as `nomic-embed-text`.
+Providers are declared as typed aliases; several aliases of the same
+type with different models can coexist:
+
+```toml
+[embed.providers.voyage_code]
+type = "voyage_text"
+model = "voyage-code-3"
+
+[embed.providers.voyage_text]
+type = "voyage_text"
+document_model = "voyage-4-large"   # one-time indexing cost
+query_model = "voyage-4-lite"       # per-search cost; same family enforced
+output_dimension = 1024
+
+[embed.providers.ollama]
+type = "ollama"
+endpoint = "http://localhost:11434"
+model = "nomic-embed-text"
+
+[embed.routes]
+code = "voyage_code"
+knowledge = "voyage_text"
+```
+
+Legacy `[embed.providers.voyage]` / `[embed.providers.ollama]` tables
+without a `type` field still parse. The default (unconfigured) alias is
+`voyage` with `voyage-code-3`. Asymmetric `document_model`/`query_model`
+pairs must derive the same compatibility family or config load fails.
+Stored corpus content embeds with `input_type=document`; live queries
+embed with `input_type=query`.
 
 ## Embedding queue
 
@@ -161,6 +192,8 @@ whole batch.
 |---|---|
 | `available` | Provider is usable for the route |
 | `provider`, `model`, `dim` | Active vector partition identity |
+| `query_model` | Query-side model when the route is asymmetric |
+| `endpoint_kind`, `output_dtype`, `compatibility_family` | Route family identity |
 | `indexed_count` | Stored vector count |
 | `queue_depth` | Pending source docs |
 | `retried_count` | Retry pressure |

@@ -9,7 +9,10 @@ use rmcp::schemars;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use super::{Bucket, EmbeddingProvider, EmbeddingRouter};
+use super::{
+    Bucket, EmbedEndpointKind, EmbedInput, EmbedInputType, EmbedOutput, EmbeddingProvider,
+    EmbeddingRouter,
+};
 
 const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
@@ -49,7 +52,42 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<NonRetryableBatchError>().is_some())
 }
 
+/// Seed a route's status with the provider's routing identity so
+/// `bbox_embed_status` reports what actually embeds and searches the route.
+fn provider_route_status(provider: &dyn EmbeddingProvider) -> RouteStatus {
+    let query_model = (provider.query_model() != provider.document_model())
+        .then(|| provider.query_model().to_string());
+    RouteStatus {
+        provider: Some(provider.id().to_string()),
+        model: Some(provider.document_model().to_string()),
+        query_model,
+        endpoint_kind: Some(provider.endpoint_kind()),
+        output_dtype: Some(provider.output_dtype().as_str().to_string()),
+        compatibility_family: Some(provider.compatibility_family()),
+        dim: Some(provider.dimensions()),
+        ..RouteStatus::default()
+    }
+}
+
 type ProviderSpec = (String, Arc<dyn EmbeddingProvider>, Option<u32>, String);
+
+/// Queue workers embed stored corpus content: every batch is `Text` inputs
+/// with the `Document` retrieval role. One vector per text.
+async fn embed_document_texts(
+    provider: &dyn EmbeddingProvider,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let inputs = texts
+        .iter()
+        .map(|text| EmbedInput::Text(text.clone()))
+        .collect::<Vec<_>>();
+    provider
+        .embed_batch(&inputs, EmbedInputType::Document)
+        .await?
+        .into_iter()
+        .map(EmbedOutput::into_single)
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct EmbedRequest {
@@ -67,6 +105,16 @@ pub struct RouteStatus {
     pub health_reason: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Model used for live queries when the route is asymmetric; absent
+    /// when it equals `model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_kind: Option<EmbedEndpointKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_dtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_family: Option<String>,
     pub dim: Option<usize>,
     pub source_count: Option<u64>,
     pub indexed_count: u64,
@@ -103,6 +151,10 @@ impl Default for RouteStatus {
             health_reason: None,
             provider: None,
             model: None,
+            query_model: None,
+            endpoint_kind: None,
+            output_dtype: None,
+            compatibility_family: None,
             dim: None,
             source_count: None,
             indexed_count: 0,
@@ -416,12 +468,7 @@ impl EmbedQueueHandle {
         };
         let provider: Arc<dyn EmbeddingProvider> = provider.into();
         let rate_limit_per_min = router.rate_limit_per_min(provider.id());
-        let status = RouteStatus {
-            provider: Some(provider.id().to_string()),
-            model: Some(provider.model_name().to_string()),
-            dim: Some(provider.dimensions()),
-            ..RouteStatus::default()
-        };
+        let status = provider_route_status(provider.as_ref());
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner
             .statuses
@@ -511,12 +558,7 @@ impl EmbedQueueHandle {
         let statuses = Arc::new(RwLock::new(BTreeMap::new()));
         let mut senders = BTreeMap::new();
         for (route, provider, rate_limit_per_min, vector_route) in providers {
-            let status = RouteStatus {
-                provider: Some(provider.id().to_string()),
-                model: Some(provider.model_name().to_string()),
-                dim: Some(provider.dimensions()),
-                ..RouteStatus::default()
-            };
+            let status = provider_route_status(provider.as_ref());
             statuses.write().entry(route.clone()).or_insert(status);
             let (tx, rx) = mpsc::unbounded_channel();
             let spec = WorkerSpec {
@@ -630,7 +672,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
             for batch in batches {
                 limiter.acquire(1).await;
                 let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
-                let result = spec.provider.embed_batch(&texts).await;
+                let result = embed_document_texts(spec.provider.as_ref(), &texts).await;
                 process_batch_outcome(
                     &spec,
                     &mut retry_batch,
@@ -652,7 +694,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                 .iter()
                 .map(|batch| {
                     let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
-                    async move { provider.embed_batch(&texts).await }
+                    async move { embed_document_texts(provider.as_ref(), &texts).await }
                 })
                 .collect::<Vec<_>>();
             let outcomes = futures::future::join_all(futures).await;
@@ -719,7 +761,7 @@ async fn process_batch_outcome(
                 vector_route = %spec.vector_route,
                 vectors = batch.len(),
                 dimensions = spec.provider.dimensions(),
-                model = spec.provider.model_name(),
+                model = spec.provider.document_model(),
                 "embedding vectors persisted"
             );
             mark_success(
@@ -803,7 +845,7 @@ async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
         }
         budget -= 1;
         let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
-        match spec.provider.embed_batch(&texts).await {
+        match embed_document_texts(spec.provider.as_ref(), &texts).await {
             Ok(vectors) => {
                 if spec.persist_vectors {
                     if let Err(err) = persist_vectors(spec, &batch, vectors) {
@@ -1246,7 +1288,11 @@ impl FailingProvider {
 
 #[async_trait]
 impl EmbeddingProvider for FailingProvider {
-    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn embed_batch(
+        &self,
+        _inputs: &[EmbedInput],
+        _input_type: EmbedInputType,
+    ) -> Result<Vec<EmbedOutput>> {
         Err(anyhow!(self.error.clone()))
     }
 
@@ -1254,8 +1300,12 @@ impl EmbeddingProvider for FailingProvider {
         0
     }
 
-    fn model_name(&self) -> &str {
+    fn document_model(&self) -> &str {
         "unavailable"
+    }
+
+    fn endpoint_kind(&self) -> EmbedEndpointKind {
+        EmbedEndpointKind::Text
     }
 
     fn id(&self) -> &str {
@@ -1292,20 +1342,31 @@ mod tests {
 
     #[async_trait]
     impl EmbeddingProvider for MockProvider {
-        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        async fn embed_batch(
+            &self,
+            inputs: &[EmbedInput],
+            _input_type: EmbedInputType,
+        ) -> Result<Vec<EmbedOutput>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(anyhow!("provider unavailable: token redacted"));
             }
-            Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+            Ok(inputs
+                .iter()
+                .map(|_| EmbedOutput::single(vec![0.0_f32; 4]))
+                .collect())
         }
 
         fn dimensions(&self) -> usize {
             4
         }
 
-        fn model_name(&self) -> &str {
+        fn document_model(&self) -> &str {
             "mock"
+        }
+
+        fn endpoint_kind(&self) -> EmbedEndpointKind {
+            EmbedEndpointKind::Text
         }
 
         fn id(&self) -> &str {
@@ -1365,21 +1426,35 @@ mod tests {
 
         #[async_trait]
         impl EmbeddingProvider for PoisonProvider {
-            async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            async fn embed_batch(
+                &self,
+                inputs: &[EmbedInput],
+                _input_type: EmbedInputType,
+            ) -> Result<Vec<EmbedOutput>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                if texts.iter().any(|text| text == "POISON") {
+                if inputs
+                    .iter()
+                    .any(|input| matches!(input, EmbedInput::Text(text) if text == "POISON"))
+                {
                     return Err(anyhow::Error::new(NonRetryableBatchError)
                         .context("voyage embedding request failed: HTTP 400 body=Input cannot contain empty strings"));
                 }
-                Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+                Ok(inputs
+                    .iter()
+                    .map(|_| EmbedOutput::single(vec![0.0_f32; 4]))
+                    .collect())
             }
 
             fn dimensions(&self) -> usize {
                 4
             }
 
-            fn model_name(&self) -> &str {
+            fn document_model(&self) -> &str {
                 "mock"
+            }
+
+            fn endpoint_kind(&self) -> EmbedEndpointKind {
+                EmbedEndpointKind::Text
             }
 
             fn id(&self) -> &str {

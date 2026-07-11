@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::EmbeddingProvider;
+use super::{
+    EmbedEndpointKind, EmbedInput, EmbedInputType, EmbedOutput, EmbeddingProvider, OutputDType,
+    UnsupportedEmbedInput, derive_compatibility_family,
+};
 
 pub const OLLAMA_DIMENSIONS: usize = 768;
 const DEFAULT_MODEL: &str = "nomic-embed-text";
@@ -39,6 +42,7 @@ fn default_model() -> String {
 pub struct OllamaProvider {
     client: reqwest::Client,
     config: OllamaConfig,
+    id: String,
 }
 
 impl std::fmt::Debug for OllamaProvider {
@@ -50,13 +54,14 @@ impl std::fmt::Debug for OllamaProvider {
 }
 
 impl OllamaProvider {
-    pub fn from_config(config: OllamaConfig) -> Result<Self> {
+    pub fn from_config(id: String, config: &OllamaConfig) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
                 .context("building ollama HTTP client")?,
-            config,
+            config: config.clone(),
+            id,
         })
     }
 
@@ -67,13 +72,31 @@ impl OllamaProvider {
 
 #[async_trait]
 impl EmbeddingProvider for OllamaProvider {
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// Ollama's embed API has no retrieval-role marking; `input_type` is
+    /// accepted and ignored.
+    async fn embed_batch(
+        &self,
+        inputs: &[EmbedInput],
+        _input_type: EmbedInputType,
+    ) -> Result<Vec<EmbedOutput>> {
+        let mut texts = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match input {
+                EmbedInput::Text(text) => texts.push(text.clone()),
+                other => {
+                    return Err(anyhow::Error::new(UnsupportedEmbedInput {
+                        provider_kind: EmbedEndpointKind::Ollama,
+                        input_kind: other.kind(),
+                    }));
+                }
+            }
+        }
         let response = self
             .client
             .post(self.embed_url())
             .json(&OllamaRequest {
                 model: &self.config.model,
-                input: texts,
+                input: &texts,
             })
             .send()
             .await
@@ -96,19 +119,40 @@ impl EmbeddingProvider for OllamaProvider {
                 );
             }
         }
-        Ok(vectors)
+        Ok(vectors.into_iter().map(EmbedOutput::single).collect())
     }
 
     fn dimensions(&self) -> usize {
         OLLAMA_DIMENSIONS
     }
 
-    fn model_name(&self) -> &str {
+    fn document_model(&self) -> &str {
         &self.config.model
     }
 
+    fn query_model(&self) -> &str {
+        &self.config.model
+    }
+
+    fn endpoint_kind(&self) -> EmbedEndpointKind {
+        EmbedEndpointKind::Ollama
+    }
+
+    fn output_dtype(&self) -> OutputDType {
+        OutputDType::Float
+    }
+
+    fn compatibility_family(&self) -> String {
+        derive_compatibility_family(
+            EmbedEndpointKind::Ollama,
+            &self.config.model,
+            OLLAMA_DIMENSIONS,
+            OutputDType::Float,
+        )
+    }
+
     fn id(&self) -> &str {
-        super::OLLAMA_PROVIDER_ID
+        &self.id
     }
 }
 
@@ -152,21 +196,39 @@ mod tests {
             .await
             .unwrap();
         });
-        let provider = OllamaProvider::from_config(OllamaConfig {
-            endpoint: format!("http://{addr}"),
-            ..OllamaConfig::default()
-        })
+        let provider = OllamaProvider::from_config(
+            super::super::OLLAMA_PROVIDER_ID.into(),
+            &OllamaConfig {
+                endpoint: format!("http://{addr}"),
+                ..OllamaConfig::default()
+            },
+        )
         .unwrap();
         assert_eq!(provider.id(), super::super::OLLAMA_PROVIDER_ID);
-        assert_eq!(provider.model_name(), DEFAULT_MODEL);
+        assert_eq!(provider.document_model(), DEFAULT_MODEL);
+        assert_eq!(provider.query_model(), DEFAULT_MODEL);
         assert_eq!(provider.dimensions(), OLLAMA_DIMENSIONS);
-        let vectors = provider.embed_batch(&["hello".into()]).await.unwrap();
-        assert_eq!(vectors[0].len(), OLLAMA_DIMENSIONS);
+        assert_eq!(
+            provider.compatibility_family(),
+            "ollama:nomic-embed-text:768:float"
+        );
+        let outputs = provider
+            .embed_batch(
+                &[EmbedInput::Text("hello".into())],
+                EmbedInputType::Document,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outputs[0].vectors[0].len(), OLLAMA_DIMENSIONS);
     }
 
     #[test]
     fn debug_omits_client_internals() {
-        let provider = OllamaProvider::from_config(OllamaConfig::default()).unwrap();
+        let provider = OllamaProvider::from_config(
+            super::super::OLLAMA_PROVIDER_ID.into(),
+            &OllamaConfig::default(),
+        )
+        .unwrap();
         let rendered = format!("{provider:?}");
         assert!(rendered.contains("OllamaProvider"));
         assert!(rendered.contains("config"));
