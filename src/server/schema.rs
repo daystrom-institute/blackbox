@@ -16,6 +16,33 @@ impl BlackboxServer {
                 BTreeMap::new()
             }
         };
+        // transcript entities are deliberately excluded from
+        // entity_type_counts_active (they're an observed history lane, not
+        // part of the active knowledge graph), so seed the count from a
+        // cheap tantivy doc_type query instead (gap-edc84378: this used to
+        // fall through to 0 for every caller).
+        match self.state.idx.try_read() {
+            Some(idx) => match idx.doc_type_count("transcript") {
+                Ok(count) => {
+                    counts.insert("transcript".into(), count);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "blackbox::tool",
+                        tool = "bbox_describe_schema",
+                        error = %err,
+                        "transcript doc_type count query failed; omitting transcript count"
+                    );
+                }
+            },
+            None => {
+                tracing::warn!(
+                    target: "blackbox::tool",
+                    tool = "bbox_describe_schema",
+                    "TranscriptIndex is busy; omitting transcript count"
+                );
+            }
+        }
         counts.insert("knowledge".into(), self.state.kb.read().all_entries().len());
         counts.insert("thread".into(), self.state.threads.read().all().len());
         counts.insert("note".into(), self.state.notes.read().all().len());

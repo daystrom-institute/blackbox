@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Count, DocSetCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query as QueryTrait, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
@@ -334,6 +334,22 @@ impl TranscriptIndex {
         self.reader.searcher().num_docs()
     }
 
+    /// Cheap count of docs matching a single `doc_type` term, via a
+    /// `TermQuery` + `Count` collector -- no stored-doc streaming. Used by
+    /// `bbox_describe_schema`'s transcript vertex count: transcript entities
+    /// are deliberately excluded from `EdgeIndex::entity_type_counts_active`
+    /// (they're an observed history lane, not part of the active knowledge
+    /// graph), so describe_schema needs a tantivy-backed count instead of an
+    /// edge-index one.
+    pub fn doc_type_count(&self, doc_type: &str) -> Result<usize> {
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.doc_type, doc_type),
+            IndexRecordOption::Basic,
+        );
+        Ok(searcher.search(&query, &Count)?)
+    }
+
     /// Stream every doc's edge-projection fields through `f`, walking each
     /// segment's doc store in storage order (sequential block decompression,
     /// deleted docs skipped via the alive bitset). One decompressed block and
@@ -537,9 +553,18 @@ impl TranscriptIndex {
             Term::from_field_text(self.fields.session_id, session_id),
             IndexRecordOption::Basic,
         );
-        for (_score, addr) in
-            searcher.search(&query, &tantivy::collector::TopDocs::with_limit(500))?
-        {
+        // byte_offset is STORED-only (not INDEXED -- see build_schema), so
+        // there's no query term to match it exactly; every doc in the
+        // session has to be checked in memory. DocSetCollector (unscored,
+        // unbounded) is load-bearing here: a scored TopDocs::with_limit(N)
+        // caps the candidate set at N docs in an arbitrary tie-broken order
+        // (every doc in a STRING-field TermQuery scores identically), so any
+        // session with more than N chunks silently drops matches beyond the
+        // cap. That's why bbox_inspect_entity 404'd real transcript refs
+        // hybrid_search had just returned (gap-edc84378): the target doc
+        // simply wasn't among the first 500 by tie-broken score.
+        let matches = searcher.search(&query, &DocSetCollector)?;
+        for addr in matches {
             let doc: TantivyDocument = searcher.doc(addr)?;
             if optional_text(&doc, self.fields.account).as_deref() != Some(provider) {
                 continue;
@@ -888,6 +913,98 @@ mod tests {
             !ids.contains(&"claude:sess-legacy:1234:0"),
             "unprefixed transcript id must not leak through: {ids:?}"
         );
+    }
+
+    #[test]
+    fn doc_type_count_counts_only_the_requested_doc_type() {
+        // gap-edc84378: bbox_describe_schema's transcript count comes from
+        // this cheap TermQuery + Count collector, not from EdgeIndex (which
+        // deliberately excludes transcript from its active counts).
+        let dir = tempfile::tempdir().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+
+        for (idx, session) in ["sess-1", "sess-2"].into_iter().enumerate() {
+            let mut transcript = TantivyDocument::new();
+            transcript.add_text(fields.doc_type, "transcript");
+            transcript.add_text(fields.account, "claude");
+            transcript.add_text(fields.session_id, session);
+            transcript.add_u64(fields.byte_offset, idx as u64);
+            writer.add_document(transcript).unwrap();
+        }
+        let mut chunk = TantivyDocument::new();
+        chunk.add_text(fields.doc_type, "project_file");
+        chunk.add_text(fields.file_path, "src/lib.rs");
+        chunk.add_text(fields.entity_id, "pfile:proj1234:src/lib.rs:0");
+        writer.add_document(chunk).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        assert_eq!(index.doc_type_count("transcript").unwrap(), 2);
+        assert_eq!(index.doc_type_count("project_file").unwrap(), 1);
+        assert_eq!(index.doc_type_count("commit").unwrap(), 0);
+    }
+
+    #[test]
+    fn transcript_properties_finds_docs_beyond_the_old_top_docs_cap() {
+        // gap-edc84378 fold: transcript_properties used to scan a session's
+        // docs via TopDocs::with_limit(500), a scored collector over a
+        // STRING TermQuery where every doc scores identically -- so any
+        // session with more than 500 chunks could silently drop matches
+        // beyond the cap. Verified against the old TopDocs(500) code: this
+        // 600-doc session's *first*-inserted doc (offset 0) was exactly the
+        // one it dropped (tantivy's tie-break favors later doc ids), and
+        // that's the doc this test resolves.
+        let dir = tempfile::tempdir().unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+
+        const DOC_COUNT: u64 = 600;
+        for offset in 0..DOC_COUNT {
+            let mut transcript = TantivyDocument::new();
+            transcript.add_text(fields.doc_type, "transcript");
+            transcript.add_text(fields.account, "claude");
+            transcript.add_text(fields.session_id, "sess-big");
+            transcript.add_u64(fields.byte_offset, offset);
+            writer.add_document(transcript).unwrap();
+        }
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+
+        let first = index
+            .transcript_properties("claude", "sess-big", 0)
+            .unwrap();
+        assert!(
+            first.is_some(),
+            "expected to resolve the first-inserted doc in a 600-doc session"
+        );
+
+        // A byte_offset that genuinely has no matching doc must still 404 --
+        // the fix must not fabricate matches for arbitrary offsets.
+        let missing = index
+            .transcript_properties("claude", "sess-big", DOC_COUNT)
+            .unwrap();
+        assert!(missing.is_none());
     }
 
     #[test]

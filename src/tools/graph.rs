@@ -478,4 +478,101 @@ mod tests {
         assert_eq!(by_adapter["direct"].as_array().unwrap().len(), 1);
         assert_eq!(by_adapter["badgey"].as_array().unwrap().len(), 1);
     }
+
+    /// gap-edc84378: transcript entities are deliberately excluded from
+    /// EdgeIndex's active counts, so bbox_describe_schema's transcript
+    /// population_count must come from a tantivy doc_type count instead. This
+    /// used to fall through to 0 for every caller.
+    #[test]
+    fn bbox_describe_schema_reports_transcript_count_from_tantivy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        {
+            let idx = server.state.idx.write();
+            let fields = idx.field_handles();
+            let mut writer = idx.index_handle().writer(50_000_000).unwrap();
+            let mut transcript = tantivy::TantivyDocument::new();
+            transcript.add_text(fields.doc_type, "transcript");
+            transcript.add_text(fields.account, "claude");
+            transcript.add_text(fields.session_id, "sess-1");
+            transcript.add_u64(fields.byte_offset, 0);
+            writer.add_document(transcript).unwrap();
+            writer.commit().unwrap();
+            idx.reader_reload_for_test();
+        }
+
+        let result = server.bbox_describe_schema(Parameters(DescribeSchemaParams::default()));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let vertex_types = body["vertex_types"].as_array().unwrap();
+        let transcript_vertex = vertex_types
+            .iter()
+            .find(|v| v["entity_type"] == "transcript")
+            .expect("transcript vertex type present");
+        assert!(
+            transcript_vertex["population_count"].as_u64().unwrap() >= 1,
+            "expected transcript population_count >= 1, got {transcript_vertex}"
+        );
+    }
+
+    /// gap-edc84378 fold: bbox_inspect_entity used to 404 real transcript
+    /// refs hybrid_search had just returned, because
+    /// TranscriptIndex::transcript_properties capped its per-session doc
+    /// scan at a fixed size (fixed in bbox-corpus-index, see its doc
+    /// comment). A transcript ref with a matching tantivy doc must inspect
+    /// OK and carry the synthesized IN_SESSION out-edge; one with no
+    /// matching doc must still 404 -- the eval oracle depends on genuinely
+    /// dead refs staying dead.
+    #[tokio::test]
+    async fn bbox_inspect_entity_resolves_transcript_doc_and_synthesizes_in_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        {
+            let idx = server.state.idx.write();
+            let fields = idx.field_handles();
+            let mut writer = idx.index_handle().writer(50_000_000).unwrap();
+            let mut transcript = tantivy::TantivyDocument::new();
+            transcript.add_text(fields.doc_type, "transcript");
+            transcript.add_text(fields.account, "claude");
+            transcript.add_text(fields.session_id, "sess-1");
+            transcript.add_u64(fields.byte_offset, 42);
+            transcript.add_text(fields.role, "assistant");
+            writer.add_document(transcript).unwrap();
+            writer.commit().unwrap();
+            idx.reader_reload_for_test();
+        }
+
+        let inspect = |entity_ref: String| {
+            let server = server.clone();
+            async move {
+                let result = server
+                    .bbox_inspect_entity(Parameters(InspectEntityParams {
+                        entity_ref,
+                        edge_types: None,
+                        direction: None,
+                        per_type_limit: Some(5),
+                        property_mode: Some("full".into()),
+                    }))
+                    .await;
+                serde_json::from_str::<serde_json::Value>(&extract_text(&result)).unwrap()
+            }
+        };
+
+        let found = inspect("transcript:claude:sess-1:42:0".to_string()).await;
+        assert_eq!(found["status"], "ok", "expected ok, got {found}");
+        assert_eq!(found["properties"]["role"], "assistant");
+        let out_edges = found["edges"]["out"].as_array().unwrap();
+        assert!(
+            out_edges
+                .iter()
+                .any(|edge| edge["kind"] == "IN_SESSION"
+                    && edge["target"] == "session:claude:sess-1"),
+            "expected synthesized IN_SESSION out-edge, got {out_edges:?}"
+        );
+
+        // A ref whose (session, byte_offset) matches no doc must stay
+        // not_found -- do not fabricate entities for arbitrary offsets.
+        let missing = inspect("transcript:claude:sess-1:999:0".to_string()).await;
+        assert_eq!(missing["status"], "error.not_found");
+    }
 }

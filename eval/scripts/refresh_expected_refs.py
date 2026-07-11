@@ -16,8 +16,13 @@ Resolution model (mirrors the indexer, bbox-corpus-index project_files.rs):
   chunk's entity_ref; among a file's chunks the best match is picked by
   token overlap with the locator description + manifest query.
 - id-keyed types (knowledge:, thread:, commit:, transcript spans) do not
-  content-drift; they are liveness-checked via bbox_inspect_entity and
-  reported for manual attention when missing.
+  content-drift; they are liveness-checked via bbox_inspect_entity. A dead
+  transcript ref gets one extra attempt: search bbox_hybrid_search
+  (doc_type=transcript) for the locator's transcript_hint and adopt a hit
+  only when it lands in the SAME session as the stale ref (drift repair,
+  not a re-target). A hit in a different session is reported as a
+  candidate for manual attention, not auto-adopted. Other id-keyed types
+  are reported for manual attention when missing.
 
 Stale path_hints (file moved, e.g. the crate decomposition) are chased
 through `git ls-files` basename matching when exactly one candidate exists;
@@ -133,6 +138,72 @@ def best_chunk(chunks, locator, manifest_query):
     return [chunk for _, chunk in scored]
 
 
+def transcript_session(ref):
+    """Return (provider, session_id) parsed out of a transcript ref, or None.
+
+    Accepts both the canonical `transcript:<provider>:<session_id>:<byte>:<idx>`
+    shape and the legacy unprefixed `<provider>:<session_id>:<byte>:<idx>` form
+    that older/undeployed daemons can still emit from hybrid_search hits
+    (gap-edc84378 fold note: hybrid_entity_id now canonicalizes with the
+    `transcript:` prefix, but a live daemon predating that fix may not).
+    """
+    parts = ref.split(":")
+    if len(parts) == 5 and parts[0] == "transcript":
+        return parts[1], parts[2]
+    if len(parts) == 4:
+        return parts[0], parts[1]
+    return None
+
+
+def reanchor_transcript(client, locator, old_ref, manifest_query, notes):
+    """Attempt to re-anchor a dead transcript ref within the SAME session.
+
+    A dead transcript ref (session purged/reparsed, byte offsets shifted) is
+    not necessarily gone corpus-wide -- the conversation may still be
+    indexed under a new line_offset. Search bbox_hybrid_search for the
+    locator's transcript_hint (falling back to the manifest query), scoped
+    to doc_type=transcript with vector_weight=0.0 (dodges the doc_type/RRF
+    starvation bug a live daemon may still carry: small limits can return
+    zero hits when the vector lane crowds out the requested doc_type before
+    fusion). Adopt a hit only when it lands back in the SAME session as the
+    stale ref -- that's drift repair, not a meaning change. A hit landing in
+    a DIFFERENT session would re-target the manifest to a different
+    conversation, which changes what the query is provenance for and needs
+    operator judgment: list the top 3 candidates as a note and return None
+    instead of auto-adopting.
+    """
+    old_session = transcript_session(old_ref)
+    if old_session is None:
+        return None
+    hint = locator.get("transcript_hint") or manifest_query
+    if not hint:
+        return None
+    try:
+        result = client.call_tool(
+            "bbox_hybrid_search",
+            {"query": hint, "doc_type": "transcript", "vector_weight": 0.0, "limit": 20},
+        )
+    except Exception as err:
+        notes.append(f"transcript re-anchor search failed: {err}")
+        return None
+    hits = result.get("results", [])
+    for hit in hits:
+        entity_id = hit.get("entity_id", "")
+        if transcript_session(entity_id) == old_session:
+            canonical = entity_id if entity_id.startswith("transcript:") else f"transcript:{entity_id}"
+            notes.append(f"transcript re-anchored within session: {old_ref} -> {canonical}")
+            return canonical
+    if hits:
+        candidates = [
+            f"{hit.get('entity_id')} ({hit.get('label', '')})" for hit in hits[:3]
+        ]
+        notes.append(
+            "session purged; candidate re-targets (different session, needs operator judgment): "
+            + "; ".join(candidates)
+        )
+    return None
+
+
 def resolve_locator(client, repo, locator, old_ref, manifest_query, notes):
     """Return the current expected ref for one locator, or None."""
     ref_type = old_ref.split(":", 1)[0]
@@ -145,6 +216,10 @@ def resolve_locator(client, repo, locator, old_ref, manifest_query, notes):
             if entity_exists(client, renamed):
                 notes.append(f"type migrated: {old_ref} -> {renamed}")
                 return renamed
+        if ref_type == "transcript":
+            reanchored = reanchor_transcript(client, locator, old_ref, manifest_query, notes)
+            if reanchored is not None:
+                return reanchored
         notes.append(f"id-keyed ref missing from corpus (manual fix): {old_ref}")
         return None
 

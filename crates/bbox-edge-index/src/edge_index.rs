@@ -162,6 +162,52 @@ impl EdgeIndex {
         edges
     }
 
+    /// Forward edges for `source`, plus a synthesized `IN_SESSION` edge when
+    /// `source` is a transcript ref and no materialized `IN_SESSION` edge
+    /// already covers it.
+    ///
+    /// transcript -> session `IN_SESSION` is a pure function of the ref
+    /// (provider/session_id are parsed straight out of `EntityRef::Transcript`),
+    /// so it doesn't need `project_tantivy_edges`, the bulk Tantivy stored-doc
+    /// projection that used to materialize this edge for every transcript doc.
+    /// That projection is opt-in via `include_tantivy_projection`, and every
+    /// caller (boot rebuild, store-mutation rebuilds) now passes `false` --
+    /// deliberately, to avoid materializing a multi-GB edge set for a corpus
+    /// with millions of transcript turns (see commit ffd9027e and the doc
+    /// comment on `EdgeStoreRefs::include_tantivy_projection`). This method is
+    /// the query-time replacement: it costs nothing until an agent actually
+    /// asks about a specific transcript ref.
+    ///
+    /// This is FORWARD ONLY. The reverse direction -- given a `session:` ref,
+    /// enumerate every transcript chunk that is IN_SESSION it -- is NOT a
+    /// pure function of the session ref alone; it requires scanning every
+    /// transcript doc in that session, which is exactly the bulk projection
+    /// this method exists to avoid. `reverse_edges` for a session ref
+    /// therefore does not gain a synthesized counterpart here, and that
+    /// enumeration is not currently supported by the graph tools.
+    pub fn forward_edges_with_synthesis(&self, source: &EntityRef) -> Vec<Edge> {
+        let mut edges: Vec<Edge> = self.forward_edges(source).into_iter().cloned().collect();
+        if let EntityRef::Transcript {
+            provider,
+            session_id,
+            ..
+        } = source
+        {
+            if !edges.iter().any(|edge| edge.kind == "IN_SESSION") {
+                edges.push(exact_edge(
+                    source.clone(),
+                    "IN_SESSION",
+                    EntityRef::Session {
+                        provider: provider.clone(),
+                        session_id: session_id.clone(),
+                    },
+                    EdgeProvenance::Derived,
+                ));
+            }
+        }
+        edges
+    }
+
     #[allow(dead_code)]
     pub fn forward_edges_filtered(&self, source: &EntityRef, kinds: &[&str]) -> Vec<&Edge> {
         self.forward_edges(source)
@@ -935,6 +981,109 @@ mod tests {
             1
         );
         assert!(index.reverse_edges_filtered(&target, &["CALLS"]).is_empty());
+    }
+
+    #[test]
+    fn forward_edges_with_synthesis_fills_in_missing_in_session() {
+        // gap-edc84378: with the tantivy stored-doc projection opt-in and
+        // off in every caller, a transcript ref with no materialized edges
+        // must still resolve its IN_SESSION edge at query time.
+        let index = EdgeIndex::default();
+        let transcript = EntityRef::Transcript {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+            line_offset: 42,
+            event_idx: 0,
+        };
+        let edges = index.forward_edges_with_synthesis(&transcript);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, "IN_SESSION");
+        assert_eq!(
+            edges[0].target,
+            EntityRef::Session {
+                provider: "claude".into(),
+                session_id: "sess-1".into(),
+            }
+        );
+        assert_eq!(edges[0].provenance, EdgeProvenance::Derived);
+    }
+
+    #[test]
+    fn forward_edges_with_synthesis_does_not_duplicate_materialized_in_session() {
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        let transcript = EntityRef::Transcript {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+            line_offset: 42,
+            event_idx: 0,
+        };
+        let session = EntityRef::Session {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+        };
+        // A materialized edge (e.g. loaded from the tantivy projection or a
+        // sidecar) is already present -- synthesis must not add a second one.
+        index.insert(
+            exact_edge(
+                transcript.clone(),
+                "IN_SESSION",
+                session.clone(),
+                EdgeProvenance::Derived,
+            ),
+            &mut seen,
+        );
+
+        let edges = index.forward_edges_with_synthesis(&transcript);
+        assert_eq!(edges.len(), 1, "materialized edge must not be duplicated");
+        assert_eq!(edges[0].target, session);
+    }
+
+    #[test]
+    fn forward_edges_with_synthesis_leaves_other_ref_types_untouched() {
+        let index = EdgeIndex::default();
+        let knowledge = EntityRef::Knowledge { id: "k-1".into() };
+        assert!(index.forward_edges_with_synthesis(&knowledge).is_empty());
+    }
+
+    #[test]
+    fn forward_edges_with_synthesis_preserves_other_materialized_edges() {
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        let transcript = EntityRef::Transcript {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+            line_offset: 42,
+            event_idx: 0,
+        };
+        let file = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        index.insert(
+            exact_edge(
+                transcript.clone(),
+                "EDITED_FILE",
+                file.clone(),
+                EdgeProvenance::Derived,
+            ),
+            &mut seen,
+        );
+
+        let edges = index.forward_edges_with_synthesis(&transcript);
+        assert_eq!(
+            edges.len(),
+            2,
+            "materialized edge plus synthesized IN_SESSION"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.kind == "EDITED_FILE" && edge.target == file)
+        );
+        assert!(edges.iter().any(|edge| edge.kind == "IN_SESSION"));
     }
 
     #[test]
