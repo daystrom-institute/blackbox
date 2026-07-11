@@ -17,7 +17,7 @@
   ],
   "expected_entity_refs": [
     "system_memory:sm-side-channel-notes",
-    "project_file:d723917f:e5f47824:15941390a5d9a0a381e06bb38dcb314e68343d391d9873c2b5775af6a10993b0:2"
+    "project_file:89bd722f:e5f47824:15941390a5d9a0a381e06bb38dcb314e68343d391d9873c2b5775af6a10993b0:2"
   ],
   "required_evidence": {
     "kind": "entity_set",

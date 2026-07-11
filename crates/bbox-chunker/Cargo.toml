@@ -19,6 +19,22 @@ anyhow = "1"
 # net-new dependency and the extraction API (extract_text_from_mem_by_pages)
 # is worth pinning close to what was validated.
 pdf-extract = "0.12"
+# Spreadsheet extraction for the X-XLSX chunker (design/corpus/agentic-corpus/
+# agentic-corpus-multimodal-chunkers.md). Pinned to the current published
+# release (0.36.0, 2026-07-06). `open_workbook_auto_from_rs` auto-detects
+# xlsx/xlsm/xlam/xlsb/xls/ods from bytes, so this one dependency covers the
+# whole family the chunker claims (crates/bbox-chunker/src/xlsx.rs).
+calamine = "0.36"
+# HTML parsing/traversal for the X-HTML chunker (design/corpus/agentic-corpus/
+# agentic-corpus-multimodal-chunkers.md spec names `scraper` directly).
+# `default-features = false` drops the `main` feature's `getopts` CLI-binary
+# dependency, which this library-only usage never needs; `Html`/`Node`
+# parsing and tree traversal work unchanged with it off. `ego-tree` is
+# `scraper`'s own tree crate (unified by cargo to the same instance) and is
+# depended on directly here only because `html.rs`'s iterative (non-recursive)
+# tree walk needs to name the `NodeRef` type explicitly.
+scraper = { version = "0.27.0", default-features = false }
+ego-tree = "0.11"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,6 +49,20 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-language-pack = "1.8.1"
+quick-xml = "0.38"
+# OOXML (.docx/.pptx) text extraction for the X-DOCX-PPTX chunker
+# (design/corpus/agentic-corpus/agentic-corpus-multimodal-chunkers.md). Parsed
+# directly (zip container + quick-xml tag-text extraction) rather than a
+# docx-rs / pptx crate: those are thin, sparsely maintained wrappers over the
+# same "unzip + read w:t/a:t runs" primitive needed here. `deflate` is the
+# only enabled backend feature: OOXML parts are deflate- or store-compressed,
+# never bzip2/lzma/zstd/AES. Version unified with the dev-dependency below.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
+
+[dev-dependencies]
+# Build a minimal .xlsx fixture byte-for-byte in the xlsx.rs test module
+# (no checked-in binary fixture). Same major version calamine itself pins
+# (0.36.0 -> zip ^8.6), so this doesn't pull in a second zip implementation.

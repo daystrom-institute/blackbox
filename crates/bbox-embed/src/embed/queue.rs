@@ -190,10 +190,23 @@ fn pack_batch(pending: &mut VecDeque<EmbedRequest>, grouped: bool) -> Vec<EmbedR
         let key = document_group_key(&front.entity_id).to_string();
         let mut group = Vec::new();
         let mut group_bytes = 0usize;
+        let mut run_truncated = false;
         while pending
             .front()
             .is_some_and(|req| document_group_key(&req.entity_id) == key)
         {
+            // One contextualized DOCUMENT must fit the contextual model's
+            // own context window (voyage-context-4: 32K tokens, rejected
+            // rather than truncated -- verified live 2026-07-11). Cap the
+            // run at MAX_DOCUMENT_BYTES; the remainder stays queued as the
+            // next window, and the batch closes below so consecutive-run
+            // grouping cannot re-merge the halves into one oversized
+            // document.
+            let next_bytes = pending.front().map(|req| req.text.len()).unwrap_or(0);
+            if !group.is_empty() && group_bytes + next_bytes > MAX_DOCUMENT_BYTES {
+                run_truncated = true;
+                break;
+            }
             let req = pending.pop_front().expect("front checked");
             group_bytes += req.text.len();
             group.push(req);
@@ -203,10 +216,18 @@ fn pack_batch(pending: &mut VecDeque<EmbedRequest>, grouped: bool) -> Vec<EmbedR
         if fits {
             bytes += group_bytes;
             batch.extend(group);
-            if batch.len() >= MAX_BATCH_DOCS {
+            if run_truncated || batch.len() >= MAX_BATCH_DOCS {
                 break;
             }
             continue;
+        }
+        if run_truncated {
+            // The window did not fit this batch either; requeue it whole
+            // and close so it leads the next batch.
+            for req in group.into_iter().rev() {
+                pending.push_front(req);
+            }
+            break;
         }
         if !batch.is_empty() {
             // Close the batch at the document boundary; the whole run
@@ -1093,6 +1114,11 @@ async fn schedule_retry_or_drop(
 //
 // Document count is capped at voyage's hard 128 limit; the bytes guard
 // usually triggers first on dense text.
+/// Grouped (contextualized) packing only: one document window must stay
+/// inside the contextual model's own context window (32K tokens for
+/// voyage-context-4, which rejects rather than truncates). 64 KiB of text
+/// is safely inside even at dense-code token ratios.
+const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 const MAX_BATCH_DOCS: usize = 128;
 const MAX_BATCH_BYTES: usize = 100 * 1024;
 // Per-worker concurrency: we dispatch multiple full batches in parallel
@@ -1780,6 +1806,31 @@ mod tests {
         let second = pack_batch(&mut pending, true);
         assert_eq!(second.len(), 100);
         assert!(second.iter().all(|req| req.entity_id.contains(":bbb:")));
+        assert!(pending.is_empty());
+    }
+
+    /// A document whose text exceeds MAX_DOCUMENT_BYTES must window into
+    /// sub-documents in SEPARATE batches: two windows of one document in
+    /// the same batch would re-merge under consecutive-run grouping and
+    /// exceed the contextual model's context window again.
+    #[test]
+    fn grouped_pack_windows_documents_beyond_context_budget() {
+        let big = "x".repeat(30 * 1024);
+        let mut pending: VecDeque<EmbedRequest> = VecDeque::new();
+        for idx in 0..3 {
+            pending.push_back(ctx_request("dense", idx, &big));
+        }
+        pending.push_back(ctx_request("small", 0, "tiny"));
+
+        // 30KB + 30KB fits the 64KB document budget; the third chunk
+        // starts a new window, which must NOT share this batch.
+        let first = pack_batch(&mut pending, true);
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|req| req.entity_id.contains(":dense:")));
+        let second = pack_batch(&mut pending, true);
+        assert_eq!(second.len(), 2, "remainder window plus the next document");
+        assert!(second[0].entity_id.contains(":dense:"));
+        assert!(second[1].entity_id.contains(":small:"));
         assert!(pending.is_empty());
     }
 

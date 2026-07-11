@@ -11,7 +11,7 @@
     }
   ],
   "expected_entity_refs": [
-    "symbol:d723917f:KnowledgeStore:40e76235daf19f7dbd2fb1d55f65eddde1a3de3c0cff98d94e25b42225b45c2d"
+    "symbol:89bd722f:KnowledgeStore:40e76235daf19f7dbd2fb1d55f65eddde1a3de3c0cff98d94e25b42225b45c2d"
   ],
   "required_evidence": {
     "kind": "edge_family",

@@ -555,6 +555,27 @@ fn is_supported_text_path(path: &Path) -> bool {
                 | "text"
                 | "log"
                 | "pdf"
+                | "ipynb"
+                // X-XLSX (crates/bbox-chunker/src/xlsx.rs): the whole
+                // spreadsheet family calamine's open_workbook_auto_from_rs
+                // auto-detects, same reasoning as the chunker's own
+                // extension gate.
+                | "xlsx"
+                | "xlsm"
+                | "xlam"
+                | "xlsb"
+                | "xls"
+                | "ods"
+                | "docx"
+                | "pptx"
+                | "vtt"
+                | "srt"
+                // .html/.htm are already admitted below via
+                // `code::language_for_path` (mapped to the "html"
+                // tree-sitter grammar); .xhtml is not, so it is listed
+                // explicitly here for the X-HTML chunker
+                // (design/corpus/agentic-corpus/agentic-corpus-multimodal-chunkers.md).
+                | "xhtml"
         )
     ) || bbox_chunker::code::language_for_path(path).is_some()
 }
@@ -903,16 +924,23 @@ fn chunk_ref(chunk: &Chunk, snapshot_id: Option<&str>) -> EntityRef {
     }
 }
 
-/// PDFs are legitimately binary (embedded streams, xref/trailer binary
-/// markers, font/image data) and are expected to contain NUL bytes in their
-/// first 4096 bytes; the null-byte heuristic below would otherwise exclude
-/// nearly every real-world PDF before it ever reaches the chunker
-/// registry's own `claims()` (magic-header) check. `PdfChunker::claims`
-/// (crates/bbox-chunker/src/pdf.rs) is the real gate for whether a `.pdf`
-/// file's content is extractable, so the blanket binary sniff is bypassed
-/// by extension here rather than tightened generically.
+/// PDFs and spreadsheet workbooks are legitimately binary (embedded
+/// streams, xref/trailer binary markers, font/image data for PDF; ZIP
+/// central-directory/OLE2 CFB structure and compressed part data for
+/// xlsx/xlsm/xlam/xlsb/xls/ods) and are expected to contain NUL bytes in
+/// their first 4096 bytes; the null-byte heuristic below would otherwise
+/// exclude nearly every real-world file of these formats before it ever
+/// reaches the chunker registry's own `claims()` (magic-header) check.
+/// `PdfChunker::claims` (crates/bbox-chunker/src/pdf.rs) and
+/// `XlsxChunker::claims` (crates/bbox-chunker/src/xlsx.rs) are the real
+/// gates for whether such a file's content is extractable, so the blanket
+/// binary sniff is bypassed by extension here rather than tightened
+/// generically.
 fn is_binary(path: &Path, bytes: &[u8]) -> bool {
-    if path.extension().and_then(|ext| ext.to_str()) == Some("pdf") {
+    if matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("pdf" | "xlsx" | "xlsm" | "xlam" | "xlsb" | "xls" | "ods" | "docx" | "pptx")
+    ) {
         return false;
     }
     bytes.iter().take(4096).any(|byte| *byte == 0)
@@ -1635,6 +1663,60 @@ mod tests {
         assert!(
             indexed.iter().all(|p| !p.contains("/.bbox/")),
             ".bbox control dir must be excluded from project_file indexing: {indexed:?}"
+        );
+    }
+
+    #[test]
+    fn html_and_xhtml_files_are_admitted_and_claimed_by_html_chunker_not_code_chunker() {
+        use std::fs;
+        // `code::language_for_path` maps .html/.htm to the "html" tree-sitter
+        // grammar, so `CodeChunker::claims` also matches those extensions
+        // (verified live: `ts_language_for_name("html")` resolves via
+        // tree-sitter-language-pack). `HtmlChunker` MUST be registered
+        // before `CodeChunker` in `chunker::default_registry()` for the
+        // registry's first-match `find()` (see `index_project` /
+        // `resolve_current_chunk_entity` above) to route .html/.htm/.xhtml
+        // through prose sectioning rather than code-symbol extraction. This
+        // guards that ordering at the registry-integration level, not just
+        // inside bbox-chunker's own unit tests.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("page.html"),
+            "<html><body><h1>Title</h1><p>hello</p></body></html>",
+        )
+        .unwrap();
+        fs::write(root.join("frag.xhtml"), "<p>fragment</p>").unwrap();
+
+        let mut out = Vec::new();
+        scan_project_files(root, &mut out).unwrap();
+        let indexed: Vec<String> = out.iter().map(|(p, _, _)| p.clone()).collect();
+        assert!(
+            indexed.iter().any(|p| p.ends_with("page.html")),
+            ".html must be admitted by the project-file walker: {indexed:?}"
+        );
+        assert!(
+            indexed.iter().any(|p| p.ends_with("frag.xhtml")),
+            ".xhtml must be admitted by the project-file walker: {indexed:?}"
+        );
+
+        let registry = chunker::default_registry();
+        let bytes = fs::read(root.join("page.html")).unwrap();
+        let sniff_len = bytes.len().min(4096);
+        let claimed = registry
+            .iter()
+            .find(|c| c.claims(Path::new("page.html"), &bytes[..sniff_len]))
+            .expect("some chunker must claim page.html");
+        assert_eq!(
+            claimed.format_id(),
+            "html",
+            "HtmlChunker must win the registry claim over CodeChunker for .html"
+        );
+
+        let (chunks, _edges) = claimed.chunk(Path::new("page.html"), &bytes).unwrap();
+        assert!(
+            chunks.iter().all(|chunk| chunk.chunk_kind == "web_section"),
+            "expected web_section chunks, got {chunks:?}"
         );
     }
 }

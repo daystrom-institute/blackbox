@@ -11,7 +11,7 @@
     }
   ],
   "expected_entity_refs": [
-    "symbol:d723917f:EntityRef:63ac9b75419fc66f648a6722362f13a0544508ee6c146d99f643d9ed24853477"
+    "symbol:89bd722f:EntityRef:63ac9b75419fc66f648a6722362f13a0544508ee6c146d99f643d9ed24853477"
   ],
   "required_evidence": {
     "kind": "edge_family",

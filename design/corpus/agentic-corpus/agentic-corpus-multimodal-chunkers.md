@@ -57,25 +57,81 @@ Original scope:
 
 ### X-IPYNB — Jupyter notebook chunker
 
+Shipped 2026-07-11 (`crates/bbox-chunker/src/ipynb.rs`): one
+`notebook_cell` chunk per non-empty cell (nbformat v4), cell index in the
+position fields, kernel language on code cells (which routes them to the
+Code bucket), text/plain and stream outputs appended truncated (2KB cap),
+binary outputs skipped. Cell-adjacency is covered by the indexer's
+derived `NEXT_SECTION` edges; `OUTPUT_OF`/`IMPORTS_FROM_CELL` remain
+unbuilt (chunkers emit no edges today).
+
+Original scope:
+
 - Cell-level chunks with cell index + outputs.
 - Edges: `NEXT_CELL`, `OUTPUT_OF`, `IMPORTS_FROM_CELL`.
 
 ### X-XLSX — Spreadsheet chunker
+
+Shipped 2026-07-11 (`crates/bbox-chunker/src/xlsx.rs`): one
+`spreadsheet_sheet` chunk per non-empty sheet across the whole calamine
+family (.xlsx/.xlsm/.xlam/.xlsb/.xls/.ods), bounded TSV projection (200
+rows / 16KB with truncation markers), formulas rendered inline as
+`value [=FORMULA]`, sheet name in `symbol`. Formula dependency edges
+remain unbuilt.
+
+Original scope:
 
 - `calamine` crate. Sheet-level + cell-range chunks.
 - Edges: `IN_SHEET`, `COMPUTED_FROM` (formula deps), `CELL_REFERENCES`.
 
 ### X-DOCX-PPTX — Office documents chunker
 
+Text-first pass **shipped 2026-07-11** (`crates/bbox-chunker/src/office.rs`):
+`.docx` parsed into `office_section` chunks (split on `Heading1`-`Heading3`
+styled paragraphs when present, else windowed at `MAX_CHUNK_BYTES`), `.pptx`
+parsed into one `slide` chunk per non-empty slide (slide number carried in the
+position fields the same way `pdf_page` carries page numbers). Both formats
+admitted through the project-file walker with a ZIP-local-file-header magic
+claim and a binary-gate exemption (they're zip containers, same story as
+`.pdf`), and graceful degradation (encrypted/OLE2, corrupt, or non-OOXML zip
+files yield zero chunks and a warning, never a failed reindex pass). Parsed
+directly (the `zip` crate + `quick-xml`) rather than `docx-rs` / a pptx crate:
+those are thin, sparsely maintained wrappers over the same "unzip + read
+w:t/a:t runs" primitive this needs. Deliberately deferred from this pass: the
+`IN_SECTION`/`ON_SLIDE`/`IN_DECK` edges below (the chunker registry emits zero
+edges today across every format; `NEXT_SECTION` is derived generically by the
+indexer over consecutive chunks regardless of `chunk_kind`), and legacy binary
+`.doc`/`.ppt` (OLE2/CFBF, a different format entirely, out of scope).
+
+Original scope:
+
 - `docx-rs` / `pptx` parser.
 - Edges: `IN_SECTION`, `ON_SLIDE`, `IN_DECK`.
 
 ### X-HTML — HTML / web archive chunker
 
+Shipped 2026-07-11 (`crates/bbox-chunker/src/html.rs`): `web_section`
+chunks split on h1-h3 (windowed `web_text` fallback), script/style/nav/
+footer/aside/head stripped, scraper-based. Registered AHEAD of the code
+chunker: .html previously fell through to tree-sitter code chunking (a
+live misroute this phase fixed, with a precedence regression test).
+Link/frame edges remain unbuilt.
+
+Original scope:
+
 - `scraper` crate.
 - Edges: `LINKS_TO_URL`, `EMBEDS_FRAME`.
 
 ### X-AV — Audio/video transcript chunker
+
+Shipped 2026-07-11 (`crates/bbox-chunker/src/av_transcript.rs`): .vtt and
+.srt transcript files parse into merged `transcript_segment` chunks
+(1KB windows, floor-second start/end in the position fields, speaker
+voice tags kept as `Speaker:` prefixes, inline markup stripped, malformed
+cues skipped individually). Running whisper is out of scope by design;
+this chunker consumes external transcript files.
+
+Original scope:
 
 - Time-segmented chunks from external transcript producers (whisper).
 - Edges: `AT_TIMESTAMP`, `IN_RECORDING`.

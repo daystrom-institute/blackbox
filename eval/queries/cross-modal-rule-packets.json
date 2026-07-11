@@ -17,7 +17,7 @@
   ],
   "expected_entity_refs": [
     "system_memory:sm-rule-packets",
-    "project_file:d723917f:3396533c:42d3268f52cf37abade1b171351d7e38f50539c5b2cb753c7732aebe1bbab1cd:4"
+    "project_file:89bd722f:3396533c:d0388ea99d917a72744aec32afa8c04e53a5e1b5d0cf52a32943d3564167f425:34"
   ],
   "required_evidence": {
     "kind": "entity_set",

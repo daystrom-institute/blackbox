@@ -1,8 +1,13 @@
+pub mod av_transcript;
 pub mod code;
 pub mod config;
+pub mod html;
+pub mod ipynb;
 pub mod markdown;
+pub mod office;
 pub mod pdf;
 pub mod text;
+pub mod xlsx;
 
 use std::path::{Path, PathBuf};
 
@@ -78,12 +83,24 @@ pub trait SourceFormatChunker: Send + Sync {
 
 pub fn default_registry() -> Vec<Box<dyn SourceFormatChunker>> {
     vec![
+        // HtmlChunker MUST claim before CodeChunker: `code::language_for_path`
+        // maps .html/.htm to the "html" tree-sitter grammar (via
+        // tree-sitter-language-pack), so CodeChunker's `claims()` already
+        // matches those extensions and would otherwise win the `find()` in
+        // `bbox-corpus-index`'s registry scan (first match wins), routing
+        // markup through code-symbol extraction instead of prose sectioning.
+        Box::new(html::HtmlChunker),
         Box::new(code::CodeChunker),
         Box::new(markdown::MarkdownChunker),
         Box::new(config::JsonChunker),
         Box::new(config::TomlChunker),
         Box::new(config::YamlChunker),
         Box::new(pdf::PdfChunker),
+        Box::new(office::DocxChunker),
+        Box::new(office::PptxChunker),
+        Box::new(ipynb::IpynbChunker),
+        Box::new(xlsx::XlsxChunker),
+        Box::new(av_transcript::AvTranscriptChunker),
         Box::new(text::PlainTextChunker),
     ]
 }

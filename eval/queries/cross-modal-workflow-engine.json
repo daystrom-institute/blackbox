@@ -17,7 +17,7 @@
   ],
   "expected_entity_refs": [
     "system_memory:sm-workflow-orchestration",
-    "project_file:d723917f:996d1a96:c8e0ed5506b7898ec4023201315b3b27f142789d707a007b50cee9e1c1043ea8:39"
+    "project_file:89bd722f:996d1a96:c8e0ed5506b7898ec4023201315b3b27f142789d707a007b50cee9e1c1043ea8:39"
   ],
   "required_evidence": {
     "kind": "entity_set",

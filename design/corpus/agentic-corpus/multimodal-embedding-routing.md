@@ -551,8 +551,13 @@ Phase 4 — Model rerank stage (Layer 3) — **capability shipped
 remains the default), reranked candidates score in a strictly higher band
 than the unsent tail with heuristic multipliers applied after under the
 existing cap, and API failure degrades to heuristic with
-`degraded.rerank_unavailable`. Still open: the eval A/B (MRR/recall@k)
-that would justify flipping the default. Original scope:
+`degraded.rerank_unavailable`. **Eval A/B run 2026-07-11**
+(`eval/scripts/rerank_mode_ab.py`, 30-query suite, refreshed refs, live
+daemon): model rerank MRR 0.1667 vs heuristic 0.1067 vs raw fusion
+0.0288; recall@1 0.167 vs 0.067. The measured-win condition for the
+default flip is met; the flip still awaits the design's second condition,
+operator acceptance of the added per-search rerank API latency. Original
+scope:
 
 Phase 5 — Contextualized embeddings (Layer 2) — **capability shipped
 2026-07-11**: `voyage_context` provider type + builtin alias
@@ -560,9 +565,18 @@ Phase 5 — Contextualized embeddings (Layer 2) — **capability shipped
 (group key derived from the chunk entity id's trailing index; batches
 never split a document's consecutive run, oversized runs fall back to
 windowed sub-documents), and flat single-chunk query encoding against the
-same partition. Still open: the eval comparison that would actually move
-`code`/`docs` onto the route (routing there today is one config line, but
-it stays eval-gated by design). Original scope:
+same partition. Two live-API facts folded back in: a contextualized
+DOCUMENT must fit the model's 32K-token context window (no truncation;
+HTTP 400 past it), so grouped packing windows documents at 64 KiB and
+never lets two windows of one document share a batch. **Eval comparison
+run 2026-07-11** (`crates/bbox-embed/examples/context_model_ab.rs`:
+production chunking, 71 files / ~3.2K chunks, 18 eval queries, file-level
+scoring): voyage-code-3 MRR 0.704, voyage-4-large/lite 0.686,
+voyage-context-4 0.644, recall@5 identical at 0.889 — no contextualized
+win at n=18, differences within noise. The migration gate therefore says
+NO: `code` stays on voyage-code-3, prose stays on voyage-4. Re-run the
+comparison when the corpus or query suite changes materially. Original
+scope:
 
 Phase 6 — Multimodal provider + first visual chunker (Layer 4) —
 **partially shipped 2026-07-11**: `VoyageMultimodalProvider`

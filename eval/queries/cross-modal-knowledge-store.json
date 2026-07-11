@@ -17,8 +17,8 @@
     }
   ],
   "expected_entity_refs": [
-    "symbol:d723917f:KnowledgeStore:40e76235daf19f7dbd2fb1d55f65eddde1a3de3c0cff98d94e25b42225b45c2d",
-    "project_file:d723917f:486a1738:13c1f9d37640b8ddf7732df0739841c729e90a69d551277849db849960aeef52:0"
+    "symbol:89bd722f:KnowledgeStore:40e76235daf19f7dbd2fb1d55f65eddde1a3de3c0cff98d94e25b42225b45c2d",
+    "project_file:89bd722f:486a1738:13c1f9d37640b8ddf7732df0739841c729e90a69d551277849db849960aeef52:0"
   ],
   "required_evidence": {
     "kind": "entity_set",

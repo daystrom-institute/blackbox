@@ -65,6 +65,28 @@ out explicitly under `Changed` or `Removed`.
   payload preflight (image byte/pixel caps, video byte cap) rejected as
   typed poison. `[embed.routes.visual]` maps visual chunk kinds to
   multimodal aliases only; text buckets never fall back there.
+- Chunker registry grew five formats beyond PDF: `.ipynb` (per-cell
+  `notebook_cell` chunks with truncated text outputs, code cells routed to
+  the Code bucket via kernel language), `.xlsx`/`.xlsm`/`.xlsb`/`.xls`/
+  `.ods` (per-sheet `spreadsheet_sheet` chunks with inline formulas,
+  bounded row/char projection), `.html`/`.htm`/`.xhtml` (`web_section`
+  chunks split on h1-h3 with script/nav/style stripped; previously .html
+  was misrouted through the tree-sitter code chunker), and `.vtt`/`.srt`
+  transcript files (`transcript_segment` chunks with start-second
+  metadata and speaker prefixes), plus `.docx`/`.pptx` (`office_section`
+  chunks split on heading styles, one `slide` chunk per non-empty slide;
+  OOXML parsed directly via zip + quick-xml).
+- Eval instrumentation for the eval-gated route decisions:
+  `eval/scripts/rerank_mode_ab.py` (model vs heuristic vs none rerank A/B
+  over the 30-query suite) and the `context_model_ab` example in
+  bbox-embed (voyage-code-3 vs voyage-4 vs voyage-context-4 with
+  production chunking). First runs: model rerank MRR 0.167 vs heuristic
+  0.107 (win measured; default flip awaits latency acceptance);
+  contextualized embeddings showed no retrieval win, so code/docs stay on
+  their current models.
+- Contextualized document packing enforces the model's 32K-token
+  per-document context window (verified live): document runs window at
+  64 KiB and two windows of one document never share a batch.
 - X-PDF text-first chunker: `.pdf` files now index as per-page `pdf_page`
   chunks (pdf-extract) into the docs bucket; encrypted/scanned/corrupt
   PDFs degrade to zero chunks without failing the reindex pass. Tables,
