@@ -588,6 +588,35 @@ impl EmbeddingRouter {
         }
     }
 
+    /// Every route the current config maps: all buckets globally, plus
+    /// every per-project override. Best-effort — a bucket whose alias
+    /// fails to resolve is skipped (it cannot claim a partition either).
+    /// This is the "is any bucket mapped to this partition?" source for
+    /// partition lifecycle tooling.
+    pub fn configured_routes(&self) -> Vec<Route> {
+        let mut routes = Vec::new();
+        for bucket in Bucket::ALL {
+            if let Ok(route) = self.route(bucket, None) {
+                routes.push(route);
+            }
+        }
+        let project_ids = self
+            .config
+            .routes
+            .per_project
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for project_id in project_ids {
+            for bucket in Bucket::ALL {
+                if let Ok(route) = self.route(bucket, Some(&project_id)) {
+                    routes.push(route);
+                }
+            }
+        }
+        routes
+    }
+
     pub fn queue_and_vector_route(
         &self,
         bucket: Bucket,
@@ -907,6 +936,33 @@ code = "voyage_code"
         assert_eq!(knowledge.compatibility_family, "voyage-4:1024:float");
         let code = router.route(Bucket::Code, None).unwrap();
         assert_eq!(code.document_model, "voyage-code-3");
+    }
+
+    #[test]
+    fn configured_routes_cover_global_and_per_project_mappings() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes]
+code = "voyage_code"
+
+[embed.routes.per_project."proj1234"]
+threads = "ollama"
+"#,
+        )
+        .unwrap();
+        let routes = router.configured_routes();
+        // 8 global buckets + 8 per-project rows for proj1234.
+        assert_eq!(routes.len(), 16);
+        assert!(routes.iter().any(|route| {
+            route.bucket == Bucket::Threads
+                && route.project_id.as_deref() == Some("proj1234")
+                && route.provider_id == OLLAMA_PROVIDER_ID
+        }));
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.bucket == Bucket::Code && route.project_id.is_none())
+        );
     }
 
     #[test]

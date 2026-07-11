@@ -116,6 +116,152 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
         })
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EmbedPartitionsParams {
+    /// "list" (default) reports every partition with its route mapping;
+    /// "prune" deletes orphaned partitions older than `older_than_days`.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Required for prune: only partitions whose last write is older than
+    /// this many days are candidates. There is no default on purpose —
+    /// the age threshold is an operator decision.
+    #[serde(default)]
+    pub older_than_days: Option<u64>,
+    /// Prune is dry-run by default; pass apply=true to delete.
+    #[serde(default)]
+    pub apply: bool,
+}
+
+/// Partition lifecycle (`bbox_embed_partitions`). Deliberately separate
+/// from `bbox_reembed`, which never prunes: re-embedding and reclaiming
+/// orphaned vector spaces are different operator decisions
+/// (design/corpus/agentic-corpus/multimodal-embedding-routing.md Layer 5).
+pub fn embed_partitions(p: &EmbedPartitionsParams) -> Result<String> {
+    let router = EmbeddingRouter::load_default().unwrap_or_default();
+    let infos = crate::vectors::partition_infos()?
+        .context("vector store is still warming up; retry shortly")?;
+    embed_partitions_with(
+        p,
+        &router,
+        infos,
+        chrono::Utc::now(),
+        crate::vectors::remove_partition,
+    )
+}
+
+fn embed_partitions_with(
+    p: &EmbedPartitionsParams,
+    router: &EmbeddingRouter,
+    infos: Vec<crate::vectors::PartitionInfo>,
+    now: chrono::DateTime<chrono::Utc>,
+    mut remove: impl FnMut(&str) -> Result<bool>,
+) -> Result<String> {
+    let action = p.action.as_deref().map(str::trim).unwrap_or("list");
+    if !matches!(action, "list" | "prune") {
+        bail!("unknown action `{action}`; expected `list` or `prune`");
+    }
+
+    // Which buckets claim each partition under the CURRENT config —
+    // vector_route_id is the join key on both sides.
+    let mut mapped: BTreeMap<String, (Vec<String>, crate::embed::Route)> = BTreeMap::new();
+    for route in router.configured_routes() {
+        let label = match &route.project_id {
+            Some(project) => format!("{}@{project}", route.bucket.as_str()),
+            None => route.bucket.as_str().to_string(),
+        };
+        mapped
+            .entry(route.vector_route_id())
+            .or_insert_with(|| (Vec::new(), route.clone()))
+            .0
+            .push(label);
+    }
+
+    let partitions = infos
+        .iter()
+        .map(|info| {
+            let mapping = mapped.get(&info.route);
+            json!({
+                "route": info.route,
+                "dims": info.dims,
+                "active_count": info.active_count,
+                "last_write": info.last_write.map(|ts| ts.to_rfc3339()),
+                "disk_bytes": info.disk_bytes,
+                "mapped": mapping.is_some(),
+                "mapped_buckets": mapping.map(|(buckets, _)| buckets.clone()).unwrap_or_default(),
+                "provider": mapping.map(|(_, r)| r.provider_id.clone()),
+                "endpoint_kind": mapping.map(|(_, r)| r.endpoint_kind),
+                "document_model": mapping.map(|(_, r)| r.document_model.clone()),
+                "query_model": mapping.map(|(_, r)| r.query_model.clone()),
+                "output_dtype": mapping.map(|(_, r)| r.output_dtype.as_str()),
+                "compatibility_family": mapping.map(|(_, r)| r.compatibility_family.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if action == "list" {
+        return Ok(serde_json::to_string_pretty(&json!({
+            "action": "list",
+            "partitions": partitions,
+        }))?);
+    }
+
+    let Some(older_than_days) = p.older_than_days else {
+        bail!(
+            "prune requires older_than_days: only partitions unmapped by current route \
+             config AND idle beyond that age are deleted"
+        );
+    };
+    let cutoff = now - chrono::Duration::days(older_than_days as i64);
+    let mut candidates = Vec::new();
+    let mut skipped = Vec::new();
+    for info in &infos {
+        if mapped.contains_key(&info.route) {
+            continue; // a configured bucket still writes/searches here
+        }
+        match info.last_write {
+            Some(last_write) if last_write < cutoff => candidates.push(info.route.clone()),
+            Some(_) => skipped.push(json!({
+                "route": info.route,
+                "reason": format!("unmapped but written within {older_than_days} day(s)"),
+            })),
+            // No file timestamps — age unknowable; stay conservative.
+            None => skipped.push(json!({
+                "route": info.route,
+                "reason": "unmapped but last_write is unknown",
+            })),
+        }
+    }
+
+    let mut pruned = Vec::new();
+    let mut errors = Vec::new();
+    if p.apply {
+        for route in &candidates {
+            match remove(route) {
+                Ok(true) => pruned.push(route.clone()),
+                Ok(false) => errors.push(json!({
+                    "route": route,
+                    "error": "partition disappeared before prune",
+                })),
+                Err(err) => errors.push(json!({
+                    "route": route,
+                    "error": format!("{err:#}"),
+                })),
+            }
+        }
+    }
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "action": "prune",
+        "dry_run": !p.apply,
+        "older_than_days": older_than_days,
+        "prune_candidates": candidates,
+        "pruned": pruned,
+        "skipped": skipped,
+        "errors": errors,
+        "partitions": partitions,
+    }))?)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RouteCoverage {
     pub source_count: u64,
@@ -1036,6 +1182,135 @@ mod tests {
     use crate::embed_queue::thread_chunk_hash;
     use crate::vectors::{VectorStore, install_test_global};
     use bbox_threads::threads::ThreadParams;
+
+    fn partition_info(
+        route: &str,
+        days_old: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::vectors::PartitionInfo {
+        crate::vectors::PartitionInfo {
+            route: route.to_string(),
+            dims: Some(1024),
+            active_count: Some(42),
+            last_write: Some(now - chrono::Duration::days(days_old)),
+            disk_bytes: 1000,
+        }
+    }
+
+    #[test]
+    fn embed_partitions_list_marks_mapped_and_orphaned() {
+        let router = EmbeddingRouter::default();
+        let now = chrono::Utc::now();
+        let live = router
+            .route(Bucket::Knowledge, None)
+            .unwrap()
+            .vector_route_id();
+        let infos = vec![
+            partition_info(&live, 1, now),
+            partition_info("voyage-old-model-1024-deadbeef", 90, now),
+        ];
+        let params = EmbedPartitionsParams {
+            action: Some("list".into()),
+            older_than_days: None,
+            apply: false,
+        };
+        let rendered =
+            embed_partitions_with(&params, &router, infos, now, |_| unreachable!()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let rows = value["partitions"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let live_row = rows.iter().find(|row| row["route"] == live).unwrap();
+        assert_eq!(live_row["mapped"], true);
+        assert_eq!(live_row["document_model"], "voyage-code-3");
+        assert_eq!(live_row["compatibility_family"], "voyage-code-3:1024:float");
+        assert!(
+            live_row["mapped_buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|bucket| bucket == "knowledge")
+        );
+        let orphan = rows.iter().find(|row| row["mapped"] == false).unwrap();
+        assert_eq!(orphan["route"], "voyage-old-model-1024-deadbeef");
+        assert!(orphan["document_model"].is_null());
+    }
+
+    #[test]
+    fn embed_partitions_prune_requires_age_threshold() {
+        let router = EmbeddingRouter::default();
+        let params = EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: None,
+            apply: false,
+        };
+        let err = embed_partitions_with(
+            &params,
+            &router,
+            Vec::new(),
+            chrono::Utc::now(),
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("older_than_days"));
+    }
+
+    #[test]
+    fn embed_partitions_prune_dry_run_deletes_nothing() {
+        let router = EmbeddingRouter::default();
+        let now = chrono::Utc::now();
+        let infos = vec![partition_info("voyage-old-model-1024-deadbeef", 90, now)];
+        let params = EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: Some(30),
+            apply: false,
+        };
+        let rendered = embed_partitions_with(&params, &router, infos, now, |_| {
+            panic!("dry run must not delete")
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(
+            value["prune_candidates"][0],
+            "voyage-old-model-1024-deadbeef"
+        );
+        assert!(value["pruned"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn embed_partitions_prune_apply_deletes_only_old_orphans() {
+        let router = EmbeddingRouter::default();
+        let now = chrono::Utc::now();
+        let live = router
+            .route(Bucket::Knowledge, None)
+            .unwrap()
+            .vector_route_id();
+        // A mapped-but-ancient partition, an old orphan, and a fresh orphan:
+        // only the old orphan may go.
+        let infos = vec![
+            partition_info(&live, 365, now),
+            partition_info("voyage-old-model-1024-deadbeef", 90, now),
+            partition_info("voyage-new-model-1024-cafebabe", 2, now),
+        ];
+        let params = EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: Some(30),
+            apply: true,
+        };
+        let mut removed = Vec::new();
+        let rendered = embed_partitions_with(&params, &router, infos, now, |route| {
+            removed.push(route.to_string());
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(removed, vec!["voyage-old-model-1024-deadbeef"]);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["dry_run"], false);
+        assert_eq!(value["pruned"][0], "voyage-old-model-1024-deadbeef");
+        let skipped = value["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["route"], "voyage-new-model-1024-cafebabe");
+    }
 
     #[test]
     fn reembed_route_validation_accepts_all_and_rejects_unknown() {

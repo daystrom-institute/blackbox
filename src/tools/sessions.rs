@@ -1,4 +1,4 @@
-use crate::embed_runtime::ReembedParams;
+use crate::embed_runtime::{EmbedPartitionsParams, ReembedParams};
 use crate::index::{
     MessagesParams, ReindexParams, SessionParams, SessionsListParams, TopicsParams,
 };
@@ -92,6 +92,20 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_reembed", move || {
             crate::embed_runtime::reembed_start(&p, server.state)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "bbox_embed_partitions",
+        description = "Vector partition lifecycle: list partitions with route mapping, dims, dtype, compatibility family, active_count, last_write; prune orphaned partitions (dry-run default)."
+    )]
+    pub(crate) async fn bbox_embed_partitions(
+        &self,
+        Parameters(p): Parameters<EmbedPartitionsParams>,
+    ) -> CallToolResult {
+        Self::run_blocking("bbox_embed_partitions", move || {
+            crate::embed_runtime::embed_partitions(&p)
         })
         .await
     }

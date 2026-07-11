@@ -243,9 +243,10 @@ Multimodal Chunk Model below; chunker phases in
 
 ### Layer 5 — Partition lifecycle (before the migrations, not after)
 
-Layers 1–2 are deliberate model migrations that orphan every current
-partition. `bbox_embed_partitions(action="list|prune")` (or CLI
-equivalent) lands first:
+Shipped 2026-07-11 (see Migration Plan Phase 2). Layers 1–2 are
+deliberate model migrations that orphan every current partition.
+`bbox_embed_partitions(action="list|prune")` (or CLI equivalent) lands
+first:
 
 - `list` reports exact route id, provider, endpoint kind, model, dim,
   dtype, compatibility family, active_count, last_write, and whether any
@@ -515,8 +516,11 @@ dtype. Original scope for the phase:
   aliases with different models; unknown alias rejection; legacy parsing;
   derived family values; asymmetric pair family mismatch rejected.
 
-Phase 2 — Partition lifecycle (Layer 5): `bbox_embed_partitions`
-list/prune as specified above, before any deliberate migration.
+Phase 2 — Partition lifecycle (Layer 5) — **shipped 2026-07-11**:
+`bbox_embed_partitions` list/prune as specified above (list is
+disk-truthful across unloaded partitions; prune requires
+`older_than_days`, deletes only unmapped-and-idle partitions, dry-run
+unless `apply=true`; `bbox_reembed` remains prune-free).
 
 Phase 3 — Prose re-route + asymmetric retrieval (Layer 1):
 

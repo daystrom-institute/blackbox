@@ -228,6 +228,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
+        name: "bbox_embed_partitions",
+        category: ToolCategory::Transcripts,
+        summary: "Vector partition lifecycle: list partitions with route mapping, dims, dtype, compatibility family, active_count, last_write; prune orphaned partitions (dry-run default).",
+        when_to_use: "Use action=\"list\" to see every vector partition and whether any configured bucket currently maps to it (orphans show mapped=false; hybrid search skips them under degraded.skipped_partitions). After a deliberate model/route migration, use action=\"prune\" with older_than_days=<N>: only partitions BOTH unmapped by current route config AND idle beyond that age are candidates, and nothing deletes without apply=true (dry-run default). bbox_reembed never prunes; reclaiming a vector space is a separate operator decision.",
+        example: Some("bbox_embed_partitions(action=\"prune\", older_than_days=30)"),
+    },
+    ToolDoc {
         name: "bbox_embed_status",
         category: ToolCategory::Transcripts,
         summary: "Return route embedding health and health_reason. recall_probe_route runs a sampled HNSW self-recall probe against that vector partition (vector-recall diagnostic, seconds on large partitions).",

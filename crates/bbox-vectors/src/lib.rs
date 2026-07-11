@@ -283,6 +283,25 @@ pub fn metrics_nonblocking() -> Option<BTreeMap<String, PartitionMetrics>> {
     try_global().map(|store| store.metrics_nonblocking())
 }
 
+/// Partition lifecycle inventory against the installed global store.
+/// Degrades to Ok(None) during cold-start warmup (same contract as
+/// `try_metrics`).
+pub fn partition_infos() -> Result<Option<Vec<PartitionInfo>>> {
+    let Some(store) = try_global() else {
+        return Ok(None);
+    };
+    store.partition_infos().map(Some)
+}
+
+/// Remove one partition from the installed global store. Errors during
+/// cold-start warmup rather than silently doing nothing.
+pub fn remove_partition(route: &str) -> Result<bool> {
+    let Some(store) = try_global() else {
+        anyhow::bail!("vector store is still warming up; retry shortly");
+    };
+    store.remove_partition(route)
+}
+
 /// Sampled self-recall probe against the installed global store. Degrades to
 /// Ok(None) during cold-start warmup (same contract as `try_metrics`).
 pub fn self_recall_probe(route: &str, sample_every: usize, k: usize) -> Result<Option<f64>> {
@@ -546,6 +565,73 @@ impl VectorStore {
         self.partitions.read().len()
     }
 
+    /// Lifecycle inventory of every partition present on disk, including
+    /// ones the in-memory map has not loaded. `dims`/`active_count` come
+    /// from loaded partition metrics (`None` while unloaded or under an
+    /// active write-lock hold); `last_write`/`disk_bytes` come from file
+    /// metadata so they never force a load of a cold multi-GB partition.
+    pub fn partition_infos(&self) -> Result<Vec<PartitionInfo>> {
+        let loaded = self.metrics_nonblocking();
+        let mut infos = Vec::new();
+        for entry in fs::read_dir(&self.root)
+            .with_context(|| format!("reading vector store {}", self.root.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let route = entry.file_name().to_string_lossy().to_string();
+            let mut last_write: Option<chrono::DateTime<chrono::Utc>> = None;
+            let mut disk_bytes = 0u64;
+            for file in fs::read_dir(entry.path())? {
+                let metadata = file?.metadata()?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                disk_bytes += metadata.len();
+                if let Ok(modified) = metadata.modified() {
+                    let modified = chrono::DateTime::<chrono::Utc>::from(modified);
+                    if last_write.is_none_or(|current| modified > current) {
+                        last_write = Some(modified);
+                    }
+                }
+            }
+            let metrics = loaded.get(&route);
+            infos.push(PartitionInfo {
+                route,
+                dims: metrics.map(|m| m.dims),
+                active_count: metrics.map(|m| m.active_count),
+                last_write,
+                disk_bytes,
+            });
+        }
+        infos.sort_by(|a, b| a.route.cmp(&b.route));
+        Ok(infos)
+    }
+
+    /// Remove one partition: drop it from the in-memory map and delete its
+    /// directory. Returns false when no such partition exists. Intended for
+    /// orphaned partitions no route maps to — a concurrent writer targeting
+    /// the same route can recreate it, so callers gate on unmapped routes.
+    pub fn remove_partition(&self, route: &str) -> Result<bool> {
+        if route.is_empty() || route.contains(['/', '\\']) || route == "." || route == ".." {
+            anyhow::bail!("invalid partition route `{route}`");
+        }
+        let removed = self.partitions.write().remove(route);
+        if let Some(partition) = removed {
+            // Let any in-flight operation on the evicted handle finish
+            // before the files disappear underneath it.
+            let _quiesce = partition.write();
+        }
+        let path = self.root.join(route);
+        if !path.is_dir() {
+            return Ok(false);
+        }
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("removing vector partition {}", path.display()))?;
+        Ok(true)
+    }
+
     /// Sampled self-recall diagnostic for one route (gap-1168b0bd c).
     /// O(sample × search) — operator-invoked probe, never a metrics()-path
     /// stat. Uses `try_read` so a probe issued during a long write-lock
@@ -658,6 +744,18 @@ impl PartitionMetrics {
             .is_some_and(|hnsw| hnsw.active_nodes >= MIN_CONNECTIVITY_GUARD_NODES)
             && self.connectivity_risk_ratio() >= threshold
     }
+}
+
+/// Lifecycle-facing partition inventory row (`bbox_embed_partitions`).
+/// Distinct from `PartitionMetrics`: this is disk-truthful (covers
+/// unloaded partitions) and carries recency, not HNSW health.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PartitionInfo {
+    pub route: String,
+    pub dims: Option<usize>,
+    pub active_count: Option<usize>,
+    pub last_write: Option<chrono::DateTime<chrono::Utc>>,
+    pub disk_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2009,5 +2107,64 @@ mod tests {
             .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0])
             .unwrap();
         assert!(store.upsert("voyage-1024", "b", "h2", vec![1.0]).is_err());
+    }
+
+    #[test]
+    fn partition_infos_cover_loaded_and_unloaded_partitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = VectorStore::open(tmp.path()).unwrap();
+            store.upsert("route-a", "a", "h1", vec![1.0, 0.0]).unwrap();
+            store.upsert("route-b", "b", "h2", vec![0.0, 1.0]).unwrap();
+            store.flush_all().unwrap();
+        }
+        // Loaded view: both partitions carry metrics.
+        let store = VectorStore::open(tmp.path()).unwrap();
+        let infos = store.partition_infos().unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].route, "route-a");
+        assert_eq!(infos[0].dims, Some(2));
+        assert_eq!(infos[0].active_count, Some(1));
+        assert!(infos[0].last_write.is_some());
+        assert!(infos[0].disk_bytes > 0);
+        drop(store);
+
+        // Unloaded view (open_unloaded): rows still appear, disk-truthful,
+        // with metrics absent instead of forcing a partition load.
+        let store = VectorStore::open_unloaded(tmp.path()).unwrap();
+        let infos = store.partition_infos().unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].dims, None);
+        assert_eq!(infos[0].active_count, None);
+        assert!(infos[0].disk_bytes > 0);
+    }
+
+    #[test]
+    fn remove_partition_deletes_dir_and_map_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store.upsert("route-a", "a", "h1", vec![1.0, 0.0]).unwrap();
+        store.upsert("route-b", "b", "h2", vec![0.0, 1.0]).unwrap();
+        store.flush_all().unwrap();
+
+        assert!(store.remove_partition("route-a").unwrap());
+        assert!(!tmp.path().join("route-a").exists());
+        assert_eq!(store.partition_count(), 1);
+        let infos = store.partition_infos().unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].route, "route-b");
+
+        // Absent partition reports false; survivors keep working.
+        assert!(!store.remove_partition("route-a").unwrap());
+        assert!(store.search("route-b", &[0.0, 1.0], 1).is_ok());
+    }
+
+    #[test]
+    fn remove_partition_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for bad in ["", ".", "..", "a/b", "a\\b"] {
+            assert!(store.remove_partition(bad).is_err(), "accepted `{bad}`");
+        }
     }
 }

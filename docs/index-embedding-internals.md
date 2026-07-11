@@ -131,7 +131,18 @@ Operator tools:
 ```text
 bbox_embed_status()
 bbox_reembed(route="<route>")
+bbox_embed_partitions(action="list")
+bbox_embed_partitions(action="prune", older_than_days=30)       # dry run
+bbox_embed_partitions(action="prune", older_than_days=30, apply=true)
 ```
+
+`bbox_embed_partitions` is the partition lifecycle surface: `list` shows
+every on-disk vector partition with its current route mapping (orphans
+show `mapped=false`; hybrid search skips them and reports
+`degraded.skipped_partitions`). `prune` deletes only partitions that are
+both unmapped by current route config and idle beyond the required age
+threshold, and is dry-run unless `apply=true`. `bbox_reembed` never
+prunes.
 
 Provider config lives in `embed.toml` under the platform config dir:
 

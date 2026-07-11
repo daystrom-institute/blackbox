@@ -44,6 +44,14 @@ out explicitly under `Changed` or `Removed`.
   float routes; a non-float dtype forces a new partition. `bbox_embed_status`
   reports the new route identity fields. The query-embedding cache key now
   includes query model, dimension, and dtype.
+- `bbox_embed_partitions`: vector partition lifecycle tool (Layer 5 of the
+  same design). `action="list"` inventories every on-disk partition with
+  dims, active count, last write, disk bytes, and whether any configured
+  bucket currently maps to it (orphans show `mapped=false`).
+  `action="prune"` reclaims orphaned partitions: requires
+  `older_than_days`, only deletes partitions both unmapped by current
+  route config and idle beyond that age, and is dry-run unless
+  `apply=true`. `bbox_reembed` never prunes.
 - `isolate` now has code-mode cell execution via repeated `--cell` or
   `--cell-file` flags, using the same harness `exec` runtime so nested
   `tools.*` / namespace calls and session `store()` / `load()` work during
