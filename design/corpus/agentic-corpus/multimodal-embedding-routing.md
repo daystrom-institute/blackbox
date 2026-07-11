@@ -522,7 +522,20 @@ disk-truthful across unloaded partitions; prune requires
 `older_than_days`, deletes only unmapped-and-idle partitions, dry-run
 unless `apply=true`; `bbox_reembed` remains prune-free).
 
-Phase 3 — Prose re-route + asymmetric retrieval (Layer 1):
+Phase 3 — Prose re-route + asymmetric retrieval (Layer 1) — **executed
+2026-07-11** on the production daemon. Coverage was repaired first
+(code/docs/git_message backfilled to 100% on the legacy route, zero
+drops), then `embed.toml` re-routed every prose bucket + transcripts to
+`voyage_text` (documents `voyage-4-large`, queries `voyage-4-lite`) and
+moved `code` to the explicit `voyage_code` alias — same model, fresh
+partition — so the legacy all-buckets `voyage` partition (233,911
+vectors incl. years of stale residue) became fully unmapped. Re-embeds
+converged (code 84,731; prose 66,532 across 7 buckets; transcripts had
+zero vectors, so nothing was lost), hybrid search verified fusing both
+new partitions with the legacy one skipped under
+`degraded.skipped_partitions`, and the legacy partition was pruned via
+Phase 2 tooling (~5 GB reclaimed). Transcript embedding remains guarded
+and un-backfilled by choice. Original scope:
 
 - Prose buckets → `voyage_text` (voyage-4 family); `code` stays on
   `voyage_code` pending eval.

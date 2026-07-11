@@ -1,0 +1,18 @@
+{
+  "id": "gap-c31f15bc",
+  "title": "New MCP tools default-allow on restricted surfaces (bbox_embed_partitions vs bbox_embed_status on 'default')",
+  "gap_kind": "mcp_surface",
+  "domain": "mcp-surfaces",
+  "wanted_capability": "Surface policy should classify newly added tools deliberately instead of letting unknown tools fall through as allowed on restricted surfaces. Observed during the Phase 2/3 embedding rollout (2026-07-11): on surface 'default', bbox_embed_status is denied (\"tool not available on surface 'default'\") but the freshly added bbox_embed_partitions (including its prune action) answered without any surface config change, meaning restricted surfaces silently widen every time a tool ships. Want either a default-deny posture for tools not named by the surface's allow set, or a startup/lint check that flags tools missing an explicit surface classification.",
+  "fallback_used": "Used ?surface=interactive for operator calls; no config change made.",
+  "evidence": [
+    "src/tools/sessions.rs bbox_embed_partitions #[tool] (new, callable on surface 'default')",
+    "MCP error on same surface: tool not available on surface 'default': bbox_embed_status"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "mcp_surface/mcp-surfaces/new-tool-default-allow-on-restricted-surfaces",
+  "resolution": "unresolved",
+  "created_at": "2026-07-11T09:18:37Z",
+  "updated_at": "2026-07-11T09:18:37Z"
+}
