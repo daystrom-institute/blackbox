@@ -105,8 +105,24 @@ fn enqueue_git_message_hook(entity_id: &str, chunk_hash: &str, message: &str) {
     let _ = enqueue_git_message(entity_id, chunk_hash, message);
 }
 
+/// THE code-vs-prose routing rule for project-file chunks, shared by the
+/// index-time enqueue hook and the coverage/backfill attribution in
+/// embed_runtime. One rule, one place: the two paths historically used
+/// different rules (chunk language here, path extension there), which
+/// routed fresh markdown edits into the Code bucket while backfills
+/// re-embedded them into Docs - dueling partitions and phantom coverage.
+/// Markdown's legacy `language: Some("md")` label is treated as prose so
+/// stored docs written before the chunker stopped emitting it still
+/// attribute correctly.
+pub fn is_code_chunk(language: Option<&str>, chunk_kind: &str) -> bool {
+    if chunk_kind == "code_block" {
+        return true;
+    }
+    matches!(language, Some(lang) if !matches!(lang, "md" | "markdown" | "mdown"))
+}
+
 pub fn enqueue_project_file(chunk: &Chunk, entity_id: &str) -> bool {
-    let bucket = if chunk.language.is_some() || chunk.chunk_kind == "code_block" {
+    let bucket = if is_code_chunk(chunk.language.as_deref(), &chunk.chunk_kind) {
         Bucket::Code
     } else {
         Bucket::Docs
@@ -397,6 +413,20 @@ pub fn enqueue(request: queue::EmbedRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_chunk_rule_treats_markdown_labels_as_prose() {
+        assert!(is_code_chunk(Some("rust"), "code_block"));
+        assert!(is_code_chunk(Some("rust"), "notebook_cell"));
+        assert!(is_code_chunk(Some("json"), "config"));
+        assert!(is_code_chunk(None, "code_block"));
+        assert!(!is_code_chunk(Some("md"), "doc_section"));
+        assert!(!is_code_chunk(Some("markdown"), "doc_section"));
+        assert!(!is_code_chunk(None, "doc_section"));
+        assert!(!is_code_chunk(None, "pdf_page"));
+        assert!(!is_code_chunk(None, "office_section"));
+        assert!(!is_code_chunk(None, "spreadsheet_sheet"));
+    }
 
     use bbox_threads::threads::{
         EdgeKind, EdgeTarget, SessionLink, Thread, ThreadEdge, ThreadKind, ThreadStatus,

@@ -745,7 +745,7 @@ fn reembed_index_doc_bucket(doc: &EmbeddingSourceDoc) -> Option<Bucket> {
             // transcript_segment, notebook_cell) were invisible to
             // coverage AND to bbox_reembed backfill: index-time enqueues
             // dropped during vector-store warmup could never be repaired.
-            if doc.language.is_some() || doc.chunk_kind == "code_block" {
+            if crate::embed_queue::is_code_chunk(doc.language.as_deref(), &doc.chunk_kind) {
                 Some(Bucket::Code)
             } else {
                 Some(Bucket::Docs)

@@ -31,10 +31,12 @@ impl SourceFormatChunker for MarkdownChunker {
             if content.is_empty() {
                 continue;
             }
+            // Prose, not code: a language label here routes the chunk into
+            // the CODE embedding bucket (see bbox-embed is_code_chunk).
             chunks.push(placeholder_chunk(
                 path,
                 "doc_section",
-                Some("md"),
+                None,
                 content,
                 start as u64,
                 end as u64,
