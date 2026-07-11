@@ -8,7 +8,6 @@
 //! SharedState construction).
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -738,24 +737,22 @@ fn reembed_index_doc_bucket(doc: &EmbeddingSourceDoc) -> Option<Bucket> {
         }
         "knowledge" | "roadmap" => Some(Bucket::Knowledge),
         "project_file" => {
-            let path = Path::new(&doc.file_path);
-            if crate::chunker::code::language_for_path(path).is_some() {
+            // Mirror enqueue_project_file's routing EXACTLY (language /
+            // chunk_kind on the stored doc, not path extension). The old
+            // path rule only knew md/rst/txt and code-language extensions,
+            // so chunks from the document chunkers (pdf_page,
+            // office_section, spreadsheet_sheet, slide, web_section,
+            // transcript_segment, notebook_cell) were invisible to
+            // coverage AND to bbox_reembed backfill: index-time enqueues
+            // dropped during vector-store warmup could never be repaired.
+            if doc.language.is_some() || doc.chunk_kind == "code_block" {
                 Some(Bucket::Code)
-            } else if is_docs_path(path) {
-                Some(Bucket::Docs)
             } else {
-                None
+                Some(Bucket::Docs)
             }
         }
         _ => None,
     }
-}
-
-fn is_docs_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("md" | "mdx" | "rst" | "txt")
-    )
 }
 
 fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
