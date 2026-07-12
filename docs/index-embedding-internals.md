@@ -182,6 +182,35 @@ pairs must derive the same compatibility family or config load fails.
 Stored corpus content embeds with `input_type=document`; live queries
 embed with `input_type=query`.
 
+### Visual routes (opt-in)
+
+Visual retrieval (images, PDF figures) is a separate, chunk-kind-keyed
+route family and is **off by default**. Indexing still produces visual
+chunks, but embedding them requires opting each chunk kind into a
+multimodal route under `[embed.routes.visual]`:
+
+```toml
+[embed.routes.visual]
+image = "voyage_visual"        # X-IMG image files
+pdf_figure = "voyage_visual"   # embedded PDF figures
+```
+
+`voyage_visual` is a built-in alias (`type = "voyage_multimodal"`,
+`voyage-multimodal-3.5`, 1024 dims, `VOYAGE_API_KEY`); declare your own
+`[embed.providers.<alias>]` with `type = "voyage_multimodal"` to
+override. Visual kinds must map to a multimodal-typed alias: pointing
+one at a text alias is a config error, and no text bucket ever falls
+back into a visual route (or vice versa).
+
+Until a kind is routed, its chunks are skipped and `bbox_embed_status`
+reports a `visual:<kind>` row with
+`visual chunk kind ... has no configured route`
+(`health_reason=not_configured`). That row is informational opt-in
+state, not a text-route failure. Shipped kinds are `image` and
+`pdf_figure`; `spreadsheet_chart`, `slide_image`, `image_caption`, and
+`video_segment` are reserved for future chunkers. After routing a kind,
+backfill existing corpus with `bbox_reembed`.
+
 ## Embedding queue
 
 The daemon runs route-specific workers. Reindexing enqueues source docs;

@@ -129,6 +129,19 @@ transcripts = "voyage"
 Mixing providers across routes is fine. Changing a route's provider or
 model requires re-embedding that route: `bbox_reembed(route="knowledge")`.
 
+Visual search (images, PDF figures) is opt-in per chunk kind and off by
+default; a `visual chunk kind ... has no configured route` status on a
+`visual:<kind>` route means the opt-in stanza is missing, not that text
+embedding is broken:
+
+```toml
+[embed.routes.visual]
+image = "voyage_visual"
+pdf_figure = "voyage_visual"
+```
+
+See `docs/index-embedding-internals.md` (Visual routes) for details.
+
 ### Port
 
 Default port: `7264` (HTTP MCP + `/tail` + `/roster`). Override with

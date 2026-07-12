@@ -585,7 +585,13 @@ impl EmbedQueueHandle {
         let resolved = match self.resolve_route(&request) {
             Ok(resolved) => resolved,
             Err(err) => {
-                let fallback = request.bucket.as_str().to_string();
+                // Visual requests carry a placeholder bucket (ignored by
+                // routing), so attribute their failures to the visual route
+                // label; marking the bucket would flag a healthy text route.
+                let fallback = match &request.visual_kind {
+                    Some(kind) => visual_queue_route(kind),
+                    None => request.bucket.as_str().to_string(),
+                };
                 mark_error(&self.inner.statuses, &fallback, &sanitize_error(&err));
                 return false;
             }
@@ -717,7 +723,8 @@ impl EmbedQueueHandle {
         let Some(meta) = router.visual_route(kind)? else {
             bail!(
                 "visual chunk kind `{kind}` has no configured route; add \
-                 [embed.routes.visual] `{kind} = \"<alias>\"` to embed.toml to opt in"
+                 [embed.routes.visual] `{kind} = \"voyage_visual\"` (or another \
+                 multimodal alias) to embed.toml to opt in"
             );
         };
         Ok(ResolvedRoute {
@@ -2261,6 +2268,54 @@ mod tests {
             vector_store
                 .contains_active("visual:image", "project_file:p:f:h:0", "h1")
                 .unwrap()
+        );
+        queue.shutdown();
+    }
+
+    /// An unrouted visual kind must surface its error on the `visual:<kind>`
+    /// status row, never on the placeholder text bucket the request carries
+    /// (`Bucket::Docs`) — marking the bucket made a healthy docs route
+    /// report unavailable in `bbox_embed_status`.
+    #[tokio::test]
+    async fn unrouted_visual_kind_marks_the_visual_route_not_the_bucket() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+            [embed.routes]
+            docs = "voyage"
+            "#,
+        )
+        .unwrap();
+        let queue = EmbedQueueHandle::from_router_for_test(
+            router,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        );
+        let mut req = request(Bucket::Docs, "project_file:p:f:h:0", "h1");
+        req.visual_kind = Some("image".into());
+        req.visual_payload = Some(VisualPayloadRef {
+            content_hash: "hash".into(),
+            media_type: "image/png".into(),
+            byte_len: 16,
+        });
+        assert!(!queue.enqueue(req));
+
+        let routes = queue.status().routes;
+        let status = routes
+            .get("visual:image")
+            .expect("error should be keyed by the visual route label");
+        assert!(!status.available);
+        assert_eq!(status.health_reason.as_deref(), Some("not_configured"));
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no configured route"),
+            "{status:?}"
+        );
+        assert!(
+            !routes.contains_key("docs"),
+            "docs bucket must not inherit the visual-lane error: {routes:?}"
         );
         queue.shutdown();
     }
