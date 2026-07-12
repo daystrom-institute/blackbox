@@ -17,7 +17,9 @@
   "dedupe_key": "eval_coverage/provider-registry/order-dependent-duplicate-registration",
   "suggested_owner": "blackbox",
   "notes": "all_providers().len() was 32 while EntityType::ALL.len() was 20. The test passes alone but fails after earlier tests register providers into global state.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-07-12T18:57:51Z",
-  "updated_at": "2026-07-12T18:57:51Z"
+  "updated_at": "2026-07-12T20:03:35Z",
+  "resolved_at": "2026-07-12T20:03:35Z",
+  "resolution_note": "Fixed by PR #5 (merge 9f11dbcd): register_extra_providers dedupes by EntityType, making registration idempotent; the invariant test now registers twice. Workspace nextest gate green post-merge (4,329 passed)."
 }
