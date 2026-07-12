@@ -5,13 +5,13 @@
   "query": "where was the mechanical bro recursion guard discussed?",
   "target_locators": [
     {
-      "description": "Transcript turns mentioning the default mcp__blackbox__bro_* disallow filter and mechanical recursion guard.",
+      "description": "Transcript turns working with the default mcp__blackbox__bro_* disallow filter and mechanical recursion guard (re-anchored 2026-07-11: original session purged from the corpus; this codex session exercises bro_mcp disallow directly).",
       "entity_type_hint": "transcript",
       "transcript_hint": "mechanical recursion guard mcp__blackbox__bro_*"
     }
   ],
   "expected_entity_refs": [
-    "transcript:account2:f11989a9-6057-4c12-af3a-cd2b86a0699f:2516124:0"
+    "transcript:codex:019ed188-596b-7bb1-8484-2641d1a6fa42:3747318:0"
   ],
   "required_evidence": {
     "kind": "edge_family",
