@@ -1547,6 +1547,10 @@ fn file_edits_to_changes(
     Ok((changes, changed_files))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn file_delete_value(root: &Path, path: &Path) -> Result<Value, String> {
     let rel_path = if let Ok(rel) = path.strip_prefix(root) {
         rel.to_path_buf()
@@ -2405,6 +2409,9 @@ impl Tool for JavaExtractClass {
             // concrete @Inject class fresh per injection point, matching the
             // source view's per-instance lifecycle so moved mutable state never
             // leaks across instances.
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source_text =
                 std::fs::read_to_string(root.join(&params.file)).unwrap_or_default();
             let inject_fqn = detect_inject_fqn(&source_text);
@@ -4027,6 +4034,10 @@ fn signature_text_for(source: &str, sig: &bbox_refactor::facts::JavaSignatureFac
         .to_string()
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn preview_candidates(root: &Path, params: &JavaPullUpPreviewParams) -> Result<Value, String> {
     let path = resolve_workspace_file(root, &params.file, "java.pullUpPreview")?;
     let source = std::fs::read_to_string(&path)
@@ -5292,6 +5303,10 @@ fn source_import_fqcns_for_target(
     (fqcns, findings)
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn pushdown_preview_value(
     root: &Path,
     params: &JavaPushDownMembersPreviewParams,
@@ -6833,6 +6848,10 @@ fn change_signature_method_from_item(
     }))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn find_change_signature_method(
     root: &Path,
     params: &JavaChangeSignaturePreviewParams,
@@ -7169,6 +7188,10 @@ fn change_signature_preview_value(
     }))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn rewritten_call_args(
     method: &ChangeSignatureMethod,
     specs: &[JavaChangeParamSpec],
@@ -8482,6 +8505,10 @@ fn field_site_rewrite(
     }
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn discover_encapsulate_field_sites(
     root: &Path,
     source_file: &str,
@@ -8544,6 +8571,10 @@ fn discover_encapsulate_field_sites(
     Ok((sites, findings))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn find_encapsulate_field(
     root: &Path,
     params: &JavaEncapsulateFieldPreviewParams,
@@ -8764,6 +8795,10 @@ fn encapsulate_field_preview_value(
     }))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn class_insert_before_closing_brace(
     items: &bbox_refactor::facts::FileItemsFacts,
     class_name: &str,
@@ -9161,6 +9196,10 @@ fn constructor_from_item(
     }))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn find_constructor_factory_target(
     root: &Path,
     params: &JavaReplaceConstructorWithFactoryPreviewParams,
@@ -9424,6 +9463,10 @@ fn discover_constructor_call_sites(
     Ok((sites, findings))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn replace_constructor_preview_value(
     root: &Path,
     params: &JavaReplaceConstructorWithFactoryPreviewParams,
@@ -9893,6 +9936,10 @@ fn migrate_type_usages_from_plan(
     usages
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn migrate_type_usages_preview_value(
     root: &Path,
     params: &JavaMigrateTypeUsagesPreviewParams,
@@ -10177,6 +10224,10 @@ struct InlineMethodInfo {
     visibility: Option<String>,
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn find_inline_method_info(
     root: &Path,
     params: &JavaInlineMethodPreviewParams,
@@ -10650,6 +10701,10 @@ fn plan_move_member(
         .map_err(|e| format!("java.moveMemberPreview: plan decode: {e}"))
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn move_member_refs(
     root: &Path,
     params: &JavaMoveMemberPreviewParams,
@@ -12271,6 +12326,10 @@ fn import_insertion_offset(source: &str) -> (usize, bool, bool) {
     (insert_at, saw_package, saw_import)
 }
 
+// Sync fs access is sanctioned here: callers run inside the call_blocking
+// closures of the java.* binding tools, never on a tokio worker
+// (concurrency-model section 5).
+#[allow(clippy::disallowed_methods)]
 fn java_add_import_value(root: &Path, params: JavaAddImportParams) -> Result<Value, String> {
     if params.imports.is_empty() {
         return Err("java.addImport: `imports` must not be empty".to_string());
@@ -12953,6 +13012,9 @@ impl Tool for JavaExtractClassPreviewPlan {
 
             // Source text for the target file, read once and reused by the DI
             // wireability check and the internal-helper-dependency scan below.
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source = std::fs::read_to_string(&path).unwrap_or_default();
             // 4. DI wireability check via fieldClassification.
             let mut non_injectable_mutable: Vec<String> = Vec::new();
@@ -13167,10 +13229,16 @@ impl Tool for JavaSynthesizeHelperWrappers {
         bro_tools::tool::call_blocking(move || {
             let source_path = root.join(&params.file);
             let delegate_path = root.join(&params.target);
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source = match std::fs::read_to_string(&source_path) {
                 Ok(s) => s,
                 Err(e) => return err(format!("read source: {e}")),
             };
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let delegate_src = match std::fs::read_to_string(&delegate_path) {
                 Ok(s) => s,
                 Err(e) => return err(format!("read delegate: {e}")),
@@ -13470,6 +13538,9 @@ impl Tool for JavaExtractColumnSpec {
         let root = cx.root.clone();
         bro_tools::tool::call_blocking(move || {
             let source_path = root.join(&params.file);
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source = match std::fs::read_to_string(&source_path) {
                 Ok(s) => s,
                 Err(e) => return err(format!("read source: {e}")),
