@@ -607,6 +607,12 @@ fn run_bounded_with_timeout(
     });
 
     let deadline = std::time::Instant::now() + timeout;
+    // Escalating poll: most git children here finish in single-digit
+    // milliseconds (rev-parse, diff-tree), and a fixed 25ms poll adds ~20ms
+    // latency per call - across the tens of thousands of per-commit calls a
+    // full reindex pass makes, that compounded to 30+ observed minutes.
+    // Start at 1ms and back off toward 25ms for genuinely slow children.
+    let mut poll = Duration::from_millis(1);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -640,7 +646,8 @@ fn run_bounded_with_timeout(
                     );
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(poll);
+                poll = (poll * 2).min(Duration::from_millis(25));
             }
             Err(err) => {
                 let _ = child.kill();
