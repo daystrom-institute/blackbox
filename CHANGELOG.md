@@ -142,6 +142,21 @@ out explicitly under `Changed` or `Removed`.
   status under `visual:<kind>` route keys. Sidecar anchoring uses the
   interim chunk[0]-as-file proxy (gap-ab3ef97f tracks the eventual
   `file:` entity migration).
+- Query-side visual retrieval (Layer 4 retrieval leg): `bbox_hybrid_search`
+  now searches configured `[embed.routes.visual]` partitions instead of
+  silently skipping them - the vector lane enumeration was bucket-keyed
+  while visual routes are chunk-kind-keyed, so a partition with indexed
+  image/pdf_figure vectors never surfaced in `searched_partitions`. The
+  query embeds once via the multimodal alias through the existing
+  process-wide query cache (no re-bill on repeat queries), searches each
+  distinct visual partition at the same `vector_weight` as text lanes
+  (image and pdf_figure sharing one alias dedupe to one search), and
+  degrades only that lane on embed failure (`degraded.vector_errors`) -
+  never the whole search. Hosts with no `[embed.routes.visual]` entry see
+  no behavior change. `bbox_embed_status` rows for `visual:<kind>` lanes
+  now populate `provider`/`model`/`dim`/`compatibility_family` from
+  `VisualRouteMeta` instead of showing them `null` next to
+  `available=true`.
 - `bbox_embed_partitions`: vector partition lifecycle tool (Layer 5 of the
   same design). `action="list"` inventories every on-disk partition with
   dims, active count, last write, disk bytes, and whether any configured
