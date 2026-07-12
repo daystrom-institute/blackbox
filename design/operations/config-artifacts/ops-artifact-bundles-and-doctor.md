@@ -1,7 +1,7 @@
 ---
 title: "Ops Artifact Bundles And Doctor"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - operations
@@ -1083,6 +1083,24 @@ Concurrency model:
   forever.
 
 ## Doctor
+
+### Status Note (2026-07-12)
+
+`bbox_doctor` v0 shipped ahead of the bundle/artifact phases described below
+(Phase 5 pulled forward; code anchors `src/doctor.rs` and
+`src/tools/doctor.rs`). It covers the 8 substrate-independent sections only:
+daemon, index, vectors, graph, projects, memories, knowledge, attention. The
+`artifacts`, `inlets`, and `workflows` sections, and the operation-record
+`blocked` reporting, described below remain deferred until the bundle and
+activator phases land, since they need catalog machinery that does not exist
+yet. The vectors section's opt-in-vs-failure classification rule for visual
+routes (a `visual:<kind>` route reported as `info` when not configured or
+coverage-seeded with no route metadata, versus `action` for credential or
+hard route failures) is a post-v1-design addition made when the visual routes
+shipped on 2026-07-10/11; it postdates and is not reflected in the sections
+list below.
+
+The rest of this section still specifies the deferred end state.
 
 Add:
 

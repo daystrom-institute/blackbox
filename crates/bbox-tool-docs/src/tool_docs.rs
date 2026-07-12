@@ -39,6 +39,7 @@ pub enum ToolCategory {
     StorageHealth,
     Workspace,
     Macros,
+    Operations,
 }
 
 impl ToolCategory {
@@ -62,6 +63,7 @@ impl ToolCategory {
             Self::StorageHealth => "Storage health",
             Self::Workspace => "Workspace tools",
             Self::Macros => "Macro registry",
+            Self::Operations => "Operations",
         }
     }
 
@@ -114,6 +116,9 @@ impl ToolCategory {
             }
             Self::Macros => {
                 "Register, inspect, plan, and execute macro recipes. Macros are data-only synthesis plans stored as JSON files. Project macros live under `.bbox/macros/` (reviewable like source). User macros live in operator config. Builtins ship with Blackbox. `macro_plan` produces a `MacroPlan` review artifact (read-only); `macro_apply` lowers a `MacroPlan` to a `RefactorPlan` and applies it to disk (requires `confirm=true`); `macro_run` combines plan + apply in one step."
+            }
+            Self::Operations => {
+                "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands."
             }
         }
     }
@@ -1585,6 +1590,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Manage the bbox roadmap — an operator-directed prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Roadmap interactions are performed only at the express direction of the operator; never use the roadmap to defer, postpone, or avoid requested implementation work. Inbox is reactive; threads are active work; knowledge is atemporal. Status lifecycle: proposed → accepted → delivered (shipped) or rejected; accepted → deferred → accepted.",
         when_to_use: "Use only when the operator explicitly asks to manage future work, review what's designed but not yet built, decide what to work on next, or promote a specific roadmap item. Do not initiate roadmap actions as an agent-selected deferral path; if the operator requested implementation, do the implementation unless they explicitly redirect it to roadmap tracking. `action=\"next\"` ranks accepted items by priority, staleness, blockers, and design-link health. `action=\"promote\"` opens a bbox_thread with the item's context injected. Link to design docs (designed_in) and threads (spawns / deferred_from). `action=\"render\"` emits a Tera-templated markdown artifact; pass `template` (inline Tera source) or `template_path` to customise layout and which statuses are included — `delivered`/`rejected` are excluded from the default template. `action=\"default_template\"` returns the built-in Tera source as a starting point.",
         example: Some(r#"bbox_roadmap(action="next", n=5)"#),
+    },
+    // ── Operations ──────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_doctor",
+        category: ToolCategory::Operations,
+        summary: "Read-only health aggregation across daemon, index, vectors, graph, projects, memories, knowledge, and attention. Findings are classified ok/info/warn/action/blocked with suggested next commands; format=summary (compact text) or json.",
+        when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\" — replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list, bbox_lint, bbox_inbox) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Artifact/inlet/workflow drift sections land with the bundle phases.",
+        example: Some(r#"bbox_doctor(format="summary")"#),
     },
     // ── Storage health ──────────────────────────────────────────────
     ToolDoc {

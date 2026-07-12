@@ -220,7 +220,13 @@ old inode until systemd restarts it.
 
 ### Daily / on-demand
 
+`bbox_doctor(format="summary")` is the first call for "what needs attention
+right now": it aggregates the old manual smoke checks (`bbox_stats`,
+`bbox_embed_status`, `bbox_project_list`, `bbox_lint`, `bbox_inbox`) into one
+classified report (ok/info/warn/action/blocked) with suggested next commands.
+
 ```bash
+bbox_doctor(format="summary")            # aggregate health + attention report
 bbox_inbox(project="/your/repo")         # attention sweep
 bbox_thread_list(status="open")          # investigation continuity
 bbox_embed_status()                      # confirm no embedding errors

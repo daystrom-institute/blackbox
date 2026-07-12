@@ -37,6 +37,7 @@ pub use bbox_config::config;
 pub use bbox_indexing::code_nav;
 mod crons;
 pub mod dispatch_mcp;
+mod doctor;
 use bbox_edge_index::edge_index;
 use bbox_embed::embed;
 use bbox_embed::embed_queue;

@@ -31,6 +31,13 @@ pub fn catalog() -> &'static MemoryCatalog {
         .expect("system memory catalog not initialized")
 }
 
+/// Non-panicking catalog access for health surfaces (doctor): `None` means
+/// the catalog never initialized in this process, which is itself a
+/// reportable finding rather than a crash.
+pub fn catalog_if_loaded() -> Option<&'static MemoryCatalog> {
+    SYSTEM_MEMORY_CATALOG.get()
+}
+
 /// Idempotently initialize the process-wide catalog from `defaults_dir`.
 /// Test support for downstream crates (the daemon's tests must initialize
 /// the catalog and own the repo-root `system-defaults/memories` path); not

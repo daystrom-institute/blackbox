@@ -776,6 +776,28 @@ does not expose stale kind-specific install/list commands.
 
 ## Phase 5: Doctor
 
+### Status Note (2026-07-12)
+
+`bbox_doctor` v0 shipped (code anchors `src/doctor.rs`, `src/tools/doctor.rs`).
+Status per subsection:
+
+- 5.1 Tool Shape: shipped with the `format` param only (`summary` or `json`);
+  `scope` and `project` are deferred, not part of v0.
+- 5.2 Sections: shipped for the 8 substrate-independent sections (daemon,
+  index, vectors, graph, projects, memories, knowledge, attention); the
+  `artifacts`, `inlets`, and `workflows` sections remain deferred to the
+  bundle/activator phases.
+- 5.3 Finding Classification: shipped as specified (ok/info/warn/action/blocked).
+- 5.4 Tests: shipped for classification and summary-rendering tests, plus one
+  empty-state end-to-end test over a per-test `SharedState`. The
+  operation-record tests (stale `applying`, etc.) are deferred along with
+  Phase 6, since they depend on the upgrade helper this doc has not built yet.
+
+Also note: this doc's source anchors predate the `bbox-artifacts` crate split
+(artifact code now lives in `crates/bbox-artifacts`, not `src/artifacts.rs`),
+so the Phase 0 anchors need re-verification against that split before
+executing any later phase.
+
 **Goal:** provide one read-only "what do I need to know right now?" surface.
 
 ### 5.1 Tool Shape

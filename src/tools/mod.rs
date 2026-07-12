@@ -16,6 +16,7 @@ pub mod code_nav;
 pub mod config;
 pub mod consultant;
 pub mod dispatch;
+pub mod doctor;
 pub mod gaps;
 pub mod graph;
 pub mod knowledge;

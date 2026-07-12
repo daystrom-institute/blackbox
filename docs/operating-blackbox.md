@@ -8,7 +8,17 @@ embedding, and compaction implementation details, see
 
 ## What healthy looks like
 
-Run these from any MCP client connected to the daemon:
+Start with the aggregate check:
+
+```text
+bbox_doctor(format="summary")
+```
+
+`bbox_doctor` classifies findings ok/info/warn/action/blocked with suggested
+next commands, so a clean run means the drill-down tools below are optional.
+When something needs a closer look, or you want to eyeball raw signal
+directly, run the individual tools from any MCP client connected to the
+daemon:
 
 ```text
 bbox_stats()

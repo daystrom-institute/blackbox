@@ -57,6 +57,7 @@ impl BlackboxServer {
                 + crate::tools::config::router()
                 + crate::tools::dispatch::router()
                 + crate::tools::mcp_surface::router()
+                + crate::tools::doctor::router()
                 + crate::tools::storage_health::router()
                 + crate::tools::storage_gc::router()
                 + crate::tools::storage_migration::router()

@@ -1139,7 +1139,9 @@ fn apply_stall_health(response: &mut EmbedStatusResponse) {
     }
 }
 
-pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
+/// Structured variant shared by `bbox_embed_status` and `bbox_doctor`, so
+/// both surfaces classify the exact same rows.
+pub(crate) fn status_response_for_state(state: &SharedState) -> Result<EmbedStatusResponse> {
     const STATUS_COVERAGE_BUCKETS: &[Bucket] = &[
         Bucket::Knowledge,
         Bucket::Code,
@@ -1162,6 +1164,11 @@ pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
             );
         }
     }
+    Ok(response)
+}
+
+pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
+    let response = status_response_for_state(state)?;
     Ok(serde_json::to_string_pretty(&response)?)
 }
 
