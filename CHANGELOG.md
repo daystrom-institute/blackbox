@@ -8,7 +8,30 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Added
+
+- `extract_java_class` grows a `constructor_injection` wiring strategy
+  (gap-3f582e0a): the delegate becomes a `private final` field plus a
+  parameter appended to the source's first constructor (inserted before a
+  trailing varargs parameter) with `this.<delegate> = <delegate>;` wiring,
+  so zero-field-injection architectures no longer receive generated
+  `@Inject` fields. A source with no constructor gets a synthesized one
+  carrying the caller-supplied annotations; a delegate name colliding with
+  an existing constructor parameter is refused with a dedicated error code.
+  The `java.extractClass` binding auto-selects the strategy from the
+  source's own injection idiom (`@Inject` constructor selects
+  `constructor_injection`, field-level `@Inject` selects
+  `external_injection`, non-DI stays `own_construction`), and
+  `java.extractClassPreviewPlan` recommends it the same way.
+
 ### Fixed
+
+- `extract_java_class` no longer silently strands constructor assignments to
+  moved fields whose initializer fails the bare-parameter threading test
+  (e.g. a computed expression or object creation): each orphaned assignment
+  now gets a FIXME comment above it and a `leftovers` entry on the plan, so
+  previews and applies surface the manual relocation instead of producing
+  non-compiling output discovered at build time.
 
 - Git subprocesses spawned by the corpus resolvers (`git_output` /
   `git_output_strings`, e.g. session-cwd base-project resolution during

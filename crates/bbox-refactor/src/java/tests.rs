@@ -2423,6 +2423,22 @@ fn guice_external_injection_spec() -> crate::WiringSpec {
         delegate_field_annotation_imports: Some(vec!["javax.inject.Inject".to_string()]),
         target_constructor_annotations: Some(vec!["@Inject".to_string()]),
         target_constructor_annotation_imports: Some(vec!["javax.inject.Inject".to_string()]),
+        ..Default::default()
+    }
+}
+
+/// The wiring spec the binding supplies for a constructor-injection extract
+/// (gap-3f582e0a): the delegate arrives through the source's own constructor,
+/// so no delegate-field annotations are emitted — the field stays
+/// `private final`, matching a zero-field-injection architecture.
+fn constructor_injection_spec() -> crate::WiringSpec {
+    crate::WiringSpec {
+        strategy: Some("constructor_injection".to_string()),
+        target_constructor_annotations: Some(vec!["@Inject".to_string()]),
+        target_constructor_annotation_imports: Some(vec!["javax.inject.Inject".to_string()]),
+        source_constructor_annotations: Some(vec!["@Inject".to_string()]),
+        source_constructor_annotation_imports: Some(vec!["javax.inject.Inject".to_string()]),
+        ..Default::default()
     }
 }
 
@@ -2511,6 +2527,295 @@ fn g7_wiring_mode_manual_skips_all_source_wiring() {
     assert!(
         !rewritten.contains("this.service = new Service"),
         "manual mode must not emit ctor wiring: {rewritten}"
+    );
+}
+
+// gap-3f582e0a: constructor_injection preserves the source's injection idiom.
+// The delegate becomes a `private final` field + a parameter appended to the
+// existing constructor + `this.<delegate> = <delegate>;` in its body. No
+// @Inject field is emitted on the source, and no `new Target(...)` appears.
+#[test]
+fn constructor_injection_appends_ctor_param_and_assigns_delegate() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Service.java");
+    fs::write(
+        &source,
+        "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+            \x20   private final Object repo;\n\
+            \x20   @Inject\n\
+            \x20   public Admin(Object repo) {\n\
+            \x20       this.repo = repo;\n\
+            \x20   }\n\
+            \x20   public Long save() { return repo.hashCode() + 0L; }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Service".to_string());
+    params.delegate_field = Some("service".to_string());
+    params.item_names = Some(vec!["save".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+    params.wiring_mode = Some(constructor_injection_spec());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        rewritten.contains("private final Service service;"),
+        "delegate must stay a private final field: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("public Admin(Object repo, Service service)"),
+        "delegate param must be appended to the existing ctor: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("this.service = service;"),
+        "ctor body must assign the delegate from its param: {rewritten}"
+    );
+    assert!(
+        !rewritten.contains("this.service = new Service"),
+        "constructor_injection must not build the delegate itself: {rewritten}"
+    );
+    assert!(
+        !rewritten.contains("@Inject\n    private Service service"),
+        "constructor_injection must not emit an @Inject delegate field: {rewritten}"
+    );
+    // Target side matches external_injection: annotated ctor for the captured dep.
+    let target_text = target_replacement(&plan);
+    assert!(
+        target_text.contains("@Inject"),
+        "target ctor must carry the container annotation: {target_text}"
+    );
+    assert!(
+        target_text.contains("public Service(Object repo)"),
+        "captured dep must become a target ctor param: {target_text}"
+    );
+}
+
+// gap-3f582e0a: a trailing varargs parameter must stay last (JLS 8.4.1) — the
+// delegate param is inserted BEFORE a trailing spread parameter.
+#[test]
+fn constructor_injection_inserts_delegate_before_trailing_varargs() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Service.java");
+    fs::write(
+        &source,
+        "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+            \x20   @Inject\n\
+            \x20   public Admin(Object repo, String... tags) {\n\
+            \x20   }\n\
+            \x20   public Long save() { return 1L; }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Service".to_string());
+    params.delegate_field = Some("service".to_string());
+    params.item_names = Some(vec!["save".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+    params.wiring_mode = Some(constructor_injection_spec());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        rewritten.contains("public Admin(Object repo, Service service, String... tags)"),
+        "delegate param must land before the varargs parameter: {rewritten}"
+    );
+}
+
+// gap-3f582e0a: a source class with no constructor gets a synthesized one
+// carrying the caller-supplied annotations, taking the delegate as its
+// parameter (constructor-injection idiom from day one).
+#[test]
+fn constructor_injection_synthesizes_annotated_ctor_when_source_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Service.java");
+    fs::write(
+        &source,
+        "package a;\n\
+             public class Admin {\n\
+            \x20   public Long save() { return 1L; }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Service".to_string());
+    params.delegate_field = Some("service".to_string());
+    params.item_names = Some(vec!["save".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+    params.wiring_mode = Some(constructor_injection_spec());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        rewritten.contains("@Inject\n    public Admin(Service service) {"),
+        "synthesized ctor must carry the supplied annotation: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("this.service = service;"),
+        "synthesized ctor must assign the delegate: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("import javax.inject.Inject;"),
+        "annotation import must be added to the source: {rewritten}"
+    );
+}
+
+// gap-3f582e0a: the delegate field name colliding with an existing ctor
+// parameter is refused with an actionable error, not silently shadowed.
+#[test]
+fn constructor_injection_refuses_delegate_name_colliding_with_ctor_param() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Service.java");
+    fs::write(
+        &source,
+        "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+            \x20   @Inject\n\
+            \x20   public Admin(Object service) {\n\
+            \x20   }\n\
+            \x20   public Long save() { return 1L; }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Service".to_string());
+    params.delegate_field = Some("service".to_string());
+    params.item_names = Some(vec!["save".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+    params.wiring_mode = Some(constructor_injection_spec());
+
+    let err = plan_extract_java_class(&params).unwrap_err().to_string();
+    assert!(
+        err.contains("delegate_name_collides_with_ctor_param"),
+        "collision must be refused with the dedicated code: {err}"
+    );
+}
+
+// gap-3f582e0a defect 2: a moved field whose ctor assignment is NOT a bare
+// surviving parameter (here: an object creation) is not auto-threaded. The
+// orphaned assignment must be marked with a FIXME and surfaced in the plan's
+// leftovers instead of silently producing non-compiling output.
+#[test]
+fn unthreaded_moved_field_ctor_assignment_gets_fixme_and_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Service.java");
+    fs::write(
+        &source,
+        "package a;\n\
+             public class Admin {\n\
+            \x20   private final StringBuilder buffer;\n\
+            \x20   public Admin(String seed) {\n\
+            \x20       this.buffer = new StringBuilder(seed);\n\
+            \x20   }\n\
+            \x20   public Long save() { return buffer.length() + 0L; }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Service".to_string());
+    params.delegate_field = Some("service".to_string());
+    params.item_names = Some(vec!["save".to_string()]);
+    params.move_fields = Some(vec!["buffer".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        rewritten.contains("// FIXME: moved field `buffer` is still initialized here"),
+        "orphaned assignment must be marked with a FIXME: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("this.buffer = new StringBuilder(seed);"),
+        "the assignment itself must be preserved for the operator to relocate: {rewritten}"
+    );
+    assert_eq!(
+        plan.leftovers.len(),
+        1,
+        "exactly one leftovers entry expected: {:?}",
+        plan.leftovers
+    );
+    assert!(
+        plan.leftovers[0].contains("buffer"),
+        "leftover must name the field: {:?}",
+        plan.leftovers
+    );
+}
+
+// gap-9462575f regression guard: a moved field initialized from a bare
+// surviving ctor parameter IS threaded — no FIXME, no leftovers.
+#[test]
+fn threaded_moved_field_ctor_assignment_stays_fixme_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Service.java");
+    fs::write(
+        &source,
+        "package a;\n\
+             public class Admin {\n\
+            \x20   private final Object repo;\n\
+            \x20   public Admin(Object repo) {\n\
+            \x20       this.repo = repo;\n\
+            \x20   }\n\
+            \x20   public Long save() { return repo.hashCode() + 0L; }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let mut params = java_plan_params("extract_java_class", &source);
+    params.target = Some(path_string(&target));
+    params.module_name = Some("Service".to_string());
+    params.delegate_field = Some("service".to_string());
+    params.item_names = Some(vec!["save".to_string()]);
+    params.move_fields = Some(vec!["repo".to_string()]);
+    params.project_dir = Some(path_string(dir.path()));
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    let rewritten = apply_source_edits(&plan, &source);
+    assert!(
+        !rewritten.contains("// FIXME: moved field"),
+        "threaded assignment must not be FIXME-marked: {rewritten}"
+    );
+    assert!(
+        plan.leftovers.is_empty(),
+        "no leftovers expected for a threaded field: {:?}",
+        plan.leftovers
     );
 }
 

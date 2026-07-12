@@ -75,7 +75,12 @@ fn build_dependency_projection(
             })
             .unwrap_or_default();
 
-    let external_injection = effective_wiring == "external_injection";
+    // Both container-owned strategies resolve the target's ctor params
+    // through the DI container, so injectability review is identical.
+    let container_owned = matches!(
+        effective_wiring,
+        "external_injection" | "constructor_injection"
+    );
     let mut capture_projections = Vec::new();
     let mut constructor_params = Vec::new();
     let mut non_injectable_params = Vec::new();
@@ -109,15 +114,14 @@ fn build_dependency_projection(
             "not_constructor_param"
         } else {
             match effective_wiring {
-                "external_injection" if is_injected => "likely_injectable",
-                "external_injection" if is_provider => "provider_binding_review",
-                "external_injection" => "non_injectable_capture",
+                _ if container_owned && is_injected => "likely_injectable",
+                _ if container_owned && is_provider => "provider_binding_review",
+                _ if container_owned => "non_injectable_capture",
                 "none" => "manual_wiring_required",
                 _ => "source_argument",
             }
         };
-        let risk = if external_injection && target_constructor_param && !is_injected && !is_provider
-        {
+        let risk = if container_owned && target_constructor_param && !is_injected && !is_provider {
             Some("non_injectable_capture")
         } else if effective_wiring == "own_construction"
             && target_constructor_param
@@ -200,6 +204,9 @@ fn build_dependency_projection(
     let base_summary = match effective_wiring {
         "external_injection" => {
             "external_injection means target constructor params must be DI-resolvable; review non_injectable_params before apply"
+        }
+        "constructor_injection" => {
+            "constructor_injection means target constructor params must be DI-resolvable (the delegate arrives through the source's constructor); review non_injectable_params before apply"
         }
         "none" => "wiring none leaves target constructor params for the operator to wire manually",
         _ => {
@@ -2289,7 +2296,8 @@ struct ExtractClassParams {
     move_fields: Option<Vec<String>>,
     #[serde(default, rename = "className", alias = "class_name")]
     class_name: Option<String>,
-    /// "own_construction" (default) | "external_injection" | "none".
+    /// "own_construction" | "constructor_injection" | "external_injection" |
+    /// "none". Auto-selected from the source's injection idiom when unset.
     #[serde(default)]
     wiring: Option<String>,
     /// Keep thin delegating wrappers on the source for the moved methods, so
@@ -2326,7 +2334,7 @@ impl Tool for JavaExtractClass {
                 "methods": { "type": "array", "items": { "type": "string" }, "description": "Method names to move to the new class." },
                 "moveFields": { "type": "array", "items": { "type": "string" }, "description": "Field names to move with the methods (mutable fields written by extracted code MUST be listed here)." },
                 "className": { "type": "string", "description": "Name for the new class (default: derived from target filename)." },
-                "wiring": { "type": "string", "enum": ["own_construction", "external_injection", "none"], "description": "How the source obtains the delegate. AUTO-SELECTED from the source — leave unset: a Guice/DI source (@Inject) gets external_injection (delegate stays container-managed + AOP-interceptable); a non-DI source gets own_construction. Set only to force a choice." },
+                "wiring": { "type": "string", "enum": ["own_construction", "constructor_injection", "external_injection", "none"], "description": "How the source obtains the delegate. AUTO-SELECTED from the source — leave unset: a DI source with an @Inject constructor gets constructor_injection (delegate becomes a ctor param + `private final` field, preserving the source's zero-field-injection idiom); a DI source using field @Inject gets external_injection (@Inject delegate field); a non-DI source gets own_construction. All DI modes keep the delegate container-managed + AOP-interceptable. Set only to force a choice." },
                 "wrappers": { "type": "boolean", "description": "Keep thin delegating wrappers for the moved methods on the source class, preserving its public API. Pass true whenever callers OUTSIDE this file use the moved methods." },
                 "previewOnly": { "type": "boolean", "description": "Run the full planner but omit heavy change/create payloads. Use this for risky seams to inspect findings and dependency_projection before re-calling without previewOnly to apply." }
             },
@@ -2379,10 +2387,16 @@ impl Tool for JavaExtractClass {
             if let Some(fields) = &params.move_fields {
                 plan_input["move_fields"] = json!(fields);
             }
-            // Wiring policy. A Guice-managed source defaults to
-            // external_injection so the delegate is itself a container-
-            // constructed (and therefore AOP-interceptable) bean; non-DI
-            // sources keep own_construction. An explicit `wiring` always wins.
+            // Wiring policy. A DI-managed source defaults to a container-owned
+            // strategy so the delegate is itself a container-constructed (and
+            // therefore AOP-interceptable) bean; non-DI sources keep
+            // own_construction. Which container-owned strategy is picked
+            // mirrors the SOURCE's injection idiom (gap-3f582e0a): a source
+            // with an @Inject constructor gets constructor_injection (delegate
+            // as ctor param + `private final` field — never a new @Inject
+            // field, which zero-field-injection architectures reject); a
+            // source using field-level @Inject gets external_injection. An
+            // explicit `wiring` always wins.
             // Only genuine injected dependencies become the target's @Inject
             // ctor params — the engine threads ONLY moved fields initialized
             // from a surviving ctor parameter, so mutable view-state fields and
@@ -2394,8 +2408,15 @@ impl Tool for JavaExtractClass {
             let source_text =
                 std::fs::read_to_string(root.join(&params.file)).unwrap_or_default();
             let inject_fqn = detect_inject_fqn(&source_text);
+            let injected_ctor = bbox_refactor::facts::java_has_injected_constructor(
+                &root.join(&params.file),
+                None,
+            )
+            .unwrap_or(false);
             let effective_wiring = params.wiring.clone().unwrap_or_else(|| {
-                if inject_fqn.is_some() {
+                if inject_fqn.is_some() && injected_ctor {
+                    "constructor_injection".to_string()
+                } else if inject_fqn.is_some() {
                     "external_injection".to_string()
                 } else {
                     "own_construction".to_string()
@@ -2403,8 +2424,9 @@ impl Tool for JavaExtractClass {
             });
             match effective_wiring.as_str() {
                 "external_injection" => {
-                    let inject =
-                        inject_fqn.unwrap_or_else(|| "com.google.inject.Inject".to_string());
+                    let inject = inject_fqn
+                        .clone()
+                        .unwrap_or_else(|| "com.google.inject.Inject".to_string());
                     plan_input["wiring_mode"] = json!({
                         "strategy": "external_injection",
                         "target_constructor_annotations": ["@Inject"],
@@ -2412,6 +2434,19 @@ impl Tool for JavaExtractClass {
                         "delegate_field_annotations": ["@Inject"],
                         "delegate_field_modifiers": ["private"],
                         "delegate_field_annotation_imports": [inject],
+                    });
+                }
+                "constructor_injection" => {
+                    let inject = inject_fqn
+                        .clone()
+                        .unwrap_or_else(|| "com.google.inject.Inject".to_string());
+                    plan_input["wiring_mode"] = json!({
+                        "strategy": "constructor_injection",
+                        "target_constructor_annotations": ["@Inject"],
+                        "target_constructor_annotation_imports": [inject],
+                        // Used only when the source has no ctor to extend.
+                        "source_constructor_annotations": ["@Inject"],
+                        "source_constructor_annotation_imports": [inject],
                     });
                 }
                 other => {
@@ -11077,14 +11112,22 @@ PARAMS
   methods: string[]       method names to move (selection is yours — inspect with code.items/code.query first)
   moveFields?: string[]   fields to move with them. REQUIRED for any mutable field the moved code WRITES
   className?: string      new class name (default: target filename)
-  wiring?: "own_construction" | "external_injection" | "none"
-                          AUTO-SELECTED from the source — usually LEAVE UNSET. A Guice/DI-managed
-                          source (uses @Inject) defaults to external_injection so the delegate is
-                          itself a container-constructed, @Inject, UNSCOPED bean — it stays
-                          interceptable by Guice AOP (a `new`-ed delegate is not). A non-DI source
-                          defaults to own_construction. Set explicitly only to force a choice:
+  wiring?: "own_construction" | "constructor_injection" | "external_injection" | "none"
+                          AUTO-SELECTED from the source — usually LEAVE UNSET. A DI-managed source
+                          (uses @Inject) defaults to a container-owned strategy matching ITS OWN
+                          injection idiom: an @Inject CONSTRUCTOR selects constructor_injection, a
+                          field-level @Inject selects external_injection. Either way the delegate is
+                          a container-constructed, UNSCOPED bean — it stays interceptable by Guice
+                          AOP (a `new`-ed delegate is not). A non-DI source defaults to
+                          own_construction. Set explicitly only to force a choice:
                           own_construction: private final field + `new <Class>(...)` in the source ctor
                                             (delegate is NOT container-managed — loses Guice AOP)
+                          constructor_injection: private final field + delegate param appended to the
+                                            source's @Inject ctor + `this.<delegate> = <delegate>;`.
+                                            Preserves zero-field-injection architectures (arch rules
+                                            banning @Inject fields keep passing). The stranded source
+                                            ctor params for moved deps are pruned AFTER apply with
+                                            java.removeUnusedConstructorParams, same as external_injection.
                           external_injection: @Inject delegate field; the container constructs it and
                                             injects the moved deps as the delegate's @Inject ctor params
                           none: no source-side wiring at all
@@ -11103,7 +11146,8 @@ RETURNS { title, changes, creates, findings, dependency_projection, preview_only
   changes:  hash-anchored {span, new_text}[] → edits.merge
   creates:  {path, content}[]               → edits.createFile (one call each)
   dependency_projection: compact pre-apply summary of which captured fields will become target
-                          constructor params under the selected wiring. For external_injection,
+                          constructor params under the selected wiring. For the container-owned
+                          strategies (external_injection / constructor_injection),
                           non_injectable_params names captures that the DI container is unlikely
                           to resolve without moving the field, supplying a binding/provider, or
                           choosing a cleaner seam.
@@ -11746,7 +11790,10 @@ RETURNS { file, methods, overloads, overloads_resolved, resolved_methods,
                        resolution_hint
   nest_access_breaks: moved members referencing private nested source types or
                       private nested source members that the delegate cannot access
-  wiring_recommendation: "external_injection" | "own_construction"
+  wiring_recommendation: "constructor_injection" | "external_injection" | "own_construction"
+                       (constructor_injection when the source has an @Inject
+                       constructor — its idiom is preserved; extractClass
+                       auto-selects the same value when wiring is left unset)
   ready: true if no blockers found; false → inspect blockers before applying
   blockers: ["overloads_resolved_use_resolved_methods"
              | "non_injectable_mutable_fields" | "internal_helper_dependencies"
@@ -12920,6 +12967,16 @@ impl Tool for JavaExtractClassPreviewPlan {
                         let is_di = detect_inject_fqn(&source).is_some();
                         if !is_di {
                             wiring_recommendation = "own_construction";
+                        } else if bbox_refactor::facts::java_has_injected_constructor(
+                            &path,
+                            class_name.as_deref(),
+                        )
+                        .unwrap_or(false)
+                        {
+                            // Mirror the source's injection idiom: an @Inject
+                            // constructor means new deps arrive through the
+                            // ctor, never as new @Inject fields.
+                            wiring_recommendation = "constructor_injection";
                         }
                         for field in &classification.fields {
                             if field.is_mutable_instance && !field.is_injected && !field.is_provider {
@@ -17070,12 +17127,12 @@ public record OrderRecord<T extends Number>(T id) {
         );
     }
 
-    // A Guice-managed source (uses `@Inject`) auto-defaults to
-    // external_injection so the extracted delegate is itself container-
-    // constructed and therefore AOP-interceptable. The moved injected dep
-    // becomes the target's @Inject ctor param; the source receives the delegate
-    // by injection (no `new`).
-    const DI_FIXTURE: &str = "package com.acme;\n\
+    // A DI-managed source auto-defaults to a container-owned strategy so the
+    // extracted delegate is itself container-constructed and therefore
+    // AOP-interceptable. WHICH strategy mirrors the source's own idiom
+    // (gap-3f582e0a): an @Inject constructor selects constructor_injection,
+    // field-level @Inject selects external_injection.
+    const DI_CTOR_FIXTURE: &str = "package com.acme;\n\
          import com.google.inject.Inject;\n\
          class OrderService {\n\
         \x20   private final Repo repo;\n\
@@ -17084,12 +17141,19 @@ public record OrderRecord<T extends Number>(T id) {
         \x20   void save() { repo.write(); }\n\
          }\n";
 
+    const DI_FIELD_FIXTURE: &str = "package com.acme;\n\
+         import com.google.inject.Inject;\n\
+         class OrderService {\n\
+        \x20   @Inject private Repo repo;\n\
+        \x20   void save() { repo.write(); }\n\
+         }\n";
+
     #[tokio::test]
-    async fn di_source_defaults_to_external_injection() {
+    async fn di_ctor_source_defaults_to_constructor_injection() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
-        std::fs::write(root.join("src/com/acme/OrderService.java"), DI_FIXTURE).unwrap();
+        std::fs::write(root.join("src/com/acme/OrderService.java"), DI_CTOR_FIXTURE).unwrap();
         let cx = cx_in(&root);
 
         let result = json_of(
@@ -17116,7 +17180,57 @@ public record OrderRecord<T extends Number>(T id) {
             target.contains("@Inject") && target.contains("OrderWriter(Repo repo)"),
             "target ctor must be @Inject and take the moved dep: {target}"
         );
-        // Source receives the delegate by injection (no `new`).
+        // Source keeps its constructor-injection idiom: `private final`
+        // delegate field + ctor param + assignment, never a new @Inject field.
+        let source_new_text: String = result["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["new_text"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            source_new_text.contains("private final OrderWriter writer;")
+                && source_new_text.contains("OrderWriter writer")
+                && source_new_text.contains("this.writer = writer;"),
+            "delegate must arrive through the source ctor: {source_new_text}"
+        );
+        assert!(
+            !source_new_text.contains("@Inject\n    private OrderWriter"),
+            "no @Inject delegate field on a constructor-injection source: {source_new_text}"
+        );
+        assert!(
+            !source_new_text.contains("new OrderWriter"),
+            "DI source must NOT new up the delegate (defeats Guice AOP): {source_new_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn di_field_source_defaults_to_external_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
+        std::fs::write(
+            root.join("src/com/acme/OrderService.java"),
+            DI_FIELD_FIXTURE,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let result = json_of(
+            JavaExtractClass
+                .call(
+                    json!({
+                        "file": "src/com/acme/OrderService.java",
+                        "target": "src/com/acme/OrderWriter.java",
+                        "delegateField": "writer",
+                        "methods": ["save"],
+                        "moveFields": ["repo"],
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        // Source uses field injection, so the delegate matches that idiom.
         let source_new_text: String = result["changes"]
             .as_array()
             .unwrap()
@@ -17180,7 +17294,10 @@ class OrderService {
         );
 
         let projection = &result["dependency_projection"];
-        assert_eq!(projection["wiring"], "external_injection", "{result}");
+        // The fixture's @Inject ctor auto-selects constructor_injection; the
+        // injectability review below is identical for both container-owned
+        // strategies.
+        assert_eq!(projection["wiring"], "constructor_injection", "{result}");
         let non_injectable = projection["non_injectable_params"]
             .as_array()
             .unwrap()
@@ -17362,7 +17479,7 @@ class OrderFormatter {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("src/com/acme")).unwrap();
-        std::fs::write(root.join("src/com/acme/OrderService.java"), DI_FIXTURE).unwrap();
+        std::fs::write(root.join("src/com/acme/OrderService.java"), DI_CTOR_FIXTURE).unwrap();
         let cx = cx_in(&root);
 
         let result = json_of(

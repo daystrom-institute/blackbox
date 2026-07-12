@@ -105,6 +105,61 @@ fn moved_field_ctor_assignments(
     out
 }
 
+/// gap-3f582e0a: constructor assignments to MOVED fields that the
+/// bare-parameter threading test rejected (computed initializer, method call,
+/// multiple assignments, ...). Their field declaration moves to the target
+/// while the assignment stays behind, targeting a field that no longer exists
+/// on the source — guaranteed non-compiling output if left silent. The caller
+/// marks each site with a FIXME and surfaces it in the plan's leftovers.
+/// Returns (field_name, statement_range) in source order.
+fn moved_field_unthreaded_ctor_assignments(
+    constructor: Node<'_>,
+    source: &str,
+    moved: &HashSet<&str>,
+    threaded: &HashSet<&str>,
+) -> Vec<(String, (usize, usize))> {
+    let mut out = Vec::new();
+    let Some(body) = constructor.child_by_field_name("body") else {
+        return out;
+    };
+    let mut cursor = body.walk();
+    for stmt in body.named_children(&mut cursor) {
+        if stmt.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(expr) = stmt.named_child(0) else {
+            continue;
+        };
+        if expr.kind() != "assignment_expression" {
+            continue;
+        }
+        let Some(lhs) = expr.child_by_field_name("left") else {
+            continue;
+        };
+        let field_name = match lhs.kind() {
+            "field_access" => match (
+                lhs.child_by_field_name("object"),
+                lhs.child_by_field_name("field"),
+            ) {
+                (Some(obj), Some(fld)) if obj.kind() == "this" => {
+                    fld.utf8_text(source.as_bytes()).ok().map(str::to_string)
+                }
+                _ => None,
+            },
+            "identifier" => lhs.utf8_text(source.as_bytes()).ok().map(str::to_string),
+            _ => None,
+        };
+        let Some(field_name) = field_name else {
+            continue;
+        };
+        if !moved.contains(field_name.as_str()) || threaded.contains(field_name.as_str()) {
+            continue;
+        }
+        out.push((field_name, (stmt.start_byte(), stmt.end_byte())));
+    }
+    out
+}
+
 fn normalize_deletion_ranges(source: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     let mut expanded = ranges
         .into_iter()
@@ -212,10 +267,14 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     let wiring = p.wiring_mode.clone().unwrap_or_default();
     let wiring_strategy = match wiring.strategy.as_deref() {
         Some(m) => {
-            if !matches!(m, "own_construction" | "external_injection" | "none") {
+            if !matches!(
+                m,
+                "own_construction" | "constructor_injection" | "external_injection" | "none"
+            ) {
                 bail!(
                     "error.bad_input(code=invalid_wiring_strategy): wiring_mode.strategy must be \
-                     one of `own_construction`, `external_injection`, `none` (got `{m}`)"
+                     one of `own_construction`, `constructor_injection`, `external_injection`, \
+                     `none` (got `{m}`)"
                 );
             }
             m.to_string()
@@ -223,6 +282,11 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         None => "own_construction".to_string(),
     };
     let external_injection = wiring_strategy == "external_injection";
+    let constructor_injection = wiring_strategy == "constructor_injection";
+    // Container-owned strategies share target-side semantics: the generated
+    // target constructor is invoked by the DI container (decorated per
+    // `target_constructor_annotations`), never by a source-side `new`.
+    let container_owned = external_injection || constructor_injection;
     let delegate_field_annotations = wiring.delegate_field_annotations.unwrap_or_default();
     let delegate_field_modifiers = wiring.delegate_field_modifiers.unwrap_or_default();
     let delegate_field_annotation_imports =
@@ -230,6 +294,10 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     let target_constructor_annotations = wiring.target_constructor_annotations.unwrap_or_default();
     let target_constructor_annotation_imports = wiring
         .target_constructor_annotation_imports
+        .unwrap_or_default();
+    let source_constructor_annotations = wiring.source_constructor_annotations.unwrap_or_default();
+    let source_constructor_annotation_imports = wiring
+        .source_constructor_annotation_imports
         .unwrap_or_default();
 
     // Mutable-capture-with-write refusal. A capture that is (a) non-final on
@@ -361,6 +429,25 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 })
         })
         .collect();
+    // gap-3f582e0a: assignments to moved fields that FAILED the bare-parameter
+    // threading test above. The declaration still moves, so each of these
+    // leaves an assignment to a nonexistent field in the source ctor — marked
+    // with a FIXME edit + a leftovers entry below instead of silently
+    // producing non-compiling output.
+    let unthreaded_moved_assignments: Vec<(String, (usize, usize))> = {
+        let threaded_names: HashSet<&str> =
+            moved_threaded.iter().map(|m| m.name.as_str()).collect();
+        first_constructor_node(class_node, &parsed.source)
+            .map(|ctor| {
+                moved_field_unthreaded_ctor_assignments(
+                    ctor,
+                    &parsed.source,
+                    &moved_field_set,
+                    &threaded_names,
+                )
+            })
+            .unwrap_or_default()
+    };
     // Target ctor takes captured deps, then callbacks, then the threaded moved
     // fields. The field DECLARATIONS for the moved ones come from
     // `moved_field_text`, so they are NOT added to `dependency_field_text` —
@@ -449,13 +536,14 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         String::new()
     } else {
         let raw = java_constructor_decl(&target_class_name, "public", &ctor_params, true, None)?;
-        // External-injection wiring may decorate the generated target
-        // constructor with caller-supplied annotations (e.g. `@Inject`) so an
-        // external owner constructs it. The annotation lines go immediately
-        // preceding `public <TargetClass>(...)`; matching imports are added to
-        // the target file below. Framework-neutral — the annotation text is
+        // Container-owned wiring (external_injection / constructor_injection)
+        // may decorate the generated target constructor with caller-supplied
+        // annotations (e.g. `@Inject`) so an external owner constructs it.
+        // The annotation lines go immediately preceding
+        // `public <TargetClass>(...)`; matching imports are added to the
+        // target file below. Framework-neutral — the annotation text is
         // macro data, not a hard-coded DI-library name.
-        if external_injection && !target_constructor_annotations.is_empty() {
+        if container_owned && !target_constructor_annotations.is_empty() {
             let needle = format!("public {target_class_name}(");
             if let Some(pos) = raw.find(&needle) {
                 let line_start = raw[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -589,7 +677,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // parameterized ctor is generated) need their imports on the target file.
     // Plain (non-conservative) add — matches the legacy target-side behavior,
     // which did not apply the source-side wildcard-skip on the target.
-    if external_injection
+    if container_owned
         && !target_constructor_annotations.is_empty()
         && !all_target_ctor_params.is_empty()
     {
@@ -916,14 +1004,15 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         // generated `private final <Type> <name>;` line so it travels with
         // the target file rather than getting buried in JSON.
         //
-        // Under external_injection the delegate/target lifecycle is owned by
+        // Under a container-owned strategy (external_injection /
+        // constructor_injection) the delegate/target lifecycle is owned by
         // an external party (a DI container, etc.): the target's captured ctor
         // params are freshly resolved at construction time, not stale snapshots
         // of source fields. Suppress the snapshot FIXMEs in that case — they're
-        // misleading noise. (Contract: external_injection means container-owned
-        // construction; own_construction is the only strategy that truly
-        // snapshots source state.)
-        let suppress_mutable_capture_fixmes = external_injection;
+        // misleading noise. (Contract: container-owned means the container
+        // constructs the target; own_construction is the only strategy that
+        // truly snapshots source state.)
+        let suppress_mutable_capture_fixmes = container_owned;
         if !suppress_mutable_capture_fixmes {
             for capture in &captured_variables {
                 if !capture.source_mutable {
@@ -1464,6 +1553,41 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         });
     }
 
+    // gap-3f582e0a: moved-field ctor assignments that could NOT be threaded
+    // (initializer is not a bare surviving ctor parameter, or the field is
+    // assigned more than once). The declaration moved to the target, so each
+    // of these statements now assigns a field that no longer exists on the
+    // source. Deleting them would silently drop initialization logic; leaving
+    // them silent produced non-compiling output the operator only discovered
+    // at build time. Mark each site with a FIXME and record it in the plan's
+    // leftovers so previews surface it too.
+    let mut plan_leftovers: Vec<String> = Vec::new();
+    for (name, (stmt_start, _stmt_end)) in &unthreaded_moved_assignments {
+        let line_start = parsed.source[..*stmt_start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line_prefix = &parsed.source[line_start..*stmt_start];
+        let indent: String = line_prefix
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
+        source_edits.push(TextEdit {
+            byte_start: line_start,
+            byte_end: line_start,
+            replacement: format!(
+                "{indent}// FIXME: moved field `{name}` is still initialized here, but its \
+                 declaration moved to {target_class_name}; relocate this initialization onto \
+                 {target_class_name} or delete it (the initializer is not a bare constructor \
+                 parameter, so it was not auto-threaded)\n"
+            ),
+        });
+        plan_leftovers.push(format!(
+            "source constructor still assigns moved field `{name}` (initializer is not a bare \
+             constructor parameter, so it was not auto-threaded); a FIXME marks the site"
+        ));
+    }
+
     // Source-side visibility widening for referenced inner types (Gap 5).
     // Widen each below-floor inner-type declaration to the floor so the
     // qualified `<SourceClass>.<InnerType>` references on the new target
@@ -1492,6 +1616,10 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // Source-side delegate field declaration varies by wiring strategy:
     // - own_construction: `private final <Target> <delegate>;` (paired with
     //   the `this.delegate = new Target(...)` ctor wiring below).
+    // - constructor_injection: `private final <Target> <delegate>;` (paired
+    //   with the appended ctor param + `this.delegate = delegate;` wiring
+    //   below — the container hands the delegate in through the ctor, so the
+    //   field keeps the constructor-injection idiom: final, unannotated).
     // - external_injection: caller-supplied annotations + modifiers, then
     //   `<Target> <delegate>;` (no synthesized `final`, no ctor wiring — an
     //   external owner populates it after construction).
@@ -1536,10 +1664,15 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             }
         }
     }
-    // Source-side wiring args: capture names verbatim, then `this::<method>`
-    // for each callback (the target's ctor takes the captures first, then the
-    // functional-interface callbacks, in declaration order).
-    let assignment = {
+    // Source-side wiring. own_construction builds the delegate in place:
+    // capture names verbatim, then `this::<method>` for each callback (the
+    // target's ctor takes the captures first, then the functional-interface
+    // callbacks, in declaration order). constructor_injection instead assigns
+    // from the delegate ctor parameter appended below — the container
+    // resolves the target's ctor params, so nothing is threaded here.
+    let assignment = if constructor_injection {
+        format!("this.{delegate_field} = {delegate_field};")
+    } else {
         let mut args: Vec<String> = dependency_params
             .iter()
             .map(|param| param.name.clone())
@@ -1571,6 +1704,55 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         // post-process accessor topo-sort treats this case as "no
         // wiring edit to relocate."
     } else if let Some(constructor) = first_constructor_node(class_node, &parsed.source) {
+        let ctor_params = constructor_parameter_names(constructor, &parsed.source);
+        if constructor_injection {
+            // gap-3f582e0a: append `<Target> <delegate>` to the existing
+            // constructor's parameter list. The constructor's own annotations
+            // (e.g. `@Inject`) are left untouched — preserving the source's
+            // injection idiom is the point of this strategy.
+            if ctor_params.contains(delegate_field) {
+                bail!(
+                    "error.bad_input(code=delegate_name_collides_with_ctor_param): \
+                     `delegate_field` `{delegate_field}` is already a parameter of the source \
+                     constructor; pick a different delegate field name"
+                );
+            }
+            let params_node = constructor
+                .child_by_field_name("parameters")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "extract_java_class: source constructor has no parseable parameter list \
+                     (constructor_injection needs one to append the delegate parameter)"
+                    )
+                })?;
+            let mut cursor = params_node.walk();
+            let last_param = params_node
+                .named_children(&mut cursor)
+                .filter(|n| matches!(n.kind(), "formal_parameter" | "spread_parameter"))
+                .last();
+            // Varargs must stay last (JLS 8.4.1) — insert BEFORE a trailing
+            // spread parameter, otherwise append after the last parameter.
+            // An empty list inserts just before the closing paren.
+            let (insert_at, replacement) = match last_param {
+                Some(node) if node.kind() == "spread_parameter" => (
+                    node.start_byte(),
+                    format!("{target_class_name} {delegate_field}, "),
+                ),
+                Some(node) => (
+                    node.end_byte(),
+                    format!(", {target_class_name} {delegate_field}"),
+                ),
+                None => (
+                    params_node.end_byte().saturating_sub(1),
+                    format!("{target_class_name} {delegate_field}"),
+                ),
+            };
+            source_edits.push(TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement,
+            });
+        }
         // Gap 7: when any captured-param name refers to a field rather than
         // a constructor parameter, that name is `null` until its own
         // `this.field = ...` assignment runs. Inserting the wiring as the
@@ -1583,12 +1765,19 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         // captured name is also a ctor parameter (in scope from the
         // parameter list), insertion at the body start is safe and matches
         // the legacy placement.
-        let ctor_params = constructor_parameter_names(constructor, &parsed.source);
-        let field_only_captures: HashSet<&str> = dependency_params
-            .iter()
-            .map(|p| p.name.as_str())
-            .filter(|name| !ctor_params.contains(*name))
-            .collect();
+        //
+        // constructor_injection reads only the appended delegate parameter
+        // at the wiring site (captures are container-resolved on the target
+        // side), so body-start insertion is always safe there.
+        let field_only_captures: HashSet<&str> = if constructor_injection {
+            HashSet::new()
+        } else {
+            dependency_params
+                .iter()
+                .map(|p| p.name.as_str())
+                .filter(|name| !ctor_params.contains(*name))
+                .collect()
+        };
         let lower_bound = if field_only_captures.is_empty() {
             constructor_body_insert_position(constructor, &parsed.source)
         } else {
@@ -1616,12 +1805,40 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         });
     } else {
         let class_name = java_class_name(class_node, &parsed.source);
-        let constructor =
-            java_constructor_decl(&class_name, "public", &[], false, Some(&assignment))?;
-        source_edits[delegate_edit_idx].replacement = format!(
-            "\n    private final {target_class_name} {delegate_field};\n\n{}",
-            constructor.trim_end()
-        );
+        if constructor_injection {
+            // No source constructor to extend — synthesize one taking the
+            // delegate as a parameter, decorated with the caller-supplied
+            // annotations (e.g. `@Inject`) so the container constructs the
+            // source through it.
+            let delegate_param = [JavaParameterSpec {
+                type_name: target_class_name.clone(),
+                name: delegate_field.to_string(),
+            }];
+            let raw = java_constructor_decl(&class_name, "public", &delegate_param, true, None)?;
+            let mut annotated = String::new();
+            for ann in &source_constructor_annotations {
+                annotated.push_str("    ");
+                annotated.push_str(ann);
+                annotated.push('\n');
+            }
+            annotated.push_str(&raw);
+            source_edits[delegate_edit_idx].replacement = format!(
+                "\n    private final {target_class_name} {delegate_field};\n\n{}",
+                annotated.trim_end()
+            );
+            for fqcn in &source_constructor_annotation_imports {
+                if let Some(edit) = java_conservative_import_edit(&parsed.source, fqcn) {
+                    source_edits.push(edit);
+                }
+            }
+        } else {
+            let constructor =
+                java_constructor_decl(&class_name, "public", &[], false, Some(&assignment))?;
+            source_edits[delegate_edit_idx].replacement = format!(
+                "\n    private final {target_class_name} {delegate_field};\n\n{}",
+                constructor.trim_end()
+            );
+        }
     }
     // Compute caller rewrites separately so they can be threaded into the
     // accessor-rewrite pass below (Gap 1: caller-rewrite zero-width inserts
@@ -2029,7 +2246,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             .map(|method| method.item)
             .chain(selected_fields.into_iter().map(|field| field.item))
             .collect(),
-        leftovers: Vec::new(),
+        leftovers: plan_leftovers,
         captured_variables,
         remaining_source_accessors,
         remaining_source_constant_refs,

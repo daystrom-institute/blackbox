@@ -582,6 +582,15 @@ pub struct WiringSpec {
     /// - `own_construction` (default): `private final <Target> <delegate>;`
     ///   plus `this.<delegate> = new <Target>(...)` in the source's first
     ///   constructor. The source builds the delegate itself.
+    /// - `constructor_injection`: `private final <Target> <delegate>;` plus a
+    ///   `<Target> <delegate>` parameter appended to the source's first
+    ///   constructor and `this.<delegate> = <delegate>;` in its body — the
+    ///   container constructs the delegate and hands it to the source through
+    ///   its constructor, preserving a source class whose injection idiom is
+    ///   constructor-based. The existing constructor's annotations are left
+    ///   untouched; when the source has no constructor, one is synthesized
+    ///   and decorated with `source_constructor_annotations`. Target-side
+    ///   annotations and capture semantics match `external_injection`.
     /// - `external_injection`: emit the delegate field with the
     ///   caller-supplied annotations/modifiers (no synthesized `final`, no
     ///   ctor wiring); an external owner (a DI container, etc.) populates it
@@ -608,18 +617,32 @@ pub struct WiringSpec {
     /// already supply the simple name; we cannot probe the classpath).
     #[serde(default)]
     pub delegate_field_annotation_imports: Option<Vec<String>>,
-    /// (`external_injection`) annotation source fragments placed on the
-    /// generated target constructor, e.g. `["@Inject"]`. Applied only when a
-    /// parameterized target constructor is generated. May be empty for
-    /// frameworks that auto-wire a sole constructor.
+    /// (`external_injection` / `constructor_injection`) annotation source
+    /// fragments placed on the generated target constructor, e.g.
+    /// `["@Inject"]`. Applied only when a parameterized target constructor is
+    /// generated. May be empty for frameworks that auto-wire a sole
+    /// constructor.
     #[serde(default)]
     pub target_constructor_annotations: Option<Vec<String>>,
-    /// (`external_injection`) fully-qualified imports to add to the TARGET
-    /// file so the target-constructor annotations resolve, e.g.
-    /// `["javax.inject.Inject"]`. Added with the standard (non-conservative)
-    /// import helper, matching the legacy target-side behavior.
+    /// (`external_injection` / `constructor_injection`) fully-qualified
+    /// imports to add to the TARGET file so the target-constructor
+    /// annotations resolve, e.g. `["javax.inject.Inject"]`. Added with the
+    /// standard (non-conservative) import helper, matching the legacy
+    /// target-side behavior.
     #[serde(default)]
     pub target_constructor_annotation_imports: Option<Vec<String>>,
+    /// (`constructor_injection`) annotation source fragments placed above the
+    /// SYNTHESIZED source constructor when the source class has no
+    /// constructor, e.g. `["@Inject"]`. Ignored when a constructor already
+    /// exists — its annotations are the source's business and are left
+    /// untouched.
+    #[serde(default)]
+    pub source_constructor_annotations: Option<Vec<String>>,
+    /// (`constructor_injection`) fully-qualified imports to add to the SOURCE
+    /// file so the synthesized-constructor annotations resolve. Added
+    /// conservatively (any non-static wildcard import suppresses the add).
+    #[serde(default)]
+    pub source_constructor_annotation_imports: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

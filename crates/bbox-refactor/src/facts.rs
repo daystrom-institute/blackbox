@@ -723,6 +723,42 @@ fn java_constructor_injected_fields(
     injected
 }
 
+/// Does `path` (optionally restricted to one owner class) declare a
+/// constructor annotated with an `@Inject`-flavored annotation? Pure fact of
+/// file bytes; drives binding-side wiring auto-defaults (a source whose
+/// injection idiom is constructor-based should keep that idiom when a
+/// transform wires in a new dependency).
+pub fn java_has_injected_constructor(path: &Path, class_name: Option<&str>) -> Result<bool> {
+    let parsed = super::parse_source_file(path)?;
+    if parsed.language != "java" {
+        return Err(anyhow!(
+            "java_has_injected_constructor only supports java files"
+        ));
+    }
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "constructor_declaration" {
+            let owner_class = java_owner_class_name(node, &parsed.source);
+            if class_name.is_some_and(|wanted| owner_class.as_deref() != Some(wanted)) {
+                continue;
+            }
+            let (_, annotations) = java_modifiers_and_annotations(node, &parsed.source);
+            if annotations
+                .iter()
+                .any(|annotation| java_annotation_is_inject(annotation))
+            {
+                return Ok(true);
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    Ok(false)
+}
+
 fn java_this_field_param_assignment(
     assignment: tree_sitter::Node<'_>,
     source: &str,
