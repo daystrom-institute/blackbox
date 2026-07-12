@@ -195,10 +195,17 @@ static EXTRA_PROVIDERS: std::sync::Mutex<Vec<Box<dyn InspectableEntityProvider>>
     std::sync::Mutex::new(Vec::new());
 
 pub fn register_extra_providers(extras: Vec<Box<dyn InspectableEntityProvider>>) {
-    EXTRA_PROVIDERS
+    let mut pending = EXTRA_PROVIDERS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .extend(extras);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for provider in extras {
+        if pending
+            .iter()
+            .all(|registered| registered.entity_type() != provider.entity_type())
+        {
+            pending.push(provider);
+        }
+    }
 }
 
 fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {

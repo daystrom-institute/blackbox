@@ -1,0 +1,23 @@
+{
+  "id": "gap-c61a2c1c",
+  "title": "Provider registry test gate is order-dependent",
+  "gap_kind": "eval_coverage",
+  "domain": "provider-registry",
+  "wanted_capability": "The full Blackbox test suite should pass under its normal and serial runners without global provider registrations accumulating across tests.",
+  "missing_primitive": "Idempotent provider registration or test-scoped registry reset/isolation",
+  "fallback_used": "Verified the failing provider-registry and orchestration tests pass in isolation; withheld installation because the complete gate still fails.",
+  "evidence": [
+    "src/providers_ext/mod.rs:87",
+    "beta/blackbox-v2@bb03988c",
+    "cargo test: 1161 passed, 1 failed, 5 ignored",
+    "cargo test -- --test-threads=1: 1161 passed, 1 failed, 5 ignored"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_task",
+  "dedupe_key": "eval_coverage/provider-registry/order-dependent-duplicate-registration",
+  "suggested_owner": "blackbox",
+  "notes": "all_providers().len() was 32 while EntityType::ALL.len() was 20. The test passes alone but fails after earlier tests register providers into global state.",
+  "resolution": "unresolved",
+  "created_at": "2026-07-12T18:57:51Z",
+  "updated_at": "2026-07-12T18:57:51Z"
+}

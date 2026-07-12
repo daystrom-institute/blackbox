@@ -81,6 +81,7 @@ mod tests {
     #[test]
     fn registry_covers_entity_type_enum() {
         crate::providers::register_extra_providers(super::extra_providers());
+        crate::providers::register_extra_providers(super::extra_providers());
         for entity_type in EntityType::ALL {
             provider_for(entity_type);
         }
