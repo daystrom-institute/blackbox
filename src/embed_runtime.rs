@@ -1063,9 +1063,45 @@ pub(crate) fn status_response_for_buckets(
             Some(counts.indexed_count as f32 / counts.source_count as f32)
         };
     }
+    // Coverage seeds a `visual:<kind>` row via `.or_default()` whenever it
+    // scans a matching chunk, independent of whether a queue worker for
+    // that route has ever spawned in THIS process (workers spawn lazily on
+    // first enqueue — `ensure_sender`). An unseeded row defaults to
+    // `available: true` with provider/model/dim left `None`: cosmetically
+    // broken (available=true but nothing describing what's available), not
+    // functionally wrong. Visual routes are chunk-kind-keyed, not
+    // `Bucket`-keyed, so they need their own metadata source; backfill from
+    // `VisualRouteMeta` instead of leaving the queue-local snapshot as the
+    // only source of truth.
+    let router = EmbeddingRouter::load_default().unwrap_or_default();
+    backfill_visual_route_metadata(&router, &mut response);
     queue::normalize_route_statuses(&mut response);
     apply_stall_health(&mut response);
     Ok(response)
+}
+
+/// Fills `provider`/`model`/`dim`/`endpoint_kind`/`output_dtype`/
+/// `compatibility_family` on any `visual:<kind>` status row still missing
+/// them, sourced from `EmbeddingRouter::visual_route`. Never overwrites a
+/// row a live queue worker already populated (`provider_route_status`);
+/// only backfills the gap left by coverage-only seeding.
+fn backfill_visual_route_metadata(router: &EmbeddingRouter, response: &mut EmbedStatusResponse) {
+    for (route, status) in response.routes.iter_mut() {
+        let Some(kind) = route.strip_prefix("visual:") else {
+            continue;
+        };
+        if status.provider.is_some() {
+            continue;
+        }
+        if let Ok(Some(meta)) = router.visual_route(kind) {
+            status.provider = Some(meta.provider_id);
+            status.model = Some(meta.document_model);
+            status.endpoint_kind = Some(crate::embed::EmbedEndpointKind::Multimodal);
+            status.output_dtype = Some(meta.output_dtype.as_str().to_string());
+            status.compatibility_family = Some(meta.compatibility_family);
+            status.dim = Some(meta.dimensions);
+        }
+    }
 }
 
 /// Runs after `normalize_route_statuses` (which owns the error-driven
@@ -1910,6 +1946,105 @@ image = "voyage_visual"
         )
         .unwrap();
         assert!(coverage.is_empty());
+    }
+
+    /// Deliverable 4: a `visual:<kind>` status row seeded by coverage alone
+    /// (`status_response_for_buckets`'s `.or_default()` — no live queue
+    /// worker ever spawned in this process, so `provider_route_status`
+    /// never ran) defaults to `available: true` with provider/model/dim
+    /// left `None`: cosmetically broken, since `available=true` reads as
+    /// "this route works" with nothing describing what it routes to.
+    /// `backfill_visual_route_metadata` must fill those fields from
+    /// `VisualRouteMeta` without disturbing coverage fields already set.
+    #[test]
+    fn backfill_visual_route_metadata_populates_provider_fields_from_config() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+pdf_figure = "voyage_visual"
+"#,
+        )
+        .unwrap();
+        let mut response = EmbedStatusResponse {
+            routes: Default::default(),
+        };
+        response.routes.insert(
+            "visual:pdf_figure".into(),
+            crate::embed::queue::RouteStatus {
+                source_count: Some(3),
+                indexed_count: 2,
+                coverage_ratio: Some(0.666),
+                ..Default::default()
+            },
+        );
+
+        backfill_visual_route_metadata(&router, &mut response);
+
+        let status = &response.routes["visual:pdf_figure"];
+        assert!(status.available, "backfill must not touch availability");
+        assert_eq!(status.provider.as_deref(), Some("voyage_visual"));
+        assert_eq!(status.model.as_deref(), Some("voyage-multimodal-3.5"));
+        assert_eq!(status.dim, Some(1024));
+        assert_eq!(
+            status.endpoint_kind,
+            Some(crate::embed::EmbedEndpointKind::Multimodal)
+        );
+        assert_eq!(status.output_dtype.as_deref(), Some("float"));
+        assert_eq!(
+            status.compatibility_family.as_deref(),
+            Some("voyage-multimodal-3.5:1024:float")
+        );
+        // Coverage fields computed earlier in status_response_for_buckets
+        // are untouched by the backfill pass.
+        assert_eq!(status.indexed_count, 2);
+        assert_eq!(status.coverage_ratio, Some(0.666));
+    }
+
+    /// A route whose provider metadata a live queue worker already
+    /// populated (`provider_route_status`) must not be overwritten by the
+    /// coverage-only backfill.
+    #[test]
+    fn backfill_visual_route_metadata_never_overwrites_a_live_worker_row() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+pdf_figure = "voyage_visual"
+"#,
+        )
+        .unwrap();
+        let mut response = EmbedStatusResponse {
+            routes: Default::default(),
+        };
+        response.routes.insert(
+            "visual:pdf_figure".into(),
+            crate::embed::queue::RouteStatus {
+                provider: Some("already-set".into()),
+                ..Default::default()
+            },
+        );
+
+        backfill_visual_route_metadata(&router, &mut response);
+
+        assert_eq!(
+            response.routes["visual:pdf_figure"].provider.as_deref(),
+            Some("already-set")
+        );
+    }
+
+    /// A non-visual route key (no `visual:` prefix) must never be touched.
+    #[test]
+    fn backfill_visual_route_metadata_ignores_non_visual_routes() {
+        let router = EmbeddingRouter::from_toml_str("").unwrap();
+        let mut response = EmbedStatusResponse {
+            routes: Default::default(),
+        };
+        response
+            .routes
+            .insert("code".into(), crate::embed::queue::RouteStatus::default());
+
+        backfill_visual_route_metadata(&router, &mut response);
+
+        assert!(response.routes["code"].provider.is_none());
     }
 
     /// Backfill: an image doc routes through `enqueue_visual_project_file`,
