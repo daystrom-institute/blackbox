@@ -66,3 +66,4 @@ test-support = []
 [dev-dependencies]
 bbox-vectors = { path = "../bbox-vectors", features = ["test-support"] }
 bbox-visual-store = { path = "../bbox-visual-store", features = ["test-support"] }
+bbox-util = { path = "../bbox-util" }

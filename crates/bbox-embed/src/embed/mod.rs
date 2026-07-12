@@ -788,6 +788,30 @@ impl EmbeddingRouter {
         }
     }
 
+    /// Every distinct visual partition the current config maps
+    /// (`[embed.routes.visual]`), deduped by `vector_route_id` — multiple
+    /// chunk kinds (`image`, `pdf_figure`, ...) commonly share one
+    /// multimodal alias, and a partition-keyed consumer (retrieval,
+    /// partition lifecycle tooling) must search or account for it once, not
+    /// once per kind. Best-effort like `configured_routes()`: a kind whose
+    /// alias fails to resolve is skipped. Returns
+    /// `(vector_route_id, representative_kind, meta)`; the representative
+    /// kind is whichever configured kind resolves to that partition first
+    /// (stable `BTreeMap` iteration order) — callers needing a provider use
+    /// it with `visual_provider(kind)`.
+    pub fn configured_visual_routes(&self) -> Vec<(String, String, VisualRouteMeta)> {
+        let mut seen = BTreeMap::<String, (String, VisualRouteMeta)>::new();
+        for kind in self.config.routes.visual.keys() {
+            if let Ok(Some(meta)) = self.visual_route(kind) {
+                seen.entry(meta.vector_route_id())
+                    .or_insert_with(|| (kind.clone(), meta));
+            }
+        }
+        seen.into_iter()
+            .map(|(route_id, (kind, meta))| (route_id, kind, meta))
+            .collect()
+    }
+
     /// Every route the current config maps: all buckets globally, plus
     /// every per-project override. Best-effort — a bucket whose alias
     /// fails to resolve is skipped (it cannot claim a partition either).
@@ -1263,6 +1287,43 @@ slide_image = "voyage_text"
             Ok(_) => panic!("text alias behind a visual kind must be rejected"),
         };
         assert!(err.to_string().contains("not a multimodal provider"));
+    }
+
+    /// `image` and `pdf_figure` sharing one multimodal alias must dedupe to
+    /// ONE partition entry — a partition-keyed retrieval lane (hybrid
+    /// search) must search it once, not once per configured kind.
+    #[test]
+    fn configured_visual_routes_dedupes_kinds_sharing_one_partition() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+image = "voyage_visual"
+pdf_figure = "voyage_visual"
+"#,
+        )
+        .unwrap();
+        let routes = router.configured_visual_routes();
+        assert_eq!(routes.len(), 1, "one partition, two kinds mapping to it");
+        let (route_id, kind, meta) = &routes[0];
+        assert_eq!(meta.provider_id, "voyage_visual");
+        assert_eq!(meta.document_model, "voyage-multimodal-3.5");
+        assert_eq!(*route_id, meta.vector_route_id());
+        // Representative kind is whichever sorts first (BTreeMap order).
+        assert_eq!(kind, "image");
+    }
+
+    /// A visual kind that fails to resolve (unknown alias) is skipped, not
+    /// propagated as an error — best-effort like `configured_routes()`.
+    #[test]
+    fn configured_visual_routes_skips_unresolvable_kinds() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+pdf_figure = "no_such_alias"
+"#,
+        )
+        .unwrap();
+        assert!(router.configured_visual_routes().is_empty());
     }
 
     #[test]
