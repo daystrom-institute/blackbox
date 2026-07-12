@@ -82,28 +82,28 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
         include_str!("queries/decision-rule-packet-validation.json"),
     ),
     (
-        "transcript-voyage-embeddings",
-        include_str!("queries/transcript-voyage-embeddings.json"),
+        "transcript-nextest-workspace-adoption",
+        include_str!("queries/transcript-nextest-workspace-adoption.json"),
     ),
     (
         "transcript-mechanical-recursion-guard",
         include_str!("queries/transcript-mechanical-recursion-guard.json"),
     ),
     (
-        "transcript-postgres-snake-case",
-        include_str!("queries/transcript-postgres-snake-case.json"),
+        "transcript-clippy-disallowed-methods",
+        include_str!("queries/transcript-clippy-disallowed-methods.json"),
     ),
     (
-        "transcript-rule-packet-validation",
-        include_str!("queries/transcript-rule-packet-validation.json"),
+        "transcript-worktree-containment-removal",
+        include_str!("queries/transcript-worktree-containment-removal.json"),
     ),
     (
-        "transcript-workflow-foreach",
-        include_str!("queries/transcript-workflow-foreach.json"),
+        "transcript-codesign-launchd-redeploy",
+        include_str!("queries/transcript-codesign-launchd-redeploy.json"),
     ),
     (
-        "transcript-entity-ref-phase-f1",
-        include_str!("queries/transcript-entity-ref-phase-f1.json"),
+        "transcript-harness-in-process-provider",
+        include_str!("queries/transcript-harness-in-process-provider.json"),
     ),
     (
         "cross-modal-knowledge-store",
@@ -224,14 +224,20 @@ pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
             check_decision_render_pipeline_unidirectional
         }
         "check_decision_rule_packet_validation" => check_decision_rule_packet_validation,
-        "check_transcript_voyage_embeddings" => check_transcript_voyage_embeddings,
+        "check_transcript_nextest_workspace_adoption" => {
+            check_transcript_nextest_workspace_adoption
+        }
         "check_transcript_mechanical_recursion_guard" => {
             check_transcript_mechanical_recursion_guard
         }
-        "check_transcript_postgres_snake_case" => check_transcript_postgres_snake_case,
-        "check_transcript_rule_packet_validation" => check_transcript_rule_packet_validation,
-        "check_transcript_workflow_foreach" => check_transcript_workflow_foreach,
-        "check_transcript_entity_ref_phase_f1" => check_transcript_entity_ref_phase_f1,
+        "check_transcript_clippy_disallowed_methods" => check_transcript_clippy_disallowed_methods,
+        "check_transcript_worktree_containment_removal" => {
+            check_transcript_worktree_containment_removal
+        }
+        "check_transcript_codesign_launchd_redeploy" => check_transcript_codesign_launchd_redeploy,
+        "check_transcript_harness_in_process_provider" => {
+            check_transcript_harness_in_process_provider
+        }
         "check_cross_modal_knowledge_store" => check_cross_modal_knowledge_store,
         "check_cross_modal_recursion_guard" => check_cross_modal_recursion_guard,
         "check_cross_modal_workflow_engine" => check_cross_modal_workflow_engine,
@@ -376,12 +382,12 @@ stub_checker!(check_decision_distinct_daemon_paths);
 stub_checker!(check_decision_bro_account_env);
 stub_checker!(check_decision_render_pipeline_unidirectional);
 stub_checker!(check_decision_rule_packet_validation);
-stub_checker!(check_transcript_voyage_embeddings);
+stub_checker!(check_transcript_nextest_workspace_adoption);
 stub_checker!(check_transcript_mechanical_recursion_guard);
-stub_checker!(check_transcript_postgres_snake_case);
-stub_checker!(check_transcript_rule_packet_validation);
-stub_checker!(check_transcript_workflow_foreach);
-stub_checker!(check_transcript_entity_ref_phase_f1);
+stub_checker!(check_transcript_clippy_disallowed_methods);
+stub_checker!(check_transcript_worktree_containment_removal);
+stub_checker!(check_transcript_codesign_launchd_redeploy);
+stub_checker!(check_transcript_harness_in_process_provider);
 stub_checker!(check_cross_modal_knowledge_store);
 stub_checker!(check_cross_modal_recursion_guard);
 stub_checker!(check_cross_modal_workflow_engine);

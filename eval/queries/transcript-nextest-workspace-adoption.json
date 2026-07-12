@@ -1,0 +1,24 @@
+{
+  "id": "transcript-nextest-workspace-adoption",
+  "query_class": "transcript_provenance",
+  "pass_strictness": "first",
+  "query": "where did we plan the cargo nextest adoption with a quarantined slow-test profile?",
+  "target_locators": [
+    {
+      "description": "Transcript turn planning the nextest adoption: baseline timed run, .config/nextest.toml with slow tests quarantined, and a fold-time full profile.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "nextest adoption baseline timed run quarantine slow tests"
+    }
+  ],
+  "expected_entity_refs": [
+    "transcript:claude:73fb10af-4c48-4c1e-96bb-e6d96573b3ed:199017:0"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only with the PROJECT.md validation section; the provenance should include the transcript turn that planned the adoption."
+  ],
+  "pass_classifier": "check_transcript_nextest_workspace_adoption"
+}

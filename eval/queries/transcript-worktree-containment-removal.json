@@ -1,0 +1,24 @@
+{
+  "id": "transcript-worktree-containment-removal",
+  "query_class": "transcript_provenance",
+  "pass_strictness": "first",
+  "query": "where did we discuss narrowing the file-tool worktree containment carveout?",
+  "target_locators": [
+    {
+      "description": "Transcript turn on the bro-tools workspace.rs containment check and the narrow explicit-instruction-doc carveout for absolute paths.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "containment issue crates/bro-tools/src/workspace.rs carveout narrow"
+    }
+  ],
+  "expected_entity_refs": [
+    "transcript:codex:019e7edf-5b48-7dc3-98f8-9ae037c21524:1295908:0"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer with a general containment policy statement only; the provenance should include the transcript turn scoping the carveout."
+  ],
+  "pass_classifier": "check_transcript_worktree_containment_removal"
+}
