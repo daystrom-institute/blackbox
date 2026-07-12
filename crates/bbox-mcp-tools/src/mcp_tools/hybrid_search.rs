@@ -10,7 +10,7 @@ use bbox_corpus_core::search::rerank::{self, RerankFeatures};
 use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
 use bbox_embed::embed::queue::EmbedStatusResponse;
 use bbox_embed::embed::rerank::{RerankConfig, RerankHit, rerank_blocking};
-use bbox_embed::embed::{Bucket, EmbeddingRouter, query_cache};
+use bbox_embed::embed::{Bucket, EmbeddingRouter, VisualRouteMeta, query_cache};
 use bbox_embed::embed_queue;
 use bbox_indexing::index::{HybridBm25Hit, TranscriptIndex};
 use bbox_indexing::projects::ProjectRecord;
@@ -403,6 +403,14 @@ pub fn hybrid_search_typed(
 /// prefix retain per lane is exact; original per-lane ranks are kept (RRF
 /// handles sparse ranks fine). The post-fusion doc_type retain stays as
 /// the authoritative backstop.
+///
+/// Visual chunks (image/pdf_figure) need no special case here: they are
+/// `project_file` entities like Code/Docs chunks — chunk_kind, not
+/// doc_type, is what distinguishes them — so `doc_type="project_file"`
+/// already includes visual vector-lane hits by prefix match, and any other
+/// doc_type value correctly excludes them. Filtering visual results down to
+/// "only images" is a chunk_kind concern the caller can apply post-hoc, not
+/// a doc_type one.
 fn scope_lists_to_doc_type(lists: &mut [RankedList], doc_type: &str) {
     let prefix = format!("{doc_type}:");
     for list in lists {
@@ -713,6 +721,22 @@ fn vector_ranked_lists(
             }
         }
     }
+    // Visual routes (`[embed.routes.visual]`) are chunk-kind-keyed, never
+    // `Bucket`-keyed (see `EmbeddingRouter::visual_route`), so they never
+    // land in `route_buckets` above. Without this second map, a visual
+    // partition present in `partitions` (vectors already indexed) fell into
+    // the "no configured bucket maps to this partition" skip branch below —
+    // the shipped sidecar embedded content but retrieval never searched it.
+    // `configured_visual_routes()` dedupes by partition id: `image` and
+    // `pdf_figure` sharing one multimodal alias search once, not twice.
+    // Empty when no `[embed.routes.visual]` kind is configured, so an
+    // unconfigured host falls through to the exact pre-existing skip branch
+    // — zero behavior change, zero extra calls.
+    let visual_routes: BTreeMap<String, (String, VisualRouteMeta)> = router
+        .configured_visual_routes()
+        .into_iter()
+        .map(|(route_id, kind, meta)| (route_id, (kind, meta)))
+        .collect();
 
     let mut lists = Vec::new();
     for (route, metrics) in partitions {
@@ -732,14 +756,7 @@ fn vector_ranked_lists(
                 continue;
             }
             vector.to_vec()
-        } else {
-            let Some(buckets) = route_buckets.get(route) else {
-                degraded.skipped_partitions.insert(
-                    route.clone(),
-                    "no configured bucket maps to this partition".into(),
-                );
-                continue;
-            };
+        } else if let Some(buckets) = route_buckets.get(route) {
             let bucket = *buckets.iter().next().unwrap_or(&Bucket::Knowledge);
             match query_cache::embed_query_cached(&router, bucket, None, query) {
                 Ok(vector) => vector,
@@ -750,6 +767,27 @@ fn vector_ranked_lists(
                     continue;
                 }
             }
+        } else if let Some((kind, meta)) = visual_routes.get(route) {
+            // Embeds the query once via the multimodal alias, through the
+            // same process-wide query cache the text lanes use — a repeat
+            // query does not re-bill. A failure here degrades only this
+            // lane (never the whole search): API-down / rate-limited /
+            // credential-missing all land in `degraded.vector_errors`.
+            match query_cache::embed_query_cached_visual(&router, meta, kind, query) {
+                Ok(vector) => vector,
+                Err(err) => {
+                    degraded
+                        .vector_errors
+                        .insert(route.clone(), sanitize_error(&err));
+                    continue;
+                }
+            }
+        } else {
+            degraded.skipped_partitions.insert(
+                route.clone(),
+                "no configured bucket maps to this partition".into(),
+            );
+            continue;
         };
         let hits = vectors::search(route, &query_vector, fetch)
             .with_context(|| format!("searching vector partition {route}"))?;
@@ -1543,6 +1581,225 @@ mod tests {
             .unwrap();
         assert!(lists.is_empty());
         assert!(degraded.skipped_partitions["route-a"].contains("do not match"));
+    }
+
+    /// Builds a local loopback mock voyage-multimodal endpoint that always
+    /// returns `dims`-length vectors, for network-free exercise of the
+    /// query-side visual auto-embed path (never a real provider).
+    fn spawn_mock_multimodal_server(dims: usize) -> String {
+        use axum::{Json, Router, routing::post};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let app = Router::new().route(
+                    "/v1/multimodalembeddings",
+                    post(move |Json(body): Json<serde_json::Value>| async move {
+                        let n = body["inputs"].as_array().map(Vec::len).unwrap_or(1);
+                        Json(serde_json::json!({
+                            "data": (0..n)
+                                .map(|_| serde_json::json!({"embedding": vec![0.25_f32; dims]}))
+                                .collect::<Vec<_>>()
+                        }))
+                    }),
+                );
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        format!("http://{addr}/v1/multimodalembeddings")
+    }
+
+    /// Deliverable 1 (visual lane wiring): with `[embed.routes.visual]`
+    /// configured and vectors already present in that partition,
+    /// `vector_ranked_lists` must embed the query via the multimodal alias
+    /// and search the partition — the exact gap this task closes (embedding
+    /// shipped, retrieval didn't). Asserts the returned `RankedList` carries
+    /// the visual partition (the same field `hybrid_search_typed` trims into
+    /// `searched_partitions`), no degradation is recorded, and the shared
+    /// `vector_weight` is applied like every other lane.
+    #[test]
+    fn visual_lane_is_searched_when_configured_and_vectors_exist() {
+        const DIMS: usize = 256;
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(bbox_vectors::VectorStore::open(vector_tmp.path()).unwrap());
+        let _store_guard = bbox_vectors::install_test_global(store.clone());
+
+        let endpoint = spawn_mock_multimodal_server(DIMS);
+        let _env = bbox_util::util::test_env_lock();
+        // SAFETY: held under test_env_lock() for the mutation window.
+        unsafe {
+            std::env::set_var("BBOX_HYBRID_SEARCH_VISUAL_TEST_KEY", "test-key");
+        }
+        let router = bbox_embed::embed::EmbeddingRouter::from_toml_str(&format!(
+            r#"
+[embed.providers.voyage_visual]
+type = "voyage_multimodal"
+api_key_env = "BBOX_HYBRID_SEARCH_VISUAL_TEST_KEY"
+output_dimension = {DIMS}
+endpoint = "{endpoint}"
+
+[embed.routes.visual]
+pdf_figure = "voyage_visual"
+"#
+        ))
+        .unwrap();
+        let route_id = router
+            .visual_route("pdf_figure")
+            .unwrap()
+            .unwrap()
+            .vector_route_id();
+        let _router_guard = bbox_embed::embed::install_test_router(router);
+
+        let entity_id = "project_file:proj1234:filehash01:abcd1234:0";
+        store
+            .upsert(&route_id, entity_id, "chunkhash", vec![0.25; DIMS])
+            .unwrap();
+
+        let mut degraded = HybridDegraded::default();
+        let partitions = BTreeMap::from([(
+            route_id.clone(),
+            PartitionMetrics {
+                route: route_id.clone(),
+                state: bbox_vectors::PartitionState::Active { dims: DIMS },
+                dims: DIMS,
+                wal_records: 1,
+                active_count: 1,
+                deleted_count: 0,
+                deleted_ratio: 0.0,
+                hnsw_rebuilds: 1,
+                hnsw: None,
+            },
+        )]);
+        let lists = vector_ranked_lists(
+            "figure of a triad",
+            None,
+            5,
+            0.6,
+            &partitions,
+            &mut degraded,
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("BBOX_HYBRID_SEARCH_VISUAL_TEST_KEY");
+        }
+
+        assert!(degraded.is_empty(), "no degradation expected: {degraded:?}");
+        assert_eq!(lists.len(), 1, "the visual partition must be searched");
+        assert_eq!(lists[0].source, format!("vector:{route_id}"));
+        assert_eq!(lists[0].weight, 0.6, "same vector_weight as other lanes");
+        assert!(
+            lists[0].hits.iter().any(|hit| hit.entity_id == entity_id),
+            "expected the upserted visual chunk to surface: {:?}",
+            lists[0].hits
+        );
+    }
+
+    /// Deliverable 1 (zero behavior change when unconfigured): a partition
+    /// that matches neither a `Bucket` route nor a visual route (no
+    /// `[embed.routes.visual]` entry at all) must fall through to the
+    /// exact pre-existing skip — no visual lookup attempted, no extra call.
+    #[test]
+    fn visual_lane_is_absent_when_no_visual_route_is_configured() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(bbox_vectors::VectorStore::open(vector_tmp.path()).unwrap());
+        let _store_guard = bbox_vectors::install_test_global(store.clone());
+        let _router_guard =
+            bbox_embed::embed::install_test_router(bbox_embed::embed::EmbeddingRouter::default());
+
+        let mut degraded = HybridDegraded::default();
+        let partitions = BTreeMap::from([(
+            "voyage-visual-orphan".to_string(),
+            PartitionMetrics {
+                route: "voyage-visual-orphan".into(),
+                state: bbox_vectors::PartitionState::Active { dims: 4 },
+                dims: 4,
+                wal_records: 1,
+                active_count: 1,
+                deleted_count: 0,
+                deleted_ratio: 0.0,
+                hnsw_rebuilds: 1,
+                hnsw: None,
+            },
+        )]);
+        let lists =
+            vector_ranked_lists("figure", None, 5, 0.6, &partitions, &mut degraded).unwrap();
+
+        assert!(lists.is_empty(), "no route maps to this partition");
+        assert_eq!(
+            degraded.skipped_partitions.get("voyage-visual-orphan"),
+            Some(&"no configured bucket maps to this partition".to_string()),
+            "unconfigured partitions keep the pre-existing skip message"
+        );
+        assert!(degraded.vector_errors.is_empty(), "no embed call attempted");
+    }
+
+    /// Deliverable 2 (graceful degradation): a multimodal query-embed
+    /// failure (provider unreachable) must degrade only the visual lane —
+    /// the function still returns `Ok`, and the failure is recorded in
+    /// `degraded.vector_errors` like every other vector-lane failure, never
+    /// propagated as a search-ending `Err`.
+    #[test]
+    fn visual_lane_embed_failure_degrades_without_failing_the_search() {
+        const DIMS: usize = 256;
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(bbox_vectors::VectorStore::open(vector_tmp.path()).unwrap());
+        let _store_guard = bbox_vectors::install_test_global(store.clone());
+
+        let router = bbox_embed::embed::EmbeddingRouter::from_toml_str(&format!(
+            r#"
+[embed.providers.voyage_visual]
+type = "voyage_multimodal"
+api_key_env = "BBOX_HYBRID_SEARCH_VISUAL_UNREACHABLE_KEY"
+output_dimension = {DIMS}
+endpoint = "http://127.0.0.1:9/v1/multimodalembeddings"
+
+[embed.routes.visual]
+pdf_figure = "voyage_visual"
+"#
+        ))
+        .unwrap();
+        let route_id = router
+            .visual_route("pdf_figure")
+            .unwrap()
+            .unwrap()
+            .vector_route_id();
+        let _router_guard = bbox_embed::embed::install_test_router(router);
+
+        let mut degraded = HybridDegraded::default();
+        let partitions = BTreeMap::from([(
+            route_id.clone(),
+            PartitionMetrics {
+                route: route_id.clone(),
+                state: bbox_vectors::PartitionState::Active { dims: DIMS },
+                dims: DIMS,
+                wal_records: 1,
+                active_count: 1,
+                deleted_count: 0,
+                deleted_ratio: 0.0,
+                hnsw_rebuilds: 1,
+                hnsw: None,
+            },
+        )]);
+        let lists =
+            vector_ranked_lists("figure", None, 5, 0.6, &partitions, &mut degraded).unwrap();
+
+        assert!(lists.is_empty(), "degraded lane contributes no ranked list");
+        assert!(
+            degraded.vector_errors.contains_key(&route_id),
+            "embed failure must be recorded as a degraded vector error: {degraded:?}"
+        );
+        assert!(
+            !degraded.skipped_partitions.contains_key(&route_id),
+            "a configured-but-failing route is a degrade, not a skip"
+        );
     }
 
     #[test]

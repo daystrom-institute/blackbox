@@ -26,3 +26,17 @@
 - `discover_seed` reuses `hybrid_search_typed` verbatim and differs only in
   post-processing (notable edges). Ranking changes land in one place and
   affect both; do not fork the ranking for one surface.
+- `vector_ranked_lists` searches TWO route families against the same
+  `partitions` map from `vectors::try_metrics()`: `Bucket`-keyed text routes
+  (`route_buckets`) and chunk-kind-keyed visual routes
+  (`EmbeddingRouter::configured_visual_routes()`, `[embed.routes.visual]`).
+  A partition matching neither falls through to the pre-existing
+  "no configured bucket maps to this partition" skip — that is also the
+  entire behavior when no visual route is configured, so the visual lane is
+  strictly additive. `configured_visual_routes()` dedupes by partition id
+  (image/pdf_figure sharing one multimodal alias search once); the visual
+  query embeds through `query_cache::embed_query_cached_visual`, the same
+  process-wide cache as the text lanes. doc_type scoping needs no visual
+  special case: visual chunks are `project_file` entities (chunk_kind, not
+  doc_type, distinguishes them), so `doc_type="project_file"` already
+  includes them by prefix match.
