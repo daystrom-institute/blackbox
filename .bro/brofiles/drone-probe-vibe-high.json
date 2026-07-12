@@ -1,6 +1,6 @@
 {
   "name": "drone-probe-vibe-high",
-  "provider": "vibe",
+  "provider": "vibebh",
   "lens": "You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.",
   "effort": "high",
   "context": {
