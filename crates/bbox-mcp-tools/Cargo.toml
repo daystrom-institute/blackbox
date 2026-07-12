@@ -43,3 +43,6 @@ bbox-embed = { path = "../bbox-embed" }
 
 [dev-dependencies]
 bbox-vectors = { path = "../bbox-vectors", features = ["test-support"] }
+bbox-embed = { path = "../bbox-embed", features = ["test-support"] }
+bbox-util = { path = "../bbox-util" }
+axum = { version = "0.8", features = ["macros"] }

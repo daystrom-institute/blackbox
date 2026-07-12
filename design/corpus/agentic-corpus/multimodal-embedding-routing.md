@@ -241,6 +241,13 @@ selection is `voyage-multimodal-3.5`, 1024 float, family
 Multimodal Chunk Model below; chunker phases in
 `agentic-corpus-multimodal-chunkers.md`.
 
+**Embedding shipped 2026-07-11 (see Multimodal Chunk Model); retrieval
+shipped 2026-07-11 in a follow-up pass.** The two legs landed separately:
+the embed-side sidecar (chunkers + queue lane, above) wrote vectors into
+`[embed.routes.visual]` partitions first, and `bbox_hybrid_search` only
+searched them once the query-side wiring landed afterward - see Search
+Semantics below for the gap and the fix.
+
 ### Layer 5 — Partition lifecycle (before the migrations, not after)
 
 Shipped 2026-07-11 (see Migration Plan Phase 2). Layers 1–2 are
@@ -535,9 +542,27 @@ Partitions with no current route metadata are skipped and reported under
 `degraded.skipped_partitions` — never guess a query encoder for orphaned
 partitions.
 
+**Gap closed 2026-07-11**: step 2's "every configured bucket" was literal
+- route resolution enumerated `Bucket` values only, and visual routes are
+chunk-kind-keyed (`[embed.routes.visual]`), never `Bucket`-keyed, so a
+visual partition with vectors already indexed fell through step 4 into
+`degraded.skipped_partitions` instead of being searched. Embedding had
+shipped; this retrieval leg had not. Fixed by resolving a second route map
+from `EmbeddingRouter::configured_visual_routes()` (chunk kind to
+partition, deduped so `image`/`pdf_figure` sharing one multimodal alias
+search once) alongside the `Bucket` map in step 2, so a text query still
+embeds once per encoder (step 3, same cache) but now also covers the
+multimodal encoder when a visual route is configured, and step 4 searches
+that partition too - reported in `searched_partitions` like any other
+lane, degraded per-lane on embed failure like any other lane. No behavior
+change when `[embed.routes.visual]` is unconfigured.
+
 For a future visual query: accept explicit parts (`text`/`image`/
-interleaved), search only compatible multimodal families unless text-only
-fallback is requested, fuse with BM25 only when the query has text.
+interleaved) AS THE QUERY ITSELF (as opposed to the text-query-into-
+visual-space retrieval above, which sends a text query but can already
+retrieve image/pdf_figure results); search only compatible multimodal
+families unless text-only fallback is requested, fuse with BM25 only when
+the query has text.
 
 Never:
 
@@ -658,7 +683,20 @@ pixel-export policy is documented there too. Still open: the visual eval
 (figure/table/chart query set) - no eval run yet compares text-only vs.
 visual-sidecar retrieval quality, so `[embed.routes.visual]` stays
 unconfigured by default (opt-in, per Design Principle 4) rather than
-becoming a recommended default for any visual kind. Original scope:
+becoming a recommended default for any visual kind.
+
+**Retrieval leg shipped 2026-07-11** (same day, follow-up pass): the
+embed-side work above wrote vectors into visual partitions, but
+`bbox_hybrid_search`'s vector lane enumeration was `Bucket`-keyed and
+never consulted them - see Search Semantics above for the gap and the
+fix (`EmbeddingRouter::configured_visual_routes()` plus a visual-route
+arm in `vector_ranked_lists`, `crates/bbox-mcp-tools/src/mcp_tools/
+hybrid_search.rs`). `bbox_embed_status` visual route rows also had a
+cosmetic gap fixed in the same pass: `provider`/`model`/`dim` showed
+`null` next to `available=true` when coverage seeded a row before any
+queue worker had spawned in-process; now backfilled from
+`VisualRouteMeta` (`src/embed_runtime.rs::backfill_visual_route_metadata`).
+Original scope:
 
 - `VoyageMultimodalProvider` against `/v1/multimodalembeddings` with the
   payload guards above; export-policy docs for pixels leaving the host.

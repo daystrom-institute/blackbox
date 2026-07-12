@@ -469,6 +469,7 @@ dependencies = [
  "bbox-knowledge",
  "bbox-stores",
  "bbox-threads",
+ "bbox-util",
  "bbox-vectors",
  "bbox-visual-store",
  "chrono",
@@ -617,6 +618,7 @@ name = "bbox-mcp-tools"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "axum",
  "bbox-chunker",
  "bbox-corpus-core",
  "bbox-edge-index",
@@ -625,6 +627,7 @@ dependencies = [
  "bbox-knowledge",
  "bbox-providers",
  "bbox-system-memory",
+ "bbox-util",
  "bbox-vectors",
  "chrono",
  "rmcp",
