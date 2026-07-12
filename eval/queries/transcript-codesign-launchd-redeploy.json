@@ -1,0 +1,24 @@
+{
+  "id": "transcript-codesign-launchd-redeploy",
+  "query_class": "transcript_provenance",
+  "pass_strictness": "first",
+  "query": "where did we work through the macOS codesign and launchd redeploy sequence for blackboxd?",
+  "target_locators": [
+    {
+      "description": "Transcript turn executing the macOS redeploy dance: ad-hoc codesign, launchctl bootout, launchctl bootstrap, then kickstart.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "codesign launchctl bootout launchctl bootstrap redeploy dance"
+    }
+  ],
+  "expected_entity_refs": [
+    "transcript:mm:3d8148a2-5588-420f-b245-f86e5984b205:144074:0"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only from BLACKBOX.md; the provenance should include the transcript turn executing the sequence."
+  ],
+  "pass_classifier": "check_transcript_codesign_launchd_redeploy"
+}

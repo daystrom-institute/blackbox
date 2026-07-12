@@ -1,0 +1,24 @@
+{
+  "id": "transcript-clippy-disallowed-methods",
+  "query_class": "transcript_provenance",
+  "pass_strictness": "first",
+  "query": "where did we discuss the clippy disallowed-methods gate blocking fs and process calls?",
+  "target_locators": [
+    {
+      "description": "Transcript turn on the clippy disallowed-methods gate flagging std::fs::read_to_string in bro-harness and the sanctioned-site exception.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "clippy disallowed-methods gate flags std::fs::read_to_string sanctioned"
+    }
+  ],
+  "expected_entity_refs": [
+    "transcript:zai:688cbca9-49f7-4af4-b944-be07a2d73b23:1816846:0"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only with clippy.toml contents; include the transcript turn discussing the sanctioned-site exception."
+  ],
+  "pass_classifier": "check_transcript_clippy_disallowed_methods"
+}

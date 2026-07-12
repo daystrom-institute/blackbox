@@ -1,0 +1,24 @@
+{
+  "id": "transcript-harness-in-process-provider",
+  "query_class": "transcript_provenance",
+  "pass_strictness": "first",
+  "query": "where did we work out that harness providers run in-process with blackboxd, not as a subprocess?",
+  "target_locators": [
+    {
+      "description": "Transcript turn realizing brodex (bro-harness) runs in-process with blackboxd, so restarting the daemon would kill its own dispatch.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "brodex bro-harness in-process with blackboxd kill its own process"
+    }
+  ],
+  "expected_entity_refs": [
+    "transcript:ds:5ee24f2a-86db-41d4-8a11-188cae5b2919:3294960:0"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer that harness providers run as a bro-harness subprocess; the provenance should include the transcript turn establishing the in-process model."
+  ],
+  "pass_classifier": "check_transcript_harness_in_process_provider"
+}
