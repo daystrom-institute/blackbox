@@ -50,6 +50,20 @@ base64 = "0.22"
 # Header-only image dimension sniffing for the multimodal payload guard
 # (image pixel cap); no decode, no transitive deps.
 imagesize = "0.13"
+# Decode/resize/encode for visual payload normalization (gap-48ae5495):
+# downscaling oversize images under the provider's pixel cap and padding
+# thin scan-strip images into its aspect-ratio range, instead of
+# poison-dropping them. default-features = false and only the codecs the
+# normalizer actually touches: jpeg/png/gif/webp decode (the formats the
+# chunkers can hand it) plus jpeg/png encode (the two output formats we
+# ever re-encode to). Keeps out the heavier codecs (tiff, avif, openexr,
+# dds, ...) the default feature set pulls in.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+] }
 tempfile = "3"
 bbox-stores = { path = "../bbox-stores" }
 bbox-knowledge = { path = "../bbox-knowledge" }
