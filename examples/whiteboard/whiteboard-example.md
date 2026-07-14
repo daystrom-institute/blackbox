@@ -186,6 +186,16 @@ wall including the merge wait) produced:
   `AwaitMerge` and `Done` archived the board through the full
   blind → read → validate → debate → resolve → archived phase history
 
+A second run (issue #3, named members + `${member.name}` prompts +
+Vote-node board auto-apply) proved the complementary paths: challenges
+RESOLVED during the response round, so the debate-settled gate fired
+`settled` after one round instead of hitting the ceiling; the engine
+cast the compliant member's votes with member-name fallback
+attribution; and the two members that drifted from the STRICT-JSON
+contract (prose preamble; provider tool-call echoes) produced loud
+`board_autoapply_skipped` events — the drift shapes that motivated the
+parser's salvage pass.
+
 The arc walk is repeatable — re-running against the same issue creates a new arc with a new board id, a new branch, and (because of `find_first` on existing PRs) reuses any already-open PR for the branch rather than creating a duplicate.
 
 ## See also
