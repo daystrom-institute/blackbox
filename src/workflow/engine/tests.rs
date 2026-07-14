@@ -373,6 +373,19 @@ async fn workflow_foreach_runtime_collects_child_exports() {
     assert_eq!(rows[0]["key"], "a-0");
     assert_eq!(rows[0]["exports"]["summary"]["item"], "a");
     assert_eq!(rows[1]["exports"]["summary"]["idx"], 1);
+    // Per-child provenance rides every item result (gap-513594d8):
+    // arc_id identifies the child arc, actor_sessions maps each durable
+    // actor to its session (empty object here — hook-only children).
+    assert!(
+        rows[0]["arc_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "child arc_id missing: {:?}",
+        rows[0]
+    );
+    assert!(
+        rows[0]["actor_sessions"].is_object(),
+        "actor_sessions missing: {:?}",
+        rows[0]
+    );
 }
 
 #[tokio::test]

@@ -313,7 +313,27 @@ is pure engine machinery.
 | `halt` | Cancel in-flight items, halt immediately |
 
 `collect.into_var` must be declared `kind: "array"` in `vars_schema`.
-The collected array entries have shape `{item: <input>, result: <sub-arc output>, status: "ok"|"failed"}`.
+Each collected entry carries the child's full result AND its dispatch
+provenance (gap-513594d8 parity with ensemble member capture):
+
+```json
+{
+  "index": 0,
+  "key": "a-0",
+  "item": { "…": "the input item" },
+  "status": "completed | error | cancelled | skipped",
+  "exports": { "…": "child vars named in exports" },
+  "outputs": { "NodeName": "child node output strings" },
+  "actor_sessions": { "actor": "session-id" },
+  "arc_id": "arc-…",
+  "arc_thread_id": "thread-…",
+  "error": "present on non-completed items"
+}
+```
+
+Downstream synthesis nodes can read outputs/exports directly, resume a
+child's durable actor via `actor_sessions`, or audit the child arc via
+`arc_id`/`arc_thread_id`.
 
 Live example: `system-defaults/badgey/workflows/badgey-triage-fanout-arc.json`
 (channel bindings fanout) and `badgey-triage-channel-arc.json` (scout

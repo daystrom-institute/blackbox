@@ -114,6 +114,7 @@ impl<'a> WorkflowRunner<'a> {
                             status: "error".into(),
                             exports: Map::new(),
                             outputs: Map::new(),
+                            actor_sessions: HashMap::new(),
                             arc_id: String::new(),
                             arc_thread_id: None,
                             error: Some("failed to build fanout child runtime".into()),
@@ -433,6 +434,10 @@ pub(super) struct FanoutChildOutcome {
     pub(super) status: String,
     pub(super) exports: Map<String, Value>,
     pub(super) outputs: Map<String, Value>,
+    /// Terminal actor → session_id map from the child arc — per-child
+    /// dispatch provenance for downstream synthesis/resume nodes
+    /// (parity with ensemble member_sessions; gap-513594d8).
+    pub(super) actor_sessions: HashMap<String, String>,
     pub(super) arc_id: String,
     pub(super) arc_thread_id: Option<String>,
     pub(super) error: Option<String>,
@@ -531,6 +536,7 @@ pub(super) async fn run_fanout_child(
         status,
         exports: export_values,
         outputs,
+        actor_sessions: result.actor_sessions,
         arc_id: result.arc_id,
         arc_thread_id: result.arc_thread_id,
         error,
@@ -545,6 +551,7 @@ pub(super) fn fanout_skipped_value(index: usize, plan: &FanoutChildPlan) -> Valu
         "status": "skipped",
         "exports": {},
         "outputs": {},
+        "actor_sessions": {},
         "error": "not dispatched after earlier item failure"
     })
 }
@@ -590,6 +597,7 @@ impl FanoutChildOutcome {
         out.insert("status".into(), Value::String(self.status));
         out.insert("exports".into(), Value::Object(self.exports));
         out.insert("outputs".into(), Value::Object(self.outputs));
+        out.insert("actor_sessions".into(), json!(self.actor_sessions));
         if !self.arc_id.is_empty() {
             out.insert("arc_id".into(), Value::String(self.arc_id));
         }

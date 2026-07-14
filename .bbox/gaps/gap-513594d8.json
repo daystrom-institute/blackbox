@@ -15,7 +15,9 @@
   "impact": "high",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "workflow/foreach/child-provenance-output-capture",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-02T20:09:58Z",
-  "updated_at": "2026-06-02T20:09:58Z"
+  "updated_at": "2026-07-14T06:52:14Z",
+  "resolved_at": "2026-07-14T06:52:14Z",
+  "resolution_note": "Foreach/matrix item results now carry full per-child provenance AND payload (verified + completed 2026-07-14, beta/blackbox-v2). Since filing, the fanout collector already grew {index, key, item, status, exports, outputs (all child node outputs), arc_id, arc_thread_id, error}; this change adds the last missing piece: actor_sessions (the child arc's terminal actor→session map, ensemble-parity) on every collected item (src/workflow/engine/fanout.rs, FanoutChildOutcome). The atom half of the gap is also stale: atom_invoke returns inline \"data\" alongside output_digest/output_shape, and run_atom_node records the full atom_status JSON into actor_results + node output. Docs: reference-implementations.md § foreach documents the real collected-entry shape (the old {item, result, status} description was stale). Regression: workflow_foreach_runtime_collects_child_exports asserts arc_id + actor_sessions on collected items."
 }
