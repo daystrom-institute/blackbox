@@ -12,7 +12,9 @@
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/workflow-engine/task-completed-signal",
   "notes": "Auto-digest-arc's routing packet exists but never fires because `bro_exec` doesn't emit the signal. Operator triggers manually via `bbox_orchestrate_run`.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:04:41Z",
-  "updated_at": "2026-06-11T18:04:41Z"
+  "updated_at": "2026-07-14T06:43:57Z",
+  "resolved_at": "2026-07-14T06:43:57Z",
+  "resolution_note": "Capability exists in full and is live-verified (2026-07-14, beta/blackbox-v2, isolated daemon). Two delivery lanes: (1) every task terminal state emits a hub SystemEvent task.completed/.failed/.cancelled with correlation {task_id} (orchestration/mod.rs wait-loop terminal emit), and spawn_system_event_signal_bridge (server/background.rs) resolves any pending workflow wait whose signal matches by correlation via signal_arc_dispatch; (2) spawn_task_completed_router routes TailEvent::TaskCompleted through domain:auto-digest/task-completed-routing for packet-driven start_arc routing (entity carries task_id/session_id/task_kind). Live probe: an arc dispatched a bro via mcp_call bro_exec, stashed taskId, registered waits on task.completed/task.failed with correlate {task_id: vars.bg_task_id}, and the bridge resolved the wait on bro completion (wait_registered → wait_resolved → arc completed). Workflows can wait on external bro task completion today with no shell polling."
 }

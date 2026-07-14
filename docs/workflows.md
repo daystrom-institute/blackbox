@@ -449,7 +449,46 @@ If `timeout` fires before any signal:
 unit suffix. Absent timeout = wait indefinitely (suitable for
 never-firing-but-cancellable arcs).
 
-## Subworkflows
+### Waiting on background bro tasks
+
+Every dispatched task's terminal state emits a hub system event
+(`task.completed` / `task.failed` / `task.cancelled`) whose correlation
+carries `{task_id}`, and the daemon's system-event signal bridge
+resolves matching workflow waits automatically. That makes
+"fan a bro out, keep walking, join later" a three-node recipe with no
+polling:
+
+```jsonc
+"SpawnBro": {
+  "on_enter": [
+    { "op": "mcp_call",
+      "args": { "server": "blackbox", "tool": "bro_exec",
+                "arguments": { "bro": "some-brofile", "prompt": "…" } },
+      "into_var": "exec_result" },
+    { "op": "set_var",
+      "args": { "key": "bg_task_id", "value": "${vars.exec_result.taskId}" } }
+  ],
+  "next": { "type": "goto", "to": "AwaitTask" }
+},
+"AwaitTask": {
+  "wait": {
+    "any_of": [
+      { "signal": "task.completed",
+        "correlate": { "task_id": { "kind": "json_path", "path": "vars.bg_task_id" } } },
+      { "signal": "task.failed",
+        "correlate": { "task_id": { "kind": "json_path", "path": "vars.bg_task_id" } } }
+    ],
+    "timeout": "1h"
+  },
+  "next": { "type": "goto", "to": "Collect" }
+}
+```
+
+Route on `last_signal.name` after the wait to branch success/failure.
+Prefer engine-native `mode: "fire_and_forget"` + `wait_for` when the
+work is an actor of THIS workflow; the signal recipe is for tasks the
+arc doesn't own - bros dispatched via `bro_exec`, another arc's
+workers, externally-started tasks - anything correlatable by task id.
 
 Two ways to compose a subworkflow into a node:
 
