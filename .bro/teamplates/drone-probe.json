@@ -7,7 +7,7 @@
       "count": 1
     },
     {
-      "brofile": "drone-probe-claude-sonnet-medium",
+      "brofile": "drone-probe-glm47-medium",
       "alias": "claude",
       "count": 1
     },

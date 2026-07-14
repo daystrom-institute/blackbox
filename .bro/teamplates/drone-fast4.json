@@ -2,7 +2,7 @@
   "name": "drone-fast4",
   "members": [
     {
-      "brofile": "drone-probe-claude-sonnet-medium",
+      "brofile": "drone-probe-glm47-medium",
       "alias": "claude",
       "count": 1
     },

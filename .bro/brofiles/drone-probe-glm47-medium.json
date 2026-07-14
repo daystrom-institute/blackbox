@@ -1,8 +1,8 @@
 {
-  "name": "drone-probe-claude-sonnet-medium",
-  "provider": "claude",
+  "name": "drone-probe-glm47-medium",
+  "provider": "glm",
   "lens": "You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.",
-  "model": "claude-sonnet-4-6",
+  "model": "glm-4.7",
   "effort": "medium",
   "context": {
     "provider_defaults": "suppress_when_supported"
