@@ -798,6 +798,7 @@ mod tests {
                         wait_for: Vec::new(),
                         foreach: None,
                         matrix: None,
+                        board: None,
                         timeout: None,
                         actor_failure: None,
                         next: NodeTransition::Terminal,

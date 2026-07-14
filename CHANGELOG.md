@@ -45,6 +45,19 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Ensemble workflow nodes accept a `board` binding (template → whiteboard
+  id) for engine-driven board auto-apply (gap-7fbefe13): each member's
+  STRICT-JSON output — one object or an array of
+  `{action: post|annotate|vote|none, …}` items, code fences tolerated —
+  is parsed into typed `BoardAction`s and applied through the same
+  registry checks the `whiteboard_*` tools enforce, with attribution from
+  the item's `agent_name` (falling back to the member name). Closes the
+  forgotten-tool-call failure mode where an agent writes the deliberation
+  but never lands it on the board; failures log `board_autoapply_*` arc
+  events without failing the node. The whiteboard example's Vote node now
+  uses it. Live-proven: probe arcs posted 3/3 member claims engine-side
+  with zero whiteboard tool calls.
+
 - Workflow actor and node specs accept a `timeout` field (duration string
   like `"30m"` or number of seconds; node overrides actor; default stays
   900s) governing how long the engine waits on dispatched actor tasks -

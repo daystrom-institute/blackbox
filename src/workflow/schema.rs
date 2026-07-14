@@ -186,9 +186,10 @@ pub enum ActorKind {
     Executor,
     /// Ensemble broadcast. Dispatched via `bro_broadcast` +
     /// `bro_when_all`. Each member runs the same prompt; outputs are
-    /// labeled and concatenated. When the node has an associated
-    /// whiteboard board, each member's STRICT-JSON output is also
-    /// auto-posted to the board.
+    /// labeled and concatenated. When the node declares a `board`
+    /// binding, each member's STRICT-JSON output is parsed into typed
+    /// board actions (post / annotate / vote) and auto-applied to the
+    /// whiteboard by the engine — see [`NodeSpec::board`].
     Ensemble,
 }
 
@@ -304,6 +305,21 @@ pub struct NodeSpec {
     /// objects, then passed through the foreach execution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<MatrixSpec>,
+
+    /// Whiteboard binding for engine-driven board mutation
+    /// (gap-7fbefe13). Template string resolving to a board id (e.g.
+    /// `"${vars.board_id}"`). When set on an ensemble node, each
+    /// member's final output is parsed as STRICT JSON — one object or
+    /// an array of `{action: post|annotate|vote|none, …}` items, code
+    /// fences tolerated — and applied to the board through the same
+    /// registry methods the `whiteboard_*` tools use (identical
+    /// phase/role/reference checks). Attribution: an item's
+    /// `agent_name` when present, else the ensemble member name.
+    /// Failures are logged as `board_autoapply_*` events and never
+    /// fail the node — mechanical enforcement stays with gate packets
+    /// over `whiteboard_summarize` counts. Ensemble nodes only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
 
     /// Optional per-node dispatch timeout for the actor task this node
     /// waits on (each ensemble member individually; also the join wait

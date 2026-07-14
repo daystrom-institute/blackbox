@@ -1216,6 +1216,213 @@ pub fn board_template_scope(board: &Board) -> Value {
     Value::Object(out)
 }
 
+// ── Structured board actions (engine auto-apply) ───────────────────
+//
+// The typed contract for engine-driven board mutation: a dispatched
+// agent returns STRICT JSON describing what it wants to do on the
+// board, and the caller (the workflow engine's `board` node binding)
+// parses + applies it through the same registry methods the
+// `whiteboard_*` MCP tools use — every phase/role/reference check
+// holds identically. This closes the silent-failure mode where an LLM
+// writes a beautiful deliberation turn but forgets the tool call
+// (gap-7fbefe13).
+
+/// One board mutation. Tagged by `action`; field names and enum
+/// spellings match the `whiteboard_*` tool surface exactly, so a
+/// prompt can describe either interface with the same vocabulary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum BoardAction {
+    Post {
+        #[serde(rename = "type")]
+        post_type: PostType,
+        title: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        severity: Option<Severity>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        finding_refs: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cascade_targets: Vec<String>,
+    },
+    Annotate {
+        post_id: String,
+        #[serde(rename = "type")]
+        annotation_type: AnnotationType,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ValidationResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolves: Option<String>,
+    },
+    Vote {
+        post_id: String,
+        vote: VoteValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Explicit abstention — lets an agent return STRICT JSON even
+    /// when it has nothing to put on the board this turn.
+    #[serde(alias = "noop")]
+    None,
+}
+
+impl BoardAction {
+    /// Short human label for event logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Post { .. } => "post",
+            Self::Annotate { .. } => "annotate",
+            Self::Vote { .. } => "vote",
+            Self::None => "none",
+        }
+    }
+}
+
+/// One parsed item: an action plus an optional agent override. When
+/// `agent_name` is absent the caller supplies its own attribution
+/// (the workflow engine uses the ensemble member name).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BoardItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(flatten)]
+    pub action: BoardAction,
+}
+
+/// Result of applying one [`BoardAction`], for event logging.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "applied", rename_all = "snake_case")]
+pub enum AppliedAction {
+    Post { post_id: String },
+    Annotate { annotation_id: String },
+    Vote { replaced: bool },
+    None,
+}
+
+/// Parse an agent's raw final output into board items.
+///
+/// Accepts a single JSON object or a JSON array of objects, optionally
+/// wrapped in a markdown code fence (```json … ``` or ``` … ```).
+/// Anything else — prose preamble, trailing commentary, malformed
+/// JSON — is an error: the contract is STRICT JSON, and a loud skip
+/// beats silently applying half an answer.
+pub fn parse_board_actions(raw: &str) -> Result<Vec<BoardItem>> {
+    let trimmed = raw.trim();
+    let inner = strip_code_fence(trimmed);
+    let value: Value = serde_json::from_str(inner)
+        .map_err(|e| anyhow!("board action output is not valid JSON: {e}"))?;
+    let items: Vec<BoardItem> = match value {
+        Value::Array(_) => serde_json::from_value(value)
+            .map_err(|e| anyhow!("board action array did not match the action schema: {e}"))?,
+        Value::Object(_) => vec![
+            serde_json::from_value(value)
+                .map_err(|e| anyhow!("board action did not match the action schema: {e}"))?,
+        ],
+        other => bail!(
+            "board action output must be a JSON object or array, got {}",
+            match other {
+                Value::String(_) => "a string",
+                Value::Number(_) => "a number",
+                Value::Bool(_) => "a bool",
+                Value::Null => "null",
+                _ => "unsupported JSON",
+            }
+        ),
+    };
+    Ok(items)
+}
+
+/// Strip one enclosing markdown code fence if present. Tolerates a
+/// language tag on the opening fence. Returns the input unchanged
+/// when it is not fenced.
+fn strip_code_fence(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix("```") else {
+        return s;
+    };
+    // Drop the language tag line (may be empty).
+    let body = match rest.split_once('\n') {
+        Some((_tag, body)) => body,
+        None => return s,
+    };
+    match body.rfind("```") {
+        Some(idx) => body[..idx].trim(),
+        None => s,
+    }
+}
+
+impl WhiteboardRegistry {
+    /// Apply one parsed action as `agent_name`. Routes through the
+    /// same `post` / `annotate` / `vote` methods the MCP tools call,
+    /// so phase legality, registration, and reference checks are
+    /// identical to the tool surface.
+    pub fn apply_action(
+        &self,
+        board_id: &str,
+        agent_name: &str,
+        action: &BoardAction,
+    ) -> Result<AppliedAction> {
+        match action {
+            BoardAction::Post {
+                post_type,
+                title,
+                body,
+                target_file,
+                target_location,
+                severity,
+                finding_refs,
+                cascade_targets,
+            } => {
+                let post_id = self.post(
+                    board_id,
+                    agent_name,
+                    *post_type,
+                    title,
+                    body,
+                    target_file.as_deref(),
+                    target_location.as_deref(),
+                    *severity,
+                    finding_refs.clone(),
+                    cascade_targets.clone(),
+                )?;
+                Ok(AppliedAction::Post { post_id })
+            }
+            BoardAction::Annotate {
+                post_id,
+                annotation_type,
+                body,
+                result,
+                resolves,
+            } => {
+                let annotation_id = self.annotate(
+                    board_id,
+                    agent_name,
+                    post_id,
+                    *annotation_type,
+                    body,
+                    *result,
+                    resolves.as_deref(),
+                )?;
+                Ok(AppliedAction::Annotate { annotation_id })
+            }
+            BoardAction::Vote {
+                post_id,
+                vote,
+                reason,
+            } => {
+                let replaced =
+                    self.vote(board_id, agent_name, post_id, *vote, reason.as_deref())?;
+                Ok(AppliedAction::Vote { replaced })
+            }
+            BoardAction::None => Ok(AppliedAction::None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,6 +1530,136 @@ mod tests {
         assert_eq!(
             last.summary.as_deref(),
             Some("force-archived from phase 'validate'")
+        );
+    }
+
+    #[test]
+    fn parse_board_actions_accepts_object_array_and_fences() {
+        // Single object.
+        let items = parse_board_actions(
+            r#"{"action":"post","type":"claim","title":"t","body":"b","severity":"high"}"#,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action.kind(), "post");
+        assert!(items[0].agent_name.is_none());
+
+        // Array with agent override + vote + abstention.
+        let items = parse_board_actions(
+            r#"[
+                {"agent_name":"security","action":"vote","post_id":"post-1","vote":"accept","reason":"solid"},
+                {"action":"annotate","post_id":"post-2","type":"corroborate","body":"agreed"},
+                {"action":"none"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].agent_name.as_deref(), Some("security"));
+        assert_eq!(items[0].action.kind(), "vote");
+        assert_eq!(items[1].action.kind(), "annotate");
+        assert_eq!(items[2].action, BoardAction::None);
+
+        // Fenced with a language tag.
+        let items = parse_board_actions(
+            "```json\n{\"action\":\"vote\",\"post_id\":\"p\",\"vote\":\"defer\"}\n```",
+        )
+        .unwrap();
+        assert_eq!(items[0].action.kind(), "vote");
+
+        // noop alias.
+        let items = parse_board_actions(r#"{"action":"noop"}"#).unwrap();
+        assert_eq!(items[0].action, BoardAction::None);
+    }
+
+    #[test]
+    fn parse_board_actions_rejects_prose_and_bad_schema() {
+        // Prose preamble breaks strictness.
+        let err = parse_board_actions("Here is my vote:\n{\"action\":\"vote\"}").unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"), "{err}");
+        // Unknown action tag.
+        let err = parse_board_actions(r#"{"action":"shout","body":"x"}"#).unwrap_err();
+        assert!(err.to_string().contains("action schema"), "{err}");
+        // Non-object/array JSON.
+        let err = parse_board_actions("42").unwrap_err();
+        assert!(err.to_string().contains("object or array"), "{err}");
+    }
+
+    #[test]
+    fn apply_action_enforces_same_phase_rules_as_tools() {
+        let r = fresh_registry();
+        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
+        r.register("b1", "bob", Role::Specialist, "security")
+            .unwrap();
+
+        // Post lands in blind.
+        let applied = r
+            .apply_action(
+                "b1",
+                "bob",
+                &BoardAction::Post {
+                    post_type: PostType::Claim,
+                    title: "t".into(),
+                    body: "b".into(),
+                    target_file: None,
+                    target_location: None,
+                    severity: None,
+                    finding_refs: vec![],
+                    cascade_targets: vec![],
+                },
+            )
+            .unwrap();
+        let post_id = match applied {
+            AppliedAction::Post { post_id } => post_id,
+            other => panic!("expected post, got {other:?}"),
+        };
+
+        // Vote outside debate is refused with the registry's own error.
+        let err = r
+            .apply_action(
+                "b1",
+                "bob",
+                &BoardAction::Vote {
+                    post_id: post_id.clone(),
+                    vote: VoteValue::Accept,
+                    reason: None,
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("voting only in 'debate'"), "{err}");
+
+        // Advance to debate; vote applies, re-vote replaces.
+        r.transition("b1", "alice", Phase::Read, None).unwrap();
+        r.transition("b1", "alice", Phase::Debate, None).unwrap();
+        let v1 = r
+            .apply_action(
+                "b1",
+                "bob",
+                &BoardAction::Vote {
+                    post_id: post_id.clone(),
+                    vote: VoteValue::Accept,
+                    reason: Some("initial".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(v1, AppliedAction::Vote { replaced: false });
+        let v2 = r
+            .apply_action(
+                "b1",
+                "bob",
+                &BoardAction::Vote {
+                    post_id,
+                    vote: VoteValue::Reject,
+                    reason: Some("changed my mind".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(v2, AppliedAction::Vote { replaced: true });
+
+        // Abstention is a clean no-op.
+        assert_eq!(
+            r.apply_action("b1", "bob", &BoardAction::None).unwrap(),
+            AppliedAction::None
         );
     }
 

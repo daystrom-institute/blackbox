@@ -164,6 +164,24 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
             bail!("node '{node_id}' timeout must be positive");
         }
 
+        // Board auto-apply is defined for ensemble actor nodes only:
+        // the contract is per-member STRICT-JSON output, which only
+        // ensemble dispatch produces.
+        if let Some(board) = &node.board {
+            if board.trim().is_empty() {
+                bail!("node '{node_id}' board binding must be a non-empty board-id template");
+            }
+            let is_ensemble = spec
+                .actors
+                .get(&node.actor)
+                .is_some_and(|a| a.kind == ActorKind::Ensemble);
+            if !is_ensemble {
+                bail!(
+                    "node '{node_id}' declares a board binding but its actor is not an ensemble — board auto-apply is ensemble-only"
+                );
+            }
+        }
+
         // late_inject.from must reference a declared node.
         if let Some(li) = &node.late_inject {
             if !spec.nodes.contains_key(&li.from) {
@@ -804,6 +822,63 @@ mod tests {
             compiled.spec.node_timeout_secs("Nope"),
             DEFAULT_NODE_TIMEOUT_SECS
         );
+    }
+
+    #[test]
+    fn board_binding_requires_ensemble_actor() {
+        // Ensemble node with a board binding compiles.
+        let json = r#"{
+            "name": "board-ok",
+            "version": 1,
+            "actors": {"panel": {"kind": "ensemble", "team": "t"}},
+            "nodes": {
+                "Vote": {"actor": "panel", "board": "${vars.board_id}", "next": {"type": "terminal"}}
+            },
+            "start": "Vote"
+        }"#;
+        compile(load_workflow(json).unwrap()).expect("ensemble board binding should compile");
+
+        // Executor node with a board binding is rejected.
+        let err = compile_err(
+            r#"{
+                "name": "board-executor",
+                "version": 1,
+                "actors": {"solo": {"kind": "executor", "brofile": "b"}},
+                "nodes": {
+                    "Vote": {"actor": "solo", "board": "${vars.board_id}", "next": {"type": "terminal"}}
+                },
+                "start": "Vote"
+            }"#,
+        );
+        assert!(err.contains("board auto-apply is ensemble-only"), "{err}");
+
+        // Hook-only node with a board binding is rejected too.
+        let err = compile_err(
+            r#"{
+                "name": "board-hookless",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Vote": {"board": "b1", "next": {"type": "terminal"}}
+                },
+                "start": "Vote"
+            }"#,
+        );
+        assert!(err.contains("board auto-apply is ensemble-only"), "{err}");
+
+        // Empty template is rejected.
+        let err = compile_err(
+            r#"{
+                "name": "board-empty",
+                "version": 1,
+                "actors": {"panel": {"kind": "ensemble", "team": "t"}},
+                "nodes": {
+                    "Vote": {"actor": "panel", "board": "  ", "next": {"type": "terminal"}}
+                },
+                "start": "Vote"
+            }"#,
+        );
+        assert!(err.contains("non-empty board-id template"), "{err}");
     }
 
     #[test]

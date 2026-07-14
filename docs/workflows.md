@@ -159,7 +159,7 @@ Two kinds.
 | Kind       | What it does                                            |
 |------------|---------------------------------------------------------|
 | `executor` | Single bro dispatched via `bro_exec` / `bro_resume`. Used for every single-bro role the workflow declares - implementer, fixer, triager, planner, facilitator, advisor, aggregator, synthesizer, reviewer, etc. The brofile + prompt carry the persona. |
-| `ensemble` | Team broadcast: every member runs the same prompt; output is the labeled concatenation. When the node has an associated whiteboard (see §Whiteboards), each member's STRICT-JSON output is also auto-postable via `whiteboard_post` from inside the dispatched turn. |
+| `ensemble` | Team broadcast: every member runs the same prompt; output is the labeled concatenation. When the node declares a `board` binding (see §Whiteboards), each member's STRICT-JSON output is parsed into typed board actions (post / annotate / vote) and auto-applied by the engine — no tool call required. |
 
 **Why only two kinds.** Earlier iterations had `advisor`, `planner`,
 `triager`, `user` as marker types. They didn't pull engine weight -
@@ -303,6 +303,7 @@ A node declares the unit of work. Fields:
 | `mode`            | `sync` (default) or `fire_and_forget`.                  |
 | `retry`           | `{max_generations: N}` - visit-count ceiling.           |
 | `timeout`         | Dispatch-wait timeout for this node's actor task (per ensemble member; also the join wait for fire-and-forget sources). Duration string (`"30m"`) or seconds. Overrides the actor's `timeout`; default 900s. |
+| `board`           | Whiteboard binding (template → board id, e.g. `"${vars.board_id}"`). Ensemble nodes only. Each member's STRICT-JSON output — one object or an array of `{action: post\|annotate\|vote\|none, …}` items, code fences tolerated — is parsed and applied to the board engine-side with the same phase/role checks as the `whiteboard_*` tools. Attribution: item `agent_name`, else member name. Failures log `board_autoapply_*` events; the node never fails from auto-apply. |
 | `late_inject`     | `{from: NodeId, policy: "resume_on_return"}` - fold an async source into this node at its entry. |
 | `subworkflow`     | Inline `Workflow` spec (mutually exclusive with `subworkflow_ref`). |
 | `subworkflow_ref` | Workflow id resolved from the registry at dispatch time. |

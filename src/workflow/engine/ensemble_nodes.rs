@@ -6,6 +6,7 @@ use serde_json::json;
 use super::super::ActorSpec;
 use super::WorkflowRunner;
 use crate::orchestration as orch;
+use crate::whiteboards;
 
 impl<'a> WorkflowRunner<'a> {
     pub(super) async fn run_ensemble_node(
@@ -121,6 +122,20 @@ impl<'a> WorkflowRunner<'a> {
         // Stable order (by member name) so prompt substitution is
         // deterministic across re-runs.
         member_outputs.sort_by(|a, b| a.0.cmp(&b.0));
+        // Board binding: parse each member's STRICT-JSON output into
+        // typed board actions and apply them engine-side, so a member
+        // that wrote the deliberation but forgot the tool call still
+        // lands on the board (gap-7fbefe13).
+        let board_template = self
+            .compiled
+            .spec
+            .nodes
+            .get(node_id)
+            .and_then(|n| n.board.clone());
+        if let Some(template) = board_template {
+            let board_id = self.render_prompt(&template);
+            self.apply_board_actions(node_id, &board_id, &member_outputs);
+        }
         let merged = member_outputs
             .iter()
             .map(|(m, o)| format!("── {m} ──\n{o}"))
@@ -153,5 +168,83 @@ impl<'a> WorkflowRunner<'a> {
             ),
         );
         Ok(())
+    }
+
+    /// Engine-driven whiteboard mutation for a `board`-bound ensemble
+    /// node. Each member's output is parsed with
+    /// [`whiteboards::parse_board_actions`] and applied through the
+    /// registry (same phase/role checks as the `whiteboard_*` tools).
+    /// Attribution: the item's `agent_name` when present, else the
+    /// member name. Nothing here fails the node — a member that
+    /// already posted via tools returns prose (parse skip), and a
+    /// phase-illegal action is the registry's refusal to log, not an
+    /// arc error. Mechanical enforcement of board contracts stays with
+    /// gate packets over `whiteboard_summarize` counts.
+    pub(super) fn apply_board_actions(
+        &mut self,
+        node_id: &str,
+        board_id: &str,
+        member_outputs: &[(String, String)],
+    ) {
+        for (member, output) in member_outputs {
+            let items = match whiteboards::parse_board_actions(output) {
+                Ok(items) => items,
+                Err(e) => {
+                    self.log_event(
+                        "board_autoapply_skipped",
+                        json!({
+                            "node": node_id,
+                            "board": board_id,
+                            "member": member,
+                            "reason": e.to_string(),
+                        }),
+                    );
+                    continue;
+                }
+            };
+            for item in items {
+                let agent = item.agent_name.as_deref().unwrap_or(member.as_str());
+                match self
+                    .server
+                    .state
+                    .whiteboards
+                    .apply_action(board_id, agent, &item.action)
+                {
+                    Ok(applied) => {
+                        self.log_event(
+                            "board_autoapply",
+                            json!({
+                                "node": node_id,
+                                "board": board_id,
+                                "member": member,
+                                "agent": agent,
+                                "action": item.action.kind(),
+                                "result": applied,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        self.log_event(
+                            "board_autoapply_failed",
+                            json!({
+                                "node": node_id,
+                                "board": board_id,
+                                "member": member,
+                                "agent": agent,
+                                "action": item.action.kind(),
+                                "reason": e.to_string(),
+                            }),
+                        );
+                        self.arc_note(
+                            "surprise",
+                            &format!(
+                                "board auto-apply failed on node '{node_id}' ({agent} {} → {board_id}): {e}",
+                                item.action.kind()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -240,6 +240,18 @@ impl<'a> WorkflowRunner<'a> {
                     );
                 }
                 outs.sort_by(|a, b| a.0.cmp(&b.0));
+                // Board-bound fire-and-forget ensembles auto-apply at
+                // join time — same contract as the synchronous path.
+                let board_template = self
+                    .compiled
+                    .spec
+                    .nodes
+                    .get(source)
+                    .and_then(|n| n.board.clone());
+                if let Some(template) = board_template {
+                    let board_id = self.render_prompt(&template);
+                    self.apply_board_actions(source, &board_id, &outs);
+                }
                 let merged = outs
                     .iter()
                     .map(|(m, o)| format!("── {m} ──\n{o}"))

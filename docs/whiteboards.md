@@ -177,6 +177,20 @@ Whiteboards integrate into the workflow engine:
   whiteboard phase, a `board-transitioned` signal fires correlated to
   `(board_id, target_phase)`. Any `Wait` node observing that board
   resumes.
+- **Engine-driven auto-apply (`board` node binding)** - an ensemble node
+  with `"board": "${vars.board_id}"` has each member's STRICT-JSON
+  output parsed into typed board actions and applied by the engine, so a
+  member that writes the deliberation but forgets the tool call still
+  lands on the board. Output is one object or an array (code fences
+  tolerated) of `{"agent_name"?, "action": "post"|"annotate"|"vote"|"none", …}`
+  items whose fields match the `whiteboard_*` tool surface exactly.
+  Attribution falls back to the ensemble member name when `agent_name`
+  is absent. Every action passes the same phase/role/reference checks
+  the tools enforce; failures are logged as `board_autoapply_*` arc
+  events and never fail the node. Agents keep read access via
+  `whiteboard_state`; mixing modes on one node (tool-written AND
+  auto-applied) risks double-posting, so a `board`-bound node's prompt
+  should say "do not call whiteboard mutation tools".
 
 ### Example: multi-round ADR workflow
 

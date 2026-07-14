@@ -277,7 +277,8 @@
     },
     "Vote": {
       "actor": "specialists",
-      "prompt": "Whiteboard board: ${vars.board_id} (phase: debate — final vote)\n\nThe exchange is over (${vars.debate_round} response round(s); ${vars.board_check.unresolved_challenges} challenge(s) left standing). Re-read the full board — posts, validations, challenges, rebuttals, concessions — then vote on what you believe NOW.\n\n**Action:** for each PEER post, call `whiteboard_vote` with:\n  - post_id, agent_name=<your role>\n  - vote: \"accept\" / \"reject\" / \"defer\"\n  - reason: one sentence citing the deliberation (e.g. \"accept — my round-1 challenge was rebutted with the benchmark in docs/perf.md\")\n\nVoting against your original stance is legitimate — changing your mind under evidence is the point of the exercise.\n\nReturn ONE LINE summarizing your votes.",
+      "board": "${vars.board_id}",
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: debate — final vote)\n\nThe exchange is over (${vars.debate_round} response round(s); ${vars.board_check.unresolved_challenges} challenge(s) left standing). Re-read the full board — posts, validations, challenges, rebuttals, concessions — via `whiteboard_state(board_id=\"${vars.board_id}\", agent_name=<your role>)`, then vote on what you believe NOW.\n\nDo NOT call `whiteboard_vote` — the engine casts your votes from your output. Return ONLY a strict JSON array (no prose before or after; a ```json fence is allowed) with one entry per PEER post:\n\n[{\"agent_name\": \"<your role>\", \"action\": \"vote\", \"post_id\": \"<peer post id>\", \"vote\": \"accept\"|\"reject\"|\"defer\", \"reason\": \"<one sentence citing the deliberation>\"}]\n\nVoting against your original stance is legitimate — changing your mind under evidence is the point of the exercise.",
       "next": { "type": "goto", "to": "TransitionToResolve" }
     },
     "TransitionToResolve": {
