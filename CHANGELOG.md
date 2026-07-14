@@ -10,6 +10,24 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- `blackboxd --help` / `--version` are side-effect-free: they print and
+  exit before any store open, background worker, port bind, or tokio
+  runtime; unknown flags exit 2 instead of silently starting a daemon
+  (gap-663baff0).
+- Resolving a workflow-origin thread no longer writes a repo-owned
+  `.bbox/record/` snapshot — discarding stale wf-* arc scaffolding leaves
+  no reviewable exhaust; promotion still records deliberately
+  (gap-8500c221).
+- Pathology correction-plan sections (diagnosis, evidence, remediation,
+  deferred, atom mapping) render object items as key-value prose instead
+  of backtick JSON blobs (gap-d062e178).
+- Foreach/matrix collected item results carry the child arc's
+  `actor_sessions` (terminal actor→session map) alongside the existing
+  outputs/exports/arc ids — full per-child dispatch provenance
+  (gap-513594d8).
+- `docs/perf-pathology-dispatch.md` repointed at the split
+  `perf-pathology-rust` / `perf-pathology-java` lanes (gap-96936c27).
+
 - Workflow dispatch waits no longer report a task that already completed as
   timed out (gap-0301dc75): `wait_for_task_with_timeout` re-checks the task's
   terminal status when the timer fires, closing the race where an ensemble
