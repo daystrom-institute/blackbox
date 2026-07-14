@@ -184,11 +184,17 @@ The provider catalog is code-owned in `src/orchestration/providers.rs`. Do not
 copy full model inventories into `PROJECT.md`; they go stale. Keep this file to
 routing facts:
 
-- Claude dispatches through the Claude Code CLI.
-- GLM, DeepSeek, MiniMax, and Brodex dispatch through `bro-harness` (the custom
+- The dispatch plane contains ZERO provider CLIs. Claude is banned as a
+  dispatch provider (removed after the June 15, 2026 `-p` rug pull); `claude`
+  survives only as a serde alias to `glm` for legacy configs. Real Claude
+  models run only via the interactive harness's native agents, never the bro
+  plane. Note the glm lane's Z.AI endpoint maps claude-* model names to GLM
+  models server-side, so claude-* pins on glm brofiles do not run Claude.
+- GLM, DeepSeek, MiniMax, Brodex, and VibeBh (all of `Provider::ALL`) dispatch
+  through `bro-harness` (the custom
   provider harness, `crates/bro-harness`): GLM/DeepSeek/MiniMax on the Anthropic
   transport, Brodex on the OpenAI Responses transport (Codex/ChatGPT
-  backend). The daemon links `bro-harness` as a **library crate** (`Cargo.toml`)
+  backend), VibeBh (Mistral) on the OpenAI chat-completions transport. The daemon links `bro-harness` as a **library crate** (`Cargo.toml`)
   and runs these providers **in-process** — `spawn_task_with_tool_placement`
   routes every harness provider to `spawn_harness_in_process_task`
   (`orchestration/mod.rs`), which calls
@@ -203,9 +209,9 @@ routing facts:
   (`provider_binary_missing`, `allocator.rs`) and legacy MCP-CLI management. See
   `design/bro-harness/anthropic-harness.md` and
   `design/bro-harness/harness-daemon-boundary.md`.
-- Codex dispatches through the codex CLI — a path distinct from Brodex
-  (`codex` → codex CLI; `brodex` → bro-harness/Responses), preserved unchanged.
-- Copilot, Vibe, and Gemini each have provider-specific arg builders.
+- `codex` is a serde alias for Brodex (bro-harness/Responses); there is no
+  separate codex CLI path. The Copilot, Vibe-CLI, and Gemini provider lanes
+  are removed entirely.
 - Provider binary overrides belong in config/env, not hard-coded call sites.
 
 Dispatch-capable providers apply a mechanical recursion guard for recursive

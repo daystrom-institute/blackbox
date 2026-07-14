@@ -1,0 +1,20 @@
+{
+  "id": "af718f59",
+  "title": "Zero-CLI dispatch plane; Claude banned as dispatch provider",
+  "content": "The bro dispatch plane contains ZERO provider CLIs: every dispatchable provider (glm, deepseek, minimax, brodex, vibebh) runs in-process via bro-harness API transports (anthropic, openai-responses, openai-chat); spawn_task_with_tool_placement routes all of Provider::ALL to spawn_harness_in_process_task, and resolved binary names survive only for the allocator availability gate and legacy MCP-CLI management. CLI-child dispatch is a removed category, not a per-provider porting backlog: claude is BANNED as a dispatch provider (removed after the June 15, 2026 -p rug pull; \"claude\" persists only as a serde alias to glm for legacy configs), and codex/copilot/gemini/vibe CLI provider lanes are gone (\"codex\" aliases brodex). Do not re-add CLI-spawning providers, do not treat missing Claude dispatch as a substrate gap, and route real-Claude-model work through the interactive harness's native Agent tool instead. Note: the glm lane's Z.AI endpoint maps claude-* model names to GLM models, so claude-* pins on glm brofiles do not run Claude.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "June 15 2026 -p rug pull triggered the Claude ban; the dispatch plane subsequently went fully in-process (harness transports), eliminating the CLI-child category. Operator-stated 2026-07-13.",
+  "source": "user",
+  "created_at": "2026-07-14T03:14:24Z",
+  "updated_at": "2026-07-14T03:14:24Z",
+  "recall_count": 0
+}
