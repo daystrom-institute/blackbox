@@ -178,20 +178,47 @@ Whiteboards integrate into the workflow engine:
   `(board_id, target_phase)`. Any `Wait` node observing that board
   resumes.
 
-### Example: ADR workflow
+### Example: multi-round ADR workflow
+
+Real deliberation is multi-round: a challenge deserves a response, a
+response deserves re-examination, and votes should be informed by the
+exchange rather than cast alongside it. A single "challenge + vote"
+dispatch produces one-shot debate theatre - nobody ever sees the
+challenges against their own posts. The shape that works:
 
 ```
-1. OpenBoard "adr-{topic}" (blind phase)
-2. Foreach (specialist agents) → Register + Post
-3. Transition → read
-4. Transition → validate
-5. Foreach (specialist agents) → Validate posts
-6. Transition → debate
-7. Foreach (specialist agents) → Challenge + Vote
-8. Transition → resolve
-9. ArchiveBoard
-10. PostOutcome - dispatch the accepted proposal
+ 1. OpenBoard "adr-{topic}" (blind phase); Register agents
+ 2. BlindPost (ensemble)          → each specialist posts independently
+ 3. Transition → read → validate
+ 4. Validate (ensemble)           → evidence round: each specialist digs for
+                                    concrete evidence on PEER posts, annotates
+                                    validation confirmed/refuted/inconclusive
+ 5. Transition → debate
+ 6. DebateChallenge (ensemble)    → challenges + corroborations on peer posts;
+                                    NO votes yet
+ 7. DebateRespond (ensemble)      → each specialist answers challenges against
+                                    ITS OWN posts: concede (resolve), or rebut
+                                    with new evidence; challengers withdraw
+                                    (resolve) or leave challenges standing
+ 8. CheckDebate (gate)            → whiteboard_summarize → packet gate on
+                                    unresolved_challenges + round counter:
+                                    loop to 7 while challenges stand and
+                                    rounds < N, else advance
+ 9. Vote (ensemble)               → votes informed by the full exchange;
+                                    changing your mind under evidence is
+                                    legitimate
+10. Transition → resolve; Synthesize (facilitator) → ADR; ArchiveBoard
 ```
+
+The loop machinery is stock: durable ensemble actors resume the same
+specialist sessions each round, a hook-only gate node reads
+`whiteboard_summarize` (`unresolved_challenges`) into a var, a packet
+routes `another_round`/`settled` with a round-counter ceiling, and a
+branch back-edge revisits the respond node. Surviving disagreement past
+the ceiling is signal, not failure - unresolved challenges flow into
+the synthesis for human judgment. Runnable version:
+`examples/whiteboard/` (workflow `whiteboard-arc.json`, gate packet
+`gate-debate-settled.json`).
 
 ## When to use whiteboards
 

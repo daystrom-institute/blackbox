@@ -30,6 +30,19 @@ out explicitly under `Changed` or `Removed`.
   (default-features off, jpeg/png/gif/webp decode plus jpeg/png encode
   only) to `bbox-embed`.
 
+### Changed
+
+- The whiteboard example (`examples/whiteboard/`) and the docs ADR example
+  (`docs/whiteboards.md`) now demonstrate genuine multi-round deliberation
+  instead of a single "annotate + vote" pass: an evidence round in the
+  validate phase, a challenge round separated from voting, gated response
+  rounds where each specialist answers the challenges against its own posts
+  (concede / rebut with new evidence / withdraw / let stand), a deliberative
+  loop gate on `whiteboard_summarize`'s `unresolved_challenges` with an
+  agree-to-disagree round ceiling (new packet
+  `whiteboard-demo/debate-settled`), and votes cast only after the exchange.
+  The example also demonstrates the new per-actor dispatch `timeout` knob.
+
 ### Added
 
 - Workflow actor and node specs accept a `timeout` field (duration string

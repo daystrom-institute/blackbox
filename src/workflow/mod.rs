@@ -3205,4 +3205,39 @@ mod tests {
         .expect("pending entity should match");
         assert_eq!(pending.classification, "pending");
     }
+
+    #[test]
+    fn gate_debate_settled_packet_routes_deliberation_rounds() {
+        let src = include_str!("../../examples/whiteboard/packets/gate-debate-settled.json");
+        let params: crate::packets::CompileParams =
+            serde_json::from_str(src).expect("gate-debate-settled.json should parse");
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        packets
+            .compile(&params)
+            .expect("gate-debate-settled packet should compile");
+        let loaded = packets
+            .load("domain:whiteboard-demo/debate-settled")
+            .expect("should load compiled gate");
+
+        let verdict = |unresolved: u64, round: u64| {
+            crate::packets::apply(
+                &loaded,
+                &serde_json::json!({"vars": {
+                    "board_check": {"unresolved_challenges": unresolved},
+                    "debate_round": round,
+                }}),
+            )
+            .expect("entity should match")
+            .classification
+        };
+
+        // Standing challenges with rounds left → loop back for a response round.
+        assert_eq!(verdict(2, 1), "another_round");
+        // Everything resolved → proceed to voting.
+        assert_eq!(verdict(0, 1), "settled");
+        // Round ceiling reached → agree-to-disagree; surviving challenges
+        // flow into synthesis instead of looping forever.
+        assert_eq!(verdict(2, 3), "settled");
+    }
 }

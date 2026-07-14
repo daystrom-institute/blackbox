@@ -1,6 +1,6 @@
 {
   "name": "whiteboard-arc",
-  "version": 1,
+  "version": 2,
   "vars_schema": {
     "owner":             { "kind": "string", "required": true },
     "repo":              { "kind": "string", "required": true },
@@ -13,6 +13,8 @@
     "issue_data":        { "kind": "object" },
     "open_result":       { "kind": "any" },
     "register_result":   { "kind": "any" },
+    "debate_round":      { "kind": "int" },
+    "board_check":       { "kind": "any" },
     "summary":           { "kind": "any" },
     "synthesis":         { "kind": "string" },
     "adr_path":          { "kind": "string" },
@@ -29,6 +31,7 @@
       "team": "whiteboard-specialists",
       "durable": true,
       "compaction_anchor": true,
+      "timeout": "20m",
       "requires": []
     },
     "facilitator": {
@@ -72,6 +75,7 @@
         { "op": "set_var", "args": { "key": "board_id", "value": "adr-${vars.issue_number}-${meta.arc_id}" } },
         { "op": "set_var", "args": { "key": "adr_slug", "value": "adr-${vars.issue_number}" } },
         { "op": "set_var", "args": { "key": "branch", "value": "adr/${vars.issue_number}-${meta.arc_id}" } },
+        { "op": "set_var", "args": { "key": "debate_round", "value": 0 } },
         {
           "op": "worktree_create",
           "args": {
@@ -168,12 +172,12 @@
     },
     "BlindPost": {
       "actor": "specialists",
-      "prompt": "Whiteboard board: ${vars.board_id} (phase: blind)\n\nADR proposal:\n  Title: ${vars.issue_title}\n  Body:\n${vars.issue_body}\n\nYour role on the board is **specialist** — your `agent_name` matches your team-member name (`security`, `performance`, or `design`). Do not see other specialists' posts during this round.\n\n**Action:** call `mcp__blackbox__whiteboard_post` with:\n  - board_id: \"${vars.board_id}\"\n  - agent_name: <your role-name as above>\n  - type: one of \"proposal\" / \"claim\" / \"concern\" / \"informational\"\n  - title: short headline (≤ 80 chars)\n  - body: 2–4 sentences from your perspective on the proposed ADR\n  - severity: one of \"critical\" / \"high\" / \"medium\" / \"low\" if you're flagging risk\n\nReturn ONE LINE confirming what you posted (no markdown).",
-      "next": { "type": "goto", "to": "TransitionToDebate" }
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: blind)\n\nADR proposal:\n  Title: ${vars.issue_title}\n  Body:\n${vars.issue_body}\n\nYour role on the board is **specialist** — your `agent_name` matches your team-member name (`security`, `performance`, or `design`). You cannot see other specialists' posts during this round.\n\n**Action:** call `mcp__blackbox__whiteboard_post` with:\n  - board_id: \"${vars.board_id}\"\n  - agent_name: <your role-name as above>\n  - type: one of \"proposal\" / \"claim\" / \"concern\" / \"informational\"\n  - title: short headline (≤ 80 chars)\n  - body: 2–4 sentences from your perspective on the proposed ADR. State claims you can defend with evidence — peers will validate and challenge them in later rounds.\n  - severity: one of \"critical\" / \"high\" / \"medium\" / \"low\" if you're flagging risk\n\nReturn ONE LINE confirming what you posted (no markdown).",
+      "next": { "type": "goto", "to": "TransitionToValidate" }
     },
-    "TransitionToDebate": {
+    "TransitionToValidate": {
       "actor": "",
-      "prompt": "Mechanical: transition the board read → debate (skip validate; this demo uses the abbreviated path).",
+      "prompt": "Mechanical: transition the board blind → read → validate.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -196,17 +200,84 @@
             "arguments": {
               "board_id": "${vars.board_id}",
               "agent_name": "facilitator",
+              "target_phase": "validate"
+            }
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Validate" }
+    },
+    "Validate": {
+      "actor": "specialists",
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: validate)\n\nAll specialists' blind posts are now visible. This is the EVIDENCE round — before anyone argues, every factual claim gets checked.\n\nRead the full board:\n  `mcp__blackbox__whiteboard_state(board_id=\"${vars.board_id}\", agent_name=<your role>)`\n\n**Action:** for each PEER post (not your own), dig for concrete evidence before judging: inspect the worktree at `${vars.worktree_path}`, the issue text, docs, or anything the post cites as fact. Then call `whiteboard_annotate` with:\n  - type: \"validation\"\n  - post_id: the peer post\n  - result: \"confirmed\" / \"refuted\" / \"inconclusive\"\n  - body: the SPECIFIC evidence you found (file path, figure, doc line) — not just your opinion\n\nDo not vote yet. Return ONE LINE listing post ids and your verdicts.",
+      "next": { "type": "goto", "to": "TransitionToDebate" }
+    },
+    "TransitionToDebate": {
+      "actor": "",
+      "prompt": "Mechanical: transition the board validate → debate.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator",
               "target_phase": "debate"
             }
           },
           "on_failure": "halt"
         }
       ],
-      "next": { "type": "goto", "to": "Debate" }
+      "next": { "type": "goto", "to": "DebateChallenge" }
     },
-    "Debate": {
+    "DebateChallenge": {
       "actor": "specialists",
-      "prompt": "Whiteboard board: ${vars.board_id} (phase: debate)\n\nThe board has transitioned. All specialists' blind posts are now visible. Read the full board via:\n  `mcp__blackbox__whiteboard_state(board_id=\"${vars.board_id}\", agent_name=<your role>)`\n\n**Action:** for each peer's post you have a position on, call **either**:\n  - `whiteboard_annotate(type=\"challenge\"|\"corroborate\", post_id, body)` — explain your stance\n  - `whiteboard_vote(post_id, vote=\"accept\"|\"reject\"|\"defer\", reason)` — record your verdict\n\nDo not annotate your own posts. You may annotate AND vote on the same peer post. Be terse.\n\nReturn ONE LINE summarizing your annotations + votes.",
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: debate — challenge round)\n\nRead the full board (posts + validation annotations):\n  `mcp__blackbox__whiteboard_state(board_id=\"${vars.board_id}\", agent_name=<your role>)`\n\n**Action:** stake out positions on your peers' posts:\n  - `whiteboard_annotate(type=\"challenge\", post_id, body)` — a specific objection, with the evidence or reasoning behind it\n  - `whiteboard_annotate(type=\"corroborate\", post_id, body)` — reinforce a peer post you agree with, adding YOUR supporting reason (not just \"+1\")\n\nDo NOT vote yet — votes come after the exchange, so they can be informed by it. Do not annotate your own posts. If you have no genuine objection to a post, corroborate it rather than manufacturing a challenge.\n\nReturn ONE LINE summarizing your challenges + corroborations.",
+      "next": { "type": "goto", "to": "DebateRespond" }
+    },
+    "DebateRespond": {
+      "actor": "specialists",
+      "on_enter": [
+        { "op": "inc_var", "args": { "key": "debate_round" } }
+      ],
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: debate — response round ${vars.debate_round})\n\nRe-read the board:\n  `mcp__blackbox__whiteboard_state(board_id=\"${vars.board_id}\", agent_name=<your role>)`\n\n**1. Challenges targeting YOUR posts** (look for challenge annotations on posts where you are the author):\n  - If the challenger is right: concede — `whiteboard_annotate(type=\"resolve\", resolves=<challenge_id>, post_id=<your post>, body=\"conceded: …\")`.\n  - If you disagree: rebut with NEW evidence — `whiteboard_annotate(type=\"corroborate\", post_id=<your post>, body)` citing the challenge id and the concrete counter-evidence (re-check the worktree at `${vars.worktree_path}` if needed). Do not repeat your original post.\n\n**2. Challenges YOU raised**: re-read the author's rebuttal (corroborate annotations on the challenged post since your challenge).\n  - If convinced: close it — `whiteboard_annotate(type=\"resolve\", resolves=<your challenge_id>, post_id, body=\"withdrawn: …\")`.\n  - If not convinced: leave it standing. Genuine disagreement is acceptable — unresolved challenges survive into the synthesis for human judgment. Raise a follow-up challenge ONLY if the rebuttal introduced a new problem.\n\nReturn ONE LINE: what you conceded, rebutted, withdrew, or left standing.",
+      "next": { "type": "goto", "to": "CheckDebate" }
+    },
+    "CheckDebate": {
+      "actor": "",
+      "prompt": "Mechanical: read the board tally and decide — another response round, or proceed to voting.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_summarize",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator"
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "board_check",
+          "on_failure": "halt"
+        }
+      ],
+      "gate": "domain:whiteboard-demo/debate-settled",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "another_round": "DebateRespond",
+          "settled": "Vote"
+        },
+        "default": "Vote"
+      }
+    },
+    "Vote": {
+      "actor": "specialists",
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: debate — final vote)\n\nThe exchange is over (${vars.debate_round} response round(s); ${vars.board_check.unresolved_challenges} challenge(s) left standing). Re-read the full board — posts, validations, challenges, rebuttals, concessions — then vote on what you believe NOW.\n\n**Action:** for each PEER post, call `whiteboard_vote` with:\n  - post_id, agent_name=<your role>\n  - vote: \"accept\" / \"reject\" / \"defer\"\n  - reason: one sentence citing the deliberation (e.g. \"accept — my round-1 challenge was rebutted with the benchmark in docs/perf.md\")\n\nVoting against your original stance is legitimate — changing your mind under evidence is the point of the exercise.\n\nReturn ONE LINE summarizing your votes.",
       "next": { "type": "goto", "to": "TransitionToResolve" }
     },
     "TransitionToResolve": {
@@ -231,7 +302,7 @@
     },
     "Synthesize": {
       "actor": "facilitator",
-      "prompt": "Whiteboard board: ${vars.board_id} (phase: resolve)\n\nThe deliberation is closed. Read the final state via:\n  `mcp__blackbox__whiteboard_state(board_id=\"${vars.board_id}\", agent_name=\"facilitator\")`\n  `mcp__blackbox__whiteboard_summarize(board_id=\"${vars.board_id}\", agent_name=\"facilitator\")`\n\n**Action:** synthesize an ADR (Architecture Decision Record) markdown document at the path printed below. The ADR should:\n  1. Title — derived from the issue\n  2. Status — Accepted / Rejected / Deferred (driven by the vote tally)\n  3. Context — short paragraph framing the question (from the issue body)\n  4. Specialist stances — one short paragraph each summarizing security / performance / design specialist's blind post\n  5. Discussion — what each specialist annotated, and how challenges resolved (if any)\n  6. Decision — the synthesized verdict, citing the vote tally\n  7. Consequences — what this commits the project to\n\nWrite the file to: `${vars.worktree_path}/docs/adrs/${vars.adr_slug}.md`\n\nThen `cd ${vars.worktree_path} && git add docs/adrs && git commit -m \"adr: ${vars.issue_title}\"`. Do NOT push — that's the next mechanical step.\n\nReturn ONE LINE summarizing the decision (e.g. \"Accepted — async runtime X adopted per 3/3 vote\")",
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: resolve)\n\nThe deliberation is closed after ${vars.debate_round} response round(s). Read the final state via:\n  `mcp__blackbox__whiteboard_state(board_id=\"${vars.board_id}\", agent_name=\"facilitator\")`\n  `mcp__blackbox__whiteboard_summarize(board_id=\"${vars.board_id}\", agent_name=\"facilitator\")`\n\n**Action:** synthesize an ADR (Architecture Decision Record) markdown document at the path printed below. The ADR should:\n  1. Title — derived from the issue\n  2. Status — Accepted / Rejected / Deferred (driven by the vote tally)\n  3. Context — short paragraph framing the question (from the issue body)\n  4. Specialist stances — one short paragraph each summarizing security / performance / design specialist's blind post, and how validation graded its claims\n  5. Deliberation — walk the challenge → rebuttal → concession/withdrawal chains. For challenges left standing, present BOTH positions verbatim-faithfully: surviving disagreement is signal for the human reader, not noise to smooth over.\n  6. Decision — the synthesized verdict, citing the vote tally and noting any vote that flipped during debate\n  7. Consequences — what this commits the project to\n\nWrite the file to: `${vars.worktree_path}/docs/adrs/${vars.adr_slug}.md`\n\nThen `cd ${vars.worktree_path} && git add docs/adrs && git commit -m \"adr: ${vars.issue_title}\"`. Do NOT push — that's the next mechanical step.\n\nReturn ONE LINE summarizing the decision (e.g. \"Accepted — async runtime X adopted per 3/3 vote, 1 perf challenge left standing\")",
       "on_exit": [
         { "op": "set_var", "args": { "key": "synthesis", "value": "${Synthesize.output}" } },
         { "op": "set_var", "args": { "key": "adr_path",  "value": "docs/adrs/${vars.adr_slug}.md" } }

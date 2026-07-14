@@ -1,0 +1,26 @@
+{
+  "domain": "whiteboard-demo/debate-settled",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["another_round", "settled"],
+  "rules": [
+    {
+      "id": "unresolved_challenges_and_rounds_left",
+      "classification": "another_round",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Ge", "field": "vars.board_check.unresolved_challenges", "value": 1 },
+          { "op": "Lt", "field": "vars.debate_round", "value": 3 }
+        ]
+      },
+      "consequent": "another_round"
+    },
+    {
+      "id": "settled_default",
+      "classification": "settled",
+      "antecedent": { "op": "True" },
+      "consequent": "settled"
+    }
+  ]
+}

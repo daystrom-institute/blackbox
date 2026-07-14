@@ -1,6 +1,6 @@
 # Whiteboard — multi-agent ADR deliberation arc
 
-Companion to [keystone](../keystone/keystone-example.md) and [sastquatch](../sastquatch/sastquatch-example.md). Same backbone — webhook ingress, idempotent PR mechanics, auto-merge — but the work in the middle is **structured deliberation** instead of bug-fixing or SAST-squashing. A panel of specialist agents posts blind, debates, votes, and a facilitator synthesizes the result into a markdown ADR that ships as a PR.
+Companion to [keystone](../keystone/keystone-example.md) and [sastquatch](../sastquatch/sastquatch-example.md). Same backbone — webhook ingress, idempotent PR mechanics, auto-merge — but the work in the middle is **structured multi-round deliberation** instead of bug-fixing or SAST-squashing. A panel of specialist agents posts blind, validates each other's claims against evidence, exchanges challenges and rebuttals across gated response rounds, votes only after the exchange, and a facilitator synthesizes the result (including surviving disagreements) into a markdown ADR that ships as a PR.
 
 This is also the example that absorbs phaser into the engine. The whiteboard primitive is now first-class machinery (`whiteboard_*` MCP tools, `whiteboards` module), not an external MCP dependency.
 
@@ -15,8 +15,11 @@ This is also the example that absorbs phaser into the engine. The whiteboard pri
 
 | Engine feature | Where in this example |
 |----------------|------------------------|
-| **Whiteboard primitive** (in-engine, port of phaser) | `whiteboard_open` / `whiteboard_register` in OpenBoard node; specialists call `whiteboard_post` from inside their dispatched turns; facilitator drives `whiteboard_transition`; `whiteboard_archive` on Done |
-| **Multi-round durable ensemble** | `actors.specialists.durable: true` — same 3 specialist sessions answer BlindPost AND Debate; their context survives the phase transition without re-prompting |
+| **Whiteboard primitive** (in-engine, port of phaser) | `whiteboard_open` / `whiteboard_register` in OpenBoard node; specialists call `whiteboard_post` / `whiteboard_annotate` / `whiteboard_vote` from inside their dispatched turns; facilitator drives `whiteboard_transition`; `whiteboard_archive` on Done |
+| **Multi-round durable ensemble** | `actors.specialists.durable: true` — the same 3 specialist sessions answer BlindPost, Validate, DebateChallenge, every DebateRespond round, and Vote; their context survives every phase transition without re-prompting |
+| **Deliberative loop gate** | CheckDebate: hook-only node reads `whiteboard_summarize` into `vars.board_check`, packet `whiteboard-demo/debate-settled` routes `another_round` (unresolved challenges + rounds left) back to DebateRespond, `settled` forward to Vote. Round ceiling = agree-to-disagree, not arc failure |
+| **Evidence round (validate phase)** | Validate node: each specialist digs for concrete evidence on PEER posts (worktree, issue text) and annotates `validation` confirmed/refuted/inconclusive before any argument starts |
+| **Per-actor dispatch timeout** | `actors.specialists.timeout: "20m"` — deliberation turns involve real evidence work; the default 900s member timeout is overridden per actor (see docs/workflows.md § Actors) |
 | **Phase-correlated wait** (could be) | Today's arc walks transitions sequentially since the workflow itself drives them. The wait-on-phase pattern would matter when an external Claude joins mid-deliberation; documented in "ontology gaps" below |
 | **mcp_call against blackbox-self** | OpenBoard, TransitionToDebate, TransitionToResolve, Done all hit `whiteboard_*` via mcp_call (HTTP transport, loopback) |
 | **Three-specialist team with different lenses** | `whiteboard-spec-{security,performance,design}` brofiles, each with a persona-specific lens; team `whiteboard-specialists` broadcasts to all three |
@@ -52,6 +55,7 @@ cd examples/whiteboard
 examples/whiteboard/
 ├── webhooks/whiteboard.json              # Forgejo PR + issue webhook spec
 ├── packets/routing-webhook-whiteboard.json
+├── packets/gate-debate-settled.json      # deliberative loop gate (unresolved challenges × round ceiling)
 ├── workflows/whiteboard-arc.json         # single top-level workflow
 └── scripts/
     ├── bootstrap.sh                      # repo + ADR-request issue + webhook
@@ -67,16 +71,32 @@ flowchart TB
     subgraph Whiteboard[whiteboard-arc]
         Setup --> OpenBoard
         OpenBoard["OpenBoard<br/>mcp_call whiteboard_open<br/>+ whiteboard_register × 4"] --> BlindPost
-        BlindPost["BlindPost (ensemble)<br/>3 specialists call<br/>whiteboard_post"] --> ToDebate
-        ToDebate["TransitionToDebate<br/>read → debate"] --> Debate
-        Debate["Debate (ensemble durable)<br/>same 3 specialists<br/>annotate + vote"] --> ToResolve
+        BlindPost["BlindPost (ensemble)<br/>3 specialists call<br/>whiteboard_post"] --> ToValidate
+        ToValidate["TransitionToValidate<br/>blind → read → validate"] --> Validate
+        Validate["Validate (ensemble durable)<br/>evidence round: each specialist<br/>validates PEER posts<br/>confirmed/refuted/inconclusive"] --> ToDebate
+        ToDebate["TransitionToDebate<br/>validate → debate"] --> Challenge
+        Challenge["DebateChallenge (ensemble durable)<br/>challenges + corroborations<br/>on peer posts — no votes"] --> Respond
+        Respond["DebateRespond (ensemble durable)<br/>answer challenges on YOUR posts:<br/>concede (resolve) or rebut with<br/>new evidence; withdraw or let stand"] --> Check
+        Check{"CheckDebate<br/>whiteboard_summarize →<br/>gate debate-settled"} -->|"another_round<br/>(unresolved + rounds left)"| Respond
+        Check -->|settled| Vote
+        Vote["Vote (ensemble durable)<br/>votes informed by the exchange;<br/>flipping your stance is legitimate"] --> ToResolve
         ToResolve["TransitionToResolve<br/>debate → resolve"] --> Synthesize
-        Synthesize["Synthesize (facilitator)<br/>read board, write<br/>docs/adrs/adr-N.md, commit"] --> PushAndOpenPr
+        Synthesize["Synthesize (facilitator)<br/>read board, walk challenge→rebuttal<br/>chains, write docs/adrs/adr-N.md"] --> PushAndOpenPr
         PushAndOpenPr["push + find_first<br/>+ POST /pulls"] --> AwaitMerge
         AwaitMerge{{"Wait on pr-merged"}} --> Done
         Done["Done<br/>whiteboard_archive"]
     end
 ```
+
+The deliberation core is steps Validate → CheckDebate: an evidence round
+before argument, a challenge round separated from voting, response
+rounds where every specialist answers the challenges against its own
+posts (concede, rebut with new evidence, withdraw, or agree to
+disagree), and a mechanical gate that loops the response round while
+unresolved challenges remain and the round ceiling (3) is not hit.
+Votes come last, informed by the whole exchange. Challenges still
+standing at the ceiling are not failures — they flow into the ADR's
+Deliberation section as explicit surviving disagreement.
 
 ## Ontology lessons this example surfaces
 
@@ -88,7 +108,9 @@ flowchart TB
 
 3. **Human-in-the-loop without a `user` actor.** The `user` kind was a stopgap "halt with note." With whiteboards, humans (and external Claudes) join a board as agents — same `whiteboard_*` MCP surface in-workflow ensemble specialists use. No special engine type, no escalation registry. The board IS the petition surface AND the response surface. An `operator` role is registered alongside specialists at OpenBoard time as the slot a human can take.
 
-4. **Multi-round durable ensemble.** The same three specialist sessions answer BlindPost and Debate. Their context (what they posted, the prompt template, prior reasoning) persists across the phase transition. No re-prompting, no context-rebuild — `actor.durable: true` does the work.
+4. **Multi-round durable ensemble.** The same three specialist sessions answer BlindPost, Validate, DebateChallenge, every DebateRespond round, and Vote. Their context (what they posted, what they challenged, prior reasoning) persists across every phase transition and loop iteration. No re-prompting, no context-rebuild — `actor.durable: true` does the work, and it is what makes response rounds meaningful: round N+1 agents remember their round-N positions.
+
+5. **Deliberation is a loop, not a node.** A single "annotate + vote" dispatch is one-shot debate theatre — nobody ever sees the challenges against their own posts, and votes can't be informed by the exchange. The corrected shape separates challenge from response from vote, and loops the response round through a mechanical gate (`whiteboard_summarize` → `unresolved_challenges` + round counter) with an agree-to-disagree ceiling instead of forced convergence.
 
 **Still open** (flagged for future iterations):
 
@@ -113,22 +135,33 @@ flowchart TB
 
 End-to-end against `keystone-admin/agora` on the shared keystone-forgejo:
 
-| Phase                | Wall time | Bro dispatches | Notes |
-|----------------------|-----------|----------------|-------|
-| Setup + OpenBoard    | ~5s       | 0 (mechanical) | Worktree create, board open, 4 agents registered |
-| BlindPost (ensemble) | ~30–60s   | 3× Sonnet      | Each specialist calls `whiteboard_post` from inside its turn |
-| TransitionToDebate   | <1s       | 0              | Two `whiteboard_transition` calls (read, debate) |
-| Debate (ensemble)    | ~60–90s   | 3× Sonnet (resumed) | Same sessions; each annotates + votes |
-| TransitionToResolve  | <1s       | 0              | One `whiteboard_transition` call |
-| Synthesize           | ~30–60s   | 1× Sonnet      | Reads board, writes `docs/adrs/adr-N.md`, commits |
-| PushAndOpenPr        | ~2s       | 0              | git push + http_json POST /pulls |
-| AwaitMerge           | ∞ (until merge) | 0      | Wait on `pr-merged` signal |
-| Done                 | <1s       | 0              | `whiteboard_archive` call |
+| Phase                   | Wall time | Bro dispatches | Notes |
+|-------------------------|-----------|----------------|-------|
+| Setup + OpenBoard       | ~5s       | 0 (mechanical) | Worktree create, board open, 4 agents registered |
+| BlindPost (ensemble)    | ~30–60s   | 3× Sonnet      | Each specialist calls `whiteboard_post` from inside its turn |
+| TransitionToValidate    | <1s       | 0              | Two `whiteboard_transition` calls (read, validate) |
+| Validate (ensemble)     | ~60–120s  | 3× Sonnet (resumed) | Evidence round: each specialist digs in the worktree/issue and validates PEER posts |
+| TransitionToDebate      | <1s       | 0              | One `whiteboard_transition` call |
+| DebateChallenge (ensemble) | ~60–90s | 3× Sonnet (resumed) | Challenges + corroborations; no votes |
+| DebateRespond × 1–3     | ~60–120s each | 3× Sonnet (resumed) per round | Concede / rebut / withdraw / let stand; round count is board-driven |
+| CheckDebate × 1–3       | <1s each  | 0              | `whiteboard_summarize` → `debate-settled` gate |
+| Vote (ensemble)         | ~30–60s   | 3× Sonnet (resumed) | Votes informed by the exchange |
+| TransitionToResolve     | <1s       | 0              | One `whiteboard_transition` call |
+| Synthesize              | ~30–60s   | 1× Sonnet      | Reads board, walks challenge chains, writes `docs/adrs/adr-N.md`, commits |
+| PushAndOpenPr           | ~2s       | 0              | git push + http_json POST /pulls |
+| AwaitMerge              | ∞ (until merge) | 0        | Wait on `pr-merged` signal |
+| Done                    | <1s       | 0              | `whiteboard_archive` call |
 
-A successful sample run produced:
-- `docs/adrs/adr-1.md` — ~8 KB, 66 lines: status, context, three specialist stances (performance / security / design), discussion, decision, consequences, board reference + vote tally
-- Board state at archival: 3 posts, 6 corroborating annotations, 6 votes (6 accept / 0 reject / 0 defer), 0 conflicts, 0 unresolved challenges
-- PR #2 merged at commit `b1fcb6f8` after the operator (or webhook) signaled `pr-merged`
+Dispatch count varies with how contentious the board gets: a
+conflict-free run is 15 specialist turns (5 ensemble nodes × 3), a
+maximally-contentious run adds 2 more response rounds (21 turns). The
+`specialists` actor carries `timeout: "20m"` because evidence-digging
+turns routinely exceed the 900s default member timeout.
+
+A representative contentious run produces:
+- `docs/adrs/adr-1.md` with a Deliberation section walking each challenge → rebuttal → concession/withdrawal chain, and any surviving disagreement presented as both positions side by side
+- Board state at archival: 3 posts, 6 validation annotations, a mix of challenge / corroborate / resolve annotations across 1–3 response rounds, 6 votes cast AFTER the exchange (flipped votes cite what changed their mind)
+- A PR whose body carries the synthesis line, merged after the operator (or webhook) signals `pr-merged`
 
 The arc walk is repeatable — re-running against the same issue creates a new arc with a new board id, a new branch, and (because of `find_first` on existing PRs) reuses any already-open PR for the branch rather than creating a duplicate.
 
