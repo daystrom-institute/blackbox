@@ -8,11 +8,16 @@ plan. It is diagnostic only while it runs: it does not edit source during
 diagnosis. Its output is automation-ready for PD-dispatch once the operator
 chooses to launch implementation.
 
-The workflow ships one language-neutral lane:
+The workflow ships two language lanes (the language-neutral v1
+`perf-pathology.json` remains on disk but is superseded by these):
 
-- `perf-pathology` surveys operator-named hot paths or scoped code, dispatches
-  the justified subset of performance detector atoms, reviews their claims on a
-  whiteboard, and writes a correction plan under `design/refactor/perf/plans/`.
+- `perf-pathology-rust` / `perf-pathology-java` survey operator-named hot
+  paths or scoped code with a language-specific facilitator + specialist
+  panel + validator (`rust-performance-pathologist` /
+  `java-performance-pathologist` and their panels), dispatch the justified
+  subset of performance detector atoms, review their claims on a
+  whiteboard, and write a correction plan under
+  `design/refactor/perf/plans/`.
 
 Strongly prefer candidates with runtime corroboration. A static-only smell is a
 hypothesis, not a remediation slice, unless the hot-path context is unambiguous.
@@ -24,7 +29,7 @@ blocking/serial async, and unbounded growth — grounded in evidence.
 ## Install Artifacts
 
 Install or refresh the performance pathology artifacts before dispatching
-`perf-pathology`:
+`perf-pathology-rust` or `perf-pathology-java`:
 
 ```text
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/performance-pathologist.json")
@@ -36,7 +41,8 @@ bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/perf-b
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/perf-unbounded-growth.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/perf-runtime-evidence-corroboration.json")
 
-bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/perf-pathology.json")
+bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/perf-pathology-rust.json")
+bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/perf-pathology-java.json")
 ```
 
 If a dispatch reports an unknown atom, brofile, or workflow, install the named
@@ -48,7 +54,7 @@ native workflow hooks for atom-request normalization and plan writing.
 ## Invocation
 
 Use `/orchestrate/by-id` or MCP `bro_orchestrate_run` with
-`workflow_id = "perf-pathology"`. `bro orchestrate run <file>` is useful for
+`workflow_id = "perf-pathology-rust"` (or `"perf-pathology-java"`). `bro orchestrate run <file>` is useful for
 dry-run validation, but real runs should use the installed workflow id so atom
 and brofile references resolve through the production artifact catalog.
 
@@ -89,7 +95,7 @@ PROJECT="/repo"
 jq -n \
   --arg project_dir "$PROJECT" \
   '{
-    workflow_id: "perf-pathology",
+    workflow_id: "perf-pathology-rust",
     project_dir: $project_dir,
     max_steps: 80,
     await_completion: false,
@@ -170,7 +176,7 @@ Successful runs write a plan with frontmatter like:
 kind: performance-correction-plan
 lifecycle: proposed
 corpus: project-refactor
-generated_by: perf-pathology
+generated_by: perf-pathology-rust
 baseline_commit: <sha>
 ```
 

@@ -14,8 +14,10 @@
   "blocking_level": "none",
   "dedupe_key": "docs_runbook/pathology-ensemble/dispatch-doc-stale-workflow-refs",
   "notes": "Extracted from thread-cc07f395 item 8 during thread triage. Doc rewrite needs awareness of both split workflows' dispatch shapes, so filed rather than hot-fixed during triage.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-cc07f395",
   "created_at": "2026-06-11T17:07:58Z",
-  "updated_at": "2026-06-11T17:07:58Z"
+  "updated_at": "2026-07-14T06:46:09Z",
+  "resolved_at": "2026-07-14T06:46:09Z",
+  "resolution_note": "docs/perf-pathology-dispatch.md repointed at the split perf-pathology-rust / perf-pathology-java workflows (install sources, invocation workflow_id, dispatch example, generated_by frontmatter), with an explicit note that the language-neutral v1 perf-pathology.json remains on disk but is superseded. Fixed 2026-07-14 on beta/blackbox-v2."
 }
