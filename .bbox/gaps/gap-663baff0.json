@@ -16,7 +16,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/harness-cli/blackboxd-help-starts-daemon",
   "notes": "Surfaced while running RETRO_HARNESS against the rebuild/reinstall session. This is operator-visible harness friction: a normal install verification command caused daemon initialization and tried to bind the already-running service port.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-13T22:26:01Z",
-  "updated_at": "2026-06-13T22:26:01Z"
+  "updated_at": "2026-07-14T06:59:34Z",
+  "resolved_at": "2026-07-14T06:59:34Z",
+  "resolution_note": "Fixed 2026-07-14 on beta/blackbox-v2: blackboxd now short-circuits --help/-h and --version/-V in main() before ANY side effect - no store opens, no background workers, no port bind, no tokio runtime build. Unknown flags print an error and exit 2 instead of silently booting a daemon (the typo'd-flag-starts-a-second-daemon footgun). Live-verified: --help and --version return instantly with no state mutation; --bogus exits 2."
 }
