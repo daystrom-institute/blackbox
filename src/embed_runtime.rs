@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use parking_lot::RwLock;
@@ -59,6 +60,11 @@ pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<Strin
     }
     let route = p.route.trim().to_string();
     let max_entities = p.max_entities;
+    // Kick the residue sweeper immediately: bbox_reembed stays "start
+    // convergence now" (its own wave below still fires), and the sweeper
+    // takes over across-wave persistence so residue past the queue cap is
+    // driven to convergence instead of stranded (gap-7323e96c).
+    sweep_notify().notify_one();
     tokio::spawn(async move {
         match enqueue_reembed_routes(&state, &buckets, max_entities) {
             Ok(enqueued) => {
@@ -73,7 +79,7 @@ pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<Strin
         "status": "ok",
         "route": p.route,
         "max_entities": p.max_entities,
-        "message": "rebuild queue refill started; final enqueue count will be logged",
+        "message": "rebuild queue refill started; residue past the queue cap converges automatically via the background sweeper. Final enqueue count will be logged.",
     }))?)
 }
 
@@ -795,6 +801,263 @@ fn enqueue_reembed_routes(
     Ok(enqueued)
 }
 
+// ===========================================================================
+// Residue sweeper (gap-7323e96c, gap-d102fca9)
+//
+// A single manual bbox_reembed (or a first-time project index) enqueues one
+// queue-capped wave: the enqueue pass fills each route to MAX_ROUTE_QUEUE_DEPTH
+// and everything past the cap is rejected. Before this sweeper that rejection
+// was a silent drop with no signal — the queue drained the accepted wave and
+// idled at depth 0 while unembedded residue was never re-enqueued, so a route
+// parked at `stalled` and the operator had to re-run bbox_reembed by hand.
+//
+// The sweeper is a daemon-side convergence loop that re-runs the existing
+// enqueue pass until every non-guarded route has no enqueueable residue left.
+// It wakes on a timer AND promptly when a route's queue drains to empty (the
+// mark_success -> QUEUE_DRAIN_HOOK path), so bbox_reembed becomes "kick
+// convergence now" without changing its API.
+//
+// Cost / termination invariants:
+//   * The enqueue pass dedups already-embedded items at the queue
+//     (should_embed vs the vector store), so a sweep over a converged corpus
+//     costs zero provider calls.
+//   * A pass runs only from a fully-idle sweepable state (no route draining),
+//     so in-flight items are never re-enqueued as duplicates.
+//   * Enqueueable residue excludes permanently dropped items (poison) and
+//     unavailable routes (outages): the sweeper never re-hammers a
+//     provider-rejected payload or a credential-missing route. Those keep
+//     their existing stall/poison/unavailable health and are cleared by a
+//     manual bbox_reembed.
+//   * The transcript corpus is never auto-swept; only an explicit
+//     bbox_reembed(route="transcripts", include_transcripts=true) touches it.
+
+/// Wake signal shared by the queue-drain hook, the sweep timer, and a manual
+/// bbox_reembed kick. Lives here (not in the queue crate) so the queue stays
+/// free of daemon types; the queue reaches it only through the registered
+/// `fn(&str)` drain hook.
+static SWEEP_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+
+fn sweep_notify() -> &'static Arc<tokio::sync::Notify> {
+    SWEEP_NOTIFY.get_or_init(|| Arc::new(tokio::sync::Notify::new()))
+}
+
+/// Registered into the queue as `QUEUE_DRAIN_HOOK`: fires when a route's
+/// pending depth returns to zero so the sweeper refills the next wave
+/// promptly. A plain `fn` (not a closure) because the hook slot is a bare
+/// function pointer; it reaches the sweeper through the module-level Notify.
+pub(crate) fn queue_drain_wake(_route: &str) {
+    sweep_notify().notify_one();
+}
+
+const DEFAULT_EMBED_SWEEP_INTERVAL_SECS: u64 = 300;
+/// Short boot delay so the first sweep runs after the vector store warms
+/// (coverage reads it) but well before the slow interval, catching residue
+/// left by a prior capped wave without waiting a full cycle.
+const EMBED_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(15);
+
+/// `BLACKBOX_EMBED_SWEEP_INTERVAL_SECS` overrides the sweep timer (default
+/// 300s). `0` disables the sweeper entirely (residue then converges only via
+/// manual bbox_reembed). Mirrors the env-override convention the sibling
+/// background maintenance tasks use (storage GC, account probes).
+fn sweep_interval_from_env() -> Duration {
+    let secs = std::env::var("BLACKBOX_EMBED_SWEEP_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_EMBED_SWEEP_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Every route the sweeper may drive: all buckets except the guarded
+/// transcript corpus. Visual `visual:<kind>` routes need no entry here — they
+/// ride the project_file scan whenever Code/Docs is enqueued.
+fn sweepable_buckets() -> Vec<Bucket> {
+    Bucket::ALL
+        .iter()
+        .copied()
+        .filter(|bucket| *bucket != Bucket::Transcripts)
+        .collect()
+}
+
+/// Enqueueable residue for one route: items in the source corpus that are not
+/// yet embedded and are neither permanently dropped nor blocked by an
+/// unavailable/mid-drain route. Zero for a route that is unavailable (leave
+/// outages to their own health) or currently draining (wait for it to finish
+/// rather than re-enqueue in-flight items).
+fn route_enqueueable_residue(status: &queue::RouteStatus) -> u64 {
+    if !status.available || status.queue_depth > 0 {
+        return 0;
+    }
+    let source = status.source_count.unwrap_or(0);
+    source
+        .saturating_sub(status.indexed_count)
+        .saturating_sub(status.dropped_count)
+}
+
+/// Aggregate residue + busy state across every sweepable route. Pure over a
+/// status response so the decision can be tested without the corpus.
+struct SweepSnapshot {
+    /// Total enqueueable residue over available, idle routes.
+    residue: u64,
+    /// Any sweepable route currently draining a wave.
+    busy: bool,
+}
+
+fn sweep_snapshot(response: &EmbedStatusResponse) -> SweepSnapshot {
+    let mut residue = 0u64;
+    let mut busy = false;
+    for (route, status) in &response.routes {
+        // The transcript corpus is guarded — never counted toward residue and
+        // never allowed to mark the sweep "busy".
+        if route == Bucket::Transcripts.as_str() {
+            continue;
+        }
+        if status.queue_depth > 0 {
+            busy = true;
+        }
+        residue = residue.saturating_add(route_enqueueable_residue(status));
+    }
+    SweepSnapshot { residue, busy }
+}
+
+fn total_capped_count(response: &EmbedStatusResponse) -> u64 {
+    response
+        .routes
+        .iter()
+        .filter(|(route, _)| *route != Bucket::Transcripts.as_str())
+        .map(|(_, status)| status.capped_count)
+        .sum()
+}
+
+/// One sweep's result, consumed by the wake decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SweepReport {
+    /// Enqueueable residue observed this wake.
+    enqueueable_residue: u64,
+    /// Items admitted to a queue by this wake's enqueue pass.
+    enqueued: usize,
+    /// The pass hit a route's depth cap: residue remains for the next wave.
+    capped: bool,
+    /// The pass actually ran (idle state with residue).
+    ran_pass: bool,
+    /// A wave was still draining, so no pass ran this wake.
+    busy: bool,
+}
+
+/// Whether the sweeper should wake on a queue-drain nudge (fast refill) or
+/// back off to the plain timer. Pure so termination/no-hot-loop is unit
+/// tested: a stuck pass (residue remains but nothing was admitted and no cap
+/// was hit — i.e. un-enqueueable/poison residue) drops to timer-only so it
+/// cannot spin on drain nudges.
+fn sweep_should_listen_for_drain(report: &SweepReport) -> bool {
+    if report.busy {
+        // A wave is draining; its drain nudge is exactly what to wait for.
+        return true;
+    }
+    if report.enqueueable_residue == 0 {
+        // Converged: idle until a timer tick or a manual reembed kick.
+        return true;
+    }
+    // Residue remains: fast-refill only if this pass made forward progress
+    // (admitted a wave) or was capped (more waves to come). Otherwise the
+    // residue is un-enqueueable and we back off to the slow timer.
+    report.enqueued > 0 || report.capped
+}
+
+/// Run one sweep pass. Reads coverage + queue status, and if there is
+/// enqueueable residue on an otherwise-idle sweepable route, re-runs the
+/// existing enqueue pass (dedup + cap enforced by the queue). Synchronous
+/// (store reads + enqueue); the caller runs it on the blocking pool.
+fn run_sweep_once(state: &Arc<SharedState>) -> SweepReport {
+    let buckets = sweepable_buckets();
+    let response = match status_response_for_buckets(&state.corpus_stores(), &buckets) {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(error = %err, "embed residue sweep: coverage scan failed; skipping");
+            return SweepReport::default();
+        }
+    };
+    let snap = sweep_snapshot(&response);
+    if snap.residue == 0 || snap.busy {
+        return SweepReport {
+            enqueueable_residue: snap.residue,
+            enqueued: 0,
+            capped: false,
+            ran_pass: false,
+            busy: snap.busy,
+        };
+    }
+    let capped_before = total_capped_count(&response);
+    let enqueued = match enqueue_reembed_routes(state, &buckets, None) {
+        Ok(enqueued) => enqueued,
+        Err(err) => {
+            tracing::warn!(error = %err, "embed residue sweep: enqueue pass failed");
+            0
+        }
+    };
+    // Re-read the live queue status: the pass may have hit a route cap, which
+    // is now counted (not silently dropped) in capped_count.
+    let capped = total_capped_count(&status_response()) > capped_before;
+    if enqueued > 0 || capped {
+        tracing::info!(
+            enqueued,
+            capped,
+            residue = snap.residue,
+            "embed residue sweep: refilled queue"
+        );
+    }
+    SweepReport {
+        enqueueable_residue: snap.residue,
+        enqueued,
+        capped,
+        ran_pass: true,
+        busy: false,
+    }
+}
+
+/// Start the residue sweeper background task and register the queue-drain wake
+/// hook. Idempotent-safe registration; disabled when the interval env is 0.
+pub(crate) fn spawn_embed_residue_sweeper(state: Arc<SharedState>) {
+    let interval = sweep_interval_from_env();
+    if interval.is_zero() {
+        tracing::info!("embed residue sweeper: disabled (interval=0)");
+        return;
+    }
+    // Wire the drain nudge so a finished wave refills promptly.
+    queue::register_queue_drain_hook(queue_drain_wake);
+    let notify = sweep_notify().clone();
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "embed residue sweeper: enabled"
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(EMBED_SWEEP_STARTUP_DELAY).await;
+        loop {
+            let state_for_pass = state.clone();
+            let report = match tokio::task::spawn_blocking(move || run_sweep_once(&state_for_pass))
+                .await
+            {
+                Ok(report) => report,
+                Err(err) => {
+                    tracing::warn!(error = %err, "embed residue sweep task panicked; backing off");
+                    SweepReport::default()
+                }
+            };
+            if sweep_should_listen_for_drain(&report) {
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(interval) => {}
+                }
+            } else {
+                // Un-enqueueable residue (poison / retry-exhausted): back off
+                // to the slow timer and let the existing stall/poison health
+                // own the reporting. Ignoring the drain nudge here is what
+                // prevents a hot loop on a route that cannot make progress.
+                tokio::time::sleep(interval).await;
+            }
+        }
+    });
+}
+
 fn enqueue_agent_manifest_artifacts(
     state: &Arc<SharedState>,
     max_entities: Option<usize>,
@@ -1132,7 +1395,7 @@ fn apply_stall_health(response: &mut EmbedStatusResponse) {
                 )
             } else {
                 format!(
-                    "coverage {ratio:.3} with idle queue — unembedded residue is not being enqueued; run bbox_reembed(route=\"{route}\") or wait for the nightly backfill"
+                    "coverage {ratio:.3} with idle queue — unembedded residue not yet enqueued; the background residue sweeper converges it automatically, or run bbox_reembed(route=\"{route}\") to kick convergence now"
                 )
             });
         }
@@ -1672,11 +1935,18 @@ mod tests {
 
         let git = &response.routes["git_message"];
         assert_eq!(git.health, "stalled");
+        let git_reason = git.health_reason.as_deref().unwrap();
         assert!(
-            git.health_reason
-                .as_deref()
-                .unwrap()
-                .contains("bbox_reembed"),
+            git_reason.contains("bbox_reembed"),
+            "still names the manual kick: {git_reason}"
+        );
+        assert!(
+            git_reason.contains("sweeper"),
+            "reflects automatic convergence, not the retired nightly backfill: {git_reason}"
+        );
+        assert!(
+            !git_reason.contains("nightly"),
+            "misleading nightly-backfill phrasing removed: {git_reason}"
         );
         assert_eq!(
             response.routes["notes"].health, "ok",
@@ -2066,5 +2336,133 @@ pdf_figure = "voyage_visual"
             &[Bucket::Docs],
             &image_embedding_source_doc()
         ));
+    }
+
+    // ---- residue sweeper -------------------------------------------------
+
+    fn route_status(
+        available: bool,
+        source: u64,
+        indexed: u64,
+        dropped: u64,
+        queue_depth: u64,
+    ) -> queue::RouteStatus {
+        queue::RouteStatus {
+            available,
+            source_count: Some(source),
+            indexed_count: indexed,
+            dropped_count: dropped,
+            queue_depth,
+            ..Default::default()
+        }
+    }
+
+    /// The transcript corpus is guarded: the sweeper must never list it among
+    /// sweepable routes, so a sweep can never auto-enqueue transcripts.
+    #[test]
+    fn sweepable_buckets_exclude_the_guarded_transcript_corpus() {
+        let buckets = sweepable_buckets();
+        assert!(!buckets.contains(&Bucket::Transcripts));
+        assert_eq!(buckets.len(), Bucket::ALL.len() - 1);
+        for bucket in Bucket::ALL {
+            if bucket != Bucket::Transcripts {
+                assert!(buckets.contains(&bucket), "missing {bucket:?}");
+            }
+        }
+    }
+
+    /// Enqueueable residue excludes poison (dropped) and outages
+    /// (unavailable) and mid-drain routes — the cost-safety guard that keeps
+    /// the sweeper from re-hammering provider-rejected payloads or a
+    /// credential-missing route.
+    #[test]
+    fn route_enqueueable_residue_excludes_poison_outages_and_in_flight() {
+        // 100 source, 60 embedded, 0 dropped, idle, available -> 40 residue.
+        assert_eq!(
+            route_enqueueable_residue(&route_status(true, 100, 60, 0, 0)),
+            40
+        );
+        // The 40-item shortfall is entirely poison -> nothing enqueueable.
+        assert_eq!(
+            route_enqueueable_residue(&route_status(true, 100, 60, 40, 0)),
+            0
+        );
+        // Unavailable (e.g. credential missing) -> excluded regardless.
+        assert_eq!(
+            route_enqueueable_residue(&route_status(false, 100, 0, 0, 0)),
+            0
+        );
+        // Mid-drain (queue_depth > 0) -> wait for it, don't re-enqueue.
+        assert_eq!(
+            route_enqueueable_residue(&route_status(true, 100, 0, 0, 5)),
+            0
+        );
+    }
+
+    #[test]
+    fn sweep_snapshot_skips_transcripts_and_flags_busy() {
+        let mut response = EmbedStatusResponse {
+            routes: Default::default(),
+        };
+        response
+            .routes
+            .insert("code".into(), route_status(true, 100, 90, 0, 0)); // 10 residue
+        response
+            .routes
+            .insert("notes".into(), route_status(true, 50, 50, 0, 3)); // busy
+        // A transcript route with residue AND a draining queue must be
+        // ignored on both axes (guarded corpus).
+        response
+            .routes
+            .insert("transcripts".into(), route_status(true, 999, 0, 0, 7));
+
+        let snap = sweep_snapshot(&response);
+        assert_eq!(
+            snap.residue, 10,
+            "only code's residue; transcripts excluded"
+        );
+        assert!(snap.busy, "notes is draining");
+    }
+
+    /// Termination / no-hot-loop: the wake decision. A stuck pass (residue
+    /// remains but nothing admitted and no cap hit) must drop to timer-only
+    /// so it cannot spin on drain nudges; every other state may fast-refill.
+    #[test]
+    fn sweep_wake_decision_backs_off_only_on_unenqueueable_residue() {
+        let base = SweepReport::default();
+        // Converged: idle, listen for a manual reembed kick.
+        assert!(sweep_should_listen_for_drain(&SweepReport {
+            enqueueable_residue: 0,
+            ..base
+        }));
+        // Busy: wait for the in-flight wave's drain nudge.
+        assert!(sweep_should_listen_for_drain(&SweepReport {
+            enqueueable_residue: 5,
+            busy: true,
+            ..base
+        }));
+        // Progress: a wave was admitted -> fast refill on drain.
+        assert!(sweep_should_listen_for_drain(&SweepReport {
+            enqueueable_residue: 5,
+            enqueued: 3,
+            ran_pass: true,
+            ..base
+        }));
+        // Capped: more waves to come -> fast refill on drain.
+        assert!(sweep_should_listen_for_drain(&SweepReport {
+            enqueueable_residue: 5,
+            capped: true,
+            ran_pass: true,
+            ..base
+        }));
+        // Stuck: residue remains but nothing admitted and not capped ->
+        // back off to the timer (no drain-nudge spin).
+        assert!(!sweep_should_listen_for_drain(&SweepReport {
+            enqueueable_residue: 5,
+            enqueued: 0,
+            capped: false,
+            ran_pass: true,
+            ..base
+        }));
     }
 }
