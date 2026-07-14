@@ -15,7 +15,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "workflow/threads/repo-owned-records-for-discarded-workflow-exhaust",
   "notes": "During cleanup of stale wf-* workflow threads, bbox_thread(action=resolve) wrote 28 untracked .bbox/record/thread-*.json files for transcript-search workflow scaffolding. The operator characterized these as discardable workflow exhaust and likely defect; tmux workflow test arcs resolved without the same repo record output.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-10T17:50:43Z",
-  "updated_at": "2026-06-10T17:50:43Z"
+  "updated_at": "2026-07-14T07:09:54Z",
+  "resolved_at": "2026-07-14T07:09:54Z",
+  "resolution_note": "Fixed 2026-07-14 on beta/blackbox-v2: thread_resolve skips the repo-owned .bbox/record/ snapshot when thread.origin == Workflow — transient wf-* arc scaffolding can now be discarded without leaving reviewable exhaust (its audit trail is the arc event log + arc thread notes, which stay host-local). thread_promote deliberately still writes a record: promotion is the operator elevating a workflow thread to durable, which per the repo-owned-project-state convention belongs in committed .bbox/. Regression test resolve_skips_record_for_workflow_origin_threads."
 }

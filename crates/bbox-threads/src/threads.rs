@@ -843,15 +843,25 @@ impl Threads {
         let topic = thread.topic.clone();
         let thread_for_embed = thread.clone();
 
-        let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some((root, path))) => Some(bbox_util::util::repo_artifact_rider(
-                &root.to_string_lossy(),
-                &path,
-            )),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!("thread record write for {id}: {e:#}");
-                None
+        // Workflow-origin threads are transient arc scaffolding: their
+        // audit trail is the arc event log, not a committed snapshot.
+        // Resolving them (typically discarding stale wf-* exhaust) must
+        // not emit repo-owned .bbox/record files for reviewers to wade
+        // through (gap-8500c221). Promotion still writes a record — that
+        // is the operator deliberately elevating the thread to durable.
+        let record_rider = if thread_for_embed.origin == Some(ThreadOrigin::Workflow) {
+            None
+        } else {
+            match write_thread_record(&thread_for_embed) {
+                Ok(Some((root, path))) => Some(bbox_util::util::repo_artifact_rider(
+                    &root.to_string_lossy(),
+                    &path,
+                )),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("thread record write for {id}: {e:#}");
+                    None
+                }
             }
         };
         enqueue_thread_embed(&thread_for_embed);
@@ -1377,6 +1387,44 @@ mod tests {
                 .any(|n| n.contains("resolve_provider_pool")),
             "investigation note should be recorded: {:?}",
             rec.notes
+        );
+    }
+
+    #[test]
+    fn resolve_skips_record_for_workflow_origin_threads() {
+        // gap-8500c221: discarding transient wf-* arc scaffolding must
+        // not leave repo-owned .bbox/record files behind.
+        let dir = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+
+        let created = threads
+            .thread(&ThreadParams {
+                topic: Some("workflow arc: nightly-eval".into()),
+                project: Some(repo_root.to_string_lossy().into_owned()),
+                origin: Some("workflow".into()),
+                ..params("open")
+            })
+            .unwrap();
+        let id = created.split_whitespace().nth(2).unwrap().to_string();
+
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                note: Some("stale arc exhaust, discarding".into()),
+                ..params("resolve")
+            })
+            .unwrap();
+
+        let record_path = repo_root
+            .join(".bbox")
+            .join("record")
+            .join(format!("{id}.json"));
+        assert!(
+            !record_path.exists(),
+            "workflow-origin thread must not snapshot to {}",
+            record_path.display()
         );
     }
 
