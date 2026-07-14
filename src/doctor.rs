@@ -500,6 +500,7 @@ mod tests {
             coverage_state: None,
             dropped_count: 0,
             last_dropped: None,
+            capped_count: 0,
         }
     }
 
