@@ -8,6 +8,22 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Fixed
+
+- Visual embedding no longer poison-drops images that violate
+  voyage-multimodal-3.5's pixel cap or aspect-ratio range (gap-48ae5495):
+  `embed_visual_requests` now normalizes each payload before it reaches the
+  provider. Images over 16M pixels (e.g. full-page scans) are downscaled
+  under a conservative target; images whose long:short ratio exceeds a
+  local 19:1 cap (thin OCR scan strips) are padded on the short side with
+  white background, then re-checked against the pixel cap in case padding
+  grew the canvas over it. `preflight_part` now also enforces the
+  aspect-ratio cap locally so a violation that survives normalization
+  (an undecodable payload, a video mislabeled as an image) still fails
+  closed as poison instead of reaching the network. Adds the `image` crate
+  (default-features off, jpeg/png/gif/webp decode plus jpeg/png encode
+  only) to `bbox-embed`.
+
 ### Added
 
 - `extract_java_class` grows a `constructor_injection` wiring strategy

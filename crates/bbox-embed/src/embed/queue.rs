@@ -177,7 +177,8 @@ async fn embed_batch_requests(
 /// Multimodal batches: load each request's payload bytes from the visual
 /// sidecar store at request-build time (never held earlier: `EmbedRequest`
 /// carries only the small `VisualPayloadRef`, per the design's "chunks and
-/// embed requests carry a ref instead of inline bytes"), build interleaved
+/// embed requests carry a ref instead of inline bytes"), normalize them
+/// against the provider's constraints (gap-48ae5495), build interleaved
 /// `Multimodal` parts, and embed. A request with no `visual_payload` is a
 /// caller bug (only the visual enqueue path should route here), not a
 /// transient failure: bail rather than silently skipping it.
@@ -199,14 +200,13 @@ async fn embed_visual_requests(
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("reading visual payload {}", path.display()))?;
+        let (bytes, mime) =
+            normalize_visual_bytes(bytes, payload.media_type.clone(), &request.entity_id).await?;
         let mut parts = Vec::with_capacity(2);
         if !request.text.trim().is_empty() {
             parts.push(MultimodalPart::Text(request.text.clone()));
         }
-        parts.push(MultimodalPart::ImageBytes {
-            mime: payload.media_type.clone(),
-            bytes,
-        });
+        parts.push(MultimodalPart::ImageBytes { mime, bytes });
         inputs.push(EmbedInput::Multimodal(parts));
     }
     provider
@@ -215,6 +215,48 @@ async fn embed_visual_requests(
         .into_iter()
         .map(EmbedOutput::into_single)
         .collect()
+}
+
+/// Normalize one visual payload against the provider's pixel-cap and
+/// aspect-ratio constraints (gap-48ae5495) before it ever reaches
+/// `voyage_multimodal::preflight_part`: downscales images over the pixel
+/// cap and pads thin scan-strip images into the permitted aspect-ratio
+/// range, instead of letting them be poison-dropped. Image decode/
+/// resize/encode is CPU-bound, so it runs on the blocking pool rather than
+/// inline on this async worker (concurrency-model I2). A normalization
+/// failure (undecodable bytes, e.g. a video mislabeled as an image) falls
+/// back to the original bytes/mime unchanged; `preflight_part` still
+/// poison-rejects whatever still violates a constraint.
+async fn normalize_visual_bytes(
+    bytes: Vec<u8>,
+    mime: String,
+    entity_id: &str,
+) -> Result<(Vec<u8>, String)> {
+    let outcome = tokio::task::spawn_blocking(move || {
+        super::visual_normalize::normalize_image_bytes(bytes, mime)
+    })
+    .await
+    .with_context(|| {
+        format!("visual payload normalization task panicked (entity_id={entity_id})")
+    })?;
+    match outcome {
+        super::visual_normalize::NormalizeOutcome::Unchanged { bytes, mime }
+        | super::visual_normalize::NormalizeOutcome::Normalized { bytes, mime } => {
+            Ok((bytes, mime))
+        }
+        super::visual_normalize::NormalizeOutcome::Failed {
+            bytes,
+            mime,
+            reason,
+        } => {
+            tracing::debug!(
+                entity_id,
+                reason,
+                "visual payload normalization skipped; preflight will judge the original bytes"
+            );
+            Ok((bytes, mime))
+        }
+    }
 }
 
 /// Which packing shape a route's provider needs. `Grouped` (contextualized
@@ -2206,6 +2248,76 @@ mod tests {
             MultimodalPart::ImageBytes { mime, bytes }
                 if mime == "image/png" && bytes == b"pretend png bytes"
         ));
+    }
+
+    /// A thin scan-strip image (aspect ratio far outside the provider's
+    /// permitted range) stored in the visual sidecar is padded into range
+    /// before it reaches the provider, so it embeds instead of being
+    /// poison-dropped (gap-48ae5495). Uses the real production constants
+    /// (not a tiny-limits harness) via the same `preflight_part` guard the
+    /// provider seam runs, and a fixture small enough (a couple hundred
+    /// thousand pixels) to stay fast even after padding — unlike the
+    /// pixel-cap class, which needs real multi-megapixel fixtures to trip
+    /// under real constants and is covered at unit scale instead
+    /// (`visual_normalize::tests`, tiny-limits harness).
+    #[tokio::test]
+    async fn oversized_aspect_ratio_payload_is_normalized_and_embeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(bbox_visual_store::VisualPayloadStore::open(
+            dir.path().to_path_buf(),
+        ));
+        let _guard = bbox_visual_store::install_test_global(store.clone());
+
+        // 100 wide x 2000 tall: a 20:1 ratio, over the real
+        // MAX_ASPECT_RATIO (19:1) — the thin OCR scan-strip shape from the
+        // gap report, shrunk to keep the fixture fast.
+        let thin_strip = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            100,
+            2000,
+            image::Rgb([40, 40, 40]),
+        ));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        thin_strip
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let raw_bytes = buf.into_inner();
+
+        // Sanity: confirm the fixture actually violates preflight as-is,
+        // so the test is exercising the real bug rather than a shape that
+        // was never poison to begin with.
+        super::super::voyage_multimodal::preflight_part(&MultimodalPart::ImageBytes {
+            mime: "image/png".into(),
+            bytes: raw_bytes.clone(),
+        })
+        .expect_err("thin strip fixture should violate the aspect ratio cap before normalization");
+
+        let payload = store.put(&raw_bytes, "image/png").unwrap();
+        let provider = VisualRecordingProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut req = request(Bucket::Docs, "project_file:p:f:h:0", "h1");
+        req.visual_kind = Some("image".into());
+        req.visual_payload = Some(payload);
+
+        let vectors = embed_batch_requests(&provider, &[req])
+            .await
+            .expect("normalized payload should embed instead of being poison-dropped");
+        assert_eq!(vectors.len(), 1);
+
+        let seen = provider.seen.lock().unwrap().clone();
+        let MultimodalPart::ImageBytes { mime, bytes } = &seen[0][1] else {
+            panic!("expected the image part second (caption text is first)");
+        };
+        assert_ne!(
+            bytes, &raw_bytes,
+            "provider should have received normalized bytes, not the raw thin-strip payload"
+        );
+        // The normalized bytes must actually clear preflight now.
+        super::super::voyage_multimodal::preflight_part(&MultimodalPart::ImageBytes {
+            mime: mime.clone(),
+            bytes: bytes.clone(),
+        })
+        .expect("normalized payload must clear preflight");
     }
 
     #[tokio::test]

@@ -33,10 +33,25 @@ const DEFAULT_API_KEY_ENV: &str = "VOYAGE_API_KEY";
 const FALLBACK_API_KEY_ENV: &str = "DAYSTROM_VOYAGE_API_KEY";
 const DEFAULT_ENDPOINT: &str = "https://api.voyageai.com/v1/multimodalembeddings";
 
-const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-const MAX_IMAGE_PIXELS: u64 = 16_000_000;
+// pub(crate): shared with `visual_normalize`, which normalizes payloads
+// against these same limits before they ever reach `preflight_part`.
+pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 16_000_000;
 const MAX_VIDEO_BYTES: usize = 20 * 1024 * 1024;
 const MAX_INPUTS_PER_REQUEST: usize = 1_000;
+
+/// Max permitted long-side:short-side ratio. Not documented: the provider's
+/// published image constraints (16M pixels, 20MB) say nothing about aspect
+/// ratio, and the observed HTTP 400 body ("image aspect ratio is not within
+/// the permitted range") was truncated before the actual number. Checked
+/// docs.voyageai.com/docs/multimodal-embeddings and
+/// docs.voyageai.com/reference/multimodal-embeddings-api directly
+/// (2026-07-13): neither documents a ratio limit. Using a conservative
+/// 19:1 ceiling until Voyage documents (or support discloses) the real
+/// value — comfortably clears realistic thin-strip OCR scan pages while
+/// staying well inside any range a patch-based vision encoder would
+/// plausibly enforce.
+pub(crate) const MAX_ASPECT_RATIO: f64 = 19.0;
 
 /// Config for one `type = "voyage_multimodal"` provider alias.
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +167,17 @@ pub fn preflight_part(part: &MultimodalPart) -> Result<()> {
                             reason: format!(
                                 "image ({mime}) is {}x{} = {pixels} pixels; provider cap \
                                  is {MAX_IMAGE_PIXELS}",
+                                size.width, size.height
+                            ),
+                        }));
+                    }
+                    let (w, h) = (size.width.max(1) as f64, size.height.max(1) as f64);
+                    let ratio = w.max(h) / w.min(h);
+                    if ratio > MAX_ASPECT_RATIO {
+                        return Err(anyhow::Error::new(MultimodalPayloadError {
+                            reason: format!(
+                                "image ({mime}) is {}x{} (aspect ratio {ratio:.1}:1); \
+                                 local cap is {MAX_ASPECT_RATIO}:1 (see MAX_ASPECT_RATIO doc comment)",
                                 size.width, size.height
                             ),
                         }));
@@ -421,6 +447,16 @@ mod tests {
         bytes
     }
 
+    /// PNG header claiming a 40x2000 thin scan strip (20:1, over
+    /// `MAX_ASPECT_RATIO`) with no real body, same header-only trick as
+    /// `huge_png_header`.
+    fn thin_strip_png_header() -> Vec<u8> {
+        let mut bytes = tiny_png();
+        bytes[16..20].copy_from_slice(&40u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&2_000u32.to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn preflight_accepts_small_image_and_rejects_pixel_bomb() {
         preflight_part(&MultimodalPart::ImageBytes {
@@ -440,6 +476,29 @@ mod tests {
                 .downcast_ref::<super::super::queue::NonRetryableBatchError>()
                 .is_some()),
             "payload violations must be poison: {err:#}"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_aspect_ratio_violation_as_poison() {
+        // Conformant (1:1) still accepted alongside the ratio check.
+        preflight_part(&MultimodalPart::ImageBytes {
+            mime: "image/png".into(),
+            bytes: tiny_png(),
+        })
+        .unwrap();
+
+        let err = preflight_part(&MultimodalPart::ImageBytes {
+            mime: "image/png".into(),
+            bytes: thin_strip_png_header(),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("aspect ratio"));
+        assert!(
+            err.chain().any(|cause| cause
+                .downcast_ref::<super::super::queue::NonRetryableBatchError>()
+                .is_some()),
+            "aspect ratio violations must be poison: {err:#}"
         );
     }
 

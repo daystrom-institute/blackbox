@@ -4,6 +4,7 @@ pub mod ollama;
 pub mod query_cache;
 pub mod queue;
 pub mod rerank;
+pub mod visual_normalize;
 pub mod voyage;
 pub mod voyage_context;
 pub mod voyage_multimodal;
