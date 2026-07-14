@@ -229,7 +229,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_reembed",
         category: ToolCategory::Transcripts,
         summary: "Request an embedding rebuild for a configured route.",
-        when_to_use: "Use after changing embedding routes or provider dimensions, or to converge a `stalled` route from bbox_embed_status. E3 performs the rebuild. Routes include knowledge, code, docs, git_message, notes, threads, and guarded transcripts; `backfill` sweeps every route except transcripts (idempotent — already-embedded items dedupe at enqueue; the nightly embed-compaction arc runs it). Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
+        when_to_use: "Use after changing embedding routes or provider dimensions to kick convergence immediately; a background residue sweeper otherwise drives every non-transcript route to full coverage on its own, including residue past the per-route queue cap, so a `stalled` route converges without repeated manual calls. E3 performs the rebuild. Routes include knowledge, code, docs, git_message, notes, threads, and guarded transcripts; `backfill` sweeps every route except transcripts (idempotent — already-embedded items dedupe at enqueue). Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
         example: None,
     },
     ToolDoc {
@@ -243,7 +243,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_embed_status",
         category: ToolCategory::Transcripts,
         summary: "Return route embedding health and health_reason. recall_probe_route runs a sampled HNSW self-recall probe against that vector partition (vector-recall diagnostic, seconds on large partitions).",
-        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, and sanitized error. health=`stalled` means coverage is under threshold with an idle queue — residue is not being enqueued; run bbox_reembed for that route (or route=\"backfill\"). Transcripts report coverage_state instead of a coverage ratio (guarded heavy scan). Pass recall_probe_route (a vector partition, e.g. \"voyage-1024\") for a sampled HNSW self-recall probe — the connectivity diagnostic for reverse-edge orphaning; ~1.0 is healthy. O(sample x search): seconds on large partitions, errors \"busy\" mid-rebuild.",
+        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, capped_count (enqueues rejected at the queue cap — residue the sweeper will refill, not a drop), dropped_count (permanently un-embeddable poison), and sanitized error. health=`stalled` means coverage is under threshold with an idle queue; the background residue sweeper converges it automatically, or run bbox_reembed(route=…) to kick it now. Transcripts report coverage_state instead of a coverage ratio (guarded heavy scan). Pass recall_probe_route (a vector partition, e.g. \"voyage-1024\") for a sampled HNSW self-recall probe — the connectivity diagnostic for reverse-edge orphaning; ~1.0 is healthy. O(sample x search): seconds on large partitions, errors \"busy\" mid-rebuild.",
         example: Some("bbox_embed_status(recall_probe_route=\"voyage-1024\")"),
     },
     ToolDoc {

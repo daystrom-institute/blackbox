@@ -292,7 +292,7 @@ impl BlackboxServer {
                 "indexing": {
                     "status": "scheduled",
                     "mode": "background",
-                    "detail": "project registration is durable; project-file indexing and edge projection are picked up by the background reindexer after this response"
+                    "detail": "project registration is durable; project-file indexing and edge projection are picked up by the background reindexer after this response, and embeddings across all routes (docs/code/notes/visual:*) then converge automatically via the background residue sweeper — no manual bbox_reembed is required"
                 },
             });
             Ok(serde_json::to_string_pretty(&response)?)

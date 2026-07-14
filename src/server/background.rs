@@ -29,6 +29,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     compact_system_events(&shared);
     spawn_outbox_worker(shared.clone());
     spawn_account_probe_refresh(shared.clone());
+    crate::embed_runtime::spawn_embed_residue_sweeper(shared.clone());
     spawn_packet_self_heal_scanner(shared);
     Ok(())
 }

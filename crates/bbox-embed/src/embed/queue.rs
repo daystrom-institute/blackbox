@@ -386,6 +386,29 @@ fn pack_batch(pending: &mut VecDeque<EmbedRequest>, mode: PackMode) -> Vec<Embed
     batch
 }
 
+/// Outcome of a single enqueue attempt. Distinguishes the three cases the
+/// old `bool` return conflated so the residue sweeper can tell convergence
+/// from backpressure instead of treating a full-queue rejection as a silent
+/// drop (gap-7323e96c): `Skipped` (dedup/empty — no work needed, counts as
+/// converged), `QueueFull` (capped — residue remains, come back after drain),
+/// and `Error` (route unresolvable / worker stopped / not configured).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    Enqueued,
+    Skipped,
+    QueueFull,
+    Error,
+}
+
+impl EnqueueOutcome {
+    /// True only when the request was actually placed on a route queue. The
+    /// `bool`-returning `enqueue` wrapper preserves the historic API by
+    /// collapsing every non-`Enqueued` outcome to `false`.
+    pub fn enqueued(self) -> bool {
+        matches!(self, EnqueueOutcome::Enqueued)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbedRequest {
     /// Ignored when `visual_kind` is `Some`: visual routing resolves
@@ -453,6 +476,13 @@ pub struct RouteStatus {
     /// Durable like `dropped_count` — survives later successes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_dropped: Option<String>,
+    /// Cumulative count of enqueue attempts rejected because the route queue
+    /// was at its depth/byte cap. A capped rejection is NOT a drop — the item
+    /// simply was not admitted this wave — so it is counted separately from
+    /// `dropped_count`. The residue sweeper snapshots this counter around an
+    /// enqueue pass to learn "capped, residue remains" without a silent drop
+    /// (gap-7323e96c). Not cleared by later successes.
+    pub capped_count: u64,
 }
 
 impl Default for RouteStatus {
@@ -479,6 +509,7 @@ impl Default for RouteStatus {
             coverage_state: None,
             dropped_count: 0,
             last_dropped: None,
+            capped_count: 0,
         }
     }
 }
@@ -500,6 +531,19 @@ pub fn register_contradiction_hook(hook: fn(&EmbedRequest, &str, &[f32])) {
     let _ = CONTRADICTION_HOOK.set(hook);
 }
 
+/// Fired when a route's pending depth returns to zero, i.e. a wave finished
+/// draining. The daemon registers a hook here at boot that wakes the residue
+/// sweeper so an across-wave refill happens promptly instead of waiting for
+/// the next timer tick (gap-7323e96c). Dependency inversion — the queue must
+/// not name the daemon's `Notify`. Unregistered means no wake, matching a
+/// daemon that never installed the sweeper.
+static QUEUE_DRAIN_HOOK: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Register the queue-drain wake hook. Idempotent; first registration wins.
+pub fn register_queue_drain_hook(hook: fn(&str)) {
+    let _ = QUEUE_DRAIN_HOOK.set(hook);
+}
+
 #[derive(Clone)]
 pub struct EmbedQueueHandle {
     inner: Arc<EmbedQueueInner>,
@@ -512,6 +556,11 @@ struct EmbedQueueInner {
     vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     debounce: Duration,
     retry_backoff: Duration,
+    /// Per-route depth cap enforced by `try_reserve_queue`. A field (not the
+    /// bare `MAX_ROUTE_QUEUE_DEPTH` const) so convergence tests can run the
+    /// full cap→drain→refill cycle against a tiny cap without enqueuing 10k
+    /// items. Atomic so a test can lower it through the shared `Arc` handle.
+    max_queue_depth: std::sync::atomic::AtomicU64,
 }
 
 struct ResolvedRoute {
@@ -623,7 +672,21 @@ impl EmbedQueueHandle {
         )
     }
 
+    /// Historic `bool` API: `true` only when the request was placed on a
+    /// queue. Preserved for the many hook/store callers that ignore the
+    /// finer outcome; the residue sweeper uses the durable `capped_count`
+    /// counter (bumped in `try_reserve_queue`) rather than this return value.
     pub fn enqueue(&self, request: EmbedRequest) -> bool {
+        self.enqueue_outcome(request).enqueued()
+    }
+
+    /// Enqueue with a classified outcome so callers can distinguish a
+    /// backpressure rejection (`QueueFull` — residue remains) from a dedup or
+    /// empty-text skip (`Skipped` — nothing to do) and from a route/config
+    /// error (`Error`). A `QueueFull` rejection is counted in the route's
+    /// durable `capped_count` instead of being silently discarded
+    /// (gap-7323e96c).
+    pub fn enqueue_outcome(&self, request: EmbedRequest) -> EnqueueOutcome {
         let resolved = match self.resolve_route(&request) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -635,7 +698,7 @@ impl EmbedQueueHandle {
                     None => request.bucket.as_str().to_string(),
                 };
                 mark_error(&self.inner.statuses, &fallback, &sanitize_error(&err));
-                return false;
+                return EnqueueOutcome::Error;
             }
         };
         if !embeddable_text(&request.text) {
@@ -645,7 +708,7 @@ impl EmbedQueueHandle {
                 chunk_hash = %request.chunk_hash,
                 "embedding enqueue skipped empty text (providers reject empty input)"
             );
-            return false;
+            return EnqueueOutcome::Skipped;
         }
         if !self.should_embed(&request, &resolved.vector_route) {
             tracing::debug!(
@@ -655,17 +718,26 @@ impl EmbedQueueHandle {
                 chunk_hash = %request.chunk_hash,
                 "embedding enqueue skipped unchanged vector record"
             );
-            return false;
+            return EnqueueOutcome::Skipped;
         }
         let request_bytes = request.text.len() as u64;
-        if !try_reserve_queue(&self.inner.statuses, &resolved.queue_route, request_bytes) {
+        let max_depth = self
+            .inner
+            .max_queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !try_reserve_queue(
+            &self.inner.statuses,
+            &resolved.queue_route,
+            request_bytes,
+            max_depth,
+        ) {
             tracing::warn!(
                 route = %resolved.queue_route,
                 entity_id = %request.entity_id,
                 request_bytes,
-                "embedding enqueue rejected because route queue is full"
+                "embedding enqueue rejected because route queue is full; residue remains for the sweeper"
             );
-            return false;
+            return EnqueueOutcome::QueueFull;
         }
         let sender = self.ensure_sender(&resolved, &request);
         match sender {
@@ -683,8 +755,9 @@ impl EmbedQueueHandle {
                         &resolved.queue_route,
                         "embedding route worker stopped",
                     );
+                    return EnqueueOutcome::Error;
                 }
-                sent
+                EnqueueOutcome::Enqueued
             }
             None => {
                 release_queue(
@@ -698,7 +771,7 @@ impl EmbedQueueHandle {
                     &resolved.queue_route,
                     "embedding route is not configured",
                 );
-                false
+                EnqueueOutcome::Error
             }
         }
     }
@@ -881,6 +954,7 @@ impl EmbedQueueHandle {
                 vector_store: None,
                 debounce: DEFAULT_DEBOUNCE,
                 retry_backoff: DEFAULT_RETRY_BACKOFF,
+                max_queue_depth: std::sync::atomic::AtomicU64::new(MAX_ROUTE_QUEUE_DEPTH),
             }),
         }
     }
@@ -947,8 +1021,18 @@ impl EmbedQueueHandle {
                 vector_store,
                 debounce,
                 retry_backoff,
+                max_queue_depth: std::sync::atomic::AtomicU64::new(MAX_ROUTE_QUEUE_DEPTH),
             }),
         }
+    }
+
+    /// Lower the per-route depth cap so convergence tests exercise the
+    /// cap→drain→refill cycle with a handful of items instead of 10k.
+    #[cfg(test)]
+    fn set_max_queue_depth(&self, depth: u64) {
+        self.inner
+            .max_queue_depth
+            .store(depth, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1468,10 +1552,11 @@ fn try_reserve_queue(
     statuses: &RwLock<BTreeMap<String, RouteStatus>>,
     route: &str,
     bytes: u64,
+    max_depth: u64,
 ) -> bool {
     let mut statuses = statuses.write();
     let status = statuses.entry(route.to_string()).or_default();
-    if status.queue_depth >= MAX_ROUTE_QUEUE_DEPTH
+    if status.queue_depth >= max_depth
         || status.queue_bytes.saturating_add(bytes) > MAX_ROUTE_QUEUE_BYTES
     {
         status.available = false;
@@ -1479,8 +1564,11 @@ fn try_reserve_queue(
         status.health_reason = Some("queue_full".into());
         status.last_error = Some(format!(
             "embedding route queue full: depth={} bytes={} max_depth={} max_bytes={}",
-            status.queue_depth, status.queue_bytes, MAX_ROUTE_QUEUE_DEPTH, MAX_ROUTE_QUEUE_BYTES
+            status.queue_depth, status.queue_bytes, max_depth, MAX_ROUTE_QUEUE_BYTES
         ));
+        // Count the rejection so the sweeper (and bbox_embed_status) can see
+        // "capped, residue remains" instead of a silently dropped item.
+        status.capped_count = status.capped_count.saturating_add(1);
         return false;
     }
     status.queue_depth = status.queue_depth.saturating_add(1);
@@ -1506,15 +1594,26 @@ fn mark_success(
     count: u64,
     bytes: u64,
 ) {
-    let mut statuses = statuses.write();
-    let status = statuses.entry(route.to_string()).or_default();
-    status.available = true;
-    status.health = "ok".into();
-    status.indexed_count = status.indexed_count.saturating_add(count);
-    status.queue_depth = status.queue_depth.saturating_sub(count);
-    status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
-    status.health_reason = None;
-    status.last_error = None;
+    let drained = {
+        let mut statuses = statuses.write();
+        let status = statuses.entry(route.to_string()).or_default();
+        status.available = true;
+        status.health = "ok".into();
+        status.indexed_count = status.indexed_count.saturating_add(count);
+        status.queue_depth = status.queue_depth.saturating_sub(count);
+        status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
+        status.health_reason = None;
+        status.last_error = None;
+        status.queue_depth == 0
+    };
+    // A wave finished draining: nudge the residue sweeper (if installed) to
+    // refill promptly rather than waiting for its next timer tick. Fired
+    // after the lock is released so the hook never contends on `statuses`.
+    if drained {
+        if let Some(hook) = QUEUE_DRAIN_HOOK.get() {
+            hook(route);
+        }
+    }
 }
 
 fn mark_retry(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str) {
@@ -1771,6 +1870,79 @@ mod tests {
         queue.shutdown();
     }
 
+    /// The queue-full path must reject cleanly and COUNT the rejection
+    /// (`capped_count`) rather than silently discard the item — the
+    /// silent-drop-with-no-signal semantics that stranded residue forever
+    /// (gap-7323e96c). The depth cap is injectable so this runs with a cap of
+    /// 2 instead of 10k.
+    #[test]
+    fn try_reserve_queue_caps_and_counts_rejections_instead_of_silent_drop() {
+        let statuses = RwLock::new(BTreeMap::new());
+        assert!(try_reserve_queue(&statuses, "code", 10, 2), "first fits");
+        assert!(try_reserve_queue(&statuses, "code", 10, 2), "second fits");
+        assert!(
+            !try_reserve_queue(&statuses, "code", 10, 2),
+            "third is capped, residue remains"
+        );
+        assert!(!try_reserve_queue(&statuses, "code", 10, 2), "still capped");
+        let statuses = statuses.read();
+        let status = &statuses["code"];
+        assert_eq!(status.queue_depth, 2, "cap holds the depth at 2");
+        assert_eq!(
+            status.capped_count, 2,
+            "each rejection is counted, not silently dropped"
+        );
+        assert_eq!(status.health_reason.as_deref(), Some("queue_full"));
+    }
+
+    /// Idempotence / cost safety: an enqueue whose (entity, chunk_hash) is
+    /// already in the vector store returns `Skipped` and never reaches the
+    /// provider. A residue sweep that re-scans a converged corpus must cost
+    /// zero Voyage calls (gap-7323e96c cost-safety invariant).
+    #[tokio::test]
+    async fn enqueue_outcome_skips_already_embedded_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+            [embed.routes]
+            code = "voyage"
+            "#,
+        )
+        .unwrap();
+        let vector_route = router.route(Bucket::Code, None).unwrap().vector_route_id();
+        let store = Arc::new(bbox_vectors::VectorStore::open(dir.path()).unwrap());
+        store
+            .upsert(
+                &vector_route,
+                "project_file:p:f:h:0",
+                "h1",
+                vec![0.0_f32; 4],
+            )
+            .unwrap();
+        let provider = Arc::new(MockProvider::ok());
+        let queue = EmbedQueueHandle::from_providers(
+            vec![(
+                "code".to_string(),
+                provider.clone() as Arc<dyn EmbeddingProvider>,
+                None,
+                vector_route.clone(),
+            )],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Some(router),
+            Some(store),
+        );
+        let req = request(Bucket::Code, "project_file:p:f:h:0", "h1");
+        assert_eq!(queue.enqueue_outcome(req), EnqueueOutcome::Skipped);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "a dedup-skipped enqueue must not call the provider"
+        );
+        queue.shutdown();
+    }
+
     /// One provider-rejected payload must not strand its batch-mates
     /// (gap-e3e033ce): the worker bisects the non-retryable batch, embeds
     /// the good items, and drops only the poison item with its entity_id
@@ -1851,6 +2023,70 @@ mod tests {
         assert!(
             status.available,
             "poison isolation keeps the route available"
+        );
+        queue.shutdown();
+    }
+
+    /// Residue larger than the queue cap converges across refill waves: fill
+    /// to the cap, drain, refill the remainder — the loop the residue sweeper
+    /// drives (gap-7323e96c). The cap rejection is a clean `QueueFull`
+    /// signal, never a silent drop, so no item is lost.
+    #[tokio::test]
+    async fn residue_beyond_cap_converges_across_refill_waves() {
+        let provider = Arc::new(MockProvider::ok());
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", provider.clone())],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        queue.set_max_queue_depth(3);
+        let total = 10usize;
+        // `accepted` stands in for the sweeper's store-backed dedup (this
+        // test harness has no vector store, so the queue can't dedup itself).
+        let mut accepted = std::collections::HashSet::new();
+        let mut hit_cap = false;
+        for _wave in 0..12 {
+            for i in 0..total {
+                let id = format!("e{i}");
+                if accepted.contains(&id) {
+                    continue;
+                }
+                match queue.enqueue_outcome(request(Bucket::Code, &id, "h1")) {
+                    EnqueueOutcome::Enqueued => {
+                        accepted.insert(id);
+                    }
+                    EnqueueOutcome::QueueFull => {
+                        // Capped: residue remains — the sweeper comes back
+                        // after the wave drains.
+                        hit_cap = true;
+                        break;
+                    }
+                    other => panic!("unexpected enqueue outcome: {other:?}"),
+                }
+            }
+            if accepted.len() == total {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        assert!(
+            hit_cap,
+            "a 10-item residue over a cap of 3 must hit the cap"
+        );
+        assert_eq!(accepted.len(), total, "every residue item enqueued");
+        // Let the final wave drain before asserting embedded counts.
+        for _ in 0..30 {
+            if queue.status().routes["code"].indexed_count == total as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let status = queue.status().routes["code"].clone();
+        assert_eq!(status.indexed_count, total as u64);
+        assert_eq!(status.queue_depth, 0);
+        assert!(
+            status.capped_count >= 1,
+            "cap rejections are counted, not silently dropped"
         );
         queue.shutdown();
     }
