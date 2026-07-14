@@ -352,12 +352,35 @@ pub(super) fn pathology_markdown(value: Option<&Value>, fallback: &str) -> Strin
             .iter()
             .map(|item| match item {
                 Value::String(s) => format!("- {s}"),
+                Value::Object(obj) if !obj.is_empty() => format!("- {}", object_bullet(obj)),
                 other => format!("- `{}`", serde_json::to_string(other).unwrap_or_default()),
             })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => fallback.to_string(),
     }
+}
+
+/// Render one object entry as readable bullet prose instead of a
+/// backtick JSON blob (gap-d062e178). Every field is kept, in the
+/// map's key order: scalars render inline (`**key**: value`), nested
+/// structures fall back to compact JSON per-field. Lossless and
+/// deterministic — no key heuristics that could silently drop a
+/// facilitator's field.
+fn object_bullet(obj: &serde_json::Map<String, Value>) -> String {
+    obj.iter()
+        .map(|(key, val)| {
+            let rendered = match val {
+                Value::String(s) => s.trim().to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => "null".to_string(),
+                nested => format!("`{}`", serde_json::to_string(nested).unwrap_or_default()),
+            };
+            format!("**{key}**: {rendered}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub(super) fn pathology_optional_section(value: Option<&Value>, heading: &str) -> String {
@@ -529,6 +552,38 @@ mod tests {
             other => panic!("expected SetVar, got {other:?}"),
         };
         fs::read_to_string(&path).unwrap()
+    }
+
+    #[test]
+    fn pathology_markdown_renders_object_items_as_prose_not_json_blobs() {
+        // gap-d062e178: object entries in diagnosis_summary / evidence /
+        // remediation / deferred used to render as one backtick JSON
+        // blob; they now render every field as readable key-value prose.
+        let value = json!([
+            "a plain string line",
+            {
+                "slice": "PP-1",
+                "action": "shard the telemetry aggregator",
+                "files": ["src/agg.rs", "src/conn.rs"],
+                "estimate_days": 2
+            }
+        ]);
+        let rendered = pathology_markdown(Some(&value), "(none)");
+        assert!(rendered.contains("- a plain string line"), "{rendered}");
+        // serde_json::Map is BTree-backed: fields render in key order.
+        assert!(
+            rendered.contains("**action**: shard the telemetry aggregator"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("**slice**: PP-1"), "{rendered}");
+        // Nested arrays stay compact JSON per-field, not per-item.
+        assert!(
+            rendered.contains(r#"**files**: `["src/agg.rs","src/conn.rs"]`"#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("**estimate_days**: 2"), "{rendered}");
+        // No whole-object backtick blob remains.
+        assert!(!rendered.contains("- `{"), "{rendered}");
     }
 
     #[test]

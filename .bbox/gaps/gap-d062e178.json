@@ -13,8 +13,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/pathology-ensemble/markdown-object-rendering",
   "notes": "Extracted from thread-cc07f395 items 3+6 during thread triage. Rendering behavior re-verified in code 2026-06-11.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-cc07f395",
   "created_at": "2026-06-11T17:07:34Z",
-  "updated_at": "2026-06-11T17:07:34Z"
+  "updated_at": "2026-07-14T06:56:58Z",
+  "resolved_at": "2026-07-14T06:56:58Z",
+  "resolution_note": "Primary ask fixed (2026-07-14, beta/blackbox-v2): pathology_markdown's object-item arm now renders every field as readable key-value prose (**key**: value; nested structures stay compact JSON per-field) instead of one backtick JSON blob, so diagnosis_summary / evidence / atom_mapping / remediation / deferred sections get legible bullets — lossless, deterministic (BTree key order), no key heuristics. Regression test pathology_markdown_renders_object_items_as_prose_not_json_blobs. The secondary polish item (facilitator posting a spurious Survey whiteboard entry) is a prompt-discipline nit, harmless to the lens-alias gate, and per the gap's either/or framing is subsumed by the rendering fix."
 }
