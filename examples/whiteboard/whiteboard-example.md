@@ -32,11 +32,13 @@ This is also the example that absorbs phaser into the engine. The whiteboard pri
 - Same as keystone: Docker, jq/curl/git, `blackboxd` (or `blackboxd-dev`) running
 - Forgejo reachable at `127.0.0.1:3000` (run `examples/keystone/scripts/run.sh` first if you don't have one yet — the whiteboard demo shares it)
 - **Four brofiles** auto-installed by `scripts/install.sh`:
-  - `whiteboard-facilitator` → Sonnet 4.6 (synthesis-focused lens)
-  - `whiteboard-spec-security` → Sonnet 4.6 (threat-modeling lens)
-  - `whiteboard-spec-performance` → Sonnet 4.6 (perf-analysis lens)
-  - `whiteboard-spec-design` → Sonnet 4.6 (design-coherence lens)
+  - `whiteboard-facilitator` → GLM 5.2 (synthesis-focused lens)
+  - `whiteboard-spec-security` → GLM 5.2 (threat-modeling lens)
+  - `whiteboard-spec-performance` → GLM 5.2 (perf-analysis lens)
+  - `whiteboard-spec-design` → GLM 5.2 (design-coherence lens)
 - Each specialist's brofile lens declares its `agent_name` so when the dispatched bro calls `whiteboard_post`, it knows which name to use
+- **The daemon's process env** must carry `FORGEJO_BASE_URL` + `FORGEJO_TOKEN` (the arc's `http_json` hooks template `${env.*}` from the daemon env, not the shell that dispatched) and `FORGEJO_WEBHOOK_SECRET` (webhook HMAC verification — without it the daemon rejects every delivery with `signature: env FORGEJO_WEBHOOK_SECRET not set` and `AwaitMerge` never resolves). Source `examples/whiteboard/.env` into the daemon's environment after bootstrap, or deliver the signal manually via `bro_arc_signal(signal="pr-merged", correlate={pr: N})`.
+- **The daemon's `BRO_HOME/mcp.json`** must register the daemon itself as `blackbox` (`{"type":"http","url":"http://127.0.0.1:<port>/mcp"}`) — the engine's `mcp_call` hooks resolve `server: "blackbox"` through the bro MCP registry, and an isolated/dev daemon starts with an empty one.
 
 ## Quick start
 
@@ -158,10 +160,28 @@ maximally-contentious run adds 2 more response rounds (21 turns). The
 `specialists` actor carries `timeout: "20m"` because evidence-digging
 turns routinely exceed the 900s default member timeout.
 
-A representative contentious run produces:
-- `docs/adrs/adr-1.md` with a Deliberation section walking each challenge → rebuttal → concession/withdrawal chain, and any surviving disagreement presented as both positions side by side
-- Board state at archival: 3 posts, 6 validation annotations, a mix of challenge / corroborate / resolve annotations across 1–3 response rounds, 6 votes cast AFTER the exchange (flipped votes cite what changed their mind)
-- A PR whose body carries the synthesis line, merged after the operator (or webhook) signals `pr-merged`
+A real maximally-contentious run (2026-07-14, GLM 5.2 panel, ~21 min
+wall including the merge wait) produced:
+- 21 specialist turns: the performance specialist challenged the
+  security post's "fair scheduling prevents noisy-neighbor starvation"
+  claim with Tokio's cooperative-budget scheduling model; the challenge
+  was never conceded or withdrawn, so the gate looped
+  `another_round → another_round → settled` — `DebateRespond` ran all
+  3 rounds and the round ceiling converted the standoff into
+  agree-to-disagree instead of an arc failure
+- Board at archival: 3 blind posts, 4 validations (confirmed ×3,
+  inconclusive ×1 — the validator explicitly flagged a claim as
+  unverifiable against the stub repo), 3 corroborations (including
+  cross-lens reinforcement and a rebuttal-shaped corroboration), 1
+  challenge left standing
+- `docs/adrs/adr-1.md` (97 lines) with a Deliberation section walking
+  the corroboration chains and presenting the surviving challenge as an
+  explicit open design constraint with BOTH positions — plus an honest
+  vote table noting which specialists skipped voting (LLM participation
+  slippage is reported, not smoothed over)
+- PR #2 with the synthesis line in its body; merging it resolved
+  `AwaitMerge` and `Done` archived the board through the full
+  blind → read → validate → debate → resolve → archived phase history
 
 The arc walk is repeatable — re-running against the same issue creates a new arc with a new board id, a new branch, and (because of `find_first` on existing PRs) reuses any already-open PR for the branch rather than creating a duplicate.
 

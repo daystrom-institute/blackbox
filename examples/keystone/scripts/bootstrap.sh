@@ -25,11 +25,15 @@ REPO_NAME="${REPO_NAME:-buggy}"
 WEBHOOK_SECRET="${WEBHOOK_SECRET:-keystone-webhook-secret-not-for-prod}"
 WEBHOOK_TARGET="${WEBHOOK_TARGET:-http://host.docker.internal:7264/webhook/forgejo}"
 
-# host.docker.internal works on Docker Desktop. On Linux it requires
-# `extra_hosts` in compose OR the `--add-host` workaround. Default to
-# the host gateway IP from inside the bridge network.
-HOST_GATEWAY="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo 172.17.0.1)"
-WEBHOOK_TARGET="${WEBHOOK_TARGET//host.docker.internal/$HOST_GATEWAY}"
+# host.docker.internal works on Docker Desktop (macOS/Windows) — and its
+# vpnkit proxy is the ONLY way containers reach 127.0.0.1-bound host
+# services there. On Linux it requires `extra_hosts` in compose OR the
+# `--add-host` workaround, so rewrite to the bridge gateway IP on Linux
+# only.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    HOST_GATEWAY="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo 172.17.0.1)"
+    WEBHOOK_TARGET="${WEBHOOK_TARGET//host.docker.internal/$HOST_GATEWAY}"
+fi
 
 log() { printf '\033[36m[bootstrap]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[bootstrap]\033[0m %s\n' "$*" >&2; }

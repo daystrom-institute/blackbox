@@ -29,8 +29,13 @@ WEBHOOK_PORT="${WEBHOOK_PORT:-${BBOX_PORT:-7264}}"
 WEBHOOK_TARGET="${WEBHOOK_TARGET:-http://host.docker.internal:${WEBHOOK_PORT}/webhook/${WEBHOOK_NAME}}"
 KEYSTONE_ENV_FILE="${KEYSTONE_ENV_FILE:-${ROOT}/../keystone/.env}"
 
-HOST_GATEWAY="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo 172.17.0.1)"
-WEBHOOK_TARGET="${WEBHOOK_TARGET//host.docker.internal/$HOST_GATEWAY}"
+# Docker Desktop (macOS/Windows) resolves host.docker.internal natively —
+# and its vpnkit proxy is the ONLY way containers reach 127.0.0.1-bound
+# host services, so the bridge-gateway rewrite must be Linux-only.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    HOST_GATEWAY="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo 172.17.0.1)"
+    WEBHOOK_TARGET="${WEBHOOK_TARGET//host.docker.internal/$HOST_GATEWAY}"
+fi
 
 log()  { printf '\033[36m[bootstrap]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[bootstrap]\033[0m %s\n' "$*" >&2; }
