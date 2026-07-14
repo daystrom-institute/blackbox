@@ -1045,7 +1045,11 @@ impl WhiteboardRegistry {
         Ok((from, target))
     }
 
-    pub fn archive(&self, id: &str, agent_name: &str) -> Result<ArchiveSummary> {
+    /// Archive the board. Normally legal only from the `resolve` phase.
+    /// `force=true` archives from ANY phase — the abandon path for boards
+    /// stranded mid-phase by a failed arc (gap-0301dc75) — and requires a
+    /// facilitator/operator role since it is a phase transition in effect.
+    pub fn archive(&self, id: &str, agent_name: &str, force: bool) -> Result<ArchiveSummary> {
         let board_arc = self
             .boards
             .read()
@@ -1053,13 +1057,22 @@ impl WhiteboardRegistry {
             .cloned()
             .ok_or_else(|| anyhow!("whiteboard '{id}' does not exist"))?;
         let board = board_arc.read();
-        if !board.agents.contains_key(agent_name) {
-            bail!("agent '{agent_name}' is not registered on board '{id}'");
-        }
-        if board.phase != Phase::Resolve {
+        let agent = board
+            .agents
+            .get(agent_name)
+            .ok_or_else(|| anyhow!("agent '{agent_name}' is not registered on board '{id}'"))?;
+        let from_phase = board.phase;
+        if force {
+            if !agent.role.can_transition() {
+                bail!(
+                    "agent '{agent_name}' has role {:?} — only facilitator or operator can force-archive",
+                    agent.role
+                );
+            }
+        } else if from_phase != Phase::Resolve {
             bail!(
-                "cannot archive: phase is '{}', archive only allowed in 'resolve'",
-                board.phase.as_str()
+                "cannot archive: phase is '{}', archive only allowed in 'resolve' (pass force=true to abandon a stranded board)",
+                from_phase.as_str()
             );
         }
         let mut posts_by_type: BTreeMap<String, u32> = BTreeMap::new();
@@ -1115,7 +1128,8 @@ impl WhiteboardRegistry {
                     phase: Phase::Archived,
                     by: agent_name.to_string(),
                     at: Utc::now().to_rfc3339(),
-                    summary: None,
+                    summary: (force && from_phase != Phase::Resolve)
+                        .then(|| format!("force-archived from phase '{}'", from_phase.as_str())),
                 });
                 b.clone()
             };
@@ -1278,6 +1292,54 @@ mod tests {
         r.register("b2", "a", Role::Facilitator, "ops").unwrap();
         let err = r.transition("b2", "a", Phase::Debate, None).unwrap_err();
         assert!(err.to_string().contains("illegal phase transition"));
+    }
+
+    #[test]
+    fn archive_requires_resolve_unless_forced() {
+        let r = fresh_registry();
+        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
+        r.register("b1", "bob", Role::Specialist, "security")
+            .unwrap();
+        r.transition("b1", "alice", Phase::Read, None).unwrap();
+        r.transition("b1", "alice", Phase::Validate, None).unwrap();
+        // Non-force archive outside resolve is refused.
+        let err = r.archive("b1", "alice", false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("archive only allowed in 'resolve'")
+        );
+        // Specialists cannot force-archive.
+        let err = r.archive("b1", "bob", true).unwrap_err();
+        assert!(err.to_string().contains("can force-archive"));
+        // Facilitator force-archives the stranded board; the archived
+        // phase event records the phase it was abandoned from.
+        let arc = r.get("b1").unwrap();
+        r.archive("b1", "alice", true).unwrap();
+        assert!(r.get("b1").is_none());
+        let board = arc.read();
+        assert_eq!(board.phase, Phase::Archived);
+        let last = board.phase_history.last().unwrap();
+        assert_eq!(
+            last.summary.as_deref(),
+            Some("force-archived from phase 'validate'")
+        );
+    }
+
+    #[test]
+    fn archive_from_resolve_needs_no_force() {
+        let r = fresh_registry();
+        r.open("b1", "topic", "/proj", None, "alice").unwrap();
+        r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
+        r.transition("b1", "alice", Phase::Read, None).unwrap();
+        r.transition("b1", "alice", Phase::Validate, None).unwrap();
+        r.transition("b1", "alice", Phase::Resolve, None).unwrap();
+        let arc = r.get("b1").unwrap();
+        r.archive("b1", "alice", false).unwrap();
+        assert!(r.get("b1").is_none());
+        // A normal resolve-phase archive carries no force annotation.
+        let board = arc.read();
+        assert_eq!(board.phase_history.last().unwrap().summary, None);
     }
 
     #[test]

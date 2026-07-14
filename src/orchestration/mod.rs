@@ -4128,7 +4128,11 @@ pub async fn wait_for_task_with_timeout(task: &Task, timeout_secs: Option<f64>) 
             let duration = std::time::Duration::from_secs_f64(secs);
             match tokio::time::timeout(duration, wait_for_task(task)).await {
                 Ok(()) => true,
-                Err(_) => false,
+                // Timer expiry can race the task's completion (or a missed
+                // notify): a task that IS terminal must never be reported
+                // as timed out, so re-check the authoritative status
+                // before declaring a timeout (gap-0301dc75).
+                Err(_) => task.inner.lock().status.is_terminal(),
             }
         }
     }
@@ -7747,5 +7751,62 @@ mod async_tests {
         // Should timeout after 0.1s
         let completed = wait_for_task_with_timeout(&task, Some(0.1)).await;
         assert!(!completed, "should have timed out");
+    }
+
+    #[tokio::test]
+    async fn test_wait_timeout_rechecks_terminal_state() {
+        // gap-0301dc75: completion racing the timeout (or a missed
+        // notify) must not be reported as a timeout. The task below
+        // turns terminal WITHOUT firing its notify, so the waiter can
+        // only learn of completion through the terminal re-check on
+        // the timeout path.
+        let task = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "t4".into(),
+                provider: Provider::Glm,
+                session_id: "s1".into(),
+                events: EventRing::new(),
+                model: None,
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Running,
+                started_at: now_ms(),
+                completed_at: None,
+                exit_code: None,
+                cwd: None,
+                managed_worktree: None,
+                bro_label: None,
+                name: None,
+                agent_label: None,
+                report: None,
+                interrupted: false,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                live_cursor: 0,
+                last_delta_roster_emit_ms: 0,
+                supervision: SupervisionState::default(),
+                origin: bro_core::Origin::Unknown,
+                workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+            roster_events: None,
+        });
+
+        let task_clone = task.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut inner = task_clone.inner.lock();
+            inner.status = TaskStatus::Completed;
+            inner.completed_at = Some(now_ms());
+            // Deliberately NO notify_waiters() — force the timeout path.
+        });
+
+        let completed = wait_for_task_with_timeout(&task, Some(0.2)).await;
+        assert!(completed, "terminal task must not be reported as timed out");
     }
 }

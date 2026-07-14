@@ -316,6 +316,7 @@ mod tests {
                         }),
                         ..Default::default()
                     }),
+                    timeout: None,
                 },
             )]),
             atom_bindings: HashMap::new(),

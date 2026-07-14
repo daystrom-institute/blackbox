@@ -157,6 +157,16 @@ whiteboard_summarize(board_id = "adr-2026-05-07", agent_name = "facilitator-clau
 whiteboard_archive(board_id = "adr-2026-05-07", agent_name = "facilitator-claude")
 ```
 
+Normal archives are legal only from the `resolve` phase. `force = true`
+archives from ANY phase - the abandon path for boards stranded mid-phase
+when their arc fails (e.g. `on_arc_exit` cleanup hooks). Force requires a
+facilitator or operator role, and the archived board's phase history
+records the phase it was abandoned from.
+
+```json
+whiteboard_archive(board_id = "adr-2026-05-07", agent_name = "facilitator-claude", force = true)
+```
+
 ## Integration with workflows
 
 Whiteboards integrate into the workflow engine:

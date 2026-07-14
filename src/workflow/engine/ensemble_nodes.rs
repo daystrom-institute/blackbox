@@ -61,12 +61,14 @@ impl<'a> WorkflowRunner<'a> {
             .map_err(|e| anyhow!("dispatch for node '{node_id}': {e}"))?;
 
         // Wait for every member concurrently, then collect outputs.
+        let timeout_secs = self.compiled.spec.node_timeout_secs(node_id);
         let mut joinset = tokio::task::JoinSet::new();
         for (member_name, task) in tasks.iter() {
             let member_name = member_name.clone();
             let task_clone = task.clone();
             joinset.spawn(async move {
-                let completed = orch::wait_for_task_with_timeout(&task_clone, Some(900.0)).await;
+                let completed =
+                    orch::wait_for_task_with_timeout(&task_clone, Some(timeout_secs)).await;
                 let result_json = orch::task_result_json(&task_clone);
                 let output = result_json
                     .get("result")
@@ -93,6 +95,7 @@ impl<'a> WorkflowRunner<'a> {
                         "node": node_id,
                         "member": member,
                         "task_id": task_id,
+                        "timeout_secs": timeout_secs,
                     }),
                 );
             }
@@ -113,7 +116,7 @@ impl<'a> WorkflowRunner<'a> {
             member_outputs.push((member, output));
         }
         if any_timeout {
-            bail!("node '{node_id}' had one or more ensemble-member timeouts");
+            bail!("node '{node_id}' had one or more ensemble-member timeouts ({timeout_secs}s)");
         }
         // Stable order (by member name) so prompt substitution is
         // deterministic across re-runs.

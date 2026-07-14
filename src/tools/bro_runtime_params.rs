@@ -244,6 +244,11 @@ pub(crate) struct WhiteboardSummarizeParams {
 pub(crate) struct WhiteboardArchiveParams {
     pub(crate) board_id: String,
     pub(crate) agent_name: String,
+    /// Archive from ANY phase (abandon path for boards stranded
+    /// mid-phase by a failed arc). Facilitator or operator role
+    /// required. Default false = resolve phase only.
+    #[serde(default)]
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

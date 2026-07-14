@@ -61,7 +61,8 @@ impl<'a> WorkflowRunner<'a> {
         };
         self.actor_tasks
             .insert(actor_name.to_string(), task_id.clone());
-        let completed = orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
+        let timeout_secs = self.compiled.spec.node_timeout_secs(node_id);
+        let completed = orch::wait_for_task_with_timeout(&task, Some(timeout_secs)).await;
         // Record full task envelope into actor_results regardless of
         // outcome so downstream nodes can branch on `status`, surface
         // `result` text, or stash `taskId` for state-machine bookkeeping.
@@ -115,7 +116,9 @@ impl<'a> WorkflowRunner<'a> {
             match failure_mode {
                 ActorFailureMode::Halt => {
                     if !completed {
-                        bail!("node '{node_id}' (task {task_id}) exceeded timeout");
+                        bail!(
+                            "node '{node_id}' (task {task_id}) exceeded timeout ({timeout_secs}s)"
+                        );
                     } else {
                         bail!(
                             "node '{node_id}' (task {task_id}) terminated with status={task_status}"

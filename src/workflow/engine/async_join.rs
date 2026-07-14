@@ -172,6 +172,7 @@ impl<'a> WorkflowRunner<'a> {
             Some(e) => e,
             None => return Ok(false),
         };
+        let timeout_secs = self.compiled.spec.node_timeout_secs(source);
         match entry {
             InFlight::Single {
                 actor_name,
@@ -179,9 +180,11 @@ impl<'a> WorkflowRunner<'a> {
                 task,
             } => {
                 let task_id = task.inner.lock().id.clone();
-                let completed = orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
+                let completed = orch::wait_for_task_with_timeout(&task, Some(timeout_secs)).await;
                 if !completed {
-                    bail!("in-flight source '{source}' (task {task_id}) exceeded timeout");
+                    bail!(
+                        "in-flight source '{source}' (task {task_id}) exceeded timeout ({timeout_secs}s)"
+                    );
                 }
                 let result_json = orch::task_result_json(&task);
                 let output = result_json
@@ -203,7 +206,8 @@ impl<'a> WorkflowRunner<'a> {
                 let mut joinset = tokio::task::JoinSet::new();
                 for (member, task) in tasks {
                     joinset.spawn(async move {
-                        let completed = orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
+                        let completed =
+                            orch::wait_for_task_with_timeout(&task, Some(timeout_secs)).await;
                         let result_json = orch::task_result_json(&task);
                         let output = result_json
                             .get("result")
@@ -231,7 +235,9 @@ impl<'a> WorkflowRunner<'a> {
                     outs.push((member, output));
                 }
                 if timed_out {
-                    bail!("in-flight source '{source}' (ensemble) had member timeouts");
+                    bail!(
+                        "in-flight source '{source}' (ensemble) had member timeouts ({timeout_secs}s)"
+                    );
                 }
                 outs.sort_by(|a, b| a.0.cmp(&b.0));
                 let merged = outs

@@ -76,6 +76,12 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
         }
     }
 
+    for (actor_name, actor) in &spec.actors {
+        if actor.timeout.is_some_and(|t| t.is_zero()) {
+            bail!("actor '{actor_name}' timeout must be positive");
+        }
+    }
+
     // Every node's `next` targets must reference declared nodes; gate
     // packet, actor, late_inject, subworkflow, wait_for cross-checks.
     for (node_id, node) in &spec.nodes {
@@ -152,6 +158,10 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
                 "node '{node_id}' references undeclared actor '{}'",
                 node.actor
             );
+        }
+
+        if node.timeout.is_some_and(|t| t.is_zero()) {
+            bail!("node '{node_id}' timeout must be positive");
         }
 
         // late_inject.from must reference a declared node.
@@ -687,6 +697,7 @@ fn format_transition(t: &NodeTransition) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::schema::DEFAULT_NODE_TIMEOUT_SECS;
     use super::*;
 
     fn compile_err(spec_json: &str) -> String {
@@ -762,6 +773,83 @@ mod tests {
             "atom:echo@v1"
         );
         assert_eq!(compiled.spec.nodes["Echo"].atom, "echoer");
+    }
+
+    #[test]
+    fn node_timeout_resolution_node_overrides_actor_overrides_default() {
+        let json = r#"{
+            "name": "timeout-resolution",
+            "version": 1,
+            "actors": {
+                "fast": {"kind": "executor", "brofile": "b"},
+                "slow": {"kind": "ensemble", "team": "t", "timeout": 1800}
+            },
+            "nodes": {
+                "Default": {"actor": "fast", "next": {"type": "goto", "to": "ActorLevel"}},
+                "ActorLevel": {"actor": "slow", "next": {"type": "goto", "to": "NodeLevel"}},
+                "NodeLevel": {"actor": "slow", "timeout": "1h", "next": {"type": "terminal"}}
+            },
+            "start": "Default"
+        }"#;
+        let spec = load_workflow(json).expect("parse timeout workflow");
+        let compiled = compile(spec).expect("compile timeout workflow");
+        assert_eq!(
+            compiled.spec.node_timeout_secs("Default"),
+            DEFAULT_NODE_TIMEOUT_SECS
+        );
+        assert_eq!(compiled.spec.node_timeout_secs("ActorLevel"), 1800.0);
+        assert_eq!(compiled.spec.node_timeout_secs("NodeLevel"), 3600.0);
+        // Unknown node falls back to the engine default.
+        assert_eq!(
+            compiled.spec.node_timeout_secs("Nope"),
+            DEFAULT_NODE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn compile_rejects_zero_timeouts_and_parse_rejects_negative() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-node-timeout",
+                "version": 1,
+                "actors": {"a": {"kind": "executor", "brofile": "b"}},
+                "nodes": {
+                    "N": {"actor": "a", "timeout": 0, "next": {"type": "terminal"}}
+                },
+                "start": "N"
+            }"#,
+        );
+        assert!(err.contains("timeout must be positive"), "{err}");
+
+        let err = compile_err(
+            r#"{
+                "name": "bad-actor-timeout",
+                "version": 1,
+                "actors": {"a": {"kind": "executor", "brofile": "b", "timeout": "0s"}},
+                "nodes": {
+                    "N": {"actor": "a", "next": {"type": "terminal"}}
+                },
+                "start": "N"
+            }"#,
+        );
+        assert!(err.contains("timeout must be positive"), "{err}");
+
+        // Negative timeouts are rejected at parse time by the shared
+        // duration codec, before compile validation even runs.
+        let err = load_workflow(
+            r#"{
+                "name": "negative-timeout",
+                "version": 1,
+                "actors": {"a": {"kind": "executor", "brofile": "b", "timeout": -5}},
+                "nodes": {
+                    "N": {"actor": "a", "next": {"type": "terminal"}}
+                },
+                "start": "N"
+            }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("workflow JSON parse failed"), "{err}");
     }
 
     #[test]

@@ -214,7 +214,11 @@ pub struct WaitSnapshot {
     pub correlation: serde_json::Map<String, Value>,
 }
 
-mod duration_secs_opt {
+/// Serde codec for optional durations authored either as a suffix
+/// string (`"30s"`, `"5m"`, `"1h"`, `"7d"`) or a bare JSON number of
+/// seconds. Shared by `WaitSpec.timeout` and the actor/node dispatch
+/// `timeout` fields in [`super::schema`].
+pub(crate) mod duration_secs_opt {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
 
@@ -226,12 +230,26 @@ mod duration_secs_opt {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Duration>, D::Error> {
-        let opt: Option<String> = Option::deserialize(de)?;
+        let opt: Option<serde_json::Value> = Option::deserialize(de)?;
         match opt {
-            None => Ok(None),
-            Some(s) => parse_duration(&s)
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => parse_duration(&s)
                 .map(Some)
                 .map_err(serde::de::Error::custom),
+            Some(serde_json::Value::Number(n)) => {
+                let secs = n.as_f64().ok_or_else(|| {
+                    serde::de::Error::custom(format!("bad duration number '{n}'"))
+                })?;
+                if !secs.is_finite() || !(0.0..=1.0e15).contains(&secs) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duration seconds must be finite, non-negative, and in range, got {secs}"
+                    )));
+                }
+                Ok(Some(Duration::from_secs_f64(secs)))
+            }
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "duration must be a suffix string (\"30s\", \"5m\", \"1h\") or a number of seconds, got {other}"
+            ))),
         }
     }
 
@@ -251,7 +269,13 @@ mod duration_secs_opt {
             "d" | "day" | "days" => 86400.0,
             other => return Err(format!("unknown duration suffix '{other}'")),
         };
-        Ok(Duration::from_secs_f64(n * mult))
+        let total = n * mult;
+        // Duration::from_secs_f64 panics on non-finite/overflowing input;
+        // reject instead — workflow JSON is not trusted enough to panic on.
+        if !total.is_finite() || !(0.0..=1.0e15).contains(&total) {
+            return Err(format!("duration '{s}' out of range"));
+        }
+        Ok(Duration::from_secs_f64(total))
     }
 }
 

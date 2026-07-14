@@ -10,6 +10,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Workflow dispatch waits no longer report a task that already completed as
+  timed out (gap-0301dc75): `wait_for_task_with_timeout` re-checks the task's
+  terminal status when the timer fires, closing the race where an ensemble
+  member's finished output landed in the same tick as the timeout and the
+  whole node was failed anyway.
+
 - Visual embedding no longer poison-drops images that violate
   voyage-multimodal-3.5's pixel cap or aspect-ratio range (gap-48ae5495):
   `embed_visual_requests` now normalizes each payload before it reaches the
@@ -25,6 +31,18 @@ out explicitly under `Changed` or `Removed`.
   only) to `bbox-embed`.
 
 ### Added
+
+- Workflow actor and node specs accept a `timeout` field (duration string
+  like `"30m"` or number of seconds; node overrides actor; default stays
+  900s) governing how long the engine waits on dispatched actor tasks -
+  executor nodes, each ensemble member, and fire-and-forget join waits
+  (gap-0301dc75). Zero/negative timeouts are rejected at compile/parse
+  time, and `wait.timeout` now also accepts bare numbers of seconds.
+- `whiteboard_archive` accepts `force=true` (facilitator/operator role) to
+  archive a board from any phase - the abandon path for boards stranded
+  mid-phase by a failed arc, e.g. from `on_arc_exit` cleanup hooks
+  (gap-0301dc75). The phase history records the phase the board was
+  abandoned from.
 
 - `extract_java_class` grows a `constructor_injection` wiring strategy
   (gap-3f582e0a): the delegate becomes a `private final` field plus a

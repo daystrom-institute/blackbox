@@ -483,13 +483,17 @@ impl BlackboxServer {
 
     #[tool(
         name = "whiteboard_archive",
-        description = "Archive the board. Resolve phase only. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics."
+        description = "Archive the board. Resolve phase only, unless force=true (facilitator/operator role) — the abandon path for boards stranded mid-phase by a failed arc. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics."
     )]
     async fn whiteboard_archive(
         &self,
         Parameters(p): Parameters<WhiteboardArchiveParams>,
     ) -> CallToolResult {
-        match self.state.whiteboards.archive(&p.board_id, &p.agent_name) {
+        match self
+            .state
+            .whiteboards
+            .archive(&p.board_id, &p.agent_name, p.force)
+        {
             Ok(summary) => Self::ok_json(&serde_json::to_value(&summary).unwrap_or_default()),
             Err(e) => Self::err_text(&format!("whiteboard_archive: {e}")),
         }

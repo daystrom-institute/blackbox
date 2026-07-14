@@ -197,6 +197,11 @@ Per-actor fields:
   to the arc's work_item thread at every boundary, so an orchestrator
   swap-out doesn't lose strategic memory.
 - `requires: [Capability, ...]` - see Capability tags below.
+- `timeout` - dispatch-wait timeout applied to every node this actor
+  runs (each ensemble member individually). Duration string (`"30m"`,
+  `"1h"`) or number of seconds; a node's own `timeout` overrides it;
+  default 900s. Size it up for long-thinking members - high-effort
+  evidence work routinely runs 10-20+ minutes (gap-0301dc75).
 
 ## Atom Bindings
 
@@ -297,6 +302,7 @@ A node declares the unit of work. Fields:
 | `gate_mode`       | `first` (one verdict, default) or `all` (multi-finding aggregate). |
 | `mode`            | `sync` (default) or `fire_and_forget`.                  |
 | `retry`           | `{max_generations: N}` - visit-count ceiling.           |
+| `timeout`         | Dispatch-wait timeout for this node's actor task (per ensemble member; also the join wait for fire-and-forget sources). Duration string (`"30m"`) or seconds. Overrides the actor's `timeout`; default 900s. |
 | `late_inject`     | `{from: NodeId, policy: "resume_on_return"}` - fold an async source into this node at its entry. |
 | `subworkflow`     | Inline `Workflow` spec (mutually exclusive with `subworkflow_ref`). |
 | `subworkflow_ref` | Workflow id resolved from the registry at dispatch time. |

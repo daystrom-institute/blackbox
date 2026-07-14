@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::context::VarsSchema;
 use super::ops::HookOp;
@@ -13,6 +14,11 @@ use super::wait::WaitSpec;
 use crate::orchestration::allocator::RuntimeRequest;
 use crate::orchestration::atoms::types::SupervisionPlanOverride;
 use crate::orchestration::providers::Capability;
+
+/// Engine default for how long a node waits on a dispatched actor task
+/// (per ensemble member) before declaring a timeout. Overridable per
+/// actor / per node via their `timeout` fields.
+pub const DEFAULT_NODE_TIMEOUT_SECS: f64 = 900.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
@@ -55,6 +61,21 @@ pub struct Workflow {
     pub on_arc_cancel: Vec<HookOp>,
 }
 
+impl Workflow {
+    /// Effective dispatch-wait timeout for a node: node `timeout`,
+    /// else its actor's `timeout`, else [`DEFAULT_NODE_TIMEOUT_SECS`].
+    pub fn node_timeout_secs(&self, node_id: &str) -> f64 {
+        let node = self.nodes.get(node_id);
+        node.and_then(|n| n.timeout)
+            .or_else(|| {
+                node.and_then(|n| self.actors.get(&n.actor))
+                    .and_then(|a| a.timeout)
+            })
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(DEFAULT_NODE_TIMEOUT_SECS)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorSpec {
     pub kind: ActorKind,
@@ -84,6 +105,17 @@ pub struct ActorSpec {
     /// Optional runtime allocation defaults for executor dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeRequest>,
+    /// Optional per-actor dispatch timeout, applied to every node this
+    /// actor runs (each ensemble member individually). A node's own
+    /// `timeout` overrides this. Accepts a duration string (`"30m"`,
+    /// `"1h"`) or a number of seconds, like `wait.timeout`. Absent =
+    /// engine default ([`DEFAULT_NODE_TIMEOUT_SECS`]). Must be positive.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::wait::duration_secs_opt"
+    )]
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -272,6 +304,21 @@ pub struct NodeSpec {
     /// objects, then passed through the foreach execution path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<MatrixSpec>,
+
+    /// Optional per-node dispatch timeout for the actor task this node
+    /// waits on (each ensemble member individually; also the join wait
+    /// for fire-and-forget nodes). Overrides the actor's `timeout`.
+    /// Accepts a duration string (`"30m"`, `"1h"`) or a number of
+    /// seconds, like `wait.timeout`. Absent = actor `timeout`, else
+    /// engine default ([`DEFAULT_NODE_TIMEOUT_SECS`]). Sized for
+    /// long-thinking members (high-effort evidence work routinely runs
+    /// 10-20+ minutes) — see gap-0301dc75. Must be positive.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "super::wait::duration_secs_opt"
+    )]
+    pub timeout: Option<Duration>,
 
     /// What to do when the actor's dispatched task terminates with a
     /// non-success outcome (timed out / failed / cancelled). Default

@@ -766,6 +766,7 @@ mod tests {
                         compaction_anchor: false,
                         requires: Vec::new(),
                         runtime: None,
+                        timeout: None,
                     },
                 );
                 m
@@ -797,6 +798,7 @@ mod tests {
                         wait_for: Vec::new(),
                         foreach: None,
                         matrix: None,
+                        timeout: None,
                         actor_failure: None,
                         next: NodeTransition::Terminal,
                     },
