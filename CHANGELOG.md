@@ -58,6 +58,16 @@ out explicitly under `Changed` or `Removed`.
   uses it. Live-proven: probe arcs posted 3/3 member claims engine-side
   with zero whiteboard tool calls.
 
+- Ensemble dispatch substitutes `${member.name}` per team member in node
+  prompts (the ArcContext templater deliberately leaves unknown
+  `${member.*}` heads verbatim), and the `/admin/team/upsert` route
+  accepts named members (`{name, brofile}` objects alongside bare brofile
+  strings). One prompt template now drives N differently-named board
+  agents without per-brofile lens duplication; the whiteboard example's
+  team members are named `security` / `performance` / `design` so
+  `${member.name}`, board registration, and auto-apply fallback
+  attribution all agree.
+
 - Workflow actor and node specs accept a `timeout` field (duration string
   like `"30m"` or number of seconds; node overrides actor; default stays
   900s) governing how long the engine waits on dispatched actor tasks -

@@ -2704,7 +2704,28 @@ pub(crate) async fn admin_brofile_upsert(
 #[derive(Debug, Deserialize)]
 pub(crate) struct AdminTeamUpsertReq {
     name: String,
-    members: Vec<String>,
+    members: Vec<AdminTeamMemberReq>,
+}
+
+/// One member in an admin team upsert: either a bare brofile name
+/// (legacy — member names auto-assigned m1..mN) or `{name, brofile}`
+/// so members carry meaningful identities. Named members matter for
+/// ensemble `${member.name}` prompt templating and whiteboard
+/// auto-apply attribution (member name = registered board agent).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum AdminTeamMemberReq {
+    Brofile(String),
+    Named { name: String, brofile: String },
+}
+
+impl AdminTeamMemberReq {
+    fn resolved(&self, index: usize) -> (String, String) {
+        match self {
+            Self::Brofile(brofile) => (format!("m{}", index + 1), brofile.clone()),
+            Self::Named { name, brofile } => (name.clone(), brofile.clone()),
+        }
+    }
 }
 
 pub(crate) async fn admin_team_upsert(
@@ -2712,15 +2733,19 @@ pub(crate) async fn admin_team_upsert(
     axum::Json(req): axum::Json<AdminTeamUpsertReq>,
 ) -> impl axum::response::IntoResponse {
     use axum::response::IntoResponse;
+    let resolved: Vec<(String, String)> = req
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| m.resolved(i))
+        .collect();
     let teamplate = orchestration::team::Teamplate {
         name: req.name.clone(),
-        members: req
-            .members
+        members: resolved
             .iter()
-            .enumerate()
-            .map(|(i, brofile)| orchestration::team::TeamplateMember {
+            .map(|(name, brofile)| orchestration::team::TeamplateMember {
                 brofile: brofile.clone(),
-                alias: Some(format!("m{}", i + 1)),
+                alias: Some(name.clone()),
                 count: 1,
             })
             .collect(),
@@ -2731,12 +2756,10 @@ pub(crate) async fn admin_team_upsert(
     let team = orchestration::team::Team {
         name: req.name.clone(),
         teamplate: req.name.clone(),
-        members: req
-            .members
+        members: resolved
             .iter()
-            .enumerate()
-            .map(|(i, brofile)| orchestration::team::TeamMember {
-                name: format!("m{}", i + 1),
+            .map(|(name, brofile)| orchestration::team::TeamMember {
+                name: name.clone(),
                 brofile: brofile.clone(),
                 session_id: None,
                 task_history: Vec::new(),
@@ -2980,6 +3003,30 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[test]
+    fn admin_team_upsert_accepts_bare_and_named_members() {
+        let req: AdminTeamUpsertReq = serde_json::from_str(
+            r#"{"name":"t","members":[
+                "some-brofile",
+                {"name":"security","brofile":"spec-security"}
+            ]}"#,
+        )
+        .expect("mixed member shapes should parse");
+        let resolved: Vec<(String, String)> = req
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| m.resolved(i))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("m1".to_string(), "some-brofile".to_string()),
+                ("security".to_string(), "spec-security".to_string()),
+            ]
+        );
     }
 
     #[test]

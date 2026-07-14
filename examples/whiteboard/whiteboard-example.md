@@ -117,10 +117,11 @@ Deliberation section as explicit surviving disagreement.
 
 6. **Ensemble auto-post → board auto-apply.** (Closed 2026-07-14, gap-7fbefe13.) When a node carries a `board:` binding, the engine parses each member's STRICT-JSON output into typed actions (post / annotate / vote / none) and applies them through the same registry checks the `whiteboard_*` tools use. The Vote node uses it; the forgotten-tool-call failure mode observed in the first proof run (two specialists wrote votes but never called `whiteboard_vote`) is mechanically closed for `board`-bound nodes.
 
+7. **Per-member prompt templating.** (Closed 2026-07-14.) `${member.name}` survives ArcContext rendering and is substituted per member at ensemble dispatch, and the admin team upsert accepts named members (`{name, brofile}`). The team's members are now named `security` / `performance` / `design`, every specialist prompt addresses "You are **${member.name}**", and the Vote node's auto-applied JSON omits `agent_name` entirely — attribution falls back to the member name, which matches board registration by construction.
+
 **Still open** (flagged for future iterations):
 
 - **`wait_for_phase` as a first-class wait variant.** Today the workflow drives transitions sequentially via mcp_call. If an external Claude joins mid-deliberation (operator decides to weigh in before the facilitator transitions), the arc has no way to wait for THAT transition. The `whiteboard_transition` tool already fires a routed `board-transitioned` signal; a workflow can correlate against `(board, target_phase)` using the existing `wait` primitive. Demonstrate this pattern in v2.
-- **Per-member prompt templating.** Ensemble dispatch passes the same prompt to every member. Each specialist knows its `agent_name` only via its brofile lens. A `${member.name}` template variable resolved per-member would let one prompt template drive N differently-named posts without per-brofile-lens duplication.
 - **Inbox surfacing of open boards.** `bbox_inbox` doesn't yet list open whiteboards as attention items. Operators would benefit from "boards waiting on facilitator transition" or "boards in resolve phase awaiting archive."
 
 ## Comparison: engine whiteboard vs. phaser

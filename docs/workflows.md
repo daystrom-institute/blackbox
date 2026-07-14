@@ -203,6 +203,15 @@ Per-actor fields:
   default 900s. Size it up for long-thinking members - high-effort
   evidence work routinely runs 10-20+ minutes (gap-0301dc75).
 
+Ensemble prompts support per-member identity templating: the literal
+`${member.name}` survives ArcContext rendering (unknown heads are left
+verbatim) and is substituted with each team member's name at dispatch,
+so one node prompt can say `agent_name: "${member.name}"` instead of
+duplicating N brofile lenses. Name team members meaningfully (the
+admin team upsert accepts `{name, brofile}` member objects alongside
+bare brofile strings) - the member name is also the attribution
+fallback for whiteboard `board` auto-apply.
+
 ## Atom Bindings
 
 A workflow uses `atom_bindings` when a node should call a reusable capability

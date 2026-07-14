@@ -11,7 +11,9 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/eval-gate/scoreboard-consumption",
   "notes": "Same shape as the `op: shell` engine gap above. nightly-eval-arc records that the harness ran; can't route on actual drift.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:06:00Z",
-  "updated_at": "2026-06-11T18:06:00Z"
+  "updated_at": "2026-07-14T06:38:48Z",
+  "resolved_at": "2026-07-14T06:38:48Z",
+  "resolution_note": "Unblocked and wired (verified 2026-07-14 on beta/blackbox-v2): the blocking primitive (op: shell stdout capture, gap-c5518519) is implemented, and nightly-eval-arc (system-defaults/agentic-corpus/workflows/nightly-eval-arc.json) routes on actual scoreboard drift: RunSuite captures the suite run via the shell op's {exit_code, stdout, stderr, parsed} into_var, Score computes drift_pp via score_eval_output (src/workflow/ops/eval_score.rs), and Decide branches stable / drift_minor / drift_major through the domain:eval/drift-policy gate packet."
 }

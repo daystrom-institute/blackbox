@@ -13,7 +13,9 @@
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/workflow-engine/op-shell-stdout-capture",
   "notes": "H3's nightly-eval-arc and several others ship as observable skeletons because gate predicates can only see workflow vars + node prompt output, not subprocess stdout. When this lands, gate routing on actual results becomes possible.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "created_at": "2026-06-11T18:04:36Z",
-  "updated_at": "2026-06-11T18:04:36Z"
+  "updated_at": "2026-07-14T06:38:38Z",
+  "resolved_at": "2026-07-14T06:38:38Z",
+  "resolution_note": "Implemented (verified 2026-07-14 on beta/blackbox-v2): exec_shell (src/workflow/ops/external.rs) writes {exit_code, stdout, stderr, parsed} into vars[into_var]; gate packets consume it from the flattened ArcContext (vars.&lt;var&gt;.exit_code / .parsed.*). Covered by ops/tests.rs shell-capture tests (exit_code assertions at :754/:776/:818) and consumed in production by nightly-eval-arc: RunSuite shell → into_var suite_output → ScoreEvalOutput reads args.suite_output → Decide gates on domain:eval/drift-policy. The capability this gap asked for exists end-to-end."
 }

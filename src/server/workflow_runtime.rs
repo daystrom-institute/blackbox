@@ -342,10 +342,16 @@ impl BlackboxServer {
             } else {
                 Vec::new()
             };
+            // Per-member identity templating: the ArcContext templater
+            // leaves unknown `${member.*}` expressions verbatim, so one
+            // node prompt can address each member by its team-member
+            // name ("post as agent_name ${member.name}") without
+            // per-brofile lens duplication.
+            let member_prompt = prompt.replace("${member.name}", member_name);
             let task = self
                 .workflow_dispatch_executor(
                     brofile,
-                    prompt,
+                    &member_prompt,
                     cwd.as_deref(),
                     existing.as_deref(),
                     existing_task_id.as_deref(),

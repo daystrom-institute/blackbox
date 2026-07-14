@@ -70,11 +70,13 @@ SPECIALIST_DESIGN_BROFILE="${SPECIALIST_DESIGN_BROFILE:-whiteboard-spec-design}"
 
 upsert_brofile() {
     local name="$1"; local provider="$2"; local model="$3"; local lens="$4"
-    log "  brofile '${name}' (provider=${provider}, model=${model})"
+    # effort=high: deliberation turns are evidence work, not frontier
+    # reasoning — no need for the provider's xhigh default.
+    log "  brofile '${name}' (provider=${provider}, model=${model}, effort=high)"
     local body
     body=$(jq -nc \
         --arg n "${name}" --arg p "${provider}" --arg m "${model}" --arg l "${lens}" \
-        '{name:$n, provider:$p, model:$m, lens:$l}')
+        '{name:$n, provider:$p, model:$m, effort:"high", lens:$l}')
     post_admin /admin/brofile/upsert "${body}" >/dev/null
 }
 
@@ -83,21 +85,28 @@ upsert_brofile "${FACILITATOR_BROFILE}" glm glm-5.2 \
     "You are the **facilitator** on a phaser-style whiteboard deliberation. Your job is to synthesize the panel's structured posts + annotations + votes into a clear ADR markdown document. Read the board state via mcp__blackbox__whiteboard_state and mcp__blackbox__whiteboard_summarize before synthesizing. Do not insert your own opinions — represent the panel."
 
 upsert_brofile "${SPECIALIST_SEC_BROFILE}" glm glm-5.2 \
-    "You are the **security specialist** on a whiteboard deliberation. Your agent_name on every board is **security**. Your lens: threat-modeling, data-race risk, attack-surface delta, supply-chain risk, secrets/auth handling. When the workflow tells you to post / annotate / vote, use mcp__blackbox__whiteboard_post / whiteboard_annotate / whiteboard_vote with agent_name=\"security\". Be terse — one short paragraph per post."
+    "You are the **security specialist** on a whiteboard deliberation. The workflow tells you your agent_name (your team-member name is security). Your lens: threat-modeling, data-race risk, attack-surface delta, supply-chain risk, secrets/auth handling. When the workflow tells you to post / annotate / vote, use mcp__blackbox__whiteboard_post / whiteboard_annotate / whiteboard_vote with agent_name=\"security\". Be terse — one short paragraph per post."
 
 upsert_brofile "${SPECIALIST_PERF_BROFILE}" glm glm-5.2 \
-    "You are the **performance specialist** on a whiteboard deliberation. Your agent_name on every board is **performance**. Your lens: throughput, latency, memory pressure, concurrency limits, nonlinear cost regimes, observability cost. Use mcp__blackbox__whiteboard_post / whiteboard_annotate / whiteboard_vote with agent_name=\"performance\". Be terse — one short paragraph per post."
+    "You are the **performance specialist** on a whiteboard deliberation. The workflow tells you your agent_name (your team-member name is performance). Your lens: throughput, latency, memory pressure, concurrency limits, nonlinear cost regimes, observability cost. Use mcp__blackbox__whiteboard_post / whiteboard_annotate / whiteboard_vote with agent_name=\"performance\". Be terse — one short paragraph per post."
 
 upsert_brofile "${SPECIALIST_DESIGN_BROFILE}" glm glm-5.2 \
-    "You are the **design specialist** on a whiteboard deliberation. Your agent_name on every board is **design**. Your lens: stylistic coherence with the existing codebase, abstraction-fit, maintenance burden, onboarding cost, churn surface. Use mcp__blackbox__whiteboard_post / whiteboard_annotate / whiteboard_vote with agent_name=\"design\". Be terse — one short paragraph per post."
+    "You are the **design specialist** on a whiteboard deliberation. The workflow tells you your agent_name (your team-member name is design). Your lens: stylistic coherence with the existing codebase, abstraction-fit, maintenance burden, onboarding cost, churn surface. Use mcp__blackbox__whiteboard_post / whiteboard_annotate / whiteboard_vote with agent_name=\"design\". Be terse — one short paragraph per post."
 
-log "upserting team 'whiteboard-specialists'"
+log "upserting team 'whiteboard-specialists' (named members)"
+# Named members: the member name doubles as the whiteboard agent_name,
+# so ${member.name} prompt templating and engine board auto-apply
+# attribution both line up with board registration.
 team_body=$(jq -nc \
     --arg n "whiteboard-specialists" \
     --arg a "${SPECIALIST_SEC_BROFILE}" \
     --arg b "${SPECIALIST_PERF_BROFILE}" \
     --arg c "${SPECIALIST_DESIGN_BROFILE}" \
-    '{name:$n, members:[$a,$b,$c]}')
+    '{name:$n, members:[
+        {name:"security",    brofile:$a},
+        {name:"performance", brofile:$b},
+        {name:"design",      brofile:$c}
+    ]}')
 post_admin /admin/team/upsert "${team_body}" >/dev/null
 
 # ── 3. Workflow ──────────────────────────────────────────────
