@@ -21,7 +21,8 @@ $XDG_CONFIG_HOME/blackbox/config.toml (override with BLACKBOX_CONFIG)
 plus explicit env overrides - BBOX_PORT, BBOX_BIND, BLACKBOX_STATE_DIR,
 and friends. See docs/operating-blackbox.md and
 docs/operations-isolated-dev-daemon.md in the repo for the full list.
-");
+"
+);
 
 fn main() -> anyhow::Result<()> {
     // Help/version probes must be side-effect-free: no store opens, no

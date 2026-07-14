@@ -185,7 +185,12 @@ Whiteboards integrate into the workflow engine:
   tolerated) of `{"agent_name"?, "action": "post"|"annotate"|"vote"|"none", …}`
   items whose fields match the `whiteboard_*` tool surface exactly.
   Attribution falls back to the ensemble member name when `agent_name`
-  is absent. Every action passes the same phase/role/reference checks
+  is absent. Real agents drift from the STRICT contract (prose
+  preambles, provider tool-call echoes), so a salvage pass also tries
+  every fenced block and the outermost bracket spans - candidates must
+  match the action schema (the tagged `action` field), so unrelated
+  JSON in the output cannot false-positive into board mutations.
+  Every action passes the same phase/role/reference checks
   the tools enforce; failures are logged as `board_autoapply_*` arc
   events and never fail the node. Agents keep read access via
   `whiteboard_state`; mixing modes on one node (tool-written AND

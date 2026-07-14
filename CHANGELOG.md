@@ -51,7 +51,10 @@ out explicitly under `Changed` or `Removed`.
   `{action: post|annotate|vote|none, …}` items, code fences tolerated —
   is parsed into typed `BoardAction`s and applied through the same
   registry checks the `whiteboard_*` tools enforce, with attribution from
-  the item's `agent_name` (falling back to the member name). Closes the
+  the item's `agent_name` (falling back to the member name). A salvage
+  pass recovers schema-valid answers from drifted output (prose
+  preambles, provider tool-call echoes) without letting unrelated JSON
+  false-positive into board mutations. Closes the
   forgotten-tool-call failure mode where an agent writes the deliberation
   but never lands it on the board; failures log `board_autoapply_*` arc
   events without failing the node. The whiteboard example's Vote node now

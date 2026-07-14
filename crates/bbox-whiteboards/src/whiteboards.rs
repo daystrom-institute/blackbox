@@ -1306,14 +1306,45 @@ pub enum AppliedAction {
 
 /// Parse an agent's raw final output into board items.
 ///
-/// Accepts a single JSON object or a JSON array of objects, optionally
-/// wrapped in a markdown code fence (```json … ``` or ``` … ```).
-/// Anything else — prose preamble, trailing commentary, malformed
-/// JSON — is an error: the contract is STRICT JSON, and a loud skip
-/// beats silently applying half an answer.
+/// The contract is STRICT JSON — a single object or an array of
+/// objects, optionally wrapped in a markdown code fence. Live runs
+/// show real agents drift anyway (prose preambles, provider tool-call
+/// echoes around the answer), so when the whole payload fails to
+/// parse, a salvage pass tries every fenced code block and then the
+/// outermost bracket-delimited spans. Salvage candidates must match
+/// the action schema (the tagged `action` field), so unrelated JSON
+/// embedded in the output — tool inputs, state dumps — cannot
+/// false-positive into board mutations. Output with no schema-valid
+/// JSON anywhere is an error: a loud skip beats silently applying
+/// half an answer.
 pub fn parse_board_actions(raw: &str) -> Result<Vec<BoardItem>> {
     let trimmed = raw.trim();
-    let inner = strip_code_fence(trimmed);
+    let primary_err = match parse_board_actions_strict(strip_code_fence(trimmed)) {
+        Ok(items) => return Ok(items),
+        Err(e) => e,
+    };
+    // Salvage 1: every fenced block in the output, first schema-valid
+    // one wins.
+    for block in fenced_blocks(trimmed) {
+        if let Ok(items) = parse_board_actions_strict(block.trim()) {
+            return Ok(items);
+        }
+    }
+    // Salvage 2: outermost bracket-delimited spans (array preferred —
+    // the documented contract shape — then object).
+    for (open, close) in [('[', ']'), ('{', '}')] {
+        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close)) {
+            if start < end {
+                if let Ok(items) = parse_board_actions_strict(&trimmed[start..=end]) {
+                    return Ok(items);
+                }
+            }
+        }
+    }
+    Err(primary_err)
+}
+
+fn parse_board_actions_strict(inner: &str) -> Result<Vec<BoardItem>> {
     let value: Value = serde_json::from_str(inner)
         .map_err(|e| anyhow!("board action output is not valid JSON: {e}"))?;
     let items: Vec<BoardItem> = match value {
@@ -1335,6 +1366,26 @@ pub fn parse_board_actions(raw: &str) -> Result<Vec<BoardItem>> {
         ),
     };
     Ok(items)
+}
+
+/// Iterate the contents of every ``` fenced block in `s`, tolerating a
+/// language tag on each opening fence.
+fn fenced_blocks(s: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut rest = s;
+    while let Some(open) = rest.find("```") {
+        let after_open = &rest[open + 3..];
+        let Some(tag_end) = after_open.find('\n') else {
+            break;
+        };
+        let body = &after_open[tag_end + 1..];
+        let Some(close) = body.find("```") else {
+            break;
+        };
+        blocks.push(&body[..close]);
+        rest = &body[close + 3..];
+    }
+    blocks
 }
 
 /// Strip one enclosing markdown code fence if present. Tolerates a
@@ -1573,8 +1624,9 @@ mod tests {
 
     #[test]
     fn parse_board_actions_rejects_prose_and_bad_schema() {
-        // Prose preamble breaks strictness.
-        let err = parse_board_actions("Here is my vote:\n{\"action\":\"vote\"}").unwrap_err();
+        // Pure prose with no schema-valid JSON anywhere.
+        let err = parse_board_actions("Deliberation reviewed. Both peer concerns are sound.")
+            .unwrap_err();
         assert!(err.to_string().contains("not valid JSON"), "{err}");
         // Unknown action tag.
         let err = parse_board_actions(r#"{"action":"shout","body":"x"}"#).unwrap_err();
@@ -1582,6 +1634,44 @@ mod tests {
         // Non-object/array JSON.
         let err = parse_board_actions("42").unwrap_err();
         assert!(err.to_string().contains("object or array"), "{err}");
+    }
+
+    #[test]
+    fn parse_board_actions_salvages_answer_from_drifted_output() {
+        // Prose preamble around a schema-valid answer — the exact drift
+        // shape observed live (2026-07-14 run 2): the model narrates,
+        // then answers. Bracket-span salvage recovers the votes.
+        let items = parse_board_actions(
+            "I reviewed the board carefully. My votes:\n\n[{\"action\":\"vote\",\"post_id\":\"post-1\",\"vote\":\"accept\",\"reason\":\"solid\"}]\n\nThat concludes my assessment.",
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action.kind(), "vote");
+
+        // Provider tool-call echoes: an unrelated fenced JSON blob
+        // precedes the fenced answer. The tool input lacks the action
+        // tag so it cannot false-positive; the real answer is found.
+        let items = parse_board_actions(
+            "**Tool: web_search**\n\n**Input:**\n```json\n{\"location\":\"us\",\"query\":\"config schema\"}\n```\n\nBased on that:\n\n```json\n[{\"action\":\"vote\",\"post_id\":\"post-2\",\"vote\":\"defer\"}]\n```\n",
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].action,
+            BoardAction::Vote {
+                post_id: "post-2".into(),
+                vote: VoteValue::Defer,
+                reason: None,
+            }
+        );
+
+        // Unrelated JSON alone (no schema-valid answer anywhere) still
+        // errors — salvage must not apply arbitrary JSON to the board.
+        let err = parse_board_actions(
+            "**Input:**\n```json\n{\"location\":\"us\",\"query\":\"x\"}\n```\nno answer given",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"), "{err}");
     }
 
     #[test]
