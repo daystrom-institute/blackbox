@@ -15,6 +15,7 @@
 //! The transport handles all wire differences; the loop and the stdout envelope
 //! are identical across providers.
 
+use crate::capabilities::HarnessSessionServices;
 use crate::cli::Cli;
 use crate::emit::{Emitter, EventCallback};
 use crate::event_log::EventLog;
@@ -103,11 +104,17 @@ impl Tool for FinalResultTool {
 
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
-    run_with_emitter(cli, None, None).await
+    run_with_emitter(cli, None, None, HarnessSessionServices::standalone()).await
 }
 
 pub async fn run_with_event_callback(cli: Cli, callback: EventCallback) -> Result<()> {
-    run_with_emitter(cli, Some(callback), None).await
+    run_with_emitter(
+        cli,
+        Some(callback),
+        None,
+        HarnessSessionServices::standalone(),
+    )
+    .await
 }
 
 #[derive(Debug)]
@@ -132,7 +139,16 @@ pub async fn run_with_event_callback_and_input(
     input_rx: SessionInputReceiver,
     callback: EventCallback,
 ) -> Result<()> {
-    run_with_event_callback_and_input_mcp(cli, input_rx, callback, None, None, None).await
+    run_with_event_callback_and_input_mcp(
+        cli,
+        input_rx,
+        callback,
+        None,
+        None,
+        None,
+        HarnessSessionServices::standalone(),
+    )
+    .await
 }
 
 pub async fn run_with_event_callback_and_input_mcp(
@@ -142,6 +158,7 @@ pub async fn run_with_event_callback_and_input_mcp(
     mcp_config: Option<mcp::McpConfig>,
     additional_context: Option<BTreeMap<String, String>>,
     shell_env: Option<BTreeMap<String, String>>,
+    services: HarnessSessionServices,
 ) -> Result<()> {
     run_controlled_session(
         cli,
@@ -150,6 +167,7 @@ pub async fn run_with_event_callback_and_input_mcp(
         mcp_config,
         additional_context,
         shell_env,
+        services,
     )
     .await
 }
@@ -158,14 +176,15 @@ async fn run_with_emitter(
     cli: Cli,
     callback: Option<EventCallback>,
     mcp_config: Option<mcp::McpConfig>,
+    services: HarnessSessionServices,
 ) -> Result<()> {
     if cli.input_format.as_deref() == Some("stream-json") {
-        return run_session(cli, callback, mcp_config, None).await;
+        return run_session(cli, callback, mcp_config, None, services).await;
     }
 
     // One-shot: a single prompt, one user turn, then persist and exit.
     let prompt = resolve_prompt(&cli)?;
-    let mut session = Session::build(&cli, callback, mcp_config, None, None).await?;
+    let mut session = Session::build(&cli, callback, mcp_config, None, None, services).await?;
     session.emitter.system_init();
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -202,10 +221,18 @@ async fn run_session(
     callback: Option<EventCallback>,
     mcp_config: Option<mcp::McpConfig>,
     additional_context: Option<BTreeMap<String, String>>,
+    services: HarnessSessionServices,
 ) -> Result<()> {
     let replay = cli.replay_user_messages;
-    let mut session =
-        Session::build(&cli, callback.clone(), mcp_config, additional_context, None).await?;
+    let mut session = Session::build(
+        &cli,
+        callback.clone(),
+        mcp_config,
+        additional_context,
+        None,
+        services,
+    )
+    .await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
 
@@ -244,6 +271,7 @@ async fn run_controlled_session(
     mcp_config: Option<mcp::McpConfig>,
     additional_context: Option<BTreeMap<String, String>>,
     shell_env: Option<BTreeMap<String, String>>,
+    services: HarnessSessionServices,
 ) -> Result<()> {
     let mut session = Session::build(
         &cli,
@@ -251,6 +279,7 @@ async fn run_controlled_session(
         mcp_config,
         additional_context,
         shell_env,
+        services,
     )
     .await?;
     session.emitter.system_init_session();
@@ -557,6 +586,10 @@ async fn run_prompt_with_controls(
 struct Session {
     tx: Box<dyn Transport>,
     reg: Registry,
+    /// Explicit services retained for the full session lifetime. Model-facing
+    /// tools hold clones of the clients they use today; unprojected clients,
+    /// such as execution, remain available for later worker protocol slices.
+    _services: HarnessSessionServices,
     /// Resolved code-mode for this session. Session-intrinsic (like `model`):
     /// persisted in the session file and restored on resume so the surface
     /// shape stays consistent with any `exec` cells already in the transcript.
@@ -647,6 +680,7 @@ impl Session {
         injected_mcp: Option<mcp::McpConfig>,
         additional_context: Option<BTreeMap<String, String>>,
         shell_env: Option<BTreeMap<String, String>>,
+        mut services: HarnessSessionServices,
     ) -> Result<Self> {
         if let Some(fmt) = cli.output_format.as_deref()
             && fmt != "stream-json"
@@ -816,13 +850,11 @@ impl Session {
             .chain(mcp_out_box.iter())
             .cloned()
             .collect();
-        // In-process capability bindings (harness-daemon-boundary.md §6): when the
-        // daemon has installed corpus/atom/refactor impls, expose them as direct
-        // trait-dispatch tools (corpus_search, atom_invoke, refactor_plan, KV
-        // inspection). Empty (no-op) for the standalone binary, so those surfaces
-        // fail closed by absence. Registered as builtins so the surface ToolFilter
-        // still gates them. The authorial surface is now code-mode (below).
-        builtins.extend(crate::capabilities::capability_tools());
+        // Session-scoped capability bindings (harness-daemon-boundary.md §4):
+        // derive direct trait-dispatch tools from this session's explicit
+        // service set. The empty standalone default fails closed by absence.
+        // Registered as builtins so the normal ToolFilter still gates them.
+        builtins.extend(services.capability_tools());
         // Code-mode (exec/wait) supersedes NARF as the authorial surface. The
         // callable set mirrors the flat surface — filtered builtins + capability
         // tools + all MCP — and a ToolCapability seam over that same set
@@ -860,9 +892,12 @@ impl Session {
                     .into_iter()
                     .filter(|t| tool_filter.permits(t.name())),
             );
-            let cm_seam: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
-                crate::capabilities::HostTools::new(cm_callable.clone(), cx.clone()),
-            );
+            let cm_seam = services.tool_or_insert_with(|| {
+                Arc::new(crate::capabilities::HostTools::new(
+                    cm_callable.clone(),
+                    cx.clone(),
+                ))
+            });
             builtins.extend(crate::code_mode::code_mode_tools(
                 &cm_callable,
                 cm_seam,
@@ -944,6 +979,7 @@ impl Session {
         Ok(Self {
             tx,
             reg,
+            _services: services,
             code_mode,
             cx,
             reference_context_item,
@@ -2659,6 +2695,7 @@ mod tests {
         let id = format!("bh-test-{}-{}", std::process::id(), nanos);
         let session = Session {
             tx: Box::new(mock),
+            _services: HarnessSessionServices::standalone(),
             code_mode: crate::code_mode::CodeMode::Optional,
             output_schema: None,
             reg: Registry::new(

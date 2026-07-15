@@ -414,6 +414,7 @@ impl BlackboxServer {
             request.spawn_agent_label,
             request.tool_placement,
             ambient_ctx.tool_arg_defaults(),
+            orch::capabilities::harness_session_services(&self.state),
             Some(self.state.system_events.clone()),
             request.origin,
         );
@@ -766,6 +767,7 @@ impl BlackboxServer {
             None,
             None,
             ambient_ctx.tool_arg_defaults(),
+            orch::capabilities::harness_session_services(&self.state),
             Some(self.state.system_events.clone()),
             // bro_resume is the user-facing MCP tool for resuming an existing
             // session — same source class as bro_exec. The HTTP control plane
@@ -1442,6 +1444,7 @@ impl BlackboxServer {
                         Some(self.state.roster_events()),
                         None,
                         None,
+                        orch::capabilities::harness_session_services(&self.state),
                         Some(self.state.system_events.clone()),
                         // bro_broadcast fans out a single prompt to
                         // every team member; each per-member spawn
@@ -1494,6 +1497,7 @@ impl BlackboxServer {
                     Some(self.state.roster_events()),
                     None,
                     None,
+                    orch::capabilities::harness_session_services(&self.state),
                     Some(self.state.system_events.clone()),
                     // bro_broadcast per-member fresh-spawn branch
                     // — same source class as the resume branch above.
@@ -1830,6 +1834,7 @@ impl BlackboxServer {
             Some(self.state.roster_events()),
             Some("workload-retro".to_string()),
             None,
+            orch::capabilities::harness_session_services(&self.state),
             Some(self.state.system_events.clone()),
             // bro_retro is a self-reflective resume — operator
             // initiated, lands in AgentDispatch like other bro_*

@@ -196,6 +196,7 @@ impl BlackboxServer {
             Some(self.state.roster_events()),
             bro_label.clone(),
             bro_label,
+            orch::capabilities::harness_session_services(&self.state),
             Some(self.state.system_events.clone()),
             // consultant_launch_exec is the consultant runtime's first-turn
             // launch — operator-initiated persona. See the Slice 1b
@@ -675,6 +676,7 @@ impl BlackboxServer {
             Some(self.state.roster_events()),
             Some(descriptor.name.to_string()),
             Some(descriptor.agent_ref.to_string()),
+            orch::capabilities::harness_session_services(&self.state),
             Some(self.state.system_events.clone()),
             // consultant_resume_internal is the consultant runtime's
             // continuation dispatch; same source class as

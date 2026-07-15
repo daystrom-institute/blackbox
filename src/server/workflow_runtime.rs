@@ -270,6 +270,7 @@ impl BlackboxServer {
             // fresh branch gets it via dispatch_fresh_bro_task; the legacy
             // spawn_task wrapper silently dropped it here.
             ambient_ctx.tool_arg_defaults(),
+            orch::capabilities::harness_session_services(&self.state),
             Some(self.state.system_events.clone()),
             // workflow_dispatch_executor's resume branch — also
             // workflow origin (matches the dispatch_fresh_bro_task

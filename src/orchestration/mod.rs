@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use bro_harness::capabilities::HarnessSessionServices;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2614,6 +2615,7 @@ pub fn spawn_task(
     roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
+    session_services: HarnessSessionServices,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2632,6 +2634,7 @@ pub fn spawn_task(
         agent_label,
         None,
         None,
+        session_services,
         system_events,
         origin,
     )
@@ -2750,6 +2753,7 @@ pub fn spawn_task_with_tool_placement(
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, String>>,
+    session_services: HarnessSessionServices,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2815,6 +2819,7 @@ pub fn spawn_task_with_tool_placement(
             agent_label,
             tool_placement,
             tool_defaults,
+            session_services,
             system_events,
             origin,
         );
@@ -2886,6 +2891,7 @@ fn spawn_harness_in_process_task(
     agent_label: Option<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     tool_defaults: Option<BTreeMap<String, String>>,
+    session_services: HarnessSessionServices,
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
@@ -2961,6 +2967,7 @@ fn spawn_harness_in_process_task(
                 control_rx,
                 mcp_config,
                 tool_defaults,
+                session_services,
             )
             .await
         }
@@ -3177,6 +3184,7 @@ async fn run_harness_in_process(
     input_rx: bro_harness::agent_loop::SessionInputReceiver,
     mcp_config: Option<bro_harness::mcp::McpConfig>,
     tool_defaults: Option<BTreeMap<String, String>>,
+    session_services: HarnessSessionServices,
 ) -> anyhow::Result<()> {
     use clap::Parser;
 
@@ -3213,6 +3221,7 @@ async fn run_harness_in_process(
                 mcp_config,
                 tool_defaults,
                 shell_env,
+                session_services,
             ),
         ),
     )

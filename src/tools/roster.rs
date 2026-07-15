@@ -973,6 +973,7 @@ Next step: <one concrete steering suggestion>\n",
                     Some(self.state.roster_events()),
                     None,
                     None,
+                    orch::capabilities::harness_session_services(&self.state),
                     Some(self.state.system_events.clone()),
                     // dispatch_team_advisor_prompt — team advisor
                     // resume branch, workflow origin (advisor
@@ -1036,6 +1037,7 @@ Next step: <one concrete steering suggestion>\n",
                     Some(self.state.roster_events()),
                     None,
                     None,
+                    orch::capabilities::harness_session_services(&self.state),
                     Some(self.state.system_events.clone()),
                     // dispatch_team_advisor_prompt — team advisor
                     // fresh branch, workflow origin.

@@ -1,70 +1,116 @@
-//! In-process capability bindings (harness-daemon-boundary.md §2/§6).
+//! Session-scoped capability bindings (harness-daemon-boundary.md §4/§6).
 //!
-//! When the daemon runs the harness in-process it *installs* concrete
-//! [`bro_capabilities`] implementations backed by its in-memory stores. The
-//! harness then exposes them as ordinary [`Tool`]s whose `call` is a direct
-//! trait dispatch — no MCP round-trip, no wire serialization for blackbox's own
-//! surfaces.
-//!
-//! The standalone `bro-harness` binary never installs anything, so the slot
-//! stays empty and capability-backed tools are simply not registered: the
-//! fail-closed behaviour the boundary doc requires (§2 — "the standalone binary
-//! injects absent impls → corpus capabilities fail closed").
+//! Every harness session receives one explicit [`HarnessSessionServices`]
+//! value. In-process daemon sessions currently populate it with adapters over
+//! daemon stores; a standalone harness uses the empty default; a future worker
+//! supplies RPC clients through the same transport-neutral traits. Tool
+//! registration is derived from that value, so sessions can carry different
+//! authority without mutating process-global state.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup, RefactorCapability,
-    RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
+    AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup, ExecutionCapability,
+    RefactorCapability, RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
 
-/// Process-global capability slots. The daemon is a singleton, so a single
-/// installed implementation per capability is the whole story; standalone
-/// leaves them `None`. Pushed by the daemon (`blackbox` → `bro-harness`), never
-/// pulled — the harness keeps no dependency on the daemon.
-static CORPUS: RwLock<Option<Arc<dyn CorpusCapability>>> = RwLock::new(None);
-static ATOMS: RwLock<Option<Arc<dyn AtomCapability>>> = RwLock::new(None);
-static REFACTOR: RwLock<Option<Arc<dyn RefactorCapability>>> = RwLock::new(None);
-
-/// Install the daemon's in-memory corpus implementation. Called once, at daemon
-/// startup, from the `blackbox` crate. Last writer wins.
-pub fn install_corpus(capability: Arc<dyn CorpusCapability>) {
-    *CORPUS.write().expect("corpus capability slot poisoned") = Some(capability);
+/// Explicit capability and service clients available to one harness session.
+///
+/// Fields stay private and construction uses additive builders so future typed
+/// clients, such as `AgentCapability`, can join this value without allowing
+/// callers to depend on its physical layout. Absence is meaningful and fails
+/// closed: no capability means no model-facing registration and no hidden
+/// fallback to another session's authority.
+#[derive(Clone, Default)]
+pub struct HarnessSessionServices {
+    tool: Option<Arc<dyn ToolCapability>>,
+    corpus: Option<Arc<dyn CorpusCapability>>,
+    atoms: Option<Arc<dyn AtomCapability>>,
+    refactor: Option<Arc<dyn RefactorCapability>>,
+    execution: Option<Arc<dyn ExecutionCapability>>,
 }
 
-/// Install the daemon's in-memory atom implementation. Called once, at daemon
-/// startup, from the `blackbox` crate. Last writer wins.
-pub fn install_atoms(capability: Arc<dyn AtomCapability>) {
-    *ATOMS.write().expect("atom capability slot poisoned") = Some(capability);
-}
+impl HarnessSessionServices {
+    /// Empty standalone policy. Capability-backed surfaces are absent.
+    pub fn standalone() -> Self {
+        Self::default()
+    }
 
-/// Install the daemon's in-memory refactor implementation. Called once, at
-/// daemon startup, from the `blackbox` crate. Last writer wins.
-pub fn install_refactor(capability: Arc<dyn RefactorCapability>) {
-    *REFACTOR.write().expect("refactor capability slot poisoned") = Some(capability);
-}
+    pub fn with_tool(mut self, capability: Arc<dyn ToolCapability>) -> Self {
+        self.tool = Some(capability);
+        self
+    }
 
-fn corpus() -> Option<Arc<dyn CorpusCapability>> {
-    CORPUS
-        .read()
-        .expect("corpus capability slot poisoned")
-        .clone()
-}
+    pub fn with_corpus(mut self, capability: Arc<dyn CorpusCapability>) -> Self {
+        self.corpus = Some(capability);
+        self
+    }
 
-fn atoms() -> Option<Arc<dyn AtomCapability>> {
-    ATOMS.read().expect("atom capability slot poisoned").clone()
-}
+    pub fn with_atoms(mut self, capability: Arc<dyn AtomCapability>) -> Self {
+        self.atoms = Some(capability);
+        self
+    }
 
-fn refactor() -> Option<Arc<dyn RefactorCapability>> {
-    REFACTOR
-        .read()
-        .expect("refactor capability slot poisoned")
-        .clone()
+    pub fn with_refactor(mut self, capability: Arc<dyn RefactorCapability>) -> Self {
+        self.refactor = Some(capability);
+        self
+    }
+
+    pub fn with_execution(mut self, capability: Arc<dyn ExecutionCapability>) -> Self {
+        self.execution = Some(capability);
+        self
+    }
+
+    pub fn tool(&self) -> Option<Arc<dyn ToolCapability>> {
+        self.tool.clone()
+    }
+
+    pub fn corpus(&self) -> Option<Arc<dyn CorpusCapability>> {
+        self.corpus.clone()
+    }
+
+    pub fn atoms(&self) -> Option<Arc<dyn AtomCapability>> {
+        self.atoms.clone()
+    }
+
+    pub fn refactor(&self) -> Option<Arc<dyn RefactorCapability>> {
+        self.refactor.clone()
+    }
+
+    pub fn execution(&self) -> Option<Arc<dyn ExecutionCapability>> {
+        self.execution.clone()
+    }
+
+    /// Resolve the session's generic tool seam, installing the worker-local
+    /// implementation when no caller supplied a typed client.
+    pub(crate) fn tool_or_insert_with(
+        &mut self,
+        make: impl FnOnce() -> Arc<dyn ToolCapability>,
+    ) -> Arc<dyn ToolCapability> {
+        self.tool.get_or_insert_with(make).clone()
+    }
+
+    /// Capability-backed model tools admitted by this session's service set.
+    /// The caller still applies the normal [`crate::mcp::ToolFilter`].
+    pub fn capability_tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        if let Some(c) = self.corpus() {
+            tools.push(Arc::new(CorpusSearchTool(c)));
+        }
+        if let Some(a) = self.atoms() {
+            tools.push(Arc::new(AtomInvokeTool(a)));
+        }
+        if let Some(r) = self.refactor() {
+            tools.push(Arc::new(RefactorPlanTool(r.clone())));
+            tools.push(Arc::new(RefactorPlanGetTool(r)));
+        }
+        tools
+    }
 }
 
 /// The generic host built-in tool seam: a code-mode cell's `tools.*` call
@@ -132,28 +178,6 @@ impl ToolCapability for HostTools {
             content_type: content_type.to_string(),
         })
     }
-}
-
-/// Capability-backed tools to merge into the registry. Empty when nothing was
-/// installed (standalone harness) → these surfaces fail closed by absence.
-///
-/// The authorial surface (cells) is now code-mode's `exec`/`wait`
-/// (`crate::code_mode`), which supersedes the retired NARF tools. These remaining
-/// tools are the direct trait-dispatch surfaces: corpus search, atom invoke,
-/// refactor plan, and KV inspection.
-pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    if let Some(c) = corpus() {
-        tools.push(Arc::new(CorpusSearchTool(c)));
-    }
-    if let Some(a) = atoms() {
-        tools.push(Arc::new(AtomInvokeTool(a)));
-    }
-    if let Some(r) = refactor() {
-        tools.push(Arc::new(RefactorPlanTool(r.clone())));
-        tools.push(Arc::new(RefactorPlanGetTool(r)));
-    }
-    tools
 }
 
 /// `corpus_search`: ranked transcript/corpus lookup via a direct in-memory
@@ -466,6 +490,77 @@ mod tests {
         let tool = AtomInvokeTool(Arc::new(StubAtoms));
         let result = tool.call(json!({ "args": {} }), &test_cx()).await;
         assert!(matches!(result, ToolResult::Error(_)));
+    }
+
+    struct SessionCorpus {
+        label: &'static str,
+        rendezvous: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl CorpusCapability for SessionCorpus {
+        async fn search_corpus(&self, _lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
+            self.rendezvous.wait().await;
+            Ok(vec![CorpusHit {
+                id: self.label.to_string(),
+                text: format!("{} policy", self.label),
+            }])
+        }
+    }
+
+    async fn session_corpus_id(services: HarnessSessionServices) -> String {
+        let tool = services
+            .capability_tools()
+            .into_iter()
+            .find(|tool| tool.name() == "corpus_search")
+            .expect("session policy admits corpus_search");
+        match tool
+            .call(json!({ "query": "session-policy" }), &test_cx())
+            .await
+        {
+            ToolResult::Json(value) => value["hits"][0]["id"].as_str().unwrap().to_string(),
+            other => panic!("expected corpus result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_session_services_do_not_leak_capabilities_or_policy() {
+        let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
+        let left = HarnessSessionServices::standalone()
+            .with_corpus(Arc::new(SessionCorpus {
+                label: "left-session",
+                rendezvous: rendezvous.clone(),
+            }))
+            .with_atoms(Arc::new(StubAtoms));
+        let right = HarnessSessionServices::standalone().with_corpus(Arc::new(SessionCorpus {
+            label: "right-session",
+            rendezvous,
+        }));
+
+        let left_names = left
+            .capability_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        let right_names = right
+            .capability_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        assert!(left_names.iter().any(|name| name == "atom_invoke"));
+        assert!(!right_names.iter().any(|name| name == "atom_invoke"));
+
+        let (left_id, right_id) = tokio::join!(
+            session_corpus_id(left.clone()),
+            session_corpus_id(right.clone())
+        );
+        assert_eq!(left_id, "left-session");
+        assert_eq!(right_id, "right-session");
+        assert!(
+            HarnessSessionServices::standalone()
+                .capability_tools()
+                .is_empty()
+        );
     }
 
     /// Stub refactor capability with a tiny host-side store, proving the

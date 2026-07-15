@@ -1,5 +1,5 @@
-//! In-memory `bro_capabilities` implementations the daemon injects into the
-//! in-process harness (harness-daemon-boundary.md §2/§6).
+//! In-memory `bro_capabilities` implementations the daemon passes to one
+//! in-process harness session (harness-daemon-boundary.md §4/§6).
 //!
 //! These wrap existing daemon stores so a harness agent's corpus lookup is a
 //! direct trait call against the live index — no MCP round-trip, no wire
@@ -158,17 +158,23 @@ impl RefactorCapability for DaemonRefactor {
     }
 }
 
-/// Install the daemon's in-memory capability implementations into the harness
-/// capability slots. Called once at startup; the standalone harness binary
-/// never calls this, so those surfaces fail closed by absence.
-pub(crate) fn install(state: &Arc<SharedState>) {
-    bro_harness::capabilities::install_corpus(Arc::new(DaemonCorpus {
-        state: state.clone(),
-    }));
-    bro_harness::capabilities::install_atoms(Arc::new(DaemonAtoms {
-        state: state.clone(),
-    }));
-    bro_harness::capabilities::install_refactor(Arc::new(DaemonRefactor::new(state.clone())));
+/// Build the explicit capability value for one daemon-hosted harness session.
+///
+/// Corpus and atom adapters share the daemon's durable state. Refactor keeps a
+/// session-local plan-handle table, so a handle from one session cannot be
+/// materialized through another session's authority. Execution and future
+/// service clients remain absent until their owning milestones land.
+pub(crate) fn harness_session_services(
+    state: &Arc<SharedState>,
+) -> bro_harness::capabilities::HarnessSessionServices {
+    bro_harness::capabilities::HarnessSessionServices::standalone()
+        .with_corpus(Arc::new(DaemonCorpus {
+            state: state.clone(),
+        }))
+        .with_atoms(Arc::new(DaemonAtoms {
+            state: state.clone(),
+        }))
+        .with_refactor(Arc::new(DaemonRefactor::new(state.clone())))
 }
 
 #[cfg(test)]

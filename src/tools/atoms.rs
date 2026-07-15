@@ -759,6 +759,7 @@ impl BlackboxServer {
             Some(self.state.roster_events()),
             Some(inv.atom_ref.clone()),
             Some(inv.atom_ref.clone()),
+            orchestration::capabilities::harness_session_services(&self.state),
             Some(self.state.system_events.clone()),
             // atom_resume_value is the resume half of atom
             // dispatch — same source class as atom_invoke (Atom).
