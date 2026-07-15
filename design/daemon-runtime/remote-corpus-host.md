@@ -1,5 +1,5 @@
 ---
-title: "Remote corpus host: dedicated blackbox machine, LAN tunnels, transcript collector"
+title: "Remote corpus host: corpus on the cage, LAN transport, transcript collector"
 kind: design
 lifecycle: proposed
 corpus: blackbox-design
@@ -9,15 +9,24 @@ topic:
   - corpus
 ---
 
-# Remote corpus host: dedicated blackbox machine, LAN tunnels, transcript collector
+# Remote corpus host: corpus on the cage, LAN transport, transcript collector
 
 Blackbox and its heaviest consumers currently share one machine with many
 concurrently-operating agents. Blackbox holds 5-16GB of RAM depending on
 indexing activity, with recurring reindex thrash and peaky embedding-batch
-buffering. This design moves the corpus authority to a dedicated always-on
-machine (a Mac mini) on the same LAN, keeps execution local to the machines
-that own repos and workers, and adds a slim transcript collector so every
-source machine's provider transcripts keep reaching the corpus.
+buffering. This design moves the corpus authority off the agent machines,
+keeps execution local to the machines that own repos and workers, and adds
+a slim transcript collector so every source machine's provider transcripts
+keep reaching the corpus.
+
+The corpus host is the operator's k3s homelab cluster ("the cage": one
+controller plus four 96GB workers on 10GbE, Longhorn replicated block
+storage across per-worker NVMe, Flux/Pulumi converge control, and an
+observability stack; CAGE-V2 phases 0-5 complete 2026-07-12). A dedicated
+always-on Mac was evaluated as the host and remains a workable stopgap
+(section: Alternative host), but the cluster wins on RAM headroom, storage,
+reconciliation, and monitoring, and the operator already offloads work to
+it.
 
 All source machines are stationary LAN peers. There is no roaming-laptop
 requirement; that assumption simplifies transport and credential handling
@@ -25,11 +34,15 @@ throughout.
 
 ## Topology
 
-- **Corpus mini (dedicated host):** blackboxd (corpus role) and blackopsd,
-  co-located, talking to each other over loopback. blackopsd is the
-  operational singleton (agent graph, mailboxes, workflows, schedules); it
-  cannot shard per-machine without fracturing that authority, and it belongs
-  beside the corpus on the always-on host rather than on a workstation.
+- **Corpus on the cage:** blackboxd (corpus role) and blackopsd run as
+  cluster workloads, co-located in one pod or adjacent pods so their
+  mutual traffic stays cluster-internal. blackopsd is the operational
+  singleton (agent graph, mailboxes, workflows, schedules); it cannot shard
+  per-machine without fracturing that authority, and it belongs beside the
+  corpus on the always-on host rather than on a workstation. State lives on
+  Longhorn-replicated volumes; the tantivy index, HNSW vector partitions,
+  and EdgeIndex sidecars are rebuildable but expensive, so replicated
+  volumes are the right default.
 - **Each agent machine:** its own fleetd plus the bro-harness workers fleetd
   launches. Fleet travels with the harness and the repos. Workers keep
   connecting to their local fleetd over the private per-host Unix socket;
@@ -45,39 +58,59 @@ repos; only fleetd-to-corpus and blackopsd-to-fleetd links cross hosts. The
 private-clone and workspace-identity problems of the remote-worker design do
 not arise.
 
-## Transport and credentials: LAN tunnels, unchanged trust model
+## Transport and credentials
 
-Transport is launchd-managed SSH tunnels (autossh-style keepalive) from each
-agent machine to the mini; static point-to-point WireGuard is an acceptable
-substitute. After blackboxd leaves the workstation, its old loopback port is
-free, so the tunnel claims it:
+The corpus services bind non-loopback inside the cluster and are exposed on
+the LAN through the cluster's existing ingress/LoadBalancer surface. That
+requires a deliberate, opt-in relaxation of the loopback fail-closed guards,
+which stay fail-closed by default:
 
-- `127.0.0.1:7264` on each machine forwards to `mini:7264` (corpus).
-- `127.0.0.1:7266` forwards to `mini:7266` (blackopsd), where needed.
-
-Consequences, and the reason this beats a mesh VPN or TLS work:
-
-- Every fail-closed loopback guard stays exactly as it is: blackboxd corpus
-  bind (`src/server/run.rs`), fleetd bind and URL validation
-  (`crates/fleetd/src/config.rs`), blackopsd bind and URL validation
-  (`crates/blackopsd/src/config.rs`). Zero relaxation, zero new config
-  surface.
-- Interactive MCP client configs keep their current `127.0.0.1` URLs.
-- fleetd's `blackboxd_url` / `blackopsd_url` stay loopback.
-- Worker sandbox port denies and `protected_peer_service_roots` keep working
-  unchanged; workers still cannot reach the corpus except through the typed
-  worker RPC brokered by their local fleetd.
+- blackboxd corpus-role bind (`src/server/run.rs`) and blackopsd bind
+  (`crates/blackopsd/src/config.rs`) gain an explicit non-loopback opt-in
+  (config field plus env override) intended for containerized deployment.
+- fleetd's `blackboxd_url` / `blackopsd_url` validators
+  (`crates/fleetd/src/config.rs`) and blackopsd's `blackboxd_url` validator
+  gain the same opt-in so agent machines can point at the cluster service
+  directly. SSH tunnels from each agent machine to a node (claiming the
+  freed local 7264/7266 ports) remain a supported alternative that keeps
+  every client-side URL loopback; use them if the wire should be encrypted.
+- Worker sandbox rules are unchanged in intent: workers still cannot reach
+  the corpus except through the typed worker RPC brokered by their local
+  fleetd. The corpus endpoint (host:port or tunnel port) joins the denied
+  set the same way the local ports do today.
 
 Bearer auth is unchanged in code. The same `service.token` value is
-provisioned out of band to each machine's local owner-only 0600 file. The
-file-trust checks in `crates/bro-rpc/src/auth.rs` are local-only and the
-comparison is by value, so `auth.rs` needs no modification.
+provisioned to each machine's local owner-only 0600 file and to the cluster
+as a secret through the homelab's established secret-sourcing path (never
+committed). The file-trust checks in `crates/bro-rpc/src/auth.rs` are
+local-only and the comparison is by value, so `auth.rs` needs no
+modification. Plaintext HTTP on the switched LAN is an accepted risk under
+the single-trusted-operator threat model; tunnels are the documented
+upgrade if that changes. A mesh overlay (Tailscale) was rejected: it solves
+a roaming problem this deployment does not have.
 
-Plain LAN HTTP with a bind allowlist was considered and remains a fallback if
-tunnel management proves annoying; it trades guard-relaxation code and
-plaintext transcripts on the wire for fewer runtime moving parts. A mesh
-overlay (Tailscale) was rejected: it solves a roaming problem this deployment
-does not have.
+## Deployment and estate placement
+
+Corpus deployment follows the homelab's converge discipline: Linux container
+images for blackboxd (corpus role) and blackopsd, manifests reconciled by
+Flux, state on Longhorn volumes, health probes on `/healthz` / `/readyz`,
+and the existing observability stack scraping the services so reindex and
+embedding behavior is finally graphed. The infra repo's self-description
+currently scopes it to the PlanGlobal estate; landing blackbox manifests
+there requires the operator's one-line amendment to that scope note so the
+repo's docs stay truthful, or a small separate overlay repo targeting the
+same cluster. Either is fine; the choice is the operator's.
+
+## Alternative host: a dedicated Mac
+
+A dedicated always-on Mac on the LAN behind launchd-managed SSH tunnels was
+the original shape of this design and remains viable, notably as a stopgap
+that needs zero code changes (tunnels claim the freed loopback ports, so no
+guard relaxation at all) and runs the same darwin binaries built daily. It
+gives up the cluster's RAM headroom, replicated storage, reconciliation,
+and monitoring. Cutover between hosts either direction is a state copy plus
+retargeting the client transport; the collector and ingest work below is
+identical for both.
 
 ## Credential posture (operator decision, 2026-07-15)
 
@@ -140,8 +173,8 @@ Working-set truth stays on the machine that owns the repo, per
 `design/bro-harness/remote-worker-boundary.md`: per-worktree LSP sessions,
 code navigation, refactor runners, validation, file tools, and the V8
 isolates inside bro-harness workers. Cross-project source indexing of repos
-that live on agent machines is handled by mounting or mirroring those repos
-on the mini through the remote-source connectors design
+that live on agent machines is handled by mirroring those repos to the
+corpus host through the remote-source connectors design
 (`design/connectors/remote-source-connectors.md`), not by shipping live
 source deltas.
 
@@ -157,7 +190,7 @@ process; there is no useful partial "embedding offload" because there is no
 local embedding compute to offload.
 
 AR-001 (`ARCH_RELAYER_LOG.md`) gates the lean corpus binary, not the move:
-the fat blackboxd on the mini already relieves the agent machines. The
+the fat blackboxd on the corpus host already relieves the agent machines. The
 `/internal/records` and capability surfaces the collector and fleetd use are
 already dependency-clean in `blackbox-corpus-service`; only the public
 agent-facing corpus MCP remains coupled to legacy `SharedState`.
@@ -180,9 +213,9 @@ doc, and is deliberately the last slice.
 
 | Slice | Delivers | Depends on | Risk |
 |---|---|---|---|
-| 0. Tunnels + token provisioning | launchd SSH tunnels each machine to mini; shared bearer value in each local 0600 file | - | Low (ops only, no code) |
-| 1. Move blackboxd to the mini | The entire RAM relief: HNSW, tantivy, EdgeIndex, reindex/merge/compaction overlap leave the agent machine. Client URLs and guards unchanged | 0 | Low-Med |
-| 2. Collector | `bbox-collector` binary; inline-payload ingest kind; per-host producer id; local spool | 0, ingest extension | Med (the new server code) |
+| 0. Linux images + bind/URL opt-in + secret provisioning | Container builds of blackboxd (corpus role) and blackopsd; explicit non-loopback opt-in on the bind and URL guards (fail-closed default); bearer value provisioned to machines and cluster | - | Low-Med (small code, mostly build/ops) |
+| 1. Corpus on the cage | Flux-reconciled deployment on Longhorn volumes; the entire RAM relief: HNSW, tantivy, EdgeIndex, reindex/merge/compaction overlap leave the agent machines; observability scrapes the corpus | 0 | Low-Med |
+| 2. Collector | `bbox-collector` binary; inline-payload ingest kind; per-host producer id; local spool. Day-one for the cage: no transcripts originate on the cluster, and collector catch-up from cursor zero doubles as the transcript migration path | 0, ingest extension | Med (the new server code) |
 | 3. Multi-fleetd identity + blackopsd fan-out | Cross-machine blackopsd-originated dispatch | 0 | High (new protocol surface); defer until needed |
-| 4. AR-001 completion | Lean corpus binary on the mini; public corpus MCP served off the peeled state | 1 | Med |
-| 5. Repos-on-mini source indexing | Cross-project code search over agent-machine repos via connectors | independent | Low-Med |
+| 4. AR-001 completion | Lean corpus binary; public corpus MCP served off the peeled state | 1 | Med |
+| 5. Repo mirroring for source indexing | Cross-project code search over agent-machine repos via connectors | independent | Low-Med |
