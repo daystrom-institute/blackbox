@@ -231,10 +231,10 @@ pub fn find_repair_candidates(
     let mut out = Vec::new();
     for (pid, a) in agg {
         // Skip packets still inside cooldown.
-        if let (Some(ts), Some(cd)) = (&a.latest_candidate_ts, &cooldown_cutoff) {
-            if ts.as_str() >= cd.as_str() {
-                continue;
-            }
+        if let (Some(ts), Some(cd)) = (&a.latest_candidate_ts, &cooldown_cutoff)
+            && ts.as_str() >= cd.as_str()
+        {
+            continue;
         }
 
         let no_match_rate = if a.applies >= config.min_apply_samples {
@@ -244,15 +244,15 @@ pub fn find_repair_candidates(
         };
 
         let mut reasons: Vec<String> = Vec::new();
-        if let Some(rate) = no_match_rate {
-            if rate >= config.no_match_threshold {
-                reasons.push("high_no_match_rate".to_string());
-            }
+        if let Some(rate) = no_match_rate
+            && rate >= config.no_match_threshold
+        {
+            reasons.push("high_no_match_rate".to_string());
         }
-        if let Some(f) = a.latest_fidelity {
-            if f < config.fidelity_threshold {
-                reasons.push("low_fidelity".to_string());
-            }
+        if let Some(f) = a.latest_fidelity
+            && f < config.fidelity_threshold
+        {
+            reasons.push("low_fidelity".to_string());
         }
         if reasons.is_empty() {
             continue;

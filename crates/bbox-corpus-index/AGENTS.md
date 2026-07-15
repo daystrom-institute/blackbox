@@ -32,3 +32,12 @@
   — the worktree case made history lanes invisible for weeks. When touching
   filter resolution, keep "registry first, hash fallback last" and test the
   out-of-tree worktree path explicitly.
+
+## Fleet transcript projection
+
+- A fleet transcript coordinate is complete only when its referenced event
+  sequence exists in a regular file beneath an explicit allowed root. Resolve
+  symlinks, enforce the size bound, and fail closed on sequence gaps.
+- Corpus-owned transcript archives are additional harness adapter roots. They
+  must participate in ordinary indexing, change detection, and purge scans so
+  a full rebuild cannot erase already acknowledged worker history.

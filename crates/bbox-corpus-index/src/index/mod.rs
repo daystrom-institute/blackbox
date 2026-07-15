@@ -138,6 +138,14 @@ pub struct ReindexConfig {
     /// the operator's real harness state. Set by the daemon at startup via
     /// [`TranscriptIndex::set_harness_sessions_dir`].
     pub harness_sessions_dir: Option<PathBuf>,
+    /// Additional corpus-owned harness archive directories. Empty by default
+    /// so hermetic indexes never discover host state implicitly.
+    pub additional_harness_sessions_dirs: Vec<PathBuf>,
+    /// Corpus-owned snapshot of retained producer records. `None` keeps
+    /// hermetic indexes detached from daemon state; the corpus runtime sets
+    /// this explicitly so a full Tantivy rebuild restores operational record
+    /// projections in the same atomic commit as the other stores.
+    pub operational_records_path: Option<PathBuf>,
     /// Gemini CLI tmp root (`~/.gemini/tmp` or `GEMINI_TMP_ROOT`) whose chat
     /// JSON files are indexed via the gemini interactive adapter. Same
     /// hermetic-by-default contract as `harness_sessions_dir`: `None`
@@ -206,6 +214,9 @@ pub struct EmbeddingSourceDoc {
 }
 
 impl TranscriptIndex {
+    // Index construction is a synchronous Tantivy boundary; callers place the
+    // complete open/create operation on their blocking initialization lane.
+    #[allow(clippy::disallowed_methods)]
     pub fn open_or_create(
         index_path: &Path,
         roots: Vec<(String, PathBuf)>,
@@ -250,6 +261,8 @@ impl TranscriptIndex {
             threads_path,
             roadmap_path,
             harness_sessions_dir: None,
+            additional_harness_sessions_dirs: Vec::new(),
+            operational_records_path: None,
             gemini_tmp_root: None,
         };
 
@@ -315,6 +328,17 @@ impl TranscriptIndex {
     /// (and therefore disabled) in hermetic test indexes.
     pub fn set_harness_sessions_dir(&mut self, dir: PathBuf) {
         self.config.harness_sessions_dir = Some(dir);
+    }
+
+    pub fn add_harness_sessions_dir(&mut self, dir: PathBuf) {
+        if !self.config.additional_harness_sessions_dirs.contains(&dir) {
+            self.config.additional_harness_sessions_dirs.push(dir);
+        }
+    }
+
+    /// Enable full-rebuild reconciliation of retained operational records.
+    pub fn set_operational_records_path(&mut self, path: PathBuf) {
+        self.config.operational_records_path = Some(path);
     }
 
     /// Enable interactive Gemini chat indexing from `tmp_root`. Called by
@@ -734,6 +758,8 @@ fn reset_index_on_schema_mismatch(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
+// The marker is part of the same synchronous, one-time index-open boundary.
+#[allow(clippy::disallowed_methods)]
 fn write_schema_version_marker(index_path: &Path) -> Result<()> {
     fs::write(
         index_path.join(SCHEMA_VERSION_FILE),
@@ -743,6 +769,7 @@ fn write_schema_version_marker(index_path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

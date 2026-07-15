@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use bro_core::Provider;
+use bro_core::{AtomRef, Provider};
 use serde::{Deserialize, Serialize};
 
 /// Codex/OpenAI Responses priority-routing value used by `/fast`.
@@ -55,6 +55,13 @@ pub struct DispatchSpec {
     /// restores the persisted value, but `ResumeSpec.service_tier` can override
     /// it for a specific continuation.
     pub service_tier: Option<String>,
+    /// Exact worker RPC operations explicitly granted by the operator for the
+    /// new session. The default is no remote authority.
+    #[serde(default)]
+    pub allowed_remote_operations: BTreeMap<String, Vec<String>>,
+    /// Exact versioned atom refs explicitly granted for invocation.
+    #[serde(default)]
+    pub allowed_atom_refs: Vec<AtomRef>,
 }
 
 impl DispatchSpec {
@@ -69,6 +76,8 @@ impl DispatchSpec {
             name: None,
             code_mode: None,
             service_tier: None,
+            allowed_remote_operations: BTreeMap::new(),
+            allowed_atom_refs: Vec::new(),
         }
     }
 }
@@ -90,6 +99,12 @@ pub struct ResumeSpec {
     /// the restored session/brofile/harness default; `Some("default")` clears
     /// back to standard routing while still persisting that choice.
     pub service_tier: Option<String>,
+    /// Optional explicit restatement of the session's remote operation policy.
+    /// Empty values inherit the immutable durable session policy.
+    #[serde(default)]
+    pub allowed_remote_operations: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub allowed_atom_refs: Vec<AtomRef>,
 }
 
 impl ResumeSpec {
@@ -108,6 +123,8 @@ impl ResumeSpec {
             name: None,
             env_overrides: None,
             service_tier: None,
+            allowed_remote_operations: BTreeMap::new(),
+            allowed_atom_refs: Vec::new(),
         }
     }
 }

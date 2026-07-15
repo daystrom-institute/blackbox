@@ -58,6 +58,8 @@ impl TranscriptCursorStore {
         base.join(format!("{provider}.json"))
     }
 
+    // Cursor stores are small synchronous sidecars loaded with their adapter.
+    #[allow(clippy::disallowed_methods)]
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
         if !path.exists() {
@@ -102,6 +104,8 @@ impl TranscriptCursorStore {
         );
     }
 
+    // Cursor persistence is an atomic synchronous sidecar update.
+    #[allow(clippy::disallowed_methods)]
     pub fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
@@ -139,6 +143,7 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::super::types::TranscriptSource;
     use tempfile::tempdir;

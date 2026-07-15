@@ -1,4 +1,6 @@
+# Cargo outputs from workspace and crate-local builds.
 /target/
+**/target/
 /site/
 /.claude/*
 !/.claude/agents/

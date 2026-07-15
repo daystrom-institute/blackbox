@@ -4,7 +4,7 @@
 //! `evt["session_id"]`). Only protocol JSON goes to stdout — all logging
 //! goes to stderr.
 
-use crate::event_log::EventLog;
+use crate::event_log::{CommittedEvent, EventLog, EventLogHealth, EventLogResult};
 use crate::transport::{ToolResult, Usage};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -51,12 +51,38 @@ impl Emitter {
         &self.session_id
     }
 
+    /// Typed durability state for the attached session outbox. Existing P3
+    /// emit methods remain infallible, while the worker supervisor can use
+    /// this API to turn an asynchronous disk or budget failure into terminal
+    /// session behavior.
+    pub fn event_log_health(&self) -> Option<EventLogHealth> {
+        self.event_log.as_ref().map(|log| log.health())
+    }
+
+    /// Subscribe to future events only after their JSONL line has completed
+    /// `write_all` and `sync_data`. The existing callback remains the immediate
+    /// P3 protocol callback and intentionally keeps its old timing.
+    pub fn subscribe_committed(&self) -> Option<tokio::sync::broadcast::Receiver<CommittedEvent>> {
+        self.event_log.as_ref().map(|log| log.subscribe_committed())
+    }
+
+    /// Flush the attached outbox and surface any writer failure. This is a
+    /// typed counterpart to the compatibility `EventLog::flush_blocking` API.
+    pub fn flush_event_log_blocking(&self) -> Option<EventLogResult<()>> {
+        self.event_log
+            .as_ref()
+            .map(|log| log.flush_blocking_result())
+    }
+
     fn write_line(&self, v: serde_json::Value) {
         if let Some(log) = &self.event_log
             && v["type"].as_str() != Some("stream_event")
             && v["isReplay"].as_bool() != Some(true)
         {
-            log.append_event(&v);
+            // Compatibility emit methods cannot return an error without a P3
+            // API break. The log records the first failure in typed health,
+            // available through `event_log_health` and the typed flush API.
+            let _ = log.try_append_event(&v);
         }
         if let Some(callback) = &self.callback {
             callback(v);
@@ -349,6 +375,8 @@ impl crate::transport::TurnSink for Emitter {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally inspect durable emitted events.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -544,5 +572,26 @@ mod tests {
         assert_eq!(events[0]["session_id"], "session-int");
         assert_eq!(events[0]["result"], "partial answer");
         assert_eq!(events[0]["num_turns"], 0);
+    }
+
+    #[test]
+    fn emitter_exposes_typed_event_log_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "x").unwrap();
+        let log = Arc::new(EventLog::at_path(blocker.join("s.events.jsonl")));
+        let emitter =
+            Emitter::with_callback("session-health".into(), Arc::new(|_| {})).with_event_log(log);
+
+        emitter.system_init();
+        let error = emitter
+            .flush_event_log_blocking()
+            .expect("event log is attached")
+            .unwrap_err();
+        assert_eq!(error.kind, crate::event_log::EventLogFailureKind::Open);
+        assert!(matches!(
+            emitter.event_log_health(),
+            Some(EventLogHealth::Fatal { .. })
+        ));
     }
 }

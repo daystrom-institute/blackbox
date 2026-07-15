@@ -6,7 +6,7 @@
 #   scripts/dev-isolated-daemon.sh --build      # cargo build first
 #
 # All state goes to a tempdir under /tmp. Nothing is persisted.
-# Point bro fleet at it with:  BBOX_PORT=7299 bro fleet
+# Point `bro mcp` at it with the printed BLACKBOX_STATE_DIR and --daemon-url.
 set -euo pipefail
 
 PORT="${BBOX_PORT:-7299}"
@@ -14,7 +14,7 @@ STATE_DIR="/tmp/blackbox-dev-throwaway-$$"
 
 if [[ "${1:-}" == "--build" ]]; then
     echo "building blackboxd..."
-    cargo build --bin blackboxd
+    cargo build --workspace --bin blackboxd
 fi
 
 BIN="${BLACKBOXD_BIN:-target/debug/blackboxd}"
@@ -26,7 +26,7 @@ fi
 mkdir -p "$STATE_DIR"
 echo "starting throwaway blackboxd on :${PORT}"
 echo "  state dir: ${STATE_DIR}"
-echo "  connect:   BBOX_PORT=${PORT} bro fleet"
+echo "  connect:   BLACKBOX_STATE_DIR=${STATE_DIR} bro mcp call bbox_stats '{}' --daemon-url http://127.0.0.1:${PORT}"
 echo ""
 
 cleanup() {
@@ -40,6 +40,8 @@ BBOX_PORT="$PORT" \
 BBOX_BIND=127.0.0.1 \
 BLACKBOX_MCP_NAME="blackbox-dev-throwaway" \
 BLACKBOX_STATE_DIR="$STATE_DIR" \
+BLACKBOX_SERVICE_TOKEN_FILE="$STATE_DIR/service.token" \
+BLACKBOX_RUNTIME_ROLE=corpus \
 BLACKBOX_REINDEX_INTERVAL_SECS=999999 \
 BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false \
 RUST_LOG="${RUST_LOG:-blackbox=info}" \

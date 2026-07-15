@@ -31,6 +31,8 @@ static PANIC_HOOK: Once = Once::new();
 /// while debugging live cockpit state. The non-blocking worker flushes promptly
 /// on its own thread.
 #[must_use = "hold the returned WorkerGuard for the cockpit's lifetime, or logs are lost"]
+// Logging is initialized synchronously before the cockpit event loop starts.
+#[allow(clippy::disallowed_methods)]
 pub fn init_cockpit_logging(
     store_dir: &Path,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {

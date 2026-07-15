@@ -80,6 +80,10 @@ pub struct SlackChannelBindings {
 }
 
 impl SlackChannelBindings {
+    // Synchronous construction-time store load. The daemon opens this store on
+    // its startup lane before serving requests; callers outside startup must
+    // isolate it on a blocking lane.
+    #[allow(clippy::disallowed_methods)]
     pub fn open(store_dir: &Path) -> Result<Self> {
         let path = store_dir.join(STORE_FILE);
         let data = if path.exists() {
@@ -193,6 +197,10 @@ impl SlackChannelBindings {
         Ok(updated)
     }
 
+    // Synchronous atomic persistence boundary for this lock-based store. The
+    // caller owns blocking-lane placement so the lock spans snapshot, fsync,
+    // and rename without an async suspension point.
+    #[allow(clippy::disallowed_methods)]
     fn save(&self) -> Result<()> {
         // Hold save_lock for the full read-snapshot → write-tmp →
         // rename sequence. This blocks concurrent saves and ensures

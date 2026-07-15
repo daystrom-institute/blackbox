@@ -45,6 +45,8 @@ pub struct OverlayManifest {
 }
 
 impl OverlayManifest {
+    // Atomic synchronous persistence boundary; materialization callers run off Tokio workers.
+    #[allow(clippy::disallowed_methods)]
     pub fn write_to(overlay_dir: &Path, hashes: &HashSet<String>) -> Result<()> {
         let manifest = OverlayManifest {
             version: OVERLAY_MANIFEST_VERSION,
@@ -60,6 +62,8 @@ impl OverlayManifest {
         Ok(())
     }
 
+    // Synchronous loader boundary; callers run manifest discovery off Tokio workers.
+    #[allow(clippy::disallowed_methods)]
     pub fn read_from(overlay_dir: &Path) -> Option<Self> {
         let path = overlay_dir.join(OVERLAY_MANIFEST_FILENAME);
         let data = fs::read_to_string(&path).ok()?;
@@ -139,6 +143,8 @@ impl WorkspaceManifest {
         workspace_manifest_dir(edges_dir, project_id).join("manifest.json")
     }
 
+    // Atomic synchronous persistence boundary; materialization callers run off Tokio workers.
+    #[allow(clippy::disallowed_methods)]
     pub fn write_to(edges_dir: &Path, manifest: &Self) -> Result<()> {
         let dir = workspace_manifest_dir(edges_dir, &manifest.project_id);
         fs::create_dir_all(&dir)?;
@@ -152,6 +158,8 @@ impl WorkspaceManifest {
         Ok(())
     }
 
+    // Synchronous loader boundary; callers run manifest discovery off Tokio workers.
+    #[allow(clippy::disallowed_methods)]
     pub fn read_from(path: &Path) -> Result<Self> {
         let data = fs::read_to_string(path)?;
         let manifest: Self = serde_json::from_str(&data)?;
@@ -189,15 +197,23 @@ pub struct ManifestIndex {
     pub updated_at: Option<String>,
 }
 
-impl ManifestIndex {
-    pub fn new() -> Self {
+impl Default for ManifestIndex {
+    fn default() -> Self {
         Self {
             version: MANIFEST_VERSION,
             workspaces: std::collections::BTreeMap::new(),
             updated_at: None,
         }
     }
+}
 
+impl ManifestIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Synchronous loader boundary; callers run manifest discovery off Tokio workers.
+    #[allow(clippy::disallowed_methods)]
     pub fn load(edges_dir: &Path) -> Result<Self> {
         let path = manifest_index_path(edges_dir);
         let data = fs::read_to_string(&path)?;
@@ -212,6 +228,8 @@ impl ManifestIndex {
         Ok(idx)
     }
 
+    // Atomic synchronous persistence boundary; materialization callers run off Tokio workers.
+    #[allow(clippy::disallowed_methods)]
     pub fn write_atomic(&self, edges_dir: &Path) -> Result<()> {
         let dir = materialized_dir(edges_dir);
         fs::create_dir_all(&dir)?;
@@ -300,23 +318,24 @@ impl ManifestIndex {
 
                 // Per-file overlay: if overlay_manifest.json present and there
                 // is a clean snapshot, load snapshot filtered by covered hashes.
-                if let Some(om) = OverlayManifest::read_from(&overlay_dir) {
-                    if let Some(ref snapshot) = entry.active_snapshot {
-                        let snap_dir = materialized_dir(edges_dir).join(snapshot);
-                        if snap_dir.is_dir() {
-                            let suppressed: HashSet<String> =
-                                om.covered_rel_path_hashes.into_iter().collect();
-                            if !suppressed.is_empty() {
-                                let mut snap_paths = Vec::new();
-                                append_jsonl_files(&snap_dir, &mut snap_paths);
-                                for path in snap_paths {
-                                    result.push(LoadablePath {
-                                        path,
-                                        mode: PathLoadMode::FilteredByHash {
-                                            suppressed_hashes: suppressed.clone(),
-                                        },
-                                    });
-                                }
+                if let (Some(om), Some(snapshot)) = (
+                    OverlayManifest::read_from(&overlay_dir),
+                    entry.active_snapshot.as_ref(),
+                ) {
+                    let snap_dir = materialized_dir(edges_dir).join(snapshot);
+                    if snap_dir.is_dir() {
+                        let suppressed: HashSet<String> =
+                            om.covered_rel_path_hashes.into_iter().collect();
+                        if !suppressed.is_empty() {
+                            let mut snap_paths = Vec::new();
+                            append_jsonl_files(&snap_dir, &mut snap_paths);
+                            for path in snap_paths {
+                                result.push(LoadablePath {
+                                    path,
+                                    mode: PathLoadMode::FilteredByHash {
+                                        suppressed_hashes: suppressed.clone(),
+                                    },
+                                });
                             }
                         }
                     }
@@ -445,6 +464,8 @@ impl ManifestIndex {
     }
 }
 
+// Synchronous directory scan used by manifest discovery off Tokio workers.
+#[allow(clippy::disallowed_methods)]
 fn append_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -529,6 +550,8 @@ fn chrono_now_rfc3339() -> String {
 }
 
 #[cfg(test)]
+// Fixture setup and assertions intentionally exercise the synchronous disk contract.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

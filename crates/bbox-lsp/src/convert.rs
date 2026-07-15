@@ -59,6 +59,9 @@ pub fn lsp_position_to_byte(source: &str, line: u32, character: u32) -> Result<u
 
 /// Flatten an LSP [`WorkspaceEdit`] into a list of [`FileEdit`] values
 /// that `apply_file_edits` can consume.
+// Conversion synchronously snapshots each edit target so hashes and byte
+// offsets describe one coherent file version before the plan is returned.
+#[allow(clippy::disallowed_methods)]
 pub fn workspace_edit_to_file_edits(workspace_edit: WorkspaceEdit) -> Result<Vec<FileEdit>> {
     let mut grouped: BTreeMap<PathBuf, Vec<lsp_types::TextEdit>> = BTreeMap::new();
 
@@ -88,17 +91,17 @@ pub fn workspace_edit_to_file_edits(workspace_edit: WorkspaceEdit) -> Result<Vec
             }
             DocumentChanges::Operations(ops) => {
                 for op in ops {
-                    if let lsp_types::DocumentChangeOperation::Edit(doc_edit) = op {
-                        if let Ok(path) = doc_edit.text_document.uri.to_file_path() {
-                            let edits = doc_edit.edits.into_iter().map(|e| match e {
-                                lsp_types::OneOf::Left(te) => te,
-                                lsp_types::OneOf::Right(ate) => lsp_types::TextEdit {
-                                    range: ate.text_edit.range,
-                                    new_text: ate.text_edit.new_text,
-                                },
-                            });
-                            grouped.entry(path).or_default().extend(edits);
-                        }
+                    if let lsp_types::DocumentChangeOperation::Edit(doc_edit) = op
+                        && let Ok(path) = doc_edit.text_document.uri.to_file_path()
+                    {
+                        let edits = doc_edit.edits.into_iter().map(|e| match e {
+                            lsp_types::OneOf::Left(te) => te,
+                            lsp_types::OneOf::Right(ate) => lsp_types::TextEdit {
+                                range: ate.text_edit.range,
+                                new_text: ate.text_edit.new_text,
+                            },
+                        });
+                        grouped.entry(path).or_default().extend(edits);
                     }
                 }
             }

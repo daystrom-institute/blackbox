@@ -22,11 +22,12 @@
 //!   the pass's own commit instead of waiting behind it.
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use tantivy::{Index, IndexReader, IndexWriter};
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use bbox_knowledge::knowledge::KnowledgeEntry;
 use bbox_stores::roadmap::RoadmapItem;
@@ -44,6 +45,15 @@ pub enum IndexWriteOp {
     UpsertThread(Box<Thread>),
     /// Full thread-store replacement from a point-in-time snapshot.
     UpsertThreadsStore(Vec<Thread>),
+    /// Idempotent retained projection of producer-owned operational records
+    /// plus any fleet transcript coordinates that must commit before ack.
+    UpsertOperationalRecords {
+        records: Vec<bro_capabilities::RecordEnvelope>,
+        transcript_targets:
+            std::collections::BTreeMap<String, bro_capabilities::TranscriptRecordTarget>,
+        transcript_roots: Vec<PathBuf>,
+        ack: mpsc::SyncSender<Result<()>>,
+    },
     /// Run a reindex pass inside the actor; ack carries the summary line.
     ReindexPass {
         full: bool,
@@ -156,6 +166,32 @@ impl IndexWriterActor {
             .recv()
             .map_err(|_| anyhow!("index writer actor dropped the flush ack"))
     }
+
+    /// Commit retained records and validated fleet transcript contents before
+    /// returning. A failed or ambiguous caller retries the durable record
+    /// batch; idempotent delete-plus-add projection makes replay harmless.
+    pub fn upsert_operational_records_blocking(
+        &self,
+        records: Vec<bro_capabilities::RecordEnvelope>,
+        transcript_targets: std::collections::BTreeMap<
+            String,
+            bro_capabilities::TranscriptRecordTarget,
+        >,
+        transcript_roots: Vec<PathBuf>,
+    ) -> Result<()> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(IndexWriteOp::UpsertOperationalRecords {
+                records,
+                transcript_targets,
+                transcript_roots,
+                ack,
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the record ingest ack"))?
+    }
 }
 
 fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
@@ -175,12 +211,30 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 let result = run_pass(&ctx, &rx, full, dirty);
                 let _ = ack.send(result);
             }
+            IndexWriteOp::UpsertOperationalRecords {
+                records,
+                transcript_targets,
+                transcript_roots,
+                ack,
+            } => {
+                let result = run_operational_record_upsert(
+                    &ctx,
+                    &records,
+                    &transcript_targets,
+                    &transcript_roots,
+                );
+                let _ = ack.send(result);
+            }
             first => {
                 let mut batch = vec![first];
                 while batch.len() < MAX_BATCH_OPS {
                     match rx.try_recv() {
                         Ok(pass @ IndexWriteOp::ReindexPass { .. }) => {
                             deferred = Some(pass);
+                            break;
+                        }
+                        Ok(records @ IndexWriteOp::UpsertOperationalRecords { .. }) => {
+                            deferred = Some(records);
                             break;
                         }
                         Ok(op) => batch.push(op),
@@ -195,6 +249,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
 }
 
 /// Apply a batch of small ops under one writer and one commit.
+#[allow(clippy::disallowed_methods)] // This function executes on the sole IndexWriterActor thread.
 fn process_batch(ctx: &ActorCtx, batch: Vec<IndexWriteOp>) {
     let mut flush_acks: Vec<mpsc::SyncSender<()>> = Vec::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -257,6 +312,11 @@ fn run_pass(
                             "a reindex pass is already running; retry after it completes"
                         )));
                     }
+                    IndexWriteOp::UpsertOperationalRecords { ack, .. } => {
+                        let _ = ack.send(Err(anyhow!(
+                            "a reindex pass is running; retry record ingest after it completes"
+                        )));
+                    }
                     IndexWriteOp::Flush(ack) => pending_flushes.push(ack),
                     small => apply_small_op(ctx, writer, small),
                 }
@@ -276,10 +336,8 @@ fn run_pass(
         // Full rebuilds settle merge threads before publishing (the old
         // owned-writer path did this between commit and meta save; doing it
         // post-commit here preserves the settled-segments property).
-        if full {
-            if let Err(err) = writer.wait_merging_threads() {
-                tracing::warn!(error = %err, "index writer actor: wait_merging_threads failed");
-            }
+        if full && let Err(err) = writer.wait_merging_threads() {
+            tracing::warn!(error = %err, "index writer actor: wait_merging_threads failed");
         }
         post_commit(ctx);
     }
@@ -335,7 +393,9 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &threads,
             ),
         ),
-        IndexWriteOp::ReindexPass { .. } | IndexWriteOp::Flush(_) => {
+        IndexWriteOp::ReindexPass { .. }
+        | IndexWriteOp::UpsertOperationalRecords { .. }
+        | IndexWriteOp::Flush(_) => {
             debug_assert!(false, "control ops are routed before apply_small_op");
             return;
         }
@@ -343,6 +403,102 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
     if let Err(err) = result {
         tracing::warn!(error = %err, op = kind, "index writer actor: op failed; reindex pass will reconcile");
     }
+}
+
+// This acknowledged mutation runs on the sole writer actor thread and commits
+// before returning the producer receipt.
+#[allow(clippy::disallowed_methods)]
+fn run_operational_record_upsert(
+    ctx: &ActorCtx,
+    records: &[bro_capabilities::RecordEnvelope],
+    transcript_targets: &std::collections::BTreeMap<
+        String,
+        bro_capabilities::TranscriptRecordTarget,
+    >,
+    transcript_roots: &[PathBuf],
+) -> Result<()> {
+    let projections = transcript_targets
+        .values()
+        .map(|target| {
+            bbox_corpus_index::transcripts::harness_sessions::project_fleet_event_log(
+                Path::new(&target.path),
+                &target.session_id,
+                target.through_event_seq,
+                transcript_roots,
+                ctx.fields,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_SMALL_OPS)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    for projection in projections {
+        writer.delete_term(Term::from_field_text(
+            ctx.fields.file_path,
+            &projection.canonical_path,
+        ));
+        for document in projection.documents {
+            writer.add_document(document)?;
+        }
+    }
+    apply_operational_record_upserts(&mut writer, ctx.fields, records)?;
+    writer.commit()?;
+    post_commit(ctx);
+    Ok(())
+}
+
+#[allow(clippy::disallowed_methods)] // Caller already owns the actor's sole IndexWriter.
+pub(super) fn apply_operational_record_upserts(
+    writer: &mut IndexWriter,
+    fields: FieldHandles,
+    records: &[bro_capabilities::RecordEnvelope],
+) -> Result<()> {
+    for record in records {
+        writer.delete_term(Term::from_field_text(fields.entity_id, &record.record_id));
+        let record_path = format!("record://{}/{}", record.producer, record.cursor);
+        let mut document = TantivyDocument::new();
+        document.add_text(fields.doc_type, "operational_record");
+        document.add_text(fields.parser_version, "record-v1");
+        document.add_text(fields.content, operational_record_search_text(record));
+        document.add_text(
+            fields.session_id,
+            record.subject.as_deref().unwrap_or(&record.record_id),
+        );
+        document.add_text(fields.account, &record.producer);
+        document.add_text(
+            fields.project,
+            record.subject.as_deref().unwrap_or(&record.producer),
+        );
+        document.add_text(fields.role, "record");
+        document.add_text(fields.file_path, &record_path);
+        document.add_text(fields.path_tokens, &record_path);
+        document.add_u64(fields.byte_offset, record.cursor.parse::<u64>()?);
+        document.add_u64(fields.is_subagent, 0);
+        document.add_text(fields.chunk_kind, &record.kind);
+        document.add_text(fields.entity_id, &record.record_id);
+        if let Some(timestamp) = &record.occurred_at {
+            document.add_text(fields.timestamp, timestamp);
+        }
+        if let Some(task_id) = record.attributes.get("task_id") {
+            document.add_text(fields.task_id, task_id);
+        }
+        writer.add_document(document)?;
+    }
+    Ok(())
+}
+
+fn operational_record_search_text(record: &bro_capabilities::RecordEnvelope) -> String {
+    let mut parts = vec![record.kind.clone(), record.producer.clone()];
+    if let Some(subject) = &record.subject {
+        parts.push(subject.clone());
+    }
+    parts.extend(
+        record
+            .attributes
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}")),
+    );
+    parts.push(record.payload.to_string());
+    parts.join("\n")
 }
 
 fn knowledge_path(config: &ReindexConfig) -> &Path {
@@ -427,6 +583,9 @@ fn create_writer(index: &Index, heap: usize) -> Result<IndexWriter> {
 }
 
 #[cfg(test)]
+// Writer-actor fixtures intentionally seed and inspect temporary indexes and
+// retained-record files.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::index::{SearchParams, TranscriptIndex};
@@ -575,7 +734,7 @@ mod tests {
         // store-doc phase re-adds it after delete_all_documents.
         let kb_path = dir.path().join("kb.json");
         let entry = test_entry("eeee5555", "florp durable entry");
-        persist_kb_entries(&kb_path, &[entry.clone()]);
+        persist_kb_entries(&kb_path, std::slice::from_ref(&entry));
 
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(entry)));
         actor.flush_blocking().unwrap();
@@ -587,5 +746,153 @@ mod tests {
             search(&index, "florp").contains("florp"),
             "full rebuild must re-add store-backed docs"
         );
+    }
+
+    #[test]
+    fn operational_record_replay_is_one_searchable_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+        let record = bro_capabilities::RecordEnvelope {
+            record_id: "operation-record-1".into(),
+            producer: "blackopsd".into(),
+            cursor: "17".into(),
+            kind: "operation.completed".into(),
+            occurred_at: Some("2026-07-14T12:00:00Z".into()),
+            subject: Some("operation-1".into()),
+            attributes: std::collections::BTreeMap::from([("task_id".into(), "task-1".into())]),
+            payload: serde_json::json!({"answer": "record-index-needle"}),
+        };
+
+        actor
+            .upsert_operational_records_blocking(
+                vec![record.clone()],
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        actor
+            .upsert_operational_records_blocking(
+                vec![record],
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let hits = index
+            .hybrid_bm25_hits("record-index-needle", 10, Some("operational_record"))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "operation-record-1");
+    }
+
+    #[test]
+    fn full_pass_restores_retained_operational_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let record = bro_capabilities::RecordEnvelope {
+            record_id: "operation-record-retained".into(),
+            producer: "blackopsd".into(),
+            cursor: "23".into(),
+            kind: "operation.completed".into(),
+            occurred_at: Some("2026-07-14T12:00:00Z".into()),
+            subject: Some("operation-retained".into()),
+            attributes: std::collections::BTreeMap::new(),
+            payload: serde_json::json!({"answer": "record-rebuild-needle"}),
+        };
+        let mut snapshot = bro_capabilities::RecordArchiveSnapshot::default();
+        snapshot
+            .records
+            .insert(record.record_id.clone(), record.clone());
+        snapshot
+            .producer_cursors
+            .insert(record.producer.clone(), record.cursor.clone());
+        let record_dir = root.join("record-ingest");
+        std::fs::create_dir_all(&record_dir).unwrap();
+        let record_path = record_dir.join("records.json");
+        std::fs::write(&record_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let mut index = test_index(&root);
+        index.set_operational_records_path(record_path);
+        let actor = IndexWriterActor::spawn_for(&index);
+        actor.run_reindex_pass(true, true).unwrap();
+        actor.run_reindex_pass(true, true).unwrap();
+
+        let hits = index
+            .hybrid_bm25_hits("record-rebuild-needle", 10, Some("operational_record"))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_id, "operation-record-retained");
+    }
+
+    #[test]
+    fn fleet_transcript_coordinate_commits_actual_content_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let worker_root = root.join("fleet-workers");
+        let worker_dir = worker_root.join("worker-1");
+        std::fs::create_dir_all(&worker_dir).unwrap();
+        let event_log = worker_dir.join("events.jsonl");
+        let body = [
+            serde_json::json!({
+                "ts": "2026-07-14T12:00:00Z",
+                "event_seq": 1,
+                "event": {
+                    "type": "harness_milestone",
+                    "milestone": "session_start",
+                    "session_id": "session-1",
+                    "provider": "glm",
+                    "transport": "anthropic",
+                    "model": "glm-test",
+                    "cwd": "/repo/test"
+                }
+            }),
+            serde_json::json!({
+                "ts": "2026-07-14T12:00:01Z",
+                "event_seq": 2,
+                "event": {
+                    "type": "assistant",
+                    "session_id": "session-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "actor-transcript-needle"}]
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+        std::fs::write(&event_log, body).unwrap();
+        let record = bro_capabilities::RecordEnvelope {
+            record_id: "fleetd:event:worker-1:2".into(),
+            producer: "fleetd".into(),
+            cursor: "1".into(),
+            kind: "session.event_committed".into(),
+            occurred_at: None,
+            subject: Some("session-1".into()),
+            attributes: std::collections::BTreeMap::from([
+                ("worker_id".into(), "worker-1".into()),
+                ("session_id".into(), "session-1".into()),
+                ("event_seq".into(), "2".into()),
+            ]),
+            payload: serde_json::json!({
+                "transcript_path": event_log,
+                "through_event_seq": 2
+            }),
+        };
+        let targets =
+            bro_capabilities::transcript_record_targets(std::slice::from_ref(&record)).unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+        actor
+            .upsert_operational_records_blocking(vec![record], targets, vec![worker_root])
+            .unwrap();
+
+        let hits = index
+            .hybrid_bm25_hits("actor-transcript-needle", 10, Some("transcript"))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }

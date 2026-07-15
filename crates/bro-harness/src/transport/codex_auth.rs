@@ -2,11 +2,17 @@
 //! harness is self-sufficient (usable without the blackbox daemon) yet shares
 //! credential state with the Codex CLI.
 //!
-//! Reads `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`). If the access
-//! token is within a skew window of expiry, refreshes it against the OpenAI
-//! OAuth endpoint (`grant_type=refresh_token`) and writes the rotated tokens
-//! back to the same file — under an advisory file lock, atomically — exactly
-//! as the Codex CLI does. Refresh is rare (access tokens last ~days).
+//! Standalone mode reads `$CODEX_HOME/auth.json` (default
+//! `~/.codex/auth.json`). If the access token is within a skew window of
+//! expiry, it refreshes against the OpenAI OAuth endpoint
+//! (`grant_type=refresh_token`) and writes the rotated tokens back to the same
+//! file under an advisory lock, atomically, as the Codex CLI does.
+//!
+//! Daemon mode instead receives the already-read auth document through the
+//! task-local `BRO_HARNESS_CODEX_AUTH_JSON` session environment. The worker
+//! never opens the provider's credential source. Rotated tokens replace only
+//! that task-local value in memory; they are neither placed in process-global
+//! environment nor written back through the worker sandbox.
 //!
 //! Endpoint + client id are the Codex public OAuth client, overridable via
 //! `CODEX_OAUTH_TOKEN_URL` / `CODEX_OAUTH_CLIENT_ID`. Skew via
@@ -23,6 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_SKEW_SECS: i64 = 300;
+const INLINE_CODEX_AUTH_ENV: &str = "BRO_HARNESS_CODEX_AUTH_JSON";
 
 pub struct ChatGptAuth {
     pub access_token: String,
@@ -38,6 +45,9 @@ fn codex_home() -> PathBuf {
 /// Load auth, refreshing the access token if near expiry, and return the
 /// (possibly refreshed) access token + account id.
 pub async fn load_fresh(http: &reqwest::Client) -> Result<ChatGptAuth> {
+    if let Some(raw) = super::session_var(INLINE_CODEX_AUTH_ENV) {
+        return load_inline_and_maybe_refresh(http, &raw, false).await;
+    }
     with_auth_lock(|auth_path| load_and_maybe_refresh(http, auth_path, /*force*/ false)).await
 }
 
@@ -47,7 +57,28 @@ pub async fn load_fresh(http: &reqwest::Client) -> Result<ChatGptAuth> {
 /// recover in-band instead of failing the turn. Mirrors codex's
 /// `UnauthorizedRecovery` reload→refresh step.
 pub async fn force_refresh(http: &reqwest::Client) -> Result<ChatGptAuth> {
+    if let Some(raw) = super::session_var(INLINE_CODEX_AUTH_ENV) {
+        return load_inline_and_maybe_refresh(http, &raw, true).await;
+    }
     with_auth_lock(|auth_path| load_and_maybe_refresh(http, auth_path, /*force*/ true)).await
+}
+
+async fn load_inline_and_maybe_refresh(
+    http: &reqwest::Client,
+    raw: &str,
+    force: bool,
+) -> Result<ChatGptAuth> {
+    let mut value: Value = serde_json::from_str(raw).context("parse inline Codex auth")?;
+    let (auth, refreshed) = load_and_maybe_refresh_value(http, &mut value, force).await?;
+    if refreshed {
+        let rotated =
+            serde_json::to_string(&value).context("serialize rotated inline Codex auth")?;
+        anyhow::ensure!(
+            super::set_session_var(INLINE_CODEX_AUTH_ENV, rotated),
+            "inline Codex auth rotation requires task-local session ownership"
+        );
+    }
+    Ok(auth)
 }
 
 /// Run `f` under an exclusive advisory lock on the auth.json sidecar so
@@ -82,48 +113,63 @@ async fn load_and_maybe_refresh(
 ) -> Result<ChatGptAuth> {
     let body = std::fs::read_to_string(&auth_path)
         .with_context(|| format!("read {}", auth_path.display()))?;
-    let mut v: Value = serde_json::from_str(&body).context("parse auth.json")?;
+    let mut value: Value = serde_json::from_str(&body).context("parse auth.json")?;
+    let (auth, refreshed) = load_and_maybe_refresh_value(http, &mut value, force).await?;
+    if refreshed {
+        write_back(&auth_path, &value)?;
+    }
+    Ok(auth)
+}
 
-    let account_id = account_id_from(&v).context(
+async fn load_and_maybe_refresh_value(
+    http: &reqwest::Client,
+    value: &mut Value,
+    force: bool,
+) -> Result<(ChatGptAuth, bool)> {
+    let account_id = account_id_from(value).context(
         "auth.json missing tokens.account_id and id_token carried no chatgpt_account_id claim",
     )?;
-    let access_token = v["tokens"]["access_token"]
+    let access_token = value["tokens"]["access_token"]
         .as_str()
         .context("auth.json missing tokens.access_token")?
         .to_string();
 
     if !force && !needs_refresh(&access_token) {
-        return Ok(ChatGptAuth {
-            access_token,
-            account_id,
-        });
+        return Ok((
+            ChatGptAuth {
+                access_token,
+                account_id,
+            },
+            false,
+        ));
     }
 
-    let refresh_token = v["tokens"]["refresh_token"]
+    let refresh_token = value["tokens"]["refresh_token"]
         .as_str()
         .context("token near expiry but auth.json has no refresh_token")?
         .to_string();
 
     tracing::info!(force, "refreshing codex access token");
     let refreshed = refresh(http, &refresh_token).await?;
-    merge_refresh(&mut v, &refreshed);
-    write_back(&auth_path, &v)?;
+    merge_refresh(value, &refreshed);
 
-    let access_token = v["tokens"]["access_token"]
+    let access_token = value["tokens"]["access_token"]
         .as_str()
         .context("refreshed auth.json missing access_token")?
         .to_string();
-    Ok(ChatGptAuth {
-        access_token,
-        account_id,
-    })
+    Ok((
+        ChatGptAuth {
+            access_token,
+            account_id,
+        },
+        true,
+    ))
 }
 
 /// True if the JWT `exp` is missing/within skew of now. A non-JWT (opaque)
 /// token returns false — we use it as-is and let a 401 trigger re-auth.
 fn needs_refresh(access_token: &str) -> bool {
-    let skew = std::env::var("CODEX_OAUTH_REFRESH_SKEW_SECS")
-        .ok()
+    let skew = super::session_var("CODEX_OAUTH_REFRESH_SKEW_SECS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SKEW_SECS);
     match jwt_exp(access_token) {
@@ -174,10 +220,10 @@ struct Refreshed {
 }
 
 async fn refresh(http: &reqwest::Client, refresh_token: &str) -> Result<Refreshed> {
-    let token_url =
-        std::env::var("CODEX_OAUTH_TOKEN_URL").unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_string());
-    let client_id =
-        std::env::var("CODEX_OAUTH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
+    let token_url = super::session_var("CODEX_OAUTH_TOKEN_URL")
+        .unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string());
+    let client_id = super::session_var("CODEX_OAUTH_CLIENT_ID")
+        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -241,9 +287,14 @@ fn write_back(auth_path: &std::path::Path, v: &Value) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
 
     #[test]
     fn jwt_exp_decodes() {
@@ -305,5 +356,101 @@ mod tests {
         assert_eq!(v["tokens"]["account_id"], "acct-1"); // preserved
         assert_eq!(v["auth_mode"], "chatgpt"); // preserved
         assert!(v["last_refresh"].is_string());
+    }
+
+    #[tokio::test]
+    async fn inline_daemon_auth_never_opens_codex_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let forbidden_home = root.join("must-not-be-created");
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":9999999999}"#);
+        let access_token = format!("h.{payload}.sig");
+        let inline = json!({
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "refresh-source",
+                "account_id": "acct-inline"
+            }
+        })
+        .to_string();
+        let vars = BTreeMap::from([
+            (INLINE_CODEX_AUTH_ENV.to_string(), inline),
+            (
+                "CODEX_HOME".to_string(),
+                forbidden_home.display().to_string(),
+            ),
+        ]);
+
+        let auth = super::super::with_session_env(vars, load_fresh(&reqwest::Client::new()))
+            .await
+            .unwrap();
+
+        assert_eq!(auth.account_id, "acct-inline");
+        assert_eq!(auth.access_token, access_token);
+        assert!(!forbidden_home.exists());
+    }
+
+    #[tokio::test]
+    async fn inline_refresh_rotates_only_task_local_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let codex_home = root.join(".codex");
+        std::fs::create_dir(&codex_home).unwrap();
+        let source_path = codex_home.join("auth.json");
+        let source_body = r#"{"tokens":{"access_token":"source-access","refresh_token":"source-refresh","account_id":"source-account"}}"#;
+        std::fs::write(&source_path, source_body).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("grant_type=refresh_token"));
+            assert!(request.contains("refresh_token=inline-refresh"));
+            let body = r#"{"access_token":"rotated-access","id_token":"rotated-id","refresh_token":"rotated-refresh"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let inline = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "inline-access",
+                "refresh_token": "inline-refresh",
+                "account_id": "acct-inline"
+            }
+        })
+        .to_string();
+        let vars = BTreeMap::from([
+            (INLINE_CODEX_AUTH_ENV.to_string(), inline),
+            ("CODEX_HOME".to_string(), codex_home.display().to_string()),
+            ("CODEX_OAUTH_TOKEN_URL".to_string(), endpoint),
+            ("CODEX_OAUTH_CLIENT_ID".to_string(), "test-client".into()),
+        ]);
+
+        super::super::with_session_env(vars, async {
+            let auth = force_refresh(&reqwest::Client::new()).await.unwrap();
+            assert_eq!(auth.access_token, "rotated-access");
+            assert_eq!(auth.account_id, "acct-inline");
+            let rotated: Value =
+                serde_json::from_str(&super::super::session_var(INLINE_CODEX_AUTH_ENV).unwrap())
+                    .unwrap();
+            assert_eq!(rotated["tokens"]["access_token"], "rotated-access");
+            assert_eq!(rotated["tokens"]["refresh_token"], "rotated-refresh");
+            assert_eq!(rotated["tokens"]["id_token"], "rotated-id");
+        })
+        .await;
+        server.await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(source_path).unwrap(), source_body);
     }
 }

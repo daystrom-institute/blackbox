@@ -12,29 +12,27 @@ pub(super) fn resolve_entity(
     let mut resolved = entity.clone();
 
     // rank lookup: entity[rank_lookup_key] is a name → packet.rank_table[name] → int
-    if !packet.rank_table.is_empty() {
-        if let Some(serde_json::Value::String(key)) = entity.get(&packet.rank_lookup_key) {
-            if let Some(rank) = packet.rank_table.get(key) {
-                resolved.insert(
-                    format!("{}_rank", packet.rank_lookup_key),
-                    serde_json::Value::Number((*rank).into()),
-                );
-            }
-        }
+    if !packet.rank_table.is_empty()
+        && let Some(serde_json::Value::String(key)) = entity.get(&packet.rank_lookup_key)
+        && let Some(rank) = packet.rank_table.get(key)
+    {
+        resolved.insert(
+            format!("{}_rank", packet.rank_lookup_key),
+            serde_json::Value::Number((*rank).into()),
+        );
     }
 
-    if !packet.threshold_table.is_empty() {
-        if let Some(serde_json::Value::String(key)) = entity.get(&packet.threshold_lookup_key) {
-            if let Some(threshold) = packet.threshold_table.get(key) {
-                // Convention: res_threshold (from "resource" → "res_threshold")
-                let field_name = if packet.threshold_lookup_key == "resource" {
-                    "res_threshold".to_string()
-                } else {
-                    format!("{}_threshold", packet.threshold_lookup_key)
-                };
-                resolved.insert(field_name, serde_json::Value::Number((*threshold).into()));
-            }
-        }
+    if !packet.threshold_table.is_empty()
+        && let Some(serde_json::Value::String(key)) = entity.get(&packet.threshold_lookup_key)
+        && let Some(threshold) = packet.threshold_table.get(key)
+    {
+        // Convention: res_threshold (from "resource" → "res_threshold")
+        let field_name = if packet.threshold_lookup_key == "resource" {
+            "res_threshold".to_string()
+        } else {
+            format!("{}_threshold", packet.threshold_lookup_key)
+        };
+        resolved.insert(field_name, serde_json::Value::Number((*threshold).into()));
     }
 
     resolved
@@ -161,10 +159,10 @@ pub(super) fn resolve_collection(
 pub(super) fn unwrap_jsonish(v: &mut serde_json::Value) {
     if let serde_json::Value::String(s) = v {
         let trimmed = s.trim_start();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                *v = parsed;
-            }
+        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+        {
+            *v = parsed;
         }
     }
 }

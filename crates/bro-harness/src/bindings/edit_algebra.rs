@@ -180,11 +180,11 @@ impl Tool for EditsBegin {
 /// these just absorb the obvious slips instead of bouncing the cell on a
 /// field-nameless serde error.
 fn normalize_algebra_input(mut input: Value) -> Value {
-    if let Some(es) = input.get("es") {
-        if let Some(inner) = es.get("es").and_then(Value::as_str) {
-            let inner = inner.to_string();
-            input["es"] = Value::String(inner);
-        }
+    if let Some(es) = input.get("es")
+        && let Some(inner) = es.get("es").and_then(Value::as_str)
+    {
+        let inner = inner.to_string();
+        input["es"] = Value::String(inner);
     }
     if let Some(span) = input.get("span")
         && let Some(raw) = span.as_str()
@@ -1131,6 +1131,8 @@ pub fn tools(store: Arc<EditStore>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dy
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise the single mutation choke point.
+#[allow(clippy::disallowed_methods, clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1139,6 +1141,7 @@ mod tests {
 
     fn cx_in(dir: &Path) -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

@@ -5,6 +5,10 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub mod dispatch;
+pub mod sections;
+pub mod shadow_selector;
+pub mod window;
+pub mod world_state;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentRole {

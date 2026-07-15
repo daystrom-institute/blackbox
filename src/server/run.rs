@@ -1,3 +1,4 @@
+use super::RuntimeRole;
 use super::background::start_background_tasks;
 use super::mcp::build_http_app;
 use super::open::open_shared_state;
@@ -11,25 +12,32 @@ pub async fn run() -> anyhow::Result<()> {
     let migrated = util::migrate_legacy_defaults(&home)?;
     init_logging(&home, migrated);
 
-    let opened = open_shared_state(&home)?;
+    let runtime_role = RuntimeRole::from_env()?;
+    let opened = open_shared_state(&home, runtime_role)?;
     let cfg = opened.cfg;
     let shared = opened.shared;
     let store_dir = opened.store_dir;
     let bind_host = opened.bind_host;
     let bind_is_loopback = opened.bind_is_loopback;
-    start_background_tasks(shared.clone()).await?;
+    if runtime_role == RuntimeRole::Corpus && !bind_is_loopback {
+        anyhow::bail!(
+            "blackboxd corpus role exposes private capability and record endpoints and must bind to loopback"
+        );
+    }
+    start_background_tasks(shared.clone(), runtime_role).await?;
 
     // MCP service
     let port = cfg.daemon.port;
 
     let ct = CancellationToken::new();
-    let app = build_http_app(shared.clone(), &cfg, &ct);
+    let app = build_http_app(shared.clone(), &cfg, &ct, runtime_role);
 
     // Bind address resolved above (hoisted so SharedState gets the
     // loopback flag). Default `127.0.0.1`; BBOX_BIND=0.0.0.0 opens
     // the listener to docker-bridged peers — closed-network only.
     let listener = tokio::net::TcpListener::bind(format!("{bind_host}:{port}")).await?;
     tracing::info!(
+        role = runtime_role.as_str(),
         "blackboxd listening on http://{bind_host}:{port}/mcp (loopback={bind_is_loopback})"
     );
 
@@ -40,6 +48,7 @@ pub async fn run() -> anyhow::Result<()> {
         store_dir,
         ct,
         cfg.daemon.shutdown_grace_secs,
+        runtime_role,
     )
     .await
 }

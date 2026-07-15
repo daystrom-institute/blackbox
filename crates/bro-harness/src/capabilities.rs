@@ -7,13 +7,14 @@
 //! registration is derived from that value, so sessions can carry different
 //! authority without mutating process-global state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup, ExecutionCapability,
-    RefactorCapability, RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
+    AgentCapability, AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup,
+    ExecutionCapability, RefactorCapability, RefactorRequest, ToolCallOutput, ToolCapability,
+    ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
@@ -33,6 +34,16 @@ pub struct HarnessSessionServices {
     atoms: Option<Arc<dyn AtomCapability>>,
     refactor: Option<Arc<dyn RefactorCapability>>,
     execution: Option<Arc<dyn ExecutionCapability>>,
+    agent: Option<Arc<dyn AgentCapability>>,
+    remote_policy: Option<RemoteServicePolicy>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RemoteServicePolicy {
+    pub allowed_capabilities: BTreeSet<String>,
+    pub downstream_availability: bro_protocol::DownstreamServiceAvailability,
+    pub connected: bool,
+    pub revision: bro_protocol::PolicyIdentity,
 }
 
 impl HarnessSessionServices {
@@ -66,6 +77,31 @@ impl HarnessSessionServices {
         self
     }
 
+    pub fn with_agent(mut self, capability: Arc<dyn AgentCapability>) -> Self {
+        self.agent = Some(capability);
+        self
+    }
+
+    pub(crate) fn with_remote_policy(
+        mut self,
+        allowed_capabilities: impl IntoIterator<Item = String>,
+        downstream_availability: bro_protocol::DownstreamServiceAvailability,
+        connected: bool,
+        revision: bro_protocol::PolicyIdentity,
+    ) -> Self {
+        self.remote_policy = Some(RemoteServicePolicy {
+            allowed_capabilities: allowed_capabilities.into_iter().collect(),
+            downstream_availability,
+            connected,
+            revision,
+        });
+        self
+    }
+
+    pub(crate) fn remote_policy(&self) -> Option<&RemoteServicePolicy> {
+        self.remote_policy.as_ref()
+    }
+
     pub fn tool(&self) -> Option<Arc<dyn ToolCapability>> {
         self.tool.clone()
     }
@@ -84,6 +120,10 @@ impl HarnessSessionServices {
 
     pub fn execution(&self) -> Option<Arc<dyn ExecutionCapability>> {
         self.execution.clone()
+    }
+
+    pub fn agent(&self) -> Option<Arc<dyn AgentCapability>> {
+        self.agent.clone()
     }
 
     /// Resolve the session's generic tool seam, installing the worker-local
@@ -108,6 +148,9 @@ impl HarnessSessionServices {
         if let Some(r) = self.refactor() {
             tools.push(Arc::new(RefactorPlanTool(r.clone())));
             tools.push(Arc::new(RefactorPlanGetTool(r)));
+        }
+        if let Some(agent) = self.agent() {
+            tools.extend(crate::agent_tools::tools(agent));
         }
         tools
     }
@@ -156,11 +199,14 @@ impl ToolCapability for HostTools {
                 ),
             )
         })?;
+        let invocation_cx = self
+            .cx
+            .for_invocation(Arc::<str>::from(invocation.invocation_id));
         let (content, is_error, content_type) = match crate::registry::call_tool_with_arg_defaults(
             tool.as_ref(),
             &invocation.name,
             invocation.input_json,
-            &self.cx,
+            &invocation_cx,
         )
         .await
         {
@@ -267,18 +313,26 @@ impl Tool for AtomInvokeTool {
         })
     }
 
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let atom = match input.get("atom").and_then(Value::as_str) {
             Some(a) if !a.trim().is_empty() => a.to_string(),
             _ => return ToolResult::Error("atom_invoke: `atom` ref is required".into()),
         };
         let input_json = input.get("args").cloned().unwrap_or_else(|| json!({}));
+        let Some(invocation_id) = cx.invocation_id() else {
+            return ToolResult::Error(
+                "atom capability call is missing its stable tool invocation identity".into(),
+            );
+        };
         match self
             .0
-            .invoke_atom(AtomInvocation {
-                atom: AtomRef::new(atom),
-                input_json,
-            })
+            .invoke_atom_for_invocation(
+                invocation_id,
+                AtomInvocation {
+                    atom: AtomRef::new(atom),
+                    input_json,
+                },
+            )
             .await
         {
             Ok(out) => ToolResult::Json(out.output_json),
@@ -409,6 +463,7 @@ mod tests {
         use std::sync::Mutex;
         // corpus_search ignores cx, so a minimal context is sufficient.
         ToolCx {
+            invocation_id: Some(Arc::from("test-capability-call")),
             root: std::env::temp_dir(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -651,6 +706,7 @@ mod tests {
         // for a missing path, which is is_error=true, NOT tool_unavailable).
         let read = host
             .call_tool(ToolInvocation {
+                invocation_id: "test-file-read-call".into(),
                 name: "file_read".to_string(),
                 input_json: json!({ "file_path": "definitely-missing.xyz" }),
             })
@@ -661,6 +717,7 @@ mod tests {
         // shell_run was denied → absent from the in-box set → fail closed.
         let denied = host
             .call_tool(ToolInvocation {
+                invocation_id: "test-shell-call".into(),
                 name: "shell_run".to_string(),
                 input_json: json!({ "command": "echo nope" }),
             })

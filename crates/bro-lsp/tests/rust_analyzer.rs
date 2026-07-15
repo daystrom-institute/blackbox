@@ -6,22 +6,23 @@ use lsp_types::{Diagnostic, DiagnosticSeverity};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rust_analyzer_diagnostics_follow_document_versions() -> anyhow::Result<()> {
-    let Some(rust_analyzer) = rust_analyzer_bin() else {
+    let Some(rust_analyzer) = rust_analyzer_bin().await else {
         eprintln!("skipping rust-analyzer integration test: rust-analyzer not found");
         return Ok(());
     };
 
     let dir = tempfile::tempdir()?;
-    let root = dir.path().canonicalize()?;
-    std::fs::create_dir(root.join("src"))?;
-    std::fs::write(
+    let root = tokio::fs::canonicalize(dir.path()).await?;
+    tokio::fs::create_dir(root.join("src")).await?;
+    tokio::fs::write(
         root.join("Cargo.toml"),
         r#"[package]
 name = "bro_lsp_ra_fixture"
 version = "0.1.0"
 edition = "2024"
 "#,
-    )?;
+    )
+    .await?;
 
     let source_path = root.join("src/lib.rs");
     let clean = r#"pub fn value() -> u32 {
@@ -34,7 +35,7 @@ edition = "2024"
     x
 }
 "#;
-    std::fs::write(&source_path, clean)?;
+    tokio::fs::write(&source_path, clean).await?;
 
     let pool = SessionPool::new(LspConfig {
         request_timeout: Duration::from_secs(90),
@@ -94,28 +95,29 @@ async fn wait_for_diagnostics(
     }
 }
 
-fn rust_analyzer_bin() -> Option<PathBuf> {
+async fn rust_analyzer_bin() -> Option<PathBuf> {
     if let Some(path) = env_path("BRO_LSP_RUST_ANALYZER_BIN")
         .or_else(|| env_path("BRO_RUST_ANALYZER_BIN"))
         .or_else(|| env_path("BLACKBOX_RUST_ANALYZER_BIN"))
-        .filter(|path| command_runs(path))
+        && command_runs(&path).await
     {
         return Some(path);
     }
 
-    if command_runs("rust-analyzer") {
+    if command_runs("rust-analyzer").await {
         return Some(PathBuf::from("rust-analyzer"));
     }
 
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let cargo_bin = home.join(".cargo/bin/rust-analyzer");
-    command_runs(&cargo_bin).then_some(cargo_bin)
+    command_runs(&cargo_bin).await.then_some(cargo_bin)
 }
 
-fn command_runs(path: impl AsRef<std::ffi::OsStr>) -> bool {
-    std::process::Command::new(path)
+async fn command_runs(path: impl AsRef<std::ffi::OsStr>) -> bool {
+    tokio::process::Command::new(path)
         .arg("--version")
         .output()
+        .await
         .is_ok_and(|output| output.status.success())
 }
 

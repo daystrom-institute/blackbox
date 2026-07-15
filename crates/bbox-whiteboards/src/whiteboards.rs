@@ -477,14 +477,14 @@ pub fn detect_conflicts(board: &Board) -> Vec<Conflict> {
             for j in (i + 1)..posts.len() {
                 let a = posts[i];
                 let b = posts[j];
-                if let (Some(la), Some(lb)) = (&a.target_location, &b.target_location) {
-                    if la == lb {
-                        out.push(Conflict::DirectOverlap {
-                            posts: vec![a.id.clone(), b.id.clone()],
-                            target_file: (*file).to_string(),
-                            target_location: la.clone(),
-                        });
-                    }
+                if let (Some(la), Some(lb)) = (&a.target_location, &b.target_location)
+                    && la == lb
+                {
+                    out.push(Conflict::DirectOverlap {
+                        posts: vec![a.id.clone(), b.id.clone()],
+                        target_file: (*file).to_string(),
+                        target_location: la.clone(),
+                    });
                 }
             }
         }
@@ -678,6 +678,9 @@ impl WhiteboardRegistry {
 
     /// Set the base directory boards are persisted under. Idempotent.
     /// Loads any existing boards from disk on first call.
+    // Registry initialization is an explicitly synchronous persistence
+    // boundary; this leaf crate has no async runtime dependency.
+    #[allow(clippy::disallowed_methods)]
     pub fn set_storage_dir(&self, dir: PathBuf) -> Result<()> {
         let mut slot = self.storage_dir.write();
         if slot.is_some() {
@@ -716,6 +719,9 @@ impl WhiteboardRegistry {
             .map(|d| d.join(format!("{id}.json")))
     }
 
+    // Board mutation APIs are synchronous and commit their file atomically
+    // before returning to the caller.
+    #[allow(clippy::disallowed_methods)]
     fn persist(&self, id: &str, board: &Board) -> Result<()> {
         let Some(path) = self.board_path(id) else {
             return Ok(()); // Storage not configured (test mode).
@@ -820,6 +826,9 @@ impl WhiteboardRegistry {
         Ok(())
     }
 
+    // This parameter list is the stable typed post contract exposed by the
+    // existing tool adapters; grouping it would churn every consumer.
+    #[allow(clippy::too_many_arguments)]
     pub fn post(
         &self,
         id: &str,
@@ -868,6 +877,8 @@ impl WhiteboardRegistry {
         Ok(post_id)
     }
 
+    // This parameter list mirrors the stable annotation action schema.
+    #[allow(clippy::too_many_arguments)]
     pub fn annotate(
         &self,
         id: &str,
@@ -1049,6 +1060,9 @@ impl WhiteboardRegistry {
     /// `force=true` archives from ANY phase — the abandon path for boards
     /// stranded mid-phase by a failed arc (gap-0301dc75) — and requires a
     /// facilitator/operator role since it is a phase transition in effect.
+    // Archival is a synchronous durability boundary: write the archive and
+    // remove the active file before reporting success.
+    #[allow(clippy::disallowed_methods)]
     pub fn archive(&self, id: &str, agent_name: &str, force: bool) -> Result<ArchiveSummary> {
         let board_arc = self
             .boards
@@ -1333,12 +1347,11 @@ pub fn parse_board_actions(raw: &str) -> Result<Vec<BoardItem>> {
     // Salvage 2: outermost bracket-delimited spans (array preferred —
     // the documented contract shape — then object).
     for (open, close) in [('[', ']'), ('{', '}')] {
-        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close)) {
-            if start < end {
-                if let Ok(items) = parse_board_actions_strict(&trimmed[start..=end]) {
-                    return Ok(items);
-                }
-            }
+        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close))
+            && start < end
+            && let Ok(items) = parse_board_actions_strict(&trimmed[start..=end])
+        {
+            return Ok(items);
         }
     }
     Err(primary_err)

@@ -18,6 +18,11 @@ pub struct FreeformGrammar {
 /// Execution context handed to every tool call.
 #[derive(Clone)]
 pub struct ToolCx {
+    /// Stable identity of the model/provider tool call currently being
+    /// dispatched. The harness derives a fresh context for every flat or
+    /// code-mode nested call, so capability-backed effects can use this as an
+    /// idempotency key independently of the worker RPC request/response id.
+    pub invocation_id: Option<Arc<str>>,
     /// Worktree root — the cwd the harness was spawned in. All file/shell/git
     /// operations are scoped to (and validated against) this root.
     pub root: PathBuf,
@@ -52,6 +57,19 @@ pub struct ToolCx {
     /// `session_env`, this is daemon-trusted context and is never inherited by
     /// shell children.
     pub tool_arg_defaults: Arc<crate::tool_defaults::ToolArgDefaults>,
+}
+
+impl ToolCx {
+    /// Clone the session context for one stable tool invocation.
+    pub fn for_invocation(&self, invocation_id: impl Into<Arc<str>>) -> Self {
+        let mut scoped = self.clone();
+        scoped.invocation_id = Some(invocation_id.into());
+        scoped
+    }
+
+    pub fn invocation_id(&self) -> Option<&str> {
+        self.invocation_id.as_deref()
+    }
 }
 
 /// Run a synchronous, I/O-heavy tool body on tokio's blocking pool.

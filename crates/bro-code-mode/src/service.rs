@@ -486,6 +486,9 @@ impl CodeModeService {
             .await
             .reserve(cell_id.clone(), handle)?;
 
+        // Local addition (not vendored): retain the outer durable invocation
+        // identity for nested capability-effect deduplication.
+        let parent_tool_call_id = request.tool_call_id.clone();
         let runtime = spawn_runtime(stored_values, request, event_tx, pending_mode);
         let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = match runtime {
             Ok(runtime) => runtime,
@@ -505,6 +508,7 @@ impl CodeModeService {
             Arc::clone(&self.inner),
             CellControlContext {
                 cell_id,
+                parent_tool_call_id,
                 runtime_tx,
                 runtime_control_tx,
                 pending_mode,
@@ -793,6 +797,8 @@ enum CellActorState {
 
 struct CellControlContext {
     cell_id: CellId,
+    // Local addition (not vendored): see `CodeModeNestedToolCall`.
+    parent_tool_call_id: String,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_control_tx: std::sync::mpsc::Sender<RuntimeControlCommand>,
     pending_mode: PendingRuntimeMode,
@@ -981,6 +987,7 @@ async fn run_cell_control(
 ) {
     let CellControlContext {
         cell_id,
+        parent_tool_call_id,
         runtime_tx,
         runtime_control_tx,
         pending_mode,
@@ -1092,6 +1099,7 @@ async fn run_cell_control(
                             pending_tool_call_ids.push(id.clone());
                         }
                         let tool_call = CodeModeNestedToolCall {
+                            parent_tool_call_id: parent_tool_call_id.clone(),
                             cell_id: cell_id.clone(),
                             runtime_tool_call_id: id.clone(),
                             tool_name: name,
@@ -1352,6 +1360,71 @@ mod tests {
             source: source.to_string(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
+        }
+    }
+
+    /// Local addition (not vendored): deterministic pseudo-random schedules
+    /// keep lifecycle race failures reproducible without adding a test-only
+    /// dependency to the vendored crate.
+    struct RaceScheduleRng(u64);
+
+    impl RaceScheduleRng {
+        fn new(seed: u64) -> Self {
+            assert_ne!(seed, 0);
+            Self(seed)
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            value
+        }
+
+        fn below(&mut self, upper: u64) -> u64 {
+            self.next() % upper
+        }
+    }
+
+    /// Local addition (not vendored): one reproducible completion-versus-
+    /// termination interleaving. Lead bands guarantee both terminal causes are
+    /// covered, while the contended band lets the actor decide the real winner.
+    #[derive(Clone, Copy, Debug)]
+    struct CompletionTerminationSchedule {
+        completion_delay_ms: u64,
+        termination_delay_ms: u64,
+        completion_observer_yields: usize,
+        termination_yields: usize,
+        spawn_termination_first: bool,
+        late_wait_first: bool,
+    }
+
+    impl CompletionTerminationSchedule {
+        fn seeded(rng: &mut RaceScheduleRng, iteration: usize) -> Self {
+            let (completion_delay_ms, termination_delay_ms) = match iteration % 3 {
+                // Give the runtime a large randomized lead.
+                0 => (1 + rng.below(4), 30 + rng.below(20)),
+                // Give explicit termination a large randomized lead.
+                1 => (30 + rng.below(20), rng.below(4)),
+                // Keep both sides close enough for actor scheduling to decide.
+                _ => (2 + rng.below(10), 2 + rng.below(10)),
+            };
+            Self {
+                completion_delay_ms,
+                termination_delay_ms,
+                completion_observer_yields: rng.below(4) as usize,
+                termination_yields: rng.below(4) as usize,
+                spawn_termination_first: rng.below(2) == 0,
+                late_wait_first: rng.below(2) == 0,
+            }
+        }
+    }
+
+    async fn yield_for_schedule(count: usize) {
+        for _ in 0..count {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -1967,53 +2040,174 @@ await new Promise(() => {});
         );
     }
 
-    /// Local addition (not vendored): repeated real runtime races prove that
-    /// completion and termination publish one stable winner with matching store
-    /// visibility.
+    /// Local addition (not vendored): seeded, randomized real-runtime
+    /// interleavings prove that completion and termination publish one stable
+    /// winner with matching store visibility.
     #[tokio::test]
-    async fn completion_and_termination_race_has_one_stable_winner() {
-        let service = CodeModeService::new();
+    async fn seeded_completion_and_termination_races_have_one_stable_winner() {
+        const SEED: u64 = 0xc011_ec7e_7e12_a7ed;
+        const ITERATIONS: usize = 36;
 
-        for iteration in 0..24 {
+        let service = Arc::new(CodeModeService::new());
+        let mut rng = RaceScheduleRng::new(SEED);
+        let mut completed = 0;
+        let mut terminated = 0;
+
+        for iteration in 0..ITERATIONS {
+            let schedule = CompletionTerminationSchedule::seeded(&mut rng, iteration);
             let key = format!("winner-{iteration}");
             let started = service
                 .execute(ExecuteRequest {
-                    source: format!(r#"store("{key}", true);"#),
+                    source: format!(
+                        r#"
+store("{key}", true);
+await new Promise((resolve) => setTimeout(resolve, {}));
+text("completed");
+"#,
+                        schedule.completion_delay_ms
+                    ),
                     yield_time_ms: Some(60_000),
                     ..execute_request("")
                 })
                 .await
                 .unwrap();
             let racing_cell_id = started.cell_id.clone();
-            let (initial, terminate) = tokio::join!(
-                started.initial_response(),
-                service.terminate(racing_cell_id.clone())
-            );
-            let initial = initial.unwrap();
-            let terminate = terminate.unwrap();
-            let WaitOutcome::LiveCell(terminate) = terminate else {
-                panic!("racing cell must retain a terminal outcome");
-            };
-            assert_eq!(terminate, initial);
 
-            let late = service
-                .wait(WaitRequest {
-                    cell_id: racing_cell_id,
-                    yield_time_ms: 1,
+            let completion_task = || {
+                tokio::spawn(async move {
+                    yield_for_schedule(schedule.completion_observer_yields).await;
+                    started.initial_response().await
                 })
+            };
+            let termination_task = || {
+                let service = Arc::clone(&service);
+                let racing_cell_id = racing_cell_id.clone();
+                tokio::spawn(async move {
+                    yield_for_schedule(schedule.termination_yields).await;
+                    tokio::time::sleep(Duration::from_millis(schedule.termination_delay_ms)).await;
+                    service.terminate(racing_cell_id).await
+                })
+            };
+            let (completion_task, termination_task) = if schedule.spawn_termination_first {
+                let termination_task = termination_task();
+                let completion_task = completion_task();
+                (completion_task, termination_task)
+            } else {
+                let completion_task = completion_task();
+                let termination_task = termination_task();
+                (completion_task, termination_task)
+            };
+
+            let initial = tokio::time::timeout(Duration::from_secs(2), completion_task)
                 .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "completion observer timed out for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+                    )
+                })
+                .unwrap()
                 .unwrap();
-            assert_eq!(late, WaitOutcome::LiveCell(initial));
+            let terminate = tokio::time::timeout(Duration::from_secs(2), termination_task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "termination observer timed out for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            let WaitOutcome::LiveCell(terminate) = terminate else {
+                panic!(
+                    "racing cell lost its terminal outcome for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+                );
+            };
+            assert_eq!(
+                terminate, initial,
+                "terminal observers diverged for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+            );
+
+            let late_wait = || {
+                let service = Arc::clone(&service);
+                let racing_cell_id = racing_cell_id.clone();
+                tokio::spawn(async move {
+                    service
+                        .wait(WaitRequest {
+                            cell_id: racing_cell_id,
+                            yield_time_ms: 1,
+                        })
+                        .await
+                })
+            };
+            let late_terminate = || {
+                let service = Arc::clone(&service);
+                let racing_cell_id = racing_cell_id.clone();
+                tokio::spawn(async move { service.terminate(racing_cell_id).await })
+            };
+            let (late_wait, late_terminate) = if schedule.late_wait_first {
+                let late_wait = late_wait();
+                let late_terminate = late_terminate();
+                (late_wait, late_terminate)
+            } else {
+                let late_terminate = late_terminate();
+                let late_wait = late_wait();
+                (late_wait, late_terminate)
+            };
+            let late_wait = late_wait.await.unwrap().unwrap();
+            let late_terminate = late_terminate.await.unwrap().unwrap();
+            assert_eq!(
+                late_wait, late_terminate,
+                "late observers diverged for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+            );
+            let WaitOutcome::LiveCell(late_response) = late_wait else {
+                panic!(
+                    "late wait lost the terminal outcome for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+                );
+            };
+            assert_eq!(
+                late_response, initial,
+                "late observers changed the winner for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+            );
 
             let was_committed = service.inner.stored_values.lock().await.contains_key(&key);
-            match terminate {
+            match &initial {
                 RuntimeResponse::Result {
-                    error_text: None, ..
-                } => assert!(was_committed),
-                RuntimeResponse::Terminated { .. } => assert!(!was_committed),
-                other => panic!("unexpected race outcome: {other:?}"),
+                    error_text: None,
+                    content_items,
+                    ..
+                } => {
+                    completed += 1;
+                    assert!(
+                        was_committed,
+                        "completion did not publish its staged write for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+                    );
+                    assert_eq!(
+                        content_items,
+                        &[FunctionCallOutputContentItem::InputText {
+                            text: "completed".to_string(),
+                        }]
+                    );
+                }
+                RuntimeResponse::Terminated { .. } => {
+                    terminated += 1;
+                    assert!(
+                        !was_committed,
+                        "termination published a staged write for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+                    );
+                }
+                other => panic!(
+                    "unexpected race outcome {other:?} for seed {SEED:#x}, iteration {iteration}, schedule {schedule:?}"
+                ),
             }
         }
+
+        assert!(
+            completed > 0,
+            "seed {SEED:#x} did not exercise a completion winner"
+        );
+        assert!(
+            terminated > 0,
+            "seed {SEED:#x} did not exercise a termination winner"
+        );
     }
 
     #[tokio::test]
@@ -3014,6 +3208,7 @@ image({
             inner,
             CellControlContext {
                 cell_id: cell_id("cell-1"),
+                parent_tool_call_id: "test-parent-call".to_string(),
                 runtime_tx: runtime_tx.clone(),
                 runtime_control_tx,
                 pending_mode: PendingRuntimeMode::Continue,

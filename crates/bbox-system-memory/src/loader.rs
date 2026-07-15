@@ -102,6 +102,9 @@ pub fn parse_memory_file(slug: &str, raw_content: &str) -> Result<RawMemory> {
     })
 }
 
+// Catalog loading is a synchronous cold-start boundary; deterministic sorting
+// requires completing the directory snapshot before catalog construction.
+#[allow(clippy::disallowed_methods)]
 fn list_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("unable to list directory {}", dir.display()))?
@@ -119,6 +122,8 @@ fn list_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(entries)
 }
 
+// Memory bodies are synchronously read into an immutable in-memory catalog.
+#[allow(clippy::disallowed_methods)]
 pub fn load_dir(dir: &Path) -> Result<Vec<RawMemory>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -150,6 +155,8 @@ pub fn load_dir(dir: &Path) -> Result<Vec<RawMemory>> {
 }
 
 #[cfg(test)]
+// Loader fixtures intentionally build temporary memory catalogs on disk.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::fs;

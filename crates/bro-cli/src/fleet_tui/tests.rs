@@ -2169,49 +2169,47 @@ fn superset_snapshot_preserves_cursor_and_only_emits_new_items() {
     // Build a transcript with two completed turns (each sealed by a
     // TurnFooter), then one active turn in progress.  The first 8 items
     // are from completed turns; items [8..12] are the in-progress turn.
-    let items: Vec<TranscriptItem> = {
-        let mut v = Vec::new();
+    let items: Vec<TranscriptItem> = vec![
         // Turn 1 (complete, 4 items)
-        v.push(TranscriptItem::UserSteer("t1 steer".into()));
-        v.push(TranscriptItem::AssistantText("t1 text".into()));
-        v.push(TranscriptItem::ToolCall {
+        TranscriptItem::UserSteer("t1 steer".into()),
+        TranscriptItem::AssistantText("t1 text".into()),
+        TranscriptItem::ToolCall {
             name: "t1".into(),
             args: "{}".into(),
-        });
-        v.push(TranscriptItem::TurnFooter {
+        },
+        TranscriptItem::TurnFooter {
             num_turns: Some(1),
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-        });
+        },
         // Turn 2 (complete, 4 items)
-        v.push(TranscriptItem::UserSteer("t2 steer".into()));
-        v.push(TranscriptItem::AssistantText("t2 text".into()));
-        v.push(TranscriptItem::ToolCall {
+        TranscriptItem::UserSteer("t2 steer".into()),
+        TranscriptItem::AssistantText("t2 text".into()),
+        TranscriptItem::ToolCall {
             name: "t2".into(),
             args: "{}".into(),
-        });
-        v.push(TranscriptItem::TurnFooter {
+        },
+        TranscriptItem::TurnFooter {
             num_turns: Some(2),
             cost_usd: None,
             input_tokens: None,
             compaction_threshold: None,
-        });
+        },
         // Turn 3 (active, 4 items)
-        v.push(TranscriptItem::UserSteer("t3 steer".into()));
-        v.push(TranscriptItem::AssistantText("t3 text".into()));
-        v.push(TranscriptItem::ToolCall {
+        TranscriptItem::UserSteer("t3 steer".into()),
+        TranscriptItem::AssistantText("t3 text".into()),
+        TranscriptItem::ToolCall {
             name: "t3".into(),
             args: "{}".into(),
-        });
-        v.push(TranscriptItem::ToolResult {
+        },
+        TranscriptItem::ToolResult {
             tool: Some("t3".into()),
             content: "ok".into(),
             is_error: false,
             rider: None,
-        });
-        v
-    };
+        },
+    ];
     assert_eq!(items.len(), 12);
     let committed: usize = 5;
     let stable_end = inline_stable_end(&items, true); // turn active → last TurnFooter at idx 7
@@ -2228,7 +2226,7 @@ fn superset_snapshot_preserves_cursor_and_only_emits_new_items() {
     // Active turn items [8..12] remain in the live region.
     assert!(end <= items.len());
     // Already-committed items [0..5) are skipped.
-    assert_eq!(start - 0, committed);
+    assert_eq!(start, committed);
 }
 
 #[test]

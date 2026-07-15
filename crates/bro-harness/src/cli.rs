@@ -5,9 +5,14 @@
 
 use clap::Parser;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "bro-harness", disable_help_flag = false)]
 pub struct Cli {
+    /// Run the persistent, reconnecting fleet worker for one harness session.
+    /// The provider session remains alive across fleet socket generations.
+    #[arg(long = "worker", default_value_t = false)]
+    pub worker: bool,
+
     /// Additive Milestone-0 worker protocol probe. This connects to fleetd,
     /// completes the versioned handshake, exchanges one event and one status
     /// command, then exits. It does not run a provider turn or claim session
@@ -43,6 +48,39 @@ pub struct Cli {
     )]
     pub worker_protocol_versions: Vec<u16>,
 
+    /// Durable command identity/outcome journal. Defaults beside the harness
+    /// session snapshot when omitted.
+    #[arg(long = "worker-command-journal")]
+    pub worker_command_journal: Option<String>,
+
+    /// Worker-attempt-scoped durable event outbox. Provider resumes may share
+    /// a session snapshot, but must never replay a prior worker's terminal
+    /// events into the new task authority.
+    #[arg(long = "worker-event-log")]
+    pub worker_event_log: Option<String>,
+
+    /// Private file holding the fleet-rotated reconnect credential. The
+    /// worker atomically replaces it after every successful welcome so a
+    /// process restart never reuses the one-time bootstrap proof.
+    #[arg(long = "worker-reconnect-credential")]
+    pub worker_reconnect_credential: Option<String>,
+
+    /// Initial and maximum reconnect delays. Exposed for deterministic local
+    /// integration tests and rolling-restart tuning.
+    #[arg(long = "worker-reconnect-initial-ms", default_value_t = 100)]
+    pub worker_reconnect_initial_ms: u64,
+
+    #[arg(long = "worker-reconnect-max-ms", default_value_t = 5_000)]
+    pub worker_reconnect_max_ms: u64,
+
+    /// Bounded command admission split. Lifecycle controls retain independent
+    /// capacity so a user-turn backlog cannot starve interrupt or shutdown.
+    #[arg(long = "worker-control-capacity", default_value_t = 32)]
+    pub worker_control_capacity: usize,
+
+    #[arg(long = "worker-input-capacity", default_value_t = 128)]
+    pub worker_input_capacity: usize,
+
     /// The user turn. May be omitted when the daemon moves a large prompt to
     /// stdin (`move_large_prompt_arg_to_stdin`); in that case stdin is read.
     #[arg(short = 'p', long = "prompt")]
@@ -68,8 +106,8 @@ pub struct Cli {
     pub exit_when_idle: bool,
 
     /// Marks a same-host daemon-supervised worker. Shell children scrub the
-    /// host/session env keys named by `BRO_HARNESS_SPAWN_SCRUB` while provider
-    /// transports in this process retain them.
+    /// host/session env keys named by `BRO_HARNESS_SPAWN_SCRUB`; provider
+    /// transports receive those values through the session task-local only.
     #[arg(long = "daemon-worker", default_value_t = false, hide = true)]
     pub daemon_worker: bool,
 
@@ -85,6 +123,22 @@ pub struct Cli {
     /// Resume a prior transcript and continue it.
     #[arg(long = "resume")]
     pub resume: Option<String>,
+
+    /// Internal fleet launch metadata: source session for a fresh child
+    /// history fork. Hidden because it is service-authored, not operator or
+    /// model authority.
+    #[arg(long = "fork-source-session", hide = true)]
+    pub fork_source_session: Option<String>,
+
+    /// Internal JSON-encoded AgentForkTurns policy paired with
+    /// --fork-source-session.
+    #[arg(long = "fork-turns", hide = true)]
+    pub fork_turns: Option<String>,
+
+    /// Internal stable prompt-cache identity shared by one logical agent tree.
+    /// The distinct --session-id remains the provider wire session identity.
+    #[arg(long = "prompt-cache-root", hide = true)]
+    pub prompt_cache_root: Option<String>,
 
     /// Model id (already normalized by the daemon: GLM strips
     /// `zai-coding-plan/`, DeepSeek strips `deepseek/`).

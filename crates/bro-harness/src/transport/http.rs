@@ -16,8 +16,7 @@ const MAX_BACKOFF_MS: u64 = 8_000;
 const DEFAULT_STREAM_IDLE_SECS: u64 = 300;
 
 pub fn request_timeout() -> Duration {
-    let secs = std::env::var("BRO_HARNESS_HTTP_TIMEOUT_SECS")
-        .ok()
+    let secs = super::session_var("BRO_HARNESS_HTTP_TIMEOUT_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(600);
     Duration::from_secs(secs)
@@ -28,16 +27,14 @@ pub fn request_timeout() -> Duration {
 /// match that default. A whole-request timeout (`request_timeout`) can't catch a
 /// connection that stays open but stops producing events.
 pub fn stream_idle_timeout() -> Duration {
-    let secs = std::env::var("BRO_HARNESS_STREAM_IDLE_SECS")
-        .ok()
+    let secs = super::session_var("BRO_HARNESS_STREAM_IDLE_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_STREAM_IDLE_SECS);
     Duration::from_secs(secs)
 }
 
 pub fn max_retries() -> u32 {
-    std::env::var("BRO_HARNESS_MAX_RETRIES")
-        .ok()
+    super::session_var("BRO_HARNESS_MAX_RETRIES")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_RETRIES)
 }

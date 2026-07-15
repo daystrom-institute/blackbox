@@ -1,5 +1,5 @@
 [Unit]
-Description=blackbox MCP daemon — transcript search, knowledge store, orchestration
+Description=Blackbox flight-data recorder and corpus service
 After=network.target
 # Ensure blackbox starts cleanly — old bro.service occupied port 7263 (now retired).
 
@@ -9,6 +9,9 @@ ExecStart=%h/.local/bin/blackboxd
 Restart=on-failure
 RestartSec=3
 Environment=RUST_LOG=blackbox=info
+Environment=BLACKBOX_RUNTIME_ROLE=corpus
+Environment=BLACKBOX_SERVICE_TOKEN_FILE=%h/.local/state/blackbox/service.token
+Environment=BLACKBOX_FLEET_TRANSCRIPT_ROOT=%h/.local/state/blackbox/fleetd/workers
 # Main config defaults to %h/.config/blackbox/config.toml.
 # Use BLACKBOX_CONFIG only when this unit must point at a non-default file.
 # Environment=BLACKBOX_CONFIG=%h/.config/blackbox/config.toml

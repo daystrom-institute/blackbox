@@ -94,6 +94,8 @@ fn head(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally verify spill-file behavior.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

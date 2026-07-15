@@ -4,6 +4,12 @@
 //! exists now so protocol, identity, version skew, and binary launch can be
 //! verified before any authority moves.
 
+pub mod capability_rpc;
+mod command_journal;
+mod supervisor;
+
+pub use supervisor::run_worker;
+
 use anyhow::{Context, Result, bail};
 use bro_core::{CommandId, SessionId, TaskId, WorkerId};
 use bro_protocol::{

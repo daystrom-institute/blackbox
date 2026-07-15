@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::types::{OutboxRecord, OutboxStatus};
 
@@ -24,6 +24,9 @@ pub struct OutboxCompactionReport {
 }
 
 impl OutboxStore {
+    // Opening the synchronous outbox establishes its durable root and removes
+    // only an orphaned compaction file before the store is published.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
         let store = Self {
@@ -62,6 +65,9 @@ impl OutboxStore {
         self.load_locked()
     }
 
+    // Callers hold the outbox mutex while taking this synchronous journal
+    // snapshot, keeping read-modify-rewrite transitions coherent.
+    #[allow(clippy::disallowed_methods)]
     fn load_locked(&self) -> Result<Vec<OutboxRecord>> {
         let path = self.current_path();
         if !path.exists() {
@@ -75,6 +81,9 @@ impl OutboxStore {
             .collect()
     }
 
+    // The outbox mutex protects this synchronous fsync-and-rename durability
+    // boundary; returning success publishes the complete replacement.
+    #[allow(clippy::disallowed_methods)]
     fn rewrite_locked(&self, records: &[OutboxRecord]) -> Result<()> {
         let path = self.current_path();
         let tmp_path = path.with_extension("tmp");
@@ -98,6 +107,9 @@ impl OutboxStore {
     /// All other statuses are retained regardless of age. Copy-forward via
     /// temp + fsync + rename — an interrupted compaction leaves the tmp
     /// orphaned and `current.jsonl` untouched.
+    // Compaction synchronously owns the outbox mutex while sweeping an orphan
+    // and atomically replacing the retained durable journal.
+    #[allow(clippy::disallowed_methods)]
     pub fn compact_with_now(&self, now_rfc3339: &str) -> Result<OutboxCompactionReport> {
         let _guard = self.lock.lock().unwrap();
         let cutoff = parse_rfc3339(now_rfc3339).with_context(|| {
@@ -148,6 +160,34 @@ impl OutboxStore {
         Ok(record)
     }
 
+    /// Ensure that one reaction record exists for an event. This closes the
+    /// retry window between durable event publication and durable reaction
+    /// enqueueing without creating duplicate side effects.
+    pub fn create_record_once(
+        &self,
+        event_id: &str,
+        reaction_name: &str,
+        idempotency_key: Option<String>,
+    ) -> Result<(OutboxRecord, bool)> {
+        let _guard = self.lock.lock().unwrap();
+        let records = self.load_locked()?;
+        if let Some(existing) = records
+            .iter()
+            .find(|record| record.event_id == event_id && record.reaction_name == reaction_name)
+        {
+            if existing.idempotency_key != idempotency_key {
+                bail!(
+                    "reaction record for event {event_id} and reaction {reaction_name} changed its idempotency key"
+                );
+            }
+            return Ok((existing.clone(), false));
+        }
+
+        let record = OutboxRecord::new(event_id, reaction_name, idempotency_key);
+        self.append_locked(&record)?;
+        Ok((record, true))
+    }
+
     pub fn claim_next(&self, now: &str, process_id: &str) -> Result<Option<OutboxRecord>> {
         let _guard = self.lock.lock().unwrap();
         let mut records = self.load_locked()?;
@@ -156,12 +196,11 @@ impl OutboxStore {
             if record.status != OutboxStatus::Pending && record.status != OutboxStatus::RetryAt {
                 continue;
             }
-            if record.status == OutboxStatus::RetryAt {
-                if let Some(ref next) = record.next_attempt_at {
-                    if next.as_str() > now {
-                        continue;
-                    }
-                }
+            if record.status == OutboxStatus::RetryAt
+                && let Some(ref next) = record.next_attempt_at
+                && next.as_str() > now
+            {
+                continue;
             }
             record.status = OutboxStatus::Claimed;
             record.claimed_at = Some(now.to_string());
@@ -312,10 +351,10 @@ impl OutboxStore {
                 }
             }
         }
-        if report.requeued > 0 || report.dead_lettered > 0 {
-            if let Err(e) = self.rewrite_locked(&records) {
-                tracing::error!("recovery rewrite failed: {e:#}");
-            }
+        if (report.requeued > 0 || report.dead_lettered > 0)
+            && let Err(e) = self.rewrite_locked(&records)
+        {
+            tracing::error!("recovery rewrite failed: {e:#}");
         }
         report
     }
@@ -353,6 +392,9 @@ fn parse_rfc3339(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
 }
 
 #[cfg(test)]
+// Outbox fixtures intentionally plant and inspect temporary journal and
+// compaction files to exercise crash recovery.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

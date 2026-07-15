@@ -29,13 +29,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 tokio::task_local! {
     /// Per-session identity environment (auth token, base URL, account home,
     /// transport kind, model). Bound by an in-process host around each session
     /// future via [`with_session_env`]; the standalone binary never binds it.
-    static SESSION_ENV: Arc<BTreeMap<String, String>>;
+    static SESSION_ENV: Arc<RwLock<BTreeMap<String, String>>>;
 }
 
 /// Run `fut` with per-session identity env bound (harness-daemon-boundary.md §3).
@@ -49,7 +49,7 @@ pub async fn with_session_env<F>(vars: BTreeMap<String, String>, fut: F) -> F::O
 where
     F: std::future::Future,
 {
-    SESSION_ENV.scope(Arc::new(vars), fut).await
+    SESSION_ENV.scope(Arc::new(RwLock::new(vars)), fut).await
 }
 
 /// Resolve a session-identity variable: per-session task-local config first,
@@ -57,19 +57,53 @@ where
 /// binary keep reading credentials from the user's shell environment.
 pub fn session_var(key: &str) -> Option<String> {
     SESSION_ENV
-        .try_with(|m| m.get(key).cloned())
+        .try_with(|m| m.read().ok().and_then(|vars| vars.get(key).cloned()))
         .ok()
         .flatten()
         .or_else(|| std::env::var(key).ok())
 }
 
+/// Replace one task-local session value without ever restoring it to the
+/// process environment. Used for in-memory credential rotation.
+pub(crate) fn set_session_var(key: impl Into<String>, value: impl Into<String>) -> bool {
+    SESSION_ENV
+        .try_with(|m| {
+            m.write()
+                .map(|mut vars| {
+                    vars.insert(key.into(), value.into());
+                    true
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 /// Snapshot the task-local session env for diagnostic surfaces. Values are
 /// still raw here; callers that expose this to agents must redact sensitive
 /// keys at the presentation boundary.
-pub fn session_env_snapshot() -> BTreeMap<String, String> {
+pub(crate) fn session_env_snapshot() -> BTreeMap<String, String> {
     SESSION_ENV
-        .try_with(|m| m.as_ref().clone())
+        .try_with(|m| m.read().map(|vars| vars.clone()).unwrap_or_default())
         .unwrap_or_default()
+}
+
+/// Snapshot only non-secret session configuration that agent-facing
+/// diagnostic tools may expose. Provider/account keys are omitted by default,
+/// independent of their spelling.
+pub(crate) fn public_session_env_snapshot() -> BTreeMap<String, String> {
+    const PUBLIC_KEYS: &[&str] = &[
+        "BRO_HARNESS_CHAT_REASONING",
+        "BRO_HARNESS_PROJECT_DOC_FILES",
+        "BRO_HARNESS_PROJECT_DOC_MAX_BYTES",
+        "BRO_HARNESS_PROVIDER",
+        "BRO_HARNESS_TRANSPORT",
+        "BRO_HOME",
+    ];
+
+    session_env_snapshot()
+        .into_iter()
+        .filter(|(key, _)| PUBLIC_KEYS.contains(&key.as_str()))
+        .collect()
 }
 
 /// Normalized usage. Each transport maps its native counters into this.
@@ -391,6 +425,11 @@ pub trait Transport: Send {
     /// don't carry a session identity on the wire).
     fn set_session_id(&mut self, _id: String) {}
 
+    /// Set the stable prompt-cache identity independently from the wire
+    /// session ID. Fresh child sessions share their root's cache identity while
+    /// retaining distinct provider session headers and durable snapshots.
+    fn set_prompt_cache_root(&mut self, _root: String) {}
+
     /// Append the user's turn to the (transport-native) conversation.
     fn push_user_text(&mut self, text: &str);
 
@@ -663,6 +702,9 @@ mod session_env_tests {
             assert_eq!(session_var(env_only).as_deref(), Some("env-value"));
             // absent everywhere → None
             assert_eq!(session_var("BRO_TEST_SESSION_ABSENT_K1"), None);
+            assert!(set_session_var(scoped, "rotated"));
+            assert_eq!(session_var(scoped).as_deref(), Some("rotated"));
+            assert!(public_session_env_snapshot().is_empty());
         })
         .await;
 

@@ -25,6 +25,9 @@ pub struct GitBlameLine {
     pub rel_path: String,
 }
 
+/// Synchronous repository-identity helper for indexing and resolver actors.
+/// Async callers must place it on a blocking lane.
+#[allow(clippy::disallowed_methods)]
 pub fn git_root_for_path(path: &Path) -> Option<PathBuf> {
     let cwd = if path.is_file() {
         path.parent().unwrap_or(path)
@@ -123,6 +126,7 @@ pub fn current_branch(root: &Path) -> Option<String> {
 /// worktree (which lives outside the registered repo root) to its registered
 /// base project. Returns `None` when `cwd` is not in a git repo or the path can't
 /// be canonicalized.
+#[allow(clippy::disallowed_methods)] // synchronous resolver/actor boundary
 pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
     let output = git_output(
         cwd,
@@ -271,10 +275,10 @@ pub fn set_notes_namespace(namespace: String) {
 }
 
 pub fn notes_namespace() -> String {
-    if let Some(ns) = NOTES_NAMESPACE_OVERRIDE.get() {
-        if !ns.is_empty() {
-            return ns.clone();
-        }
+    if let Some(ns) = NOTES_NAMESPACE_OVERRIDE.get()
+        && !ns.is_empty()
+    {
+        return ns.clone();
     }
     std::env::var("BBOX_GIT_NOTES_NAMESPACE")
         .ok()
@@ -293,6 +297,9 @@ pub fn notes_ref(kind: &str) -> String {
     format!("refs/notes/{}/{}", notes_namespace(), kind)
 }
 
+/// Synchronous git-notes mutation boundary. Callers run provenance export on
+/// a blocking operation lane so stdin write and child wait remain ordered.
+#[allow(clippy::disallowed_methods)]
 pub fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Result<()> {
     let mut child = Command::new("git")
         .arg("-C")
@@ -333,6 +340,9 @@ pub fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Res
 /// bodies. Setting `union` once per repo makes concurrent provenance pushes
 /// safe; git config writes are idempotent so calling this on every export is
 /// harmless.
+/// Synchronous one-shot repository configuration boundary used by provenance
+/// export on its blocking lane.
+#[allow(clippy::disallowed_methods)]
 pub fn ensure_notes_merge_strategy_union(root: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
@@ -387,6 +397,8 @@ pub fn list_notes(root: &Path, notes_ref: &str) -> Result<Vec<(String, String)>>
         .collect())
 }
 
+/// Synchronous blame lookup used by the corpus query blocking lane.
+#[allow(clippy::disallowed_methods)]
 pub fn blame_for_line(file: &Path, line: u64) -> Result<Option<GitBlameLine>> {
     if line == 0 {
         anyhow::bail!("line must be 1-based");
@@ -543,12 +555,16 @@ pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
 /// every metadata/log invocation these helpers make against healthy repos.
 const GIT_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounded synchronous git subprocess boundary. Its callers are indexing and
+/// resolver actors, never an unisolated async request future.
+#[allow(clippy::disallowed_methods)]
 pub fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path).args(args);
     run_git_bounded(cmd, path, action)
 }
 
+#[allow(clippy::disallowed_methods)] // same bounded blocking boundary as git_output
 fn git_output_strings(path: &Path, args: &[String], action: &'static str) -> Option<Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path).args(args);
@@ -670,6 +686,7 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous child-process boundary under test
     fn run_bounded_kills_hung_child_at_the_deadline() {
         // gap context: session cwds can point into dead NFS automounts,
         // where a spawned git polls forever and wedges the writer actor.
@@ -691,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous child-process boundary under test
     fn run_bounded_returns_full_output_for_fast_child() {
         let mut cmd = Command::new("echo");
         cmd.arg("bounded-ok");
@@ -730,6 +748,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous temporary repository fixture
     fn commit_log_falls_back_to_full_when_since_is_not_ancestor() {
         let repo = tempfile::tempdir().unwrap();
         run_git(repo.path(), &["init"]);
@@ -751,6 +770,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous temporary repository fixture
     fn git_notes_write_show_and_list_round_trip() {
         let repo = tempfile::tempdir().unwrap();
         run_git(repo.path(), &["init"]);
@@ -772,6 +792,7 @@ mod tests {
         assert_eq!(list_notes(repo.path(), notes_ref).unwrap().len(), 1);
     }
 
+    #[allow(clippy::disallowed_methods)] // synchronous temporary git fixture helper
     fn run_git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")

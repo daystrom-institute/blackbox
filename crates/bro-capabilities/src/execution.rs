@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use bro_core::{AttemptId, OperationId, Provider, SessionId, TaskId};
+use bro_core::{AtomRef, AttemptId, OperationId, Provider, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -15,6 +15,12 @@ pub enum ExecutionKind {
     Resume {
         session_id: SessionId,
         prompt: String,
+    },
+    /// Resume a durable harness session whose first input is supplied by the
+    /// typed agent mailbox worker command. This variant deliberately carries
+    /// no prompt, so a followup body has exactly one model-visible owner.
+    MailboxResume {
+        session_id: SessionId,
     },
 }
 
@@ -94,6 +100,15 @@ pub struct ExecutionToolPolicy {
     pub tool_placement: BTreeMap<String, String>,
     #[serde(default)]
     pub tool_defaults: BTreeMap<String, String>,
+    /// Exact remote operations requested for this session, keyed by the
+    /// capability name carried on worker RPC. An empty map grants no remote
+    /// authority, independently of which tool definitions are visible.
+    #[serde(default)]
+    pub allowed_remote_operations: BTreeMap<String, Vec<String>>,
+    /// Exact versioned atom references this session may invoke. Granting the
+    /// `atom/invoke_atom` operation without naming a ref still grants no atom.
+    #[serde(default)]
+    pub allowed_atom_refs: Vec<AtomRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

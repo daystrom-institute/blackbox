@@ -5,6 +5,7 @@
 //! changing the existing subprocess entrypoint.
 
 pub mod agent_loop;
+mod agent_tools;
 pub mod bindings;
 pub mod bound;
 pub mod capabilities;
@@ -22,5 +23,6 @@ pub mod project_doc;
 pub mod registry;
 pub mod report;
 pub mod session;
+mod session_environment;
 pub mod transport;
 pub mod worker;

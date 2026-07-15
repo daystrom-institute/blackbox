@@ -54,6 +54,8 @@ pub fn find_session_file(
         // Runtime lookup path (per-request locate, never a scan): resolve the
         // harness sessions dir from the live env like from_runtime_config.
         harness_sessions_dir: Some(crate::transcripts::harness_sessions::env_sessions_dir()),
+        additional_harness_sessions_dirs: Vec::new(),
+        operational_records_path: None,
     };
     let registry = crate::transcripts::adapters::TranscriptAdapterRegistry::from_reindex_config(
         &registry_config,
@@ -192,22 +194,22 @@ pub fn extract_codex_first_prompt(path: &Path) -> String {
             // Extract text from content blocks
             if let Some(blocks) = v["payload"]["content"].as_array() {
                 for block in blocks {
-                    if block["type"].as_str() == Some("input_text") {
-                        if let Some(text) = block["text"].as_str() {
-                            // Skip system/env context blocks
-                            if text.starts_with('<') || text.starts_with('#') {
-                                continue;
-                            }
-                            let t = text.trim();
-                            if t.len() > 120 {
-                                let mut end = 120;
-                                while end > 0 && !t.is_char_boundary(end) {
-                                    end -= 1;
-                                }
-                                return format!("{}...", &t[..end]);
-                            }
-                            return t.to_string();
+                    if block["type"].as_str() == Some("input_text")
+                        && let Some(text) = block["text"].as_str()
+                    {
+                        // Skip system/env context blocks
+                        if text.starts_with('<') || text.starts_with('#') {
+                            continue;
                         }
+                        let t = text.trim();
+                        if t.len() > 120 {
+                            let mut end = 120;
+                            while end > 0 && !t.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            return format!("{}...", &t[..end]);
+                        }
+                        return t.to_string();
                     }
                 }
             }
@@ -239,14 +241,12 @@ pub fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<Stri
             if p.to_string_lossy().contains("/subagents/") {
                 continue;
             }
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    if let Ok(age) = now.duration_since(mtime) {
-                        if age.as_secs() < max_age_secs {
-                            out.push((p.to_path_buf(), age.as_secs()));
-                        }
-                    }
-                }
+            if let Ok(meta) = entry.metadata()
+                && let Ok(mtime) = meta.modified()
+                && let Ok(age) = now.duration_since(mtime)
+                && age.as_secs() < max_age_secs
+            {
+                out.push((p.to_path_buf(), age.as_secs()));
             }
         }
     };
@@ -307,15 +307,15 @@ pub fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<Stri
                 }
             };
 
-            if let Some(text) = user_text {
-                if text.to_lowercase().contains(&query_lower) {
-                    if is_codex {
-                        return Some(extract_codex_session_id(path));
-                    } else if let Some(stem) = path.file_stem() {
-                        let s = stem.to_string_lossy().to_string();
-                        if looks_like_uuid(&s) {
-                            return Some(s);
-                        }
+            if let Some(text) = user_text
+                && text.to_lowercase().contains(&query_lower)
+            {
+                if is_codex {
+                    return Some(extract_codex_session_id(path));
+                } else if let Some(stem) = path.file_stem() {
+                    let s = stem.to_string_lossy().to_string();
+                    if looks_like_uuid(&s) {
+                        return Some(s);
                     }
                 }
             }
@@ -326,6 +326,8 @@ pub fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<Stri
 
 /// Build a map of session UUID -> friendly name from Claude session files.
 /// Claude stores sessions in ~/.claude/sessions/{pid}.json with { sessionId, name? }.
+// Name discovery is a bounded synchronous scan used by synchronous search APIs.
+#[allow(clippy::disallowed_methods)]
 pub fn load_claude_session_names(roots: &[(String, PathBuf)]) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for (_account, root) in roots {
@@ -350,10 +352,10 @@ pub fn load_claude_session_names(roots: &[(String, PathBuf)]) -> HashMap<String,
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if let (Some(sid), Some(name)) = (v["sessionId"].as_str(), v["name"].as_str()) {
-                if !name.is_empty() {
-                    map.insert(sid.to_string(), name.to_string());
-                }
+            if let (Some(sid), Some(name)) = (v["sessionId"].as_str(), v["name"].as_str())
+                && !name.is_empty()
+            {
+                map.insert(sid.to_string(), name.to_string());
             }
         }
     }
@@ -380,10 +382,10 @@ pub fn load_codex_session_names(codex_root: Option<&PathBuf>) -> HashMap<String,
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let (Some(id), Some(name)) = (v["id"].as_str(), v["thread_name"].as_str()) {
-            if !name.is_empty() {
-                map.insert(id.to_string(), name.to_string());
-            }
+        if let (Some(id), Some(name)) = (v["id"].as_str(), v["thread_name"].as_str())
+            && !name.is_empty()
+        {
+            map.insert(id.to_string(), name.to_string());
         }
     }
     map

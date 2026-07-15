@@ -126,6 +126,9 @@ pub enum RuntimeResponse {
 /// if their tool-call graph requires globally unique ids.
 #[derive(Debug)]
 pub struct CodeModeNestedToolCall {
+    /// Local addition (not vendored): stable provider tool-call identity of
+    /// the outer `exec` invocation.
+    pub parent_tool_call_id: String,
     pub cell_id: CellId,
     pub runtime_tool_call_id: String,
     pub tool_name: ToolName,
@@ -331,12 +334,11 @@ fn run_runtime(
     }
 
     let mut pending_promise = pending_promise;
-    loop {
-        let Some(command) = next_runtime_command(&event_tx, &command_rx, &control_rx, pending_mode)
-        else {
-            break;
-        };
-
+    // Local addition (not vendored): the equivalent while-let form keeps the
+    // workspace clippy gate warning-free.
+    while let Some(command) =
+        next_runtime_command(&event_tx, &command_rx, &control_rx, pending_mode)
+    {
         match command {
             RuntimeCommand::Terminate => break,
             RuntimeCommand::ToolResponse { id, result } => {

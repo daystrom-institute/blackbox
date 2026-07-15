@@ -174,6 +174,7 @@ fn build_record_doc(
 /// investigations are searchable on a clone where the live thread store doesn't
 /// carry them. Deduped against the live thread store by id — on the origin
 /// machine the live thread is already indexed, so its record is skipped.
+#[allow(clippy::disallowed_methods)] // Called only by the IndexWriterActor reindex pass.
 pub fn reindex_project_records_standalone(
     projects_path: &Path,
     threads_path: &Path,
@@ -216,6 +217,7 @@ pub fn reindex_project_records_standalone(
     Ok(docs)
 }
 
+#[allow(clippy::disallowed_methods)] // Called only by the IndexWriterActor reindex pass.
 pub fn reindex_threads_store_standalone(
     threads_path: &Path,
     f: FieldHandles,
@@ -251,6 +253,7 @@ pub fn reindex_threads_store_standalone(
 
 /// Apply a full thread-store replacement to an already-held writer (no
 /// commit). `threads` is a point-in-time snapshot of every thread.
+#[allow(clippy::disallowed_methods)] // Runs only inside IndexWriterActor's single-writer lane.
 pub fn apply_threads_store_upsert(
     writer: &mut IndexWriter,
     f: FieldHandles,
@@ -266,6 +269,7 @@ pub fn apply_threads_store_upsert(
 }
 
 /// Apply a single-thread upsert to an already-held writer (no commit).
+#[allow(clippy::disallowed_methods)] // Runs only inside IndexWriterActor's single-writer lane.
 pub fn apply_thread_upsert(
     writer: &mut IndexWriter,
     f: FieldHandles,
@@ -281,6 +285,8 @@ pub fn apply_thread_upsert(
 }
 
 #[cfg(test)]
+// Thread-index fixtures intentionally seed temporary stores on disk.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::index::build_schema;

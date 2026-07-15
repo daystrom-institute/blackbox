@@ -8,6 +8,11 @@ static NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Acquire an exclusive lock on `<store_path>.json.lock` and execute `f`.
 /// The lock is released after `f` returns.
+///
+/// This is a synchronous storage boundary. Async owners must call it from a
+/// store actor or blocking lane so the OS file lock is never held across an
+/// async suspension point.
+#[allow(clippy::disallowed_methods)]
 pub fn with_store_lock<T>(store_path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let lock_path = store_path.with_extension("json.lock");
     if let Some(parent) = lock_path.parent() {
@@ -35,6 +40,7 @@ pub fn with_store_lock<T>(store_path: &Path, f: impl FnOnce() -> Result<T>) -> R
 
 /// Atomically write `value` to `store_path` using a unique temporary file.
 /// This function does NOT acquire the lock; callers should wrap it in `with_store_lock`.
+#[allow(clippy::disallowed_methods)] // synchronous locked-store publication boundary
 pub fn atomic_write_json_locked<T: serde::Serialize>(store_path: &Path, value: &T) -> Result<()> {
     let pid = std::process::id();
     let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
@@ -96,6 +102,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous filesystem assertion
     fn json_store_writes_trailing_newline() {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("store.json");
@@ -108,6 +115,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous lock and filesystem stress fixture
     fn json_store_lock_serializes_concurrent_writes() {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("store.json");

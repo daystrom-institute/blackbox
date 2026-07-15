@@ -1067,6 +1067,8 @@ declare const code: {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise hash-anchored source facts.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -1074,6 +1076,7 @@ mod tests {
 
     fn cx_in(dir: &Path) -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

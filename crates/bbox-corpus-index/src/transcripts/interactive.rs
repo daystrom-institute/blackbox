@@ -340,6 +340,8 @@ impl TranscriptReadAdapter for GeminiTranscriptAdapter {
         }
     }
 
+    // Gemini snapshots are bounded files read synchronously on the adapter lane.
+    #[allow(clippy::disallowed_methods)]
     fn read_since(
         &self,
         location: &TranscriptLocation,
@@ -507,6 +509,8 @@ fn message_id_cursor(
     }
 }
 
+// Cursor advancement is part of the same synchronous adapter read.
+#[allow(clippy::disallowed_methods)]
 fn next_byte_cursor(path: &Path) -> Result<Option<TranscriptCursor>, TranscriptReadError> {
     let size = fs::metadata(path)
         .map_err(|err| TranscriptReadError::io("metadata", path, err))?
@@ -564,6 +568,8 @@ fn codex_location(path: &Path) -> TranscriptLocation {
     }
 }
 
+// Gemini location discovery reads its small project marker synchronously.
+#[allow(clippy::disallowed_methods)]
 fn gemini_location(path: &Path) -> TranscriptLocation {
     let session_id = read_gemini_session_id(path);
     let project = path
@@ -627,6 +633,8 @@ fn extract_codex_cwd(path: &Path) -> Option<String> {
     None
 }
 
+// Gemini discovery is a bounded synchronous directory scan for the adapter.
+#[allow(clippy::disallowed_methods)]
 fn gemini_chat_paths(tmp_root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let Ok(projects) = fs::read_dir(tmp_root) else {
@@ -654,6 +662,8 @@ fn gemini_chat_paths(tmp_root: &Path) -> Vec<PathBuf> {
     paths
 }
 
+// The session identifier is read during synchronous adapter discovery.
+#[allow(clippy::disallowed_methods)]
 fn read_gemini_session_id(path: &Path) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
@@ -661,6 +671,7 @@ fn read_gemini_session_id(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::fs;
 

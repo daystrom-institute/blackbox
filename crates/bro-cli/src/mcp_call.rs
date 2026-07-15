@@ -45,6 +45,7 @@ async fn call(args: McpCallArgs) -> anyhow::Result<()> {
     let base_url = args.daemon_url.unwrap_or_else(default_base_url);
     let mcp_url = format!("{}/mcp", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
+    let authorization = bro_fleet_client::service_authorization_header()?;
 
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -59,7 +60,8 @@ async fn call(args: McpCallArgs) -> anyhow::Result<()> {
             },
         },
     });
-    let (init_response, session_id) = post_json_rpc(&client, &mcp_url, None, &initialize).await?;
+    let (init_response, session_id) =
+        post_json_rpc(&client, &mcp_url, &authorization, None, &initialize).await?;
     ensure_json_rpc_success(&init_response, "initialize")?;
 
     let tool_call = json!({
@@ -71,8 +73,14 @@ async fn call(args: McpCallArgs) -> anyhow::Result<()> {
             "arguments": arguments,
         },
     });
-    let (call_response, _) =
-        post_json_rpc(&client, &mcp_url, session_id.as_deref(), &tool_call).await?;
+    let (call_response, _) = post_json_rpc(
+        &client,
+        &mcp_url,
+        &authorization,
+        session_id.as_deref(),
+        &tool_call,
+    )
+    .await?;
     print_tool_response(&call_response)
 }
 
@@ -91,6 +99,7 @@ fn parse_arguments(raw: &str) -> anyhow::Result<Value> {
 async fn post_json_rpc(
     client: &reqwest::Client,
     url: &str,
+    authorization: &reqwest::header::HeaderValue,
     session_id: Option<&str>,
     body: &Value,
 ) -> anyhow::Result<(Value, Option<String>)> {
@@ -98,6 +107,7 @@ async fn post_json_rpc(
         .post(url)
         .header(ACCEPT, "application/json, text/event-stream")
         .header(CONTENT_TYPE, "application/json")
+        .header(reqwest::header::AUTHORIZATION, authorization.clone())
         .header("Mcp-Protocol-Version", MCP_PROTOCOL_VERSION)
         .json(body);
     if let Some(session_id) = session_id {

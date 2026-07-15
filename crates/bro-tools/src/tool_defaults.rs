@@ -583,8 +583,7 @@ mod tests {
                 "session_id": {"type": "string"}
             }
         });
-        let warnings =
-            defaults.validation_warnings([("mcp__blackbox__bbox_note", &schema)].into_iter());
+        let warnings = defaults.validation_warnings([("mcp__blackbox__bbox_note", &schema)]);
         assert_eq!(warnings.len(), 2);
         assert!(warnings.iter().any(|w| w.contains("unknown param 'nope'")));
         assert!(

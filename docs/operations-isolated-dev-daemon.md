@@ -1,11 +1,13 @@
 # Running an Isolated Throwaway blackboxd
 
-A lightweight dev daemon for live validation (HTTP routes, fleet TUI, dispatch)
-that does **not** touch the production daemon at `127.0.0.1:7264` or its state,
-and skips heavy startup indexing/edge-rebuild.
+A lightweight corpus daemon for live validation of health, MCP, indexing, and
+record routes that does **not** touch the production service or its state and
+skips heavy startup indexing/edge-rebuild. For Fleet TUI or dispatch validation,
+run an isolated blackboxd, blackopsd, and fleetd trio; a corpus daemon is never
+a fallback execution authority.
 
 The repo already ships a dev service template (`deploy/blackbox-dev.service`
-with `deploy/config-dev.toml`) for a persistent dev instance on port 7265. This
+with `deploy/config-dev.toml`) for a persistent dev instance on port 7274. This
 runbook covers the lighter-weight case: a throwaway daemon you spin up, probe,
 and tear down without touching any persisted config.
 
@@ -17,7 +19,7 @@ scripts/dev-isolated-daemon.sh
 ```
 
 The script starts `blackboxd` on port 7299 with an isolated state directory
-under `/tmp`. Press Ctrl-C to stop; nothing is persisted.
+and service token under `/tmp`. Press Ctrl-C to stop; nothing is persisted.
 
 ## How it works — env vars and what they do
 
@@ -46,6 +48,7 @@ is sufficient for full isolation:
 | Env var | Default (relative to state_dir) | Effect |
 |---|---|---|
 | `BLACKBOX_STATE_DIR` | `~/.local/state/blackbox` | Root for all below |
+| `BLACKBOX_SERVICE_TOKEN_FILE` | `<state_dir>/service.token` | Bearer for non-health routes |
 | `BLACKBOX_KNOWLEDGE_PATH` | `<state_dir>/blackbox-knowledge.json` | Knowledge store |
 | `BLACKBOX_THREADS_PATH` | `<state_dir>/blackbox-threads.json` | Thread store |
 | `BLACKBOX_NOTES_PATH` | `<state_dir>/blackbox-notes.json` | Notes store |
@@ -94,26 +97,17 @@ env overrides applied on top of compiled defaults, so no config file is needed.
 If you need config-file-only settings (e.g. provider overrides), create a
 minimal `config.toml` and point `BLACKBOX_CONFIG` at it.
 
-## Connecting `bro fleet` / `bro`
+## Connecting `bro mcp`
 
-The `bro` CLI and `bro fleet` TUI resolve the daemon URL in this order:
-
-1. Explicit `--daemon-url <URL>` flag
-2. `BLACKBOX_FLEET_DAEMON_URL` env var
-3. `BBOX_PORT` env var (default 7264) → `http://127.0.0.1:{port}`
-
-To point a client at the throwaway daemon:
+Pass both the isolated state root and explicit corpus URL so `bro` loads the
+matching throwaway token:
 
 ```bash
-# Option A: use the same BBOX_PORT
-BBOX_PORT=7299 bro fleet
-
-# Option B: explicit flag
-bro fleet --daemon-url http://127.0.0.1:7299
-
-# Option C: env var
-BLACKBOX_FLEET_DAEMON_URL=http://127.0.0.1:7299 bro fleet
+BLACKBOX_STATE_DIR=/tmp/blackbox-dev-throwaway-<pid> \
+  bro mcp call bbox_stats '{}' --daemon-url http://127.0.0.1:7299
 ```
+
+`bro fleet` always targets fleetd (default port 7265), not this corpus process.
 
 ## Teardown
 
@@ -129,7 +123,8 @@ No prod state, config, or index is touched.
 
 ## Persistent dev instance (alternative)
 
-For a long-lived dev daemon on port 7265, use the shipped service template:
+For a long-lived dev daemon on port 7274, use the shipped service template.
+Port 7265 is reserved for fleetd:
 
 ```bash
 cp deploy/config-dev.toml ~/.config/blackbox-dev/config.toml
@@ -148,6 +143,8 @@ BBOX_PORT=7299 \
 BBOX_BIND=127.0.0.1 \
 BLACKBOX_MCP_NAME=blackbox-dev-throwaway \
 BLACKBOX_STATE_DIR=/tmp/blackbox-dev-throwaway \
+BLACKBOX_SERVICE_TOKEN_FILE=/tmp/blackbox-dev-throwaway/service.token \
+BLACKBOX_RUNTIME_ROLE=corpus \
 BLACKBOX_REINDEX_INTERVAL_SECS=999999 \
 BLACKBOX_EDGE_INDEX_BOOT_REBUILD=false \
 RUST_LOG=blackbox=info \

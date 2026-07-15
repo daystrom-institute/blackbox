@@ -8,6 +8,8 @@ use bbox_corpus_core::project_record::ProjectRecord;
 use crate::index::{first_text, first_u64, optional_text};
 
 #[cfg(test)]
+// Code-nav fixtures directly seed and commit an isolated Tantivy index.
+#[allow(clippy::disallowed_methods)]
 mod tests;
 
 /// Synthesis cases live here AND in `refactor_kind_for` — the two
@@ -366,10 +368,10 @@ pub fn code_symbols_indexed(
                 stored_file_path.clone()
             };
 
-        if let Some(path_contains) = p.path_contains.as_deref().filter(|s| !s.is_empty()) {
-            if !rel_path.contains(path_contains) {
-                continue;
-            }
+        if let Some(path_contains) = p.path_contains.as_deref().filter(|s| !s.is_empty())
+            && !rel_path.contains(path_contains)
+        {
+            continue;
         }
 
         let language = optional_text(&doc, fields.language).unwrap_or_default();

@@ -30,8 +30,11 @@ pub(super) enum Auth {
 /// keep a single buffer across a WS→HTTP fallback (no two-buffer divergence).
 pub(super) struct ResponsesState {
     pub auth: Auth,
-    /// Stable per-session id (codex `session-id` header + `prompt_cache_key`).
+    /// Stable per-session id used only for the codex `session-id` header.
     pub session_id: String,
+    /// Stable prompt-cache key. Forked child sessions may share this value
+    /// while retaining distinct `session_id` headers.
+    pub prompt_cache_root: String,
     /// Per-turn id (codex `thread-id` header); rotated on each new user turn.
     pub thread_id: String,
     /// Flat Responses `input[]` buffer.
@@ -52,6 +55,7 @@ impl ResponsesState {
         Self {
             auth,
             session_id: String::new(),
+            prompt_cache_root: String::new(),
             thread_id: new_id(),
             input: Vec::new(),
             custom_tool_call_ids: HashSet::new(),
@@ -151,7 +155,12 @@ impl ResponsesState {
     }
 
     pub(super) fn build_body(&self, tools: &[ToolSpec], opts: &TurnOpts) -> Value {
-        build_body(&self.input, &self.session_id, tools, opts)
+        let prompt_cache_root = if self.prompt_cache_root.is_empty() {
+            &self.session_id
+        } else {
+            &self.prompt_cache_root
+        };
+        build_body(&self.input, prompt_cache_root, tools, opts)
     }
 
     pub(super) fn parse_sse(&mut self, sse: &str) -> Result<TurnOutput> {
@@ -243,11 +252,11 @@ pub(super) fn identity_auth_headers(
 
 /// Build the Responses request body (pure; no I/O). The base instructions plus
 /// stable overlay go in `instructions`; the volatile `developer` item is never
-/// persisted into the buffer. `input` is the conversation buffer; `session_id`
-/// keys the prompt cache.
+/// persisted into the buffer. `input` is the conversation buffer;
+/// `prompt_cache_root` keys the prompt cache independently of wire identity.
 pub(super) fn build_body(
     input: &[Value],
-    session_id: &str,
+    prompt_cache_root: &str,
     tools: &[ToolSpec],
     opts: &TurnOpts,
 ) -> Value {
@@ -287,8 +296,8 @@ pub(super) fn build_body(
     }
     // Stable cache key (codex uses the thread id): keeps the cached prefix
     // pinned to this session instead of relying on implicit server keying.
-    if !session_id.is_empty() {
-        body["prompt_cache_key"] = json!(session_id);
+    if !prompt_cache_root.is_empty() {
+        body["prompt_cache_key"] = json!(prompt_cache_root);
     }
     // `/fast` lever: forward the priority/flex tier when set (and not the
     // standard-routing sentinel, which the backend rejects as a no-op).
@@ -746,15 +755,15 @@ pub(super) fn new_id() -> String {
 /// backend routes/accounts the request as it expects. Overridable to match
 /// codex's own `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, or `BRO_HARNESS_ORIGINATOR`.
 pub(super) fn originator() -> String {
-    std::env::var("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
-        .or_else(|_| std::env::var("BRO_HARNESS_ORIGINATOR"))
-        .unwrap_or_else(|_| "codex_cli_rs".to_string())
+    super::session_var("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+        .or_else(|| super::session_var("BRO_HARNESS_ORIGINATOR"))
+        .unwrap_or_else(|| "codex_cli_rs".to_string())
 }
 
 /// Descriptive `User-Agent` in codex's shape (`<originator>/<ver> (<os>; <arch>)`),
 /// fully overridable via `BRO_HARNESS_USER_AGENT`.
 pub(super) fn user_agent() -> String {
-    std::env::var("BRO_HARNESS_USER_AGENT").unwrap_or_else(|_| {
+    super::session_var("BRO_HARNESS_USER_AGENT").unwrap_or_else(|| {
         format!(
             "{}/{} ({}; {})",
             originator(),
@@ -779,10 +788,10 @@ pub(super) fn model_supports_reasoning(model: &str) -> bool {
 /// Reasoning summary mode (codex default `auto`). `BRO_HARNESS_REASONING_SUMMARY`
 /// overrides; `none`/`off`/empty omits the field.
 pub(super) fn reasoning_summary() -> Option<String> {
-    match std::env::var("BRO_HARNESS_REASONING_SUMMARY") {
-        Ok(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "none" | "off" | "") => None,
-        Ok(v) => Some(v.trim().to_string()),
-        Err(_) => Some("auto".to_string()),
+    match super::session_var("BRO_HARNESS_REASONING_SUMMARY") {
+        Some(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "none" | "off" | "") => None,
+        Some(v) => Some(v.trim().to_string()),
+        None => Some("auto".to_string()),
     }
 }
 
@@ -1287,6 +1296,37 @@ mod tests {
         assert_eq!(body["service_tier"], SERVICE_TIER_PRIORITY);
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn root_and_child_share_cache_key_while_wire_sessions_differ() {
+        let mut root = state();
+        root.session_id = "root-session".into();
+        root.prompt_cache_root = "root-session".into();
+        let mut child = state();
+        child.session_id = "child-session".into();
+        child.prompt_cache_root = root.prompt_cache_root.clone();
+
+        let root_body = root.build_body(&[], &opts(SystemPrompt::default()));
+        let child_body = child.build_body(&[], &opts(SystemPrompt::default()));
+        let root_headers = root.identity_auth_headers();
+        let child_headers = child.identity_auth_headers();
+
+        assert_eq!(
+            root_body["prompt_cache_key"],
+            child_body["prompt_cache_key"]
+        );
+        assert_eq!(child_body["prompt_cache_key"], "root-session");
+        assert!(
+            root_headers
+                .iter()
+                .any(|(name, value)| { *name == "session-id" && value == "root-session" })
+        );
+        assert!(
+            child_headers
+                .iter()
+                .any(|(name, value)| { *name == "session-id" && value == "child-session" })
+        );
     }
 
     #[test]

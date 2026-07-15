@@ -70,6 +70,7 @@ pub fn selected_config_path() -> Option<PathBuf> {
         .or_else(default_config_path)
 }
 
+#[allow(clippy::disallowed_methods)]
 fn load_partial() -> PartialConfig {
     selected_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -101,6 +102,22 @@ pub fn bro_home() -> PathBuf {
         return expand_tilde(s);
     }
     state_dir(&cfg).join("bro")
+}
+
+/// Shared same-host daemon credential. All differentiated services resolve
+/// this exact path unless the operator supplies an explicit override.
+pub fn service_token_path() -> PathBuf {
+    if let Some(path) = env_path("BLACKBOX_SERVICE_TOKEN_FILE") {
+        return path;
+    }
+    state_dir(&load_partial()).join("service.token")
+}
+
+/// Load or initialize the credential used by trusted local HTTP clients.
+pub fn service_authorization_header() -> anyhow::Result<reqwest::header::HeaderValue> {
+    let path = service_token_path();
+    crate::service_auth::load_or_create(&path)
+        .map_err(|error| anyhow::anyhow!("loading service token from {}: {error}", path.display()))
 }
 
 /// The daemon port from `[daemon].port`, else 7264.

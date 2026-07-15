@@ -188,10 +188,10 @@ impl Provider {
     /// provider-wide set (fail open — the allocator validates the model id
     /// separately).
     pub fn model_efforts(&self, model_id: &str) -> Vec<&'static str> {
-        if let Some(mi) = self.models().iter().find(|m| m.id == model_id) {
-            if !mi.efforts.is_empty() {
-                return mi.efforts.to_vec();
-            }
+        if let Some(mi) = self.models().iter().find(|m| m.id == model_id)
+            && !mi.efforts.is_empty()
+        {
+            return mi.efforts.to_vec();
         }
         self.efforts().iter().map(|e| e.id).collect()
     }
@@ -203,7 +203,7 @@ impl Provider {
         let ids = self.model_efforts(model_id);
         self.efforts()
             .iter()
-            .filter(|e| ids.iter().any(|id| *id == e.id))
+            .filter(|e| ids.contains(&e.id))
             .collect()
     }
 
@@ -211,10 +211,10 @@ impl Provider {
     /// [`ModelInfo::default_effort`], else the provider effort flagged
     /// `default`, else the first provider effort.
     pub fn model_default_effort(&self, model_id: &str) -> Option<&'static str> {
-        if let Some(mi) = self.models().iter().find(|m| m.id == model_id) {
-            if let Some(d) = mi.default_effort {
-                return Some(d);
-            }
+        if let Some(mi) = self.models().iter().find(|m| m.id == model_id)
+            && let Some(d) = mi.default_effort
+        {
+            return Some(d);
         }
         self.efforts()
             .iter()

@@ -129,6 +129,15 @@ the authenticated worker connection to a policy envelope. blackopsd binds that
 session to the canonical root identity and verifies every target is the root or
 a descendant. Transport framing and retries live in `bro-rpc`, not in the trait.
 
+Effectful AgentCapability and AtomCapability calls also carry a stable
+invocation identity outside their semantic DTO. The flat surface obtains it
+from the provider tool-call ID through `ToolCx`; a nested code-mode call derives
+it from the outer `exec` ID and its deterministic `tool-N` ordinal. Worker RPC
+keeps that value separate from the ephemeral response-correlation `call_id`,
+and blackopsd uses only the former for logical operation idempotency. A response
+lost after commit can therefore be replayed through a new connection without
+creating a second child, message, followup, interrupt, or atom invocation.
+
 ## 4. Canonical identity and lifecycle
 
 Canonical names are hierarchical, for example `/root/research/api_scan`. A

@@ -77,6 +77,7 @@ struct Entry {
 pub struct Registry {
     tools: HashMap<String, Entry>,
     activated: Arc<Mutex<HashSet<String>>>,
+    disabled: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Registry {
@@ -143,6 +144,7 @@ impl Registry {
         }
 
         let activated = Arc::new(Mutex::new(HashSet::new()));
+        let disabled = Arc::new(Mutex::new(HashSet::new()));
 
         // tool_search is added unless explicitly denied. It ignores allow-list
         // exclusion (decision b): a narrow allow-list still gets search so it
@@ -163,6 +165,7 @@ impl Registry {
             let search: Arc<dyn Tool> = Arc::new(ToolSearchTool {
                 catalog,
                 activated: activated.clone(),
+                disabled: disabled.clone(),
             });
             tools.insert(
                 TOOL_SEARCH.to_string(),
@@ -173,7 +176,18 @@ impl Registry {
             );
         }
 
-        Self { tools, activated }
+        Self {
+            tools,
+            activated,
+            disabled,
+        }
+    }
+
+    /// Replace the runtime-disabled subset. The registry retains each tool so
+    /// a later policy grant can restore the same session-scoped proxy, while
+    /// every model-facing and dispatch path fails closed during revocation.
+    pub fn set_disabled_tools(&self, names: impl IntoIterator<Item = String>) {
+        *self.disabled.lock().unwrap() = names.into_iter().collect();
     }
 
     fn spec_of(e: &Entry) -> ToolSpec {
@@ -189,11 +203,15 @@ impl Registry {
     /// then Eager, then any Deferred tools activated so far. Sorted within
     /// each group for stable prompt-cache prefixes.
     pub fn wire_specs(&self) -> Vec<ToolSpec> {
+        let disabled = self.disabled.lock().unwrap().clone();
         let activated = self.activated.lock().unwrap();
         let mut pinned = Vec::new();
         let mut eager = Vec::new();
         let mut active = Vec::new();
         for e in self.tools.values() {
+            if disabled.contains(e.tool.name()) {
+                continue;
+            }
             match e.tier {
                 Tier::Pinned => pinned.push(Self::spec_of(e)),
                 Tier::Eager => eager.push(Self::spec_of(e)),
@@ -215,10 +233,11 @@ impl Registry {
     /// Pinned tool (name, description) pairs for the prominent system-prompt
     /// callout.
     pub fn pinned(&self) -> Vec<(String, String)> {
+        let disabled = self.disabled.lock().unwrap().clone();
         let mut v: Vec<_> = self
             .tools
             .values()
-            .filter(|e| e.tier == Tier::Pinned)
+            .filter(|e| e.tier == Tier::Pinned && !disabled.contains(e.tool.name()))
             .map(|e| (e.tool.name().to_string(), short_desc(e.tool.description())))
             .collect();
         v.sort();
@@ -228,11 +247,16 @@ impl Registry {
     /// Deferred-and-not-yet-activated (name, description) pairs for the
     /// names-only manifest.
     pub fn manifest(&self) -> Vec<(String, String)> {
+        let disabled = self.disabled.lock().unwrap().clone();
         let activated = self.activated.lock().unwrap();
         let mut v: Vec<_> = self
             .tools
             .values()
-            .filter(|e| e.tier == Tier::Deferred && !activated.contains(e.tool.name()))
+            .filter(|e| {
+                e.tier == Tier::Deferred
+                    && !disabled.contains(e.tool.name())
+                    && !activated.contains(e.tool.name())
+            })
             .map(|e| (e.tool.name().to_string(), short_desc(e.tool.description())))
             .collect();
         v.sort();
@@ -240,22 +264,38 @@ impl Registry {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.contains_key(name) && !self.disabled.lock().unwrap().contains(name)
     }
 
     pub fn schemas(&self) -> Vec<(String, Value)> {
+        let disabled = self.disabled.lock().unwrap().clone();
         let mut schemas: Vec<_> = self
             .tools
             .iter()
+            .filter(|(name, _)| !disabled.contains(name.as_str()))
             .map(|(name, entry)| (name.clone(), entry.tool.input_schema()))
             .collect();
         schemas.sort_by(|a, b| a.0.cmp(&b.0));
         schemas
     }
 
-    pub async fn dispatch(&self, name: &str, input: Value, cx: &ToolCx) -> ToolResult {
+    pub async fn dispatch(
+        &self,
+        invocation_id: &str,
+        name: &str,
+        input: Value,
+        cx: &ToolCx,
+    ) -> ToolResult {
+        if self.disabled.lock().unwrap().contains(name) {
+            return ToolResult::Error(format!(
+                "tool unavailable under current service policy: {name}"
+            ));
+        }
         match self.tools.get(name) {
-            Some(e) => call_tool_with_arg_defaults(e.tool.as_ref(), name, input, cx).await,
+            Some(e) => {
+                let invocation_cx = cx.for_invocation(Arc::<str>::from(invocation_id));
+                call_tool_with_arg_defaults(e.tool.as_ref(), name, input, &invocation_cx).await
+            }
             None => ToolResult::Error(format!("unknown tool: {name}")),
         }
     }
@@ -267,6 +307,9 @@ impl Registry {
     /// must be serialized. This is the conservative default for MCP tools, whose
     /// effects the harness cannot inspect, and for any builtin that writes.
     pub fn read_only(&self, name: &str) -> bool {
+        if self.disabled.lock().unwrap().contains(name) {
+            return false;
+        }
         self.tools
             .get(name)
             .map(|e| e.tool.annotations().read_only)
@@ -325,6 +368,7 @@ struct ToolSearchInput {
 struct ToolSearchTool {
     catalog: Arc<Vec<DeferredEntry>>,
     activated: Arc<Mutex<HashSet<String>>>,
+    disabled: Arc<Mutex<HashSet<String>>>,
 }
 
 #[async_trait]
@@ -361,11 +405,12 @@ impl Tool for ToolSearchTool {
             return ToolResult::Error("query is required".into());
         }
 
+        let disabled = self.disabled.lock().unwrap().clone();
         let matches: Vec<&DeferredEntry> = if let Some(sel) = query.strip_prefix("select:") {
             let names: HashSet<&str> = sel.split(',').map(|s| s.trim()).collect();
             self.catalog
                 .iter()
-                .filter(|e| names.contains(e.name.as_str()))
+                .filter(|e| names.contains(e.name.as_str()) && !disabled.contains(&e.name))
                 .collect()
         } else {
             let terms: Vec<String> = query
@@ -376,6 +421,7 @@ impl Tool for ToolSearchTool {
             let mut scored: Vec<(usize, &DeferredEntry)> = self
                 .catalog
                 .iter()
+                .filter(|e| !disabled.contains(&e.name))
                 .filter_map(|e| {
                     let hay = format!("{} {}", e.name, e.description).to_lowercase();
                     let score = terms.iter().filter(|t| hay.contains(t.as_str())).count();
@@ -406,7 +452,7 @@ impl Tool for ToolSearchTool {
         let remaining_count = self
             .catalog
             .iter()
-            .filter(|e| !activated.contains(e.name.as_str()))
+            .filter(|e| !disabled.contains(&e.name) && !activated.contains(e.name.as_str()))
             .count();
         ToolResult::Json(json!({
             "loaded": matches.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
@@ -458,6 +504,7 @@ mod tests {
 
     fn test_cx(defaults: bro_tools::ToolArgDefaults) -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: std::env::temp_dir(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -508,6 +555,7 @@ mod tests {
         );
         let result = reg
             .dispatch(
+                "test-default-call",
                 "mcp__blackbox__bbox_note",
                 json!({"kind": "done"}),
                 &test_cx(defaults),
@@ -535,6 +583,7 @@ mod tests {
         );
         let result = reg
             .dispatch(
+                "test-conflict-call",
                 "mcp__blackbox__bbox_note",
                 json!({"session_id": "model-session"}),
                 &test_cx(defaults),
@@ -716,7 +765,12 @@ mod tests {
         let cx = test_cx(bro_tools::ToolArgDefaults::default());
 
         let compact = reg
-            .dispatch("tool_search", json!({"query":"stats"}), &cx)
+            .dispatch(
+                "test-search-call",
+                "tool_search",
+                json!({"query":"stats"}),
+                &cx,
+            )
             .await;
         match compact {
             ToolResult::Json(v) => {
@@ -735,6 +789,7 @@ mod tests {
         );
         let verbose = reg
             .dispatch(
+                "test-verbose-search-call",
                 "tool_search",
                 json!({"query":"stats","include_schemas":true}),
                 &cx,
@@ -746,6 +801,44 @@ mod tests {
             }
             other => panic!("expected json, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_policy_hides_dispatch_and_restores_the_same_tool_proxy() {
+        let reg = Registry::new(
+            vec![mk("remote_probe", "remote policy probe")],
+            vec![],
+            &PinPolicy { patterns: vec![] },
+            &ToolFilter::default(),
+        );
+        let cx = test_cx(bro_tools::ToolArgDefaults::default());
+        assert!(reg.contains("remote_probe"));
+        assert!(
+            reg.wire_specs()
+                .iter()
+                .any(|spec| spec.name == "remote_probe")
+        );
+
+        reg.set_disabled_tools(["remote_probe".to_string()]);
+        assert!(!reg.contains("remote_probe"));
+        assert!(
+            !reg.wire_specs()
+                .iter()
+                .any(|spec| spec.name == "remote_probe")
+        );
+        assert!(matches!(
+            reg.dispatch("test-disabled-call", "remote_probe", json!({}), &cx)
+                .await,
+            ToolResult::Error(message) if message.contains("current service policy")
+        ));
+
+        reg.set_disabled_tools(Vec::<String>::new());
+        assert!(reg.contains("remote_probe"));
+        assert!(!matches!(
+            reg.dispatch("test-restored-call", "remote_probe", json!({}), &cx)
+                .await,
+            ToolResult::Error(_)
+        ));
     }
 
     #[test]

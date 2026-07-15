@@ -671,6 +671,8 @@ fn gc_protects_apply_referenced_duplicates() {
 }
 
 #[test]
+// This fixture inspects the synchronous packet store's on-disk lock files.
+#[allow(clippy::disallowed_methods)]
 fn gc_sweeps_orphaned_lock_files() {
     let (dir, store) = tmp_packets();
     let params = compile_params(

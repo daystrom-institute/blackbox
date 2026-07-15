@@ -128,6 +128,10 @@ impl CodeModeSessionDelegate for HarnessDelegate {
             let name = invocation.tool_name.to_string();
             let input_json = invocation.input.unwrap_or_else(|| json!({}));
             let call = ToolInvocation {
+                invocation_id: format!(
+                    "{}:code:{}",
+                    invocation.parent_tool_call_id, invocation.runtime_tool_call_id
+                ),
                 name: name.clone(),
                 input_json,
             };
@@ -387,7 +391,7 @@ impl Tool for ExecTool {
         })
     }
 
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let Some(source) = input.get("source").and_then(Value::as_str) else {
             return ToolResult::Error("exec: `source` is required".into());
         };
@@ -395,8 +399,13 @@ impl Tool for ExecTool {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(format!("exec: {e}")),
         };
+        let Some(invocation_id) = cx.invocation_id() else {
+            return ToolResult::Error(
+                "exec is missing its stable provider tool invocation identity".into(),
+            );
+        };
         let request = ExecuteRequest {
-            tool_call_id: "exec".to_string(),
+            tool_call_id: invocation_id.to_string(),
             enabled_tools: self.surface.catalog.clone(),
             source: parsed.code,
             yield_time_ms: parsed.yield_time_ms,
@@ -505,6 +514,8 @@ pub fn code_mode_tools(
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise nested code-mode tools.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -531,8 +542,27 @@ mod tests {
         }
     }
 
+    struct InvocationEcho;
+
+    #[async_trait]
+    impl Tool for InvocationEcho {
+        fn name(&self) -> &str {
+            "invocation_echo"
+        }
+        fn description(&self) -> &str {
+            "Return the stable invocation identity."
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn call(&self, _input: Value, cx: &ToolCx) -> ToolResult {
+            ToolResult::Text(cx.invocation_id().unwrap_or("missing").to_string())
+        }
+    }
+
     fn test_cx() -> ToolCx {
         ToolCx {
+            invocation_id: Some(Arc::from("test-code-mode-call")),
             root: std::env::temp_dir(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -594,6 +624,29 @@ mod tests {
             .await;
         match result {
             ToolResult::Text(t) => assert!(t.contains("\"a\":1"), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_call_identity_derives_from_provider_call_and_runtime_ordinal() {
+        let exec = exec_with(vec![Arc::new(InvocationEcho) as Arc<dyn Tool>]);
+        let cx = test_cx().for_invocation(Arc::<str>::from("provider-exec-call-9"));
+        let result = exec
+            .call(
+                json!({
+                    "source": "const id = await tools.invocation_echo({}); text(id);"
+                }),
+                &cx,
+            )
+            .await;
+        match result {
+            ToolResult::Text(text) => {
+                assert!(
+                    text.contains("provider-exec-call-9:code:tool-1"),
+                    "got: {text}"
+                );
+            }
             other => panic!("expected text, got {other:?}"),
         }
     }
@@ -686,6 +739,7 @@ text(JSON.stringify(result));
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("probe.txt"), "hello-codemode-123").unwrap();
         let cx = ToolCx {
+            invocation_id: Some(Arc::from("test-code-mode-call")),
             root: dir.path().to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -908,6 +962,7 @@ text(JSON.stringify(result));
         )
         .unwrap();
         let cx = ToolCx {
+            invocation_id: Some(Arc::from("test-code-mode-call")),
             root: dir.path().to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -956,6 +1011,7 @@ text(`${inv.language}:${beta.kind}:${body.text.startsWith("pub fn beta")}`);
         )
         .unwrap();
         let cx = ToolCx {
+            invocation_id: Some(Arc::from("test-code-mode-call")),
             root: dir.path().to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

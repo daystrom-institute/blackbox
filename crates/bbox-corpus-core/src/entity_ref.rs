@@ -542,6 +542,9 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(&digest[..4])
 }
 
+/// Synchronous path-identity boundary used by indexing and registration
+/// actors. Async callers must resolve it on their blocking lane.
+#[allow(clippy::disallowed_methods)]
 pub fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     if canonical.is_file() {
@@ -920,6 +923,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous filesystem fixture setup
     fn project_ids_reject_file_paths() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("file.txt");
@@ -946,6 +950,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // synchronous temporary git fixture
     fn repo_id_falls_back_to_remote_origin_without_commits() {
         let dir = tempfile::tempdir().unwrap();
         let init = Command::new("git")
@@ -979,6 +984,7 @@ mod tests {
     }
 
     /// Init a tempdir git repo with one commit, branch-explicit and config-free.
+    #[allow(clippy::disallowed_methods)] // synchronous temporary git fixture helper
     fn test_repo_with_commit() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {

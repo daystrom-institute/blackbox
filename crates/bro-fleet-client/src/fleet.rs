@@ -176,6 +176,7 @@ pub struct ProjectDispatch {
 /// worktree creation or dispatch. There is deliberately NO plain-copy
 /// fallback: physically copying a multi-GB target dir would cost more than
 /// the cold build it is meant to avoid, so non-CoW filesystems just skip.
+#[allow(clippy::disallowed_methods)]
 pub fn seed_worktree_dirs(base_repo: &Path, worktree: &Path, dirs: &[String]) -> Vec<String> {
     let mut outcomes = Vec::new();
     for dir in dirs {
@@ -219,6 +220,7 @@ pub fn seed_worktree_dirs(base_repo: &Path, worktree: &Path, dirs: &[String]) ->
 /// `cp` with the platform's copy-on-write flag. macOS: `-c` (clonefile,
 /// APFS). Other unices: `--reflink=always` (btrfs/xfs); `always` not `auto`
 /// so a non-CoW filesystem fails fast instead of physically copying.
+#[allow(clippy::disallowed_methods)]
 fn clone_dir_cow(src: &Path, dst: &Path) -> Result<(), String> {
     let mut cmd = std::process::Command::new("cp");
     #[cfg(target_os = "macos")]
@@ -472,6 +474,7 @@ disagree or ignore it. Turns without that prefix are your actual operator direct
     )
 }
 
+#[allow(clippy::disallowed_methods)]
 impl FleetConfig {
     /// `fleet.json` beside the selected `config.toml`. This intentionally
     /// honors `BLACKBOX_CONFIG`; macOS' `dirs::config_dir()` points at
@@ -1222,6 +1225,42 @@ struct DaemonFleetClient {
     base_url: Arc<str>,
     http: reqwest::Client,
     stream_http: reqwest::Client,
+    service_credential: ServiceCredential,
+}
+
+#[derive(Clone)]
+enum ServiceCredential {
+    Ready(Arc<reqwest::header::HeaderValue>),
+    Unavailable(Arc<str>),
+}
+
+impl ServiceCredential {
+    fn load() -> Self {
+        let path = config::service_token_path();
+        match crate::service_auth::load_or_create(&path) {
+            Ok(token) => Self::Ready(Arc::new(token)),
+            Err(error) => Self::Unavailable(Arc::from(format!(
+                "loading service token from {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn test() -> Self {
+        Self::Ready(Arc::new(
+            crate::service_auth::parse(&"a".repeat(64)).expect("fixed test service token"),
+        ))
+    }
+
+    fn authorize(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        match self {
+            Self::Ready(header) => Ok(request.header(reqwest::header::AUTHORIZATION, &**header)),
+            Self::Unavailable(error) => anyhow::bail!(error.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1281,6 +1320,10 @@ impl DaemonAgentHandle {
 
 impl DaemonFleetClient {
     fn new(raw_url: impl Into<String>) -> Self {
+        Self::with_credential(raw_url, ServiceCredential::load())
+    }
+
+    fn with_credential(raw_url: impl Into<String>, service_credential: ServiceCredential) -> Self {
         let mut url = raw_url.into();
         while url.ends_with('/') {
             url.pop();
@@ -1298,7 +1341,12 @@ impl DaemonFleetClient {
             // SSE streams are intentionally unbounded after connect. A total
             // request timeout would kill healthy infinite streams on schedule.
             stream_http: build_http_client(STREAM_HTTP_TIMEOUTS),
+            service_credential,
         }
+    }
+
+    fn for_test(raw_url: impl Into<String>) -> Self {
+        Self::with_credential(raw_url, ServiceCredential::test())
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -1306,12 +1354,8 @@ impl DaemonFleetClient {
     }
 
     async fn post_json(&self, path: &str, body: Value) -> anyhow::Result<Value> {
-        let resp = self
-            .http
-            .post(self.endpoint(path))
-            .json(&body)
-            .send()
-            .await?;
+        let request = self.http.post(self.endpoint(path)).json(&body);
+        let resp = self.service_credential.authorize(request)?.send().await?;
         let resp = surface_error_body(resp, path).await?;
         let outer: Value = resp.json().await?;
         parse_tool_result_json(outer)
@@ -1328,21 +1372,20 @@ impl DaemonFleetClient {
     /// the daemon's structured outcome on `Ok` and treat HTTP failures
     /// uniformly.
     async fn post_json_value(&self, path: &str, body: Value) -> anyhow::Result<Value> {
-        let resp = self
-            .http
-            .post(self.endpoint(path))
-            .json(&body)
-            .send()
-            .await?;
+        let request = self.http.post(self.endpoint(path)).json(&body);
+        let resp = self.service_credential.authorize(request)?.send().await?;
         let resp = surface_error_body(resp, path).await?;
         Ok(resp.json().await?)
     }
 
     async fn get_roster_snapshot(&self) -> anyhow::Result<RosterSnapshotV1> {
-        let resp = self
+        let request = self
             .http
             .get(self.endpoint("/control/roster"))
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(15));
+        let resp = self
+            .service_credential
+            .authorize(request)?
             .send()
             .await?
             .error_for_status()?;
@@ -1350,8 +1393,11 @@ impl DaemonFleetClient {
     }
 
     async fn forget_roster_task(&self, task_id: &str) -> anyhow::Result<()> {
-        self.http
-            .delete(self.endpoint(&format!("/control/roster/{task_id}")))
+        let request = self
+            .http
+            .delete(self.endpoint(&format!("/control/roster/{task_id}")));
+        self.service_credential
+            .authorize(request)?
             .send()
             .await?
             .error_for_status()?;
@@ -1359,9 +1405,12 @@ impl DaemonFleetClient {
     }
 
     async fn open_roster_stream(&self) -> anyhow::Result<reqwest::Response> {
-        Ok(self
+        let request = self
             .stream_http
-            .get(self.endpoint("/control/roster/stream"))
+            .get(self.endpoint("/control/roster/stream"));
+        Ok(self
+            .service_credential
+            .authorize(request)?
             .send()
             .await?
             .error_for_status()?)
@@ -1546,6 +1595,14 @@ fn dispatch_body(spec: &DispatchSpec) -> Value {
     if let Some(name) = &spec.name {
         body["display_name"] = Value::String(name.clone());
     }
+    if !spec.allowed_remote_operations.is_empty() {
+        body["allowed_remote_operations"] =
+            serde_json::to_value(&spec.allowed_remote_operations).unwrap_or_default();
+    }
+    if !spec.allowed_atom_refs.is_empty() {
+        body["allowed_atom_refs"] =
+            serde_json::to_value(&spec.allowed_atom_refs).unwrap_or_default();
+    }
     body
 }
 
@@ -1567,6 +1624,14 @@ fn resume_body(spec: &ResumeSpec) -> Value {
     }
     if let Some(service_tier) = &spec.service_tier {
         body["service_tier"] = Value::String(service_tier.clone());
+    }
+    if !spec.allowed_remote_operations.is_empty() {
+        body["allowed_remote_operations"] =
+            serde_json::to_value(&spec.allowed_remote_operations).unwrap_or_default();
+    }
+    if !spec.allowed_atom_refs.is_empty() {
+        body["allowed_atom_refs"] =
+            serde_json::to_value(&spec.allowed_atom_refs).unwrap_or_default();
     }
     body
 }
@@ -1668,7 +1733,7 @@ async fn apply_roster_delta_or_resync<T: RosterTransport + ?Sized>(
 
 #[derive(Debug, PartialEq)]
 enum RosterSseItem {
-    Delta(RosterDelta),
+    Delta(Box<RosterDelta>),
     Resync {
         reason: Option<String>,
         skipped: Option<u64>,
@@ -1714,6 +1779,7 @@ fn parse_roster_sse_frame(frame: &str) -> Option<RosterSseItem> {
     }
     serde_json::from_str::<RosterDelta>(&data)
         .ok()
+        .map(Box::new)
         .map(RosterSseItem::Delta)
 }
 
@@ -1733,7 +1799,7 @@ async fn handle_roster_sse_item<T: RosterTransport + ?Sized>(
             if delta.seq() <= state.last_seq {
                 return Ok(());
             }
-            apply_roster_delta_or_resync(state, delta, transport, task_store, tail_tx).await
+            apply_roster_delta_or_resync(state, *delta, transport, task_store, tail_tx).await
         }
         RosterSseItem::Resync { reason, skipped } => {
             tracing::warn!(
@@ -1866,7 +1932,7 @@ impl FleetOrchestrator {
     /// scheme reqwest rejects at request-build time. Test fixtures must use
     /// this instead of [`FleetOrchestrator::new`] for two reasons:
     ///
-    /// 1. `new`'s default URL is the live local blackboxd on 7264, so a test
+    /// 1. `new`'s default URL is the live local fleetd on 7265, so a test
     ///    that steers/resumes fires real `/control/*` calls at the prod
     ///    daemon (test-isolation violation).
     /// 2. The URL must fail without any socket IO. `block_on_fleet_http`
@@ -1882,7 +1948,7 @@ impl FleetOrchestrator {
         Self::with_store(
             store_dir,
             TaskStore::new(),
-            DaemonFleetClient::new("dead-scheme://cockpit-test-fixture"),
+            DaemonFleetClient::for_test("dead-scheme://cockpit-test-fixture"),
         )
     }
 
@@ -1919,9 +1985,11 @@ impl FleetOrchestrator {
         let store_dir = config::bro_home().join(store_name);
         let store = TaskStore::new();
         // The fleet client is daemon-only: resolve an explicit --daemon-url,
-        // then BLACKBOX_FLEET_DAEMON_URL, then the default local daemon. Dispatch
-        // always rides `/control/*` against this singleton (§7).
+        // then FLEETD_URL, the compatibility BLACKBOX_FLEET_DAEMON_URL, and
+        // finally the default local fleetd. Dispatch always rides `/control/*`
+        // against this singleton (§7).
         let url = daemon_url
+            .or_else(|| std::env::var("FLEETD_URL").ok())
             .or_else(|| std::env::var("BLACKBOX_FLEET_DAEMON_URL").ok())
             .unwrap_or_else(default_daemon_url);
         let orch = Self::with_store(store_dir, store, DaemonFleetClient::new(url));
@@ -2141,21 +2209,19 @@ impl FleetOrchestrator {
     }
 }
 
-/// First line of the prompt, capped — the durable display name for a session.
+/// First line of the prompt, capped. This is the durable display name for a session.
 fn prompt_head(prompt: &str) -> String {
     let line = prompt.lines().next().unwrap_or("").trim();
     line.chars().take(60).collect()
 }
 
-/// The default daemon base URL the cockpit drives when no `--daemon-url` /
-/// `BLACKBOX_FLEET_DAEMON_URL` is given: the local daemon on `BBOX_PORT`
-/// (default 7264). The fleet client is daemon-only, so `bro fleet` with no flags
-/// targets the local singleton (harness-daemon-boundary.md §7).
+/// The default service URL the cockpit drives when no explicit endpoint is
+/// given: local fleetd on `FLEETD_PORT` (default 7265).
 fn default_daemon_url() -> String {
-    let port = std::env::var("BBOX_PORT")
+    let port = std::env::var("FLEETD_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(7264);
+        .unwrap_or(7265);
     format!("http://127.0.0.1:{port}")
 }
 
@@ -2176,12 +2242,25 @@ pub fn provider_supports_bidi(provider: Provider) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use bro_protocol::{SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY};
 
     #[test]
+    fn default_endpoint_is_standalone_fleetd() {
+        let _guard = crate::test_env_lock();
+        let previous = std::env::var_os("FLEETD_PORT");
+        unsafe { std::env::remove_var("FLEETD_PORT") };
+        assert_eq!(default_daemon_url(), "http://127.0.0.1:7265");
+        if let Some(previous) = previous {
+            unsafe { std::env::set_var("FLEETD_PORT", previous) };
+        }
+    }
+
+    #[test]
     fn new_orchestrator_has_no_tasks() {
-        let orch = FleetOrchestrator::new(std::env::temp_dir().join("bbox-fleet-test"));
+        let orch = FleetOrchestrator::for_test(std::env::temp_dir().join("bbox-fleet-test"));
         assert!(orch.tasks().is_empty());
         // subscribe must yield a live receiver without a prior dispatch.
         let _rx = orch.subscribe();
@@ -2253,9 +2332,23 @@ mod tests {
         // Absent ⇒ no code_mode/service_tier keys (harness applies defaults).
         assert!(dispatch_body(&spec).get("code_mode").is_none());
         assert!(dispatch_body(&spec).get("service_tier").is_none());
+        assert!(
+            dispatch_body(&spec)
+                .get("allowed_remote_operations")
+                .is_none()
+        );
+        assert!(dispatch_body(&spec).get("allowed_atom_refs").is_none());
         // Set ⇒ forwarded as ExecParams.code_mode.
         spec.code_mode = Some("only".to_string());
         spec.service_tier = Some(SERVICE_TIER_PRIORITY.to_string());
+        spec.allowed_remote_operations = BTreeMap::from([
+            (
+                "blackops.agent".into(),
+                vec!["spawn".into(), "status".into()],
+            ),
+            ("atom".into(), vec!["invoke_atom".into()]),
+        ]);
+        spec.allowed_atom_refs = vec![bro_core::AtomRef::new("atom:review@v1")];
         assert_eq!(
             dispatch_body(&spec)
                 .get("code_mode")
@@ -2268,19 +2361,42 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some(SERVICE_TIER_PRIORITY)
         );
+        assert_eq!(
+            dispatch_body(&spec)["allowed_remote_operations"],
+            serde_json::json!({
+                "atom": ["invoke_atom"],
+                "blackops.agent": ["spawn", "status"]
+            })
+        );
+        assert_eq!(
+            dispatch_body(&spec)["allowed_atom_refs"],
+            serde_json::json!(["atom:review@v1"])
+        );
     }
 
     #[test]
     fn resume_body_carries_service_tier_only_when_set() {
         let mut spec = ResumeSpec::new(Provider::Brodex, "sess-1", "continue");
         assert!(resume_body(&spec).get("service_tier").is_none());
+        assert!(
+            resume_body(&spec)
+                .get("allowed_remote_operations")
+                .is_none()
+        );
+        assert!(resume_body(&spec).get("allowed_atom_refs").is_none());
 
         spec.service_tier = Some(SERVICE_TIER_DEFAULT.to_string());
+        spec.allowed_remote_operations =
+            BTreeMap::from([("blackops.agent".into(), vec!["status".into()])]);
         assert_eq!(
             resume_body(&spec)
                 .get("service_tier")
                 .and_then(|v| v.as_str()),
             Some(SERVICE_TIER_DEFAULT)
+        );
+        assert_eq!(
+            resume_body(&spec)["allowed_remote_operations"],
+            serde_json::json!({"blackops.agent": ["status"]})
         );
     }
 

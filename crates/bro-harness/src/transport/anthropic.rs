@@ -911,8 +911,8 @@ const DEFAULT_ANTHROPIC_BETAS: &str =
     "effort-2025-11-24,context-1m-2025-08-07,extended-cache-ttl-2025-04-11";
 
 fn anthropic_betas() -> String {
-    std::env::var("BRO_HARNESS_ANTHROPIC_BETAS")
-        .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BETAS.to_string())
+    super::session_var("BRO_HARNESS_ANTHROPIC_BETAS")
+        .unwrap_or_else(|| DEFAULT_ANTHROPIC_BETAS.to_string())
 }
 
 /// `cache_control` block for prompt-cache breakpoints. Defaults to a **1-hour
@@ -936,10 +936,10 @@ fn cache_control(minimax: bool) -> Value {
     if minimax {
         return json!({"type": "ephemeral"});
     }
-    match std::env::var("BRO_HARNESS_CACHE_TTL") {
-        Ok(t) if t.is_empty() => json!({"type": "ephemeral"}),
-        Ok(t) => json!({"type": "ephemeral", "ttl": t}),
-        Err(_) => json!({"type": "ephemeral", "ttl": "1h"}),
+    match super::session_var("BRO_HARNESS_CACHE_TTL") {
+        Some(t) if t.is_empty() => json!({"type": "ephemeral"}),
+        Some(t) => json!({"type": "ephemeral", "ttl": t}),
+        None => json!({"type": "ephemeral", "ttl": "1h"}),
     }
 }
 
@@ -1052,6 +1052,8 @@ fn content_blocks(message: &Value) -> impl Iterator<Item = &Value> {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise provider credential discovery.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::transport::{BaseInstructions, SystemPrompt};

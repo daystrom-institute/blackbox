@@ -25,6 +25,8 @@ pub(super) struct CockpitInstanceLock {
 }
 
 impl CockpitInstanceLock {
+    // Acquired synchronously during cockpit startup, before the TUI event loop begins.
+    #[allow(clippy::disallowed_methods)]
     pub(super) fn acquire(store_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(store_dir)?;
         let path = store_dir.join("cockpit.lock");
@@ -62,6 +64,8 @@ fn read_holder_pid(file: &mut File) -> Option<u32> {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise the process-level lock contract.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

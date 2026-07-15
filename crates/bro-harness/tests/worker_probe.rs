@@ -1,4 +1,5 @@
 #![cfg(unix)]
+#![allow(clippy::disallowed_methods)] // Integration fixture owns its temporary socket state.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -14,6 +15,16 @@ use bro_rpc::{FleetHandshakeConfig, accept_worker};
 use tempfile::tempdir;
 use tokio::net::UnixListener;
 use tokio::process::Command;
+
+fn worker_start_timeout() -> Duration {
+    if cfg!(target_os = "macos") {
+        // Newly linked binaries can spend well over ten seconds in macOS
+        // loader/signature validation before reaching worker bootstrap.
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(10)
+    }
+}
 
 fn fleet_config() -> FleetHandshakeConfig {
     FleetHandshakeConfig {
@@ -68,9 +79,9 @@ async fn real_harness_binary_completes_probe_exchange() {
         .spawn()
         .unwrap();
 
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+    let (stream, _) = tokio::time::timeout(worker_start_timeout(), listener.accept())
         .await
-        .expect("worker did not connect within 10 seconds")
+        .expect("worker did not connect before the platform startup deadline")
         .unwrap();
     let (mut framed, hello, welcome) = accept_worker(stream, fleet_config(), |hello| {
         (hello.bootstrap_or_resume_proof.expose_secret() == "bootstrap-probe")
@@ -182,9 +193,9 @@ async fn real_harness_binary_reports_version_mismatch() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+    let (stream, _) = tokio::time::timeout(worker_start_timeout(), listener.accept())
         .await
-        .expect("worker did not connect within 10 seconds")
+        .expect("worker did not connect before the platform startup deadline")
         .unwrap();
     let result = accept_worker(stream, fleet_config(), |_| Ok(())).await;
     assert!(result.is_err());
@@ -222,9 +233,9 @@ async fn real_harness_binary_reports_authentication_rejection() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+    let (stream, _) = tokio::time::timeout(worker_start_timeout(), listener.accept())
         .await
-        .expect("worker did not connect within 10 seconds")
+        .expect("worker did not connect before the platform startup deadline")
         .unwrap();
     let result = accept_worker(stream, fleet_config(), |_| {
         Err("bootstrap proof mismatch".to_string())

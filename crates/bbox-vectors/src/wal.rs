@@ -73,6 +73,9 @@ pub fn append(path: &Path, record: &WalRecord) -> Result<()> {
 /// page cache flushed and triggered tantivy mmap re-paging on next
 /// access. This was the dominant disk-I/O source identified in the
 /// post-mortem of the agentic-corpus backfill.
+// WAL appends are an intentionally synchronous durability boundary in this
+// runtime-independent leaf crate; callers choose the blocking lane.
+#[allow(clippy::disallowed_methods)]
 pub fn append_many(path: &Path, records: &[WalRecord]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -191,6 +194,9 @@ pub fn for_each_from(
     Ok(())
 }
 
+// Compaction owns the partition write lock and performs one synchronous,
+// atomic WAL replacement before exposing the rebuilt partition.
+#[allow(clippy::disallowed_methods)]
 pub fn rewrite(path: &Path, records: impl IntoIterator<Item = WalRecord>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

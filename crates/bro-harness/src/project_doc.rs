@@ -588,6 +588,8 @@ fn delivered_paths_from_rider_text(text: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise scoped project-document discovery.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::fs;

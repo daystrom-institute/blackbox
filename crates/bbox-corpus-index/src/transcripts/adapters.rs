@@ -59,6 +59,9 @@ impl TranscriptAdapterRegistry {
         if let Some(dir) = &config.harness_sessions_dir {
             adapters.extend(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(dir));
         }
+        for dir in &config.additional_harness_sessions_dirs {
+            adapters.extend(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(dir));
+        }
         if !config.roots.is_empty() {
             adapters.push(Box::new(super::interactive::ClaudeTranscriptAdapter::new(
                 config.roots.clone(),

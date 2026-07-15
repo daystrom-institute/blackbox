@@ -306,16 +306,16 @@ impl TranscriptIndex {
         // legitimately appears in unrelated sessions. Opt in via
         // `exclude_self=true` from interactive callers that genuinely
         // need to suppress self-reference.
-        if p.exclude_self.unwrap_or(false) {
-            if let Some(caller_sid) = detect_caller_session(&self.config, raw_query) {
-                clauses.push((
-                    Occur::MustNot,
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(self.fields.session_id, &caller_sid),
-                        IndexRecordOption::Basic,
-                    )),
-                ));
-            }
+        if p.exclude_self.unwrap_or(false)
+            && let Some(caller_sid) = detect_caller_session(&self.config, raw_query)
+        {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.session_id, &caller_sid),
+                    IndexRecordOption::Basic,
+                )),
+            ));
         }
 
         let query = BooleanQuery::new(clauses);
@@ -626,6 +626,9 @@ impl TranscriptIndex {
 
     // ── Context ─────────────────────────────────────────────────────
 
+    // Search APIs are synchronous; transcript reads stay on their caller's
+    // blocking corpus lane with the associated Tantivy query.
+    #[allow(clippy::disallowed_methods)]
     pub fn context(&self, p: &ContextParams) -> Result<String> {
         let file_path = p.file_path.as_str();
         let target_offset = p.byte_offset;
@@ -691,6 +694,8 @@ impl TranscriptIndex {
 
     // ── Session ─────────────────────────────────────────────────────
 
+    // Session metadata lookup is a bounded synchronous search operation.
+    #[allow(clippy::disallowed_methods)]
     pub fn session(&self, p: &SessionParams) -> Result<String> {
         let raw_id = p.session_id.as_str();
 
@@ -773,6 +778,9 @@ impl TranscriptIndex {
 
     // ── Messages ────────────────────────────────────────────────────
 
+    // Transcript materialization is intentionally synchronous with this
+    // synchronous search API.
+    #[allow(clippy::disallowed_methods)]
     pub fn messages(&self, p: &MessagesParams) -> Result<String> {
         let role_filter = p.role.as_deref();
         let include_subagents = p.include_subagents.unwrap_or(false);
@@ -839,10 +847,10 @@ impl TranscriptIndex {
                     parser::parse_transcript_line(line)
                 };
                 for ev in &events {
-                    if let Some(rf) = role_filter {
-                        if ev.role.as_ref() != rf {
-                            continue;
-                        }
+                    if let Some(rf) = role_filter
+                        && ev.role.as_ref() != rf
+                    {
+                        continue;
                     }
 
                     let preview = if max_length == 0 {
@@ -1016,20 +1024,20 @@ impl TranscriptIndex {
         // Main: .../projects/<proj>/<session-id>.jsonl
         // Subs: .../projects/<proj>/<session-id>/subagents/agent-*.jsonl
         let main_path = Path::new(&main);
-        if let Some(stem) = main_path.file_stem() {
-            if let Some(parent) = main_path.parent() {
-                let subagent_dir = parent
-                    .join(stem.to_string_lossy().as_ref())
-                    .join("subagents");
-                if subagent_dir.exists() {
-                    for entry in WalkDir::new(&subagent_dir)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        let p = entry.path();
-                        if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                            files.push(p.to_string_lossy().to_string());
-                        }
+        if let Some(stem) = main_path.file_stem()
+            && let Some(parent) = main_path.parent()
+        {
+            let subagent_dir = parent
+                .join(stem.to_string_lossy().as_ref())
+                .join("subagents");
+            if subagent_dir.exists() {
+                for entry in WalkDir::new(&subagent_dir)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let p = entry.path();
+                    if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                        files.push(p.to_string_lossy().to_string());
                     }
                 }
             }
@@ -1062,6 +1070,8 @@ impl TranscriptIndex {
 
     // ── Topics ──────────────────────────────────────────────────────
 
+    // Topic extraction reads a bounded transcript on the synchronous search lane.
+    #[allow(clippy::disallowed_methods)]
     pub fn topics(&self, p: &TopicsParams) -> Result<String> {
         let top_n = p.limit.unwrap_or(25) as usize;
         let role_filter = p.role.as_deref();
@@ -1091,10 +1101,10 @@ impl TranscriptIndex {
                     parser::parse_transcript_line(line)
                 };
                 for ev in &events {
-                    if let Some(rf) = role_filter {
-                        if ev.role.as_ref() != rf {
-                            continue;
-                        }
+                    if let Some(rf) = role_filter
+                        && ev.role.as_ref() != rf
+                    {
+                        continue;
                     }
                     // Skip tool_result — too noisy for topic extraction
                     if ev.role == bro_transcript::MessageRole::ToolResult {
@@ -1174,6 +1184,8 @@ impl TranscriptIndex {
 
     // ── Sessions List ───────────────────────────────────────────────
 
+    // Session listing is a synchronous metadata/filesystem search operation.
+    #[allow(clippy::disallowed_methods)]
     pub fn sessions_list(&self, p: &SessionsListParams) -> Result<String> {
         let account_filter = p.account.as_deref();
         let project_filter = p.project.as_deref();
@@ -1226,10 +1238,10 @@ impl TranscriptIndex {
 
         // Claude Code sessions — from session-meta JSON files
         for (account_name, root) in &self.config.roots {
-            if let Some(af) = account_filter {
-                if af != account_name {
-                    continue;
-                }
+            if let Some(af) = account_filter
+                && af != account_name
+            {
+                continue;
             }
             let meta_dir = root.join("usage-data").join("session-meta");
             if !meta_dir.exists() {
@@ -1261,10 +1273,10 @@ impl TranscriptIndex {
                 };
 
                 let project = v["project_path"].as_str().unwrap_or("").to_string();
-                if let Some(pf) = project_filter {
-                    if !project_matches(pf, &project) {
-                        continue;
-                    }
+                if let Some(pf) = project_filter
+                    && !project_matches(pf, &project)
+                {
+                    continue;
                 }
 
                 let start = v["start_time"].as_str().unwrap_or("").to_string();
@@ -1284,10 +1296,10 @@ impl TranscriptIndex {
 
                 let name = claude_names.get(&sid).cloned().unwrap_or_default();
 
-                if let Some(nf) = name_filter {
-                    if !name.to_lowercase().contains(&nf.to_lowercase()) {
-                        continue;
-                    }
+                if let Some(nf) = name_filter
+                    && !name.to_lowercase().contains(&nf.to_lowercase())
+                {
+                    continue;
                 }
 
                 entries.push(SessionEntry {
@@ -1304,65 +1316,65 @@ impl TranscriptIndex {
         }
 
         // Codex sessions — from session files
-        if account_filter.is_none() || account_filter == Some("codex") {
-            if let Some(ref codex_root) = self.config.codex_root {
-                let sessions_dir = codex_root.join("sessions");
-                if sessions_dir.exists() {
-                    for entry in WalkDir::new(&sessions_dir)
-                        .follow_links(true)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        let path = entry.path();
-                        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
-                            continue;
-                        }
-
-                        let session_id = extract_codex_session_id(path);
-
-                        let cwd = extract_codex_cwd(path);
-                        let project = cwd.as_deref().unwrap_or("");
-
-                        if let Some(pf) = project_filter {
-                            if !project_matches(pf, project) {
-                                continue;
-                            }
-                        }
-
-                        // Extract timestamp from filename: rollout-YYYY-MM-DDTHH-MM-SS-...
-                        let stem = path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let start_time = if stem.starts_with("rollout-") && stem.len() > 27 {
-                            // rollout-2026-04-12T13-09-35-...
-                            let date_part = &stem[8..27]; // 2026-04-12T13-09-35
-                            date_part.replace('T', " ").replacen('-', ":", 2)
-                        } else {
-                            String::new()
-                        };
-
-                        // Get first user prompt (read only first ~20 lines)
-                        let first_prompt = extract_codex_first_prompt(path);
-                        let name = codex_names.get(&session_id).cloned().unwrap_or_default();
-
-                        if let Some(nf) = name_filter {
-                            if !name.to_lowercase().contains(&nf.to_lowercase()) {
-                                continue;
-                            }
-                        }
-
-                        entries.push(SessionEntry {
-                            session_id,
-                            account: "codex".to_string(),
-                            project: shorten_project(project),
-                            start_time,
-                            duration_minutes: 0,
-                            user_messages: 0,
-                            first_prompt,
-                            name,
-                        });
+        if (account_filter.is_none() || account_filter == Some("codex"))
+            && let Some(ref codex_root) = self.config.codex_root
+        {
+            let sessions_dir = codex_root.join("sessions");
+            if sessions_dir.exists() {
+                for entry in WalkDir::new(&sessions_dir)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+                        continue;
                     }
+
+                    let session_id = extract_codex_session_id(path);
+
+                    let cwd = extract_codex_cwd(path);
+                    let project = cwd.as_deref().unwrap_or("");
+
+                    if let Some(pf) = project_filter
+                        && !project_matches(pf, project)
+                    {
+                        continue;
+                    }
+
+                    // Extract timestamp from filename: rollout-YYYY-MM-DDTHH-MM-SS-...
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let start_time = if stem.starts_with("rollout-") && stem.len() > 27 {
+                        // rollout-2026-04-12T13-09-35-...
+                        let date_part = &stem[8..27]; // 2026-04-12T13-09-35
+                        date_part.replace('T', " ").replacen('-', ":", 2)
+                    } else {
+                        String::new()
+                    };
+
+                    // Get first user prompt (read only first ~20 lines)
+                    let first_prompt = extract_codex_first_prompt(path);
+                    let name = codex_names.get(&session_id).cloned().unwrap_or_default();
+
+                    if let Some(nf) = name_filter
+                        && !name.to_lowercase().contains(&nf.to_lowercase())
+                    {
+                        continue;
+                    }
+
+                    entries.push(SessionEntry {
+                        session_id,
+                        account: "codex".to_string(),
+                        project: shorten_project(project),
+                        start_time,
+                        duration_minutes: 0,
+                        user_messages: 0,
+                        first_prompt,
+                        name,
+                    });
                 }
             }
         }
@@ -1422,10 +1434,10 @@ impl TranscriptIndex {
         // normal use, so a minute of staleness is a fair trade.
         const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-        if let Some((at, cached)) = self.stats_cache.lock().as_ref() {
-            if at.elapsed() < STATS_TTL {
-                return Ok(cached.clone());
-            }
+        if let Some((at, cached)) = self.stats_cache.lock().as_ref()
+            && at.elapsed() < STATS_TTL
+        {
+            return Ok(cached.clone());
         }
 
         let computed = self.compute_stats();
@@ -1487,6 +1499,9 @@ impl TranscriptIndex {
         self.build_index(p.full.unwrap_or(false))
     }
 
+    // This is the explicit synchronous Tantivy writer boundary; daemon callers
+    // run the complete build on their reindex thread/actor.
+    #[allow(clippy::disallowed_methods)]
     pub fn build_index(&mut self, full: bool) -> Result<String> {
         let mut writer: IndexWriter = self.index.writer(100_000_000)?;
         // Incremental rebuilds use the same conservative policy as the
@@ -1636,6 +1651,8 @@ fn single_symbol_token(query: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+// Stats are computed synchronously alongside the rest of the corpus query.
+#[allow(clippy::disallowed_methods)]
 fn count_tool_call_edges(edges_dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(edges_dir) else {
         return 0;
@@ -1657,6 +1674,7 @@ fn count_tool_call_edges(edges_dir: &Path) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod agentic_project_file_tests {
     use std::process::Command;
 

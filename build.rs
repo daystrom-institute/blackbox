@@ -18,6 +18,9 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Cargo build scripts are synchronous processes, so deriving the build stamp
+// cannot block an application Tokio worker.
+#[allow(clippy::disallowed_methods)]
 fn git_head_short(short_len: u32) -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", &format!("--short={short_len}"), "HEAD"])

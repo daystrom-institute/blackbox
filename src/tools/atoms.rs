@@ -686,6 +686,7 @@ impl BlackboxServer {
         let resume_lease = match crate::server::progress::try_acquire_resume_lease(
             &self.state.task_store,
             self.state.resume_leases.as_ref(),
+            self.state.worker_registry.as_ref(),
             provider,
             &session_id,
         ) {
@@ -782,7 +783,11 @@ impl BlackboxServer {
             task.clone(),
             dispatch_filters.policy_file,
         );
-        crate::server::progress::release_resume_lease_when_done(task.clone(), resume_lease);
+        crate::server::progress::release_resume_lease_when_done(
+            task.clone(),
+            resume_lease,
+            self.state.worker_registry.clone(),
+        );
 
         {
             let mut inv_store = self.state.atom_invocation_store.write();

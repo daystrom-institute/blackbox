@@ -559,7 +559,7 @@ pub(super) fn render_report_tool_call(
     }
     let message = extract_tool_string_arg(args, &["message", "body", "text"])?;
     let compact = quote_flat_string(&message);
-    let max_width = width.saturating_sub(1).min(140).max(12);
+    let max_width = width.saturating_sub(1).clamp(12, 140);
     let prefix = format!("{TOOL_CALL_GLYPH} report(");
     let suffix = ")";
     let available = max_width

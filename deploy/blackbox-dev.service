@@ -1,5 +1,5 @@
 [Unit]
-Description=blackbox MCP daemon (dev) — isolated transcript search, knowledge store, orchestration
+Description=Blackbox corpus service (dev, isolated)
 After=network.target
 
 [Service]
@@ -9,6 +9,9 @@ Restart=on-failure
 RestartSec=3
 Environment=BLACKBOX_CONFIG=%h/.config/blackbox-dev/config.toml
 Environment=RUST_LOG=blackbox=info
+Environment=BLACKBOX_RUNTIME_ROLE=corpus
+Environment=BLACKBOX_SERVICE_TOKEN_FILE=%h/.local/state/blackbox-dev/service.token
+Environment=BLACKBOX_FLEET_TRANSCRIPT_ROOT=%h/.local/state/blackbox-dev/fleetd/workers
 WorkingDirectory=%h
 StandardOutput=journal
 StandardError=journal

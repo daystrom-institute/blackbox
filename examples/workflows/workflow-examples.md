@@ -13,7 +13,7 @@ Run any of these:
 bro orchestrate run examples/workflows/<file>.json
 ```
 
-Point `bro` at a specific daemon port (e.g. dev on 7265) via env or flag:
+Point `bro` at fleetd on port 7265 via env or flag:
 
 ```bash
 BRO_PORT=7265 bro orchestrate run examples/workflows/e2e-smoke.json

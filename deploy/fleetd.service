@@ -1,0 +1,27 @@
+[Unit]
+Description=Blackbox live execution authority
+After=network.target blackbox.service blackopsd.service
+Wants=blackbox.service blackopsd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fleetd --mode authority
+KillMode=process
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=fleetd=info
+Environment=FLEETD_STATE_DIR=%h/.local/state/blackbox/fleetd
+Environment=BLACKBOX_SERVICE_TOKEN_FILE=%h/.local/state/blackbox/service.token
+Environment=FLEETD_BRO_HARNESS_BIN=%h/.local/bin/bro-harness
+# Authority launch on Linux is intentionally unavailable until this root-owned
+# launcher passes the blackbox-worker-sandbox-v1 self-test.
+Environment=FLEETD_WORKER_SANDBOX_LAUNCHER=/usr/local/libexec/blackbox-worker-sandbox
+Environment=FLEETD_BLACKBOXD_URL=http://127.0.0.1:7264
+Environment=FLEETD_BLACKOPSD_URL=http://127.0.0.1:7266
+Environment=FLEETD_ALLOWED_CAPABILITIES=corpus,blackops.agent,atom
+WorkingDirectory=%h
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

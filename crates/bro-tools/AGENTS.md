@@ -1,5 +1,12 @@
 # bro-tools — harness tool surface + fleet worktree closeout driver
 
+## Tool invocation context
+
+- `ToolCx.invocation_id` is per-dispatch durable provenance, not a session
+  singleton. The harness clones the context for each flat or nested call.
+  Effectful capability tools fail closed when it is absent; never replace it
+  with an RPC message ID or shared mutable current-call slot.
+
 ## Workspace search output shape
 
 - `content_search` is exploratory by default, not an exhaustive dump. Keep the

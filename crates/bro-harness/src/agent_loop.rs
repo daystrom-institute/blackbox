@@ -26,9 +26,19 @@ use crate::registry::{PinPolicy, Registry};
 use crate::session::SessionStore;
 use crate::transport::{self, StopReason, SystemPrompt, Transport, TransportKind, TurnOpts, Usage};
 use anyhow::{Context, Result};
+use bro_capabilities::{
+    AgentCapability, AgentIdentity, AgentMessageRequest, AgentSpawnRequest, AgentStatus,
+    AgentSummary, AgentTarget, AgentWaitRequest, AgentWake, CapabilityResult,
+};
+use bro_core::AgentId;
+use bro_protocol::{
+    AgentMailboxDelivery, AgentMailboxMessage, DownstreamServiceAvailability, PolicyIdentity,
+    ServiceAvailability,
+};
 use bro_tools::{SafetyPolicy, Tool, ToolCx, builtin_tools};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::Read as _;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncBufReadExt as _;
@@ -54,6 +64,220 @@ const INTERRUPTED_TOOL_RESULT: &str = "[Request interrupted by user]";
 
 /// Name of the synthetic terminal tool for structured output.
 const FINAL_RESULT_TOOL: &str = "final_result";
+
+const MAILBOX_WAKE_PROMPT: &str =
+    "Continue with the newly delivered typed agent follow-up in your mailbox context.";
+
+/// Fresh service policy projected by the worker supervisor at a safe session
+/// boundary. Connection liveness is separate from authorization revision so
+/// an outage can revoke stale model belief without fabricating a policy bump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServicePolicyUpdate {
+    pub revision: PolicyIdentity,
+    #[serde(default)]
+    pub allowed_capabilities: BTreeSet<String>,
+    #[serde(default)]
+    pub downstream_availability: DownstreamServiceAvailability,
+    pub connected: bool,
+}
+
+fn remote_capability_available(update: &ServicePolicyUpdate, capability: &str) -> bool {
+    if !update.connected || !update.allowed_capabilities.contains(capability) {
+        return false;
+    }
+    let service = match capability {
+        crate::worker::capability_rpc::CAPABILITY_CORPUS
+        | crate::worker::capability_rpc::CAPABILITY_REFACTOR => {
+            update.downstream_availability.corpus
+        }
+        crate::worker::capability_rpc::CAPABILITY_ATOM
+        | crate::worker::capability_rpc::CAPABILITY_AGENT => {
+            update.downstream_availability.blackops
+        }
+        _ => ServiceAvailability::Unavailable,
+    };
+    service == ServiceAvailability::Available
+}
+
+fn disabled_remote_service_tools(update: &ServicePolicyUpdate) -> Vec<String> {
+    let mut disabled = Vec::new();
+    let groups: &[(&str, &[&str])] = &[
+        (
+            crate::worker::capability_rpc::CAPABILITY_CORPUS,
+            &["corpus_search"],
+        ),
+        (
+            crate::worker::capability_rpc::CAPABILITY_ATOM,
+            &["atom_invoke"],
+        ),
+        (
+            crate::worker::capability_rpc::CAPABILITY_REFACTOR,
+            &["refactor_plan", "refactor_plan_get"],
+        ),
+        (
+            crate::worker::capability_rpc::CAPABILITY_AGENT,
+            &[
+                "spawn_agent",
+                "send_message",
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "wait_agent",
+            ],
+        ),
+    ];
+    for (capability, names) in groups {
+        if !remote_capability_available(update, capability) {
+            disabled.extend(names.iter().map(|name| (*name).to_string()));
+        }
+    }
+    disabled
+}
+
+fn remote_service_availability(
+    update: &ServicePolicyUpdate,
+    tool: bool,
+) -> crate::context::sections::ServiceAvailabilitySnapshot {
+    let available = |capability: &str| remote_capability_available(update, capability);
+    crate::context::sections::ServiceAvailabilitySnapshot {
+        tool,
+        corpus: available(crate::worker::capability_rpc::CAPABILITY_CORPUS),
+        atoms: available(crate::worker::capability_rpc::CAPABILITY_ATOM),
+        refactor: available(crate::worker::capability_rpc::CAPABILITY_REFACTOR),
+        execution: available(crate::worker::capability_rpc::CAPABILITY_EXECUTION),
+        collaboration: available(crate::worker::capability_rpc::CAPABILITY_AGENT),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredMailboxMessage {
+    delivery_id: String,
+    wake: bool,
+    message: AgentMailboxMessage,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MailboxInbox {
+    #[serde(default)]
+    target_agent_id: Option<AgentId>,
+    #[serde(default)]
+    canonical_target: Option<String>,
+    #[serde(default)]
+    through_sequence: u64,
+    #[serde(default)]
+    pending: BTreeMap<u64, StoredMailboxMessage>,
+}
+
+impl MailboxInbox {
+    fn from_side(value: &Value) -> Result<Self> {
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+        let inbox: Self =
+            serde_json::from_value(value.clone()).context("restore typed agent mailbox inbox")?;
+        if inbox.target_agent_id.is_some() != inbox.canonical_target.is_some()
+            || inbox
+                .canonical_target
+                .as_deref()
+                .is_some_and(|path| !path.starts_with('/') || path.ends_with('/'))
+        {
+            anyhow::bail!("restored agent mailbox has an invalid target binding");
+        }
+        for (sequence, stored) in &inbox.pending {
+            if *sequence == 0
+                || *sequence > inbox.through_sequence
+                || stored.message.sequence != *sequence
+                || inbox.target_agent_id.as_ref() != Some(&stored.message.recipient)
+            {
+                anyhow::bail!("restored agent mailbox has an invalid pending message");
+            }
+        }
+        Ok(inbox)
+    }
+
+    fn admit(&mut self, delivery: &AgentMailboxDelivery) -> Result<bool> {
+        if delivery.messages.is_empty()
+            || delivery.through_sequence == 0
+            || delivery.canonical_target.is_empty()
+            || !delivery.canonical_target.starts_with('/')
+            || delivery.canonical_target.ends_with('/')
+        {
+            anyhow::bail!("agent mailbox delivery has invalid identity or bounds");
+        }
+        match (&self.target_agent_id, &self.canonical_target) {
+            (Some(agent_id), Some(path))
+                if agent_id != &delivery.target_agent_id || path != &delivery.canonical_target =>
+            {
+                anyhow::bail!("agent mailbox delivery escaped the bound target");
+            }
+            (None, None) => {
+                self.target_agent_id = Some(delivery.target_agent_id.clone());
+                self.canonical_target = Some(delivery.canonical_target.clone());
+            }
+            (Some(_), Some(_)) => {}
+            _ => anyhow::bail!("agent mailbox target binding is incomplete"),
+        }
+        if delivery.through_sequence <= self.through_sequence {
+            return Ok(false);
+        }
+        let first = delivery
+            .messages
+            .first()
+            .map(|message| message.sequence)
+            .unwrap_or_default();
+        if first != self.through_sequence.saturating_add(1)
+            || delivery.messages.last().map(|message| message.sequence)
+                != Some(delivery.through_sequence)
+        {
+            anyhow::bail!("agent mailbox delivery contains a cursor gap");
+        }
+        let mut expected = first;
+        for message in &delivery.messages {
+            if message.sequence != expected
+                || message.recipient != delivery.target_agent_id
+                || message.message_id.trim().is_empty()
+                || message.body.trim().is_empty()
+            {
+                anyhow::bail!("agent mailbox delivery contains an invalid message");
+            }
+            self.pending.insert(
+                message.sequence,
+                StoredMailboxMessage {
+                    delivery_id: delivery.delivery_id.clone(),
+                    wake: delivery.wake,
+                    message: message.clone(),
+                },
+            );
+            expected = expected
+                .checked_add(1)
+                .context("agent mailbox sequence overflow")?;
+        }
+        self.through_sequence = delivery.through_sequence;
+        Ok(true)
+    }
+
+    fn has_wake_pending(&self) -> bool {
+        self.pending.values().any(|message| message.wake)
+    }
+
+    fn drain_rendered(&mut self) -> Vec<(AgentMailboxMessage, String)> {
+        std::mem::take(&mut self.pending)
+            .into_values()
+            .map(|stored| {
+                let rendered = serde_json::to_string(&stored.message)
+                    .map(|json| format!("<agent_mailbox_message>{json}</agent_mailbox_message>"))
+                    .unwrap_or_else(|_| {
+                        "<agent_mailbox_message>unavailable</agent_mailbox_message>".into()
+                    });
+                (stored.message, rendered)
+            })
+            .collect()
+    }
+
+    fn to_side(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
 
 /// System-prompt instruction appended when structured output is active.
 const STRUCTURED_OUTPUT_INSTRUCTION: &str = "\
@@ -105,18 +329,20 @@ impl Tool for FinalResultTool {
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
     if cli.daemon_worker {
-        let scrub = std::env::var("BRO_HARNESS_SPAWN_SCRUB")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .map(str::to_string)
-            .collect();
-        return bro_tools::shell::with_spawn_scrub(
-            scrub,
-            run_with_emitter(cli, None, None, HarnessSessionServices::standalone()),
-        )
-        .await;
+        // Fleet starts one harness process per session. Move every
+        // provider/account value out of the process environment before any
+        // tool, hook, language server, or stdio MCP child can spawn, then make
+        // the values available only through the transport task-local. This is
+        // stronger than child-by-child scrubbing and closes inherited-env
+        // escape paths outside `shell_run`.
+        return crate::session_environment::DaemonSessionEnvironment::take()?
+            .scope(run_with_emitter(
+                cli,
+                None,
+                None,
+                HarnessSessionServices::standalone(),
+            ))
+            .await;
     }
     run_with_emitter(cli, None, None, HarnessSessionServices::standalone()).await
 }
@@ -134,6 +360,19 @@ pub async fn run_with_event_callback(cli: Cli, callback: EventCallback) -> Resul
 #[derive(Debug)]
 pub enum SessionInput {
     User(String),
+    WorkerTurn {
+        text: String,
+        command_id: String,
+    },
+    WorkerSteer {
+        text: String,
+        command_id: String,
+    },
+    AgentMailbox {
+        delivery: AgentMailboxDelivery,
+        command_id: String,
+    },
+    ServicePolicy(ServicePolicyUpdate),
     Control {
         subtype: String,
         request_id: Option<String>,
@@ -146,6 +385,109 @@ pub type SessionInputReceiver = mpsc::UnboundedReceiver<SessionInput>;
 
 pub fn session_input_channel() -> (SessionInputSender, SessionInputReceiver) {
     mpsc::unbounded_channel()
+}
+
+/// Session-local adapter that races only `wait_agent` against the normal user
+/// steering boundary. Other collaboration operations pass through unchanged.
+struct SteerAwareAgentCapability {
+    inner: Arc<dyn AgentCapability>,
+    steer_rx: tokio::sync::Mutex<watch::Receiver<u64>>,
+}
+
+impl SteerAwareAgentCapability {
+    fn new(inner: Arc<dyn AgentCapability>, steer_rx: watch::Receiver<u64>) -> Self {
+        Self {
+            inner,
+            steer_rx: tokio::sync::Mutex::new(steer_rx),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentCapability for SteerAwareAgentCapability {
+    async fn spawn(&self, request: AgentSpawnRequest) -> CapabilityResult<AgentIdentity> {
+        self.inner.spawn(request).await
+    }
+
+    async fn spawn_for_invocation(
+        &self,
+        invocation_id: &str,
+        request: AgentSpawnRequest,
+    ) -> CapabilityResult<AgentIdentity> {
+        self.inner
+            .spawn_for_invocation(invocation_id, request)
+            .await
+    }
+
+    async fn send_message(&self, request: AgentMessageRequest) -> CapabilityResult<()> {
+        self.inner.send_message(request).await
+    }
+
+    async fn send_message_for_invocation(
+        &self,
+        invocation_id: &str,
+        request: AgentMessageRequest,
+    ) -> CapabilityResult<()> {
+        self.inner
+            .send_message_for_invocation(invocation_id, request)
+            .await
+    }
+
+    async fn followup(&self, request: AgentMessageRequest) -> CapabilityResult<()> {
+        self.inner.followup(request).await
+    }
+
+    async fn followup_for_invocation(
+        &self,
+        invocation_id: &str,
+        request: AgentMessageRequest,
+    ) -> CapabilityResult<()> {
+        self.inner
+            .followup_for_invocation(invocation_id, request)
+            .await
+    }
+
+    async fn interrupt(&self, target: AgentTarget) -> CapabilityResult<AgentStatus> {
+        self.inner.interrupt(target).await
+    }
+
+    async fn interrupt_for_invocation(
+        &self,
+        invocation_id: &str,
+        target: AgentTarget,
+    ) -> CapabilityResult<AgentStatus> {
+        self.inner
+            .interrupt_for_invocation(invocation_id, target)
+            .await
+    }
+
+    async fn status(&self, target: AgentTarget) -> CapabilityResult<AgentSummary> {
+        self.inner.status(target).await
+    }
+
+    async fn list(&self, prefix: Option<String>) -> CapabilityResult<Vec<AgentSummary>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn wait(&self, request: AgentWaitRequest) -> CapabilityResult<AgentWake> {
+        let mut steer_rx = self.steer_rx.lock().await;
+        let wait = self.inner.wait(request);
+        tokio::pin!(wait);
+        tokio::select! {
+            biased;
+            changed = steer_rx.changed() => {
+                match changed {
+                    Ok(()) => Ok(AgentWake::UserSteer),
+                    Err(_) => wait.await,
+                }
+            }
+            wake = &mut wait => wake,
+        }
+    }
+}
+
+fn signal_user_steer(sender: &watch::Sender<u64>) {
+    sender.send_modify(|generation| *generation = generation.saturating_add(1));
 }
 
 pub async fn run_with_event_callback_and_input(
@@ -184,6 +526,52 @@ pub async fn run_with_event_callback_and_input_mcp(
         services,
     )
     .await
+}
+
+/// Run one persistent worker-owned session. The session input sender may be
+/// replaced by the worker supervisor across fleet socket generations while
+/// this runtime and its provider/transport state remain stable.
+///
+/// The event log is returned through `ready` before the init event is emitted,
+/// allowing the supervisor to subscribe to committed events without a startup
+/// race. A no-op callback keeps stdout out of the internal worker protocol.
+pub async fn run_worker_session(
+    cli: Cli,
+    input_rx: SessionInputReceiver,
+    services: HarnessSessionServices,
+    ready: tokio::sync::oneshot::Sender<Arc<EventLog>>,
+) -> Result<()> {
+    let callback: EventCallback = Arc::new(|_| {});
+    let mut session =
+        Session::build(&cli, Some(callback.clone()), None, None, None, services).await?;
+    let event_log = session.event_log();
+    ready
+        .send(event_log.clone())
+        .map_err(|_| anyhow::anyhow!("worker supervisor dropped session startup"))?;
+    session.emitter.system_init_session();
+    let ctrl_emitter = make_emitter(
+        session.session_id().to_string(),
+        Some(callback),
+        Some(event_log),
+    );
+    let mut pending = VecDeque::new();
+    if let Some(prompt) = cli.prompt.clone() {
+        pending.push_back(prompt);
+    }
+    session_loop(
+        &mut session,
+        map_session_input(input_rx),
+        &ctrl_emitter,
+        pending,
+    )
+    .await?;
+    let body = session.persist_body()?;
+    let path = session.store_path().to_path_buf();
+    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
+        .await
+        .context("persist task panicked")?
+        .context("write session")?;
+    Ok(())
 }
 
 async fn run_with_emitter(
@@ -271,7 +659,7 @@ async fn run_session(
 
     if exit_when_idle {
         await_first_controlled_input(&mut session, &mut input_rx, &ctrl_emitter, &mut pending)
-            .await;
+            .await?;
         session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
     } else {
         session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
@@ -338,6 +726,24 @@ fn map_session_input(mut external_rx: SessionInputReceiver) -> mpsc::UnboundedRe
 fn to_input(input: SessionInput) -> Input {
     match input {
         SessionInput::User(text) => Input::User(text),
+        SessionInput::WorkerTurn { text, command_id } => Input::TrackedUser {
+            text,
+            command_id,
+            kind: TrackedUserKind::Turn,
+        },
+        SessionInput::WorkerSteer { text, command_id } => Input::TrackedUser {
+            text,
+            command_id,
+            kind: TrackedUserKind::Steer,
+        },
+        SessionInput::AgentMailbox {
+            delivery,
+            command_id,
+        } => Input::AgentMailbox {
+            delivery,
+            command_id,
+        },
+        SessionInput::ServicePolicy(update) => Input::ServicePolicy(update),
         SessionInput::Control {
             subtype,
             request_id,
@@ -350,7 +756,7 @@ fn to_input(input: SessionInput) -> Input {
     }
 }
 
-fn queue_redirect_from_control(raw: &Value, inputs: &Arc<StdMutex<VecDeque<String>>>) {
+fn queue_redirect_from_control(raw: &Value, inputs: &Arc<StdMutex<VecDeque<MidTurnInput>>>) {
     let prompt = raw["prompt"]
         .as_str()
         .or_else(|| raw["request"]["prompt"].as_str())
@@ -358,8 +764,67 @@ fn queue_redirect_from_control(raw: &Value, inputs: &Arc<StdMutex<VecDeque<Strin
     if let Some(prompt) = prompt
         && let Ok(mut inputs) = inputs.lock()
     {
-        inputs.push_back(prompt);
+        inputs.push_back(MidTurnInput::User(prompt));
     }
+}
+
+async fn admit_idle_mailbox(
+    session: &mut Session,
+    delivery: AgentMailboxDelivery,
+    command_id: String,
+    pending: &mut VecDeque<String>,
+) -> Result<()> {
+    let wake = delivery.wake;
+    let added = session.admit_agent_mailbox(delivery, &command_id).await?;
+    if added && wake {
+        pending.push_back(MAILBOX_WAKE_PROMPT.to_string());
+    }
+    Ok(())
+}
+
+async fn apply_idle_service_policy(
+    session: &mut Session,
+    update: ServicePolicyUpdate,
+) -> Result<()> {
+    session.apply_service_policy(update)?;
+    persist_session_snapshot(session).await
+}
+
+async fn drain_turn_boundary_inputs(
+    session: &mut Session,
+    inputs: &Arc<StdMutex<VecDeque<MidTurnInput>>>,
+    pending: &mut VecDeque<String>,
+) -> Result<()> {
+    let queued = {
+        let Ok(mut inputs) = inputs.lock() else {
+            return Ok(());
+        };
+        inputs.drain(..).collect::<Vec<_>>()
+    };
+    let mut user_inputs = Vec::new();
+    let mut wake = false;
+    for input in queued {
+        match input {
+            MidTurnInput::User(text) => user_inputs.push(text),
+            MidTurnInput::AgentMailbox {
+                delivery,
+                command_id,
+            } => {
+                let should_wake = delivery.wake;
+                if session.admit_agent_mailbox(delivery, &command_id).await? {
+                    wake |= should_wake;
+                }
+            }
+            MidTurnInput::ServicePolicy(update) => session.apply_service_policy(update)?,
+        }
+    }
+    for text in user_inputs.into_iter().rev() {
+        pending.push_front(text);
+    }
+    if wake {
+        pending.push_front(MAILBOX_WAKE_PROMPT.to_string());
+    }
+    Ok(())
 }
 
 /// The core bidirectional loop, factored out of `run_session` so it can be
@@ -372,10 +837,52 @@ async fn session_loop(
     mut pending: VecDeque<String>,
 ) -> Result<()> {
     loop {
+        if pending.is_empty() && session.has_pending_mailbox_wake() {
+            pending.push_back(MAILBOX_WAKE_PROMPT.to_string());
+        }
         let prompt = match pending.pop_front() {
             Some(p) => p,
             None => match input_rx.recv().await {
                 Some(Input::User(p)) => p,
+                Some(Input::TrackedUser {
+                    text,
+                    command_id,
+                    kind: TrackedUserKind::Turn,
+                }) => {
+                    record_worker_input_admission(
+                        &session.event_log,
+                        session.emitter.session_id(),
+                        &command_id,
+                        TrackedUserKind::Turn,
+                        "turn_started",
+                    )?;
+                    text
+                }
+                Some(Input::TrackedUser {
+                    command_id,
+                    kind: TrackedUserKind::Steer,
+                    ..
+                }) => {
+                    record_worker_input_admission(
+                        &session.event_log,
+                        session.emitter.session_id(),
+                        &command_id,
+                        TrackedUserKind::Steer,
+                        "rejected_idle",
+                    )?;
+                    continue;
+                }
+                Some(Input::AgentMailbox {
+                    delivery,
+                    command_id,
+                }) => {
+                    admit_idle_mailbox(session, delivery, command_id, &mut pending).await?;
+                    continue;
+                }
+                Some(Input::ServicePolicy(update)) => {
+                    apply_idle_service_policy(session, update).await?;
+                    continue;
+                }
                 Some(Input::Control {
                     subtype,
                     req_id,
@@ -384,6 +891,7 @@ async fn session_loop(
                     // Control while idle: apply any mutation, ack success.
                     session.apply_control(&subtype, &raw);
                     ctrl_emitter.control_response_success(req_id.as_deref());
+                    persist_session_snapshot(session).await?;
                     continue;
                 }
                 None => break, // stdin closed and nothing pending
@@ -392,9 +900,8 @@ async fn session_loop(
 
         // `/compact` is an in-stream slash command, not a model turn.
         if prompt.trim() == "/compact" {
-            if let Err(e) = session.compact_manual().await {
-                tracing::warn!("manual /compact failed: {e:#}");
-            }
+            session.compact_manual().await?;
+            persist_session_snapshot(session).await?;
             continue;
         }
 
@@ -405,8 +912,12 @@ async fn session_loop(
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let mut stdin_closed = false;
         let mut deferred: Vec<(String, Value)> = Vec::new();
-        let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
+        let mid_turn_user_inputs: Arc<StdMutex<VecDeque<MidTurnInput>>> =
             Arc::new(StdMutex::new(VecDeque::new()));
+        let admission_event_log = session.event_log();
+        let admission_session_id = session.session_id().to_string();
+        let user_steer_wake = session.user_steer_wake.clone();
+        let mut turn_error = None;
         {
             let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
             tokio::pin!(turn);
@@ -416,6 +927,7 @@ async fn session_loop(
                     res = &mut turn => {
                         if let Err(e) = res {
                             tracing::error!("turn failed: {e:#}");
+                            turn_error = Some(format!("{e:#}"));
                         }
                         break;
                     }
@@ -426,8 +938,56 @@ async fn session_loop(
                             ctrl_emitter.control_response_success(req_id.as_deref());
                         }
                         Some(Input::User(p)) => {
+                            signal_user_steer(&user_steer_wake);
                             if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-                                inputs.push_back(p);
+                                inputs.push_back(MidTurnInput::User(p));
+                            }
+                        }
+                        Some(Input::TrackedUser {
+                            text,
+                            command_id,
+                            kind: TrackedUserKind::Turn,
+                        }) => {
+                            record_worker_input_admission(
+                                &admission_event_log,
+                                &admission_session_id,
+                                &command_id,
+                                TrackedUserKind::Turn,
+                                "turn_queued",
+                            )?;
+                            pending.push_back(text);
+                        }
+                        Some(Input::TrackedUser {
+                            text,
+                            command_id,
+                            kind: TrackedUserKind::Steer,
+                        }) => {
+                            record_worker_input_admission(
+                                &admission_event_log,
+                                &admission_session_id,
+                                &command_id,
+                                TrackedUserKind::Steer,
+                                "steer_injected",
+                            )?;
+                            signal_user_steer(&user_steer_wake);
+                            if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                                inputs.push_back(MidTurnInput::User(text));
+                            }
+                        }
+                        Some(Input::AgentMailbox {
+                            delivery,
+                            command_id,
+                        }) => {
+                            if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                                inputs.push_back(MidTurnInput::AgentMailbox {
+                                    delivery,
+                                    command_id,
+                                });
+                            }
+                        }
+                        Some(Input::ServicePolicy(update)) => {
+                            if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                                inputs.push_back(MidTurnInput::ServicePolicy(update));
                             }
                         }
                         Some(Input::Control { subtype, req_id, raw }) => {
@@ -444,40 +1004,18 @@ async fn session_loop(
                 }
             }
         }
+        if let Some(error) = turn_error {
+            session.emitter.result_error(&error, session.turns);
+        }
         // The turn (and its &mut self borrow) is done — apply deferred controls.
         for (subtype, raw) in deferred {
             session.apply_control(&subtype, &raw);
         }
-        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-            while let Some(p) = inputs.pop_back() {
-                pending.push_front(p);
-            }
-        }
-        // Persist after every turn, not just at clean session exit. A bidi
-        // session is routinely killed (SIGTERM on fleet stop / cockpit close)
-        // before the end-of-`run_session` persist runs; without this, every
-        // completed turn is lost and a `--resume` finds no session file and
-        // starts cold. Per-turn persistence bounds the loss to at most the
-        // single in-flight turn.
-        match session.persist_body() {
-            Ok(body) => {
-                let path = session.store_path().to_path_buf();
-                // Move the write off the async runtime.
-                let write_res =
-                    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-                        .await;
-                if let Err(e) = match write_res {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(e.context("write session")),
-                    Err(je) => Err(anyhow::anyhow!("persist task panicked: {je}")),
-                } {
-                    tracing::warn!("failed to persist session after turn: {e:#}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to serialize session after turn: {e:#}");
-            }
-        }
+        drain_turn_boundary_inputs(session, &mid_turn_user_inputs, &mut pending).await?;
+        // Persist after every turn, not just at clean session exit. The
+        // committed marker is the worker supervisor's safe completion
+        // boundary, so serialization or write failures are terminal.
+        persist_session_snapshot(session).await?;
         if stdin_closed && pending.is_empty() {
             break;
         }
@@ -492,10 +1030,52 @@ async fn session_loop_until_idle(
     mut pending: VecDeque<String>,
 ) -> Result<()> {
     loop {
+        if pending.is_empty() && session.has_pending_mailbox_wake() {
+            pending.push_back(MAILBOX_WAKE_PROMPT.to_string());
+        }
         let prompt = match pending.pop_front() {
             Some(p) => p,
             None => match input_rx.try_recv() {
                 Ok(Input::User(p)) => p,
+                Ok(Input::TrackedUser {
+                    text,
+                    command_id,
+                    kind: TrackedUserKind::Turn,
+                }) => {
+                    record_worker_input_admission(
+                        &session.event_log,
+                        session.emitter.session_id(),
+                        &command_id,
+                        TrackedUserKind::Turn,
+                        "turn_started",
+                    )?;
+                    text
+                }
+                Ok(Input::TrackedUser {
+                    command_id,
+                    kind: TrackedUserKind::Steer,
+                    ..
+                }) => {
+                    record_worker_input_admission(
+                        &session.event_log,
+                        session.emitter.session_id(),
+                        &command_id,
+                        TrackedUserKind::Steer,
+                        "rejected_idle",
+                    )?;
+                    continue;
+                }
+                Ok(Input::AgentMailbox {
+                    delivery,
+                    command_id,
+                }) => {
+                    admit_idle_mailbox(session, delivery, command_id, &mut pending).await?;
+                    continue;
+                }
+                Ok(Input::ServicePolicy(update)) => {
+                    apply_idle_service_policy(session, update).await?;
+                    continue;
+                }
                 Ok(Input::Control {
                     subtype,
                     req_id,
@@ -503,6 +1083,7 @@ async fn session_loop_until_idle(
                 }) => {
                     session.apply_control(&subtype, &raw);
                     ctrl_emitter.control_response_success(req_id.as_deref());
+                    persist_session_snapshot(session).await?;
                     continue;
                 }
                 Err(_) => break,
@@ -511,26 +1092,75 @@ async fn session_loop_until_idle(
 
         run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt)
             .await?;
-        match session.persist_body() {
-            Ok(body) => {
-                let path = session.store_path().to_path_buf();
-                let write_res =
-                    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
-                        .await;
-                if let Err(e) = match write_res {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(e.context("write session")),
-                    Err(je) => Err(anyhow::anyhow!("persist task panicked: {je}")),
-                } {
-                    tracing::warn!("failed to persist session after controlled turn: {e:#}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to serialize session after controlled turn: {e:#}");
-            }
-        }
+        persist_session_snapshot(session).await?;
     }
     Ok(())
+}
+
+async fn persist_session_snapshot(session: &mut Session) -> Result<()> {
+    let body = session
+        .persist_body()
+        .context("serialize session after turn")?;
+    let path = session.store_path().to_path_buf();
+    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
+        .await
+        .context("session snapshot writer panicked")?
+        .context("write session snapshot")?;
+    append_durable_milestone(
+        &session.event_log,
+        "session_snapshot_committed",
+        session.emitter.session_id(),
+        json!({}),
+    )?;
+    Ok(())
+}
+
+async fn write_fork_source_snapshot(handoff: (std::path::PathBuf, String)) -> Result<()> {
+    let (path, body) = handoff;
+    tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
+        .await
+        .context("fork source snapshot writer panicked")?
+        .context("write fork source snapshot")
+}
+
+fn append_durable_milestone(
+    event_log: &EventLog,
+    milestone: &str,
+    session_id: &str,
+    fields: Value,
+) -> Result<()> {
+    if matches!(
+        event_log.health(),
+        crate::event_log::EventLogHealth::Disabled
+    ) {
+        return Ok(());
+    }
+    event_log
+        .try_append_milestone(milestone, session_id, fields)
+        .with_context(|| format!("append {milestone} milestone"))?;
+    Ok(())
+}
+
+fn record_worker_input_admission(
+    event_log: &EventLog,
+    session_id: &str,
+    command_id: &str,
+    kind: TrackedUserKind,
+    disposition: &str,
+) -> Result<()> {
+    append_durable_milestone(
+        event_log,
+        "worker_input_admitted",
+        session_id,
+        json!({
+            "command_id": command_id,
+            "kind": match kind {
+                TrackedUserKind::Turn => "user_turn",
+                TrackedUserKind::Steer => "steer",
+            },
+            "disposition": disposition,
+        }),
+    )
 }
 
 /// Child compatibility mode sends the initial prompt over stdin rather than
@@ -542,10 +1172,49 @@ async fn await_first_controlled_input(
     input_rx: &mut mpsc::UnboundedReceiver<Input>,
     ctrl_emitter: &Emitter,
     pending: &mut VecDeque<String>,
-) {
+) -> Result<()> {
+    if pending.is_empty() && session.has_pending_mailbox_wake() {
+        pending.push_back(MAILBOX_WAKE_PROMPT.to_string());
+    }
     while pending.is_empty() {
         match input_rx.recv().await {
             Some(Input::User(prompt)) => pending.push_back(prompt),
+            Some(Input::TrackedUser {
+                text,
+                command_id,
+                kind: TrackedUserKind::Turn,
+            }) => {
+                record_worker_input_admission(
+                    &session.event_log,
+                    session.emitter.session_id(),
+                    &command_id,
+                    TrackedUserKind::Turn,
+                    "turn_queued",
+                )?;
+                pending.push_back(text);
+            }
+            Some(Input::TrackedUser {
+                command_id,
+                kind: TrackedUserKind::Steer,
+                ..
+            }) => {
+                record_worker_input_admission(
+                    &session.event_log,
+                    session.emitter.session_id(),
+                    &command_id,
+                    TrackedUserKind::Steer,
+                    "rejected_idle",
+                )?;
+            }
+            Some(Input::AgentMailbox {
+                delivery,
+                command_id,
+            }) => {
+                admit_idle_mailbox(session, delivery, command_id, pending).await?;
+            }
+            Some(Input::ServicePolicy(update)) => {
+                apply_idle_service_policy(session, update).await?;
+            }
             Some(Input::Control {
                 subtype,
                 req_id,
@@ -553,10 +1222,12 @@ async fn await_first_controlled_input(
             }) => {
                 session.apply_control(&subtype, &raw);
                 ctrl_emitter.control_response_success(req_id.as_deref());
+                persist_session_snapshot(session).await?;
             }
             None => break,
         }
     }
+    Ok(())
 }
 
 async fn run_prompt_with_controls(
@@ -567,16 +1238,17 @@ async fn run_prompt_with_controls(
     prompt: String,
 ) -> Result<()> {
     if prompt.trim() == "/compact" {
-        if let Err(e) = session.compact_manual().await {
-            tracing::warn!("manual /compact failed: {e:#}");
-        }
+        session.compact_manual().await?;
         return Ok(());
     }
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let mut deferred: Vec<(String, Value)> = Vec::new();
-    let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
+    let mid_turn_user_inputs: Arc<StdMutex<VecDeque<MidTurnInput>>> =
         Arc::new(StdMutex::new(VecDeque::new()));
+    let admission_event_log = session.event_log();
+    let admission_session_id = session.session_id().to_string();
+    let user_steer_wake = session.user_steer_wake.clone();
     let turn_result = {
         let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
         tokio::pin!(turn);
@@ -591,8 +1263,56 @@ async fn run_prompt_with_controls(
                         ctrl_emitter.control_response_success(req_id.as_deref());
                     }
                     Some(Input::User(p)) => {
+                        signal_user_steer(&user_steer_wake);
                         if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-                            inputs.push_back(p);
+                            inputs.push_back(MidTurnInput::User(p));
+                        }
+                    }
+                    Some(Input::TrackedUser {
+                        text,
+                        command_id,
+                        kind: TrackedUserKind::Turn,
+                    }) => {
+                        record_worker_input_admission(
+                            &admission_event_log,
+                            &admission_session_id,
+                            &command_id,
+                            TrackedUserKind::Turn,
+                            "turn_queued",
+                        )?;
+                        pending.push_back(text);
+                    }
+                    Some(Input::TrackedUser {
+                        text,
+                        command_id,
+                        kind: TrackedUserKind::Steer,
+                    }) => {
+                        record_worker_input_admission(
+                            &admission_event_log,
+                            &admission_session_id,
+                            &command_id,
+                            TrackedUserKind::Steer,
+                            "steer_injected",
+                        )?;
+                        signal_user_steer(&user_steer_wake);
+                        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                            inputs.push_back(MidTurnInput::User(text));
+                        }
+                    }
+                    Some(Input::AgentMailbox {
+                        delivery,
+                        command_id,
+                    }) => {
+                        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                            inputs.push_back(MidTurnInput::AgentMailbox {
+                                delivery,
+                                command_id,
+                            });
+                        }
+                    }
+                    Some(Input::ServicePolicy(update)) => {
+                        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                            inputs.push_back(MidTurnInput::ServicePolicy(update));
                         }
                     }
                     Some(Input::Control { subtype, req_id, raw }) => {
@@ -621,11 +1341,7 @@ async fn run_prompt_with_controls(
     for (subtype, raw) in deferred {
         session.apply_control(&subtype, &raw);
     }
-    if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
-        while let Some(p) = inputs.pop_back() {
-            pending.push_front(p);
-        }
-    }
+    drain_turn_boundary_inputs(session, &mid_turn_user_inputs, pending).await?;
     Ok(())
 }
 
@@ -633,6 +1349,14 @@ async fn run_prompt_with_controls(
 struct Session {
     tx: Box<dyn Transport>,
     reg: Registry,
+    /// Session-intrinsic prompt-cache identity. This may be shared across a
+    /// fresh history fork even though `store.id` and provider wire identity are
+    /// unique to this child.
+    prompt_cache_root: String,
+    /// Stateful steering generation observed by the wait-agent capability
+    /// adapter. A watch channel preserves a steer that arrives just before the
+    /// wait tool begins polling.
+    user_steer_wake: watch::Sender<u64>,
     /// Explicit services retained for the full session lifetime. Model-facing
     /// tools hold clones of the clients they use today; unprojected clients,
     /// such as execution, remain available for later worker protocol slices.
@@ -642,7 +1366,21 @@ struct Session {
     /// shape stays consistent with any `exec` cells already in the transcript.
     code_mode: crate::code_mode::CodeMode,
     cx: ToolCx,
+    /// Compatibility mirror for focused legacy tests and diagnostics. Typed
+    /// comparison authority lives in `world_state`; this value is not written
+    /// back to the retired `reference_context` side cell.
     reference_context_item: Option<crate::context::TurnContextItem>,
+    /// Typed comparison snapshot for everything the model is expected to know.
+    world_state: Value,
+    /// Whether project instruction discovery is active for this session.
+    discover_project_instructions: bool,
+    service_availability: crate::context::sections::ServiceAvailabilitySnapshot,
+    service_policy_revision: Option<PolicyIdentity>,
+    service_policy_allowed: Option<BTreeSet<String>>,
+    service_policy_availability: Option<DownstreamServiceAvailability>,
+    context_window: Arc<crate::context::window::ContextWindowTracker>,
+    shadow_lens_selector: Option<crate::context::shadow_selector::ShadowLensSelector>,
+    shadow_lens_selection: Option<crate::context::shadow_selector::ShadowSelection>,
     hooks: HookEngine,
     scoped_project_docs: crate::project_doc::ScopedProjectDocs,
     emitter: Emitter,
@@ -655,10 +1393,9 @@ struct Session {
     /// scope, and pins land for this session's transport
     /// (design/bro-harness/dispatch-prompt-slots.md §5).
     strategy: crate::context::dispatch::CompositionStrategy,
-    /// Typed dispatch-context state (`--dispatch-context`): the current
-    /// in-memory context plus the last-emitted user-lane baselines. Persisted
-    /// in the `dispatch_context` / `dispatch_emitted` side cells (scope is
-    /// NEVER persisted/restored — per-dispatch correlation data).
+    /// Typed dispatch-context state (`--dispatch-context`). Context persists in
+    /// `dispatch_context`; model-visible scope/pin baselines live only in the
+    /// World State `dispatch` section.
     dispatch: crate::context::dispatch::DispatchState,
     max_turns: u64,
     compaction: crate::compaction::CompactionPolicy,
@@ -672,6 +1409,10 @@ struct Session {
     /// user turns and compaction milestones. Best-effort — never fails a turn.
     event_log: Arc<EventLog>,
     prior_side: Value,
+    /// Durable typed mailbox admission state. The cursor advances when an
+    /// inbound delivery is persisted, while pending bodies remain here until
+    /// they are atomically appended to the transport snapshot.
+    mailbox_inbox: MailboxInbox,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
     /// Cross-turn diagnostics baselines: per-file `{sha256, version,
     /// diagnostics}` snapshots from the most recent analyzer pass, so a
@@ -718,6 +1459,37 @@ fn web_search_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn resolve_prompt_cache_root(
+    session_id: &str,
+    explicit: Option<&str>,
+    restored: Option<&str>,
+    fork_source: Option<(&str, &crate::session::Restored)>,
+) -> Result<String> {
+    if explicit.is_some_and(str::is_empty) {
+        anyhow::bail!("prompt-cache root cannot be empty");
+    }
+    if let Some((source_session, source)) = fork_source {
+        // The source snapshot is the cache-lineage authority. blackopsd's
+        // logical root label intentionally does not replace the root harness's
+        // actual provider cache key. Legacy source snapshots fall back to their
+        // wire session ID, which was the old cache-key behavior.
+        return Ok(source
+            .prompt_cache_root
+            .as_deref()
+            .filter(|root| !root.is_empty())
+            .unwrap_or(source_session)
+            .to_string());
+    }
+    match (explicit, restored) {
+        (Some(explicit), Some(restored)) if explicit != restored => {
+            anyhow::bail!("prompt-cache root does not match resumed session")
+        }
+        (Some(explicit), _) => Ok(explicit.to_string()),
+        (None, Some(restored)) if !restored.is_empty() => Ok(restored.to_string()),
+        _ => Ok(session_id.to_string()),
+    }
+}
+
 impl Session {
     // one-time session construction; cwd canonicalize happens before the loop serves turns.
     #[allow(clippy::disallowed_methods)]
@@ -754,6 +1526,7 @@ impl Session {
             None => std::env::current_dir().context("cwd")?,
         };
 
+        let discover_project_instructions = cli.system_prompt.is_none();
         let (explicit_system, user_instructions) = match cli.system_prompt.as_deref() {
             Some("") => (None, None),
             Some(s) => (Some(s.to_string()), None),
@@ -764,9 +1537,63 @@ impl Session {
         let mut tx = transport::build_transport(kind).await?;
 
         let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
+        let history_fork = crate::session::parse_history_fork(
+            cli.fork_source_session.as_deref(),
+            cli.fork_turns.as_deref(),
+        )?;
+        if cli.resume.is_some() && history_fork.is_some() {
+            anyhow::bail!("a session cannot resume and fork history at the same time");
+        }
+        if history_fork.is_some() && cli.prompt_cache_root.is_none() {
+            anyhow::bail!("a history fork requires an explicit prompt-cache root");
+        }
+        if history_fork
+            .as_ref()
+            .is_some_and(|fork| fork.source_session == store.id)
+        {
+            anyhow::bail!("a fresh session cannot fork its own history");
+        }
+        let fork_source = if let Some(fork) = &history_fork {
+            let source = crate::session::load_fork_source(&fork.source_session)?;
+            if source.transport != tx.name() {
+                anyhow::bail!(
+                    "fork transport mismatch: source is '{}', harness is '{}'",
+                    source.transport,
+                    tx.name()
+                );
+            }
+            Some(source)
+        } else {
+            None
+        };
+        let restored_prompt_cache_root = store
+            .restored
+            .as_ref()
+            .and_then(|restored| restored.prompt_cache_root.as_deref());
+        let prompt_cache_root = resolve_prompt_cache_root(
+            &store.id,
+            cli.prompt_cache_root.as_deref(),
+            restored_prompt_cache_root,
+            history_fork
+                .as_ref()
+                .zip(fork_source.as_ref())
+                .map(|(fork, source)| (fork.source_session.as_str(), source)),
+        )?;
+        let (user_steer_wake, user_steer_rx) = watch::channel(0u64);
+        if let Some(agent) = services.agent() {
+            services = services.with_agent(Arc::new(SteerAwareAgentCapability::new(
+                agent,
+                user_steer_rx,
+            )));
+        }
         // Sidecar append-only event log next to the snapshot — the durable
         // timestamped record of this session (event_log.rs).
-        let event_log = Arc::new(EventLog::for_session(&store.id));
+        let event_log = Arc::new(
+            cli.worker_event_log
+                .as_ref()
+                .map(|path| EventLog::at_path(std::path::PathBuf::from(path)))
+                .unwrap_or_else(|| EventLog::for_session(&store.id)),
+        );
         let scoped_project_docs = crate::project_doc::ScopedProjectDocs::from_startup_and_event_log(
             user_instructions
                 .as_ref()
@@ -774,10 +1601,11 @@ impl Session {
                 .unwrap_or_default(),
             event_log.path(),
         );
-        // Hand the transport the stable session id, so it can populate the
-        // codex-style `session-id` header + `prompt_cache_key` (vs a random
-        // per-request id).
+        // Keep provider wire identity distinct from the prompt-cache root. A
+        // forked child gets its own session ID while sharing stable prefix cache
+        // identity with its logical root.
         tx.set_session_id(store.id.clone());
+        tx.set_prompt_cache_root(prompt_cache_root.clone());
         let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
         let restored_code_mode = store.restored.as_ref().and_then(|r| r.code_mode.clone());
         let restored_service_tier = store.restored.as_ref().and_then(|r| r.service_tier.clone());
@@ -788,6 +1616,8 @@ impl Session {
             .as_ref()
             .map(|r| r.side.clone())
             .unwrap_or(Value::Null);
+        let mailbox_inbox =
+            MailboxInbox::from_side(prior_side.get("agent_mailbox").unwrap_or(&Value::Null))?;
         let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
             prior_side.get("todos").unwrap_or(&Value::Null),
         )));
@@ -799,6 +1629,7 @@ impl Session {
         let restored_reference_context = crate::context::TurnContextItem::from_side(
             prior_side.get("reference_context").unwrap_or(&Value::Null),
         );
+        let world_state = crate::context::sections::migrate_legacy_world_state(&prior_side);
         // Dispatch-context resolution (dispatch-prompt-slots.md §4): the flag
         // replaces the persisted context wholesale; empty clears; absent
         // restores persona/pins/non-`needs_scope` directives from side-state
@@ -819,6 +1650,13 @@ impl Session {
                 );
             }
             tx.restore(r.snapshot.clone());
+        } else if let (Some(fork), Some(source)) = (&history_fork, &fork_source) {
+            let forked = crate::session::fork_conversation_snapshot(
+                &source.transport,
+                &source.snapshot,
+                &fork.turns,
+            )?;
+            tx.restore(forked);
         }
         let restored_snapshot = store.restored.is_some();
 
@@ -839,22 +1677,38 @@ impl Session {
 
         let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
         let cx = ToolCx {
+            invocation_id: None,
             root: root.clone(),
             safety: Arc::new(SafetyPolicy::new()),
             http: reqwest::Client::new(),
             todos: todos.clone(),
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             edits: edits.clone(),
-            session_env: Arc::new(transport::session_env_snapshot()),
+            session_env: Arc::new(transport::public_session_env_snapshot()),
             tool_arg_defaults: Arc::new(tool_arg_defaults),
             shell_env: Arc::new(shell_env),
         };
-        // Stage 1 has no rollout reconstruction yet. On resume, seed the
-        // context baseline gate for legacy sessions with no persisted
-        // `reference_context` so the already-persisted conversation is not
-        // front-loaded with a second fresh <environment_context>.
-        let reference_context_item =
-            reference_context_item_for_restore(restored_snapshot, restored_reference_context, &cx);
+        let compaction = crate::compaction::CompactionPolicy::from_env();
+        let compact_threshold = compaction.threshold(&model);
+        let context_window = Arc::new(crate::context::window::ContextWindowTracker::restore(
+            prior_side.get("context_window").unwrap_or(&Value::Null),
+            compaction.context_window(&model),
+        ));
+        let shadow_lens_selector = transport::session_var("BRO_HARNESS_SHADOW_LENS_CATALOG")
+            .filter(|raw| !raw.trim().is_empty())
+            .and_then(|raw| {
+                match crate::context::shadow_selector::ShadowLensSelector::from_json(&raw) {
+                    Ok(selector) => Some(selector),
+                    Err(error) => {
+                        tracing::warn!(%error, "shadow lens catalog disabled");
+                        None
+                    }
+                }
+            });
+        // This compatibility mirror is not comparison authority. Legacy side
+        // cells were converted into `world_state` above; retained transport
+        // fragments handle old sessions that never had a reference cell.
+        let reference_context_item = restored_reference_context;
         // The builtin `report` tool is harness-owned (it emits the cockpit's
         // status signal on the stream) and holds its own emitter handle. It is
         // registered always but only pinned in fleet (bidirectional) mode.
@@ -876,6 +1730,9 @@ impl Session {
             callback.clone(),
             Some(event_log.clone()),
         ))));
+        builtins.push(Arc::new(
+            crate::context::window::GetContextRemainingTool::new(context_window.clone()),
+        ));
         let (mcp_tools, tool_placement) = match injected_mcp {
             Some(config) => {
                 let tools = mcp::load_mcp_tools_from_config(&config, &tool_filter).await;
@@ -957,6 +1814,7 @@ impl Session {
         if fleet {
             pin.also_pin(crate::report::REPORT_TOOL);
         }
+        pin.also_pin(crate::context::window::GET_CONTEXT_REMAINING);
 
         // Structured output: when an output schema is supplied, register a
         // synthetic `final_result` tool whose input_schema IS the output schema,
@@ -981,6 +1839,15 @@ impl Session {
             &tool_filter,
             code_mode.defers_builtins(),
         );
+        let initial_service_policy = services.remote_policy().map(|policy| ServicePolicyUpdate {
+            revision: policy.revision.clone(),
+            allowed_capabilities: policy.allowed_capabilities.clone(),
+            downstream_availability: policy.downstream_availability,
+            connected: policy.connected,
+        });
+        if let Some(update) = &initial_service_policy {
+            reg.set_disabled_tools(disabled_remote_service_tools(update));
+        }
         validate_tool_arg_defaults(&cx.tool_arg_defaults, &reg);
 
         let base_opts = TurnOpts {
@@ -998,10 +1865,29 @@ impl Session {
         };
 
         let emitter = make_emitter(store.id.clone(), callback, Some(event_log.clone()));
-        let compaction = crate::compaction::CompactionPolicy::from_env();
-        let compact_threshold = compaction.threshold(&base_opts.model);
         let tool_result_cap = crate::bound::cap_bytes();
         let dump_dir = crate::bound::dump_dir();
+
+        let service_availability = initial_service_policy.as_ref().map_or_else(
+            || crate::context::sections::ServiceAvailabilitySnapshot {
+                tool: services.tool().is_some(),
+                corpus: services.corpus().is_some(),
+                atoms: services.atoms().is_some(),
+                refactor: services.refactor().is_some(),
+                execution: services.execution().is_some(),
+                collaboration: services.agent().is_some(),
+            },
+            |update| remote_service_availability(update, services.tool().is_some()),
+        );
+        let service_policy_revision = initial_service_policy
+            .as_ref()
+            .map(|policy| policy.revision.clone());
+        let service_policy_allowed = initial_service_policy
+            .as_ref()
+            .map(|policy| policy.allowed_capabilities.clone());
+        let service_policy_availability = initial_service_policy
+            .as_ref()
+            .map(|policy| policy.downstream_availability);
 
         // Timestamp the session boundary in the sidecar log. `provider` is the
         // daemon's dispatch provider when riding in-process
@@ -1026,10 +1912,21 @@ impl Session {
         Ok(Self {
             tx,
             reg,
+            prompt_cache_root,
+            user_steer_wake,
             _services: services,
             code_mode,
             cx,
             reference_context_item,
+            world_state,
+            discover_project_instructions,
+            service_availability,
+            service_policy_revision,
+            service_policy_allowed,
+            service_policy_availability,
+            context_window,
+            shadow_lens_selector,
+            shadow_lens_selection: None,
             hooks,
             scoped_project_docs,
             emitter,
@@ -1046,6 +1943,7 @@ impl Session {
             store,
             event_log,
             prior_side,
+            mailbox_inbox,
             todos,
             lsp_baselines,
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
@@ -1063,10 +1961,102 @@ impl Session {
         self.emitter.session_id()
     }
 
+    async fn admit_agent_mailbox(
+        &mut self,
+        delivery: AgentMailboxDelivery,
+        command_id: &str,
+    ) -> Result<bool> {
+        if delivery.session_id.as_str() != self.store.id {
+            anyhow::bail!("agent mailbox delivery belongs to another session");
+        }
+        let added = self.mailbox_inbox.admit(&delivery)?;
+        if added {
+            // Admission is not acknowledged until both cursor and pending body
+            // are in the atomic session snapshot.
+            persist_session_snapshot(self).await?;
+        }
+        append_durable_milestone(
+            &self.event_log,
+            "worker_input_admitted",
+            self.emitter.session_id(),
+            json!({
+                "command_id": command_id,
+                "kind": "agent_mailbox",
+                "disposition": if added { "mailbox_queued" } else { "mailbox_duplicate" },
+                "delivery_id": delivery.delivery_id,
+                "through_sequence": delivery.through_sequence,
+                "wake": delivery.wake,
+            }),
+        )?;
+        Ok(added)
+    }
+
+    fn has_pending_mailbox_wake(&self) -> bool {
+        self.mailbox_inbox.has_wake_pending()
+    }
+
+    fn inject_pending_mailbox(&mut self) -> bool {
+        let messages = self.mailbox_inbox.drain_rendered();
+        if messages.is_empty() {
+            return false;
+        }
+        for (message, rendered) in messages {
+            self.event_log.append_event(&json!({
+                "type": "user",
+                "session_id": self.session_id(),
+                "agent_mailbox": {
+                    "message_id": message.message_id,
+                    "sequence": message.sequence,
+                    "kind": message.kind,
+                    "sender": message.sender,
+                    "recipient": message.recipient,
+                },
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": rendered}],
+                },
+            }));
+            self.push_user_text_raw(&rendered);
+        }
+        true
+    }
+
     /// Shared handle to the sidecar event log, for auxiliary emitters
     /// (control responses, stdin replay) created outside `build`.
     fn event_log(&self) -> Arc<EventLog> {
         self.event_log.clone()
+    }
+
+    fn apply_service_policy(&mut self, update: ServicePolicyUpdate) -> Result<()> {
+        if update.revision.version == 0 || update.revision.digest.trim().is_empty() {
+            anyhow::bail!("service policy update has an invalid revision identity");
+        }
+        if let Some(prior) = &self.service_policy_revision {
+            if update.revision.version < prior.version
+                || update.revision.version > prior.version.saturating_add(1)
+            {
+                anyhow::bail!("service policy revision is non-contiguous");
+            }
+            if update.revision.version == prior.version {
+                if update.revision.digest != prior.digest {
+                    anyhow::bail!("service policy digest changed without a revision bump");
+                }
+                if self.service_policy_allowed.as_ref() != Some(&update.allowed_capabilities) {
+                    anyhow::bail!("service policy grants changed without a revision bump");
+                }
+                if self.service_policy_availability != Some(update.downstream_availability) {
+                    anyhow::bail!("service availability changed without a revision bump");
+                }
+            }
+        }
+        self.reg
+            .set_disabled_tools(disabled_remote_service_tools(&update));
+        self.service_availability =
+            remote_service_availability(&update, self._services.tool().is_some());
+        self.service_policy_revision = Some(update.revision);
+        self.service_policy_allowed = Some(update.allowed_capabilities);
+        self.service_policy_availability = Some(update.downstream_availability);
+        Ok(())
     }
 
     /// Apply a mid-session control mutation. `interrupt` is handled by the
@@ -1079,6 +2069,8 @@ impl Session {
         {
             self.base_opts.model = m.to_string();
             self.compact_threshold = self.compaction.threshold(m);
+            self.context_window
+                .set_window_tokens(self.compaction.context_window(m));
             tracing::info!(model = m, "set_model");
         }
         // set_max_thinking_tokens / others are accepted (acked) but not yet
@@ -1094,7 +2086,7 @@ impl Session {
             self.emitter.session_id(),
             json!({"reason": "manual"}),
         );
-        match self
+        let compacted = self
             .tx
             .compact(
                 self.compaction.params(),
@@ -1102,14 +2094,38 @@ impl Session {
                 &tool_specs,
                 &self.base_opts,
             )
-            .await?
-        {
-            Some(summary) => {
+            .await;
+        match compacted {
+            Ok(Some(summary)) => {
+                let transition = self.context_window.advance();
                 self.emitter
                     .compact_boundary("manual", self.last_prompt_tokens, summary.len());
                 self.reference_context_item = None;
+                append_durable_milestone(
+                    &self.event_log,
+                    "compact_boundary",
+                    self.emitter.session_id(),
+                    json!({"reason":"manual","noop":false,"context_window":transition}),
+                )?;
             }
-            None => tracing::info!("manual /compact: nothing compactible yet"),
+            Ok(None) => {
+                tracing::info!("manual /compact: nothing compactible yet");
+                append_durable_milestone(
+                    &self.event_log,
+                    "compact_boundary",
+                    self.emitter.session_id(),
+                    json!({"reason":"manual","noop":true}),
+                )?;
+            }
+            Err(error) => {
+                append_durable_milestone(
+                    &self.event_log,
+                    "compact_boundary",
+                    self.emitter.session_id(),
+                    json!({"reason":"manual","error":format!("{error:#}")}),
+                )?;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1126,10 +2142,20 @@ impl Session {
         &mut self,
         prompt: &str,
         mut cancel: watch::Receiver<bool>,
-        mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
+        mid_turn_user_inputs: Arc<StdMutex<VecDeque<MidTurnInput>>>,
     ) -> Result<()> {
         let mut pending_prompt = Some(prompt);
         let prompt_estimate = est_tokens(prompt);
+
+        if let Some(selector) = &self.shadow_lens_selector {
+            let run = selector.select(prompt);
+            self.event_log.append_milestone(
+                "lens_shadow_selection",
+                self.emitter.session_id(),
+                run.metrics,
+            );
+            self.shadow_lens_selection = Some(run.selection);
+        }
 
         // Timestamp the user turn in the sidecar log. The protocol stream
         // only carries user text when `--replay-user-messages` is on, so the
@@ -1202,6 +2228,7 @@ impl Session {
                     .await
                 {
                     Ok(Some(summary)) => {
+                        let transition = self.context_window.advance();
                         tracing::info!(pre_tokens = projected_tokens, "compacted");
                         self.emitter
                             .compact_boundary("auto", projected_tokens, summary.len());
@@ -1210,14 +2237,25 @@ impl Session {
                         // longer applies.
                         self.pending_input_estimate = 0;
                         self.reference_context_item = None;
+                        self.event_log.append_milestone(
+                            "context_window_advanced",
+                            self.emitter.session_id(),
+                            json!({"reason":"auto","context_window":transition}),
+                        );
                     }
                     Ok(None) => {}
                     Err(e) => tracing::warn!("compaction failed: {e:#}"),
                 }
             }
+            self.prepare_context_for_user_turn()?;
+            let mailbox_injected = self.inject_pending_mailbox();
             if let Some(prompt) = pending_prompt.take() {
-                self.prepare_context_for_user_turn();
                 self.push_user_text_raw(prompt);
+            }
+            if mailbox_injected {
+                // Persist the transport append and pending-queue removal as
+                // one snapshot before the provider can observe this input.
+                persist_session_snapshot(self).await?;
             }
             let mut sys = compose_system(
                 &self.system_sections(),
@@ -1289,12 +2327,19 @@ impl Session {
                             .await
                         {
                             Ok(Some(summary)) => {
+                                let transition = self.context_window.advance();
                                 self.emitter.compact_boundary(
                                     "overflow",
                                     self.last_prompt_tokens,
                                     summary.len(),
                                 );
                                 self.reference_context_item = None;
+                                self.event_log.append_milestone(
+                                    "context_window_advanced",
+                                    self.emitter.session_id(),
+                                    json!({"reason":"overflow","context_window":transition}),
+                                );
+                                self.reconcile_world_state_after_overflow()?;
                             }
                             // Nothing compactible, or compaction itself failed:
                             // a retry would just re-overflow — surface the
@@ -1314,12 +2359,29 @@ impl Session {
             self.turns += 1;
             self.total_usage.add(&out.usage);
             self.last_prompt_tokens = out.usage.total_input_tokens();
+            self.context_window
+                .observe_used_tokens(self.last_prompt_tokens);
             // The just-sent input is now reflected in last_prompt_tokens; clear
             // the appended-tail estimate so it only counts items added afterward.
             self.pending_input_estimate = 0;
             last_model_stop = Some(out.stop.clone());
             last_model_tool_call_count = out.tool_calls.len();
             last_step_text = out.text.clone();
+
+            if let (Some(selector), Some(selection)) =
+                (&self.shadow_lens_selector, &self.shadow_lens_selection)
+            {
+                for observation in selector.observe_invocations(
+                    selection,
+                    out.tool_calls.iter().map(|call| call.name.clone()),
+                ) {
+                    self.event_log.append_milestone(
+                        "lens_shadow_invocation",
+                        self.emitter.session_id(),
+                        observation,
+                    );
+                }
+            }
 
             for n in self.hooks.on_assistant_turn(&out.text, &out.tool_calls) {
                 if n.delivery == Delivery::SystemTail {
@@ -1405,55 +2467,64 @@ impl Session {
             // the structured result, emit a synthetic tool_result back, and terminate
             // the turn cleanly. The model should only call this once; ignore
             // subsequent calls if it fires multiple times.
-            if self.output_schema.is_some() {
-                if let Some(fr) = out
+            if self.output_schema.is_some()
+                && let Some(fr) = out
                     .tool_calls
                     .iter()
                     .find(|tc| tc.name == FINAL_RESULT_TOOL)
-                {
-                    let structured = fr.args.clone();
-                    tracing::info!("final_result captured; terminating turn");
-                    // Emit a tool_result so the transport buffer stays valid
-                    // (every tool_use gets a matching result).
-                    let fr_result = transport::ToolResult {
-                        id: fr.id.clone(),
-                        content: serde_json::to_string(&structured).unwrap_or_default(),
-                        is_error: false,
-                    };
-                    self.emitter.tool_results(std::slice::from_ref(&fr_result));
-                    // Pad any sibling tool calls that were NOT final_result with
-                    // interrupted markers so the buffer stays balanced.
-                    let mut padding: Vec<transport::ToolResult> = Vec::new();
-                    for tc in &out.tool_calls {
-                        if tc.name != FINAL_RESULT_TOOL {
-                            padding.push(transport::ToolResult {
-                                id: tc.id.clone(),
-                                content: INTERRUPTED_TOOL_RESULT.to_string(),
-                                is_error: true,
-                            });
-                        }
+            {
+                let structured = fr.args.clone();
+                tracing::info!("final_result captured; terminating turn");
+                // Emit a tool_result so the transport buffer stays valid
+                // (every tool_use gets a matching result).
+                let fr_result = transport::ToolResult {
+                    id: fr.id.clone(),
+                    content: serde_json::to_string(&structured).unwrap_or_default(),
+                    is_error: false,
+                };
+                self.emitter.tool_results(std::slice::from_ref(&fr_result));
+                // Pad any sibling tool calls that were NOT final_result with
+                // interrupted markers so the buffer stays balanced.
+                let mut padding: Vec<transport::ToolResult> = Vec::new();
+                for tc in &out.tool_calls {
+                    if tc.name != FINAL_RESULT_TOOL {
+                        padding.push(transport::ToolResult {
+                            id: tc.id.clone(),
+                            content: INTERRUPTED_TOOL_RESULT.to_string(),
+                            is_error: true,
+                        });
                     }
-                    if !padding.is_empty() {
-                        self.emitter.tool_results(&padding);
-                    }
-                    let mut transport_results = Vec::with_capacity(1 + padding.len());
-                    transport_results.push(fr_result);
-                    transport_results.extend(padding);
-                    self.tx.push_tool_results(transport_results);
-                    // Emit the structured result as the final assistant result.
-                    self.emitter.result(
-                        &serde_json::to_string(&structured).unwrap_or_default(),
-                        &self.total_usage,
-                        self.turns,
-                        None,
-                        None,
-                        self.compact_threshold,
-                    );
-                    // Turn-boundary event-log drain (see end of user_turn).
-                    let log = self.event_log.clone();
-                    let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
-                    return Ok(());
                 }
+                if !padding.is_empty() {
+                    self.emitter.tool_results(&padding);
+                }
+                let mut transport_results = Vec::with_capacity(1 + padding.len());
+                transport_results.push(fr_result);
+                transport_results.extend(padding);
+                self.tx.push_tool_results(transport_results);
+                // Emit the structured result as the final assistant result.
+                self.emitter.result(
+                    &serde_json::to_string(&structured).unwrap_or_default(),
+                    &self.total_usage,
+                    self.turns,
+                    None,
+                    None,
+                    self.compact_threshold,
+                );
+                // Turn-boundary event-log drain (see end of user_turn).
+                let log = self.event_log.clone();
+                let _ = tokio::task::spawn_blocking(move || log.flush_blocking()).await;
+                return Ok(());
+            }
+
+            if self.service_availability.collaboration && !out.tool_calls.is_empty() {
+                // A spawn can be direct or nested inside the code-mode `exec`
+                // tool. Publish before every tool-dispatch boundary while the
+                // collaboration capability is live so both surfaces fork the
+                // current in-memory history rather than the prior committed
+                // turn.
+                let fork_source = self.fork_source_snapshot()?;
+                write_fork_source_snapshot(fork_source).await?;
             }
 
             // Dispatch tool calls. Read-only tools (per their annotation) run
@@ -1485,7 +2556,12 @@ impl Session {
                     let calls = &out.tool_calls;
                     let futs = read_idx.into_iter().map(|i| {
                         let tc = &calls[i];
-                        async move { (i, reg.dispatch(&tc.name, tc.args.clone(), cx).await) }
+                        async move {
+                            (
+                                i,
+                                reg.dispatch(&tc.id, &tc.name, tc.args.clone(), cx).await,
+                            )
+                        }
                     });
                     tokio::select! {
                         biased;
@@ -1510,7 +2586,7 @@ impl Session {
                     tokio::select! {
                         biased;
                         _ = cancel.changed() => { interrupted = true; break; }
-                        res = self.reg.dispatch(&tc.name, tc.args.clone(), &self.cx) => {
+                        res = self.reg.dispatch(&tc.id, &tc.name, tc.args.clone(), &self.cx) => {
                             raw[i] = Some(res.into_content());
                         }
                     }
@@ -1590,11 +2666,12 @@ impl Session {
             self.pending_input_estimate = self
                 .pending_input_estimate
                 .saturating_add(est_tool_results(&results));
+            self.update_context_projection();
             self.tx.push_tool_results(results);
             if interrupted {
                 break "interrupted_dispatch";
             }
-            self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
+            self.drain_mid_turn_inputs(&mid_turn_user_inputs).await?;
             self.hooks.tick();
         };
 
@@ -1620,6 +2697,8 @@ impl Session {
                 {
                     self.last_prompt_tokens = partial.total_input_tokens();
                     self.pending_input_estimate = 0;
+                    self.context_window
+                        .observe_used_tokens(self.last_prompt_tokens);
                 }
             }
             self.tx.note_interrupted();
@@ -1669,7 +2748,7 @@ impl Session {
 
     #[cfg(test)]
     fn push_user_text(&mut self, prompt: &str) {
-        self.emit_initial_context_if_needed();
+        self.prepare_context_for_user_turn().unwrap();
         self.push_user_text_raw(prompt);
     }
 
@@ -1678,6 +2757,7 @@ impl Session {
         self.pending_input_estimate = self
             .pending_input_estimate
             .saturating_add(est_tokens(prompt));
+        self.update_context_projection();
         for n in self.hooks.on_user_turn(prompt) {
             if n.delivery == Delivery::SystemTail {
                 self.tail_nudge = Some(n.message);
@@ -1712,138 +2792,184 @@ impl Session {
         sections
     }
 
-    fn prepare_context_for_user_turn(&mut self) {
-        if self.reference_context_item.is_none() {
-            self.emit_initial_context_if_needed();
-        } else if self.strategy.context_rides_user_lane() {
-            self.emit_environment_context_diff_if_needed();
-            self.emit_dispatch_context_changes_if_needed();
-        } else {
-            // Vibe-shaped: the leading system rebuild carries
-            // environment/scope/pins; advance the baseline silently so
-            // side-state stays current.
-            let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
-            self.reference_context_item = Some(env.to_turn_context_item());
-        }
+    fn prepare_context_for_user_turn(&mut self) -> Result<()> {
+        let messages = self.render_world_state()?;
+        self.push_world_state_messages(messages);
+        Ok(())
     }
 
-    fn emit_initial_context_if_needed(&mut self) {
-        if self.reference_context_item.is_some() {
-            return;
+    fn render_world_state(&mut self) -> Result<Vec<crate::context::TextMessage>> {
+        if self.discover_project_instructions {
+            self.user_instructions = crate::context::UserInstructions::from_project(&self.cx.root);
         }
         let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
-        // The emitter is strategy-aware (design §5, review round 2 blocker):
-        // on the vibe-shaped strategy memory/environment/scope/pins resolve to
-        // the stable system slot, so the initial-context emitter contributes
-        // NOTHING to the user lane.
+        let retained =
+            crate::context::world_state::retained_fragments_from_snapshot(&self.tx.snapshot());
+        let mut coordinator = crate::context::world_state::WorldStateCoordinator::from_side(
+            &self.world_state,
+            retained,
+        );
+        // Registration order preserves the existing Codex-shaped composition:
+        // project instructions, scope/pins, then environment.
+        coordinator.register(crate::context::sections::ProjectInstructionsSection::new(
+            self.strategy,
+            self.user_instructions.as_ref(),
+            self.cx.root.to_string_lossy().into_owned(),
+        ))?;
+        coordinator.register(crate::context::sections::DispatchSection::new(
+            self.strategy,
+            &self.dispatch,
+        ))?;
+        coordinator.register(crate::context::sections::EnvironmentSection::new(
+            self.strategy,
+            env.clone(),
+        ))?;
+        coordinator.register(crate::context::sections::ToolManifestSection::new(
+            self.reg
+                .wire_specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect(),
+            self.reg
+                .manifest()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+        ))?;
+        coordinator.register(crate::context::sections::ServiceAvailabilitySection::new(
+            self.service_availability.clone(),
+        ))?;
+        coordinator.register(crate::context::sections::SelectedLensesSection::shadow(
+            self.shadow_lens_selection
+                .as_ref()
+                .map(|selection| selection.selected_ids.clone())
+                .unwrap_or_default(),
+        ))?;
+        let (messages, snapshot) = coordinator.render_and_snapshot()?;
         if self.strategy.context_rides_user_lane() {
-            // Turn-1 contextual user message ordering (codex order):
-            // UserInstructions (AGENTS.md) → scope → pins → environment LAST.
-            let mut sections = Vec::new();
-            if let Some(instructions) = &self.user_instructions {
-                sections.push(crate::context::ContextualUserFragment::render(instructions));
+            // Typed World State is authoritative, but keep the legacy side-cell
+            // baseline current while older persisted sessions can still carry
+            // `dispatch_emitted`. Scope remains deliberately non-restorable:
+            // when this run has no scope, preserve the prior comparison value.
+            let dispatch =
+                crate::context::sections::DispatchSnapshot::from_dispatch(&self.dispatch);
+            if dispatch.scope.is_some() {
+                self.dispatch.emitted_scope = dispatch.scope;
             }
-            if let Some(scope) = self.dispatch.scope_render() {
-                self.dispatch.emitted_scope = Some(scope.clone());
-                sections.push(scope);
-            }
-            if let Some(pins) = self.dispatch.pins_render() {
-                self.dispatch.emitted_pins = Some(pins.clone());
-                sections.push(pins);
-            }
-            sections.push(crate::context::ContextualUserFragment::render(&env));
-            if let Some(message) = crate::context::build_contextual_user_message(sections) {
-                let added_tokens = message
-                    .text_blocks
-                    .iter()
-                    .map(|section| est_tokens(section))
-                    .fold(0u64, u64::saturating_add);
-                self.tx.push_user_text_blocks(message.text_blocks);
-                self.pending_input_estimate =
-                    self.pending_input_estimate.saturating_add(added_tokens);
-            }
+            self.dispatch.emitted_pins = dispatch.pins;
         }
+        self.world_state = snapshot;
         self.reference_context_item = Some(env.to_turn_context_item());
+        Ok(messages)
     }
 
-    /// Re-emit scope/pins fragments when the current dispatch context differs
-    /// from the last-emitted baselines (resume with a changed scope, pin
-    /// update). No current scope ⇒ nothing emitted and the baseline survives
-    /// for future comparison (design §4/§7).
-    fn emit_dispatch_context_changes_if_needed(&mut self) {
-        let mut sections: Vec<String> = Vec::new();
-        if let Some(scope) = self.dispatch.scope_render()
-            && self.dispatch.emitted_scope.as_deref() != Some(scope.as_str())
-        {
-            self.dispatch.emitted_scope = Some(scope.clone());
-            sections.push(scope);
+    fn push_world_state_messages(&mut self, messages: Vec<crate::context::TextMessage>) {
+        let mut user_blocks = Vec::new();
+        for message in messages {
+            match message.role {
+                crate::context::FragmentRole::User => user_blocks.extend(message.text_blocks),
+                crate::context::FragmentRole::Developer => {
+                    tracing::warn!("developer World State delta has no transport insertion path")
+                }
+            }
         }
-        if let Some(pins) = self.dispatch.pins_render()
-            && self.dispatch.emitted_pins.as_deref() != Some(pins.as_str())
-        {
-            self.dispatch.emitted_pins = Some(pins.clone());
-            sections.push(pins);
-        }
-        if let Some(message) = crate::context::build_contextual_user_message(sections) {
-            let added_tokens = message
-                .text_blocks
-                .iter()
-                .map(|section| est_tokens(section))
-                .fold(0u64, u64::saturating_add);
-            self.tx.push_user_text_blocks(message.text_blocks);
-            self.pending_input_estimate = self.pending_input_estimate.saturating_add(added_tokens);
-        }
-    }
-
-    fn emit_environment_context_diff_if_needed(&mut self) {
-        let Some(before) = self.reference_context_item.clone() else {
+        if user_blocks.is_empty() {
             return;
-        };
-        let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
-        if let Some(delta) =
-            crate::context::EnvironmentContextDelta::from_turn_context_item(&before, &env)
-        {
-            let rendered = crate::context::ContextualUserFragment::render(&delta);
-            if let Some(message) = crate::context::build_contextual_user_message(vec![rendered]) {
-                let added_tokens = message
-                    .text_blocks
+        }
+        let added_tokens = user_blocks
+            .iter()
+            .map(|section| est_tokens(section))
+            .fold(0u64, u64::saturating_add);
+        self.tx.push_user_text_blocks(user_blocks);
+        self.pending_input_estimate = self.pending_input_estimate.saturating_add(added_tokens);
+        self.update_context_projection();
+    }
+
+    fn reconcile_world_state_after_overflow(&mut self) -> Result<()> {
+        let messages = self.render_world_state()?;
+        let blocks: Vec<String> = messages
+            .iter()
+            .filter(|message| message.role == crate::context::FragmentRole::User)
+            .flat_map(|message| message.text_blocks.clone())
+            .collect();
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let mut snapshot = self.tx.snapshot();
+        if crate::context::world_state::prepend_blocks_to_last_user(&mut snapshot, &blocks) {
+            self.tx.restore(snapshot);
+            self.pending_input_estimate = self.pending_input_estimate.saturating_add(
+                blocks
                     .iter()
-                    .map(|section| est_tokens(section))
-                    .fold(0u64, u64::saturating_add);
-                self.tx.push_user_text_blocks(message.text_blocks);
-                self.pending_input_estimate =
-                    self.pending_input_estimate.saturating_add(added_tokens);
-            }
+                    .map(|block| est_tokens(block))
+                    .fold(0u64, u64::saturating_add),
+            );
+            self.update_context_projection();
+        } else {
+            self.push_world_state_messages(messages);
         }
-        // Match Codex's runtime baseline advance: even a shell-only change
-        // emits no model-visible delta, but the in-memory side-state baseline
-        // still reflects the current turn environment.
-        self.reference_context_item = Some(env.to_turn_context_item());
+        Ok(())
     }
 
-    fn drain_mid_turn_user_inputs(&mut self, inputs: &Arc<StdMutex<VecDeque<String>>>) {
-        let Ok(mut inputs) = inputs.lock() else {
-            return;
-        };
-        while let Some(prompt) = inputs.pop_front() {
-            if prompt.trim() == "/compact" {
-                tracing::info!("deferring /compact received during active turn");
-                continue;
-            }
-            // Log the steer like the turn-start user log above: the event log
-            // is THE transcript (the fleet zoom renders it and reconciles
-            // queued-steer echoes against it), so an operator turn injected
-            // mid-turn must appear in it at the position the model saw it.
-            self.event_log.append_event(&json!({
-                "type": "user",
-                "session_id": self.session_id(),
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}],
-                },
-            }));
-            self.push_user_text_raw(&prompt);
+    fn update_context_projection(&self) {
+        if self.last_prompt_tokens > 0 {
+            self.context_window.observe_projected_tokens(
+                self.last_prompt_tokens
+                    .saturating_add(self.pending_input_estimate),
+            );
         }
+    }
+
+    async fn drain_mid_turn_inputs(
+        &mut self,
+        inputs: &Arc<StdMutex<VecDeque<MidTurnInput>>>,
+    ) -> Result<()> {
+        let queued = {
+            let Ok(mut inputs) = inputs.lock() else {
+                return Ok(());
+            };
+            inputs.drain(..).collect::<Vec<_>>()
+        };
+        let mut mailbox_added = false;
+        let mut service_policy_changed = false;
+        for input in queued {
+            match input {
+                MidTurnInput::User(prompt) => {
+                    if prompt.trim() == "/compact" {
+                        tracing::info!("deferring /compact received during active turn");
+                        continue;
+                    }
+                    // Log the steer like the turn-start user log above: the
+                    // event log is the transcript, so an operator turn
+                    // injected mid-turn appears where the model sees it.
+                    self.event_log.append_event(&json!({
+                        "type": "user",
+                        "session_id": self.session_id(),
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": prompt}],
+                        },
+                    }));
+                    self.push_user_text_raw(&prompt);
+                }
+                MidTurnInput::AgentMailbox {
+                    delivery,
+                    command_id,
+                } => {
+                    mailbox_added |= self.admit_agent_mailbox(delivery, &command_id).await?;
+                }
+                MidTurnInput::ServicePolicy(update) => {
+                    self.apply_service_policy(update)?;
+                    service_policy_changed = true;
+                }
+            }
+        }
+        let mailbox_injected = mailbox_added && self.inject_pending_mailbox();
+        if mailbox_injected || service_policy_changed {
+            // The next loop iteration may call the provider immediately.
+            persist_session_snapshot(self).await?;
+        }
+        Ok(())
     }
 
     fn turn_end_diagnostics(
@@ -1957,10 +3083,19 @@ impl Session {
             "model": &self.base_opts.model,
             "code_mode": self.code_mode.as_str(),
             "service_tier": self.base_opts.service_tier.as_deref(),
+            "prompt_cache_root": &self.prompt_cache_root,
             "snapshot": self.tx.snapshot(),
             "side": self.side_state(),
         }))
         .context("serialize session")
+    }
+
+    fn fork_source_snapshot(&self) -> Result<(std::path::PathBuf, String)> {
+        let body = self
+            .persist_body()
+            .context("serialize current fork source snapshot")?;
+        let path = self.store.fork_source_path();
+        Ok((path, body))
     }
 
     fn store_path(&self) -> &std::path::PathBuf {
@@ -1981,17 +3116,21 @@ impl Session {
             .unwrap_or(Value::Null);
         side["nudges"] = self.hooks.to_side();
         side["lsp_baselines"] = self.lsp_baselines.to_side();
-        side["reference_context"] = self
-            .reference_context_item
-            .as_ref()
-            .map(crate::context::TurnContextItem::to_side)
-            .unwrap_or(Value::Null);
         side["dispatch_context"] = self.dispatch.context_to_side();
-        side["dispatch_emitted"] = self.dispatch.emitted_to_side();
+        side["world_state"] = self.world_state.clone();
+        side["context_window"] = self.context_window.to_side();
+        side["agent_mailbox"] = self.mailbox_inbox.to_side();
+        if let Some(map) = side.as_object_mut() {
+            // Tolerant reads above are the compatibility path. New snapshots
+            // retire both ad hoc comparison cells.
+            map.remove("reference_context");
+            map.remove("dispatch_emitted");
+        }
         side
     }
 }
 
+#[cfg(test)]
 fn reference_context_item_for_restore(
     restored_snapshot: bool,
     restored_reference_context: Option<crate::context::TurnContextItem>,
@@ -2113,6 +3252,16 @@ fn tool_result_trace(call: &transport::ToolCall, result: &transport::ToolResult)
 enum Input {
     /// A user turn (text extracted from the SDK user-message shape).
     User(String),
+    TrackedUser {
+        text: String,
+        command_id: String,
+        kind: TrackedUserKind,
+    },
+    AgentMailbox {
+        delivery: AgentMailboxDelivery,
+        command_id: String,
+    },
+    ServicePolicy(ServicePolicyUpdate),
     /// A control request. `subtype` is read from the top level or from a nested
     /// `request` object (both Claude Agent SDK shapes are accepted).
     Control {
@@ -2120,6 +3269,21 @@ enum Input {
         req_id: Option<String>,
         raw: Value,
     },
+}
+
+#[derive(Clone, Copy)]
+enum TrackedUserKind {
+    Turn,
+    Steer,
+}
+
+enum MidTurnInput {
+    User(String),
+    AgentMailbox {
+        delivery: AgentMailboxDelivery,
+        command_id: String,
+    },
+    ServicePolicy(ServicePolicyUpdate),
 }
 
 /// Spawn a task that reads stdin NDJSON and forwards parsed [`Input`]s. The
@@ -2164,6 +3328,38 @@ fn spawn_stdin_reader(replay: bool, emitter: Emitter) -> mpsc::UnboundedReceiver
                         })
                         .is_err()
                     {
+                        break;
+                    }
+                }
+                Some("agent_mailbox") => {
+                    let Some(command_id) = v["command_id"].as_str().map(str::to_string) else {
+                        tracing::warn!("stdin: rejected agent mailbox without command identity");
+                        continue;
+                    };
+                    let Ok(delivery) =
+                        serde_json::from_value::<AgentMailboxDelivery>(v["delivery"].clone())
+                    else {
+                        tracing::warn!("stdin: rejected malformed agent mailbox delivery");
+                        continue;
+                    };
+                    if tx
+                        .send(Input::AgentMailbox {
+                            delivery,
+                            command_id,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some("service_policy") => {
+                    let Ok(update) =
+                        serde_json::from_value::<ServicePolicyUpdate>(v["policy"].clone())
+                    else {
+                        tracing::warn!("stdin: rejected malformed service policy update");
+                        continue;
+                    };
+                    if tx.send(Input::ServicePolicy(update)).is_err() {
                         break;
                     }
                 }
@@ -2342,8 +3538,103 @@ fn env_u64(key: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+// Filesystem/process fixtures intentionally exercise durable harness boundaries.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    struct NeverWakeAgentCapability {
+        wait_entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentCapability for NeverWakeAgentCapability {
+        async fn spawn(&self, _request: AgentSpawnRequest) -> CapabilityResult<AgentIdentity> {
+            unreachable!()
+        }
+
+        async fn send_message(&self, _request: AgentMessageRequest) -> CapabilityResult<()> {
+            unreachable!()
+        }
+
+        async fn followup(&self, _request: AgentMessageRequest) -> CapabilityResult<()> {
+            unreachable!()
+        }
+
+        async fn interrupt(&self, _target: AgentTarget) -> CapabilityResult<AgentStatus> {
+            unreachable!()
+        }
+
+        async fn status(&self, _target: AgentTarget) -> CapabilityResult<AgentSummary> {
+            unreachable!()
+        }
+
+        async fn list(&self, _prefix: Option<String>) -> CapabilityResult<Vec<AgentSummary>> {
+            unreachable!()
+        }
+
+        async fn wait(&self, _request: AgentWaitRequest) -> CapabilityResult<AgentWake> {
+            self.wait_entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_user_steer_wakes_agent_wait_with_typed_reason() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let inner: Arc<dyn AgentCapability> = Arc::new(NeverWakeAgentCapability {
+            wait_entered: entered.clone(),
+        });
+        let (steer_tx, steer_rx) = watch::channel(0u64);
+        let capability = Arc::new(SteerAwareAgentCapability::new(inner, steer_rx));
+        let waiter = {
+            let capability = capability.clone();
+            tokio::spawn(async move {
+                capability
+                    .wait(AgentWaitRequest {
+                        timeout_ms: Some(3_600_000),
+                        path_prefix: None,
+                        after_mailbox_sequence: None,
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+
+        signal_user_steer(&steer_tx);
+
+        let wake = tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
+            .await
+            .expect("wait_agent did not wake promptly")
+            .expect("wait task panicked")
+            .expect("wait returned a capability error");
+        assert_eq!(wake, AgentWake::UserSteer);
+    }
+
+    #[test]
+    fn forked_child_inherits_actual_root_prompt_cache_lineage() {
+        let root_cache = resolve_prompt_cache_root("root-session", None, None, None).unwrap();
+        let source = crate::session::Restored {
+            transport: "openai-responses".into(),
+            model: Some("m".into()),
+            code_mode: None,
+            service_tier: None,
+            prompt_cache_root: Some(root_cache.clone()),
+            snapshot: json!({"input": []}),
+            side: Value::Null,
+        };
+        let child_cache = resolve_prompt_cache_root(
+            "child-session",
+            Some("root-session"),
+            None,
+            Some(("root-session", &source)),
+        )
+        .unwrap();
+
+        assert_ne!("root-session", "child-session");
+        assert_eq!(root_cache, child_cache);
+        assert_eq!(child_cache, "root-session");
+    }
 
     #[test]
     fn builtin_tools_include_yield_poll_shell_session_tools() {
@@ -2454,6 +3745,8 @@ mod tests {
         FileReadUnderChild,
         /// Await a gate that tests never release — to be cancelled by interrupt.
         Block,
+        /// Fail the provider call before a normal result can be emitted.
+        Error(String),
     }
 
     #[derive(Clone, Default)]
@@ -2517,6 +3810,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or(MockTurn::Text("ok".into()));
             match script {
+                MockTurn::Error(message) => Err(anyhow::anyhow!(message)),
                 MockTurn::Block => {
                     self.shared.model_gate.notified().await;
                     unreachable!("gate is never released in tests");
@@ -2614,7 +3908,15 @@ mod tests {
             }
         }
         fn snapshot(&self) -> Value {
-            json!([])
+            Value::Array(
+                self.shared
+                    .pushed_users
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|text| json!({"role":"user","content":text}))
+                    .collect(),
+            )
         }
         fn restore(&mut self, _snapshot: Value) {}
         async fn compact(
@@ -2625,6 +3927,7 @@ mod tests {
             _opts: &TurnOpts,
         ) -> Result<Option<String>> {
             self.shared.compact_calls.fetch_add(1, Ordering::SeqCst);
+            self.shared.pushed_users.lock().unwrap().clear();
             Ok(Some("summary".into()))
         }
     }
@@ -2672,6 +3975,27 @@ mod tests {
 
         async fn call(&self, _input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
             bro_tools::ToolResult::Text("FILE-BODY".into())
+        }
+    }
+
+    struct CollaborationPolicyProbe;
+
+    #[async_trait]
+    impl bro_tools::Tool for CollaborationPolicyProbe {
+        fn name(&self) -> &str {
+            "spawn_agent"
+        }
+
+        fn description(&self) -> &str {
+            "test-only collaboration policy probe"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        async fn call(&self, _input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+            bro_tools::ToolResult::Text("available".into())
         }
     }
 
@@ -2725,6 +4049,7 @@ mod tests {
         };
         let todos = Arc::new(Mutex::new(bro_tools::TodoList::default()));
         let cx = ToolCx {
+            invocation_id: None,
             root: std::env::temp_dir(),
             safety: Arc::new(SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -2740,8 +4065,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let id = format!("bh-test-{}-{}", std::process::id(), nanos);
+        let (user_steer_wake, _user_steer_rx) = watch::channel(0u64);
         let session = Session {
             tx: Box::new(mock),
+            prompt_cache_root: id.clone(),
+            user_steer_wake,
             _services: HarnessSessionServices::standalone(),
             code_mode: crate::code_mode::CodeMode::Optional,
             output_schema: None,
@@ -2762,6 +4090,18 @@ mod tests {
             ),
             cx,
             reference_context_item: None,
+            world_state: Value::Null,
+            discover_project_instructions: false,
+            service_availability: crate::context::sections::ServiceAvailabilitySnapshot::default(),
+            service_policy_revision: None,
+            service_policy_allowed: None,
+            service_policy_availability: None,
+            context_window: Arc::new(crate::context::window::ContextWindowTracker::restore(
+                &Value::Null,
+                Some(200_000),
+            )),
+            shadow_lens_selector: None,
+            shadow_lens_selection: None,
             hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
             scoped_project_docs: crate::project_doc::ScopedProjectDocs::default(),
             strategy: crate::context::dispatch::CompositionStrategy::CodexShaped,
@@ -2786,6 +4126,7 @@ mod tests {
             store: SessionStore::open(Some(&id), None).unwrap(),
             event_log: Arc::new(EventLog::disabled()),
             prior_side: Value::Null,
+            mailbox_inbox: MailboxInbox::default(),
             todos,
             lsp_baselines: LspBaselines::default(),
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
@@ -2797,6 +4138,36 @@ mod tests {
             tail_nudge: None,
         };
         (session, shared)
+    }
+
+    fn mailbox_delivery(
+        sequence: u64,
+        wake: bool,
+        agent_id: &str,
+        canonical_target: &str,
+    ) -> AgentMailboxDelivery {
+        let recipient = AgentId::new(agent_id);
+        AgentMailboxDelivery {
+            delivery_id: format!("delivery-{agent_id}-{sequence}"),
+            target_agent_id: recipient.clone(),
+            canonical_target: canonical_target.to_string(),
+            session_id: bro_core::SessionId::new("test-session"),
+            through_sequence: sequence,
+            wake,
+            messages: vec![AgentMailboxMessage {
+                message_id: format!("message-{sequence}"),
+                sequence,
+                sender: Some(AgentId::new("agent-root")),
+                recipient,
+                kind: if wake {
+                    bro_protocol::AgentMailboxMessageKind::Followup
+                } else {
+                    bro_protocol::AgentMailboxMessageKind::Send
+                },
+                body: format!("mailbox body {sequence}"),
+                created_at_unix_ms: 100 + sequence,
+            }],
+        }
     }
 
     async fn run_user_turn(session: &mut Session, prompt: &str) {
@@ -2981,15 +4352,51 @@ mod tests {
         assert!(baseline.current_date.is_some());
     }
 
+    #[tokio::test]
+    async fn fork_handoff_captures_current_in_memory_history_before_turn_commit() {
+        let (mut session, _shared) = mk_session(vec![]);
+        session.push_user_text("current triggering turn");
+        let (_store_path, body) = session.fork_source_snapshot().unwrap();
+        let body_value: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            body_value["snapshot"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["role"] == "user" && item["content"] == "current triggering turn"
+                })
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "bro-harness-fork-handoff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("source.fork.json");
+        write_fork_source_snapshot((path.clone(), body))
+            .await
+            .unwrap();
+        assert!(path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
-    fn fresh_user_push_writes_reference_context_side_state() {
+    fn fresh_user_push_writes_world_state_side_state() {
         let (mut session, _shared) = mk_session(vec![]);
         session.push_user_text("hello");
 
         let side = session.side_state();
-        let persisted =
-            crate::context::TurnContextItem::from_side(&side["reference_context"]).unwrap();
+        let persisted = crate::context::TurnContextItem::from_side(
+            &side["world_state"]["sections"]["environment"],
+        )
+        .unwrap();
 
+        assert!(side.get("reference_context").is_none(), "{side}");
         assert_eq!(
             Some(&persisted),
             session.reference_context_item.as_ref(),
@@ -2998,7 +4405,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_reference_context_suppresses_emit_and_preserves_persisted_baseline() {
+    fn restored_world_state_and_retained_fragment_emit_only_the_real_delta() {
         let (mut session, shared) = mk_session(vec![]);
         let persisted = crate::context::TurnContextItem {
             cwd: "/persisted/baseline".into(),
@@ -3006,26 +4413,48 @@ mod tests {
             current_date: Some("2026-01-02".into()),
             timezone: Some("America/New_York".into()),
         };
-        session.reference_context_item =
-            reference_context_item_for_restore(true, Some(persisted.clone()), &session.cx);
+        session.world_state = json!({
+            "v": 1,
+            "sections": {"environment": persisted},
+        });
+        let retained =
+            crate::context::ContextualUserFragment::render(&crate::context::EnvironmentContext {
+                cwd: "/persisted/baseline".into(),
+                shell: Some("/bin/persisted-shell".into()),
+                current_date: Some("2026-01-02".into()),
+                timezone: Some("America/New_York".into()),
+            });
+        shared.pushed_users.lock().unwrap().push(retained.clone());
 
         session.push_user_text("resume turn");
 
         let pushed = shared.pushed_users.lock().unwrap();
-        assert_eq!(pushed.as_slice(), &["resume turn".to_string()]);
-        assert_eq!(session.reference_context_item, Some(persisted));
+        assert_eq!(pushed.len(), 3, "{pushed:?}");
+        assert_eq!(pushed[0], retained);
+        assert!(pushed[1].starts_with("<environment_context>"), "{pushed:?}");
+        assert!(
+            pushed[1].contains(&format!("<cwd>{}</cwd>", session.cx.root.display())),
+            "{pushed:?}"
+        );
+        assert!(!pushed[1].contains("<shell>"), "{pushed:?}");
+        assert_eq!(pushed[2], "resume turn");
     }
 
     #[test]
-    fn seeded_reference_context_suppresses_initial_context_emit() {
+    fn typed_world_state_without_retained_fragment_reinjects_context() {
         let (mut session, shared) = mk_session(vec![]);
         let env = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
-        session.reference_context_item = Some(env.to_turn_context_item());
+        session.world_state = json!({
+            "v": 1,
+            "sections": {"environment": env.to_turn_context_item()},
+        });
 
         session.push_user_text("resume turn");
 
         let pushed = shared.pushed_users.lock().unwrap();
-        assert_eq!(pushed.as_slice(), &["resume turn".to_string()]);
+        assert_eq!(pushed.len(), 2);
+        assert!(pushed[0].starts_with("<environment_context>"));
+        assert_eq!(pushed[1], "resume turn");
     }
 
     #[test]
@@ -3092,16 +4521,34 @@ mod tests {
     async fn cwd_change_emits_one_field_environment_delta_and_updates_baseline() {
         let (mut session, shared) = mk_session(vec![MockTurn::Text("ok".into())]);
         let current = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
-        session.reference_context_item = Some(crate::context::TurnContextItem {
+        let previous = crate::context::TurnContextItem {
             cwd: "/old/cwd".into(),
             shell: current.shell.clone(),
             current_date: current.current_date.clone(),
             timezone: current.timezone.clone(),
+        };
+        session.reference_context_item = Some(previous.clone());
+        session.world_state = json!({
+            "v": 1,
+            "sections": {"environment": previous},
         });
+        shared
+            .pushed_users
+            .lock()
+            .unwrap()
+            .push(crate::context::ContextualUserFragment::render(
+                &crate::context::EnvironmentContext {
+                    cwd: "/old/cwd".into(),
+                    shell: current.shell.clone(),
+                    current_date: current.current_date.clone(),
+                    timezone: current.timezone.clone(),
+                },
+            ));
+        let prior_len = shared.pushed_users.lock().unwrap().len();
 
         run_user_turn(&mut session, "turn").await;
 
-        let pushed = shared.pushed_users.lock().unwrap().clone();
+        let pushed = shared.pushed_users.lock().unwrap()[prior_len..].to_vec();
         assert_eq!(pushed.len(), 2, "{pushed:?}");
         let delta = &pushed[0];
         assert!(delta.starts_with("<environment_context>"), "{delta}");
@@ -3123,16 +4570,34 @@ mod tests {
     async fn shell_only_environment_change_emits_no_delta() {
         let (mut session, shared) = mk_session(vec![MockTurn::Text("ok".into())]);
         let current = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
-        session.reference_context_item = Some(crate::context::TurnContextItem {
+        let previous = crate::context::TurnContextItem {
             cwd: current.cwd.clone(),
             shell: Some("different-shell".into()),
             current_date: current.current_date.clone(),
             timezone: current.timezone.clone(),
+        };
+        session.reference_context_item = Some(previous.clone());
+        session.world_state = json!({
+            "v": 1,
+            "sections": {"environment": previous},
         });
+        shared
+            .pushed_users
+            .lock()
+            .unwrap()
+            .push(crate::context::ContextualUserFragment::render(
+                &crate::context::EnvironmentContext {
+                    cwd: current.cwd.clone(),
+                    shell: Some("different-shell".into()),
+                    current_date: current.current_date.clone(),
+                    timezone: current.timezone.clone(),
+                },
+            ));
+        let prior_len = shared.pushed_users.lock().unwrap().len();
 
         run_user_turn(&mut session, "turn").await;
 
-        let pushed = shared.pushed_users.lock().unwrap().clone();
+        let pushed = shared.pushed_users.lock().unwrap()[prior_len..].to_vec();
         assert_eq!(pushed, vec!["turn".to_string()]);
     }
 
@@ -3254,7 +4719,7 @@ mod tests {
         }
     }
 
-    fn ordered<'a>(haystack: &'a str, needles: &[&str]) {
+    fn ordered(haystack: &str, needles: &[&str]) {
         let mut last = 0usize;
         for needle in needles {
             let idx = haystack
@@ -3308,9 +4773,9 @@ mod tests {
             ],
         );
         assert_eq!(pushed[1], "hello");
-        // Baselines recorded for change/compaction re-emit.
-        assert!(session.dispatch.emitted_scope.is_some());
-        assert!(session.dispatch.emitted_pins.is_some());
+        // Baselines recorded in typed World State for change/compaction re-emit.
+        assert!(session.world_state["sections"]["dispatch"]["scope"].is_string());
+        assert!(session.world_state["sections"]["dispatch"]["pins"].is_string());
     }
 
     #[test]
@@ -3360,7 +4825,7 @@ mod tests {
         // emits nothing — the leading system block is not part of the
         // compacted buffer.
         session.reference_context_item = None;
-        session.prepare_context_for_user_turn();
+        session.prepare_context_for_user_turn().unwrap();
         let pushed = shared.pushed_users.lock().unwrap();
         assert_eq!(*pushed, vec!["turn one".to_string()]);
         assert!(
@@ -3377,13 +4842,13 @@ mod tests {
         assert_eq!(shared.pushed_users.lock().unwrap().len(), 2);
 
         // Same scope on the next turn ⇒ nothing re-emitted.
-        session.prepare_context_for_user_turn();
+        session.prepare_context_for_user_turn().unwrap();
         assert_eq!(shared.pushed_users.lock().unwrap().len(), 2);
 
         // A resume re-passing a CHANGED scope ⇒ one short fragment, baseline
         // advanced. Pins unchanged ⇒ not re-emitted.
         session.dispatch.context.as_mut().unwrap().scope = Some(test_scope("task-2"));
-        session.prepare_context_for_user_turn();
+        session.prepare_context_for_user_turn().unwrap();
         {
             let pushed = shared.pushed_users.lock().unwrap();
             assert_eq!(pushed.len(), 3);
@@ -3393,7 +4858,7 @@ mod tests {
         }
 
         // And it converges: same scope again ⇒ silent.
-        session.prepare_context_for_user_turn();
+        session.prepare_context_for_user_turn().unwrap();
         assert_eq!(shared.pushed_users.lock().unwrap().len(), 3);
     }
 
@@ -3433,7 +4898,8 @@ mod tests {
         // the deterministic re-emit renders the CURRENT in-memory context.
         session.dispatch.context.as_mut().unwrap().scope = Some(test_scope("task-9"));
         session.reference_context_item = None;
-        session.prepare_context_for_user_turn();
+        shared.pushed_users.lock().unwrap().clear();
+        session.prepare_context_for_user_turn().unwrap();
 
         let pushed = shared.pushed_users.lock().unwrap();
         let re_emitted = pushed.last().unwrap();
@@ -3510,6 +4976,423 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_send_is_durable_without_waking_and_deduplicates_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let snapshot_path = root.join("sessions").join("session.json");
+        let delivery = mailbox_delivery(1, false, "agent-child", "/root/child");
+        let (mut session, shared) = mk_session(vec![]);
+        session.store = SessionStore::at_path_for_test(snapshot_path.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::AgentMailbox {
+            delivery: delivery.clone(),
+            command_id: "mailbox-command-1".into(),
+        })
+        .unwrap();
+
+        session_loop_until_idle(
+            &mut session,
+            rx,
+            &Emitter::new("ctrl".into()),
+            VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(shared.started.load(Ordering::SeqCst), 0);
+        let snapshot: Value =
+            serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
+        let restored = MailboxInbox::from_side(&snapshot["side"]["agent_mailbox"]).unwrap();
+        assert_eq!(restored.through_sequence, 1);
+        assert_eq!(restored.pending.len(), 1);
+
+        let (mut resumed, resumed_shared) = mk_session(vec![MockTurn::Text("done".into())]);
+        resumed.store = SessionStore::at_path_for_test(snapshot_path.clone());
+        resumed.mailbox_inbox = restored;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::AgentMailbox {
+            delivery: delivery.clone(),
+            command_id: "mailbox-command-replay".into(),
+        })
+        .unwrap();
+        tx.send(Input::User("process queued context".into()))
+            .unwrap();
+
+        session_loop_until_idle(
+            &mut resumed,
+            rx,
+            &Emitter::new("ctrl".into()),
+            VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(resumed_shared.started.load(Ordering::SeqCst), 1);
+        let users = resumed_shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(
+            users
+                .iter()
+                .filter(|text| text.contains("<agent_mailbox_message>"))
+                .count(),
+            1
+        );
+        assert!(users.iter().any(|text| text.contains("mailbox body 1")));
+        assert_eq!(resumed.mailbox_inbox.through_sequence, 1);
+        assert!(resumed.mailbox_inbox.pending.is_empty());
+
+        let snapshot: Value =
+            serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
+        let restored = MailboxInbox::from_side(&snapshot["side"]["agent_mailbox"]).unwrap();
+        let (mut replayed, replayed_shared) = mk_session(vec![]);
+        replayed.store = SessionStore::at_path_for_test(snapshot_path);
+        replayed.mailbox_inbox = restored;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::AgentMailbox {
+            delivery,
+            command_id: "mailbox-command-late-replay".into(),
+        })
+        .unwrap();
+
+        session_loop_until_idle(
+            &mut replayed,
+            rx,
+            &Emitter::new("ctrl".into()),
+            VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        assert_eq!(replayed_shared.started.load(Ordering::SeqCst), 0);
+        assert!(replayed.mailbox_inbox.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_followup_wakes_once_and_injects_typed_mailbox_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let snapshot_path = root.join("sessions").join("session.json");
+        let delivery = mailbox_delivery(1, true, "agent-child", "/root/child");
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
+        session.store = SessionStore::at_path_for_test(snapshot_path);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::AgentMailbox {
+            delivery: delivery.clone(),
+            command_id: "followup-command-1".into(),
+        })
+        .unwrap();
+
+        session_loop_until_idle(
+            &mut session,
+            rx,
+            &Emitter::new("ctrl".into()),
+            VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(shared.started.load(Ordering::SeqCst), 1);
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert!(users.iter().any(|text| text.contains("mailbox body 1")));
+        assert!(users.iter().any(|text| text == MAILBOX_WAKE_PROMPT));
+        assert!(session.mailbox_inbox.pending.is_empty());
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::AgentMailbox {
+            delivery,
+            command_id: "followup-command-replay".into(),
+        })
+        .unwrap();
+        session_loop_until_idle(
+            &mut session,
+            rx,
+            &Emitter::new("ctrl".into()),
+            VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        assert_eq!(shared.started.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mailbox_inbox_fails_closed_on_cursor_gap_and_cross_target_delivery() {
+        let mut inbox = MailboxInbox::default();
+        let gap = mailbox_delivery(2, false, "agent-child", "/root/child");
+        assert!(
+            inbox
+                .admit(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("cursor gap")
+        );
+
+        inbox
+            .admit(&mailbox_delivery(1, false, "agent-child", "/root/child"))
+            .unwrap();
+        let escaped = mailbox_delivery(2, false, "agent-sibling", "/root/sibling");
+        assert!(
+            inbox
+                .admit(&escaped)
+                .unwrap_err()
+                .to_string()
+                .contains("escaped the bound target")
+        );
+    }
+
+    #[test]
+    fn service_policy_reconciles_outage_revocation_restore_and_world_state() {
+        let (mut session, _) = mk_session(vec![]);
+        session.reg = Registry::new(
+            vec![Arc::new(CollaborationPolicyProbe)],
+            vec![],
+            &PinPolicy::from_env(),
+            &mcp::ToolFilter::default(),
+        );
+        let agent_capability = crate::worker::capability_rpc::CAPABILITY_AGENT.to_string();
+        let revision_one = PolicyIdentity {
+            version: 1,
+            digest: "sha256:policy-1".into(),
+        };
+        session
+            .apply_service_policy(ServicePolicyUpdate {
+                revision: revision_one.clone(),
+                allowed_capabilities: BTreeSet::from([agent_capability.clone()]),
+                downstream_availability: DownstreamServiceAvailability {
+                    blackops: ServiceAvailability::Available,
+                    corpus: ServiceAvailability::Available,
+                },
+                connected: true,
+            })
+            .unwrap();
+        assert!(session.service_availability.collaboration);
+        session.render_world_state().unwrap();
+        assert_eq!(
+            session.world_state["sections"]["service_availability"]["collaboration"],
+            true
+        );
+
+        session
+            .apply_service_policy(ServicePolicyUpdate {
+                revision: revision_one.clone(),
+                allowed_capabilities: BTreeSet::from([agent_capability.clone()]),
+                downstream_availability: DownstreamServiceAvailability {
+                    blackops: ServiceAvailability::Available,
+                    corpus: ServiceAvailability::Available,
+                },
+                connected: false,
+            })
+            .unwrap();
+        assert!(!session.service_availability.collaboration);
+        session
+            .apply_service_policy(ServicePolicyUpdate {
+                revision: revision_one.clone(),
+                allowed_capabilities: BTreeSet::from([agent_capability.clone()]),
+                downstream_availability: DownstreamServiceAvailability {
+                    blackops: ServiceAvailability::Available,
+                    corpus: ServiceAvailability::Available,
+                },
+                connected: true,
+            })
+            .unwrap();
+        assert!(session.service_availability.collaboration);
+        assert!(session.reg.contains("spawn_agent"));
+
+        session
+            .apply_service_policy(ServicePolicyUpdate {
+                revision: PolicyIdentity {
+                    version: 2,
+                    digest: "sha256:policy-2".into(),
+                },
+                allowed_capabilities: BTreeSet::from([agent_capability.clone()]),
+                downstream_availability: DownstreamServiceAvailability {
+                    blackops: ServiceAvailability::Unavailable,
+                    corpus: ServiceAvailability::Available,
+                },
+                connected: true,
+            })
+            .unwrap();
+        assert!(!session.service_availability.collaboration);
+        assert!(!session.reg.contains("spawn_agent"));
+        session.render_world_state().unwrap();
+        assert_eq!(
+            session.world_state["sections"]["service_availability"]["collaboration"],
+            false
+        );
+
+        session
+            .apply_service_policy(ServicePolicyUpdate {
+                revision: PolicyIdentity {
+                    version: 3,
+                    digest: "sha256:policy-3".into(),
+                },
+                allowed_capabilities: BTreeSet::from([agent_capability]),
+                downstream_availability: DownstreamServiceAvailability {
+                    blackops: ServiceAvailability::Available,
+                    corpus: ServiceAvailability::Available,
+                },
+                connected: true,
+            })
+            .unwrap();
+        assert!(session.service_availability.collaboration);
+        assert!(session.reg.contains("spawn_agent"));
+        session.render_world_state().unwrap();
+        assert_eq!(
+            session.world_state["sections"]["service_availability"]["collaboration"],
+            true
+        );
+
+        let corpus_capability = crate::worker::capability_rpc::CAPABILITY_CORPUS.to_string();
+        session
+            .apply_service_policy(ServicePolicyUpdate {
+                revision: PolicyIdentity {
+                    version: 4,
+                    digest: "sha256:policy-4".into(),
+                },
+                allowed_capabilities: BTreeSet::from([corpus_capability.clone()]),
+                downstream_availability: DownstreamServiceAvailability {
+                    blackops: ServiceAvailability::Available,
+                    corpus: ServiceAvailability::Available,
+                },
+                connected: true,
+            })
+            .unwrap();
+        assert!(session.service_availability.corpus);
+        assert!(!session.service_availability.collaboration);
+        assert!(
+            session
+                .apply_service_policy(ServicePolicyUpdate {
+                    revision: PolicyIdentity {
+                        version: 4,
+                        digest: "sha256:policy-4".into(),
+                    },
+                    allowed_capabilities: BTreeSet::new(),
+                    downstream_availability: DownstreamServiceAvailability {
+                        blackops: ServiceAvailability::Available,
+                        corpus: ServiceAvailability::Available,
+                    },
+                    connected: true,
+                })
+                .is_err()
+        );
+        assert!(
+            session
+                .apply_service_policy(ServicePolicyUpdate {
+                    revision: PolicyIdentity {
+                        version: 6,
+                        digest: "sha256:policy-6".into(),
+                    },
+                    allowed_capabilities: BTreeSet::from([corpus_capability]),
+                    downstream_availability: DownstreamServiceAvailability {
+                        blackops: ServiceAvailability::Available,
+                        corpus: ServiceAvailability::Available,
+                    },
+                    connected: true,
+                })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_marker_follows_a_durable_snapshot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let snapshot_path = root.join("sessions").join("session.json");
+        let log = Arc::new(EventLog::at_path(root.join("session.events.jsonl")));
+        let (mut session, _shared) = mk_session(vec![]);
+        session.store = SessionStore::at_path_for_test(snapshot_path.clone());
+        session.event_log = log.clone();
+        session.emitter = Emitter::new("test".into()).with_event_log(log.clone());
+
+        persist_session_snapshot(&mut session).await.unwrap();
+        log.flush_blocking_result().unwrap();
+
+        let snapshot: Value =
+            serde_json::from_str(&std::fs::read_to_string(snapshot_path).unwrap()).unwrap();
+        assert_eq!(snapshot["transport"], "mock");
+        let events: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.iter().any(|event| {
+            event["event"]["type"] == "harness_milestone"
+                && event["event"]["milestone"] == "session_snapshot_committed"
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_session_snapshot_write_emits_no_committed_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, "block snapshot parent creation").unwrap();
+        let log = Arc::new(EventLog::at_path(root.join("session.events.jsonl")));
+        let (mut session, _shared) = mk_session(vec![]);
+        session.store =
+            SessionStore::at_path_for_test(blocker.join("sessions").join("session.json"));
+        session.event_log = log.clone();
+        session.emitter = Emitter::new("test".into()).with_event_log(log.clone());
+
+        let error = persist_session_snapshot(&mut session).await.unwrap_err();
+
+        assert!(error.to_string().contains("write session snapshot"));
+        assert!(
+            !log.path().exists(),
+            "a failed snapshot write must not enqueue its committed marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_worker_turn_error_emits_result_before_snapshot_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = Arc::new(EventLog::at_path(root.join("session.events.jsonl")));
+        let (mut session, _shared) = mk_session(vec![MockTurn::Error("provider failed".into())]);
+        session.store = SessionStore::at_path_for_test(root.join("sessions").join("session.json"));
+        session.event_log = log.clone();
+        session.emitter = Emitter::new("test".into()).with_event_log(log.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::TrackedUser {
+            text: "fail this turn".into(),
+            command_id: "command-1".into(),
+            kind: TrackedUserKind::Turn,
+        })
+        .unwrap();
+        drop(tx);
+
+        session_loop(
+            &mut session,
+            rx,
+            &Emitter::new("ctrl".into()),
+            VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        log.flush_blocking_result().unwrap();
+
+        let events: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["event"].clone())
+            .collect();
+        let result_index = events
+            .iter()
+            .position(|event| event["type"] == "result" && event["is_error"] == true)
+            .expect("failed turn must emit an error result");
+        let snapshot_index = events
+            .iter()
+            .position(|event| {
+                event["type"] == "harness_milestone"
+                    && event["milestone"] == "session_snapshot_committed"
+            })
+            .expect("failed turn must still commit its resume snapshot");
+        assert!(result_index < snapshot_index);
+    }
+
+    #[tokio::test]
     async fn exit_when_idle_waits_for_delayed_first_stdin_turn() {
         let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3525,7 +5408,8 @@ mod tests {
             await_first_controlled_input(&mut session, &mut rx, &ctrl, &mut pending),
         )
         .await
-        .expect("worker must wait for the daemon's first stdin message");
+        .expect("worker must wait for the daemon's first stdin message")
+        .unwrap();
         writer.await.unwrap();
         assert_eq!(pending.front().map(String::as_str), Some("delayed prompt"));
 
@@ -3899,7 +5783,11 @@ mod tests {
         let (mut session, _shared) = mk_session(vec![]);
         session.cx.root = root.clone();
         session.lsp_pool = bro_lsp::SessionPool::new(bro_lsp::LspConfig {
-            ready_timeout: std::time::Duration::from_secs(5),
+            // A full package run may start other language fixtures at the same
+            // time. Keep this real-RA proof bounded, but do not turn ordinary
+            // backend scheduling contention into a diagnostics regression.
+            ready_timeout: std::time::Duration::from_secs(30),
+            request_timeout: std::time::Duration::from_secs(60),
             rust_analyzer_bin: Some(ra),
             ..Default::default()
         });

@@ -994,11 +994,11 @@ plus admin shortcuts (`/admin/brofile/upsert`, `/admin/team/upsert`)
 for install scripts that can't easily speak rmcp's streamable-HTTP
 transport.
 
-The admin endpoints are loopback-only by default (`BBOX_BIND=127.0.0.1`).
-Set `BBOX_BIND=0.0.0.0` if you need a Docker container on the same
-host (Forgejo/Gitea webhook → `http://172.17.0.1:7264/webhook/...`).
-**Closed-network assumption applies in 0.0.0.0 mode.** The dev daemon
-template ships at `0.0.0.0`; prod stays at loopback.
+The compatibility admin endpoints are loopback-only
+(`BBOX_BIND=127.0.0.1`) and require the shared service bearer. Corpus mode does
+not mount them. Keep the daemon on loopback; container ingress belongs behind a
+trusted same-host adapter or authenticated reverse proxy rather than a wildcard
+daemon bind. The shipped dev template is loopback-only too.
 
 ## Audit and observability
 

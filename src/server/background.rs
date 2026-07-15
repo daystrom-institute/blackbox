@@ -1,5 +1,5 @@
 use super::restore::restore_runtime_state;
-use super::{SharedState, dispatch_routed_event, spawn_edge_index_rebuild_watcher};
+use super::{RuntimeRole, SharedState, dispatch_routed_event, spawn_edge_index_rebuild_watcher};
 use crate::packets::ScannerConfig;
 use crate::server::routes::signal_arc_dispatch;
 use crate::server::runtime_metrics::spawn_runtime_metrics_sampler;
@@ -11,25 +11,35 @@ use crate::tools::bro_helpers::tier0_cosine_threshold_from_env;
 use crate::{embed, embed_queue, orchestration, util, vectors, watcher};
 use std::sync::Arc;
 
-pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::Result<()> {
-    install_badgey_adapter(&shared);
-    configure_dispatch_path_env();
-    restore_badgey_registry_from_notes(&shared);
-    recover_badgey_non_terminal_state(&shared);
+pub(super) async fn start_background_tasks(
+    shared: Arc<SharedState>,
+    role: RuntimeRole,
+) -> anyhow::Result<()> {
     configure_embed_queue(&shared);
     spawn_vector_warmup_thread()?;
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
     spawn_storage_gc(shared.clone());
     spawn_runtime_metrics_sampler();
-    spawn_task_completed_router(shared.clone());
-    spawn_system_event_signal_bridge(shared.clone());
     start_bbox_watcher(&shared);
-    restore_runtime_state(&shared).await;
-    compact_system_events(&shared);
-    spawn_outbox_worker(shared.clone());
-    spawn_account_probe_refresh(shared.clone());
     crate::embed_runtime::spawn_embed_residue_sweeper(shared.clone());
-    spawn_packet_self_heal_scanner(shared);
+    if role == RuntimeRole::Compatibility {
+        compact_system_events(&shared);
+        super::worker_rpc::start_worker_rpc(shared.clone())?;
+        install_badgey_adapter(&shared);
+        configure_dispatch_path_env();
+        restore_badgey_registry_from_notes(&shared);
+        recover_badgey_non_terminal_state(&shared);
+        spawn_task_completed_router(shared.clone());
+        spawn_system_event_signal_bridge(shared.clone());
+        restore_runtime_state(&shared).await;
+        spawn_outbox_worker(shared.clone());
+        spawn_account_probe_refresh(shared.clone());
+        spawn_packet_self_heal_scanner(shared);
+    } else {
+        tracing::info!(
+            "blackboxd corpus role active; legacy worker, task, workflow, atom, and provider-probe owners are disabled"
+        );
+    }
     Ok(())
 }
 

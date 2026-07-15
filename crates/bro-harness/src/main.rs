@@ -19,6 +19,13 @@ async fn main() {
         .init();
 
     let cli = bro_harness::cli::Cli::parse();
+    if cli.worker {
+        if let Err(e) = bro_harness::worker::run_worker(cli).await {
+            tracing::error!("worker failed: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if cli.worker_probe {
         if let Err(e) = bro_harness::worker::run_probe(&cli).await {
             tracing::error!("worker probe failed: {e:#}");

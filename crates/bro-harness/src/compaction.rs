@@ -152,6 +152,13 @@ impl CompactionPolicy {
         Some((window as f64 * ratio) as u64)
     }
 
+    /// Configured context-window capacity for model-facing remaining-token
+    /// reporting. This remains available when automatic compaction is off.
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        let (window, _) = self.resolve(model);
+        (window > 0).then_some(window)
+    }
+
     /// Bundle the per-pass tuning knobs for `Transport::compact`.
     pub fn params(&self) -> crate::transport::CompactionParams {
         crate::transport::CompactionParams {

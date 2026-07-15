@@ -193,7 +193,8 @@ connection:
 
 ```text
 CapabilityRequest {
-  call_id,
+  call_id,        // ephemeral request/response correlation
+  invocation_id?, // stable originating provider tool-call identity
   capability,
   operation,
   bounded_payload,
@@ -205,6 +206,14 @@ CapabilityResponse {
   result_or_error
 }
 ```
+
+`invocation_id` and `call_id` are deliberately different lanes. Reconnect or
+an ambiguous lost response may replay one provider tool invocation through a
+new RPC request, so effectful agent and atom operations derive idempotency only
+from the stable invocation identity. A legacy request without it may use
+`call_id` for compatibility, but the worker's model-facing path always sends
+it. Flat tools use the provider call ID directly. A nested code-mode call uses
+the outer `exec` call ID plus its deterministic cell-runtime call ordinal.
 
 fleetd binds each connection to a policy envelope and ignores any caller-
 supplied attempt to select another root session, worktree, provider identity, or
@@ -226,7 +235,8 @@ Routing is explicit:
 
 Capability calls are bounded and cancelable. Connection loss fails outstanding
 calls with a typed unavailable cause. Only operations explicitly defined as
-idempotent may be retried automatically.
+idempotent may be retried automatically, and retries preserve `invocation_id`
+while minting a fresh `call_id`.
 
 ## 7. Lease and reconnect state machine
 

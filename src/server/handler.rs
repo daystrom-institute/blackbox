@@ -91,7 +91,14 @@ impl BlackboxServer {
 impl ServerHandler for BlackboxServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Blackbox: unified transcript search, knowledge management, and multi-provider agent orchestration")
+            .with_instructions(match self.runtime_role {
+                server::RuntimeRole::Corpus => {
+                    "Blackbox corpus: transcript and code search, knowledge, evidence, and retained records"
+                }
+                server::RuntimeRole::Compatibility => {
+                    "Blackbox compatibility runtime: corpus plus legacy orchestration during migration"
+                }
+            })
     }
 
     async fn initialize(

@@ -4,6 +4,8 @@
 //!
 //! Skips (like bro-lsp's rust_analyzer test) when rust-analyzer is absent.
 
+#![allow(clippy::disallowed_methods)] // Integration fixture owns its temporary workspace.
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -69,6 +71,7 @@ async fn cell_renames_cross_file_via_lsp_authority() -> anyhow::Result<()> {
     )?;
 
     let cx = ToolCx {
+        invocation_id: Some(Arc::from("test-lsp-cell-call")),
         root: root.clone(),
         safety: Arc::new(bro_tools::SafetyPolicy::new()),
         http: reqwest::Client::new(),

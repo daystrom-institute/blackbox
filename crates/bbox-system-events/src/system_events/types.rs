@@ -155,6 +155,9 @@ impl JournalEnvelope {
 
 // Not `#[cfg(test)]` gated: consumer-crate tests build events with this
 // helper while this crate compiles as a normal dependency (cfg(test) false).
+// The arguments mirror the stable SystemEvent envelope fields, keeping test
+// call sites explicit when they construct cross-crate fixtures.
+#[allow(clippy::too_many_arguments)]
 pub fn make_event(
     kind: SystemEventKind,
     producer: &str,

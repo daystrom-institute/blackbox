@@ -11,9 +11,9 @@ out months of accumulated knowledge.
 
 ### Protect - cannot be reconstructed
 
-These files are the durable state blackbox accumulates over time. Back
-them up, version them, and replicate them to wherever your next machine
-will run.
+These files are the durable state blackbox accumulates over time. Back them up
+in an encrypted, access-controlled system and replicate them to wherever your
+next machine will run. Do not commit tokens or credentials to source control.
 
 | Path | Contents | Size (typical) |
 |---|---|---|
@@ -25,7 +25,10 @@ will run.
 | `~/.local/state/blackbox/projects.json` | Registered project roots and their IDs | small |
 | `~/.local/state/blackbox/packets/` | Compiled rule packets (packet JSON + audit examples) | varies |
 | `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed workflows, agents, brofiles) | varies |
-| `~/.local/state/blackbox/bro/` | **The entire bro directory** - see breakdown below | varies |
+| `~/.local/state/blackbox/bro/` | Client/catalog data plus legacy compatibility authority state; preserve during migration | varies |
+| `~/.local/state/blackbox/blackopsd/` | Operational definitions, logical agents, mailboxes, workflow runs, schedules, waits, approvals, integration intents, and outboxes | varies |
+| `~/.local/state/blackbox/fleetd/` | Attempts, leases, worker metadata and logs, commands, record outbox, and worktree ownership | varies |
+| `~/.local/state/blackbox/service.token` | Owner-only bearer shared by trusted clients and peer daemons | 65 bytes |
 | `~/.bro/slack-identities.json` | Slack user identity mappings | small |
 
 The `bro/` subtree in detail:
@@ -64,15 +67,18 @@ repos. Don't waste backup space on them.
 
 ```
 ~/.local/bin/blackboxd
-~/.local/bin/blackboxd-dev
+~/.local/bin/blackbox-corpusd
+~/.local/bin/fleetd
+~/.local/bin/blackopsd
 ~/.local/bin/bro
+~/.local/bin/bro-harness
 ```
 
-Built from source: `cargo build --release && install -m 755 target/release/{blackboxd,bro} ~/.local/bin/ && install -d ~/.local/share/blackbox/memories && cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/`.
+Built from source: `cargo build --release --workspace && install -m 755 target/release/{blackboxd,blackbox-corpusd,fleetd,blackopsd,bro,bro-harness} ~/.local/bin/ && install -d ~/.local/share/blackbox/memories && cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/`.
 
 ## Configuration
 
-### API keys
+### Credentials by owner
 
 Blackbox uses Voyage AI for embeddings. The daemon needs the key in its
 environment - not in a config file, not hardcoded.
@@ -91,7 +97,7 @@ systemctl --user daemon-reload
 systemctl --user restart blackbox.service
 ```
 
-Same pattern for the dev unit:
+Use the same pattern for the dev corpus unit:
 
 ```ini
 # ~/.config/systemd/user/blackbox-dev.service.d/secrets.conf
@@ -99,16 +105,29 @@ Same pattern for the dev unit:
 Environment=DAYSTROM_VOYAGE_API_KEY=pa-...
 ```
 
-For provider-credential env vars needed by arc executors (e.g.
-`FORGEJO_TOKEN` for the Keystone example):
+LLM provider credentials belong to fleetd. fleetd reads standard provider
+homes or an owner-only `FLEETD_PROVIDER_CONFIG`, and projects only the selected
+lane into a sandboxed worker. If an account uses an environment credential,
+put it in a fleetd drop-in, not a blackboxd drop-in:
 
 ```ini
-# ~/.config/systemd/user/blackbox-dev.service.d/keystone.conf
+# ~/.config/systemd/user/fleetd.service.d/providers.conf
 [Service]
-Environment=FORGEJO_BASE_URL=http://localhost:3000
-Environment=FORGEJO_TOKEN=...
-Environment=FORGEJO_WEBHOOK_SECRET=...
+Environment=MISTRAL_API_KEY=...
 ```
+
+Integration and publish credentials belong to blackopsd or to the dedicated
+secret resolver used by its installed integration adapter:
+
+```ini
+# ~/.config/systemd/user/blackopsd.service.d/integrations.conf
+[Service]
+Environment=INTEGRATION_TOKEN=...
+```
+
+Do not put provider credentials in blackboxd, integration credentials in a
+harness worker, or any of these secrets in `fleet.json`, rendered provider
+memory, URLs, or committed service files.
 
 ### Embedding provider config
 
@@ -142,11 +161,91 @@ pdf_figure = "voyage_visual"
 
 See `docs/index-embedding-internals.md` (Visual routes) for details.
 
-### Port
+### Ports
 
-Default port: `7264` (HTTP MCP + `/tail` + `/roster`). Override with
-`BBOX_PORT` environment variable. Port `7263` is retired (old `bro.service`)
-- avoid it.
+| Service | Default | Override |
+|---|---:|---|
+| blackboxd corpus MCP/FDR | 7264 | `BBOX_PORT` |
+| fleetd live execution/control | 7265 | `FLEETD_BIND` |
+| blackopsd operational intent | 7266 | `BLACKOPSD_BIND` |
+| isolated blackboxd-dev sample | 7274 | dev `config.toml` |
+
+Port `7263` is retired. The previous blackboxd-dev default of 7265 is also
+retired because 7265 now belongs to fleetd.
+
+### Worker authority sandbox
+
+Authority-mode fleetd launches every `bro-harness` inside a mandatory inherited
+OS sandbox. This is a service-authority boundary, not an environment-variable
+claim. Neither the token contents nor its filesystem path enters the worker
+environment, harness arguments, or worker protocol. fleetd supplies the
+canonical token path only to the trusted sandbox launcher; the inherited policy
+prevents workers and all descendants from reading, writing, linking, or
+replacing that path. It also denies the canonical blackopsd state/catalog and
+corpus state/index roots, blocks direct connections to the loopback ports owned
+by blackboxd, fleetd, and blackopsd, and blocks cross-sandbox process inspection
+or signals on macOS. Provider egress, repository writes, worker journals, and
+the private fleet Unix socket remain available.
+
+When a peer service uses nondefault storage, set the matching
+`FLEETD_BLACKOPSD_STATE_DIR`, `FLEETD_BLACKOPSD_CATALOG_DIR`,
+`FLEETD_CORPUS_STATE_DIR`, or `FLEETD_CORPUS_INDEX_DIR` value in fleetd as
+well. fleetd canonicalizes these roots before launch and fails closed on
+symlinks, unsafe overlap with its own state, or provider configuration that
+tries to replace fleet-owned `BRO_HOME`, provider, scrub-manifest, or sandbox
+variables. The Linux launcher receives each root as a repeated
+`--protected-service-root PATH` argument.
+
+macOS uses the system `/usr/bin/sandbox-exec` with a fleetd-generated Seatbelt
+profile and needs no additional launcher. fleetd probes the policy at startup
+and refuses authority mode if it cannot be applied.
+
+Linux requires a root-installed launcher:
+
+```ini
+Environment=FLEETD_WORKER_SANDBOX_LAUNCHER=/usr/local/libexec/blackbox-worker-sandbox
+```
+
+The sample `deploy/fleetd.service` sets that path. Install a root-owned,
+executable, group/other-nonwritable implementation before enabling the service.
+Every directory in the launcher's absolute path must also be root-owned and not
+writable by group or other.
+It must implement the `blackbox-worker-sandbox-v1` self-test and launch protocol
+in `design/bro-harness/leaf-sandbox-isolation.md`. Missing or failed enforcement
+stops fleetd; there is no unsandboxed fallback. Do not point this setting at a
+general command runner such as `sh`, `env`, or `systemd-run` without a dedicated
+root-owned policy wrapper.
+
+The repository does not ship this privileged Linux launcher. Linux authority
+mode is therefore unavailable until the operator supplies a conforming
+implementation. Starting the sample fleetd unit before then is expected to
+fail closed.
+
+### Live downstream policy and replay identity
+
+fleetd monitors blackops and corpus readiness while a worker remains connected.
+Availability changes travel as monotonic policy revisions over that same worker
+socket. bro-harness installs each revision at a safe session boundary, updates
+the service-availability World State section, and revokes or restores affected
+tools. Operators do not need to reconnect a healthy worker to clear stale tool
+authority after an outage or recovery.
+
+Provider invocation identity is durable and separate from the RPC `call_id`
+used to correlate one capability request and response. The provider identity is
+preserved through nested code-mode calls and retries, so a response lost after
+commit can be replayed under a fresh RPC ID without creating a second logical
+blackops operation or fleet effect.
+
+### Blackops catalog startup
+
+blackopsd embeds the exact shipped atom, brofile, and workflow sources at build
+time, then imports those sources together with the installed catalog during
+startup. The catalog backend is semantic authority: profile, workflow,
+deterministic, adapter, and consultant atoms retain their distinct execution
+paths. Input/output schemas and effects, composition, and trace metadata remain
+attached to the operational definition. Invalid schemas, missing references,
+or unsupported backend contracts fail closed instead of degrading to a generic
+model prompt.
 
 ### Daemon variants
 
@@ -156,11 +255,14 @@ a dev build swap doesn't touch the running prod service:
 | Service | Binary | Port |
 |---|---|---|
 | `blackbox.service` | `~/.local/bin/blackboxd` | 7264 |
-| `blackbox-dev.service` | `~/.local/bin/blackboxd-dev` | 7265 (or override) |
+| `fleetd.service` | `~/.local/bin/fleetd` | 7265 |
+| `blackopsd.service` | `~/.local/bin/blackopsd` | 7266 |
+| `blackbox-dev.service` | `~/.local/bin/blackboxd-dev` | 7274 (or override) |
 
-Upgrade pattern: build, `install` both binary names atomically (unlink +
-write), restart only the service you changed. Running process keeps the
-old inode until systemd restarts it.
+Upgrade pattern: build, install each changed binary to a sibling temporary path,
+sign and verify it there, then rename it over the installed path and restart only
+the service that owns it. A running process keeps the old inode until its service
+restarts.
 
 ## Full on-disk layout
 
@@ -169,7 +271,11 @@ old inode until systemd restarts it.
 ├── bin/
 │   ├── blackboxd               # prod daemon binary
 │   ├── blackboxd-dev           # dev daemon binary
-│   └── bro                     # terminal TUI client
+│   ├── blackbox-corpusd        # dependency-clean internal corpus boundary
+│   ├── blackopsd               # operational-intent service
+│   ├── fleetd                  # live execution service
+│   ├── bro-harness             # per-session worker
+│   └── bro                     # thin terminal client/TUI
 ├── share/blackbox/
 │   ├── index/                  # Tantivy index + schema_version.txt  ← REBUILD
 │   └── memories/               # Shipped system memories and runbooks ← REBUILD
@@ -195,6 +301,9 @@ old inode until systemd restarts it.
     │   ├── slack-channel-bindings.json
     │   ├── slack-proposal-links.json
     │   └── tasks.json
+    ├── blackopsd/               ← PROTECT (intent, agents, mailboxes, outboxes)
+    ├── fleetd/                  ← PROTECT (attempts, leases, worktree ownership)
+    ├── service.token            ← PROTECT (same-host daemon bearer, mode 0600)
     ├── vectors/                 ← REBUILD (bbox_reembed per route)
     ├── edges/                   ← REBUILD (EdgeIndex auto-rebuild)
     ├── git_meta/                ← REBUILD (next reindex)
@@ -203,6 +312,8 @@ old inode until systemd restarts it.
 
 ~/.config/systemd/user/
 ├── blackbox.service
+├── blackopsd.service
+├── fleetd.service
 ├── blackbox.service.d/
 │   └── secrets.conf            ← PROTECT (API keys)
 ├── blackbox-dev.service
@@ -235,23 +346,30 @@ bbox_embed_status()                      # confirm no embedding errors
 ### After a daemon upgrade (no schema change)
 
 ```bash
-cargo build --release
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-install -m 755 target/release/bro ~/.local/bin/bro
+cargo build --release --workspace
 install -d ~/.local/share/blackbox/memories
 cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
-systemctl --user restart blackbox.service blackbox-dev.service
-system-defaults/maintenance/scripts/install-maintenance.sh   # (re)schedule maintenance arcs
 ```
 
-The maintenance script is idempotent and is what keeps storage GC and
-nightly embed compaction actually scheduled — a workflow installed without
-its cron silently never runs (`bbox_inbox` flags this as "Cron scheduling
-gaps"). See `system-defaults/maintenance/maintenance-defaults.md`.
+Install only changed binaries, then restart by owner:
 
-Watch the journal for `auto-reindex: indexed N files` - if the schema
-version changed, the index will drop and rebuild (~5–7 min for 1M docs).
+| Changed artifact | Restart action |
+|---|---|
+| blackboxd, corpus, index, embed | Restart `blackbox.service` |
+| blackopsd, blackops-core, embedded operational catalog | Restart `blackopsd.service` |
+| fleetd, fleet-core, fleet control | Restart `fleetd.service`; workers reconnect |
+| bro-harness, providers, V8, local tools | Replace `bro-harness`; existing workers keep their build and new workers use the replacement |
+| bro CLI or Fleet TUI | Replace and restart only the client |
+
+Do not run `system-defaults/maintenance/scripts/install-maintenance.sh` against
+the default differentiated topology. That installer targets the legacy
+monolith workflow, cron, and system-event surfaces, which corpus-role
+blackboxd does not serve. New schedules belong in blackopsd through
+`blackops_definition_install` and `blackops_schedule_put`. Porting the shipped
+legacy maintenance schedules and runtime state is tracked in AR-003.
+
+Watch the blackboxd journal for `auto-reindex: indexed N files`. If the schema
+version changed, the index drops and rebuilds.
 
 ### After a schema version bump
 
@@ -298,12 +416,44 @@ bbox_lint()               # contradictions, stale entries, duplicates
 bbox_render(scope="global")  # re-sync provider markdown files if out of date
 ```
 
+## Differentiated cutover
+
+Treat migration from the monolith as an authority handoff, not as an in-place
+file-format upgrade:
+
+1. Stop new legacy admissions and drain or explicitly abandon all live tasks
+   and workflow attempts.
+2. Take an encrypted backup of every protected store, service secret, provider
+   account source, and integration secret source.
+3. Install all service binaries and templates from one release.
+4. Start blackboxd with `BLACKBOX_RUNTIME_ROLE=corpus`, then blackopsd, then
+   fleetd.
+5. Configure separate bearer-authenticated MCP entries for ports 7264, 7265,
+   and 7266.
+6. Verify `/readyz` on each owner before admitting new work.
+
+The new fleetd and blackopsd stores do not import old live tasks, worker
+leases, logical agents, mailboxes, workflow runs, waits, approvals, schedules,
+or system-event runtime state. blackopsd imports embedded shipped definitions
+and the installed artifact catalog only. Preserve old authority state for audit
+and rollback, but never copy old files into the new state roots. AR-003 tracks
+conversion and cutover tooling.
+
+`BLACKBOX_RUNTIME_ROLE=compatibility` is for a bounded rollback window. Do not
+run its legacy execution or operational writers beside authority-mode fleetd
+and blackopsd.
+
 ## Backup strategy
 
-Minimal working backup - tar the protect list:
+Drain live attempts and stop the three services before taking an authority
+snapshot. This example encrypts the protected set with `age`; use an equivalent
+approved encryption tool if `age` is not your backup system:
+
+Remove optional paths that do not exist on the host before running the example.
 
 ```bash
-tar -czf blackbox-backup-$(date +%F).tar.gz \
+systemctl --user stop fleetd.service blackopsd.service blackbox.service
+tar -czf - \
   ~/.local/state/blackbox/blackbox-knowledge.json \
   ~/.local/state/blackbox/blackbox-notes.json \
   ~/.local/state/blackbox/blackbox-threads.json \
@@ -313,8 +463,25 @@ tar -czf blackbox-backup-$(date +%F).tar.gz \
   ~/.local/state/blackbox/packets/ \
   ~/.local/state/blackbox/artifacts/ \
   ~/.local/state/blackbox/bro/ \
-  ~/.bro/slack-identities.json
+  ~/.local/state/blackbox/blackopsd/ \
+  ~/.local/state/blackbox/fleetd/ \
+  ~/.local/state/blackbox/service.token \
+  ~/.config/blackbox/ \
+  ~/.config/systemd/user/blackbox.service.d/ \
+  ~/.config/systemd/user/blackopsd.service.d/ \
+  ~/.config/systemd/user/fleetd.service.d/ \
+  ~/.bro/slack-identities.json \
+  | age -r "$BACKUP_RECIPIENT" -o "blackbox-backup-$(date +%F).tar.gz.age"
+systemctl --user start blackbox.service blackopsd.service fleetd.service
 ```
+
+Include any provider credential homes or external secret-resolver data needed
+by fleetd and blackopsd according to their own backup policy. Never store this
+archive unencrypted. The service token must restore as an owner-only regular
+file, and daemon state directories must remain private to the service user.
+On macOS, include `~/Library/Application Support/blackbox/` and the three
+rendered plists under `~/Library/LaunchAgents/` instead of the Linux systemd
+paths, while preserving any operator-owned secret entries.
 
 The rebuild data (index, vectors, edges) can be reconstructed after restore
 by starting the daemon and waiting for the reindex + re-embed cycles. For
@@ -322,12 +489,19 @@ vectors, run `bbox_reembed(route="<route>")` for each configured route.
 
 ## Migrating to a new machine
 
-1. Restore the protected files to the same paths.
-2. Build and install the daemon binaries.
-3. Copy systemd units and drop-ins (including secrets).
-4. Start the daemon - index rebuilds automatically.
-5. Run `bbox_reembed(route="<route>")` for each embedding route.
-6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_inbox`.
+1. Decrypt and restore the protected files to the same paths while the three
+   services are stopped.
+2. Restore owner-only permissions on `service.token`, provider account files,
+   integration secrets, and service drop-ins.
+3. Build and install all service binaries from one release.
+4. Restore systemd units and drop-ins, including the conforming Linux worker
+   launcher configuration where applicable.
+5. Start blackboxd, then blackopsd, then fleetd. The corpus index rebuilds as
+   needed.
+6. Run `bbox_reembed(route="<route>")` for each embedding route.
+7. Verify all three `/readyz` endpoints, then run `bbox_describe_schema`,
+   `bbox_embed_status`, `bro_roster`, and `blackops_definition_list` against
+   their owning services.
 
 Multi-machine active setups: the JSON stores are not concurrency-safe
 across machines. Use one canonical host and treat others as read-only

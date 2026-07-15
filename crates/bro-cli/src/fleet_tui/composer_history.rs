@@ -84,6 +84,8 @@ pub fn read_history(path: &Path) -> Vec<HistoryEntry> {
 ///
 /// Uses `flock(LOCK_EX)` via `fs2` for the entire append+trim operation.
 /// Creates the file (and parent dirs) if they don't exist.
+// Composer history is a synchronous, lock-ordered persistence boundary in the TUI.
+#[allow(clippy::disallowed_methods)]
 pub fn append_history(path: &Path, text: &str) -> std::io::Result<()> {
     // Ensure parent directory exists.
     if let Some(parent) = path.parent() {
@@ -102,6 +104,7 @@ pub fn append_history(path: &Path, text: &str) -> std::io::Result<()> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(path)?;
 
@@ -142,6 +145,8 @@ fn count_lines(file: &File) -> std::io::Result<usize> {
 
 /// Trim the histfile to the last `HISTORY_CAP` entries, using tmp+rename
 /// atomicity. Caller must hold the exclusive lock on `file`.
+// Atomic rename must remain inside the same synchronous flock transaction.
+#[allow(clippy::disallowed_methods)]
 fn trim_locked(file: &File, path: &Path) -> std::io::Result<()> {
     let mut file_ref = file;
     file_ref.rewind()?;
@@ -196,6 +201,8 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise the synchronous history contract.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::io::Write as IoWrite;

@@ -2007,6 +2007,10 @@ fn short_id() -> String {
 }
 
 #[cfg(test)]
+// These integration-style fixtures intentionally drive synchronous git and
+// filesystem operations inside isolated temporary repositories. They do not
+// run on an application Tokio worker.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::tool::ToolCx;
@@ -2068,6 +2072,7 @@ mod tests {
 
     fn cx(root: &Path) -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: root.to_path_buf(),
             safety: Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -2601,7 +2606,7 @@ mod tests {
 
         // Cleanup: restore the original worktree branch so the test repo
         // can be torn down without an in-use branch warning.
-        let _ = run_git(&cwd, &["checkout", &worktree_branch]);
+        run_git(&cwd, &["checkout", &worktree_branch]);
         run_git(
             repo.path(),
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
@@ -2967,7 +2972,7 @@ mod tests {
         );
 
         // Cleanup: abort the in-progress rebase, then tear down.
-        let _ = run_git(&cwd, &["rebase", "--abort"]);
+        run_git(&cwd, &["rebase", "--abort"]);
         run_git(
             repo.path(),
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
@@ -3676,7 +3681,7 @@ mod tests {
             Some(worktree.to_str().unwrap()),
             |_| "main".to_string(),
             None,
-            &[store_root.clone()],
+            std::slice::from_ref(&store_root),
         );
         assert!(
             accepted.is_ok(),

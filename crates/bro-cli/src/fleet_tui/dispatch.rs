@@ -89,9 +89,21 @@ pub(super) async fn build_fleet_dispatch(
     classifier_cfg: Option<ClassifierConfig>,
     alias: Option<String>,
 ) -> DispatchOutcome {
-    let worktree = match prepare_dispatch_worktree(&orch, launch_cwd.as_deref(), &prompt) {
-        Ok(worktree) => worktree,
-        Err(e) => return DispatchOutcome::Failed(format!("worktree isolation failed: {e}")),
+    let prepare_orch = orch.clone();
+    let prepare_cwd = launch_cwd.clone();
+    let prepare_prompt = prompt.clone();
+    let worktree = match tokio::task::spawn_blocking(move || {
+        prepare_dispatch_worktree(&prepare_orch, prepare_cwd.as_deref(), &prepare_prompt)
+    })
+    .await
+    {
+        Ok(Ok(worktree)) => worktree,
+        Ok(Err(e)) => {
+            return DispatchOutcome::Failed(format!("worktree isolation failed: {e}"));
+        }
+        Err(e) => {
+            return DispatchOutcome::Failed(format!("worktree isolation worker failed: {e}"));
+        }
     };
 
     // Classifier companion: prepend the intern rider to the executor's first
@@ -346,6 +358,8 @@ pub(super) fn resolve_project_directive(
     })
 }
 
+// The async dispatch path invokes this synchronous git transaction via spawn_blocking.
+#[allow(clippy::disallowed_methods)]
 pub(super) fn prepare_dispatch_worktree(
     orch: &FleetOrchestrator,
     launch_cwd: Option<&str>,
@@ -543,6 +557,8 @@ pub(super) fn resume_env_overrides(
 /// canonical repo path) into the worktree dispatch env. Best-effort: a missing or
 /// malformed `fleet.json` must never block a dispatch, and reserved `BRO_FLEET_*`
 /// vars (already inserted) are never overridden.
+// Synchronous git probe shared by the blocking dispatch transaction and bounded TUI lookups.
+#[allow(clippy::disallowed_methods)]
 pub(super) fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .arg("-C")

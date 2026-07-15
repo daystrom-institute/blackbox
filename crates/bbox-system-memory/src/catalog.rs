@@ -336,6 +336,8 @@ fn signpost_preview(content: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+// Catalog fixtures intentionally write and inspect temporary markdown trees.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::fs;

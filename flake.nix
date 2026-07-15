@@ -16,6 +16,8 @@
           version = "0.2.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "--workspace" ];
+          cargoTestFlags = [ "--workspace" ];
         };
 
         mkProductApp = binName: flake-utils.lib.mkApp {
@@ -42,6 +44,8 @@
         };
 
         bbx-dev-blackboxd = mkWrapped "bbx-dev-blackboxd" "${blackbox}/bin/blackboxd";
+        bbx-dev-blackopsd = mkWrapped "bbx-dev-blackopsd" "${blackbox}/bin/blackopsd";
+        bbx-dev-fleetd = mkWrapped "bbx-dev-fleetd" "${blackbox}/bin/fleetd";
         bbx-dev-bro = mkWrapped "bbx-dev-bro" "${blackbox}/bin/bro";
         bbx-dev-claude = mkWrapped "bbx-dev-claude" ''"''${CLAUDE_BIN:-claude}"'';
         bbx-dev-codex = mkWrapped "bbx-dev-codex" ''"''${CODEX_BIN:-codex}"'';
@@ -54,6 +58,8 @@
           default = blackbox;
           dev-home = bbx-dev-home;
           dev-blackboxd = bbx-dev-blackboxd;
+          dev-blackopsd = bbx-dev-blackopsd;
+          dev-fleetd = bbx-dev-fleetd;
           dev-bro = bbx-dev-bro;
           dev-claude = bbx-dev-claude;
           dev-codex = bbx-dev-codex;
@@ -65,9 +71,15 @@
         apps = {
           default = mkProductApp "blackboxd";
           blackboxd = mkProductApp "blackboxd";
+          blackbox-corpusd = mkProductApp "blackbox-corpusd";
+          blackopsd = mkProductApp "blackopsd";
+          fleetd = mkProductApp "fleetd";
+          bro-harness = mkProductApp "bro-harness";
           bro = mkProductApp "bro";
           dev-home = flake-utils.lib.mkApp { drv = bbx-dev-home; };
           dev-blackboxd = flake-utils.lib.mkApp { drv = bbx-dev-blackboxd; };
+          dev-blackopsd = flake-utils.lib.mkApp { drv = bbx-dev-blackopsd; };
+          dev-fleetd = flake-utils.lib.mkApp { drv = bbx-dev-fleetd; };
           dev-bro = flake-utils.lib.mkApp { drv = bbx-dev-bro; };
           dev-claude = flake-utils.lib.mkApp { drv = bbx-dev-claude; };
           dev-codex = flake-utils.lib.mkApp { drv = bbx-dev-codex; };
@@ -98,7 +110,7 @@
           shellHook = ''
             export BBOX_DEV_REPO_ROOT="$(pwd)"
             echo "blackbox dev shell loaded"
-            echo "consumer outputs: nix build .#blackbox | nix run .#blackboxd | nix run .#bro"
+            echo "consumer outputs: nix build .#blackbox | nix run .#blackboxd | nix run .#blackopsd | nix run .#fleetd | nix run .#bro"
             echo "isolated agent harness: nix run .#dev-home -- init"
           '';
         };
@@ -115,6 +127,8 @@
             pkgs.rustc
             bbx-dev-home
             bbx-dev-blackboxd
+            bbx-dev-blackopsd
+            bbx-dev-fleetd
             bbx-dev-bro
             bbx-dev-claude
             bbx-dev-codex

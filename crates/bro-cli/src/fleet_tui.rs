@@ -1047,6 +1047,8 @@ fn append_agent_rename_event(agent: &Agent, name: &str) -> Result<(), String> {
     append_rename_event_to_path(&path, session_id, name)
 }
 
+// User-triggered transcript metadata persistence is a small synchronous TUI boundary.
+#[allow(clippy::disallowed_methods)]
 fn append_rename_event_to_path(path: &Path, session_id: &str, name: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -1120,6 +1122,8 @@ fn latest_rename_name_for_session(app: &App, session_id: &str) -> Option<String>
     found
 }
 
+// Resume-name resolution synchronously scans local transcript metadata before dispatch.
+#[allow(clippy::disallowed_methods)]
 fn latest_matching_rename_in_path(path: &Path, target: &str) -> Option<TranscriptRename> {
     let contents = fs::read_to_string(path).ok()?;
     let mut found = None;
@@ -1134,6 +1138,8 @@ fn latest_matching_rename_in_path(path: &Path, target: &str) -> Option<Transcrip
     found
 }
 
+// Resume-name resolution synchronously scans local transcript metadata before dispatch.
+#[allow(clippy::disallowed_methods)]
 fn latest_rename_for_session_in_path(path: &Path, session_id: &str) -> Option<TranscriptRename> {
     let contents = fs::read_to_string(path).ok()?;
     let mut found = None;
@@ -1170,6 +1176,8 @@ fn parse_rename_event_line(path: &Path, line: &str) -> Option<TranscriptRename> 
     Some(TranscriptRename { session_id, name })
 }
 
+// Bounded local discovery is kept synchronous so rename resolution observes one snapshot.
+#[allow(clippy::disallowed_methods)]
 fn candidate_harness_event_log_paths(app: &App) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
@@ -3292,6 +3300,8 @@ fn prune_status_message(
 
 /// Check whether a worktree directory has a clean working tree (no uncommitted
 /// changes). Returns `Ok(true)` if `git status --porcelain` is empty.
+// Ctrl+K prune is a deliberate synchronous maintenance transaction in the TUI.
+#[allow(clippy::disallowed_methods)]
 fn worktree_clean_status(worktree: &str) -> Result<bool, String> {
     let out = Command::new("git")
         .arg("-C")
@@ -3318,6 +3328,8 @@ enum FleetWorktreeRemoval {
 /// Remove a managed fleet worktree, then delete its branch only when the branch
 /// tip is already merged into the base repo's current branch. Best-effort: logs
 /// failures rather than crashing the prune flow.
+// Ctrl+K prune keeps worktree removal and branch disposition in one transaction.
+#[allow(clippy::disallowed_methods)]
 fn remove_fleet_worktree(worktree: &str) -> Option<FleetWorktreeRemoval> {
     // Resolve the base repo so we can run `git worktree remove` from it.
     let base_repo = match closeout::base_repo_of_worktree(worktree) {
@@ -3386,6 +3398,8 @@ fn remove_fleet_worktree(worktree: &str) -> Option<FleetWorktreeRemoval> {
     }
 }
 
+// Called only inside the synchronous prune maintenance transaction above.
+#[allow(clippy::disallowed_methods)]
 fn branch_tip_merged_into_base_head(base_repo: &Path, branch: &str) -> Result<bool, String> {
     let out = Command::new("git")
         .arg("-C")
@@ -3404,6 +3418,8 @@ fn branch_tip_merged_into_base_head(base_repo: &Path, branch: &str) -> Result<bo
 }
 
 /// Resolve the current branch name of a worktree checkout.
+// Called only inside the synchronous prune maintenance transaction above.
+#[allow(clippy::disallowed_methods)]
 fn worktree_branch(worktree: &str) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -5984,6 +6000,8 @@ mod dispatch;
 mod highlight;
 mod markdown;
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise transcript, worktree, and session persistence.
+#[allow(clippy::disallowed_methods)]
 mod tests;
 mod transcript;
 mod view;

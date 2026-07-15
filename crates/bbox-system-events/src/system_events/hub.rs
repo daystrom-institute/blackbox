@@ -52,6 +52,11 @@ pub struct EmitOutcome {
     pub outbox_enqueued: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox_error: Option<String>,
+    /// True when at least one reaction record failed on durable I/O and a
+    /// later independent repair pass may succeed. Template/config failures are
+    /// permanent until the reaction changes and do not gate event consumers.
+    #[serde(default)]
+    pub outbox_retryable: bool,
     pub matched_reactions: usize,
 }
 
@@ -75,6 +80,9 @@ pub struct SystemEventCompactionReport {
 }
 
 impl EventHub {
+    // Hub construction synchronously establishes its durable reaction and
+    // identity roots before the shared handle is published.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(
         event_store: EventStore,
         outbox_store: OutboxStore,
@@ -261,7 +269,7 @@ impl EventHub {
         }
         let path = self.reactions_dir.join(format!("{}.json", spec.name));
         let pretty = serde_json::to_string_pretty(&spec)?;
-        std::fs::write(&path, pretty)?;
+        tokio::fs::write(&path, pretty).await?;
         let mut reactions = self.reactions.write().await;
         reactions.insert(spec.name.clone(), spec);
         Ok(())
@@ -290,6 +298,25 @@ impl EventHub {
     }
 
     pub async fn emit(&self, draft: SystemEventDraft) -> Result<EmitOutcome> {
+        self.emit_inner(draft, new_event_id()).await
+    }
+
+    /// Publish a caller-identified event exactly once. Repeating the same ID
+    /// and body repairs any missing reaction records while preserving a single
+    /// journal event and a single record per reaction.
+    pub async fn emit_once(
+        &self,
+        event_id: impl Into<String>,
+        draft: SystemEventDraft,
+    ) -> Result<EmitOutcome> {
+        let event_id = event_id.into();
+        if event_id.is_empty() || event_id.len() > 256 {
+            bail!("caller-provided system event id must contain 1 to 256 bytes");
+        }
+        self.emit_inner(draft, event_id).await
+    }
+
+    async fn emit_inner(&self, draft: SystemEventDraft, event_id: String) -> Result<EmitOutcome> {
         if let Some(ref cid) = draft.causation_id {
             let chain = self.event_store.causation_chain(cid)?;
             if chain.len() >= MAX_CAUSATION_DEPTH {
@@ -303,7 +330,7 @@ impl EventHub {
         }
 
         let event = SystemEvent {
-            id: new_event_id(),
+            id: event_id,
             kind: draft.kind,
             occurred_at: bbox_util::util::now_iso(),
             producer: draft.producer,
@@ -316,9 +343,10 @@ impl EventHub {
         };
 
         let envelope = JournalEnvelope::wrap(event.clone());
-        if let Err(e) = self.event_store.append(&envelope) {
-            bail!("journal append failed: {e:#}");
-        }
+        let (event, newly_appended) = self
+            .event_store
+            .append_once(&envelope)
+            .map_err(|e| anyhow::anyhow!("journal append failed: {e:#}"))?;
 
         let reactions = self.reactions.read().await;
         let matched: Vec<&ReactionSpec> = reactions
@@ -329,6 +357,7 @@ impl EventHub {
 
         let mut outbox_enqueued = true;
         let mut outbox_error: Option<String> = None;
+        let mut outbox_retryable = false;
 
         let event_roots = build_event_roots(&event);
 
@@ -345,33 +374,40 @@ impl EventHub {
                         Ok(k) => Some(k),
                         Err(e) => {
                             outbox_enqueued = false;
-                            outbox_error = Some(format!(
-                                "idempotency key render failed for '{}': {e:#}",
-                                reaction.name
-                            ));
-                            break;
+                            append_outbox_error(
+                                &mut outbox_error,
+                                format!(
+                                    "idempotency key render failed for '{}': {e:#}",
+                                    reaction.name
+                                ),
+                            );
+                            continue;
                         }
                     }
                 }
                 None => None,
             };
-            if let Err(e) = self
-                .outbox_store
-                .create_record(&event.id, &reaction.name, rendered_key)
+            if let Err(e) =
+                self.outbox_store
+                    .create_record_once(&event.id, &reaction.name, rendered_key)
             {
                 outbox_enqueued = false;
-                outbox_error = Some(format!("{e:#}"));
-                break;
+                let message = format!("{e:#}");
+                outbox_retryable |= !message.contains("changed its idempotency key");
+                append_outbox_error(&mut outbox_error, message);
             }
         }
 
-        let _ = self.tx.send(event.clone());
+        if newly_appended {
+            let _ = self.tx.send(event.clone());
+        }
 
         Ok(EmitOutcome {
             event,
             journal_appended: true,
             outbox_enqueued,
             outbox_error,
+            outbox_retryable,
             matched_reactions: matched_count,
         })
     }
@@ -431,6 +467,16 @@ impl EventHub {
     }
 }
 
+fn append_outbox_error(slot: &mut Option<String>, message: String) {
+    match slot {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&message);
+        }
+        None => *slot = Some(message),
+    }
+}
+
 fn build_event_roots(event: &SystemEvent) -> serde_json::Map<String, serde_json::Value> {
     let mut roots = serde_json::Map::new();
     roots.insert(
@@ -445,6 +491,9 @@ enum RawReaction {
     Invalid { path: String, error: String },
 }
 
+// Reaction restore and diagnostics take one synchronous directory snapshot so
+// validation observes a coherent cold-start/admin view of the installed set.
+#[allow(clippy::disallowed_methods)]
 fn load_all_reactions_raw(dir: &Path) -> Vec<RawReaction> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -492,6 +541,8 @@ fn scan_reaction_warnings(dir: &Path) -> Vec<ReactionLoadWarning> {
 }
 
 #[cfg(test)]
+// Hub fixtures intentionally write isolated reaction specs to temporary roots.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -547,6 +598,69 @@ mod tests {
             .unwrap();
         assert_eq!(received.id, outcome.event.id);
         assert_eq!(received.producer, "broadcaster");
+    }
+
+    #[tokio::test]
+    async fn emit_once_deduplicates_the_journal_broadcast_and_reaction_outbox() {
+        let (hub, _dir) = test_hub();
+        hub.install_reaction(
+            ReactionSpec {
+                contract: "reaction/v1".to_string(),
+                name: "once-reaction".to_string(),
+                version: 1,
+                enabled: true,
+                event_kinds: vec!["task.completed".to_string()],
+                when: None,
+                idempotency_key: Some("once:${event.id}".to_string()),
+                action: ReactionAction::EmitEvent { args: json!({}) },
+                retry: RetryPolicy::default(),
+                on_failure: FailurePolicy::DeadLetter,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let draft = SystemEventDraft {
+            kind: SystemEventKind::TaskCompleted,
+            producer: "terminal-outbox".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation: serde_json::Map::new(),
+            causation_id: None,
+            payload: json!({"task_id": "task-1"}),
+        };
+        let mut subscriber = hub.subscribe();
+
+        let first = hub
+            .emit_once("evt-terminal-task-1", draft.clone())
+            .await
+            .unwrap();
+        let second = hub.emit_once("evt-terminal-task-1", draft).await.unwrap();
+
+        assert_eq!(first.event, second.event);
+        assert_eq!(hub.list_events(None, None, None, None).unwrap().len(), 1);
+        assert_eq!(hub.outbox_store().load_all().unwrap().len(), 1);
+        assert_eq!(subscriber.try_recv().unwrap().id, "evt-terminal-task-1");
+        assert!(matches!(
+            subscriber.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn emit_once_rejects_reusing_an_id_for_different_content() {
+        let (hub, _dir) = test_hub();
+        hub.emit_once("evt-stable", simple_draft("first"))
+            .await
+            .unwrap();
+
+        let error = hub
+            .emit_once("evt-stable", simple_draft("second"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("different content"));
+        assert_eq!(hub.list_events(None, None, None, None).unwrap().len(), 1);
     }
 
     #[tokio::test]

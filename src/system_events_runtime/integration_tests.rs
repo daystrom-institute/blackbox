@@ -90,11 +90,17 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         edge_rebuild_nudge_rx: std::sync::Mutex::new(None),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(TaskStore::new())),
+        worker_registry: Arc::new(
+            orchestration::worker_registry::WorkerRegistry::open(&tmp.path().join("bro")).unwrap(),
+        ),
         tail_tx,
         roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         roster_tx,
         roster_view: Arc::new(orchestration::RosterView::new()),
         store_dir: tmp.path().join("bro"),
+        service_token: Arc::new(
+            bro_rpc::ServiceToken::load_or_create(&tmp.path().join("service.token")).unwrap(),
+        ),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
@@ -148,6 +154,10 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             tmp.path().join("reactions"),
             tmp.path().join("identities"),
         )),
+        record_ingest: Arc::new(
+            blackbox_corpus_service::RecordStore::open(&tmp.path().join("bro")).unwrap(),
+        ),
+        record_transcript_roots: Arc::new(vec![tmp.path().join("fleetd/workers")]),
     });
     BlackboxServer::new(state)
 }

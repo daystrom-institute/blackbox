@@ -217,10 +217,10 @@ pub struct AnalysisReferences;
 
 fn workspace_relative(root: &std::path::Path, path: &str) -> String {
     let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        if let Ok(stripped) = p.strip_prefix(root) {
-            return stripped.to_string_lossy().to_string();
-        }
+    if p.is_absolute()
+        && let Ok(stripped) = p.strip_prefix(root)
+    {
+        return stripped.to_string_lossy().to_string();
     }
     path.to_string()
 }
@@ -1027,6 +1027,7 @@ mod tests {
 
     fn cx_in(dir: &Path) -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

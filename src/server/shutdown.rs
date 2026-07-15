@@ -1,4 +1,4 @@
-use super::SharedState;
+use super::{RuntimeRole, SharedState};
 use crate::{config, embed_queue, vectors};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,11 +11,12 @@ pub(super) async fn serve_until_shutdown(
     store_dir: PathBuf,
     ct: CancellationToken,
     shutdown_grace_secs: u64,
+    runtime_role: RuntimeRole,
 ) -> anyhow::Result<()> {
     spawn_config_reload_handler(shared.clone());
     spawn_shutdown_signal_handler(ct.clone());
     serve_with_grace_period(listener, app, &ct, shutdown_grace_secs).await?;
-    persist_shutdown_state(shared, store_dir);
+    persist_shutdown_state(shared, store_dir, runtime_role);
     tracing::info!("blackboxd shut down");
     Ok(())
 }
@@ -98,13 +99,18 @@ async fn serve_with_grace_period(
     Ok(())
 }
 
-fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
+fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf, runtime_role: RuntimeRole) {
     embed_queue::shutdown();
-    // Tear down long-lived LSP sessions before persistence so JDTLS and friends
-    // get a chance to write workspace caches and exit cleanly.
-    shared.lsp_sessions.shutdown_all();
-    // Block until durable: shutdown must not race the persist actor's thread.
-    crate::orchestration::flush_persist_blocking(&shared.task_store, &store_dir);
+    if runtime_role == RuntimeRole::Compatibility {
+        // The compatibility owner may have live LSP and task state. Corpus
+        // role never starts or persists those retired authorities.
+        shared.lsp_sessions.shutdown_all();
+        if let Err(err) =
+            crate::orchestration::flush_persist_blocking(&shared.task_store, &store_dir)
+        {
+            tracing::warn!(error = %err, "task persister flush on shutdown failed");
+        }
+    }
     if let Err(err) = shared.kb_persister.flush_blocking() {
         tracing::warn!(error = %err, "knowledge persister flush on shutdown failed");
     }

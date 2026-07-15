@@ -726,6 +726,7 @@ pub fn classify_post_response(status: u16, attempt: u32) -> PostOutcome {
 /// `false` if exhausted (ack-and-drop).
 pub async fn post_to_daemon_with_retry(
     client: &reqwest::Client,
+    authorization: &reqwest::header::HeaderValue,
     daemon_url: &str,
     webhook_name: &str,
     build_body: impl Fn(u32) -> Value,
@@ -740,6 +741,7 @@ pub async fn post_to_daemon_with_retry(
 
         let mut req = client
             .post(&url)
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
             .header("X-Slack-Envelope-Id", envelope_id)
             .header("Content-Type", "application/json");
 
@@ -946,6 +948,7 @@ pub type SharedHealthStats = Arc<HealthStats>;
 
 struct BridgeContext<'a> {
     daemon_client: &'a reqwest::Client,
+    daemon_authorization: &'a reqwest::header::HeaderValue,
     daemon_url: &'a str,
     webhook_name: &'a str,
     identities: &'a SlackIdentities,
@@ -1080,6 +1083,7 @@ where
     // _meta.retry_attempt reflects the actual attempt number.
     let delivered = post_to_daemon_with_retry(
         ctx.daemon_client,
+        ctx.daemon_authorization,
         ctx.daemon_url,
         ctx.webhook_name,
         |attempt| {
@@ -1313,6 +1317,13 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = bbox_config::config::load()?;
+    let service_token_path = std::env::var_os("BLACKBOX_SERVICE_TOKEN_FILE")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cfg.paths.state_dir.join("service.token"));
+    let daemon_authorization = bro_rpc::ServiceToken::load_or_create(&service_token_path)
+        .map_err(|error| anyhow!("loading blackbox service token: {error}"))?
+        .authorization_header();
     let identities_path = if let Some(p) = args.identities_file {
         bbox_util::util::resolve_tilde(&p)
     } else {
@@ -1418,6 +1429,7 @@ async fn main() -> Result<()> {
     let daemon_client = reqwest::Client::new();
     let ctx = BridgeContext {
         daemon_client: &daemon_client,
+        daemon_authorization: &daemon_authorization,
         daemon_url: &args.daemon_url,
         webhook_name: &args.webhook_name,
         identities: &identities,

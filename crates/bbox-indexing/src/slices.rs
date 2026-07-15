@@ -730,6 +730,9 @@ fn line_spans(source: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+// Slice planning synchronously snapshots source bytes before hashing and
+// constructing an immutable edit plan.
+#[allow(clippy::disallowed_methods)]
 fn read_existing_snapshot(path: &Path) -> Result<FileSnapshot> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let text = String::from_utf8(bytes)
@@ -741,6 +744,8 @@ fn read_existing_snapshot(path: &Path) -> Result<FileSnapshot> {
     })
 }
 
+// Create-or-edit planning synchronously snapshots the target or its absence.
+#[allow(clippy::disallowed_methods)]
 fn read_snapshot_or_empty(path: &Path) -> Result<FileSnapshot> {
     match fs::read(path) {
         Ok(bytes) => {
@@ -761,6 +766,9 @@ fn read_snapshot_or_empty(path: &Path) -> Result<FileSnapshot> {
     }
 }
 
+// Preview verification synchronously reloads the exact source revision named
+// by the plan hash before producing a diff.
+#[allow(clippy::disallowed_methods)]
 fn read_original_for_preview(path: &Path, expected_sha256: &str) -> Result<Vec<u8>> {
     match fs::read(path) {
         Ok(bytes) => Ok(bytes),
@@ -979,6 +987,9 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(test)]
+// Slice fixtures intentionally create source trees and invoke isolated Git
+// subprocesses to verify plan and apply semantics.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::process::Command;

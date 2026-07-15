@@ -149,6 +149,8 @@ fn unwrap_log_line(value: Value) -> Value {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise incremental transcript tailing.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::io::Write;

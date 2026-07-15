@@ -1,32 +1,113 @@
 ---
-title: "Leaf sandbox isolation (proposed)"
+title: "Worker and leaf sandbox isolation"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
   - orchestration
-brief: "Forward-looking OS-level *scope* sandboxing for the shell child processes the in-process harness spawns. Re-pointed (2026-06-02) after the V8/shell simplification: V8 runs in-process (isolate-contained), and the v1 shell isolation is supervision (timeout + ulimit/cgroup), not a sandbox. This doc is the threat-model-change escape hatch — pulled only when agents are genuinely untrusted/third-party or run unattended-autonomous. Key framing: a sandbox bounds *scope* (worktree, network, PIDs), it does not deny *capability* — a trusted agent with file-write+execute can do anything within its scope regardless of bash-vs-python, and name-based allowlists are speed bumps (cargo runs build.rs). So on a single-user box this is accident-containment between concurrent agents, not security. Per-OS, best-effort, graceful fallback first-class. Mines codex-rs/linux-sandbox + sandboxing (namespaces/landlock/seccomp on Linux, Seatbelt on macOS) and Daystrom's NamespaceIsolation. Bonus on Linux: mount/PID namespaces make two repo conventions (only-touch-your-own-worktree, don't-kill-across-agents) mechanical."
+brief: "As-built narrow authority firewall for every fleetd-launched bro-harness process, plus the proposed broader worktree/PID scope sandbox. macOS authority launch is fail-closed through Seatbelt. Linux authority launch requires a root-owned external sandbox launcher that satisfies the v1 probe and launch contract."
 ---
 
-# Leaf sandbox isolation (proposed)
+# Worker and leaf sandbox isolation
 
-> **Status: proposed, forward-looking — not v1, re-pointed 2026-06-02.** After the
-> V8/shell simplification, **V8 runs in-process** (isolate-contained) and the v1
-> shell isolation is **supervision** (timeout + ulimit/cgroup) — see
-> [`harness-daemon-boundary.md`](./harness-daemon-boundary.md) §5. This doc is the
-> *scope* sandbox for the shell child processes (what they can *touch*), and it is
-> a **threat-model-change escape hatch**, not on the v1 path. Pull it only when the
-> triggers in §8 fire.
+> **Status: partially shipped.** The service split changed the threat model: a
+> same-UID worker must not recover the shared daemon bearer or bypass fleetd by
+> calling authority services directly. That narrow process-tree boundary is now
+> load-bearing and fail-closed. Broader worktree hiding, PID namespaces, and
+> arbitrary network policy remain proposed.
+
+## 0. Shipped authority boundary
+
+`fleetd` never launches `bro-harness` directly in authority mode. The launcher
+first establishes an inherited OS policy around the whole harness process, so
+V8-dispatched tools, shells, compilers, and their descendants cannot escape by
+changing executable or language.
+
+The required guarantees are deliberately narrow:
+
+- deny read, write, hard-link, replacement, and unlink access to the canonical
+  shared service-token path;
+- deny replacement of the canonical bro-harness executable trusted for later
+  dispatches;
+- deny reads and writes to every provider credential source file/directory
+  fleetd used to construct the spawn environment; Brodex receives the parsed
+  auth document inline through scrubbed task-local session state and refreshes
+  only that in-memory copy;
+- deny reads and writes to fleet authority snapshots/locks and every sibling
+  worker directory, while allowing the bound worker's private journal tree;
+- deny reads and writes to configured blackopsd state/catalog and corpus
+  private-state/index roots; when the corpus state root is a shared parent, the
+  narrower fleet state subtree remains available under its own rules;
+- scope `BRO_HOME` to the durable SessionId, deny every sibling Bro session
+  directory, and retain that same private session directory when fleetd starts
+  a replacement worker for the session;
+- deny unlink, rename, and replacement of the fleet Unix socket path while
+  retaining Unix-domain connection access to it;
+- deny direct loopback TCP connections to blackboxd, fleetd, and blackopsd,
+  including configured non-default service ports;
+- deny cross-sandbox process inspection, task-port acquisition, and signals on
+  macOS so another same-UID daemon is not a token side channel;
+- retain ordinary provider network access, repository/worktree access, the
+  private fleet Unix socket, and worker journals; and
+- fail the authority startup or worker launch rather than fall back to a bare
+  process when the required policy cannot be established.
+
+On macOS, fleetd uses only the root-owned `/usr/bin/sandbox-exec`, compiles and
+applies a Seatbelt policy during startup as a probe, canonicalizes every
+protected path before inserting it as a profile parameter, and wraps the
+complete bro-harness process tree. Fleet state, worker, socket-parent, Bro
+session-root, bound worker, and bound Bro-session directories are real
+canonical directories with mode `0700`. An external override is rejected.
+Daemon-owned persistence of a Brodex refresh-token rotation remains the
+explicit `AR-004` removal gate in `ARCH_RELAYER_LOG.md`; direct worker
+write-back to the source is not an acceptable bridge.
+
+On Linux, authority mode requires
+`FLEETD_WORKER_SANDBOX_LAUNCHER=/absolute/root-owned/path`. fleetd rejects a
+launcher that is not root-owned, executable, or is writable by group/other. It
+also rejects a launcher beneath any non-root-owned or group/other-writable path
+component, then requires this exact protocol:
+
+```text
+launcher --self-test --protocol blackbox-worker-sandbox-v1 \
+  --service-token-file PATH --worker-binary PATH --worker-socket PATH \
+  --fleet-state-dir PATH --worker-root PATH --worker-dir PATH \
+  --bro-root PATH --bro-session-dir PATH \
+  --protected-service-root PATH ... \
+  --protected-path PATH ... \
+  --deny-loopback-port PORT ...
+
+stdout: blackbox-worker-sandbox-v1\n
+
+launcher --launch --protocol blackbox-worker-sandbox-v1 \
+  --service-token-file PATH --worker-binary PATH --worker-socket PATH \
+  --fleet-state-dir PATH --worker-root PATH --worker-dir PATH \
+  --bro-root PATH --bro-session-dir PATH \
+  --protected-service-root PATH ... \
+  --protected-path PATH ... \
+  --deny-loopback-port PORT ... -- /absolute/bro-harness ARGS...
+```
+
+The self-test must validate active kernel enforcement, not merely argument
+syntax. The launch path must establish token and protected-source read/write
+denial, worker-binary write denial, peer worker/Bro-session denial, fleet and
+peer-service authority-state denial, Unix-socket mutation denial, service-port
+connection denial, child inheritance, provider egress, bound worker/session
+writes, and access to the named Unix socket before it execs bro-harness. It
+must consume
+the control arguments rather than forwarding authority paths to the worker.
+The exact one-line marker is the only accepted self-test output. Other
+platforms reject authority mode.
 
 ## 1. Scope
 
 The boundary doc runs harness sessions in-process; **V8 cells run in-process**
 (the isolate is the containment unit) and **shell tool ops are child processes**
-the harness spawns and supervises (timeout + resource cap). This doc covers the
-orthogonal, *optional* question: a shell child is its own process — should we also
-confine **what it can touch** (filesystem, network, other processes), and how,
-per-OS?
+the harness spawns and supervises (timeout + resource cap). The shipped authority
+firewall above covers the minimum service boundary. The rest of this doc covers
+the orthogonal, broader question: should a shell child also be confined to one
+worktree, one process set, and a smaller network scope?
 
 The honest answer up front: a sandbox bounds **scope**, not **capability**. An
 agent with file-write + execute has arbitrary code execution — bash vs python vs a
@@ -50,13 +131,12 @@ There is **no Linux prod/CI tier** to design against. The dev environment is
 **either Linux or macOS depending on the machine** — a single tier whose OS
 varies, not a dev-vs-prod split. So:
 
-- OS sandbox hardening is **forward-looking**, not a current requirement.
-- It must be **per-OS and best-effort**, with "no isolation available" a
-  first-class, expected state — never a hard failure (Daystrom's probe → cache →
-  graceful-fallback pattern).
-- Isolation here is **defense-in-depth, not load-bearing**. If a future use case
-  (e.g. unattended autonomous runs) makes it load-bearing, *that* path runs on
-  Linux, where the strong guarantees exist.
+- The narrow service-authority firewall is current and load-bearing on every
+  authority launch. It never degrades gracefully.
+- Broader worktree/PID hardening remains per-OS and forward-looking.
+- Linux has no in-repo test tier, so its load-bearing integration is an explicit
+  root-owned launcher with a runtime self-test rather than an unverified
+  best-effort backend.
 
 ## 3. Two orthogonal layers
 
@@ -76,14 +156,14 @@ A shell leaf wants both: `execpolicy` says "only `cargo check`," the sandbox say
 
 ## 4. Per-OS strategy behind one interface
 
-One manager interface, per-OS backends, no-op fallback (the shape of codex's
+One manager interface and per-OS backends (the shape of codex's
 `sandboxing::manager` / `SandboxType`):
 
 | OS | Mechanism | Gives |
 |---|---|---|
 | **Linux** | `unshare --user --pid --net` + landlock (FS ACL) + seccomp + `no_new_privs` | PID-ns (no cross-agent kill), mount-ns (worktree hiding), net-ns (network denial), syscall filtering |
 | **macOS** | Seatbelt — `sandbox-exec` + an SBPL profile | path-based file deny/allow, network deny; **profile-based MAC, not namespaces** |
-| **other** | no-op | nothing — fall back to a bare (unsandboxed) child process |
+| **other** | none | authority mode is rejected |
 
 macOS caveats (see the session that produced this doc): Seatbelt's `sandbox_init`
 is **deprecated since OS X 10.7** but never removed and universally used (Chrome,
@@ -91,7 +171,9 @@ codex, Bazel) for lack of a CLI-level replacement; App Sandbox/entitlements only
 applies to signed `.app` bundles and is useless for wrapping a subprocess. It is a
 *different model* — it restricts operations by policy, not visibility — so it
 **cannot** match the namespace-invisibility guarantees (no PID-ns cross-kill
-protection; worktree confinement is path-policy, not "the directory isn't there").
+or hiding; the shipped authority policy denies cross-sandbox inspection and
+signals, while worktree confinement would still be path-policy, not "the
+directory isn't there").
 
 ## 5. Mine, don't hand-roll
 
@@ -123,39 +205,39 @@ conventions** into structural guarantees:
 - **PID-ns** → *"don't kill processes across agents"* becomes structural: a leaf
   cannot see, let alone signal, another agent's PIDs.
 
-These are Linux-only; macOS Seatbelt approximates the first via path policy and
-does not get the second.
+Namespace invisibility is Linux-only. macOS Seatbelt can approximate the first
+with path policy and the second with cross-sandbox signal denial, but peer paths
+and PIDs still exist in the host namespace.
 
-## 7. Graceful degradation is first-class
+## 7. Fail closed for authority; optional only for broader scope
 
-Non-negotiable, because unprivileged user namespaces are off on many hosts and
-absent entirely on macOS:
+For the shipped service boundary:
 
-1. Probe the best available config at first use; cache the result.
-2. If nothing works → report not-supported; the leaf runs as a bare worker.
-3. Never hard-fail a dispatch because isolation is unavailable. The security model
-   does not *assume* the strong case — it states guarantees per-platform and treats
-   isolation as additive.
+1. Probe the required backend during authority startup.
+2. Reject missing, mutable, malformed, or non-enforcing launchers.
+3. Never retry a worker as a bare process.
+
+Future worktree/PID confinement may still use feature probes and optional
+degradation, but it must compose inside the already-required authority boundary.
 
 ## 8. Open questions
 
 - Adopt codex's sandbox crates as **dependencies**, or mine the patterns into our
   own `bro-*` crate? (Dependency is faster; mining avoids coupling to codex's
-  release cadence and policy shapes.)
-- **When does isolation become load-bearing?** (Unattended autonomous runs,
-  untrusted-tool execution.) That answer also forces "runs on Linux."
+  release cadence and policy shapes.) This applies to the broader scope layer;
+  the narrow macOS authority policy is already code-owned by fleetd.
 - Does the **V8 cell** get sandboxed too, or only the shell leaf? (V8 already has
   no ambient fs/network from JS — globals deleted — so the FS/net sandbox matters
   mostly for the shell ops the cell *dispatches*.)
-- macOS SBPL profile authoring: a single conservative profile, or per-tool
-  profiles?
+- Which Linux root-owned launcher implementation should become the recommended
+  packaged default once a Linux test tier exists?
 
 ## 9. Relationship
 
-- **The scope-sandbox escape hatch referenced by**
+- **The scope-sandbox boundary referenced by**
   [`harness-daemon-boundary.md`](./harness-daemon-boundary.md) §5. V8 runs
-  in-process there and the v1 shell isolation is supervision (timeout/cap); this
-  doc is pulled only on a threat-model change (§8).
+  in-process there and shell supervision still owns timeout/resource caps; this
+  doc owns the inherited OS authority boundary and broader scope follow-ons.
 - Reference implementations: codex-rs `linux-sandbox` / `sandboxing` /
   `execpolicy`; Daystrom `NamespaceIsolation`.
 - Composes with **RX-V2** (the cargo-only `execpolicy` instance for atom-dispatched

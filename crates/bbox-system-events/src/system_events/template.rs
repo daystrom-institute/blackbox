@@ -16,25 +16,27 @@ pub fn render_template_with_roots(
     let bytes = template.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
-            if let Some(close) = find_close_brace(template, i + 2) {
-                let expr = &template[i + 2..close];
-                match resolve_in_roots(expr, roots) {
-                    Some(v) => out.push_str(&value_to_template_string(&v)),
-                    None => match unresolved {
-                        UnresolvedPolicy::LeaveVerbatim => {
-                            out.push_str("${");
-                            out.push_str(expr);
-                            out.push('}');
-                        }
-                        UnresolvedPolicy::HardError => {
-                            bail!("unresolved template expression: '${{{expr}}}'")
-                        }
-                    },
-                }
-                i = close + 1;
-                continue;
+        if i + 1 < bytes.len()
+            && bytes[i] == b'$'
+            && bytes[i + 1] == b'{'
+            && let Some(close) = find_close_brace(template, i + 2)
+        {
+            let expr = &template[i + 2..close];
+            match resolve_in_roots(expr, roots) {
+                Some(v) => out.push_str(&value_to_template_string(&v)),
+                None => match unresolved {
+                    UnresolvedPolicy::LeaveVerbatim => {
+                        out.push_str("${");
+                        out.push_str(expr);
+                        out.push('}');
+                    }
+                    UnresolvedPolicy::HardError => {
+                        bail!("unresolved template expression: '${{{expr}}}'")
+                    }
+                },
             }
+            i = close + 1;
+            continue;
         }
         out.push(bytes[i] as char);
         i += 1;
@@ -58,10 +60,11 @@ fn resolve_in_roots(expr: &str, roots: &serde_json::Map<String, Value>) -> Optio
             if let Some(root) = roots.get(head) {
                 return walk_value(root, &parts[1..]);
             }
-            if parts.len() == 2 && parts[1] == "output" {
-                if let Some(outputs) = roots.get("outputs") {
-                    return walk_value(outputs, &[parts[0]]);
-                }
+            if parts.len() == 2
+                && parts[1] == "output"
+                && let Some(outputs) = roots.get("outputs")
+            {
+                return walk_value(outputs, &[parts[0]]);
             }
             None
         }

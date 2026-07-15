@@ -50,6 +50,83 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Runtime authority is split across independently restartable services:
+  blackboxd remains the flight-data recorder and corpus owner on port 7264,
+  fleetd owns live execution on port 7265, and blackopsd owns durable
+  operational intent on port 7266. `bro fleet` now defaults to fleetd and
+  accepts `FLEETD_URL`; bounded compatibility proxies preserve the migration
+  window for older clients. The sample isolated blackboxd-dev port moves from
+  7265 to 7274 to avoid colliding with fleetd.
+- **Breaking cutover:** drain or abandon legacy live attempts before enabling
+  the new authorities, back up the legacy stores and service secrets, install
+  one coherent release, then start blackboxd in `corpus` role, blackopsd, and
+  fleetd in that order. Client configurations that need all tools now require
+  three bearer-authenticated MCP entries on ports 7264, 7265, and 7266.
+  `BLACKBOX_RUNTIME_ROLE=compatibility` is a bounded rollback path and must not
+  run legacy writers beside the two new authorities.
+- The fleetd and blackopsd authority stores start fresh. There is no automatic
+  import of legacy live tasks, leases, logical agents, mailboxes, workflow
+  runs, waits, approvals, schedules, or system-event runtime state. blackopsd
+  imports the shipped definitions embedded in its build plus the installed
+  artifact catalog, but those definitions are not live-run state. Keep legacy
+  state for audit and rollback; automatic authority-state conversion is tracked
+  as AR-003.
+- blackboxd now defaults to the corpus runtime role. That role omits legacy
+  control HTTP routes, worker/task background owners, and operational MCP tools
+  so fleetd and blackopsd cannot accidentally become secondary writers. Set
+  `BLACKBOX_RUNTIME_ROLE=compatibility` only for the supported migration and
+  rollback window.
+- Provider sessions run in one `bro-harness` child process per selected
+  session. Private same-user sockets, versioned Hello/Welcome negotiation,
+  stable worker credentials, leases, acknowledged replay, separate control
+  backpressure, durable command journals, and snapshot-gated terminal
+  projection let sessions reconnect across supervisor replacement without
+  giving workers ambient service credentials.
+- Downstream blackops and corpus readiness is now live policy on the existing
+  worker socket. fleetd publishes monotonic availability revisions without
+  forcing a reconnect; bro-harness applies them at safe session boundaries,
+  updates model-visible World State, and revokes or restores affected tools so
+  a stale connection cannot retain authority through an outage.
+- Provider tool-call identity is distinct from transport RPC correlation.
+  Provider invocation IDs survive nested code-mode calls and replay, while RPC
+  `call_id` values identify only one request and response. A retry after an
+  ambiguous or dropped response therefore resolves to one durable blackops
+  operation and one fleet effect.
+- Every non-health HTTP route on blackboxd, fleetd, and blackopsd now requires
+  the shared same-host bearer credential. Trusted clients load the private
+  `service.token`; neither its contents nor path enters a worker environment,
+  harness argument, or worker protocol message. fleetd gives the canonical path
+  only to the trusted OS sandbox launcher, whose inherited policy blocks worker
+  reads, writes, links, and replacement at that path.
+- Authority workers now require an inherited OS sandbox. macOS fleetd probes
+  and uses the root-owned system Seatbelt launcher. Linux fleetd requires a
+  root-owned external launcher that passes the
+  `blackbox-worker-sandbox-v1` self-test. Missing or failed enforcement stops
+  authority startup; no dispatch falls back to an unsandboxed worker. The
+  repository does not ship that privileged Linux launcher, so Linux authority
+  mode remains unavailable until an operator installs a conforming one.
+- Session policy now persists the exact remote operations and versioned atom
+  refs requested at dispatch. fleetd intersects that request with host policy,
+  checks every worker RPC at call time, and forwards a digest-bound attestation;
+  blackopsd rechecks the exact operation and atom ref before accepting an
+  effect. Empty policy grants no remote authority, and resume may inherit but
+  cannot broaden the original session envelope.
+- Daemon workers move provider/account values out of process-global state before
+  starting a session, keep rotated Brodex auth task-local, and redact diagnostic
+  environment values by default. The worker sandbox also denies provider source
+  files, sibling worker and harness-session state, fleet authority files,
+  blackopsd state/catalog, corpus state/index, and Unix-socket replacement while
+  preserving the bound journal and socket connection. Provider configuration
+  cannot override fleet-owned scrub, provider, sandbox, or per-session home
+  variables. Pre-auth worker handshakes are limited to 32 concurrent 64 KiB
+  frames so a slow unauthenticated peer cannot exhaust the listener.
+- blackopsd embeds the exact shipped atom, brofile, and workflow catalog at
+  build time and imports it with the installed catalog at startup. Atom
+  execution preserves profile, workflow, deterministic, adapter, and
+  consultant backend semantics plus input/output schemas, effects,
+  composition, and trace metadata instead of flattening every atom into a
+  generic model prompt.
+
 - The whiteboard example (`examples/whiteboard/`) and the docs ADR example
   (`docs/whiteboards.md`) now demonstrate genuine multi-round deliberation
   instead of a single "annotate + vote" pass: an evidence round in the
@@ -62,6 +139,46 @@ out explicitly under `Changed` or `Removed`.
   The example also demonstrates the new per-actor dispatch `timeout` knob.
 
 ### Added
+
+- `fleetd` and `fleet-core` provide the live execution authority: atomic
+  attempt admission, worker supervision and reconnect, provider/account
+  allocation, managed worktree seeding and cleanup, scoped capability routing,
+  roster/SSE projections, and authority/shadow deployment modes.
+- `blackopsd` and `blackops-core` provide durable operation, logical-agent,
+  parent graph, team, mailbox state, workflow/atom definition and invocation
+  intent, waits, approvals, whiteboards, and schedule state. Versioned workflow
+  graphs persist each transition before its effect, retain stable operation IDs
+  across retry generations, resume waits exactly once, and emit durable publish
+  intents and terminal records. Bounded loopback poll sources deny proxies and
+  redirects, derive stable delivery identities, and persist source cursors
+  before admission. Fleet requests and blackbox record publication use durable
+  outboxes and idempotent reconciliation, so any peer may be unavailable without
+  losing accepted intent.
+- blackboxd exposes typed, fail-closed corpus capability and idempotent record
+  ingestion endpoints. Producer cursors and stable record IDs prevent duplicate
+  retained history when fleetd or blackopsd catches up after an outage, and
+  accepted operational records are projected into Tantivy for ordinary corpus
+  search with idempotent startup reconciliation. Fleet transcript receipts now
+  require a corpus-owned private archive plus committed user, assistant, and
+  tool documents through the reported worker sequence; descriptor-only or
+  out-of-root log coordinates cannot advance fleet's indexed cursor.
+- bro-harness now projects model-visible World State as typed, stable sections,
+  restores retained fragments after compaction/resume, tracks context-window
+  lineage and remaining context, and can run a shadow-only lexical lens
+  selector. Native scoped agent tools support spawn, durable queue-only message,
+  follow-up, interrupt, list, status, and wait through the `blackops.agent`
+  capability. Cursor-bearing mailbox effects deliver one copy to the bound live
+  worker at a safe input boundary, survive disconnects, and acknowledge only
+  durable worker admission; follow-up remains a distinct wake-and-run intent.
+- Linux systemd and macOS launchd templates cover blackboxd, blackopsd, and
+  fleetd. Reconnectable worker process groups are preserved across authority
+  replacement, fleetd resolves the platform Blackbox `fleet.json` by default,
+  and health/build identity endpoints support rolling validation.
+- The dependency-clean `blackbox-corpusd` internal boundary is independently
+  buildable. The installed public corpus MCP package still carries migration
+  dependencies until AR-001 completes the handler/state peel; corpus runtime
+  role prevents those compatibility components from becoming operational
+  writers meanwhile.
 
 - Ensemble workflow nodes accept a `board` binding (template → whiteboard
   id) for engine-driven board auto-apply (gap-7fbefe13): each member's

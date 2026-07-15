@@ -380,6 +380,8 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+// Filesystem/process fixtures intentionally exercise diagnostics baselines.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use lsp_types::DiagnosticSeverity;

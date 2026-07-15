@@ -214,9 +214,21 @@ pub(crate) fn cleanup_policy_file_when_done(
 pub(crate) fn try_acquire_resume_lease(
     task_store: &RwLock<TaskStore>,
     leases: &orchestration::resume_lease::ResumeLeaseRegistry,
+    worker_registry: &orchestration::worker_registry::WorkerRegistry,
     provider: Provider,
     session_id: &str,
 ) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    if let Some(active_task) = task_store.read().all_tasks().into_iter().find_map(|task| {
+        let inner = task.inner.lock();
+        (inner.provider == provider
+            && inner.session_id == session_id
+            && worker_registry.owns_task(&bro_core::TaskId::new(&inner.id)))
+        .then(|| inner.id.clone())
+    }) {
+        return Err(format!(
+            "session {session_id} for provider {provider} is still owned by draining worker task {active_task}; wait for worker closeout before resuming"
+        ));
+    }
     if let Some(lease) = leases.try_acquire(provider, session_id) {
         return Ok(lease);
     }
@@ -244,9 +256,19 @@ pub(crate) fn running_task_for_session(
 pub(crate) fn release_resume_lease_when_done(
     task: std::sync::Arc<orch::Task>,
     lease: tokio::sync::OwnedMutexGuard<()>,
+    worker_registry: std::sync::Arc<orchestration::worker_registry::WorkerRegistry>,
 ) {
     tokio::spawn(async move {
+        let task_id = bro_core::TaskId::new(task.id());
         orch::wait_for_task(&task).await;
+        // A cancelled Task becomes user-visible immediately, but its worker may
+        // still be draining an active provider turn and writing the shared
+        // resume snapshot. Keep the provider/session single-flight lease until
+        // worker authority is Terminal/Lost. Compatibility tasks have no
+        // worker record and pass through immediately.
+        while worker_registry.owns_task(&task_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         drop(lease);
     });
 }

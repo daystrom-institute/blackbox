@@ -181,6 +181,9 @@ pub struct IdentityRegistry {
 }
 
 impl IdentityRegistry {
+    // Registry construction synchronously creates and loads the durable cache
+    // before the registry becomes visible to event routing.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)
             .with_context(|| format!("creating identity registry dir {}", root.display()))?;
@@ -261,6 +264,8 @@ impl IdentityRegistry {
         self.root.join(scope).join(format!("{instance}.json"))
     }
 
+    // Reload replaces the cache from one synchronous filesystem snapshot.
+    #[allow(clippy::disallowed_methods)]
     pub fn reload(&self) -> Result<()> {
         let mut cache = HashMap::new();
         if !self.root.exists() {
@@ -307,6 +312,9 @@ impl IdentityRegistry {
         Ok(())
     }
 
+    // Identity publication waits for its atomic synchronous store update
+    // before replacing the cache and clearing the provisioning marker.
+    #[allow(clippy::disallowed_methods)]
     pub fn upsert(&self, identity: &ExternalIdentity) -> Result<()> {
         validate_external_identity(identity)?;
         let path = self.scope_path(&identity.scope, &identity.instance);
@@ -370,6 +378,9 @@ impl IdentityRegistry {
     }
 }
 
+// Upsert reads the existing identity vector under the store's synchronous
+// compare-and-replace boundary.
+#[allow(clippy::disallowed_methods)]
 fn load_file(path: &Path) -> Result<Vec<ExternalIdentity>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -388,6 +399,9 @@ fn model_hash_suffix(model: &str) -> String {
 }
 
 #[cfg(test)]
+// Identity fixtures intentionally inspect repo documentation and temporary
+// registry files synchronously.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::tempdir;

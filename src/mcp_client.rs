@@ -25,6 +25,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::Value;
 use tokio::time::timeout;
@@ -196,17 +197,45 @@ async fn stdio_call(
 
 async fn http_call(
     url: String,
-    _headers: BTreeMap<String, String>,
+    mut headers: BTreeMap<String, String>,
     tool_name: &str,
     arguments: serde_json::Map<String, Value>,
 ) -> Result<Value> {
-    // Headers from the registry config aren't yet wired through —
-    // rmcp 1.4's StreamableHttpClientTransport::from_uri is the simple
-    // path; the with-headers builder needs a reqwest::Client we'd have
-    // to construct. For the SASTquatch self-call (loopback, no auth)
-    // the simple path is fine. Add the reqwest builder when the first
-    // remote-HTTP target needs auth headers.
-    let transport = StreamableHttpClientTransport::from_uri(url.clone());
+    if is_local_blackbox_mcp(&url)
+        && !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+    {
+        let cfg = crate::config::load()?;
+        let token_path = std::env::var_os("BLACKBOX_SERVICE_TOKEN_FILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cfg.paths.state_dir.join("service.token"));
+        let token = bro_rpc::ServiceToken::load_or_create(&token_path)
+            .map_err(|error| anyhow!("loading blackbox service token: {error}"))?;
+        let value = token
+            .authorization_header()
+            .to_str()
+            .map_err(|error| anyhow!("invalid blackbox authorization header: {error}"))?
+            .to_string();
+        headers.insert("authorization".into(), value);
+    }
+    let custom_headers = headers
+        .into_iter()
+        .map(|(name, value)| {
+            let name = http::HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid MCP header name '{name}'"))?;
+            let mut value = http::HeaderValue::from_str(&value)
+                .with_context(|| format!("invalid MCP header value for '{name}'"))?;
+            if name == http::header::AUTHORIZATION {
+                value.set_sensitive(true);
+            }
+            Ok((name, value))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>>>()?;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(custom_headers),
+    );
     let client = ()
         .serve(transport)
         .await
@@ -227,6 +256,19 @@ async fn http_call(
     let mut client = client;
     let _ = client.close_with_timeout(Duration::from_secs(2)).await;
     extract_result_value(resp)
+}
+
+fn is_local_blackbox_mcp(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    loopback && url.path().trim_end_matches('/') == "/mcp"
 }
 
 /// Collapse a `CallToolResult` into a single JSON value the engine can

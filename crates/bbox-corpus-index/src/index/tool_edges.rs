@@ -112,6 +112,9 @@ impl ToolEdgeContext {
         }
     }
 
+    // Edge projection reads the indexed working-copy snapshot on the reindex
+    // thread before emitting its sidecar record.
+    #[allow(clippy::disallowed_methods)]
     fn build_file_tool_edge(
         &self,
         event: &ParsedEvent,
@@ -303,12 +306,16 @@ impl ToolEdgeContext {
         Some((project, root, absolute))
     }
 
+    // Scope resolution is a synchronous filesystem operation on the reindex lane.
+    #[allow(clippy::disallowed_methods)]
     fn project_for_cwd(&self, event: &ParsedEvent) -> Option<(&ProjectRecord, PathBuf)> {
         let cwd = event.cwd.as_deref()?;
         let cwd = fs::canonicalize(cwd).ok()?;
         self.project_for_absolute_path(&cwd)
     }
 
+    // Registered roots are canonicalized synchronously on the reindex lane.
+    #[allow(clippy::disallowed_methods)]
     fn project_for_absolute_path(&self, absolute: &Path) -> Option<(&ProjectRecord, PathBuf)> {
         self.projects
             .iter()
@@ -436,6 +443,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use bro_transcript::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind};

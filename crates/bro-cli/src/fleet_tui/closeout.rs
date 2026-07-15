@@ -317,6 +317,8 @@ fn resolve_project_closeout(worktree: &str) -> Result<Option<ProjectCloseout>, S
 /// Resolve the base repo backing a managed worktree via
 /// `git --git-common-dir` (`<base>/.git` → `<base>`). Used to key
 /// `project_closeout`/`project_dispatch` by canonical repo path.
+// Closeout preflight performs this bounded synchronous identity probe before dispatch.
+#[allow(clippy::disallowed_methods)]
 pub(super) fn base_repo_of_worktree(worktree: &str) -> Option<PathBuf> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -483,7 +485,6 @@ pub(super) fn install_closeout(app: &mut App, msg: CloseoutMsg) {
             // operator's decision.
             if let Some(detail) = deferred_divergence_detail(&outcome) {
                 resume_agent_for_assessment(app, &worktree, &detail);
-                return;
             }
             // The outcome line above IS the operator's success/fail signal —
             // it must be read, so a successful fold no longer yanks the
@@ -850,6 +851,8 @@ fn same_path(left: &Path, right: &str) -> bool {
 }
 
 #[cfg(test)]
+// Real git/filesystem fixtures are intentional; helpers below remain grouped by product flow.
+#[allow(clippy::disallowed_methods, clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

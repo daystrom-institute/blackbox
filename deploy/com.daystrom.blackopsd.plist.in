@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.daystrom.blackopsd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/blackopsd</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>BLACKOPSD_STATE_DIR</key>
+    <string>__HOME__/.local/state/blackbox/blackopsd</string>
+    <key>BLACKBOX_SERVICE_TOKEN_FILE</key>
+    <string>__HOME__/.local/state/blackbox/service.token</string>
+    <key>BLACKOPSD_FLEETD_URL</key>
+    <string>http://127.0.0.1:7265</string>
+    <key>BLACKOPSD_BLACKBOXD_URL</key>
+    <string>http://127.0.0.1:7264</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/blackopsd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/blackopsd.log</string>
+</dict>
+</plist>

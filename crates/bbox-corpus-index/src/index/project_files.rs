@@ -118,14 +118,14 @@ pub fn scan_registered_project_files(config: &ReindexConfig) -> Result<Vec<(Stri
     for project in load_project_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
         scan_project_files(&root, &mut files)?;
-        if project.repo_id.is_some() {
-            if let Some(head) = bbox_corpus_core::git::head_fingerprint(&root) {
-                files.push((
-                    super::git_history::git_source_key(&project.project_id),
-                    0,
-                    head,
-                ));
-            }
+        if project.repo_id.is_some()
+            && let Some(head) = bbox_corpus_core::git::head_fingerprint(&root)
+        {
+            files.push((
+                super::git_history::git_source_key(&project.project_id),
+                0,
+                head,
+            ));
         }
     }
     Ok(files)
@@ -229,6 +229,9 @@ pub fn build_project_file_doc(
     doc
 }
 
+// Chunk resolution reads the working-copy snapshot synchronously on the
+// caller's corpus/indexing lane.
+#[allow(clippy::disallowed_methods)]
 pub fn resolve_current_chunk_entity(
     project: &ProjectRecord,
     root: &Path,
@@ -305,6 +308,8 @@ fn classify_project_file(
     }
 }
 
+// File reads and Tantivy writes are serialized by the synchronous writer lane.
+#[allow(clippy::disallowed_methods)]
 fn index_project(
     project: &ProjectRecord,
     root: &Path,
@@ -1181,6 +1186,7 @@ fn snapshot_after_reindex(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::index::build_schema;

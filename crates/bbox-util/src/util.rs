@@ -234,6 +234,9 @@ pub enum LegacyMove {
     SkippedDestinationExists { old: PathBuf, new: PathBuf },
 }
 
+// Legacy migration is a synchronous startup/administrative boundary. It must
+// finish the rename or cross-device copy before configuration paths change.
+#[allow(clippy::disallowed_methods)]
 pub fn migrate_legacy_file(old: &Path, new: &Path) -> anyhow::Result<LegacyMove> {
     if !old.exists() {
         return Ok(LegacyMove::SkippedMissing {
@@ -287,6 +290,9 @@ pub fn resolve_tilde(path: &str) -> PathBuf {
     }
 }
 
+// The migration walks legacy roots synchronously before the daemon publishes
+// its resolved storage layout.
+#[allow(clippy::disallowed_methods)]
 pub fn migrate_legacy_defaults(home: &Path) -> anyhow::Result<Vec<String>> {
     let mut moved = Vec::new();
 
@@ -373,6 +379,9 @@ pub fn migrate_legacy_defaults(home: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 #[cfg(test)]
+// Migration fixtures intentionally construct and inspect temporary on-disk
+// layouts using the same synchronous boundary as production startup.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::tempdir;

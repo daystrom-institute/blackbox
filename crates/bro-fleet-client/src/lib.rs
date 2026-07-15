@@ -15,6 +15,7 @@
 mod config;
 mod fleet;
 mod mcp;
+mod service_auth;
 mod tail;
 mod task;
 
@@ -22,7 +23,7 @@ pub use bro_protocol::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,
     PhaseResult, SERVICE_TIER_DEFAULT, SERVICE_TIER_PRIORITY,
 };
-pub use config::{bro_home, daemon_port};
+pub use config::{bro_home, daemon_port, service_authorization_header, service_token_path};
 pub use fleet::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, CloseoutEvent,
     DEFAULT_CLASSIFIER_PROMPT, DispatchSpec, FleetConfig, FleetOrchestrator, HookOnFail,

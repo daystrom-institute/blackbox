@@ -146,6 +146,7 @@ async fn build_surface(mcp_config: Option<&str>) -> IsolateSurface {
 /// edit sinks are wired so `edits.*`/`shell_run` also work when exercised.
 fn make_cx(root: PathBuf) -> ToolCx {
     ToolCx {
+        invocation_id: None,
         root,
         safety: Arc::new(SafetyPolicy::new()),
         http: reqwest::Client::new(),
@@ -223,8 +224,15 @@ async fn execute_cell_sources(
     let mut results = Vec::with_capacity(sources.len());
 
     let execution_result = async {
-        for source in sources {
-            let result = exec.call(json!({ "source": source }), cx).await;
+        for (cell_index, source) in sources.into_iter().enumerate() {
+            // Provider-backed turns carry the provider's stable tool-call id.
+            // Isolate owns an ephemeral code-mode session instead, so the
+            // source ordinal is its stable, collision-free identity within
+            // that session. Distinct ids are load-bearing for multi-cell
+            // runs: each fresh V8 cell restarts nested call ordinals, so a
+            // reused outer id could conflate durable downstream effects.
+            let exec_cx = cx.for_invocation(format!("isolate-exec-{cell_index}"));
+            let result = exec.call(json!({ "source": source }), &exec_cx).await;
             let result = drive_cell_to_completion(result, &wait, cx, cell_timeout).await?;
             let is_error = result.is_error();
             results.push(result);
@@ -436,15 +444,15 @@ async fn main() -> Result<()> {
         json!({})
     };
 
-    if cli.strict {
-        if let Some(file) = input.get("file").and_then(Value::as_str) {
-            let resolved = root.join(file);
-            if !resolved.exists() {
-                bail!(
-                    "--strict: file `{file}` not found under root {}",
-                    root.display()
-                );
-            }
+    if cli.strict
+        && let Some(file) = input.get("file").and_then(Value::as_str)
+    {
+        let resolved = root.join(file);
+        if !resolved.exists() {
+            bail!(
+                "--strict: file `{file}` not found under root {}",
+                root.display()
+            );
         }
     }
 
@@ -458,6 +466,8 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise the isolate CLI surface.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -484,6 +494,56 @@ mod tests {
             ToolResult::Text(t) => assert!(t.contains("7:42"), "got: {t}"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cell_mode_scopes_nested_invocation_identity_per_source() {
+        use async_trait::async_trait;
+
+        struct InvocationEcho;
+
+        #[async_trait]
+        impl Tool for InvocationEcho {
+            fn name(&self) -> &str {
+                "invocation_echo"
+            }
+
+            fn description(&self) -> &str {
+                "Return the stable invocation identity."
+            }
+
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+
+            async fn call(&self, _input: Value, cx: &ToolCx) -> ToolResult {
+                ToolResult::Text(cx.invocation_id().unwrap_or("missing").to_string())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cx = make_cx(dir.path().to_path_buf());
+        let tools = vec![Arc::new(InvocationEcho) as Arc<dyn Tool>];
+        let results = execute_cell_sources(
+            vec![
+                "text(await tools.invocation_echo({}));".to_string(),
+                "text(await tools.invocation_echo({}));".to_string(),
+            ],
+            &cx,
+            &tools,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            &results[0],
+            ToolResult::Text(text) if text == "isolate-exec-0:code:tool-1"
+        ));
+        assert!(matches!(
+            &results[1],
+            ToolResult::Text(text) if text == "isolate-exec-1:code:tool-1"
+        ));
     }
 
     #[tokio::test]

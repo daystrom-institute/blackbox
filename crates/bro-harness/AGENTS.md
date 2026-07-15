@@ -54,6 +54,17 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
 - Sessions persist after every turn (a bidi session is routinely SIGTERMed);
   resume reconstructs from the session file. Anything that must survive a
   resume belongs in persisted session state, not loop locals.
+- Typed agent mailbox bodies and their contiguous cursor persist before worker
+  admission is acknowledged. Queue-only sends never wake an idle loop;
+  followups wake once, and replay after restart cannot append the body twice.
+- Every worker reconnect projects a fresh monotonic service policy before
+  replayed input can start a provider turn. Disconnect revokes remote tool
+  visibility and held proxies immediately; a later grant restores the same
+  session proxy and updates typed service availability before the next turn.
+- Provider tool-call identity is durable effect identity. Flat dispatch scopes
+  `ToolCx` with the provider ID; nested code-mode calls derive an ID from the
+  outer call plus their deterministic runtime ordinal. Capability RPC keeps
+  that identity separate from its ephemeral request/response `call_id`.
 
 ## Deferred tool surface
 
@@ -76,6 +87,10 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
   / explicit paths exist for exactly this; the sessions dir resolves from
   `BRO_HOME`, so a leaked env var writes into the operator's real session
   store.
+- Daemon workers capture provider credentials into task-local transport state,
+  then remove the complete spawn scrub manifest from process-global env before
+  any shell or MCP child can start. Service bearer values and paths are never
+  worker inputs.
 
 ## Responses transport
 

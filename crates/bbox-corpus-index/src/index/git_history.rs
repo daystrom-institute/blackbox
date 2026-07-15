@@ -259,6 +259,8 @@ fn indexable_commit_message(message: &str) -> String {
     format!("{}{}", &message[..end], TRUNCATED_COMMIT_MESSAGE_SUFFIX)
 }
 
+// Git-history ingestion is synchronous and runs inside the index writer lane.
+#[allow(clippy::disallowed_methods)]
 fn load_git_meta(path: &Path) -> Result<GitIngestMeta> {
     if !path.exists() {
         return Ok(GitIngestMeta::default());
@@ -266,6 +268,8 @@ fn load_git_meta(path: &Path) -> Result<GitIngestMeta> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
+// Persisting the ingest cursor is part of the synchronous index writer lane.
+#[allow(clippy::disallowed_methods)]
 fn save_git_meta(path: &Path, meta: &GitIngestMeta) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -314,6 +318,7 @@ pub fn current_chunk_targets(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::collections::HashMap;
     use std::path::Path;

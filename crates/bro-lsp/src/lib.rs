@@ -1458,7 +1458,7 @@ fn marked_string_is_empty(value: &lsp_types::MarkedString) -> bool {
 }
 
 fn format_wait_duration(duration: Duration) -> String {
-    if duration.as_millis() % 1000 == 0 {
+    if duration.as_millis().is_multiple_of(1000) {
         format!("{}s", duration.as_secs())
     } else {
         format!("{}ms", duration.as_millis())

@@ -1,0 +1,21 @@
+[Unit]
+Description=Blackbox operational intent authority
+After=network.target blackbox.service
+Wants=blackbox.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/blackopsd
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=blackopsd=info
+Environment=BLACKOPSD_STATE_DIR=%h/.local/state/blackbox/blackopsd
+Environment=BLACKBOX_SERVICE_TOKEN_FILE=%h/.local/state/blackbox/service.token
+Environment=BLACKOPSD_FLEETD_URL=http://127.0.0.1:7265
+Environment=BLACKOPSD_BLACKBOXD_URL=http://127.0.0.1:7264
+WorkingDirectory=%h
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -91,6 +91,9 @@ pub struct CheckoutContext {
 /// exactly what a caller scoping a query wants. Returns `None` for paths no
 /// registered project owns; callers keep their existing fallback
 /// (deterministic path-hash id, raw filter, etc.).
+/// Synchronous checkout-resolution boundary used by corpus indexing and
+/// request-side blocking lanes.
+#[allow(clippy::disallowed_methods)]
 pub fn resolve_base_project_for_scope<'a>(
     path: &str,
     projects: &'a [ProjectRecord],
@@ -123,6 +126,7 @@ struct ProjectStoreView {
 /// file. Returns an empty list when the file does not exist. This is the
 /// thin static read used by index passes; registry mutation stays with the
 /// daemon-side `ProjectRegistry`.
+#[allow(clippy::disallowed_methods)] // synchronous index-pass snapshot load
 pub fn load_project_records(
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<Vec<ProjectRecord>> {

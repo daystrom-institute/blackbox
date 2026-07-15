@@ -688,6 +688,7 @@ impl BlackboxServer {
         let resume_lease = match try_acquire_resume_lease(
             &self.state.task_store,
             self.state.resume_leases.as_ref(),
+            self.state.worker_registry.as_ref(),
             provider,
             &session_id,
         ) {
@@ -788,7 +789,11 @@ impl BlackboxServer {
             );
         }
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-        release_resume_lease_when_done(task.clone(), resume_lease);
+        release_resume_lease_when_done(
+            task.clone(),
+            resume_lease,
+            self.state.worker_registry.clone(),
+        );
 
         if let Some(bro_name) = &p.bro {
             self.record_task_to_bro(bro_name, &task);
@@ -1401,6 +1406,7 @@ impl BlackboxServer {
                     let resume_lease = match try_acquire_resume_lease(
                         &self.state.task_store,
                         self.state.resume_leases.as_ref(),
+                        self.state.worker_registry.as_ref(),
                         effective_provider,
                         sid,
                     ) {
@@ -1453,7 +1459,11 @@ impl BlackboxServer {
                         bro_core::Origin::AgentDispatch,
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
-                    release_resume_lease_when_done(t.clone(), resume_lease);
+                    release_resume_lease_when_done(
+                        t.clone(),
+                        resume_lease,
+                        self.state.worker_registry.clone(),
+                    );
                     t
                 } else {
                     launched.push(json!({
@@ -1800,6 +1810,7 @@ impl BlackboxServer {
         let resume_lease = try_acquire_resume_lease(
             &self.state.task_store,
             self.state.resume_leases.as_ref(),
+            self.state.worker_registry.as_ref(),
             provider,
             session_id,
         )?;
@@ -1842,7 +1853,7 @@ impl BlackboxServer {
             bro_core::Origin::AgentDispatch,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-        release_resume_lease_when_done(task, resume_lease);
+        release_resume_lease_when_done(task, resume_lease, self.state.worker_registry.clone());
         Ok(task_id)
     }
 
@@ -1974,14 +1985,28 @@ impl BlackboxServer {
         // in-flight work is interrupted before cancel_task records the status.
         let _ = self.state.cancel_arc(&p.task_id);
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
-            Ok(()) => {
-                let mut inner = task.inner.lock();
-                inner.live_cursor += 1;
-                let _ = self.state.tail_tx.send(TailEvent::TaskCancelled {
-                    cursor: inner.live_cursor,
-                    task_id: inner.id.clone(),
-                    elapsed: orch::format_elapsed(inner.started_at, inner.completed_at),
-                });
+            Ok(worker_owned) => {
+                if worker_owned {
+                    if let Err(error) = orch::drain_pending_worker_terminal_publication(
+                        &task,
+                        &self.state.tail_tx,
+                        &p.task_id,
+                        Some(self.state.system_events.clone()),
+                        &self.state.task_store,
+                        &self.state.store_dir,
+                    ) {
+                        tracing::warn!(task_id = %p.task_id, %error, "cancel lifecycle publication deferred to repair sweep");
+                    }
+                } else {
+                    let mut inner = task.inner.lock();
+                    inner.live_cursor += 1;
+                    let _ = self.state.tail_tx.send(TailEvent::TaskCancelled {
+                        cursor: inner.live_cursor,
+                        task_id: inner.id.clone(),
+                        elapsed: orch::format_elapsed(inner.started_at, inner.completed_at),
+                    });
+                }
+                let inner = task.inner.lock();
                 Self::ok_json(&json!({
                     "taskId": inner.id,
                     "sessionId": inner.session_id,

@@ -47,6 +47,7 @@ pub fn indexable_roadmap_item(item: &RoadmapItem) -> bool {
     !matches!(item.status, bbox_stores::roadmap::RoadmapStatus::Rejected)
 }
 
+#[allow(clippy::disallowed_methods)] // Called only by the IndexWriterActor reindex pass.
 pub fn reindex_roadmap_store_standalone(
     roadmap_path: &Path,
     fields: FieldHandles,
@@ -75,6 +76,7 @@ pub fn reindex_roadmap_store_standalone(
 }
 
 /// Apply a roadmap upsert to an already-held writer (no commit).
+#[allow(clippy::disallowed_methods)] // Runs only inside IndexWriterActor's single-writer lane.
 pub fn apply_roadmap_upsert(
     writer: &mut IndexWriter,
     fields: FieldHandles,
@@ -102,6 +104,8 @@ pub fn apply_roadmap_delete(
     Ok(())
 }
 
+// Reindex metadata is synchronously sampled inside the writer actor's pass.
+#[allow(clippy::disallowed_methods)]
 fn file_meta(path: &Path) -> Option<FileMeta> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta

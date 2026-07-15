@@ -1,20 +1,42 @@
 # blackbox
 
-Single daemon for AI dev tooling: hybrid (BM25 + vector + path-token)
-search across Claude Code / Codex / Copilot / Vibe / Gemini transcripts
-**plus** registered project source code, an agentic graph projection
-over the same substrate (12 entity types, 7 edge families, ~1.1M
-indexed docs / ~1.9M edges as of this writing), a unified knowledge
-store rendered into each provider's markdown files, work-thread
-tracking, and multi-provider agent orchestration with a live
-multi-lane tail TUI. Backed by [tantivy](https://github.com/quickwit-oss/tantivy)
-(Rust) and HNSW vector partitions per provider+model+dim combination.
-Voyage `voyage-code-3` (1024d) is the default embedding provider; Ollama
-`nomic-embed-text` (768d) supported as a local fallback.
+Blackbox is a differentiated runtime for AI development agents. It combines
+hybrid (BM25 + vector + path-token) search across provider transcripts and
+registered source code, durable knowledge, multi-provider orchestration, and a
+live fleet TUI. Runtime authority is deliberately split so corpus maintenance,
+operational automation, and live provider sessions can restart independently:
 
-The crate is `blackbox`. It produces two binaries:
-- **`blackboxd`** - HTTP-MCP daemon (one long-lived user service, shared across all CLIs on the host)
-- **`bro`** - terminal TUI for tailing live orchestration activity
+| Process | Default address | Authority |
+|---|---:|---|
+| **`blackboxd`** | `127.0.0.1:7264` | Flight-data recorder, transcript/index, knowledge, and corpus MCP |
+| **`fleetd`** | `127.0.0.1:7265` | Live attempts, worker processes, provider allocation, worktrees, and control |
+| **`blackopsd`** | `127.0.0.1:7266` | Durable agents, mailbox state, teams, definition/invocation intent, schedules, and operational policy |
+| **`bro-harness`** | private fleetd Unix socket | Provider loop, local tools, V8 code mode, and model-visible World State |
+
+The thin **`bro`** CLI and Fleet TUI talk to fleetd. Workers receive scoped,
+typed capabilities through fleetd. The shared service bearer and its path are
+never projected into the worker environment or protocol, and workers cannot
+dial the three service ports directly. Authority-mode workers run inside a
+mandatory OS sandbox, while their selected provider environment, repository,
+worker journal, and private fleet socket remain available. blackopsd and fleetd
+publish durable operational and attempt/session-coordinate records to
+blackboxd through independent, idempotent outboxes, while each worker keeps its
+own replayable session log.
+
+Remote tools are authorized independently of their visibility. Each dispatch
+may name exact capability operations and versioned atom refs; fleetd persists
+and intersects that request with host policy, and the destination service
+rechecks the resulting attestation. An empty request grants no remote authority,
+and a resumed or child session may inherit or narrow its envelope but cannot
+broaden it.
+
+Before fleetd advances an indexed-event cursor, blackboxd copies the referenced
+log prefix through that exact event into a private corpus-owned archive and
+commits its user, assistant, and tool content to Tantivy. Later or malformed
+suffixes cannot leak into that receipt. Descriptor-only receipts are rejected.
+Backed by [tantivy](https://github.com/quickwit-oss/tantivy) and HNSW
+vector partitions. Voyage `voyage-code-3` (1024d) is the default embedding
+provider; Ollama `nomic-embed-text` (768d) is supported as a local fallback.
 
 **For day-2 operations** - reindexing, re-embedding, compaction,
 post-update checks, key paths, and restore boundaries - see
@@ -25,58 +47,154 @@ mechanics, start at [`docs/internals.md`](docs/internals.md).
 
 ## Quick start
 
-Five steps. After step 5 every agent CLI on your host is talking to the same daemon, your existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content has been imported into one store, and the store is rendered back out to each provider in a consistent layered form.
+Six steps. After step 6 each capable agent CLI has separate corpus, fleet, and
+operational MCP entries, your existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
+content has been imported into one store, and the store is rendered back out to
+each provider in a consistent layered form.
 
 ### 1. Build and install the binaries
 
 ```bash
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
-cargo build --release
+cargo build --release --workspace
 install -m 755 target/release/blackboxd    ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd    ~/.local/bin/blackboxd-dev
+install -m 755 target/release/blackbox-corpusd ~/.local/bin/blackbox-corpusd
+install -m 755 target/release/fleetd       ~/.local/bin/fleetd
+install -m 755 target/release/blackopsd    ~/.local/bin/blackopsd
 install -m 755 target/release/bro          ~/.local/bin/bro
 install -m 755 target/release/bro-harness  ~/.local/bin/bro-harness
 install -d ~/.local/share/blackbox/memories
 cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 ```
 
-`bro-harness` is **required**, not optional: GLM / DeepSeek / Brodex providers
-dispatch through it, and `cargo test` exercises it (the allocator scoring tests
-expect it on `PATH` or `BRO_HARNESS_BIN`). Verify a complete install with:
+`bro-harness` is **required**, not optional: every authority-mode provider
+dispatch runs through it, and the workspace test gates exercise it. fleetd
+resolves it through `FLEETD_BRO_HARNESS_BIN` (the older standalone
+`BRO_HARNESS_BIN` remains useful for harness-specific tests). Verify a complete
+install with:
 
 ```bash
-for b in blackboxd blackboxd-dev bro bro-harness; do command -v "$b" || echo "MISSING: $b"; done
+for b in blackboxd blackboxd-dev blackbox-corpusd fleetd blackopsd bro bro-harness; do command -v "$b" || echo "MISSING: $b"; done
 ```
 
 `~/.local/bin` is on `bro`'s resolution path by default (`BRO_EXTRA_PATH`), so a
 binary installed there resolves even if it isn't on your interactive shell PATH.
 
-### 2. Run `blackboxd` as a systemd user service
+### 2. Run the three user services
+
+Authority-mode fleetd requires an enforced worker sandbox. On macOS it always
+uses the built-in `/usr/bin/sandbox-exec` Seatbelt launcher and rejects an
+external launcher. On Linux, install a dedicated root-owned launcher that
+implements `blackbox-worker-sandbox-v1` before enabling the sample unit. The
+repository does not ship a privileged Linux launcher, and fleetd refuses
+authority mode if the configured launcher is missing, mutable by non-root
+users, or fails its startup probe. See
+[`docs/operations.md`](docs/operations.md#worker-authority-sandbox) for the
+contract and installation checks.
 
 ```bash
-cp deploy/blackbox.service ~/.config/systemd/user/
+install -d ~/.config/systemd/user
+cp deploy/{blackbox,blackopsd,fleetd}.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now blackbox.service
+systemctl --user enable --now blackbox.service blackopsd.service
 ```
 
-One daemon serves every Claude / GLM / DeepSeek / Inception / Codex / Gemini / Copilot / Vibe CLI on the host, so they all share the same tantivy index, knowledge store, and orchestration state. Prod and dev should use separate installed daemon paths even when they come from the same built artifact, so restarting the dev unit never mutates the prod service binary in place. Upgrades: rebuild, `install` (atomic), `systemctl --user restart blackbox`.
+Linux authority mode is unavailable until the operator installs the conforming
+root-owned launcher. After that launcher passes its self-test, enable fleetd:
+
+```bash
+systemctl --user enable --now fleetd.service
+```
+
+Without the launcher, leave fleetd disabled. Corpus and operational state remain
+available, but Linux live provider dispatch is intentionally unavailable.
+
+The services tolerate dependency outages and reconcile after restart. Start
+blackboxd first on a fresh install, then blackopsd and fleetd as shown above.
+The first process creates `~/.local/state/blackbox/service.token` with owner-only
+permissions. Every non-health HTTP route requires that bearer credential;
+`bro`, fleetd, blackopsd, and bro-slack load it automatically. fleetd passes
+the canonical path only to its trusted sandbox launcher so the inherited policy
+can deny reads, writes, links, and replacement; it never places the token or
+path in the harness environment, harness arguments, or worker protocol.
+blackboxd defaults to `BLACKBOX_RUNTIME_ROLE=corpus`, which removes its legacy
+control routes and agent/workflow/atom/dispatch MCP tools so fleetd and
+blackopsd remain the only live and operational writers. The temporary
+`compatibility` role is available only for a bounded migration or rollback.
+The dependency-clean `blackbox-corpusd` boundary can independently serve typed
+internal corpus and record traffic and is installed for migration validation.
+The public topology still runs blackboxd while moving the full corpus MCP
+catalog out of the compatibility package, which is tracked in
+`ARCH_RELAYER_LOG.md` and does not restore any legacy execution authority in
+corpus mode.
+Prod and dev should use separate installed corpus-daemon paths even when they
+come from the same build. For upgrades, replace all binaries atomically and
+restart only the owners that changed. Reconnectable bro-harness workers survive
+fleetd replacement and replay from their acknowledged sequence.
 
 Logs live in journald:
 ```bash
-journalctl --user -u blackbox -f
+journalctl --user -u blackbox -u blackopsd -u fleetd -f
 ```
 
-**macOS (no systemd):** `blackboxd` is platform-agnostic — only the service
-wrapper differs. Run it under a launchd user agent (a `~/Library/LaunchAgents/<label>.plist`
-whose `ProgramArguments` invoke `~/.local/bin/blackboxd`, with `RunAtLoad` and
-`KeepAlive`), then `launchctl bootstrap gui/$(id -u) <plist>` to start and
-`launchctl kickstart -k gui/$(id -u)/<label>` to restart after an upgrade. Any
-process supervisor works; the daemon just needs to stay running and listen on
-`127.0.0.1:${BBOX_PORT:-7264}`.
+**macOS (no systemd):** install replacement binaries, sign blackboxd,
+blackopsd, fleetd, and bro-harness with the same persistent code-signing
+identity used by the prior install, then render the three `.plist.in` files by
+replacing `__HOME__` with the absolute home directory. Lint the resulting
+plists and bootstrap the labels in blackboxd, blackopsd, fleetd order. Preserve
+any operator-owned secret settings when replacing an existing plist. A
+binary-only replacement signed by the same identity needs only
+`launchctl kickstart -k`; a plist change requires bootout and bootstrap. The
+fleetd template sets `AbandonProcessGroup=true` so reconnectable workers
+survive authority replacement. Exact commands are in
+[`docs/getting-started.md`](docs/getting-started.md#macos-launchd).
 
-Migration note:
-On first start after the XDG-path change, `blackboxd` automatically moves legacy default stores from `~/.claude-shared/blackbox-{knowledge,threads,notes}.json`, `~/.claude-shared/transcript-index`, and `~/.bro/` into the new XDG defaults, but only when the corresponding new target does not already exist. Explicit env overrides disable that automatic migration for the overridden path.
+```bash
+export BLACKBOX_CODESIGN_IDENTITY="your persistent code-signing identity"
+codesign --force --sign "$BLACKBOX_CODESIGN_IDENTITY" --timestamp=none ~/.local/bin/blackboxd
+codesign --force --sign "$BLACKBOX_CODESIGN_IDENTITY" --timestamp=none ~/.local/bin/blackopsd
+codesign --force --sign "$BLACKBOX_CODESIGN_IDENTITY" --timestamp=none ~/.local/bin/fleetd
+codesign --force --sign "$BLACKBOX_CODESIGN_IDENTITY" --timestamp=none ~/.local/bin/bro-harness
+install -d "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+sed "s|__HOME__|$HOME|g" deploy/com.daystrom.blackbox.plist.in > "$HOME/Library/LaunchAgents/com.daystrom.blackbox.plist"
+sed "s|__HOME__|$HOME|g" deploy/com.daystrom.blackopsd.plist.in > "$HOME/Library/LaunchAgents/com.daystrom.blackopsd.plist"
+sed "s|__HOME__|$HOME|g" deploy/com.daystrom.fleetd.plist.in > "$HOME/Library/LaunchAgents/com.daystrom.fleetd.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.daystrom.blackbox.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.daystrom.blackopsd.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.daystrom.fleetd.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.daystrom.blackbox.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.daystrom.blackopsd.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.daystrom.fleetd.plist"
+```
+
+Restart ownership is narrow:
+
+| Changed artifact | Restart action |
+|---|---|
+| `blackboxd` or corpus/index code | Restart blackboxd; workers and blackops intent continue |
+| `blackopsd` or operational catalog/runtime | Restart blackopsd; live workers continue |
+| `fleetd` or fleet-core | Restart fleetd; workers reconnect and replay |
+| `bro-harness` or provider/tool runtime | Replace the binary; existing workers keep their build and new workers use the replacement |
+| `bro` | Replace or restart the client only |
+
+**Breaking migration checklist:** drain or abandon legacy live attempts before
+cutover, back up all legacy state and service secrets, install one coherent
+release, start blackboxd in `corpus` role, then blackopsd, then fleetd, and
+repoint clients to the three owner endpoints. The new fleetd and blackopsd
+stores do not automatically import legacy live tasks, leases, logical agents,
+mailboxes, workflow runs, waits, approvals, schedules, or system-event runtime
+state. blackopsd does import its embedded shipped definitions and the installed
+artifact catalog. Keep `BLACKBOX_RUNTIME_ROLE=compatibility` only for bounded
+rollback and never run its legacy writers beside both authority services. The
+missing authority-state conversion is tracked as AR-003 in
+[`ARCH_RELAYER_LOG.md`](ARCH_RELAYER_LOG.md).
+
+This is separate from blackboxd's older XDG-path migration. On first start,
+blackboxd can move legacy default corpus and knowledge stores only when the new
+target does not already exist. That path migration does not migrate authority
+state, and explicit path overrides disable it for the overridden target.
 
 ### 2a. Run an isolated dev daemon alongside prod
 
@@ -88,11 +206,15 @@ systemctl --user daemon-reload
 systemctl --user enable --now blackbox-dev.service
 ```
 
-This sample unit listens on `127.0.0.1:7265/mcp` with MCP name `blackbox-dev`, while keeping knowledge/threads/notes/index/render backups under dev-specific XDG paths. It also runs a separate installed binary path, `~/.local/bin/blackboxd-dev`, so dev restarts and binary swaps do not touch the prod service executable.
+This sample unit listens on `127.0.0.1:7274/mcp` with MCP name
+`blackbox-dev`. Port 7265 is reserved for fleetd. The dev service keeps its
+knowledge, threads, notes, index, and render backups under dev-specific XDG
+paths and uses `~/.local/bin/blackboxd-dev`, so dev restarts and binary swaps do
+not touch the production service executable.
 
 ### 2b. Build or develop with Nix, and contributor setup
 
-Nix flake outputs (`nix build .#blackbox`, `nix run .#blackboxd|.#bro`,
+Nix flake outputs (`nix build .#blackbox`, `nix run .#blackboxd|.#blackopsd|.#fleetd|.#bro`,
 `nix develop .`/`.#dev-agent`, `nix flake check`, `nix fmt`), the fully isolated
 dev-agent world, and build-performance guidance (per-worktree target isolation +
 `sccache` via `fleet.json` `project_dispatch`) now live in
@@ -101,18 +223,40 @@ stays focused on installing and running.
 
 ### 3. Connect your CLIs
 
-The daemon listens on `127.0.0.1:7264/mcp` by default. Point every agent CLI at the same URL.
+Configure three MCP entries when a client needs the full product: blackboxd for
+corpus tools, fleetd for live execution tools, and blackopsd for operational
+tools. Provide the same service token through the client's secret or
+environment header facility:
 
-The URL accepts an optional `?surface=<name>` query param that scopes which tools
-are exposed. Use `?surface=interactive` for the normal working set, and switch to
-`?surface=ops` only for admin/operator work. Run `bbox_mcp_surface` to list the
-available surfaces and what each includes.
+```bash
+export BLACKBOX_SERVICE_TOKEN="$(tr -d '\n' < ~/.local/state/blackbox/service.token)"
+```
+
+The blackboxd URL accepts an optional `?surface=<name>` query parameter that
+scopes its corpus tools. Use `?surface=interactive` for the normal working set,
+and switch to `?surface=ops` only for corpus admin work. fleetd and blackopsd
+already expose owner-specific MCP catalogs and do not use blackboxd surfaces.
+Run `bbox_mcp_surface` to list the available blackboxd surfaces.
 
 **Claude Code** - top-level `~/.claude.json` (the `mcpServers` key; some installs keep this under a `~/.claude*` config dir instead — edit whichever your CLI actually reads):
 ```json
 {
   "mcpServers": {
-    "blackbox": { "type": "http", "url": "http://127.0.0.1:7264/mcp" }
+    "blackbox": {
+      "type": "http",
+      "url": "http://127.0.0.1:7264/mcp?surface=interactive",
+      "headers": { "Authorization": "Bearer ${BLACKBOX_SERVICE_TOKEN}" }
+    },
+    "blackbox-fleet": {
+      "type": "http",
+      "url": "http://127.0.0.1:7265/mcp",
+      "headers": { "Authorization": "Bearer ${BLACKBOX_SERVICE_TOKEN}" }
+    },
+    "blackbox-ops": {
+      "type": "http",
+      "url": "http://127.0.0.1:7266/mcp",
+      "headers": { "Authorization": "Bearer ${BLACKBOX_SERVICE_TOKEN}" }
+    }
   }
 }
 ```
@@ -120,18 +264,47 @@ available surfaces and what each includes.
 **Codex CLI** - `~/.codex/config.toml`:
 ```toml
 [mcp_servers.blackbox]
-url = "http://127.0.0.1:7264/mcp"
+url = "http://127.0.0.1:7264/mcp?surface=interactive"
+bearer_token_env_var = "BLACKBOX_SERVICE_TOKEN"
+
+[mcp_servers.blackbox-fleet]
+url = "http://127.0.0.1:7265/mcp"
+bearer_token_env_var = "BLACKBOX_SERVICE_TOKEN"
+
+[mcp_servers.blackbox-ops]
+url = "http://127.0.0.1:7266/mcp"
+bearer_token_env_var = "BLACKBOX_SERVICE_TOKEN"
 ```
 
-Restart each CLI. The first transcript search will auto-build the index (1–3 minutes depending on corpus size).
+Restart each CLI. The first transcript search will auto-build the index.
+
+Do not use a bare `gemini mcp add` or `copilot mcp add` command that cannot
+attach the bearer. If a client cannot securely inject an Authorization header
+from a secret or environment source, use a local authenticated wrapper or a
+secret-aware bridge. `bro mcp call` is the shipped one-off wrapper and loads the
+owner-only token file automatically. Never put the token in a URL, command
+history, committed config, or rendered provider memory.
+
+`bro fleet` and `bro agent` use `http://127.0.0.1:7265` by default. Set
+`FLEETD_URL` for an alternate fleetd endpoint. The older
+`BLACKBOX_FLEET_DAEMON_URL` name remains a compatibility fallback for one
+migration window. Corpus MCP clients continue to use blackboxd on port 7264.
 
 For a dev daemon, add a separate MCP entry instead of replacing prod:
 
 ```json
 {
   "mcpServers": {
-    "blackbox": { "type": "http", "url": "http://127.0.0.1:7264/mcp" },
-    "blackbox-dev": { "type": "http", "url": "http://127.0.0.1:7265/mcp" }
+    "blackbox": {
+      "type": "http",
+      "url": "http://127.0.0.1:7264/mcp",
+      "headers": { "Authorization": "Bearer ${BLACKBOX_SERVICE_TOKEN}" }
+    },
+    "blackbox-dev": {
+      "type": "http",
+      "url": "http://127.0.0.1:7274/mcp",
+      "headers": { "Authorization": "Bearer ${BLACKBOX_DEV_SERVICE_TOKEN}" }
+    }
   }
 }
 ```
@@ -235,84 +408,63 @@ Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMI
 
 ---
 
-## `bro tail` - multi-lane orchestration TUI
+## `bro fleet` and `bro agent`
 
-Live tail one or more bros (named agent instances) side-by-side:
+`bro` is a thin client of fleetd. `bro fleet` opens the multi-agent cockpit;
+`bro agent` opens the same transcript and composer experience for one provider
+session. The clients read fleetd's materialized roster and monotonic SSE stream,
+submit control intent, and tail the worker-owned session event log. They do not
+spawn provider processes or own authoritative task state locally.
 
 ```bash
-bro tail alice bob                  # two specific bros
-bro tail --team review-panel        # every member of a team
-bro tail --provider codex           # all codex bros across all teams
+bro fleet --cwd /home/you/repos/my-app
+bro agent --cwd /home/you/repos/my-app --provider brodex "inspect the failing test"
 ```
 
-Each lane seeds from the bro's session JSONL on disk, then follows it live. Displayed per event:
-- Assistant / user / developer text - markdown rendered, code fences syntax-highlighted via `syntect`.
-- Thinking blocks - italicized.
-- Tool use - name + extracted target (Bash→command, Read/Edit/Write→path, Grep→pattern, etc.).
-- Tool result - size, exit code (when present), preview, error-state color.
-- System signals - session init, compaction, hooks, system-reminders, slash commands - rendered as inline dividers so you can see *why* an agent shifted.
+Programmatic `DispatchSpec` callers can opt a session into remote services with
+`allowed_remote_operations` (capability → exact operation names) and
+`allowed_atom_refs` (exact `atom:name@version` values). The cockpit and bare
+`bro agent` path leave both empty unless an operator-facing integration supplies
+them. A resume with empty fields inherits the durable session envelope; an
+explicit mismatch is rejected.
 
-**Keybindings:**
-
-| Key | Action |
-|---|---|
-| `Tab` / `Shift-Tab` | Cycle selected lane |
-| `f` | Fullscreen toggle on selected lane |
-| `↑`/`↓` or `k`/`j` | Scroll 1 line |
-| `PgUp`/`PgDn` | Scroll one page |
-| `g` / `Home` | Jump to top |
-| `G` / `End` | Jump to bottom (live mode) |
-| `q` / `Esc` / `Ctrl-C` | Quit |
-
-**Mouse:**
-
-| Action | Effect |
-|---|---|
-| Click lane body | Sets that lane as selected |
-| Click + drag on divider | Resize adjacent lanes (±1 col detection, 12-col minimum) |
-| Wheel up/down | Scrolls lane under cursor (no Tab required) |
-
-Footer per lane shows `● LIVE` or `⏸ -N` when scrolled up, plus running counts (text / tool / thinking / signal events). Scroll position stays anchored to content when new events arrive.
-
-Five providers at parity: Claude (`.jsonl`), Codex (`.jsonl`), Gemini (`.json` single-object), Copilot (`session-state/<id>/events.jsonl`), Vibe (`logs/session/.../messages.jsonl`).
+The cockpit can dispatch, steer, interrupt, resume, and close out managed
+worktrees without routing those actions through blackboxd. `FLEETD_URL`
+selects a non-default fleetd endpoint. `bro tail` remains a headless reader for
+the temporary blackboxd compatibility `/tail` stream; it is not available in
+the default `BLACKBOX_RUNTIME_ROLE=corpus` topology.
 
 ---
 
-## `bro orchestrate` - workflow engine
+## Durable workflows and operational automation
 
-Protocol-level orchestration: define a workflow as a mermaid
-state-diagram plus actor/node metadata, then dispatch it. The daemon
-owns the loop; the CLI is a courier. Replaces long skill-prose
-protocols (overmind, crucible) that required the top-most LLM to
-cosplay a state machine across hundreds of turns.
+blackopsd is the sole authority for logical agents, exact immutable atom and
+workflow definitions, invocations, schedules, waits, approvals, integration
+intent, and shared whiteboards. It persists intent before fleetd realizes any
+provider attempt. Restart reconciliation reuses stable operation and provider
+invocation identities, so replay under a new transport call ID does not create
+a second logical effect.
 
-The engine composes rule-packet decisions, hook side-effects,
-sub-arc composition, and external webhook signals into a deterministic
-state machine. Suspendable arcs (Wait nodes), capability-tagged
-actors, operator-blessed registries, and hook gating via packets are
-all first-class.
+The `bro mcp` helper can inspect the operational endpoint directly:
 
 ```bash
-bro orchestrate run <workflow.json> [--project-dir <path>] [--max-steps N] [--dry-run] [--stream]
-bro orchestrate status <thread-id>
-bro orchestrate list [--limit N]
-bro orchestrate peek [<thread-id>]
+bro mcp call blackops_definition_list '{}' --daemon-url http://127.0.0.1:7266
+bro mcp call blackops_invocation_list '{}' --daemon-url http://127.0.0.1:7266
+bro mcp call blackops_workflow_list '{}' --daemon-url http://127.0.0.1:7266
 ```
 
-MCP surface: `bro_orchestrate_run`, `bro_orchestrate_author`,
-`bro_workflow_install`, `bro_webhook_install`, `bro_arc_signal`,
-`bro_arc_status`. Webhook ingress at `POST /webhook/<name>` with
-HMAC-SHA256 signature verification (Forgejo / GitHub / None for
-closed networks).
+Shipped deterministic and adapter atoms can complete locally. Profile atoms
+dispatch through fleetd with their provider, model, effort, persona, tool
+filter, code-mode, service-tier, and output-schema semantics intact.
+Atom-binding workflows compose exact child references, and consultant atoms
+retain one durable logical agent across follow-ups. Input and output JSON
+Schemas fail closed.
 
-> **See [Workflow Engine](docs/workflows.md) for the canonical reference** -
-> ArcContext templating, hook ops, Wait/signal correlation,
-> subworkflow imports/exports, capability tags, webhook routing,
-> operator-blessed registries, audit surfaces, and authoring loops.
->
-> **End-to-end example**: [Keystone example](examples/keystone/keystone-example.md)
-> wires Forgejo issues → implementer subworkflow → reviewer ensemble
-> → wait-loop until merged → cleanup hooks. Real LLM dispatch.
+The older `bro orchestrate` courier and its `/orchestrate`, `/webhook`, and
+`bro_orchestrate_*` surfaces remain migration-only compatibility paths on
+blackboxd. They are absent in the default corpus role. See
+[`docs/workflows.md`](docs/workflows.md) for workflow authoring concepts and
+the compatibility migration boundary.
 
 ---
 
@@ -382,61 +534,68 @@ See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative - quick refere
 | `bbox_thread` | Manage long-running work threads - friendly names, edges to other threads/sessions, notes. |
 | `bbox_thread_list` | List / scan threads (open / active / stale by default). |
 
-### Multi-provider orchestration (`bro_*`)
+### Live execution (`bro_*`, served by fleetd)
 
-Dispatch agent tasks to Claude, GLM, DeepSeek, Inception, Codex, Copilot, Vibe, or Gemini and coordinate them as teams.
+Dispatch and control provider sessions through the single live-execution
+authority. The fleet MCP endpoint is `http://127.0.0.1:7265/mcp` and uses the
+same bearer token as the other services.
 
 | Tool | Description |
 |---|---|
 | `bro_exec` | Launch an agent task. Returns `{taskId, sessionId}` immediately. |
 | `bro_resume` | Resume a previous agent session with a follow-up prompt. Single-flight per provider session: wait or cancel the prior task before resuming the same session again. |
-| `bro_wait` / `bro_when_all` / `bro_when_any` | Block until one / all / first task(s) complete. Emits MCP progress notifications (client-echoed `progressToken`) with a multi-lane activity snapshot every 15s. |
-| `bro_broadcast` | Send the same prompt to every team member. Resumed members obey the same single-flight session rule as `bro_resume`. |
+| `bro_wait` | Wait for one task with a bounded timeout. |
 | `bro_status` | Non-blocking progress check. |
-| `bro_cancel` | Send SIGTERM to a running task. |
+| `bro_steer` / `bro_interrupt` | Queue user steering or interrupt the current worker turn. |
+| `bro_cancel` | Persist an idempotent graceful cancellation. |
+| `bro_roster` | Read fleetd's complete materialized roster. |
 | `bro_dashboard` | List recent tasks and sessions. |
-| `bro_providers` | Show configured providers, binaries, and model/effort catalogs. |
-| `bro_brofile` | Manage brofile templates and named accounts. |
-| `bro_team` | Manage team templates and live teams. |
+| `bro_closeout` | Run phased managed-worktree closeout under fleet authority. |
 
-### Atoms (`atom_*`)
+### Operational intent (`blackops_*`, served by blackopsd)
 
-| Tool | Description |
-|---|---|
-| `atom_list` / `atom_search` | Browse installed first-class capability artifacts by subcontract, cost, provenance, or semantic query. |
-| `atom_get` / `atom_describe` | Inspect an atom contract, implementation kind, effects, composition policy, and trace policy. |
-| `atom_invoke` | Invoke an atom through its implementation path (`profile`, `workflow`, `deterministic`, or `adapter`). Returns an owned invocation handle. |
-| `atom_status` | Read the normalized trace envelope for an invocation. Ownership-gated. |
-| `atom_resume` / `atom_delegate` | Resume profile-backed invocations or grant ownership to another caller. |
-
-Full reference in [`docs/atoms.md`](docs/atoms.md).
-
-### Workflow engine (`bro_*`)
+blackopsd serves its MCP endpoint at `http://127.0.0.1:7266/mcp`. It owns
+logical agents, exact versioned definitions, invocations, workflows, schedules,
+waits, approvals, integration intents, and whiteboards.
 
 | Tool | Description |
 |---|---|
-| `bro_orchestrate_run`     | Dispatch a workflow spec; blocks until termination (or use `--stream`). |
-| `bro_orchestrate_author`  | Compile a prose charter into a validated spec via an authoring LLM. |
-| `bro_workflow_install` / `bro_workflow_list`  | Operator-blessed workflow registry (referenced by id from webhook routing + sub-arc lookup). |
-| `bro_webhook_install` / `bro_webhook_list`    | Operator-blessed webhook ingress (HMAC-SHA256, Extractor projection, routing-packet dispatch). |
-| `bro_arc_signal`          | Manually deliver a signal to a pending Wait (debug / rescue path). |
-| `bro_arc_status`          | Read-only snapshot of running arc + pending waits. |
+| `blackops_agent_spawn` / `blackops_agent_followup` | Commit logical child or follow-up intent; fleetd later realizes the concrete attempt. |
+| `blackops_agent_send` / `blackops_agent_interrupt` | Queue-only mailbox delivery or durable interruption intent. |
+| `blackops_agent_list` / `blackops_agent_status` / `blackops_agent_wait` | Observe the caller's authorized logical tree. |
+| `blackops_atom_invoke` | Invoke an exact immutable `atom:<name>@vN` definition. |
+| `blackops_definition_install` / `blackops_definition_list` | Install or inspect immutable atom and workflow definitions. |
+| `blackops_invocation_request` / `blackops_invocation_list` / `blackops_invocation_status` | Create and observe durable invocation intent. |
+| `blackops_schedule_*` | Store schedules and admit due, webhook, or bounded poll occurrences idempotently. |
+| `blackops_wait_*` / `blackops_approval_*` / `blackops_whiteboard_*` | Operate durable coordination state. |
 
-Full reference and authoring guide in [Workflow Engine](docs/workflows.md).
+The shipped atom catalog is compiled into blackopsd and imported as exact
+immutable versions at startup. Definition artifacts under
+`~/.local/state/blackbox/artifacts` are imported into the same authority.
+Deterministic and adapter atoms complete locally with durable output; profile
+atoms preserve their brofile provider, persona, tool filter, code-mode, service
+tier, and output contract when they dispatch through fleetd; atom-binding
+workflows compose exact child atoms; consultant turns retain one durable logical
+agent across follow-ups. Input and output JSON Schemas fail closed.
 
 ### HTTP endpoints (non-MCP)
 
 | Path | Description |
 |---|---|
-| `GET /mcp` | MCP streamable-HTTP transport. All client CLIs connect here. |
-| `GET /tail` | SSE stream of orchestration lifecycle events. Filter via `?team=`/`?bro=`/`?provider=`. |
-| `GET /roster` | Resolves `?bros=a,b&team=X&provider=Y` selectors → `[{bro, team, provider, session_id, jsonl_path, model}]`. Used by `bro tail` to locate transcript files. |
-| `POST /webhook/<name>`        | External-event ingestion → routing packet → `start_arc`/`signal_arc`/`cancel_arc`/`ignore`/`dead_letter`. See [Workflow Engine](docs/workflows.md#webhook). |
-| `POST /webhook/<name>/replay` | Run a payload through the extractor + routing packet without dispatching. Debug aid. |
-| `POST /orchestrate`           | Dispatch a full workflow spec (JSON body). |
-| `POST /orchestrate/by-id`     | Dispatch a registry-installed workflow by id with optional `initial_vars`. |
-| `GET /orchestrate/peek`       | Live in-flight arc snapshots. |
-| `POST /admin/{packet/compile,workflow/install,webhook/install,brofile/upsert,team/upsert}` | Plain-HTTP admin shortcuts for install scripts that can't speak rmcp's streamable-HTTP transport. |
+| `GET/POST 127.0.0.1:7264/mcp` | blackboxd corpus MCP transport. |
+| `POST 127.0.0.1:7265/mcp` | fleetd execution MCP transport. |
+| `POST 127.0.0.1:7266/mcp` | blackopsd operational MCP transport. |
+| `POST 7264/internal/capability` | Typed, bounded corpus lookup from fleetd. |
+| `POST 7264/internal/records` | Idempotent producer record and transcript-coordinate ingestion. |
+| `POST 7265/control/*` | Low-level execution, resume, wait, steering, cancellation, and closeout control. |
+| `GET 7265/control/roster` / `GET 7265/control/roster/stream` | Materialized fleet snapshot and monotonic SSE deltas used by `bro`. |
+| `POST 7266/internal/capability` | Session-bound agent and atom calls routed by fleetd. |
+| `GET /healthz` / `GET /readyz` on each service | Unauthenticated liveness/readiness and build identity only. |
+
+All other routes require the shared bearer. The old blackboxd `/tail`,
+`/roster`, `/orchestrate`, webhook, and `/control/*` routes exist only in the
+temporary `compatibility` runtime role; they are absent from the default corpus
+role.
 
 ---
 
@@ -464,38 +623,80 @@ Content is capped at 12KB per document. Responses are capped at 80KB to avoid bl
 
 ## Provider catalog
 
-Maintained in `src/orchestration/providers.rs`:
+The shared model and effort catalog lives in
+`crates/bro-core/src/provider.rs`; fleetd owns account discovery, credential
+status, concurrency, quota/cooldown state, and durable lane allocation.
+Authority-mode dispatch currently supports:
 
-- **Claude** - Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
-- **GLM** - Z.AI Coding Plan API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `glm-5.2`, helper model `glm-4.5-air`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-zai` by default). Legacy `zai-coding-plan/...` model slugs are normalized at dispatch.
-- **DeepSeek** - DeepSeek API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `deepseek-v4-pro`, helper model `deepseek-v4-flash`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-ds` by default). Legacy `deepseek/...` model slugs are normalized at dispatch.
-- **Codex** - gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
-- **Copilot** - Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
-- **Vibe**, **Gemini** - model lists only.
+- **GLM** via the Anthropic-compatible transport and
+  `~/.claude-zai/settings.json` by default.
+- **DeepSeek** via the Anthropic-compatible transport and
+  `~/.claude-ds/settings.json` by default.
+- **MiniMax** via the Anthropic-compatible transport and
+  `~/.claude-mm/settings.json` by default.
+- **Brodex** via the OpenAI Responses transport and `CODEX_HOME` or
+  `~/.codex/auth.json`.
+- **VibeBH** via the OpenAI chat-completions transport against Mistral, using
+  `MISTRAL_API_KEY` or `~/.vibe/.env`.
+
+Set `FLEETD_PROVIDER_CONFIG` to a private JSON account file when one provider
+needs multiple named lanes, an explicit default account, a concurrency limit,
+or scoped environment overrides. fleetd refuses a lane whose credential probe
+fails; it does not silently switch providers.
+
+Provider credentials belong to fleetd and are projected only into the selected
+worker session. Corpus and embedding credentials belong to blackboxd.
+Integration and publish credentials belong to blackopsd, or to a dedicated
+secret resolver used by its integration adapter. Do not place model-provider
+credentials in blackboxd or integration credentials in a harness worker.
 
 ---
 
 ## Configuration
 
-Auto-detection works out of the box for most setups. Override via environment variables (typically via a systemd unit drop-in - see *Multi-account example* below).
+Auto-detection works out of the box for most corpus and provider setups.
+Override these values through service-manager environment entries or CLI flags.
+Every configured daemon address and peer URL must remain on loopback.
 
-| Env var | Default | Description |
-|---|---|---|
-| `TRANSCRIPT_SEARCH_ROOTS` | auto-detect `~/.claude` + `~/.claude-*` | Account roots. Format: `name=/path,name2=/path2` |
-| `TRANSCRIPT_SEARCH_CODEX_ROOT` | `~/.codex` if it exists | Codex CLI data directory |
-| `TRANSCRIPT_SEARCH_INDEX_PATH` | `~/.local/share/blackbox/index` | Tantivy index location |
-| `BLACKBOX_MCP_NAME` | `blackbox` | MCP server name used for transient provider injection |
-| `BLACKBOX_STATE_DIR` | `~/.local/state/blackbox` | Base dir for default bbox JSON stores when explicit per-store paths are unset |
-| `BLACKBOX_KNOWLEDGE_PATH` | `<state-dir>/blackbox-knowledge.json` | Knowledge store path |
-| `BLACKBOX_THREADS_PATH` | `<state-dir>/blackbox-threads.json` | Thread store path |
-| `BLACKBOX_NOTES_PATH` | `<state-dir>/blackbox-notes.json` | Notes store path |
-| `BRO_HOME` | `<state-dir>/bro` | Base dir for task store, MCP registry, and Gemini policy tempfiles |
-| `BLACKBOX_REINDEX_INTERVAL_SECS` | `120` | Background reindex interval (seconds) |
-| `BBOX_PORT` / `BRO_PORT` | `7264` | HTTP port for MCP + `/tail` + `/roster` endpoints |
-| `BLACKBOX_GLOBAL_CLAUDE_MD` / `BLACKBOX_GLOBAL_CODEX_MD` / `BLACKBOX_GLOBAL_GEMINI_MD` | provider defaults | Override global render targets; useful for dev instances that must not touch prod memory files |
-| `BLACKBOX_BACKUP_DIR` | `~/.local/state/blackbox/backups` | Managed-region backup root for `bbox_render(scope=global)` |
-| `BLACKBOX_RUST_ANALYZER_BIN` (also `BRO_LSP_RUST_ANALYZER_BIN` / `BRO_RUST_ANALYZER_BIN`) | `rust-analyzer` from `$PATH` | rust-analyzer binary for window-0 harness diagnostics - see *Window-0 diagnostics* below |
-| `RUST_LOG` | `blackbox=info` | Tracing filter |
+| Owner | Env var | Default | Description |
+|---|---|---|---|
+| shared | `BLACKBOX_SERVICE_TOKEN_FILE` | `~/.local/state/blackbox/service.token` | Owner-only bearer used by trusted local HTTP clients and peer daemons. Never expose it to a harness worker. |
+| blackboxd | `BBOX_BIND` / `BBOX_PORT` | `127.0.0.1` / `7264` | Corpus MCP and flight-data-recorder listener. `BRO_PORT` no longer overrides this port. |
+| blackboxd | `BLACKBOX_RUNTIME_ROLE` | `corpus` | `corpus` removes legacy execution/control ownership; `compatibility` temporarily restores migration routes. Values are strict. |
+| blackboxd | `TRANSCRIPT_SEARCH_ROOTS` | auto-detect `~/.claude` and `~/.claude-*` | Account roots in `name=/path,name2=/path2` form. |
+| blackboxd | `TRANSCRIPT_SEARCH_CODEX_ROOT` | `~/.codex` if present | Codex CLI transcript directory. |
+| blackboxd | `TRANSCRIPT_SEARCH_INDEX_PATH` | `~/.local/share/blackbox/index` | Tantivy index location. |
+| blackboxd | `BLACKBOX_STATE_DIR` | `~/.local/state/blackbox` | Base for host-local corpus, knowledge, and compatibility state. |
+| blackboxd | `BLACKBOX_FLEET_TRANSCRIPT_ROOT` | `<state-dir>/fleetd/workers` in the sample unit | Worker-log root from which blackboxd archives acknowledged exact prefixes. |
+| blackboxd | `BLACKBOX_KNOWLEDGE_PATH` / `BLACKBOX_THREADS_PATH` / `BLACKBOX_NOTES_PATH` | files under `<state-dir>` | Explicit host-store overrides. |
+| blackboxd | `BLACKBOX_REINDEX_INTERVAL_SECS` | `120` | Background reindex interval in seconds. |
+| blackboxd | `BLACKBOX_MCP_NAME` | `blackbox` | Corpus MCP server name. |
+| fleetd | `FLEETD_BIND` | `127.0.0.1:7265` | Live execution, roster, and fleet MCP listener. |
+| fleetd | `FLEETD_MODE` | `shadow` for the binary; `authority` in service templates | `shadow` is read-only and never opens the worker socket or process launcher. |
+| fleetd | `FLEETD_STATE_DIR` | `~/.local/state/blackbox/fleetd` | Attempts, commands, leases, worker metadata, outbox, and materialized fleet state. |
+| fleetd | `FLEETD_BRO_HARNESS_BIN` | `bro-harness` | Trusted absolute harness executable in production templates. |
+| fleetd | `FLEETD_WORKER_SANDBOX_LAUNCHER` | none | Required root-owned external launcher in Linux authority mode; rejected on macOS, which always uses Seatbelt. |
+| fleetd | `FLEETD_BLACKOPSD_STATE_DIR` / `FLEETD_BLACKOPSD_CATALOG_DIR` / `FLEETD_CORPUS_STATE_DIR` / `FLEETD_CORPUS_INDEX_DIR` | peer-service defaults | Canonical peer-service authority roots denied to every worker. Override all affected roots when blackopsd or blackboxd uses nondefault state, catalog, or index paths. |
+| fleetd | `FLEETD_BLACKBOXD_URL` / `FLEETD_BLACKOPSD_URL` | unset by the binary; sample units use ports 7264/7266 | Loopback peers for corpus records/capabilities and operational capabilities. Missing routes fail closed. |
+| fleetd | `FLEETD_ALLOWED_CAPABILITIES` | empty | Static authorization labels such as `corpus,blackops.agent,atom`; this does not assert live availability. |
+| fleetd | `FLEETD_PROVIDER_CONFIG` | standard provider homes | Optional private provider-account and lane configuration. |
+| fleetd | `FLEETD_FLEET_CONFIG` / `FLEETD_WORKTREE_ROOT` | `fleet.json` beside the selected Blackbox config / `<state-dir>/worktrees` | Project dispatch environment, seed directories, closeout policy, and managed-worktree root. |
+| client | `FLEETD_URL` | `http://127.0.0.1:7265` | fleetd endpoint used by `bro fleet` and `bro agent`. |
+| blackopsd | `BLACKOPSD_BIND` | `127.0.0.1:7266` | Operational MCP and internal capability listener. |
+| blackopsd | `BLACKOPSD_STATE_DIR` | `~/.local/state/blackbox/blackopsd` | Durable logical agents, definitions, invocations, workflow runs, schedules, waits, approvals, and integration state. |
+| blackopsd | `BLACKOPSD_CATALOG_DIR` | `~/.local/state/blackbox/artifacts` | Existing operator-installed artifacts imported alongside the embedded shipped catalog. |
+| blackopsd | `BLACKOPSD_FLEETD_URL` / `BLACKOPSD_BLACKBOXD_URL` | ports 7265 / 7264 | Loopback realization and record peers. |
+| blackopsd | `BLACKOPSD_DEFAULT_PROVIDER` / `BLACKOPSD_DEFAULT_MODEL` | `glm` / `glm-4.7` | Fallback for generic manually installed definitions that do not resolve a shipped profile. |
+| harness | `BLACKBOX_RUST_ANALYZER_BIN` (also `BRO_LSP_RUST_ANALYZER_BIN` / `BRO_RUST_ANALYZER_BIN`) | `rust-analyzer` from `PATH` | rust-analyzer used for window-0 diagnostics. |
+| all | `RUST_LOG` | service-specific `info` filter in templates | Tracing filter. |
+
+Configured capability labels and current service availability are separate.
+fleetd probes blackboxd and blackopsd readiness, durably advances a complete
+monotonic session-policy revision, then sends it over the same authenticated
+worker socket. bro-harness applies the update at a safe session boundary,
+updates the model-visible service-availability World State, and revokes or
+restores the affected remote tools. A healthy worker does not need to reconnect
+after a downstream outage or recovery.
 
 ### Auto-detection
 
@@ -522,9 +723,10 @@ it pulls rust-analyzer and rides a diagnostics summary onto that edit's tool
 result, synchronously, so the agent sees what its edit produced before acting
 again. This needs **`rust-analyzer` reachable by the dispatched harness process**.
 
-The catch: a dispatched harness inherits the *daemon's* environment, and
-`~/.cargo/bin` (where rustup installs rust-analyzer) is often **not** on the
-daemon's PATH. Make it reachable one of two ways:
+The catch: a dispatched harness receives fleetd's scrubbed, session-scoped
+spawn environment rather than your interactive shell environment.
+`~/.cargo/bin` (where rustup installs rust-analyzer) is therefore often absent
+from its `PATH`. Make it reachable one of two ways:
 
 ```bash
 # A) symlink it onto the PATH dir the binaries already live on
@@ -571,25 +773,73 @@ unaffected - you simply get no diagnostics. The feature is Rust-only today.
 
 ## Architecture
 
-- **Tantivy** for full-text indexing with BM25 ranking, phrase queries, and positional indexing.
-- **Separate documents per content block** - each text / thinking / tool_use block is its own document, enabling role-based filtering and precise excerpts.
-- **Incremental indexing** via file mtime/size tracking; background reindex thread runs every 120s.
-- **MCP over streamable HTTP** - `rmcp` crate as transport, axum for auxiliary `/tail` and `/roster` endpoints. Progress notifications echo the caller's `progressToken` per spec.
-- **Knowledge render pipeline** - three-layer composition (steerage → shared memory → per-project PROJECT.md) into provider-specific markdown, with atomic-replace safety and external-edit absorption.
-- **Multi-provider orchestration** - spawns provider CLIs as child processes, streams JSON events, manages task lifecycle, team coordination, and SSE broadcast to `/tail` subscribers.
-- **Atom registry and invocation** - installable `atom:*@vN` capability artifacts with input/output contracts, effect limits, composition policy, and profile/workflow/deterministic/adapter implementations.
-- **Two-layer transcript model** - `parser::TranscriptEvent` (rich, tool-call structured, system-signal aware) for the `bro tail` TUI; projected to `ParsedEvent` for the flat tantivy doc shape.
-- **No LLM calls** - pure local indexing and retrieval. `bbox_topics` uses term frequency, not embeddings.
+- **Authority is partitioned by lifetime.** blackboxd owns durable corpus and
+  knowledge state, fleetd owns concrete live execution, blackopsd owns durable
+  operational intent, and each bro-harness worker owns its provider loop and
+  replayable session state. A service restart cannot silently transfer
+  ownership to another process.
+- **The contract bottom is pure.** `bro-core`, `bro-protocol`, and
+  `bro-capabilities` define IDs, wire values, and capability traits without I/O.
+  `bro-rpc` provides framing, negotiation, and bearer handling immediately
+  above that bottom without depending on an authority implementation.
+  `bro-harness` never depends on the blackbox daemon.
+- **HTTP is same-host and authenticated.** All service listeners and peer URLs
+  are loopback-only. Every route except `/healthz` and `/readyz` requires the
+  owner-only shared bearer. Workers reach daemon capabilities only through the
+  task-scoped private fleet socket.
+- **Worker isolation is kernel-enforced.** macOS authority launch uses a probed
+  Seatbelt profile. Linux authority launch requires a probed root-owned
+  external launcher. Both modes fail closed; there is no direct unsandboxed
+  worker fallback.
+- **Authorization follows live truth.** fleetd keeps configured grants separate
+  from downstream readiness and sends monotonic policy revisions on the worker
+  connection. bro-harness updates World State and its tool registry at safe
+  boundaries, including revocation during an outage and restoration after
+  recovery.
+- **Operational effects are replay-safe.** blackopsd stores immutable
+  definitions, logical agents, mailbox cursors, workflows, waits, schedules,
+  approvals, and integration intents. Durable provider invocation identity is
+  separate from an ephemeral RPC call ID, including nested code-mode effects.
+- **Corpus intake is prefix-exact.** fleetd and blackopsd use independent
+  idempotent record outboxes. For a transcript coordinate, blackboxd validates
+  and privately archives the exact acknowledged log prefix before committing
+  its content and advancing the producer cursor.
+- **Search remains content-granular.** Tantivy stores separate documents for
+  text, thinking, tool calls, and tool results, with BM25, phrase, positional,
+  vector, and path-token retrieval. Incremental indexing uses file metadata and
+  a periodic reindex loop.
+- **Operational definitions retain backend semantics.** blackopsd embeds the
+  shipped atom, brofile, and workflow catalog and preserves profile, workflow,
+  deterministic, adapter, and consultant execution behavior together with
+  schemas, effects, composition, and trace metadata.
+- **Provider calls are isolated from corpus queries.** blackboxd performs local
+  indexing and retrieval, with separately configured embedding providers.
+  Agent LLM traffic occurs only in fleetd-launched bro-harness workers.
 
-Source layout (`src/`):
+Source layout:
 
-- **main.rs** - `rmcp` server with `#[tool]`-annotated handlers, axum routes for `/tail` / `/roster`, progress-notifier plumbing, signal handling.
-- **cli.rs** - `bro` binary. Ratatui TUI with per-lane seed-from-history + live follow, tui-markdown + syntect rendering, crossterm mouse capture.
-- **index/** - Tantivy lifecycle, schema, search / browse / session handlers, incremental reindex thread, session-file discovery.
-- **parser.rs** - Claude / Codex / Gemini / Copilot / Vibe JSONL parsers emitting both rich `TranscriptEvent` and flat `ParsedEvent`.
-- **knowledge.rs**, **render.rs** - Knowledge CRUD and three-layer markdown render pipeline.
-- **threads.rs** - Work-thread tracker.
-- **orchestration/** - Provider catalogs, exec/resume arg builders, brofile/team persistence, task lifecycle, tail event stream, bro-name ↔ session-id resolution.
+- **`src/` and `crates/blackbox-corpus-service/`** contain the blackboxd corpus
+  server, public corpus MCP, typed internal corpus/record boundary, indexing,
+  search, knowledge, rendering, and compatibility-only legacy surfaces.
+- **`crates/bbox-*`** contain corpus-domain leaves such as indexing, vectors,
+  embeddings, code navigation, refactor planning, stores, and MCP tool docs.
+- **`crates/fleet-core/` and `crates/fleetd/`** contain the durable execution
+  model and its sole writer, worker launcher/socket, provider allocator,
+  worktrees, roster/SSE projection, record pump, and fleet MCP/control server.
+- **`crates/blackops-core/` and `crates/blackopsd/`** contain durable
+  operational state, catalog import, invocation/workflow reconciliation,
+  logical-agent mailboxes, schedules, waits, approvals, and operational MCP.
+- **`crates/bro-core/`, `crates/bro-protocol/`, and
+  `crates/bro-capabilities/`** are the pure shared contract bottom.
+  **`crates/bro-rpc/`** is the dependency-light transport immediately above it.
+- **`crates/bro-harness/`**, with `bro-tools`, `bro-code-mode`, `bro-lsp`, and
+  `bro-transcript`, contains the provider loop, session persistence, local tool
+  runtime, V8 cells, World State, capability proxies, and worker supervisor.
+- **`crates/bro-cli/` and `crates/bro-fleet-client/`** contain the thin `bro`
+  command, Fleet cockpit, transcript view, and typed fleet client. They do not
+  link either authority implementation.
+- **`deploy/` and `system-defaults/`** contain service-manager templates and
+  shipped operational, memory, prompt, and MCP-surface artifacts.
 
 ---
 
@@ -598,9 +848,22 @@ Source layout (`src/`):
 Installable blackbox-owned artifacts live in
 [System Defaults](system-defaults/system-defaults.md).
 This includes atoms, Badgey artifacts, refactor personas, agentic-corpus
-producer machinery, and the default MCP surface packet. The daemon does not
-auto-install them; seed only the catalog entries you want with
-`bbox_artifact_install` or the per-kind installer.
+producer machinery, and the default MCP surface packet.
+
+blackopsd is intentionally different from the old opt-in atom registry. Its
+binary embeds the shipped atom, brofile, and workflow sources at build time and
+imports their exact immutable definitions on every startup. It also imports
+existing operator-installed definitions from `BLACKOPSD_CATALOG_DIR`, which
+defaults to `~/.local/state/blackbox/artifacts`. Startup preserves each
+definition's resolved profile or workflow and its input/output schemas,
+effects, composition, and trace policy; it does not flatten every atom into a
+generic prompt dispatch.
+
+This automatic import applies to blackopsd's operational definition catalog,
+not every file under `system-defaults/`. Memory packets, corpus artifacts,
+personas, and MCP surface packets retain their documented copy or per-kind
+installation flow. Do not use `bbox_artifact_install` merely to seed the
+shipped atom definitions into blackopsd; they are already embedded.
 
 For the runtime runbook set, start at the Obsidian navigation map:
 [System Memory Catalog](system-defaults/memories/system-memory-catalog.md).

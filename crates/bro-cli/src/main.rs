@@ -71,7 +71,7 @@ struct FleetArgs {
     #[arg(long, value_name = "DIR")]
     cwd: Option<String>,
     /// Daemon base URL for daemon-backed fleet dispatch/control. Also accepted
-    /// via BLACKBOX_FLEET_DAEMON_URL.
+    /// via FLEETD_URL (or compatibility BLACKBOX_FLEET_DAEMON_URL).
     #[arg(long, value_name = "URL")]
     daemon_url: Option<String>,
     /// Bypass the single-cockpit instance lock and start even if another
@@ -247,11 +247,13 @@ async fn run_tail_stream_printer(sel: TailSelectors) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .build()?;
+    let authorization = bro_fleet_client::service_authorization_header()?;
 
     loop {
         let resp = match client
             .get(&url)
             .header("Accept", "text/event-stream")
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
             .send()
             .await
         {
@@ -338,7 +340,14 @@ async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
         url.push_str(&format!("?thread_id={}", urlencoding_lite(tid)));
     }
     let client = reqwest::Client::new();
-    let resp = client.get(&url).send().await?;
+    let resp = client
+        .get(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            bro_fleet_client::service_authorization_header()?,
+        )
+        .send()
+        .await?;
     let text = resp.text().await?;
     let parsed: serde_json::Value = serde_json::from_str(&text)?;
     if let Some(err) = parsed["error"].as_str() {
@@ -410,7 +419,14 @@ async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let url = format!("{}/orchestrate/list", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let resp = client.get(&url).send().await?;
+    let resp = client
+        .get(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            bro_fleet_client::service_authorization_header()?,
+        )
+        .send()
+        .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -460,7 +476,14 @@ async fn orchestrate_status(args: OrchestrateStatusArgs) -> anyhow::Result<()> {
         urlencoding_lite(&args.thread_id)
     );
     let client = reqwest::Client::new();
-    let resp = client.get(&url).send().await?;
+    let resp = client
+        .get(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            bro_fleet_client::service_authorization_header()?,
+        )
+        .send()
+        .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -513,7 +536,8 @@ fn urlencoding_lite(s: &str) -> String {
 
 async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
     use anyhow::Context;
-    let workflow_raw = std::fs::read_to_string(&args.path)
+    let workflow_raw = tokio::fs::read_to_string(&args.path)
+        .await
         .with_context(|| format!("reading {}", args.path.display()))?;
     let workflow: serde_json::Value = serde_json::from_str(&workflow_raw)
         .with_context(|| format!("parsing {} as JSON", args.path.display()))?;
@@ -540,7 +564,15 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3600))
         .build()?;
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = client
+        .post(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            bro_fleet_client::service_authorization_header()?,
+        )
+        .json(&body)
+        .send()
+        .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -583,7 +615,15 @@ async fn orchestrate_run_stream(base_url: &str, body: &serde_json::Value) -> any
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3600))
         .build()?;
-    let resp = client.post(&url).json(body).send().await?;
+    let resp = client
+        .post(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            bro_fleet_client::service_authorization_header()?,
+        )
+        .json(body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();

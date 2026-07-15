@@ -253,7 +253,7 @@ mod ocr {
     /// Timeout for one `pdftoppm` batch (at most `OCR_BATCH_PAGES` pages).
     const RASTERIZE_TIMEOUT: Duration = Duration::from_secs(60);
     /// Timeout for one `tesseract` page recognition.
-    const TESSERACT_TIMEOUT: Duration = Duration::from_secs(30);
+    const TESSERACT_TIMEOUT: Duration = Duration::from_secs(60);
     /// Wall-clock budget for all OCR work on a single document.
     const DOC_OCR_BUDGET: Duration = Duration::from_secs(300);
 

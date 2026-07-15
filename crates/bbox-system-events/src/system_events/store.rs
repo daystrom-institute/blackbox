@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::types::{JournalEnvelope, SystemEvent};
 
@@ -75,6 +75,41 @@ impl EventStore {
 
     pub fn append(&self, envelope: &JournalEnvelope) -> Result<()> {
         let _guard = self.lock.lock().unwrap();
+        self.append_locked(envelope)?;
+        self.index
+            .lock()
+            .unwrap()
+            .insert(envelope.event.id.clone(), envelope.event.clone());
+        Ok(())
+    }
+
+    /// Append a caller-identified event exactly once. A retry with the same
+    /// event body returns the first durable event. Reusing an ID for a
+    /// different event fails closed.
+    pub fn append_once(&self, envelope: &JournalEnvelope) -> Result<(SystemEvent, bool)> {
+        let _guard = self.lock.lock().unwrap();
+        let mut index = self.index.lock().unwrap();
+        if let Some(existing) = index.get(&envelope.event.id) {
+            let mut candidate = envelope.event.clone();
+            candidate.occurred_at.clone_from(&existing.occurred_at);
+            if &candidate != existing {
+                bail!(
+                    "system event id {} was reused with different content",
+                    envelope.event.id
+                );
+            }
+            return Ok((existing.clone(), false));
+        }
+
+        self.append_locked(envelope)?;
+        index.insert(envelope.event.id.clone(), envelope.event.clone());
+        Ok((envelope.event.clone(), true))
+    }
+
+    // The journal mutex owns this synchronous one-buffer, one-write durability
+    // boundary so an acknowledged append is already on disk.
+    #[allow(clippy::disallowed_methods)]
+    fn append_locked(&self, envelope: &JournalEnvelope) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("creating event journal dir {}", self.root.display()))?;
         let path = self.current_path();
@@ -94,10 +129,6 @@ impl EventStore {
         file.write_all(&record)
             .with_context(|| format!("writing event to {}", path.display()))?;
         file.sync_all()?;
-        self.index
-            .lock()
-            .unwrap()
-            .insert(envelope.event.id.clone(), envelope.event.clone());
         Ok(())
     }
 
@@ -147,6 +178,9 @@ impl EventStore {
         self.root.join("current.tmp")
     }
 
+    // Startup and compaction synchronously remove only their own orphaned
+    // copy-forward file while the complete journal remains authoritative.
+    #[allow(clippy::disallowed_methods)]
     fn remove_stale_tmp(&self) {
         let tmp = self.tmp_path();
         if tmp.exists() {
@@ -245,6 +279,9 @@ impl EventStore {
         Ok(())
     }
 
+    // The journal mutex protects this synchronous fsync-and-rename compaction
+    // boundary, preserving the complete prior journal on interruption.
+    #[allow(clippy::disallowed_methods)]
     fn rewrite_locked(&self, envelopes: &[JournalEnvelope]) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("creating event journal dir {}", self.root.display()))?;
@@ -292,6 +329,9 @@ fn parse_rfc3339(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
 }
 
 #[cfg(test)]
+// Journal fixtures intentionally corrupt and inspect temporary files to verify
+// quarantine, atomic compaction, and multi-writer recovery behavior.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::system_events::types::*;

@@ -255,7 +255,7 @@ fn resolve_bin_on_path(bin: &str) -> Option<PathBuf> {
 fn redact_env(env: &BTreeMap<String, String>) -> BTreeMap<String, Value> {
     env.iter()
         .map(|(key, value)| {
-            let redacted = is_sensitive_env_key(key);
+            let redacted = !is_public_session_env_key(key);
             (
                 key.clone(),
                 json!({
@@ -269,18 +269,16 @@ fn redact_env(env: &BTreeMap<String, String>) -> BTreeMap<String, Value> {
         .collect()
 }
 
-fn is_sensitive_env_key(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
+fn is_public_session_env_key(key: &str) -> bool {
     [
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "API_KEY",
-        "AUTH",
-        "CREDENTIAL",
+        "BRO_HARNESS_CHAT_REASONING",
+        "BRO_HARNESS_PROJECT_DOC_FILES",
+        "BRO_HARNESS_PROJECT_DOC_MAX_BYTES",
+        "BRO_HARNESS_PROVIDER",
+        "BRO_HARNESS_TRANSPORT",
+        "BRO_HOME",
     ]
-    .iter()
-    .any(|needle| upper.contains(needle))
+    .contains(&key)
 }
 
 /// Resolve a caller-supplied path to a normalized absolute path. Relative
@@ -1653,6 +1651,9 @@ impl Tool for ApplyPatch {
 }
 
 #[cfg(test)]
+// These synchronous filesystem fixtures build and inspect isolated tempdir
+// workspaces directly; no application Tokio worker executes them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -1743,6 +1744,7 @@ mod tests {
 
     fn cx_at(root: &Path) -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: root.to_path_buf(),
             safety: std::sync::Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),
@@ -1770,6 +1772,7 @@ mod tests {
                 "ANTHROPIC_AUTH_TOKEN".to_string(),
                 "secret-token".to_string(),
             ),
+            ("CUSTOM_BEARER".to_string(), "opaque-secret".to_string()),
         ]));
 
         let out = SandboxStatus
@@ -1792,6 +1795,7 @@ mod tests {
             v["session_env"]["BRO_HARNESS_PROJECT_DOC_FILES"]["value"],
             "AGENTS_BETA.md"
         );
+        assert_eq!(v["session_env"]["CUSTOM_BEARER"]["value"], "<redacted>");
     }
 
     #[tokio::test]

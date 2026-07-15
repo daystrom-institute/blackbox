@@ -1547,6 +1547,14 @@ fn file_edits_to_changes(
     Ok((changes, changed_files))
 }
 
+type JavaMemberLookup<T> = (
+    PathBuf,
+    String,
+    bbox_refactor::facts::FileItemsFacts,
+    Option<T>,
+    Vec<Value>,
+);
+
 // Sync fs access is sanctioned here: callers run inside the call_blocking
 // closures of the java.* binding tools, never on a tokio worker
 // (concurrency-model section 5).
@@ -3538,8 +3546,7 @@ fn java_simple_name(type_text: &str) -> Option<&str> {
                 || c == '\n'
                 || c == '&'
         })
-        .filter(|part| !part.is_empty())
-        .next_back()
+        .rfind(|part| !part.is_empty())
         .unwrap_or(cleaned);
     if ident.is_empty() { None } else { Some(ident) }
 }
@@ -4564,6 +4571,11 @@ fn java_target_prelude(target_package: Option<&str>, imports: &[String]) -> Stri
     }
 }
 
+struct TargetTypePolicies<'a> {
+    comment: &'a str,
+    annotation: &'a str,
+}
+
 fn render_target_type(
     type_name: &str,
     type_decl_suffix: &str,
@@ -4571,8 +4583,7 @@ fn render_target_type(
     target_package: Option<&str>,
     imports: &[String],
     candidates: &[PullUpCandidate],
-    comment_policy: &str,
-    annotation_policy: &str,
+    policies: TargetTypePolicies<'_>,
 ) -> String {
     let mut out = java_target_prelude(target_package, imports);
     if target_kind == "abstract_class" {
@@ -4580,7 +4591,7 @@ fn render_target_type(
             "public abstract class {type_name}{type_decl_suffix} {{\n"
         ));
         for candidate in candidates {
-            if matches!(comment_policy, "copy" | "move") && !candidate.trivia.trim().is_empty() {
+            if matches!(policies.comment, "copy" | "move") && !candidate.trivia.trim().is_empty() {
                 for line in candidate.trivia.trim_matches('\n').lines() {
                     if line.trim().is_empty() {
                         continue;
@@ -4591,7 +4602,11 @@ fn render_target_type(
                 }
             }
             out.push_str("    ");
-            out.push_str(&abstract_signature(candidate, annotation_policy, "public"));
+            out.push_str(&abstract_signature(
+                candidate,
+                policies.annotation,
+                "public",
+            ));
             out.push_str("\n\n");
         }
     } else {
@@ -4599,7 +4614,7 @@ fn render_target_type(
             "public interface {type_name}{type_decl_suffix} {{\n"
         ));
         for candidate in candidates {
-            if matches!(comment_policy, "copy" | "move") && !candidate.trivia.trim().is_empty() {
+            if matches!(policies.comment, "copy" | "move") && !candidate.trivia.trim().is_empty() {
                 for line in candidate.trivia.trim_matches('\n').lines() {
                     if line.trim().is_empty() {
                         continue;
@@ -4610,7 +4625,7 @@ fn render_target_type(
                 }
             }
             out.push_str("    ");
-            out.push_str(&interface_signature(candidate, annotation_policy));
+            out.push_str(&interface_signature(candidate, policies.annotation));
             out.push_str("\n\n");
         }
     }
@@ -5544,6 +5559,8 @@ impl Tool for JavaExtractInterface {
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "extractInterface".to_string()))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaExtractInterfaceParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -5731,14 +5748,12 @@ impl Tool for JavaExtractInterface {
                 Ok(edit) => edits.push(edit),
                 Err(e) => return err(format!("java.extractInterface: {e}")),
             }
-            if let Some(target_package) = params.target_package.as_deref() {
-                if source_package(&source).as_deref() != Some(target_package) {
-                    if let Some(edit) =
-                        insert_import_edit(&source, &format!("{target_package}.{}", params.type_name))
-                    {
-                        edits.push(edit);
-                    }
-                }
+            if let Some(target_package) = params.target_package.as_deref()
+                && source_package(&source).as_deref() != Some(target_package)
+                && let Some(edit) =
+                    insert_import_edit(&source, &format!("{target_package}.{}", params.type_name))
+            {
+                edits.push(edit);
             }
             for candidate in &selected {
                 if comment_policy == "move"
@@ -5771,8 +5786,10 @@ impl Tool for JavaExtractInterface {
                 target_package,
                 &target_imports,
                 &selected,
-                comment_policy,
-                annotation_policy,
+                TargetTypePolicies {
+                    comment: comment_policy,
+                    annotation: annotation_policy,
+                },
             );
             let preview_only = params.preview_only.unwrap_or(false);
             let changes = if preview_only || new_source == source {
@@ -5850,6 +5867,8 @@ impl Tool for JavaPullUpMembers {
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "pullUpMembers".to_string()))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaPullUpMembersParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -6328,6 +6347,8 @@ impl Tool for JavaPushDownMembers {
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "pushDownMembers".to_string()))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaPushDownMembersParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -6552,13 +6573,13 @@ impl Tool for JavaPushDownMembers {
                 .collect::<Vec<_>>();
             findings.extend(remaining_refs);
             findings.extend(import_findings);
-            if let Some(warning) = preview["target_class"]["relationship"]["warning"].as_object() {
-                if !warning.is_empty() {
-                    findings.push(json!({
-                        "finding": "hierarchy_warning",
-                        "warning": preview["target_class"]["relationship"]["warning"].clone(),
-                    }));
-                }
+            if let Some(warning) = preview["target_class"]["relationship"]["warning"].as_object()
+                && !warning.is_empty()
+            {
+                findings.push(json!({
+                    "finding": "hierarchy_warning",
+                    "warning": preview["target_class"]["relationship"]["warning"].clone(),
+                }));
             }
             let mut would_change_files = Vec::new();
             if source != new_source {
@@ -6855,16 +6876,7 @@ fn change_signature_method_from_item(
 fn find_change_signature_method(
     root: &Path,
     params: &JavaChangeSignaturePreviewParams,
-) -> Result<
-    (
-        PathBuf,
-        String,
-        bbox_refactor::facts::FileItemsFacts,
-        Option<ChangeSignatureMethod>,
-        Vec<Value>,
-    ),
-    String,
-> {
+) -> Result<JavaMemberLookup<ChangeSignatureMethod>, String> {
     let path = resolve_workspace_file(root, &params.file, "java.changeSignaturePreview")?;
     let source = std::fs::read_to_string(&path)
         .map_err(|e| format!("java.changeSignaturePreview: read {}: {e}", params.file))?;
@@ -7297,6 +7309,8 @@ impl Tool for JavaChangeSignature {
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "changeSignature".to_string()))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaChangeSignatureParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -7701,7 +7715,7 @@ fn field_inject_preview_data(
         .first()
         .map(|field| field.owner_class.as_str())
         .filter(|name| !name.is_empty())
-        .or_else(|| params.class_name.as_deref())
+        .or(params.class_name.as_deref())
         .unwrap_or("Unknown");
     let (class_name, class_body_start) =
         find_class_name_and_body(&source, params.class_name.as_deref(), fallback_class);
@@ -7818,10 +7832,11 @@ fn strip_field_injection_annotations(field: &FieldInjectCandidate, make_final: b
         out.push(line.to_string());
     }
     let mut text = out.join("\n");
-    if make_final && !field.is_final {
-        if let Some(type_pos) = text.find(field.type_text.as_str()) {
-            text.insert_str(type_pos, "final ");
-        }
+    if make_final
+        && !field.is_final
+        && let Some(type_pos) = text.find(field.type_text.as_str())
+    {
+        text.insert_str(type_pos, "final ");
     }
     text
 }
@@ -8482,27 +8497,15 @@ fn field_site_rewrite(
         });
     }
 
-    if bare {
-        Some(EncapsulateFieldSite {
-            file: String::new(),
-            byte_start: pos,
-            byte_end: name_end,
-            kind: "read".to_string(),
-            text: line_snippet(source, pos, name_end),
-            replacement: Some(format!("{getter_name}()")),
-            blocker: None,
-        })
-    } else {
-        Some(EncapsulateFieldSite {
-            file: String::new(),
-            byte_start: pos,
-            byte_end: name_end,
-            kind: "read".to_string(),
-            text: line_snippet(source, pos, name_end),
-            replacement: Some(format!("{getter_name}()")),
-            blocker: None,
-        })
-    }
+    Some(EncapsulateFieldSite {
+        file: String::new(),
+        byte_start: pos,
+        byte_end: name_end,
+        kind: "read".to_string(),
+        text: line_snippet(source, pos, name_end),
+        replacement: Some(format!("{getter_name}()")),
+        blocker: None,
+    })
 }
 
 // Sync fs access is sanctioned here: callers run inside the call_blocking
@@ -8578,16 +8581,7 @@ fn discover_encapsulate_field_sites(
 fn find_encapsulate_field(
     root: &Path,
     params: &JavaEncapsulateFieldPreviewParams,
-) -> Result<
-    (
-        PathBuf,
-        String,
-        bbox_refactor::facts::FileItemsFacts,
-        Option<EncapsulateFieldInfo>,
-        Vec<Value>,
-    ),
-    String,
-> {
+) -> Result<JavaMemberLookup<EncapsulateFieldInfo>, String> {
     let path = resolve_workspace_file(root, &params.file, "java.encapsulateFieldPreview")?;
     let source = std::fs::read_to_string(&path)
         .map_err(|e| format!("java.encapsulateFieldPreview: read {}: {e}", params.file))?;
@@ -8898,6 +8892,8 @@ impl Tool for JavaEncapsulateField {
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "encapsulateField".to_string()))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaEncapsulateFieldParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -9203,16 +9199,7 @@ fn constructor_from_item(
 fn find_constructor_factory_target(
     root: &Path,
     params: &JavaReplaceConstructorWithFactoryPreviewParams,
-) -> Result<
-    (
-        PathBuf,
-        String,
-        bbox_refactor::facts::FileItemsFacts,
-        Option<ConstructorFactoryInfo>,
-        Vec<Value>,
-    ),
-    String,
-> {
+) -> Result<JavaMemberLookup<ConstructorFactoryInfo>, String> {
     let path = resolve_workspace_file(
         root,
         &params.file,
@@ -9567,6 +9554,8 @@ impl Tool for JavaReplaceConstructorWithFactoryPreview {
             "replaceConstructorWithFactoryPreview".to_string(),
         ))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaReplaceConstructorWithFactoryPreviewParams = match serde_json::from_value(
             input,
@@ -9624,6 +9613,8 @@ impl Tool for JavaReplaceConstructorWithFactory {
             "replaceConstructorWithFactory".to_string(),
         ))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaReplaceConstructorWithFactoryParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -10075,6 +10066,8 @@ impl Tool for JavaMigrateTypeUsages {
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("java".to_string(), "migrateTypeUsages".to_string()))
     }
+    // All synchronous source reads below are contained by call_blocking.
+    #[allow(clippy::disallowed_methods)]
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
         let params: JavaMigrateTypeUsagesParams = match serde_json::from_value(input) {
             Ok(p) => p,
@@ -10738,11 +10731,13 @@ fn move_member_refs(
     Ok(refs)
 }
 
+type MoveMemberChangeSet = (Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>);
+
 fn move_member_changes_from_plan(
     root: &Path,
     plan: &bbox_refactor::RefactorPlan,
     preview_only: bool,
-) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>), String> {
+) -> Result<MoveMemberChangeSet, String> {
     let empty_sha = bbox_refactor::sha256_hex(&[]);
     let mut changes = Vec::new();
     let mut creates = Vec::new();
@@ -12924,7 +12919,7 @@ impl Tool for JavaExtractClassPreviewPlan {
                     class_name.as_deref(),
                 ) {
                     Ok(closure) => {
-                        for (_field, deps) in &closure {
+                        for deps in closure.values() {
                             for dep in deps {
                                 if !augmented_move_fields.contains(dep) {
                                     augmented_move_fields.push(dep.clone());
@@ -12961,11 +12956,11 @@ impl Tool for JavaExtractClassPreviewPlan {
                     Ok(plan_params) => {
                         match bbox_refactor::plan(&plan_params) {
                             Ok(plan_json) => {
-                                if let Ok(summary) = serde_json::from_str::<Value>(&plan_json) {
-                                    if let Some(files_by_name) = summary
+                                if let Ok(summary) = serde_json::from_str::<Value>(&plan_json)
+                                    && let Some(files_by_name) = summary
                                         .get("usage_files_by_name")
                                         .and_then(Value::as_object)
-                                    {
+                                {
                                         let rel_file = path
                                             .strip_prefix(&root)
                                             .unwrap_or(&path)
@@ -12996,7 +12991,6 @@ impl Tool for JavaExtractClassPreviewPlan {
                                             .collect();
                                         has_external_callers = !ext.is_empty();
                                         external_callers = serde_json::to_value(ext).unwrap_or(json!({}));
-                                    }
                                 }
                             }
                             Err(e) => {
@@ -13264,64 +13258,63 @@ impl Tool for JavaSynthesizeHelperWrappers {
                     None,
                 ) {
                     for cap in &facts.captures {
-                        if cap.capture == "name" && cap.text == bare {
-                            if let Some(method_cap) = facts.captures.iter().find(|mc| {
+                        if cap.capture == "name"
+                            && cap.text == bare
+                            && let Some(method_cap) = facts.captures.iter().find(|mc| {
                                 mc.capture == "method"
                                     && mc.byte_start <= cap.byte_start
                                     && mc.byte_end >= cap.byte_end
-                            }) {
-                                let mtext =
-                                    &delegate_src[method_cap.byte_start..method_cap.byte_end];
-                                // Find opening brace — the header is everything before it.
-                                let brace_pos = mtext.find('{').unwrap_or(mtext.len());
-                                let header = mtext[..brace_pos].trim().to_string();
-                                // Extract param names from the header's param list.
-                                let params_start = header.find('(').unwrap_or(header.len());
-                                let params_end = header.rfind(')').unwrap_or(header.len());
-                                let param_names: Vec<String> = if params_start < params_end {
-                                    // Split on commas not nested inside <...> angle brackets.
-                                    let param_str = &header[params_start + 1..params_end];
-                                    let mut names = Vec::new();
-                                    let mut depth = 0;
-                                    let mut current = String::new();
-                                    for ch in param_str.chars() {
-                                        match ch {
-                                            '<' => {
-                                                depth += 1;
-                                                current.push(ch);
-                                            }
-                                            '>' => {
-                                                depth -= 1;
-                                                current.push(ch);
-                                            }
-                                            ',' if depth == 0 => {
-                                                let parts: Vec<&str> =
-                                                    current.trim().split_whitespace().collect();
-                                                if let Some(name) = parts.last() {
-                                                    names.push(name.to_string());
-                                                }
-                                                current.clear();
-                                            }
-                                            _ => current.push(ch),
+                            })
+                        {
+                            let mtext = &delegate_src[method_cap.byte_start..method_cap.byte_end];
+                            // Find opening brace — the header is everything before it.
+                            let brace_pos = mtext.find('{').unwrap_or(mtext.len());
+                            let header = mtext[..brace_pos].trim().to_string();
+                            // Extract param names from the header's param list.
+                            let params_start = header.find('(').unwrap_or(header.len());
+                            let params_end = header.rfind(')').unwrap_or(header.len());
+                            let param_names: Vec<String> = if params_start < params_end {
+                                // Split on commas not nested inside <...> angle brackets.
+                                let param_str = &header[params_start + 1..params_end];
+                                let mut names = Vec::new();
+                                let mut depth = 0;
+                                let mut current = String::new();
+                                for ch in param_str.chars() {
+                                    match ch {
+                                        '<' => {
+                                            depth += 1;
+                                            current.push(ch);
                                         }
-                                    }
-                                    if !current.trim().is_empty() {
-                                        let parts: Vec<&str> =
-                                            current.trim().split_whitespace().collect();
-                                        if let Some(name) = parts.last() {
-                                            names.push(name.to_string());
+                                        '>' => {
+                                            depth -= 1;
+                                            current.push(ch);
                                         }
+                                        ',' if depth == 0 => {
+                                            let parts: Vec<&str> =
+                                                current.split_whitespace().collect();
+                                            if let Some(name) = parts.last() {
+                                                names.push(name.to_string());
+                                            }
+                                            current.clear();
+                                        }
+                                        _ => current.push(ch),
                                     }
-                                    names
-                                } else {
-                                    Vec::new()
-                                };
-                                sigs.push(MethodSig {
-                                    bare_name: bare.to_string(),
-                                    header,
-                                    param_names,
-                                });
-                            }
+                                }
+                                if !current.trim().is_empty() {
+                                    let parts: Vec<&str> = current.split_whitespace().collect();
+                                    if let Some(name) = parts.last() {
+                                        names.push(name.to_string());
+                                    }
+                                }
+                                names
+                            } else {
+                                Vec::new()
+                            };
+                            sigs.push(MethodSig {
+                                bare_name: bare.to_string(),
+                                header,
+                                param_names,
+                            });
                         }
                     }
                 }
@@ -13621,13 +13614,10 @@ impl Tool for JavaExtractColumnSpec {
 
             // Match columns by position. The first N columns that share the
             // same key become the common spec.
-            let common_count = method_cols[0].len().min(method_cols[1].len());
             let mut spec_cols: Vec<&ColInfo> = Vec::new();
-            for i in 0..common_count {
-                if method_cols[0][i].key == method_cols[1][i].key
-                    && method_cols[0][i].align == method_cols[1][i].align
-                {
-                    spec_cols.push(&method_cols[0][i]);
+            for (left, right) in method_cols[0].iter().zip(&method_cols[1]) {
+                if left.key == right.key && left.align == right.align {
+                    spec_cols.push(left);
                 } else {
                     break;
                 }
@@ -13866,6 +13856,8 @@ declare const java: {
 }
 
 #[cfg(test)]
+// Filesystem fixtures intentionally exercise transform previews and edit synthesis.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap as StdBTreeMap;
@@ -13873,6 +13865,7 @@ mod tests {
 
     fn cx_in(dir: &Path) -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: dir.to_path_buf(),
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),

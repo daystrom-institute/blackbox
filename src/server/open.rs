@@ -31,7 +31,10 @@ pub(super) struct OpenedServer {
     pub(super) bind_is_loopback: bool,
 }
 
-pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
+pub(super) fn open_shared_state(
+    home: &Path,
+    runtime_role: super::RuntimeRole,
+) -> anyhow::Result<OpenedServer> {
     let cfg = config::load()?;
     // Push the config-resolved git-notes namespace into the corpus-core
     // foundation crate (dependency inversion: corpus-core must not reach up into
@@ -74,6 +77,8 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     // provider transcript. Same dir the BRO_HOME export below points the
     // in-process harness at.
     idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
+    idx.add_harness_sessions_dir(cfg.paths.bro_home.join("record-ingest/transcript-archive"));
+    idx.set_operational_records_path(cfg.paths.bro_home.join("record-ingest/records.json"));
     // Interactive Gemini chats (claude/codex roots already travel inside
     // ReindexConfig; gemini's tmp root is resolved here, same explicit-only
     // contract — gap-5af6d773).
@@ -225,7 +230,12 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         }
     }
     let task_ttl = cfg.daemon.task_ttl_ms;
-    let task_store = TaskStore::load(&store_dir, task_ttl);
+    let worker_registry = Arc::new(orchestration::worker_registry::WorkerRegistry::open(
+        &store_dir,
+    )?);
+    let reconnectable_tasks = worker_registry.reconnectable_task_ids();
+    let task_store =
+        TaskStore::load_with_reconnectable_tasks(&store_dir, task_ttl, &reconnectable_tasks);
     let consultant_proposals = Arc::new(orchestration::consultant::ProposalStore::new(
         orchestration::badgey::descriptor().proposals_root(&store_dir),
     )?);
@@ -258,6 +268,32 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     );
 
     let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
+    let record_ingest = Arc::new(blackbox_corpus_service::RecordStore::open(&store_dir)?);
+    let record_transcript_roots = Arc::new(vec![
+        std::env::var_os("BLACKBOX_FLEET_TRANSCRIPT_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/state/blackbox/fleetd").join("workers")),
+    ]);
+    let retained_records = record_ingest.all_records();
+    let retained_targets = bro_capabilities::transcript_record_targets(&retained_records)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+    let archived_targets = record_ingest
+        .ensure_archived_transcript_targets(&retained_targets, record_transcript_roots.as_ref())
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+    index_writer.upsert_operational_records_blocking(
+        retained_records,
+        archived_targets,
+        vec![record_ingest.transcript_archive_root()],
+    )?;
+    let service_token_path = std::env::var_os("BLACKBOX_SERVICE_TOKEN_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cfg.paths.state_dir.join("service.token"));
+    let service_token = Arc::new(
+        bro_rpc::ServiceToken::load_or_create(&service_token_path)
+            .map_err(|error| anyhow::anyhow!("loading blackbox service token: {error}"))?,
+    );
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         index_writer,
@@ -284,11 +320,13 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
+        worker_registry,
         tail_tx,
         roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         roster_tx,
         roster_view: Arc::new(orchestration::RosterView::new()),
         store_dir: store_dir.clone(),
+        service_token,
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
@@ -337,13 +375,17 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
             store_dir.join("reactions"),
             store_dir.join("identities"),
         )),
+        record_ingest,
+        record_transcript_roots,
     });
 
     // Start the single-writer task-store persist actor (control-plane starvation
     // fix). Hot paths now signal `request_persist` instead of doing a blocking
     // `task_store.read().persist(dir)` on a tokio worker. Production only — tests
     // build SharedState via `for_test` and keep the synchronous fallback.
-    orchestration::init_task_persister(shared.task_store.clone(), shared.store_dir.clone());
+    if runtime_role == super::RuntimeRole::Compatibility {
+        orchestration::init_task_persister(shared.task_store.clone(), shared.store_dir.clone());
+    }
 
     // Cold-start roster rebuild: tasks restored from `tasks.json` need to
     // appear in `/control/roster` immediately, before any in-process delta

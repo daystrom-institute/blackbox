@@ -7,12 +7,23 @@ use async_trait::async_trait;
 use bro_core::{AtomRef, AttemptId, BroError};
 use serde::{Deserialize, Serialize};
 
+mod agents;
 mod execution;
+mod records;
 
+pub use agents::{
+    AgentCapability, AgentForkTurns, AgentIdentity, AgentMessageRequest, AgentSpawnRequest,
+    AgentStatus, AgentSummary, AgentTarget, AgentWaitRequest, AgentWake,
+};
 pub use execution::{
     AttemptOutcome, AttemptState, ExecutionAccepted, ExecutionCodeMode, ExecutionDirective,
     ExecutionDirectiveCadence, ExecutionDispatchContext, ExecutionKind, ExecutionRequest,
     ExecutionScope, ExecutionServiceTier, ExecutionToolPolicy, WorkingSetIntent,
+};
+pub use records::{
+    MAX_RECORD_BYTES, RECORD_ARCHIVE_SNAPSHOT_VERSION, RecordArchiveSnapshot, RecordEnvelope,
+    RecordIngestCapability, RecordIngestReceipt, RecordIngestRequest, TranscriptRecordTarget,
+    transcript_record_targets,
 };
 
 pub type CapabilityResult<T> = Result<T, BroError>;
@@ -31,12 +42,53 @@ pub struct AtomOutput {
 #[async_trait]
 pub trait AtomCapability: Send + Sync {
     async fn invoke_atom(&self, invocation: AtomInvocation) -> CapabilityResult<AtomOutput>;
+
+    /// Invoke an atom under the stable identity of the originating provider
+    /// tool call. Remote implementations override this to keep durable effect
+    /// identity separate from ephemeral request/response correlation.
+    async fn invoke_atom_for_invocation(
+        &self,
+        invocation_id: &str,
+        invocation: AtomInvocation,
+    ) -> CapabilityResult<AtomOutput> {
+        let _ = invocation_id;
+        self.invoke_atom(invocation).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusLookup {
     pub query: String,
     pub limit: usize,
+}
+
+pub const MAX_CORPUS_QUERY_BYTES: usize = 16 * 1024;
+pub const MAX_CORPUS_LOOKUP_RESULTS: usize = 100;
+
+impl CorpusLookup {
+    /// Validate the bounded cross-service lookup contract consistently at
+    /// every corpus implementation boundary.
+    pub fn validate(&self) -> CapabilityResult<()> {
+        if self.query.trim().is_empty() {
+            return Err(BroError::new(
+                "corpus.invalid_query",
+                "corpus query must not be empty",
+            ));
+        }
+        if self.query.len() > MAX_CORPUS_QUERY_BYTES {
+            return Err(BroError::new(
+                "corpus.invalid_query",
+                format!("corpus query exceeds {MAX_CORPUS_QUERY_BYTES} bytes"),
+            ));
+        }
+        if self.limit == 0 || self.limit > MAX_CORPUS_LOOKUP_RESULTS {
+            return Err(BroError::new(
+                "corpus.invalid_limit",
+                format!("corpus limit must be between 1 and {MAX_CORPUS_LOOKUP_RESULTS}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +124,9 @@ pub struct RefactorPlanHandle {
 /// `tools.*` call can only reach down here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocation {
+    /// Stable identity derived from the outer provider tool call and, for a
+    /// code-mode nested call, its deterministic nested call id.
+    pub invocation_id: String,
     pub name: String,
     pub input_json: serde_json::Value,
 }
@@ -241,5 +296,31 @@ mod tests {
         let error = service.request_execution(conflict).await.unwrap_err();
         assert_eq!(error.code, "execution.idempotency_conflict");
         assert_eq!(service.accepted.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn corpus_lookup_contract_is_bounded_and_nonempty() {
+        CorpusLookup {
+            query: "needle".into(),
+            limit: MAX_CORPUS_LOOKUP_RESULTS,
+        }
+        .validate()
+        .unwrap();
+        for lookup in [
+            CorpusLookup {
+                query: " ".into(),
+                limit: 1,
+            },
+            CorpusLookup {
+                query: "needle".into(),
+                limit: 0,
+            },
+            CorpusLookup {
+                query: "x".repeat(MAX_CORPUS_QUERY_BYTES + 1),
+                limit: 1,
+            },
+        ] {
+            assert!(lookup.validate().is_err());
+        }
     }
 }

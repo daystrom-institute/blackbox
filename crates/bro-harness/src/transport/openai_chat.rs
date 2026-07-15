@@ -55,7 +55,7 @@ enum ReasoningProfile {
 
 impl ReasoningProfile {
     fn from_env() -> Self {
-        match std::env::var("BRO_HARNESS_CHAT_REASONING")
+        match super::session_var("BRO_HARNESS_CHAT_REASONING")
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str()
@@ -93,6 +93,7 @@ pub struct OpenAiChatTransport {
     messages: Vec<Value>,
     reasoning: ReasoningProfile,
     session_id: Option<String>,
+    prompt_cache_root: Option<String>,
 }
 
 impl OpenAiChatTransport {
@@ -112,6 +113,7 @@ impl OpenAiChatTransport {
             messages: Vec::new(),
             reasoning: ReasoningProfile::from_env(),
             session_id: None,
+            prompt_cache_root: None,
         })
     }
 
@@ -204,9 +206,13 @@ impl OpenAiChatTransport {
             body["reasoning_effort"] = json!(effort);
         }
         if self.reasoning == ReasoningProfile::Mistral
-            && let Some(session_id) = self.session_id.as_deref().filter(|id| !id.is_empty())
+            && let Some(prompt_cache_root) = self
+                .prompt_cache_root
+                .as_deref()
+                .or(self.session_id.as_deref())
+                .filter(|id| !id.is_empty())
         {
-            body["prompt_cache_key"] = json!(session_id);
+            body["prompt_cache_key"] = json!(prompt_cache_root);
         }
         body
     }
@@ -339,6 +345,10 @@ impl Transport for OpenAiChatTransport {
 
     fn set_session_id(&mut self, id: String) {
         self.session_id = Some(id);
+    }
+
+    fn set_prompt_cache_root(&mut self, root: String) {
+        self.prompt_cache_root = Some(root);
     }
 
     fn push_user_text(&mut self, text: &str) {
@@ -748,6 +758,7 @@ mod tests {
             messages: vec![json!({"role": "user", "content": "hi"})],
             reasoning: ReasoningProfile::Off,
             session_id: None,
+            prompt_cache_root: None,
         }
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
@@ -849,6 +860,7 @@ mod tests {
             ],
             reasoning: ReasoningProfile::Off,
             session_id: None,
+            prompt_cache_root: None,
         }
     }
 
@@ -998,6 +1010,19 @@ mod tests {
         let body = tx.build_body(&[], &opts(SystemPrompt::default()));
 
         assert_eq!(body["prompt_cache_key"], "sess-1");
+    }
+
+    #[test]
+    fn mistral_profile_uses_cache_root_without_changing_session_identity() {
+        let mut tx = transport();
+        tx.reasoning = ReasoningProfile::Mistral;
+        tx.set_session_id("child-session".into());
+        tx.set_prompt_cache_root("root-cache".into());
+
+        let body = tx.build_body(&[], &opts(SystemPrompt::default()));
+
+        assert_eq!(tx.session_id.as_deref(), Some("child-session"));
+        assert_eq!(body["prompt_cache_key"], "root-cache");
     }
 
     #[test]

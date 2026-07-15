@@ -146,6 +146,7 @@ mod tests {
 
     fn cx() -> ToolCx {
         ToolCx {
+            invocation_id: None,
             root: std::env::temp_dir(),
             safety: Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),

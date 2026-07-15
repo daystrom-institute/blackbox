@@ -10,7 +10,7 @@ validate changes without touching prod state, see
 ## Build and test
 
 ```bash
-cargo build --release                      # binaries into target/release
+cargo build --release --workspace          # binaries into target/release
 cargo check                                # fast type-check
 cargo nextest run --workspace              # mid-cycle gate (~24s execution)
 cargo nextest run --workspace --profile full   # fold/closeout gate (~85s, full suite)
@@ -128,6 +128,8 @@ The root flake separates product outputs from contributor tooling:
 ```bash
 nix build .#blackbox
 nix run .#blackboxd
+nix run .#blackopsd
+nix run .#fleetd
 nix run .#bro
 nix develop .
 nix flake check
@@ -135,7 +137,7 @@ nix fmt
 ```
 
 - `packages.blackbox` / `packages.default`: build the crate for consumers
-- `apps.blackboxd` / `apps.bro`: run the shipped binaries without a local Rust toolchain
+- `apps.blackboxd` / `apps.blackopsd` / `apps.fleetd` / `apps.bro`: run the shipped binaries without a local Rust toolchain
 - `checks.default`: validates the packaged build path that consumers use
 - `formatter`: `nix fmt` formats the flake with `nixpkgs-fmt`
 - `devShells.default`: contributor shell with Rust/Nix tooling

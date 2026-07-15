@@ -239,12 +239,23 @@ pub(super) fn execute_reindex_pass(
         indexed_files += 1;
         indexed_docs += roadmap_docs;
     }
+    let operational_records = load_operational_records(config)?;
+    if !operational_records.is_empty() {
+        super::writer_actor::apply_operational_record_upserts(
+            writer,
+            fields,
+            &operational_records,
+        )?;
+        indexed_files += 1;
+        indexed_docs += operational_records.len() as u64;
+    }
     tracing::info!(
         full,
         elapsed_ms = stores_phase.elapsed().as_millis(),
         knowledge_docs,
         thread_docs,
         roadmap_docs,
+        operational_record_docs = operational_records.len(),
         "auto-reindex: store-doc phase complete"
     );
 
@@ -308,6 +319,37 @@ pub(super) fn execute_reindex_pass(
     );
     tracing::info!("{}", summary);
     Ok(summary)
+}
+
+// The reindex writer actor synchronously snapshots retained records before it
+// begins the one-writer reconstruction pass.
+#[allow(clippy::disallowed_methods)]
+fn load_operational_records(
+    config: &ReindexConfig,
+) -> Result<Vec<bro_capabilities::RecordEnvelope>> {
+    let Some(path) = config.operational_records_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "operational record snapshot is not a regular file: {}",
+            path.display()
+        );
+    }
+    let snapshot: bro_capabilities::RecordArchiveSnapshot =
+        serde_json::from_slice(&std::fs::read(path)?)?;
+    if snapshot.version != bro_capabilities::RECORD_ARCHIVE_SNAPSHOT_VERSION {
+        anyhow::bail!(
+            "unsupported operational record snapshot version {}; expected {}",
+            snapshot.version,
+            bro_capabilities::RECORD_ARCHIVE_SNAPSHOT_VERSION
+        );
+    }
+    Ok(snapshot.records.into_values().collect())
 }
 
 /// Spawn the background reindex thread. Runs every `interval` seconds.
@@ -427,6 +469,8 @@ pub fn backfill_tool_edges_for_project(
 }
 
 #[cfg(test)]
+// Reindex fixtures intentionally seed temporary stores and commit test indexes.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use tantivy::schema::Field;
 
@@ -495,8 +539,8 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// End-to-end: a synthetic harness session event log under
-    /// `harness_sessions_dir` is discovered by the adapter registry and
+    /// End-to-end: a synthetic retained harness log under an additional
+    /// corpus archive directory is discovered by the adapter registry and
     /// indexed into tantivy with role/session/timestamp/project intact.
     #[test]
     fn harness_session_event_log_indexes_into_test_index() {
@@ -525,7 +569,9 @@ mod tests {
             knowledge_path: root.join("kb.json"),
             threads_path: root.join("threads.json"),
             roadmap_path: root.join("roadmap.json"),
-            harness_sessions_dir: Some(sessions_dir),
+            harness_sessions_dir: None,
+            additional_harness_sessions_dirs: vec![sessions_dir],
+            operational_records_path: None,
             gemini_tmp_root: None,
         };
 
@@ -619,6 +665,8 @@ mod tests {
             threads_path: root.join("threads.json"),
             roadmap_path: root.join("roadmap.json"),
             harness_sessions_dir: Some(sessions_dir),
+            additional_harness_sessions_dirs: Vec::new(),
+            operational_records_path: None,
             gemini_tmp_root: None,
         };
 

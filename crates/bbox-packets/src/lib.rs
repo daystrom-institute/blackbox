@@ -231,6 +231,8 @@ pub struct Packets {
 }
 
 impl Packets {
+    // Opening the packet store is an explicitly synchronous setup boundary.
+    #[allow(clippy::disallowed_methods)]
     pub fn open(packets_dir: &Path) -> Result<Self> {
         let actual_dir = packets_dir.to_path_buf();
 
@@ -268,13 +270,15 @@ impl Packets {
     /// Append one event to the log. Best-effort: errors are logged
     /// via tracing but never propagate, so event-log I/O can never
     /// break a compile/apply/audit operation.
+    // Packet mutations use the store's synchronous durability path.
+    #[allow(clippy::disallowed_methods)]
     fn append_event(&self, event: &PacketEvent) {
         let path = events_log_path(&self.packets_dir);
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                tracing::warn!(error = %e, "packet event log: create_dir_all failed");
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, "packet event log: create_dir_all failed");
+            return;
         }
         let line = match serde_json::to_string(event) {
             Ok(s) => s,
@@ -289,6 +293,8 @@ impl Packets {
     }
 
     /// Read events from the log, newest first, with optional filters.
+    // Event-log queries are synchronous reads from this filesystem-backed store.
+    #[allow(clippy::disallowed_methods)]
     pub fn list_events(
         &self,
         op: Option<&str>,
@@ -315,10 +321,10 @@ impl Packets {
                 Ok(e) => e,
                 Err(_) => continue, // skip malformed lines silently
             };
-            if let Some(o) = op {
-                if ev.op != o {
-                    continue;
-                }
+            if let Some(o) = op
+                && ev.op != o
+            {
+                continue;
             }
             if let Some(id) = packet_id {
                 let want = normalize_id(id);
@@ -327,15 +333,15 @@ impl Packets {
                     _ => continue,
                 }
             }
-            if let Some(oc) = outcome {
-                if ev.outcome != oc {
-                    continue;
-                }
+            if let Some(oc) = outcome
+                && ev.outcome != oc
+            {
+                continue;
             }
-            if let Some(s) = since {
-                if ev.timestamp.as_str() < s {
-                    continue;
-                }
+            if let Some(s) = since
+                && ev.timestamp.as_str() < s
+            {
+                continue;
             }
             events.push(ev);
         }
@@ -427,6 +433,8 @@ impl Packets {
     }
 
     /// Search both scopes for a packet by canonical ID or bare suffix.
+    // Packet lookup is a synchronous operation over the local packet store.
+    #[allow(clippy::disallowed_methods)]
     pub fn load(&self, id: &str) -> Result<Packet> {
         // Domain-shaped reference: `domain:<domain-name>` resolves to
         // the most-recently-compiled packet matching that domain.
@@ -507,6 +515,8 @@ impl Packets {
         Ok(Some((*matches[0]).clone()))
     }
 
+    // Packet enumeration is a synchronous operation over the local packet store.
+    #[allow(clippy::disallowed_methods)]
     pub fn list_all(&self) -> Result<Vec<Packet>> {
         let mut out = Vec::new();
         for scope in &["global", "project"] {
@@ -520,10 +530,10 @@ impl Packets {
                 if path.extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
                 }
-                if let Ok(raw) = fs::read_to_string(&path) {
-                    if let Ok(packet) = serde_json::from_str::<Packet>(&raw) {
-                        out.push(packet);
-                    }
+                if let Ok(raw) = fs::read_to_string(&path)
+                    && let Ok(packet) = serde_json::from_str::<Packet>(&raw)
+                {
+                    out.push(packet);
                 }
             }
         }
@@ -543,6 +553,8 @@ impl Packets {
         Ok(updated)
     }
 
+    // Domain removal is a synchronous mutation of the local packet store.
+    #[allow(clippy::disallowed_methods)]
     pub fn remove_domain(&self, domain: &str) -> Result<usize> {
         let packets: Vec<Packet> = self
             .list_all()?
@@ -789,6 +801,8 @@ impl Packets {
     /// references can never dangle. Sibling `.json.lock` files are removed
     /// with their packet, and orphaned lock files (packet json already gone,
     /// e.g. from `remove_domain`) are swept opportunistically.
+    // Garbage collection synchronously scans and mutates the local packet store.
+    #[allow(clippy::disallowed_methods)]
     pub fn gc_duplicate_packets(&self, apply: bool) -> Result<PacketGcReport> {
         let all = self.list_all()?;
 

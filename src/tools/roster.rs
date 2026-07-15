@@ -918,6 +918,7 @@ Next step: <one concrete steering suggestion>\n",
                 let resume_lease = try_acquire_resume_lease(
                     &self.state.task_store,
                     self.state.resume_leases.as_ref(),
+                    self.state.worker_registry.as_ref(),
                     effective_provider,
                     session_id,
                 )?;
@@ -981,7 +982,11 @@ Next step: <one concrete steering suggestion>\n",
                     bro_core::Origin::Workflow,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-                release_resume_lease_when_done(task.clone(), resume_lease);
+                release_resume_lease_when_done(
+                    task.clone(),
+                    resume_lease,
+                    self.state.worker_registry.clone(),
+                );
                 task
             }
             None => {

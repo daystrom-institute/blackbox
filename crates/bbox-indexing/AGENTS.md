@@ -36,3 +36,16 @@
   field; don't overload this one.
 - `managed_fleet_worktree_project`'s `:fleet-worktree` pseudo-id is a compat
   shim that ProjectContext should eventually subsume — don't add consumers.
+
+## Record ingest commits are synchronous
+
+- Operational-record batches carrying fleet transcript coordinates use the
+  writer actor's acknowledged path, not fire-and-forget enqueue. The caller
+  may advance a producer cursor only after the corpus archive, transcript
+  documents, descriptor records, Tantivy commit, and reader reload succeed.
+- A concurrent full reindex rejects the record batch for retry. Never report a
+  successful transcript receipt from an uncommitted or merely queued write.
+- Full rebuilds reload the corpus-owned retained-record snapshot and re-add its
+  descriptor projections in the rebuild commit. The transcript archive adapter
+  independently restores the referenced conversation and tool documents; both
+  lanes are required so a rebuild cannot erase already acknowledged evidence.

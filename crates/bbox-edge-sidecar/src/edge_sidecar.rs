@@ -49,6 +49,8 @@ impl Edge {
     }
 }
 
+// Synchronous sidecar inspection; callers place this boundary off Tokio workers.
+#[allow(clippy::disallowed_methods)]
 pub fn count_materialized_jsonl_files(edges_dir: &Path) -> usize {
     let mat_dir = crate::manifest::materialized_dir(edges_dir);
     if !mat_dir.is_dir() {
@@ -71,6 +73,8 @@ pub fn count_materialized_jsonl_files(edges_dir: &Path) -> usize {
     count_jsonl_recursive(&mat_dir)
 }
 
+// Synchronous sidecar inspection; callers place this boundary off Tokio workers.
+#[allow(clippy::disallowed_methods)]
 pub fn scan_lane_project_ids(lane_dir: &Path) -> HashSet<String> {
     let mut ids = HashSet::new();
     let Ok(entries) = fs::read_dir(lane_dir) else {
@@ -120,6 +124,8 @@ pub fn sidecar_file_stem(path: &Path) -> Option<&str> {
     path.file_stem().and_then(|s| s.to_str())
 }
 
+// Synchronous sidecar inspection; callers place this boundary off Tokio workers.
+#[allow(clippy::disallowed_methods)]
 pub fn scan_managed_derived_project_ids(managed_dir: &Path) -> HashSet<String> {
     let mut ids = HashSet::new();
     let Ok(namespace_entries) = fs::read_dir(managed_dir) else {
@@ -165,6 +171,7 @@ pub fn sidecar_project_is_registered(
 /// Test-fixture helper: append raw chunker edges to a project's JSONL lane.
 /// Deliberately un-gated (no `#[cfg(test)]`) so consumer-crate tests can use
 /// it — `cfg(test)` does not cross crate boundaries.
+#[allow(clippy::disallowed_methods)]
 pub fn append_project_edges(
     edges_dir: &Path,
     project_id: &str,
@@ -241,6 +248,8 @@ pub fn replace_project_edges(
     Ok(())
 }
 
+// Synchronous persistence boundary used by the sidecar writer actor.
+#[allow(clippy::disallowed_methods)]
 pub fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
     if edges.is_empty() {
         return Ok(());
@@ -257,6 +266,8 @@ pub fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Resul
     Ok(())
 }
 
+// Synchronous persistence boundary used by the sidecar writer actor.
+#[allow(clippy::disallowed_methods)]
 pub fn append_edges_dedup(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<usize> {
     if edges.is_empty() {
         return Ok(0);

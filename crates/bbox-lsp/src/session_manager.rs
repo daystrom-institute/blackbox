@@ -325,15 +325,15 @@ impl LspSessionManager {
                     };
                     for key in stale {
                         let removed = inner.sessions.lock().remove(&key);
-                        if let Some(arc) = removed {
-                            if let Some(mut sess) = arc.try_lock() {
-                                tracing::info!(
-                                    project = %key.project_root.display(),
-                                    language = ?key.language,
-                                    "evicting idle LSP session"
-                                );
-                                shutdown_session(&mut sess);
-                            }
+                        if let Some(arc) = removed
+                            && let Some(mut sess) = arc.try_lock()
+                        {
+                            tracing::info!(
+                                project = %key.project_root.display(),
+                                language = ?key.language,
+                                "evicting idle LSP session"
+                            );
+                            shutdown_session(&mut sess);
                         }
                     }
                 }
@@ -345,6 +345,9 @@ impl LspSessionManager {
     /// given project+language. Subsequent calls reuse the same child.
     /// On [`LspError::Broken`] the session is dropped from the pool;
     /// the next call respawns.
+    // This manager is deliberately synchronous: one caller owns the session
+    // mutex and child stdio for the full request/response exchange.
+    #[allow(clippy::disallowed_methods)]
     pub fn with_session<F, R>(&self, project_dir: &Path, language: Language, f: F) -> Result<R>
     where
         F: FnOnce(LspClient<'_>) -> Result<R, LspError>,
@@ -461,6 +464,9 @@ fn shutdown_session(sess: &mut Session) {
     let _ = sess.child.wait();
 }
 
+// LSP processes are spawned and initialized on the manager's synchronous
+// session lane before the handle is published to concurrent callers.
+#[allow(clippy::disallowed_methods)]
 fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
     let argv = launch_argv(key.language, config);
     let mut child = Command::new(&argv[0])

@@ -39,6 +39,8 @@ pub fn segment_count(index: &Index) -> usize {
         .unwrap_or(0)
 }
 
+// Reindex metadata is owned by the synchronous index-writer lane.
+#[allow(clippy::disallowed_methods)]
 pub fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
     if !path.exists() {
         return Ok(HashMap::new());
@@ -47,6 +49,8 @@ pub fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+// Reindex metadata is atomically persisted on the synchronous writer lane.
+#[allow(clippy::disallowed_methods)]
 pub fn save_meta(path: &Path, meta: &HashMap<String, FileMeta>) -> Result<()> {
     let raw = serde_json::to_string(meta)?;
     let tmp_path = path.with_extension("json.tmp");
@@ -102,6 +106,8 @@ pub fn scan_jsonl_dir(dir: &Path, out: &mut Vec<(String, u64, u64)>) {
 }
 
 /// Stat a single file and push if not too recent.
+// Source discovery is a synchronous filesystem pass run by the reindex lane.
+#[allow(clippy::disallowed_methods)]
 pub fn scan_single_file(path: &Path, out: &mut Vec<(String, u64, u64)>) {
     if let Ok(meta) = fs::metadata(path) {
         let mtime = meta
@@ -273,7 +279,8 @@ pub fn index_transcripts_via_adapters(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+// Adapter reads and Tantivy mutation share the synchronous index-writer lane.
+#[allow(clippy::disallowed_methods, clippy::too_many_arguments)]
 pub fn index_adapter_location(
     adapter: &dyn TranscriptReadAdapter,
     location: &TranscriptLocation,

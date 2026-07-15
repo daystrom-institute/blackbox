@@ -43,6 +43,241 @@ use crate::util;
 use crate::webhooks;
 use crate::workflow;
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct RoutedCapabilityRequest {
+    worker_id: bro_core::WorkerId,
+    session_id: bro_core::SessionId,
+    #[serde(default)]
+    authorization: Option<bro_protocol::CapabilityAuthorization>,
+    request: bro_protocol::CapabilityRequest,
+}
+
+pub(crate) async fn internal_capability_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(routed): axum::Json<RoutedCapabilityRequest>,
+) -> axum::Json<bro_protocol::CapabilityResponse> {
+    use bro_protocol::{CapabilityErrorCode, CapabilityResponse};
+
+    let request = routed.request;
+    let call_id = request.call_id.clone();
+    if routed.worker_id.as_str().is_empty() || routed.session_id.as_str().is_empty() {
+        return axum::Json(capability_error_response(
+            call_id,
+            CapabilityErrorCode::Unauthorized,
+            "worker and session identity are required",
+            false,
+        ));
+    }
+    if request.call_id.trim().is_empty() {
+        return axum::Json(capability_error_response(
+            call_id,
+            CapabilityErrorCode::InvalidRequest,
+            "call identity is required",
+            false,
+        ));
+    }
+    if !routed.authorization.as_ref().is_some_and(|authorization| {
+        authorization.authorizes(
+            &routed.worker_id,
+            &routed.session_id,
+            &request.capability,
+            &request.operation,
+        )
+    }) {
+        return axum::Json(capability_error_response(
+            call_id,
+            CapabilityErrorCode::Unauthorized,
+            "fleet authorization does not grant this exact corpus operation",
+            false,
+        ));
+    }
+    if request
+        .deadline_unix_ms
+        .is_some_and(|deadline| deadline <= unix_time_ms())
+    {
+        return axum::Json(capability_error_response(
+            call_id,
+            CapabilityErrorCode::DeadlineExceeded,
+            "corpus capability deadline elapsed before admission",
+            false,
+        ));
+    }
+    if request.capability != "corpus" || request.operation != "search_corpus" {
+        return axum::Json(capability_error_response(
+            call_id,
+            CapabilityErrorCode::Unauthorized,
+            "blackboxd only serves the corpus search capability on this endpoint",
+            false,
+        ));
+    }
+    let lookup: bro_capabilities::CorpusLookup =
+        match serde_json::from_value(request.bounded_payload) {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                return axum::Json(capability_error_response(
+                    call_id,
+                    CapabilityErrorCode::InvalidRequest,
+                    error.to_string(),
+                    false,
+                ));
+            }
+        };
+    if let Err(error) = lookup.validate() {
+        return axum::Json(capability_error_response(
+            call_id,
+            CapabilityErrorCode::InvalidRequest,
+            error.message,
+            false,
+        ));
+    }
+    let indexed = state
+        .idx
+        .read()
+        .hybrid_bm25_hits(&lookup.query, lookup.limit, None);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut hits = match indexed {
+        Ok(hits) => hits
+            .into_iter()
+            .filter_map(|hit| {
+                seen.insert(hit.entity_id.clone())
+                    .then(|| bro_capabilities::CorpusHit {
+                        id: hit.entity_id,
+                        text: match hit.title {
+                            Some(title) => format!("{title}\n{}", hit.excerpt),
+                            None => hit.excerpt,
+                        },
+                    })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return axum::Json(capability_error_response(
+                call_id,
+                CapabilityErrorCode::Internal,
+                error.to_string(),
+                true,
+            ));
+        }
+    };
+    if hits.len() < lookup.limit {
+        for hit in state
+            .record_ingest
+            .search(&lookup.query, lookup.limit - hits.len())
+        {
+            if seen.insert(hit.id.clone()) {
+                hits.push(hit);
+            }
+        }
+    }
+    let value = match serde_json::to_value(hits) {
+        Ok(value) => value,
+        Err(error) => {
+            return axum::Json(capability_error_response(
+                call_id,
+                CapabilityErrorCode::Internal,
+                error.to_string(),
+                false,
+            ));
+        }
+    };
+    axum::Json(CapabilityResponse::success(call_id, value))
+}
+
+pub(crate) async fn internal_record_ingest_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(request): axum::Json<bro_capabilities::RecordIngestRequest>,
+) -> impl IntoResponse {
+    let records = request.records.clone();
+    let record_store = state.record_ingest.clone();
+    let index_writer = state.index_writer.clone();
+    let transcript_roots = state.record_transcript_roots.as_ref().clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let targets = bro_capabilities::transcript_record_targets(&records)?;
+        let mut receipt = record_store.ingest(request)?;
+        let pending = targets
+            .iter()
+            .filter(|(stream, target)| {
+                receipt
+                    .transcript_cursors
+                    .get(stream.as_str())
+                    .is_none_or(|cursor| *cursor < target.through_event_seq)
+            })
+            .map(|(stream, target)| (stream.clone(), target.clone()))
+            .collect();
+        let archived = record_store.archive_transcript_targets(&pending, &transcript_roots)?;
+        let archive_root = record_store.transcript_archive_root();
+        index_writer
+            .upsert_operational_records_blocking(records, archived, vec![archive_root])
+            .map_err(|error| {
+                bro_core::BroError::new("record_ingest.index_failed", error.to_string())
+            })?;
+        if !targets.is_empty() {
+            let acknowledged = targets
+                .into_iter()
+                .map(|(stream, target)| (stream, target.through_event_seq))
+                .collect();
+            receipt.transcript_cursors = record_store.acknowledge_transcripts(&acknowledged)?;
+        }
+        Ok::<_, bro_core::BroError>(receipt)
+    })
+    .await
+    .map_err(|error| bro_core::BroError::new("record_ingest.worker_failed", error.to_string()))
+    .and_then(|result| result);
+    match result {
+        Ok(receipt) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!(receipt)),
+        ),
+        Err(error) => {
+            let (status, retryable) = match error.code.as_str() {
+                "record_ingest.idempotency_conflict" => (axum::http::StatusCode::CONFLICT, false),
+                "record_ingest.persistence_failed"
+                | "record_ingest.index_failed"
+                | "record_ingest.worker_failed" => {
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, true)
+                }
+                _ => (axum::http::StatusCode::BAD_REQUEST, false),
+            };
+            (
+                status,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                        "retryable": retryable
+                    }
+                })),
+            )
+        }
+    }
+}
+
+fn capability_error_response(
+    call_id: String,
+    code: bro_protocol::CapabilityErrorCode,
+    message: impl Into<String>,
+    retryable: bool,
+) -> bro_protocol::CapabilityResponse {
+    bro_protocol::CapabilityResponse::error(
+        call_id.clone(),
+        bro_protocol::CapabilityError {
+            code,
+            message: message.into(),
+            retryable,
+            details: None,
+        },
+    )
+    .unwrap_or_else(|_| bro_protocol::CapabilityResponse::success(call_id, Value::Null))
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 pub(crate) async fn orchestrate_list_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
 ) -> impl axum::response::IntoResponse {

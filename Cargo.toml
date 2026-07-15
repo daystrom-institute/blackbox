@@ -16,6 +16,11 @@ members = [
     "crates/bro-code-mode",
     "crates/bro-apply-patch",
     "crates/bro-slack",
+    "crates/fleet-core",
+    "crates/fleetd",
+    "crates/blackops-core",
+    "crates/blackopsd",
+    "crates/blackbox-corpus-service",
 
     # Daemon-internal corpus crates peeled out of the root `blackbox` crate for
     # build parallelism (NOT bro-harness crates). Pure leaves: they depend only
@@ -73,6 +78,7 @@ tantivy = "0.22"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+semver = "1"
 serde_json = "1"
 toml = "0.8"
 schemars = "0.8"
@@ -90,6 +96,7 @@ bbox-vectors = { path = "crates/bbox-vectors" }
 # Foundation crate (entity_ref + git) extracted from the root crate (stage 0).
 bbox-corpus-core = { path = "crates/bbox-corpus-core" }
 bbox-corpus-index = { path = "crates/bbox-corpus-index" }
+blackbox-corpus-service = { path = "crates/blackbox-corpus-service" }
 bbox-edge-sidecar = { path = "crates/bbox-edge-sidecar" }
 # Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).
 bbox-chunker = { path = "crates/bbox-chunker" }
@@ -106,6 +113,7 @@ bbox-system-memory = { path = "crates/bbox-system-memory" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }
+bro-rpc = { path = "crates/bro-rpc" }
 bro-transcript = { path = "crates/bro-transcript" }
 bro-harness = { path = "crates/bro-harness" }
 bro-fleet-client = { path = "crates/bro-fleet-client" }

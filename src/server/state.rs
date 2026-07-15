@@ -81,6 +81,9 @@ pub(crate) struct SharedState {
     pub(crate) edge_rebuild_nudge_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pub(crate) path_cache: RwLock<path_cache::PathCache>,
     pub(crate) task_store: Arc<RwLock<TaskStore>>,
+    /// Temporary worker connection authority hosted by blackboxd until P5
+    /// moves the same state machine into fleet-core and fleetd.
+    pub(crate) worker_registry: Arc<orchestration::worker_registry::WorkerRegistry>,
     pub(crate) tail_tx: broadcast::Sender<TailEvent>,
     pub(crate) roster_version: Arc<AtomicU64>,
     pub(crate) roster_tx: broadcast::Sender<bro_protocol::RosterDelta>,
@@ -91,6 +94,9 @@ pub(crate) struct SharedState {
     /// fleet poll. See `src/orchestration/mod.rs::RosterView`.
     pub(crate) roster_view: Arc<orchestration::RosterView>,
     pub(crate) store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
+    /// Same-host bearer authority for every non-health HTTP route. This value
+    /// is intentionally never placed in a harness worker environment.
+    pub(crate) service_token: Arc<bro_rpc::ServiceToken>,
     /// In-flight workflow arcs keyed by `arc_thread_id`. Updated at
     /// every node boundary by the engine so /orchestrate/peek can
     /// report the live state without reading notes. Entries persist
@@ -198,6 +204,8 @@ pub(crate) struct SharedState {
     #[allow(dead_code)]
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
     pub(crate) system_events: system_events::SharedEventHub,
+    pub(crate) record_ingest: Arc<blackbox_corpus_service::RecordStore>,
+    pub(crate) record_transcript_roots: Arc<Vec<std::path::PathBuf>>,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -467,11 +475,17 @@ impl SharedState {
             edge_rebuild_nudge_rx: std::sync::Mutex::new(Some(edge_rebuild_nudge_rx)),
             path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
+            worker_registry: Arc::new(
+                orchestration::worker_registry::WorkerRegistry::open(store_dir).unwrap(),
+            ),
             tail_tx,
             roster_version: Arc::new(AtomicU64::new(0)),
             roster_tx,
             roster_view: Arc::new(orchestration::RosterView::new()),
             store_dir: store_dir.to_path_buf(),
+            service_token: Arc::new(
+                bro_rpc::ServiceToken::load_or_create(&store_dir.join("service.token")).unwrap(),
+            ),
             running_arcs: RwLock::new(HashMap::new()),
             wait_store: Arc::new(workflow::wait::WaitStore::new()),
             webhooks: Arc::new(webhooks::WebhookRegistry::new()),
@@ -529,6 +543,8 @@ impl SharedState {
                 store_dir.join("reactions"),
                 store_dir.join("identities"),
             )),
+            record_ingest: Arc::new(blackbox_corpus_service::RecordStore::open(store_dir).unwrap()),
+            record_transcript_roots: Arc::new(vec![store_dir.join("fleetd/workers")]),
         }
     }
 }
@@ -557,6 +573,7 @@ pub(crate) struct ArcSnapshot {
 pub(crate) struct BlackboxServer {
     pub(crate) state: Arc<SharedState>,
     pub(crate) tool_router: ToolRouter<Self>,
+    pub(crate) runtime_role: super::RuntimeRole,
     /// Session-scoped MCP tool surface selector. Set once during
     /// MCP session initialization from the `?surface` query parameter.
     pub(crate) surface: OnceLock<Arc<str>>,

@@ -190,6 +190,7 @@ impl BlackboxServer {
             match try_acquire_resume_lease(
                 &self.state.task_store,
                 self.state.resume_leases.as_ref(),
+                self.state.worker_registry.as_ref(),
                 provider,
                 &session_id,
             ) {
@@ -291,7 +292,7 @@ impl BlackboxServer {
         }
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(lease) = resume_lease {
-            release_resume_lease_when_done(task.clone(), lease);
+            release_resume_lease_when_done(task.clone(), lease, self.state.worker_registry.clone());
         }
         self.record_task_to_bro(brofile, &task);
         Ok(task)

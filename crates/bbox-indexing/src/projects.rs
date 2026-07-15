@@ -189,6 +189,9 @@ impl ProjectRegistry {
         self.rename_project_locked(p)
     }
 
+    // An operator-requested on-disk rename is a synchronous administrative
+    // boundary and finishes before the registry record is updated.
+    #[allow(clippy::disallowed_methods)]
     fn rename_project_locked(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
         let idx = self
             .resolve_project_index(&p.project)?
@@ -215,13 +218,13 @@ impl ProjectRegistry {
                     new_path.display()
                 );
             }
-            if let Some(parent) = new_path.parent() {
-                if !parent.is_dir() {
-                    anyhow::bail!(
-                        "cannot move_on_disk: target parent is not a directory: {}",
-                        parent.display()
-                    );
-                }
+            if let Some(parent) = new_path.parent()
+                && !parent.is_dir()
+            {
+                anyhow::bail!(
+                    "cannot move_on_disk: target parent is not a directory: {}",
+                    parent.display()
+                );
             }
             if dry_run {
                 canonical_nonexistent_absolute_path(&new_path)?
@@ -327,15 +330,15 @@ impl ProjectRegistry {
             return Ok(Some(idx));
         }
         let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            if let Ok(canonical) = canonical_project_path(&path) {
-                let canonical_path = canonical.to_string_lossy();
-                return Ok(self
-                    .store
-                    .projects
-                    .iter()
-                    .position(|project| project.canonical_path == canonical_path));
-            }
+        if path.is_absolute()
+            && let Ok(canonical) = canonical_project_path(&path)
+        {
+            let canonical_path = canonical.to_string_lossy();
+            return Ok(self
+                .store
+                .projects
+                .iter()
+                .position(|project| project.canonical_path == canonical_path));
         }
         Ok(None)
     }
@@ -400,6 +403,8 @@ fn valid_alias(alias: &str) -> bool {
     !alias.is_empty() && !alias.contains('/') && !alias.chars().any(char::is_whitespace)
 }
 
+// Project registry open synchronously snapshots its small durable JSON store.
+#[allow(clippy::disallowed_methods)]
 fn load_store(path: &Path) -> Result<ProjectStore> {
     if !path.exists() {
         return Ok(ProjectStore::default());
@@ -495,6 +500,9 @@ pub fn fleet_worktree_scope_and_dir(
 /// out-of-tree user worktrees of a registered repo do not alias. Read-only
 /// scope resolution for retrieval uses the broader
 /// [`resolve_base_project_for_scope`].
+// Project resolution synchronously canonicalizes operator-supplied paths before
+// granting write-side worktree aliasing.
+#[allow(clippy::disallowed_methods)]
 fn resolve_managed_fleet_worktree<'a>(
     project_dir: Option<&str>,
     projects: &'a [ProjectRecord],
@@ -537,6 +545,8 @@ fn resolve_managed_fleet_worktree<'a>(
 /// - a nested independent checkout (`.git` *directory* short-circuits);
 /// - a linked worktree of a DIFFERENT repo parked inside the root (its gitdir
 ///   base is not `root`).
+// Linked-worktree classification synchronously verifies canonical git roots.
+#[allow(clippy::disallowed_methods)]
 fn in_tree_linked_worktree_top(path: &Path, root: &Path) -> Option<PathBuf> {
     let mut cursor = path;
     while cursor != root {
@@ -575,6 +585,8 @@ pub use bbox_corpus_core::project_record::resolve_base_project_for_scope;
 ///
 /// Uses the broad retrieval resolution of [`resolve_base_project_for_scope`].
 /// `None` when no registered project owns the path.
+// Read-side scope resolution synchronously canonicalizes the selected checkout.
+#[allow(clippy::disallowed_methods)]
 pub fn resolve_scope_and_checkout_dir(
     path: &str,
     projects: &[ProjectRecord],
@@ -644,6 +656,9 @@ pub enum ResolveIntent {
 /// under the subdirectory itself. Under `Write` intent this resolver returns
 /// the base for the root/exact matches and `None` for plain subdirectories,
 /// leaving that fallback decision explicit at the call site.
+// The unified resolver synchronously canonicalizes absolute selectors before
+// granting either read or write scope.
+#[allow(clippy::disallowed_methods)]
 pub fn resolve_project_context(
     raw: &str,
     projects: &[ProjectRecord],
@@ -679,13 +694,12 @@ pub fn resolve_project_context(
         }
         ResolveIntent::Write => {
             // A canonicalized form of a registered root still resolves.
-            if let Ok(canonical) = fs::canonicalize(path) {
-                if let Some(record) = projects
+            if let Ok(canonical) = fs::canonicalize(path)
+                && let Some(record) = projects
                     .iter()
                     .find(|project| Path::new(&project.canonical_path) == canonical)
-                {
-                    return Some(base_context(record));
-                }
+            {
+                return Some(base_context(record));
             }
             let (base, worktree) = resolve_managed_fleet_worktree(Some(raw), projects)?;
             Some(ProjectContext {
@@ -712,6 +726,9 @@ fn base_context(record: &ProjectRecord) -> ProjectContext {
 /// Walk a project root (capped at depth 4) collecting language
 /// fingerprints. Skips heavy build/output directories so a polyglot
 /// monorepo doesn't pay an O(everything) cost on registration.
+// Registration performs this bounded synchronous directory walk before it
+// persists the project's language fingerprint.
+#[allow(clippy::disallowed_methods)]
 pub fn detect_languages(root: &Path) -> BTreeSet<Language> {
     const MAX_DEPTH: usize = 4;
     const SKIP_DIRS: &[&str] = &[
@@ -777,6 +794,9 @@ pub fn detect_languages(root: &Path) -> BTreeSet<Language> {
     found
 }
 
+// Rename dry-runs synchronously canonicalize the existing parent without
+// creating the requested target.
+#[allow(clippy::disallowed_methods)]
 fn canonical_nonexistent_absolute_path(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
@@ -790,6 +810,9 @@ fn canonical_nonexistent_absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+// Project-registry fixtures intentionally create repositories, worktrees, and
+// configuration trees using synchronous filesystem and Git subprocesses.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use bbox_stores::store_persister::StorePersister;

@@ -42,31 +42,50 @@ Useful shell checks:
 
 ```bash
 systemctl --user status blackbox.service
-journalctl --user -u blackbox.service -n 100 --no-pager
-journalctl --user -u blackbox.service -f
+systemctl --user status blackopsd.service fleetd.service
+journalctl --user -u blackbox.service -u blackopsd.service -u fleetd.service -n 100 --no-pager
+journalctl --user -u blackbox.service -u blackopsd.service -u fleetd.service -f
+curl -fsS http://127.0.0.1:7264/readyz
+curl -fsS http://127.0.0.1:7265/readyz
+curl -fsS http://127.0.0.1:7266/readyz
 ```
 
-## After every daemon update
+The production blackboxd must report `"role":"corpus"` from `/readyz`.
+This disables the retired control routes and operational MCP tools; fleetd and
+blackopsd are the only execution and operational authorities. Use
+`BLACKBOX_RUNTIME_ROLE=compatibility` only during the bounded rollback window,
+never alongside an authority-mode fleetd/blackopsd pair for normal operation.
 
-Build and install the binaries you changed:
+## After an update
+
+Build the release, install only the artifacts that changed, and restart only
+their owners:
 
 ```bash
-cargo build --release
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-install -m 755 target/release/bro ~/.local/bin/bro
+cargo build --release --workspace
 install -d ~/.local/share/blackbox/memories
 cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
-systemctl --user restart blackbox.service
 ```
 
-Restart `blackbox-dev.service` only if you updated the dev daemon too.
-Prod and dev intentionally use different installed binary paths.
+| Changed artifact | Install target | Restart behavior |
+|---|---|---|
+| blackboxd or corpus/index crates | `~/.local/bin/blackboxd` | Restart `blackbox.service`; live workers and blackops intent continue |
+| blackopsd or blackops-core | `~/.local/bin/blackopsd` | Restart `blackopsd.service`; live workers continue |
+| fleetd or fleet-core | `~/.local/bin/fleetd` | Restart `fleetd.service`; workers reconnect and replay |
+| bro-harness, provider transport, or local tool runtime | `~/.local/bin/bro-harness` | Do not drain fleetd; existing workers retain the old build and new workers use the replacement |
+| bro or Fleet TUI | `~/.local/bin/bro` | Restart the client only |
+| blackboxd-dev | `~/.local/bin/blackboxd-dev` | Restart only `blackbox-dev.service` |
+
+On macOS, sign a replacement with the same persistent identity before reload.
+Use `launchctl kickstart -k` for a binary-only service replacement. If its
+plist changed, boot out the label, merge operator-owned secret entries into the
+rendered replacement, lint it, and bootstrap it again. Replacing bro-harness
+does not require a fleetd restart.
 
 Then watch the journal:
 
 ```bash
-journalctl --user -u blackbox.service -f
+journalctl --user -u blackbox.service -u blackopsd.service -u fleetd.service -f
 ```
 
 Expected after a normal restart:
@@ -75,6 +94,8 @@ Expected after a normal restart:
 - Background reindex starts after its startup delay.
 - Embedding queues may receive new/changed docs.
 - EdgeIndex rebuilds if the indexed corpus grew.
+- `/healthz` and `/readyz` answer without credentials; every other route
+  returns 401 without the private service bearer.
 
 Expected after a schema change:
 
@@ -254,7 +275,7 @@ share the same fix.
 |---|---|---|
 | Vector partitions | WAL records under `~/.local/state/blackbox/vectors/` | Automatic background compactor |
 | Edge sidecars | JSONL graph sidecars under `~/.local/state/blackbox/edges/` | `bbox_edge_compact` when sidecars grow from repeated full reindex replay |
-| Workflow context | Rolling `ANCHOR` notes on workflow threads | Read via `bro orchestrate status` or `bbox_notes`; no storage cleanup needed |
+| Workflow context | Durable blackops workflow runs and corpus thread notes | Read `blackops_workflow_status` on blackopsd or `bbox_notes` on blackboxd; legacy `bro orchestrate` is compatibility-only |
 
 ### Vector compaction
 
@@ -312,8 +333,18 @@ Protect:
 - `~/.local/state/blackbox/packets/`
 - `~/.local/state/blackbox/artifacts/`
 - `~/.local/state/blackbox/bro/`
+- `~/.local/state/blackbox/blackopsd/`
+- `~/.local/state/blackbox/fleetd/`
+- `~/.local/state/blackbox/service.token`
 - customized `~/.config/blackbox/embed.toml`
-- systemd drop-ins containing API keys
+- fleetd provider-account configuration and credential sources
+- blackopsd integration configuration and secret sources
+- systemd drop-ins or launchd plists containing API keys
+
+Encrypt any backup containing the service token or credentials. Take a
+consistent authority backup with the three services stopped, or after draining
+live attempts. Restore owner-only permissions before starting blackboxd,
+blackopsd, and fleetd in that order.
 
 Rebuild:
 
@@ -336,13 +367,14 @@ The longer backup checklist lives in [Operations](operations.md).
 | Disk grows under `vectors/` | journal compaction lines | Usually wait; re-embed only after provider/data issues |
 | Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
 | Provider markdown stale | `bbox_lint`, rendered files | `bbox_render(scope="global")` |
-| Reaction dead-lettered / no reaction ran / identity missing | `system_event_open` → `reaction_deliveries` → `reaction_replay dry_run` → `reaction_retry` | See [System events](system-events.md) — operational loops. |
+| Legacy reaction or maintenance state is missing after cutover | Confirm the old store is preserved and the new authority stores were intentionally fresh | Do not copy legacy files into blackopsd; use compatibility only for rollback and follow AR-003 |
 
-System events are journalled separately from the transcript index and have
-their own retention/compaction. The transcript-side `bbox_*` reindex tools
-do not touch the system-event journal or the outbox. For the system-event
-runbook (dead-lettered reactions, missing identities, missing token
-secrets, replay), see [System events](system-events.md).
+The older `system_event_*`, `reaction_*`, `bro orchestrate`, and maintenance
+installer paths are monolith compatibility surfaces. They are not served by a
+normal corpus-role blackboxd and must not be presented as differentiated day-2
+commands. Use blackopsd definitions, invocations, schedules, waits, approvals,
+and integration intents for new automation. Porting legacy runtime state and
+maintenance schedules is tracked in AR-003.
 
 ## Key paths
 
@@ -350,9 +382,17 @@ secrets, replay), see [System events](system-events.md).
 |---|---|
 | `~/.local/bin/blackboxd` | Production daemon binary |
 | `~/.local/bin/blackboxd-dev` | Dev daemon binary |
+| `~/.local/bin/blackopsd` | Operational-intent service binary |
+| `~/.local/bin/fleetd` | Live-execution authority binary |
+| `~/.local/bin/bro-harness` | Per-session worker binary used by new workers |
 | `~/.local/bin/bro` | Terminal TUI client |
 | `~/.config/systemd/user/blackbox.service` | Prod systemd unit |
+| `~/.config/systemd/user/blackopsd.service` | Operational authority systemd unit |
+| `~/.config/systemd/user/fleetd.service` | Live authority systemd unit |
 | `~/.config/systemd/user/blackbox.service.d/*.conf` | Drop-in env and secrets |
+| `~/.local/state/blackbox/service.token` | Owner-only shared local bearer; protect and encrypt in backups |
+| `~/.local/state/blackbox/blackopsd/` | Durable operational authority state |
+| `~/.local/state/blackbox/fleetd/` | Attempts, leases, worker logs, outbox, and worktree ownership |
 | `~/.local/share/blackbox/index/` | Rebuildable Tantivy index |
 | `~/.local/share/blackbox/memories/` | Shipped system memories and runbooks |
 | `~/.local/state/blackbox/vectors/` | Rebuildable vector partitions |
@@ -361,5 +401,5 @@ secrets, replay), see [System events](system-events.md).
 | `~/.local/state/blackbox/` | Durable JSON stores plus rebuildable projections |
 | `~/.bro/mcp.json` | Global MCP server config |
 | `<project>/.bro/mcp.json` | Project MCP overlay |
-| `~/.bro/events/journal/current.jsonl` | System-event journal (compacts at 10k events / 7 days) |
-| `~/.bro/events/outbox/current.jsonl` | Reaction outbox (succeeded rows compact at 7 days; all other statuses retained) |
+| `~/.bro/events/journal/current.jsonl` | Legacy compatibility system-event journal; preserve for rollback |
+| `~/.bro/events/outbox/current.jsonl` | Legacy compatibility reaction outbox; preserve for rollback |

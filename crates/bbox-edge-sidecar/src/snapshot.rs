@@ -83,6 +83,8 @@ pub fn dirty_overlay_rel(project_id: &str) -> String {
     format!("workspace/{}/{}", project_id, DIRTY_OVERLAY_DIRNAME)
 }
 
+// Atomic synchronous persistence boundary; materialization callers run off Tokio workers.
+#[allow(clippy::disallowed_methods)]
 pub fn write_snapshot_files(
     edges_dir: &Path,
     project_id: &str,
@@ -117,6 +119,8 @@ pub fn write_snapshot_files(
     Ok(())
 }
 
+// Atomic synchronous persistence boundary; materialization callers run off Tokio workers.
+#[allow(clippy::disallowed_methods)]
 pub fn write_dirty_overlay(
     edges_dir: &Path,
     project_id: &str,
@@ -204,6 +208,8 @@ pub fn write_dirty_overlay(
     Ok(())
 }
 
+// Synchronous persistence boundary; materialization callers run off Tokio workers.
+#[allow(clippy::disallowed_methods)]
 pub fn clear_dirty_overlay(edges_dir: &Path, project_id: &str) -> Result<bool> {
     let overlay_dir = dirty_overlay_dir(edges_dir, project_id);
     if !overlay_dir.is_dir() {
@@ -225,6 +231,8 @@ pub fn clear_dirty_overlay(edges_dir: &Path, project_id: &str) -> Result<bool> {
     Ok(true)
 }
 
+// Synchronous validation belongs to the same off-worker persistence transaction.
+#[allow(clippy::disallowed_methods)]
 fn validate_overlay_provenance(overlay_dir: &Path) -> std::result::Result<(), Vec<PathBuf>> {
     let mut bad = Vec::new();
     if let Ok(entries) = fs::read_dir(overlay_dir) {
@@ -241,11 +249,11 @@ fn validate_overlay_provenance(overlay_dir: &Path) -> std::result::Result<(), Ve
                     if trimmed.is_empty() {
                         continue;
                     }
-                    if let Ok(edge) = serde_json::from_str::<Edge>(trimmed) {
-                        if edge.provenance != EdgeProvenance::Derived {
-                            bad.push(path.clone());
-                            break;
-                        }
+                    if let Ok(edge) = serde_json::from_str::<Edge>(trimmed)
+                        && edge.provenance != EdgeProvenance::Derived
+                    {
+                        bad.push(path.clone());
+                        break;
                     }
                 }
             }
@@ -254,6 +262,8 @@ fn validate_overlay_provenance(overlay_dir: &Path) -> std::result::Result<(), Ve
     if bad.is_empty() { Ok(()) } else { Err(bad) }
 }
 
+// Synchronous quarantine is part of the off-worker overlay transaction.
+#[allow(clippy::disallowed_methods)]
 fn quarantine_dirty_overlay(
     edges_dir: &Path,
     project_id: &str,
@@ -275,6 +285,8 @@ fn quarantine_dirty_overlay(
     Ok(())
 }
 
+// Stable lifecycle API whose arguments mirror the three persisted edge lanes.
+#[allow(clippy::too_many_arguments)]
 pub fn switch_to_clean_snapshot(
     edges_dir: &Path,
     project_id: &str,
@@ -318,19 +330,23 @@ pub fn switch_to_clean_snapshot(
 
     update_manifest_for_snapshot(
         edges_dir,
-        project_id,
-        repo_id,
-        branch,
-        Some(head_sha),
-        false,
-        None,
-        &snap_id,
-        None,
+        ManifestSnapshotUpdate {
+            project_id,
+            repo_id,
+            branch,
+            head_sha: Some(head_sha),
+            dirty: false,
+            dirty_fingerprint: None,
+            snapshot_id: &snap_id,
+            dirty_overlay_rel: None,
+        },
     )?;
 
     Ok(())
 }
 
+// Stable lifecycle API whose arguments mirror identity plus three persisted edge lanes.
+#[allow(clippy::too_many_arguments)]
 pub fn switch_to_dirty_overlay(
     edges_dir: &Path,
     project_id: &str,
@@ -358,32 +374,49 @@ pub fn switch_to_dirty_overlay(
     ];
     write_dirty_overlay(edges_dir, project_id, &overlay_files)?;
 
+    let overlay_rel = dirty_overlay_rel(project_id);
     update_manifest_for_snapshot(
         edges_dir,
-        project_id,
-        repo_id,
-        branch,
-        Some(head_sha),
-        true,
-        Some(dirty_fingerprint),
-        &snap_id,
-        Some(&dirty_overlay_rel(project_id)),
+        ManifestSnapshotUpdate {
+            project_id,
+            repo_id,
+            branch,
+            head_sha: Some(head_sha),
+            dirty: true,
+            dirty_fingerprint: Some(dirty_fingerprint),
+            snapshot_id: &snap_id,
+            dirty_overlay_rel: Some(&overlay_rel),
+        },
     )?;
 
     Ok(())
 }
 
+struct ManifestSnapshotUpdate<'a> {
+    project_id: &'a str,
+    repo_id: &'a str,
+    branch: Option<&'a str>,
+    head_sha: Option<&'a str>,
+    dirty: bool,
+    dirty_fingerprint: Option<&'a str>,
+    snapshot_id: &'a str,
+    dirty_overlay_rel: Option<&'a str>,
+}
+
 fn update_manifest_for_snapshot(
     edges_dir: &Path,
-    project_id: &str,
-    repo_id: &str,
-    branch: Option<&str>,
-    head_sha: Option<&str>,
-    dirty: bool,
-    dirty_fingerprint: Option<&str>,
-    snapshot_id: &str,
-    dirty_overlay_rel: Option<&str>,
+    update: ManifestSnapshotUpdate<'_>,
 ) -> Result<()> {
+    let ManifestSnapshotUpdate {
+        project_id,
+        repo_id,
+        branch,
+        head_sha,
+        dirty,
+        dirty_fingerprint,
+        snapshot_id,
+        dirty_overlay_rel,
+    } = update;
     let manifest = WorkspaceManifest {
         version: 1,
         project_id: project_id.to_string(),
@@ -444,6 +477,8 @@ fn discover_repo_id(project_path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+// Fixture setup and assertions intentionally exercise the synchronous disk contract.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use bbox_corpus_core::entity_ref::EntityRef;

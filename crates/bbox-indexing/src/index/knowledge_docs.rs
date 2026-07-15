@@ -107,6 +107,7 @@ pub fn reindex_knowledge_store_standalone(
 
 /// Apply a knowledge upsert to an already-held writer (no commit). The
 /// IndexWriterActor is the production caller; it batches ops and commits once.
+#[allow(clippy::disallowed_methods)] // Runs only inside IndexWriterActor's single-writer lane.
 pub fn apply_knowledge_upsert(
     writer: &mut IndexWriter,
     fields: FieldHandles,
@@ -134,6 +135,8 @@ pub fn apply_knowledge_delete(
     Ok(())
 }
 
+// Reindex metadata is synchronously sampled inside the writer actor's pass.
+#[allow(clippy::disallowed_methods)]
 fn file_meta(path: &Path) -> Option<FileMeta> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta
@@ -150,6 +153,8 @@ fn file_meta(path: &Path) -> Option<FileMeta> {
 }
 
 #[cfg(test)]
+// Knowledge-index fixtures intentionally build temporary stores on disk.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope};

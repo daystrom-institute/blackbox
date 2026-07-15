@@ -28,15 +28,21 @@
 //! readable metadata at all are owned by the [`FALLBACK_PROVIDER`] instance so
 //! exactly one adapter indexes each file.
 
+use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use anyhow::{Context as _, Result as AnyResult};
 use serde_json::Value;
+use tantivy::TantivyDocument;
 
 use bro_core::Provider;
 use bro_transcript::parse_transcript_line_rich;
 
+use crate::index::FieldHandles;
+
 use super::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
+use super::projection::{normalized_to_doc, normalized_to_tool_call_doc};
 use super::types::{
     NormalizedTranscriptEvent, RawTranscriptRef, TranscriptBatch, TranscriptCursor,
     TranscriptLocation, TranscriptReadError, TranscriptSource, TranscriptStorage,
@@ -48,6 +54,7 @@ pub const EVENT_LOG_SUFFIX: &str = ".events.jsonl";
 /// Owner of logs whose provider cannot be determined (no `session_start`
 /// milestone, no inferable transport/model).
 const FALLBACK_PROVIDER: Provider = Provider::Glm;
+const MAX_EXTERNAL_EVENT_LOG_BYTES: u64 = 256 * 1024 * 1024;
 
 /// All harness providers that persist sessions into the shared sessions dir.
 const HARNESS_PROVIDERS: &[Provider] = &[
@@ -117,6 +124,201 @@ impl HarnessSessionsAdapter {
     }
 }
 
+/// Complete, validated document replacement for one fleet-owned harness log.
+pub struct HarnessEventLogProjection {
+    pub canonical_path: String,
+    pub documents: Vec<TantivyDocument>,
+}
+
+/// An immutable byte prefix ending exactly at one committed fleet event.
+///
+/// The source may continue growing after this value is built. Consumers must
+/// project or archive `bytes`, never reopen the source and read through EOF,
+/// because `through_event_seq` is an acknowledgement boundary.
+#[derive(Debug)]
+pub struct FleetEventLogPrefix {
+    pub canonical_path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+/// Validate a fleet-owned event-log coordinate and project its conversational
+/// contents into corpus documents. Callers must delete existing documents for
+/// `canonical_path` and add this replacement in one Tantivy commit.
+pub fn project_fleet_event_log(
+    path: &Path,
+    session_id: &str,
+    through_event_seq: u64,
+    allowed_roots: &[PathBuf],
+    fields: FieldHandles,
+) -> AnyResult<HarnessEventLogProjection> {
+    anyhow::ensure!(
+        through_event_seq > 0,
+        "fleet transcript coordinate must be positive"
+    );
+    anyhow::ensure!(
+        !session_id.trim().is_empty(),
+        "fleet transcript session identity is empty"
+    );
+    let prefix = read_fleet_event_log_prefix(path, through_event_seq, allowed_roots)?;
+    let canonical_path = prefix.canonical_path;
+    let contents =
+        std::str::from_utf8(&prefix.bytes).context("fleet transcript prefix is not valid UTF-8")?;
+
+    let meta = read_session_meta_from_contents(contents);
+    let provider = meta.resolve_provider();
+    let adapter = HarnessSessionsAdapter::new(
+        provider,
+        canonical_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    );
+    let location = adapter.location_for(session_id, canonical_path.clone(), &meta);
+    let snapshot = adapter
+        .read_contents_since(&location, contents, 0)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let path_text = canonical_path.to_string_lossy().into_owned();
+    let account = location
+        .account
+        .as_deref()
+        .unwrap_or(location.source.label());
+    let project = location.project.as_deref().unwrap_or("");
+    let mut documents = Vec::new();
+    for event in &snapshot.events {
+        if let Some(document) = normalized_to_doc(
+            event,
+            account,
+            &path_text,
+            location.is_subagent,
+            project,
+            None,
+            fields,
+        ) {
+            documents.push(document);
+        }
+        if let Some(document) = normalized_to_tool_call_doc(
+            event,
+            account,
+            &path_text,
+            location.is_subagent,
+            project,
+            None,
+            fields,
+        ) {
+            documents.push(document);
+        }
+    }
+    Ok(HarnessEventLogProjection {
+        canonical_path: path_text,
+        documents,
+    })
+}
+
+/// Resolve one regular event-log file under an explicitly allowed root.
+pub fn validate_fleet_event_log_path(path: &Path, allowed_roots: &[PathBuf]) -> AnyResult<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading fleet transcript metadata at {}", path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "fleet transcript path is not a regular non-symlink file"
+    );
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing fleet transcript {}", path.display()))?;
+    let allowed = allowed_roots.iter().any(|root| {
+        root.canonicalize()
+            .is_ok_and(|canonical_root| canonical_path.starts_with(canonical_root))
+    });
+    anyhow::ensure!(allowed, "fleet transcript path is outside configured roots");
+    Ok(canonical_path)
+}
+
+/// Read and validate only the committed source prefix through `through_event_seq`.
+///
+/// Sequence validation starts at one and is contiguous. Legacy records without
+/// an explicit `event_seq` consume the expected sequence, matching the harness
+/// event-log recovery contract. A file whose first explicit record starts above
+/// one is therefore rejected; accepting a compacted lower bound requires a
+/// future explicit metadata contract rather than guessing from the first line.
+/// Bytes after the requested event are deliberately not read or validated.
+pub fn read_fleet_event_log_prefix(
+    path: &Path,
+    through_event_seq: u64,
+    allowed_roots: &[PathBuf],
+) -> AnyResult<FleetEventLogPrefix> {
+    anyhow::ensure!(
+        through_event_seq > 0,
+        "fleet transcript coordinate must be positive"
+    );
+    let canonical_path = validate_fleet_event_log_path(path, allowed_roots)?;
+    let file = std::fs::File::open(&canonical_path)
+        .with_context(|| format!("opening fleet transcript {}", canonical_path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut prefix = Vec::new();
+    let mut line = Vec::new();
+    let mut previous_sequence = None;
+    let mut line_number = 0usize;
+
+    loop {
+        line.clear();
+        let remaining = (MAX_EXTERNAL_EVENT_LOG_BYTES as usize).saturating_sub(prefix.len());
+        let read = (&mut reader)
+            .take(remaining.saturating_add(1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        anyhow::ensure!(
+            prefix.len().saturating_add(line.len()) <= MAX_EXTERNAL_EVENT_LOG_BYTES as usize,
+            "fleet transcript prefix exceeds the {MAX_EXTERNAL_EVENT_LOG_BYTES}-byte intake limit"
+        );
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            prefix.extend_from_slice(&line);
+            continue;
+        }
+        anyhow::ensure!(
+            line.ends_with(b"\n"),
+            "fleet transcript event at line {line_number} is not durably newline-committed"
+        );
+        let raw = line.strip_suffix(b"\n").expect("newline checked above");
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let value: Value = serde_json::from_slice(raw)
+            .with_context(|| format!("parsing fleet transcript line {line_number}"))?;
+        anyhow::ensure!(
+            value.get("event").is_some(),
+            "fleet transcript line {line_number} has no event envelope"
+        );
+        let expected = previous_sequence
+            .map(|sequence: u64| {
+                sequence
+                    .checked_add(1)
+                    .context("fleet transcript sequence space exhausted")
+            })
+            .transpose()?
+            .unwrap_or(1);
+        let sequence = match value.get("event_seq") {
+            None | Some(Value::Null) => expected,
+            Some(value) => value.as_u64().with_context(|| {
+                format!("fleet transcript event_seq at line {line_number} is not an integer")
+            })?,
+        };
+        anyhow::ensure!(
+            sequence == expected,
+            "fleet transcript sequence gap: expected {expected}, found {sequence} at line {line_number}"
+        );
+        prefix.extend_from_slice(&line);
+        previous_sequence = Some(sequence);
+        if sequence == through_event_seq {
+            return Ok(FleetEventLogPrefix {
+                canonical_path,
+                bytes: prefix,
+            });
+        }
+    }
+    anyhow::bail!("fleet transcript has not durably committed event sequence {through_event_seq}")
+}
+
 /// Session metadata mined from the log's `session_start` / `session_resume`
 /// milestone (scanned from the head of the file).
 #[derive(Debug, Default, Clone)]
@@ -159,10 +361,14 @@ impl SessionMeta {
 /// few lines are examined — the harness writes the milestone before any
 /// protocol event, so this stays cheap for large logs.
 fn read_session_meta(path: &Path) -> SessionMeta {
-    const HEAD_LINES: usize = 8;
     let Ok(contents) = read_head(path, 64 * 1024) else {
         return SessionMeta::default();
     };
+    read_session_meta_from_contents(&contents)
+}
+
+fn read_session_meta_from_contents(contents: &str) -> SessionMeta {
+    const HEAD_LINES: usize = 8;
     for line in contents.lines().take(HEAD_LINES) {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -227,6 +433,8 @@ impl TranscriptReadAdapter for HarnessSessionsAdapter {
         Ok(Some(self.location_for(session_id, path, &meta)))
     }
 
+    // Adapter discovery is a bounded synchronous scan on the corpus reindex lane.
+    #[allow(clippy::disallowed_methods)]
     fn scan_locations(
         &self,
         target: TranscriptScanTarget,
@@ -258,6 +466,8 @@ impl TranscriptReadAdapter for HarnessSessionsAdapter {
         Ok(out)
     }
 
+    // Harness event logs are read synchronously by the adapter/reindex lane.
+    #[allow(clippy::disallowed_methods)]
     fn read_since(
         &self,
         location: &TranscriptLocation,
@@ -275,12 +485,23 @@ impl TranscriptReadAdapter for HarnessSessionsAdapter {
         };
         let contents = std::fs::read_to_string(&location.path)
             .map_err(|err| TranscriptReadError::io("read", &location.path, err))?;
+        self.read_contents_since(location, &contents, start_offset)
+    }
+}
+
+impl HarnessSessionsAdapter {
+    fn read_contents_since(
+        &self,
+        location: &TranscriptLocation,
+        contents: &str,
+        start_offset: u64,
+    ) -> Result<TranscriptBatch, TranscriptReadError> {
         let fallback_session_id = location
             .session_id
             .clone()
             .or_else(|| session_id_from_path(&location.path))
             .unwrap_or_default();
-        let meta = read_session_meta(&location.path);
+        let meta = read_session_meta_from_contents(contents);
 
         let mut events = Vec::new();
         let mut offset = 0u64;
@@ -384,6 +605,7 @@ fn project_envelope(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::transcripts::types::TranscriptEventKind;
@@ -408,6 +630,21 @@ mod tests {
                 "cwd": cwd,
                 "provider": provider,
             }
+        })
+    }
+
+    fn sequenced_message(sequence: u64, session_id: &str, text: &str) -> Value {
+        json!({
+            "ts": "2026-07-15T01:00:00.000Z",
+            "event_seq": sequence,
+            "event": {
+                "type": "user",
+                "session_id": session_id,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}],
+                },
+            },
         })
     }
 
@@ -613,5 +850,78 @@ mod tests {
         let location = adapter.locate("sess-torn").unwrap().expect("located");
         let batch = adapter.read_since(&location, None).unwrap();
         assert_eq!(batch.events.len(), 5, "torn line skipped, rest intact");
+    }
+
+    #[test]
+    fn fleet_projection_stops_at_the_acknowledged_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = write_log(
+            &root,
+            "fleet-prefix",
+            &[
+                sequenced_message(1, "fleet-prefix", "acknowledged"),
+                sequenced_message(2, "fleet-prefix", "not acknowledged"),
+            ],
+        );
+        let (_schema, fields) = crate::index::build_schema();
+
+        let projection = project_fleet_event_log(
+            &path,
+            "fleet-prefix",
+            1,
+            std::slice::from_ref(&root),
+            fields,
+        )
+        .unwrap();
+        assert_eq!(projection.documents.len(), 1);
+        let prefix = read_fleet_event_log_prefix(&path, 1, &[root]).unwrap();
+        let prefix = String::from_utf8(prefix.bytes).unwrap();
+        assert!(prefix.contains("acknowledged"));
+        assert!(!prefix.contains("not acknowledged"));
+    }
+
+    #[test]
+    fn fleet_prefix_ignores_malformed_or_gapped_suffix_after_coordinate() {
+        for suffix in [
+            "{not-json}\n".to_string(),
+            format!("{}\n", sequenced_message(4, "fleet-suffix", "gap")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let path = write_log(
+                &root,
+                "fleet-suffix",
+                &[
+                    sequenced_message(1, "fleet-suffix", "one"),
+                    sequenced_message(2, "fleet-suffix", "two"),
+                ],
+            );
+            let mut contents = std::fs::read_to_string(&path).unwrap();
+            contents.push_str(&suffix);
+            std::fs::write(&path, contents).unwrap();
+            let (_schema, fields) = crate::index::build_schema();
+
+            let projection =
+                project_fleet_event_log(&path, "fleet-suffix", 2, &[root], fields).unwrap();
+            assert_eq!(projection.documents.len(), 2);
+        }
+    }
+
+    #[test]
+    fn fleet_prefix_rejects_a_non_one_start_without_compaction_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = write_log(
+            &root,
+            "fleet-gap",
+            &[sequenced_message(100, "fleet-gap", "detached suffix")],
+        );
+
+        let error = read_fleet_event_log_prefix(&path, 100, &[root]).unwrap_err();
+        assert!(
+            error.to_string().contains("expected 1, found 100"),
+            "{error:#}"
+        );
     }
 }

@@ -4,8 +4,8 @@
 # This config is referenced by deploy/blackbox-dev.service
 
 [daemon]
-port = 7265
-bind = "0.0.0.0"
+port = 7274
+bind = "127.0.0.1"
 mcp_name = "blackbox-dev"
 mcp_session_keepalive_secs = 21600
 shutdown_grace_secs = 15

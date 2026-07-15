@@ -21,6 +21,9 @@ pub fn render(source: &str, ctx: &serde_json::Value) -> Result<String> {
 }
 
 /// Render a Tera template loaded from a file against a JSON context value.
+/// File-backed rendering is a synchronous workflow/indexing boundary; async
+/// callers must place it on their blocking lane.
+#[allow(clippy::disallowed_methods)]
 pub fn render_file(path: &Path, ctx: &serde_json::Value) -> Result<String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("template file '{}': {e}", path.display()))?;

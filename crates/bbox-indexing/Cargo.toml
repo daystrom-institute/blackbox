@@ -18,6 +18,7 @@ bbox-chunker = { path = "../bbox-chunker" }
 bbox-refactor = { path = "../bbox-refactor" }
 bbox-code-nav = { path = "../bbox-code-nav" }
 bro-core = { path = "../bro-core" }
+bro-capabilities = { path = "../bro-capabilities" }
 bro-transcript = { path = "../bro-transcript" }
 parking_lot = "0.12"
 tracing = "0.1"

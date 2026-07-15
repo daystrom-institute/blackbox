@@ -21,10 +21,17 @@ pub use dispatch_context::{
 };
 pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 pub use worker::{
-    AuthenticationProof, BuildIdentity, CapabilityRequest, CapabilityResponse, CommandOutcome,
-    Envelope, EventAck, FleetWelcome, HandshakeMessage, HandshakeReject, Heartbeat, LeaseGrant,
-    SessionPolicy, WORKER_PROTOCOL_V1, WorkerCommand, WorkerCommandKind, WorkerEvent, WorkerHello,
-    WorkerLifecycleState, WorkerMessage, WorkerStatus,
+    AgentMailboxDelivery, AgentMailboxDeliveryReceipt, AgentMailboxDeliveryState,
+    AgentMailboxMessage, AgentMailboxMessageKind, AuthenticationProof, BuildIdentity,
+    CapabilityAuthorization, CapabilityError, CapabilityErrorCode, CapabilityRequest,
+    CapabilityResponse, CommandOutcome, CommandOutcomeAck,
+    DOWNSTREAM_SERVICE_AVAILABILITY_ATTRIBUTE, DownstreamServiceAvailability, DrainBoundary,
+    DrainCompletion, Envelope, EventAck, FeaturePolicy, FleetWelcome, HandshakeMessage,
+    HandshakeReject, Heartbeat, LeaseGrant, LeaseRenewal, PolicyIdentity, ProtocolError,
+    ProtocolErrorCode, ReplayRequest, ReplayUnavailable, SESSION_CAPABILITY_POLICY_ATTRIBUTE,
+    ServiceAvailability, SessionCapabilityPolicy, SessionPolicy, ShutdownCompletion, ShutdownMode,
+    WORKER_FEATURE_POLICY_ATTRIBUTE, WORKER_PROTOCOL_V1, WorkerCommand, WorkerCommandKind,
+    WorkerEvent, WorkerFeature, WorkerHello, WorkerLifecycleState, WorkerMessage, WorkerStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

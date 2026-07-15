@@ -45,3 +45,6 @@ and in bro-harness.
   the design — do not "fix" it by capturing scope.
 - Tool results resolve in batches at quiescent boundaries; `Promise.all`
   over independent calls is the parallelism model.
+- Nested tool calls retain the outer provider `exec` call ID and combine it
+  with the deterministic `tool-N` runtime ordinal. The harness uses that
+  derived identity for remote effect deduplication across reconnect replay.

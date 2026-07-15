@@ -330,6 +330,9 @@ pub struct VectorStore {
 }
 
 impl VectorStore {
+    // Store construction is a synchronous cold-start persistence boundary;
+    // this leaf crate deliberately has no async runtime dependency.
+    #[allow(clippy::disallowed_methods)]
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)
@@ -347,6 +350,7 @@ impl VectorStore {
     /// This is for process state that only needs a placeholder handle while the
     /// real global vector store warms asynchronously. Search/status callers use
     /// `try_global` to degrade until that warmup completes.
+    #[allow(clippy::disallowed_methods)]
     pub fn open_unloaded(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)
@@ -398,11 +402,10 @@ impl VectorStore {
 
     pub fn delete(&self, route: &str, entity_id: &str) -> Result<()> {
         let partition = self.partition(route)?;
-        let result = partition
+        partition
             .write()
             .delete(entity_id)
-            .with_context(|| format!("deleting vector entity {entity_id} from {route}"));
-        result
+            .with_context(|| format!("deleting vector entity {entity_id} from {route}"))
     }
 
     pub fn delete_entity_all_routes(&self, entity_id: &str) -> Result<()> {
@@ -465,8 +468,7 @@ impl VectorStore {
 
     pub fn rebuild(&self, route: &str) -> Result<()> {
         let partition = self.partition(route)?;
-        let result = partition.write().compact().map(|_| ());
-        result
+        partition.write().compact().map(|_| ())
     }
 
     pub fn compact_partitions(
@@ -570,6 +572,9 @@ impl VectorStore {
     /// from loaded partition metrics (`None` while unloaded or under an
     /// active write-lock hold); `last_write`/`disk_bytes` come from file
     /// metadata so they never force a load of a cold multi-GB partition.
+    // Inventory explicitly samples synchronous filesystem metadata; callers
+    // keep it off latency-sensitive async lanes.
+    #[allow(clippy::disallowed_methods)]
     pub fn partition_infos(&self) -> Result<Vec<PartitionInfo>> {
         let loaded = self.metrics_nonblocking();
         let mut infos = Vec::new();
@@ -613,6 +618,8 @@ impl VectorStore {
     /// directory. Returns false when no such partition exists. Intended for
     /// orphaned partitions no route maps to — a concurrent writer targeting
     /// the same route can recreate it, so callers gate on unmapped routes.
+    // Removal is a synchronous administrative persistence operation.
+    #[allow(clippy::disallowed_methods)]
     pub fn remove_partition(&self, route: &str) -> Result<bool> {
         if route.is_empty() || route.contains(['/', '\\']) || route == "." || route == ".." {
             anyhow::bail!("invalid partition route `{route}`");
@@ -676,6 +683,8 @@ impl VectorStore {
             .collect()
     }
 
+    // Called only from synchronous store construction before publication.
+    #[allow(clippy::disallowed_methods)]
     fn load_existing_partitions(&self) -> Result<()> {
         for entry in fs::read_dir(&self.root)
             .with_context(|| format!("reading vector store {}", self.root.display()))?
@@ -924,6 +933,8 @@ struct PartitionSnapshot {
 }
 
 impl Partition {
+    // Partition opening is part of the synchronous store/partition cold path.
+    #[allow(clippy::disallowed_methods)]
     fn open(route: String, path: PathBuf) -> Result<Self> {
         fs::create_dir_all(&path)
             .with_context(|| format!("creating vector partition {}", path.display()))?;
@@ -1213,6 +1224,9 @@ impl Partition {
         }
     }
 
+    // Snapshot publication is an atomic synchronous durability boundary held
+    // under the partition writer lock.
+    #[allow(clippy::disallowed_methods)]
     fn write_snapshot(&mut self) -> Result<()> {
         fs::create_dir_all(&self.path)?;
         let wal_path = self.wal_path();
@@ -1311,6 +1325,9 @@ impl Partition {
         })
     }
 
+    // Compaction owns the writer lock and removes the obsolete snapshot before
+    // atomically replacing durable state.
+    #[allow(clippy::disallowed_methods)]
     fn apply_prepared_compaction(
         &mut self,
         prepared: PreparedCompaction,
@@ -1421,6 +1438,9 @@ impl Partition {
     /// `flush_derived_full` is the same operation today — kept as a
     /// distinct alias so future durability extensions can branch on
     /// checkpoint strength without churning callers.
+    // The checkpoint contract is synchronous: metadata and WAL durability are
+    // complete when this function returns.
+    #[allow(clippy::disallowed_methods)]
     fn flush_derived_files(&mut self) -> Result<()> {
         let options = HnswOptions::default();
         let metrics = self.metrics();
@@ -1727,6 +1747,9 @@ mod tests {
         );
     }
 
+    // The fixture deliberately corrupts a snapshot on disk before reopening
+    // the synchronous store.
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn invalid_snapshot_falls_back_to_wal_rebuild() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1754,6 +1777,8 @@ mod tests {
         assert!(rebuilt.contains_active("voyage-1024", "a", "h1").unwrap());
     }
 
+    // The fixture writes a legacy on-disk encoding to exercise migration.
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn old_snapshot_without_magic_falls_back_to_wal_rebuild() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1777,6 +1802,8 @@ mod tests {
         assert!(rebuilt.contains_active("voyage-1024", "a", "h1").unwrap());
     }
 
+    // This persistence fixture writes the exact snapshot bytes under test.
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn snapshot_roundtrips_entries_without_upsert_timestamp() {
         let tmp = tempfile::tempdir().unwrap();

@@ -13,6 +13,7 @@ pub mod resume_lease;
 pub mod supervision;
 pub mod tail;
 pub mod team;
+pub mod worker_registry;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
@@ -94,6 +95,28 @@ fn harness_input_wire(input: bro_harness::agent_loop::SessionInput) -> Value {
                 "content": [{"type": "text", "text": text}],
             },
         }),
+        bro_harness::agent_loop::SessionInput::WorkerTurn { text, .. }
+        | bro_harness::agent_loop::SessionInput::WorkerSteer { text, .. } => {
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}],
+                },
+            })
+        }
+        bro_harness::agent_loop::SessionInput::AgentMailbox {
+            delivery,
+            command_id,
+        } => serde_json::json!({
+            "type": "agent_mailbox",
+            "delivery": delivery,
+            "command_id": command_id,
+        }),
+        bro_harness::agent_loop::SessionInput::ServicePolicy(policy) => serde_json::json!({
+            "type": "service_policy",
+            "policy": policy,
+        }),
         bro_harness::agent_loop::SessionInput::Control {
             subtype,
             request_id,
@@ -133,8 +156,8 @@ fn harness_input_wire(input: bro_harness::agent_loop::SessionInput) -> Value {
 // taken under a brief read lock ON the persist thread; the blocking file write
 // happens entirely off the runtime.
 
-/// Ack channel an explicit flush attaches so it can block until durable.
-type PersistAck = Option<std::sync::mpsc::Sender<()>>;
+/// Ack channel an explicit flush attaches so it can prove durability.
+type PersistAck = Option<std::sync::mpsc::Sender<std::io::Result<()>>>;
 
 struct TaskPersister {
     store: Arc<RwLock<TaskStore>>,
@@ -154,7 +177,7 @@ impl TaskPersister {
                     // Coalesce: drain everything already queued so a burst of N
                     // requests collapses to ONE snapshot+write, collecting any
                     // acks waiting on durability.
-                    let mut acks: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+                    let mut acks: Vec<std::sync::mpsc::Sender<std::io::Result<()>>> = Vec::new();
                     if let Some(a) = first {
                         acks.push(a);
                     }
@@ -163,12 +186,25 @@ impl TaskPersister {
                             acks.push(a);
                         }
                     }
-                    let data = store_w.read().serialize_snapshot(MAX_PERSISTED_EVENTS);
-                    if let Some(data) = data {
-                        TaskStore::write_snapshot_blocking(&dir_w, &data);
-                    }
+                    let result = store_w
+                        .read()
+                        .serialize_snapshot(MAX_PERSISTED_EVENTS)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "task snapshot serialization failed",
+                            )
+                        })
+                        .and_then(|data| TaskStore::write_snapshot_blocking(&dir_w, &data));
                     for a in acks {
-                        let _ = a.send(());
+                        let ack_result = result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|error| std::io::Error::new(error.kind(), error.to_string()));
+                        let _ = a.send(ack_result);
+                    }
+                    if let Err(error) = result {
+                        tracing::error!(%error, "task snapshot persistence failed");
                     }
                 }
             });
@@ -188,23 +224,35 @@ impl TaskPersister {
     /// is gone, fall back to a direct synchronous write so state is never lost.
     fn request(&self) {
         if self.tx.send(None).is_err() {
-            self.write_now();
+            if let Err(error) = self.write_now() {
+                tracing::error!(%error, "task snapshot persistence fallback failed");
+            }
         }
     }
 
     /// Block until the current state is durable on disk (shutdown path).
-    fn flush_blocking(&self) {
+    fn flush_blocking(&self) -> std::io::Result<()> {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        if self.tx.send(Some(ack_tx)).is_ok() && ack_rx.recv().is_ok() {
-            return;
+        if self.tx.send(Some(ack_tx)).is_ok()
+            && let Ok(result) = ack_rx.recv()
+        {
+            return result;
         }
-        self.write_now();
+        self.write_now()
     }
 
-    fn write_now(&self) {
-        if let Some(data) = self.store.read().serialize_snapshot(MAX_PERSISTED_EVENTS) {
-            TaskStore::write_snapshot_blocking(&self.store_dir, &data);
-        }
+    fn write_now(&self) -> std::io::Result<()> {
+        let data = self
+            .store
+            .read()
+            .serialize_snapshot(MAX_PERSISTED_EVENTS)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "task snapshot serialization failed",
+                )
+            })?;
+        TaskStore::write_snapshot_blocking(&self.store_dir, &data)
     }
 }
 
@@ -230,7 +278,9 @@ pub(crate) fn request_persist(store: &RwLock<TaskStore>, store_dir: &std::path::
         Some(p) => p.request(),
         None => {
             if let Some(data) = store.read().serialize_snapshot(MAX_PERSISTED_EVENTS) {
-                TaskStore::write_snapshot_blocking(store_dir, &data);
+                if let Err(error) = TaskStore::write_snapshot_blocking(store_dir, &data) {
+                    tracing::error!(%error, "task snapshot persistence failed");
+                }
             }
         }
     }
@@ -238,26 +288,48 @@ pub(crate) fn request_persist(store: &RwLock<TaskStore>, store_dir: &std::path::
 
 /// Flush the task store and block until durable (shutdown). Synchronous fallback
 /// when the actor was never initialised.
-pub(crate) fn flush_persist_blocking(store: &RwLock<TaskStore>, store_dir: &std::path::Path) {
+pub(crate) fn flush_persist_blocking(
+    store: &RwLock<TaskStore>,
+    store_dir: &std::path::Path,
+) -> std::io::Result<()> {
     match task_persister().get() {
         Some(p) => p.flush_blocking(),
         None => {
-            if let Some(data) = store.read().serialize_snapshot(MAX_PERSISTED_EVENTS) {
-                TaskStore::write_snapshot_blocking(store_dir, &data);
-            }
+            let data = store
+                .read()
+                .serialize_snapshot(MAX_PERSISTED_EVENTS)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "task snapshot serialization failed",
+                    )
+                })?;
+            TaskStore::write_snapshot_blocking(store_dir, &data)
         }
     }
 }
 
-/// Translate a `bro_protocol::SessionCommand` into the harness's internal
-/// input and deliver it through either the rollback in-process channel or the
-/// production child worker's NDJSON writer.
+/// Deliver a session command through the durable worker authority when this is
+/// a reconnectable session, otherwise through the Stage 1 compatibility
+/// channel used by rollback in-process and short-lived child sessions.
 pub fn apply_session_command(
     task_id: &str,
     command: bro_protocol::SessionCommand,
 ) -> Result<(), String> {
     use bro_harness::agent_loop::SessionInput;
-    use bro_protocol::SessionCommand;
+    use bro_protocol::{SessionCommand, WorkerCommandKind};
+
+    let worker_command = match &command {
+        SessionCommand::UserTurn { text } => WorkerCommandKind::UserTurn { text: text.clone() },
+        SessionCommand::Interrupt => WorkerCommandKind::Interrupt,
+        SessionCommand::SetModel { model } => WorkerCommandKind::SetModel {
+            model: model.clone(),
+        },
+        SessionCommand::Compact => WorkerCommandKind::Compact,
+    };
+    if crate::server::worker_rpc::dispatch_task_command_if_owned(task_id, worker_command)? {
+        return Ok(());
+    }
 
     let tx = harness_controls()
         .read()
@@ -290,10 +362,21 @@ pub fn apply_session_command(
 }
 
 pub fn steer_harness_task(task_id: &str, prompt: String) -> Result<(), String> {
-    apply_session_command(
+    if crate::server::worker_rpc::dispatch_task_command_if_owned(
         task_id,
-        bro_protocol::SessionCommand::UserTurn { text: prompt },
-    )
+        bro_protocol::WorkerCommandKind::Steer {
+            text: prompt.clone(),
+        },
+    )? {
+        return Ok(());
+    }
+    let tx = harness_controls()
+        .read()
+        .get(task_id)
+        .cloned()
+        .ok_or_else(|| format!("task {task_id} has no live harness control channel"))?;
+    tx.send(bro_harness::agent_loop::SessionInput::User(prompt))
+        .map_err(|_| format!("task {task_id} harness control channel is closed"))
 }
 
 pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result<(), String> {
@@ -302,6 +385,16 @@ pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result
         // control's raw so the harness dequeues it immediately on cancel. This
         // payload shape has no SessionCommand variant, so it stays inline.
         Some(prompt) => {
+            if crate::server::worker_rpc::dispatch_task_command_if_owned(
+                task_id,
+                bro_protocol::WorkerCommandKind::Interrupt,
+            )? {
+                crate::server::worker_rpc::dispatch_task_command_if_owned(
+                    task_id,
+                    bro_protocol::WorkerCommandKind::Steer { text: prompt },
+                )?;
+                return Ok(());
+            }
             let tx = harness_controls()
                 .read()
                 .get(task_id)
@@ -373,6 +466,7 @@ impl BroReport {
 }
 
 /// Shared inner state of a task, updated by background readers.
+#[derive(Clone)]
 pub struct TaskInner {
     pub id: String,
     pub provider: Provider,
@@ -459,9 +553,73 @@ impl TaskInner {
     }
 }
 
+#[derive(Clone)]
 pub struct EventRing {
     events: Vec<Value>,
     total_count: usize,
+    /// Canonical durable projection cursor for reconnectable worker events.
+    /// This is persisted with the task projection so a daemon crash between
+    /// task and worker-registry writes cannot apply the same event twice.
+    worker_event_ack: u64,
+    /// Durable terminal-publication outbox for a worker result. `published`
+    /// distinguishes a committed result awaiting lifecycle publication from one
+    /// already emitted by the current or a previous daemon owner.
+    worker_terminal_publication: Option<WorkerTerminalPublication>,
+    /// A raw worker result whose session snapshot has not yet been committed.
+    /// The following durable snapshot milestone consumes this record and owns
+    /// terminal lifecycle projection.
+    pending_worker_result: Option<PendingWorkerResult>,
+    /// Reconnectable worker attempt identity and its actual replay log. These
+    /// are task authority, not provider-session defaults, and survive restart
+    /// so roster tailing and early child-exit handling remain exact.
+    worker_id: Option<String>,
+    worker_event_log_path: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingWorkerResult {
+    event_seq: u64,
+    event: Value,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WorkerTerminalPublication {
+    event_seq: u64,
+    cursor: u64,
+    /// Immutable terminal fields captured when the snapshot marker commits.
+    /// Recovery must not rebuild the event body from task fields that may have
+    /// changed after the deterministic system-event ID was first journaled.
+    lifecycle: WorkerTerminalSnapshot,
+    /// Exact durable system-event body paired with the deterministic ID.
+    system_event: crate::system_events::SystemEventDraft,
+    published: bool,
+    /// The lifecycle is independent of system-event reaction delivery. A
+    /// retryable journal/outbox failure leaves this durable bit set for the
+    /// owner repair sweep without withholding worker acknowledgement.
+    #[serde(default)]
+    reaction_repair_pending: bool,
+    /// In-memory claim that prevents concurrent replay or the child waiter from
+    /// publishing while the durable system event is being appended.
+    #[serde(skip)]
+    publishing: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WorkerTerminalSnapshot {
+    kind: WorkerTerminalKind,
+    elapsed: String,
+    cost: Option<f64>,
+    error: String,
+    source_session: String,
+    task_kind: Option<String>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerTerminalKind {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 impl EventRing {
@@ -469,6 +627,11 @@ impl EventRing {
         Self {
             events: Vec::with_capacity(TASK_EVENT_RING_CAPACITY.min(16)),
             total_count: 0,
+            worker_event_ack: 0,
+            worker_terminal_publication: None,
+            pending_worker_result: None,
+            worker_id: None,
+            worker_event_log_path: None,
         }
     }
 
@@ -478,6 +641,44 @@ impl EventRing {
         Self {
             events,
             total_count,
+            worker_event_ack: 0,
+            worker_terminal_publication: None,
+            pending_worker_result: None,
+            worker_id: None,
+            worker_event_log_path: None,
+        }
+    }
+
+    pub(crate) fn worker_event_ack(&self) -> u64 {
+        self.worker_event_ack
+    }
+
+    pub(crate) fn set_worker_event_ack(&mut self, through_event_seq: u64) {
+        self.worker_event_ack = through_event_seq;
+    }
+
+    fn set_worker_attempt(&mut self, worker_id: String, event_log_path: String) {
+        self.worker_id = Some(worker_id);
+        self.worker_event_log_path = Some(event_log_path);
+    }
+
+    fn reserve_worker_terminal_publication(
+        &mut self,
+        event_seq: u64,
+        cursor: u64,
+        lifecycle: WorkerTerminalSnapshot,
+        system_event: crate::system_events::SystemEventDraft,
+    ) {
+        if self.worker_terminal_publication.is_none() {
+            self.worker_terminal_publication = Some(WorkerTerminalPublication {
+                event_seq,
+                cursor,
+                lifecycle,
+                system_event,
+                published: false,
+                reaction_repair_pending: true,
+                publishing: false,
+            });
         }
     }
 
@@ -1011,7 +1212,7 @@ impl Task {
         }
     }
 
-    fn emit_roster_updated(&self) {
+    pub(crate) fn emit_roster_updated(&self) {
         if let Some(sink) = &self.roster_events {
             sink.emit_updated(self);
         }
@@ -1092,7 +1293,11 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
         // harness itself uses when it opens the log, so the cockpit attaches
         // to the exact file the running agent appends to. The file may not
         // exist yet for a fresh dispatch; readers treat absence as empty.
-        transcript_path: harness_session_transcript_path(&inner.session_id),
+        transcript_path: inner
+            .events
+            .worker_event_log_path
+            .clone()
+            .or_else(|| harness_session_transcript_path(&inner.session_id)),
     }
 }
 
@@ -1402,6 +1607,16 @@ struct PersistedTask {
     #[serde(default)]
     live_cursor: u64,
     #[serde(default)]
+    worker_event_ack: u64,
+    #[serde(default)]
+    worker_terminal_publication: Option<WorkerTerminalPublication>,
+    #[serde(default)]
+    pending_worker_result: Option<PendingWorkerResult>,
+    #[serde(default)]
+    worker_id: Option<String>,
+    #[serde(default)]
+    worker_event_log_path: Option<String>,
+    #[serde(default)]
     supervision: SupervisionState,
     /// Origin is back-compat default `Unknown` when absent on disk —
     /// pre-Slice-1b records have no `origin` field, and a daemon
@@ -1435,7 +1650,9 @@ impl TaskStore {
 
     fn persist_with_event_limit(&self, store_dir: &std::path::Path, event_limit: usize) {
         if let Some(data) = self.serialize_snapshot(event_limit) {
-            Self::write_snapshot_blocking(store_dir, &data);
+            if let Err(error) = Self::write_snapshot_blocking(store_dir, &data) {
+                tracing::error!(%error, "task snapshot persistence failed");
+            }
         }
     }
 
@@ -1483,6 +1700,11 @@ impl TaskStore {
                     transcript_location: inner.transcript_location.clone(),
                     transcript_cursor: inner.transcript_cursor.clone(),
                     live_cursor: inner.live_cursor,
+                    worker_event_ack: inner.events.worker_event_ack(),
+                    worker_terminal_publication: inner.events.worker_terminal_publication.clone(),
+                    pending_worker_result: inner.events.pending_worker_result.clone(),
+                    worker_id: inner.events.worker_id.clone(),
+                    worker_event_log_path: inner.events.worker_event_log_path.clone(),
                     supervision: inner.supervision.clone(),
                     origin: inner.origin,
                     workflow_owned: Some(inner.workflow_owned),
@@ -1496,16 +1718,44 @@ impl TaskStore {
     /// **Blocking** file I/O — never call on a tokio worker. It runs on the
     /// [`TaskPersister`] dedicated thread, or on a cold synchronous path
     /// (shutdown, tests) where blocking is acceptable.
-    pub fn write_snapshot_blocking(store_dir: &std::path::Path, data: &str) {
+    pub fn write_snapshot_blocking(store_dir: &std::path::Path, data: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+
         let file = store_dir.join("tasks.json");
-        let tmp = store_dir.join("tasks.json.tmp");
-        let _ = std::fs::create_dir_all(store_dir);
-        if std::fs::write(&tmp, data).is_ok() {
-            let _ = std::fs::rename(&tmp, &file);
+        let tmp = store_dir.join(format!(".tasks.{}.tmp", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(store_dir)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
         }
+        let mut output = options.open(&tmp)?;
+        if let Err(error) = (|| {
+            output.write_all(data.as_bytes())?;
+            output.sync_all()?;
+            drop(output);
+            std::fs::rename(&tmp, &file)?;
+            std::fs::File::open(store_dir)?.sync_all()?;
+            Ok::<(), std::io::Error>(())
+        })() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        Ok(())
     }
 
+    #[cfg(test)]
     pub fn load(store_dir: &std::path::Path, ttl_ms: u64) -> Self {
+        Self::load_with_reconnectable_tasks(store_dir, ttl_ms, &std::collections::BTreeSet::new())
+    }
+
+    pub fn load_with_reconnectable_tasks(
+        store_dir: &std::path::Path,
+        ttl_ms: u64,
+        reconnectable_task_ids: &std::collections::BTreeSet<String>,
+    ) -> Self {
         let file = store_dir.join("tasks.json");
         let mut store = Self::new();
         let data = match std::fs::read_to_string(&file) {
@@ -1529,11 +1779,11 @@ impl TaskStore {
         // `daemon.task_ttl_ms` / `BRO_TASK_TTL_MS` env var.
         let cutoff = now_ms().saturating_sub(ttl_ms);
         for mut rec in records {
-            if rec.started_at < cutoff {
+            if rec.started_at < cutoff && !reconnectable_task_ids.contains(&rec.id) {
                 continue;
             }
             let model = rec.model.or_else(|| model_from_events_at_load(&rec.events));
-            if rec.status == TaskStatus::Running {
+            if rec.status == TaskStatus::Running && !reconnectable_task_ids.contains(&rec.id) {
                 rec.status = TaskStatus::Failed;
                 rec.completed_at = Some(now_ms());
                 rec.stderr.push_str(
@@ -1544,7 +1794,12 @@ impl TaskStore {
                 );
                 rec.recoverable = true;
             }
-            let events = EventRing::from_loaded(rec.events);
+            let mut events = EventRing::from_loaded(rec.events);
+            events.set_worker_event_ack(rec.worker_event_ack);
+            events.worker_terminal_publication = rec.worker_terminal_publication;
+            events.pending_worker_result = rec.pending_worker_result;
+            events.worker_id = rec.worker_id;
+            events.worker_event_log_path = rec.worker_event_log_path;
             let live_cursor = rec.live_cursor.max(events.len() as u64);
             let task = Arc::new(Task {
                 inner: Mutex::new(TaskInner {
@@ -2884,6 +3139,10 @@ fn ensure_cli_flag(args: &mut Vec<String>, flag: &str) {
     }
 }
 
+fn remove_cli_flag(args: &mut Vec<String>, flag: &str) {
+    args.retain(|arg| arg != flag);
+}
+
 fn spawn_child_control_writer(
     task_id: String,
     mut stdin: tokio::process::ChildStdin,
@@ -2984,11 +3243,15 @@ fn spawn_harness_child_task(
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
-    let self_mcp_url = std::env::var("BLACKBOX_MCP_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-        .map(|url| crate::dispatch_mcp::dispatch_mcp_url_for_origin(&url, origin));
-    let launch = match prepare_harness_child_launch(
+    let self_mcp_url = (!crate::server::worker_rpc::is_available())
+        .then(|| {
+            std::env::var("BLACKBOX_MCP_URL")
+                .ok()
+                .filter(|url| !url.is_empty())
+                .map(|url| crate::dispatch_mcp::dispatch_mcp_url_for_origin(&url, origin))
+        })
+        .flatten();
+    let mut launch = match prepare_harness_child_launch(
         provider,
         args,
         cwd.as_deref(),
@@ -3016,22 +3279,192 @@ fn spawn_harness_child_task(
         }
     };
 
-    let spawned = spawn_task_interactive(
-        task_id.clone(),
+    if let Err(error) = task_store.write().reserve_id(&task_id) {
+        if let Some(existing) = task_store.read().get(&task_id) {
+            return existing;
+        }
+        return failed_duplicate_task(
+            task_id,
+            provider,
+            session_id,
+            cwd,
+            bro_label,
+            agent_label,
+            error.to_string(),
+            origin,
+        );
+    }
+    let task = match install_reserved_task_authority(
+        &task_id,
         provider,
-        launch.args,
-        session_id,
-        cwd,
-        Some(launch.env_overrides),
-        store_dir,
-        task_store,
-        tail_tx,
-        roster_events,
-        bro_label,
-        agent_label,
-        system_events,
+        &session_id,
+        &cwd,
+        &store_dir,
+        &task_store,
+        &tail_tx,
+        &roster_events,
+        &bro_label,
+        &agent_label,
+        system_events.as_ref(),
         origin,
+    ) {
+        Ok(task) => task,
+        Err(task) => return task,
+    };
+
+    let worker = match crate::server::worker_rpc::provision_task_worker(
+        &task_id,
+        &session_id,
+        cwd.as_deref(),
+        &launch.initial_prompt,
+    ) {
+        Ok(worker) => worker,
+        Err(error) => {
+            {
+                let mut inner = task.inner.lock();
+                inner.status = TaskStatus::Failed;
+                inner.completed_at = Some(now_ms());
+                inner.stderr.push_str(&format!(
+                    "provisioning reconnectable harness worker failed: {error:#}\n"
+                ));
+            }
+            reserve_owner_terminal_publication(&task, &task_id);
+            task.emit_roster_updated();
+            let _ = flush_persist_blocking(&task_store, &store_dir);
+            task.notify.notify_waiters();
+            let _ = drain_pending_worker_terminal_publication(
+                &task,
+                &tail_tx,
+                &task_id,
+                system_events.clone(),
+                &task_store,
+                &store_dir,
+            );
+            return task;
+        }
+    };
+
+    if let Some((bootstrap, socket_path)) = worker.as_ref() {
+        let attempt_dir = store_dir.join("workers").join(bootstrap.worker_id.as_str());
+        let event_log_path = attempt_dir.join("events.jsonl");
+        remove_cli_flag(&mut launch.args, "--exit-when-idle");
+        remove_cli_flag(&mut launch.args, "--daemon-worker");
+        ensure_cli_flag(&mut launch.args, "--worker");
+        set_cli_value_arg(
+            &mut launch.args,
+            "--fleet-socket",
+            socket_path.to_string_lossy().into_owned(),
+        );
+        set_cli_value_arg(&mut launch.args, "--task-id", task_id.clone());
+        set_cli_value_arg(
+            &mut launch.args,
+            "--worker-id",
+            bootstrap.worker_id.as_str().to_string(),
+        );
+        set_cli_value_arg(
+            &mut launch.args,
+            "--session-id",
+            bootstrap.session_id.as_str().to_string(),
+        );
+        set_cli_value_arg(
+            &mut launch.args,
+            "--bootstrap-secret-file",
+            bootstrap.proof_path.to_string_lossy().into_owned(),
+        );
+        set_cli_value_arg(
+            &mut launch.args,
+            "--worker-command-journal",
+            attempt_dir
+                .join("commands.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        set_cli_value_arg(
+            &mut launch.args,
+            "--worker-reconnect-credential",
+            attempt_dir
+                .join("reconnect.secret")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        set_cli_value_arg(
+            &mut launch.args,
+            "--worker-event-log",
+            event_log_path.to_string_lossy().into_owned(),
+        );
+        task.inner.lock().events.set_worker_attempt(
+            bootstrap.worker_id.as_str().to_string(),
+            event_log_path.to_string_lossy().into_owned(),
+        );
+        if let Err(error) = flush_persist_blocking(&task_store, &store_dir) {
+            crate::server::worker_rpc::abandon_task_worker(&bootstrap.worker_id);
+            {
+                let mut inner = task.inner.lock();
+                inner.status = TaskStatus::Failed;
+                inner.completed_at = Some(now_ms());
+                inner.stderr.push_str(&format!(
+                    "persisting worker attempt paths before spawn failed: {error}\n"
+                ));
+            }
+            reserve_owner_terminal_publication(&task, &task_id);
+            task.emit_roster_updated();
+            task.notify.notify_waiters();
+            let _ = flush_persist_blocking(&task_store, &store_dir);
+            let _ = drain_pending_worker_terminal_publication(
+                &task,
+                &tail_tx,
+                &task_id,
+                system_events.clone(),
+                &task_store,
+                &store_dir,
+            );
+            return task;
+        }
+    }
+
+    let spawned = spawn_task_reserved_with_authority(
+        task_id.clone(),
+        SpawnTaskParams {
+            provider,
+            args: launch.args,
+            session_id,
+            cwd,
+            env_overrides: Some(launch.env_overrides),
+            store_dir: store_dir.clone(),
+            task_store: task_store.clone(),
+            tail_tx: tail_tx.clone(),
+            roster_events,
+            bro_label,
+            agent_label,
+            system_events: system_events.clone(),
+            interactive: true,
+            origin,
+        },
+        Some(task),
     );
+    if let Some((bootstrap, _)) = worker {
+        drop(spawned.stdin);
+        if spawned.task.inner.lock().status.is_terminal() {
+            crate::server::worker_rpc::abandon_task_worker(&bootstrap.worker_id);
+            reserve_owner_terminal_publication(&spawned.task, &task_id);
+            if let Err(error) = flush_persist_blocking(&task_store, &store_dir) {
+                let mut inner = spawned.task.inner.lock();
+                inner.stderr.push_str(&format!(
+                    "persisting failed worker spawn state failed: {error}\n"
+                ));
+            }
+            let _ = drain_pending_worker_terminal_publication(
+                &spawned.task,
+                &tail_tx,
+                &task_id,
+                system_events,
+                &task_store,
+                &store_dir,
+            );
+            return spawned.task;
+        }
+        return spawned.task;
+    }
     if let Some(stdin) = spawned.stdin {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = tx.send(bro_harness::agent_loop::SessionInput::User(
@@ -3388,7 +3821,481 @@ fn apply_harness_result_failure(inner: &mut TaskInner, evt: &Value) {
     }
 }
 
-fn ingest_harness_event(
+struct HarnessProgressPublication {
+    cursor: u64,
+    activity: String,
+    emit_system_event: bool,
+}
+
+struct HarnessEventPublication {
+    task_event: Option<tail::TailEvent>,
+    emit_roster: bool,
+    notify_session_observed: bool,
+    progress: Option<HarnessProgressPublication>,
+}
+
+/// Project one harness event into task state without publishing any observable
+/// effects. Callers may persist or roll back the mutated state before deciding
+/// whether to publish the returned effects.
+fn project_harness_event(
+    inner: &mut TaskInner,
+    provider: Provider,
+    evt: Value,
+    apply_result_failure_now: bool,
+    include_progress: bool,
+) -> HarnessEventPublication {
+    // Stream deltas arrive at token-chunk rate while a bro streams (50+/s);
+    // everything in this projection must be O(chunk), never O(message) -
+    // per-delta O(accumulated-message) work measurably degraded runtime
+    // worker poll times (thread-935b467d §4.6 measurements).
+    let is_stream_delta = evt.get("type").and_then(Value::as_str) == Some("stream_event");
+    // Decide fork acceptance before parsing so the parse can mutate the task's
+    // accumulated message in place. A rejected forked event must not touch it.
+    let emitted_session_id = emitted_session_id_from_event(&evt);
+    let mut accepted = true;
+    let mut session_id_observed = false;
+    if let Some(sid) = emitted_session_id {
+        if inner.session_id == "pending" {
+            inner.session_id = sid;
+            session_id_observed = true;
+        } else if inner.session_id != sid {
+            reject_forked_session(inner, &sid);
+            accepted = false;
+        }
+    }
+
+    let mut task_event = None;
+    if accepted {
+        let mut sink = EventSink {
+            // Zero-copy seed: take the accumulated message so delta appends are
+            // amortized O(chunk). apply_sink_updates writes it back.
+            last_assistant_message: inner.last_assistant_message.take(),
+            usage: inner.usage.clone(),
+            cost_usd: inner.cost_usd,
+            num_turns: inner.num_turns,
+            session_id: if inner.session_id != "pending" {
+                Some(inner.session_id.clone())
+            } else {
+                None
+            },
+            interrupted: false,
+        };
+        provider.parse_event(&evt, &mut sink);
+        apply_cwd_updates_from_event(inner, &evt);
+        inner
+            .supervision
+            .observe_event(&evt, &sink, &supervision::config(), now_ms());
+        apply_sink_updates(inner, sink);
+        if apply_result_failure_now {
+            apply_harness_result_failure(inner, &evt);
+        }
+        // Store the event last so it moves instead of deep-cloning. Stream
+        // deltas are not stored because every ring consumer either filters
+        // them at read time or skips them structurally.
+        if !is_stream_delta {
+            task_event = Some(append_task_event(inner, evt));
+        }
+    }
+
+    // Roster summaries rebuild and broadcast per emit. Throttle the delta-rate
+    // path to roughly once per second; step-boundary events always emit.
+    let now = now_ms();
+    let emit_roster = !is_stream_delta
+        || session_id_observed
+        || now.saturating_sub(inner.last_delta_roster_emit_ms) >= 1000;
+    if is_stream_delta && emit_roster {
+        inner.last_delta_roster_emit_ms = now;
+    }
+    let progress = if accepted && include_progress {
+        inner
+            .last_assistant_message
+            .as_ref()
+            .map(|message| snippet_tail(message, 160))
+            .and_then(|activity| {
+                if activity.is_empty() {
+                    None
+                } else {
+                    inner.live_cursor += 1;
+                    Some(HarnessProgressPublication {
+                        cursor: inner.live_cursor,
+                        activity,
+                        emit_system_event: !is_stream_delta,
+                    })
+                }
+            })
+    } else {
+        None
+    };
+
+    HarnessEventPublication {
+        task_event,
+        emit_roster,
+        notify_session_observed: session_id_observed,
+        progress,
+    }
+}
+
+fn publish_harness_event(
+    task: &Task,
+    publication: HarnessEventPublication,
+    tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+    task_id: &str,
+    system_events: Option<crate::system_events::SharedEventHub>,
+) {
+    if let Some(task_event) = publication.task_event {
+        let _ = tail_tx.send(task_event);
+    }
+
+    if publication.emit_roster {
+        task.emit_roster_updated();
+    }
+
+    if publication.notify_session_observed {
+        task.notify.notify_waiters();
+    }
+
+    if let Some(progress) = publication.progress {
+        let _ = tail_tx.send(tail::TailEvent::TaskProgress {
+            cursor: progress.cursor,
+            task_id: task_id.to_string(),
+            activity: progress.activity.clone(),
+        });
+        // System events journal every emit and run reaction matching. Stream
+        // deltas stay out of that path because they arrive at token cadence.
+        if progress.emit_system_event
+            && let Some(ref hub) = system_events
+        {
+            emit_task_progress_event(hub, task_id.to_string(), progress.activity);
+        }
+    }
+}
+
+struct WorkerTerminalClaim {
+    before: WorkerTerminalPublication,
+    tail_event: Option<tail::TailEvent>,
+}
+
+fn freeze_worker_terminal_lifecycle(
+    inner: &TaskInner,
+    task_id: &str,
+) -> Option<(
+    WorkerTerminalSnapshot,
+    crate::system_events::SystemEventDraft,
+)> {
+    let kind = match inner.status {
+        TaskStatus::Completed => WorkerTerminalKind::Completed,
+        TaskStatus::Failed => WorkerTerminalKind::Failed,
+        TaskStatus::Cancelled => WorkerTerminalKind::Cancelled,
+        TaskStatus::Running => return None,
+    };
+    let elapsed = format_elapsed(inner.started_at, inner.completed_at);
+    let cost = inner.cost_usd;
+    let error: String = inner.stderr.chars().take(200).collect();
+    let lifecycle = WorkerTerminalSnapshot {
+        kind,
+        elapsed: elapsed.clone(),
+        cost,
+        error: error.clone(),
+        source_session: inner.session_id.clone(),
+        task_kind: inner.bro_label.clone(),
+    };
+    let (event_kind, payload) = match kind {
+        WorkerTerminalKind::Completed => (
+            crate::system_events::types::SystemEventKind::TaskCompleted,
+            serde_json::json!({"task_id": task_id, "elapsed": elapsed, "cost_usd": cost}),
+        ),
+        WorkerTerminalKind::Failed => (
+            crate::system_events::types::SystemEventKind::TaskFailed,
+            serde_json::json!({"task_id": task_id, "elapsed": elapsed, "error": error}),
+        ),
+        WorkerTerminalKind::Cancelled => (
+            crate::system_events::types::SystemEventKind::TaskCancelled,
+            serde_json::json!({"task_id": task_id, "elapsed": elapsed}),
+        ),
+    };
+    let mut correlation = serde_json::Map::new();
+    correlation.insert("task_id".into(), serde_json::json!(task_id));
+    let system_event = crate::system_events::SystemEventDraft {
+        kind: event_kind,
+        producer: "orchestration.dispatch".to_string(),
+        project: None,
+        principal: None,
+        subject: None,
+        correlation,
+        causation_id: None,
+        payload,
+    };
+    Some((lifecycle, system_event))
+}
+
+/// Reserve an idempotent terminal lifecycle for an owner-side terminal state
+/// that has no worker snapshot marker, such as cancellation, lease loss, or a
+/// fatal session failure. The synthetic sequence cannot collide with a valid
+/// worker event because the authority is terminal before this is called.
+pub(crate) fn reserve_owner_terminal_publication(task: &Task, task_id: &str) -> bool {
+    let mut inner = task.inner.lock();
+    if inner.events.worker_terminal_publication.is_some() || !inner.status.is_terminal() {
+        return false;
+    }
+    inner.events.pending_worker_result = None;
+    inner.live_cursor = inner.live_cursor.saturating_add(1);
+    let cursor = inner.live_cursor;
+    let Some((lifecycle, system_event)) = freeze_worker_terminal_lifecycle(&inner, task_id) else {
+        return false;
+    };
+    inner
+        .events
+        .reserve_worker_terminal_publication(u64::MAX, cursor, lifecycle, system_event);
+    true
+}
+
+fn worker_terminal_tail_event(
+    lifecycle: &WorkerTerminalSnapshot,
+    cursor: u64,
+    task_id: &str,
+) -> tail::TailEvent {
+    match lifecycle.kind {
+        WorkerTerminalKind::Completed => tail::TailEvent::TaskCompleted {
+            cursor,
+            task_id: task_id.to_string(),
+            elapsed: lifecycle.elapsed.clone(),
+            cost: lifecycle.cost,
+            source_session: lifecycle.source_session.clone(),
+            task_kind: lifecycle.task_kind.clone(),
+        },
+        WorkerTerminalKind::Failed => tail::TailEvent::TaskFailed {
+            cursor,
+            task_id: task_id.to_string(),
+            elapsed: lifecycle.elapsed.clone(),
+            error: lifecycle.error.clone(),
+        },
+        WorkerTerminalKind::Cancelled => tail::TailEvent::TaskCancelled {
+            cursor,
+            task_id: task_id.to_string(),
+            elapsed: lifecycle.elapsed.clone(),
+        },
+    }
+}
+
+fn claim_worker_terminal_publication(
+    task: &Task,
+    event_seq: u64,
+    task_id: &str,
+) -> Option<WorkerTerminalClaim> {
+    let mut inner = task.inner.lock();
+    let publication = inner.events.worker_terminal_publication.as_mut()?;
+    if publication.event_seq != event_seq
+        || publication.publishing
+        || (publication.published && !publication.reaction_repair_pending)
+    {
+        return None;
+    }
+    let before = publication.clone();
+    publication.publishing = true;
+    let tail_event = (!before.published)
+        .then(|| worker_terminal_tail_event(&before.lifecycle, before.cursor, task_id));
+    Some(WorkerTerminalClaim { before, tail_event })
+}
+
+/// Attempt the frozen, caller-identified system event without coupling its
+/// reaction delivery to the worker lifecycle. `true` means a later owner sweep
+/// should retry; permanent template/config failures are warned and cleared.
+fn attempt_worker_terminal_reaction_repair(
+    event_seq: u64,
+    task_id: &str,
+    system_event: crate::system_events::SystemEventDraft,
+    system_events: Option<crate::system_events::SharedEventHub>,
+) -> bool {
+    let Some(hub) = system_events else {
+        tracing::warn!(
+            task_id,
+            event_seq,
+            "worker terminal system-event hub unavailable; repair remains pending"
+        );
+        return true;
+    };
+
+    use sha2::{Digest as _, Sha256};
+
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::warn!(
+                task_id,
+                event_seq,
+                %error,
+                "worker terminal system-event runtime unavailable; repair remains pending"
+            );
+            return true;
+        }
+    };
+    let task_digest = Sha256::digest(task_id.as_bytes());
+    let system_event_id = format!(
+        "worker-terminal:{}:{event_seq}",
+        hex::encode(&task_digest[..16])
+    );
+    let emitted = std::thread::Builder::new()
+        .name("worker-terminal-event".to_string())
+        .spawn(move || handle.block_on(hub.emit_once(system_event_id, system_event)))
+        .and_then(|thread| {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("worker terminal system event thread panicked"))
+        });
+    match emitted {
+        Ok(Ok(outcome)) if outcome.outbox_enqueued => false,
+        Ok(Ok(outcome)) if outcome.outbox_retryable => {
+            tracing::warn!(
+                task_id,
+                event_seq,
+                error = outcome
+                    .outbox_error
+                    .as_deref()
+                    .unwrap_or("unknown outbox error"),
+                "worker terminal reaction enqueue failed; repair remains pending"
+            );
+            true
+        }
+        Ok(Ok(outcome)) => {
+            tracing::warn!(
+                task_id,
+                event_seq,
+                error = outcome
+                    .outbox_error
+                    .as_deref()
+                    .unwrap_or("unknown permanent outbox error"),
+                "worker terminal reaction configuration failed permanently; clearing repair marker"
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                task_id,
+                event_seq,
+                error = %format_args!("{error:#}"),
+                "worker terminal system-event emit failed; repair remains pending"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                task_id,
+                event_seq,
+                %error,
+                "worker terminal system-event thread failed; repair remains pending"
+            );
+            true
+        }
+    }
+}
+
+fn stage_worker_terminal_claim_result(task: &Task, event_seq: u64, repair_pending: bool) -> bool {
+    let mut inner = task.inner.lock();
+    if let Some(publication) = inner.events.worker_terminal_publication.as_mut()
+        && publication.event_seq == event_seq
+        && publication.publishing
+    {
+        publication.published = true;
+        publication.reaction_repair_pending = repair_pending;
+        return true;
+    }
+    false
+}
+
+fn complete_worker_terminal_claim(task: &Task, event_seq: u64) {
+    let mut inner = task.inner.lock();
+    if let Some(publication) = inner.events.worker_terminal_publication.as_mut()
+        && publication.event_seq == event_seq
+    {
+        publication.publishing = false;
+    }
+}
+
+fn restore_worker_terminal_claim(task: &Task, before: WorkerTerminalPublication) {
+    let mut inner = task.inner.lock();
+    if inner
+        .events
+        .worker_terminal_publication
+        .as_ref()
+        .is_some_and(|publication| publication.event_seq == before.event_seq)
+    {
+        inner.events.worker_terminal_publication = Some(before);
+    }
+}
+
+fn persist_task_snapshot_now(
+    task_store: &RwLock<TaskStore>,
+    store_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    let data = task_store
+        .read()
+        .serialize_snapshot(MAX_PERSISTED_EVENTS)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "task snapshot serialization failed",
+            )
+        })?;
+    TaskStore::write_snapshot_blocking(store_dir, &data)
+}
+
+/// Drain a snapshot-committed terminal lifecycle or independently repair its
+/// system-event reaction enqueue. Owner startup and handshake reconciliation
+/// call this even when the worker registry cursor has already caught up with
+/// the task projection. A repair-only pass never repeats tail/roster effects.
+pub(crate) fn drain_pending_worker_terminal_publication(
+    task: &Task,
+    tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+    task_id: &str,
+    system_events: Option<crate::system_events::SharedEventHub>,
+    task_store: &RwLock<TaskStore>,
+    store_dir: &std::path::Path,
+) -> std::io::Result<bool> {
+    let event_seq = task
+        .inner
+        .lock()
+        .events
+        .worker_terminal_publication
+        .as_ref()
+        .filter(|publication| {
+            !publication.publishing
+                && (!publication.published || publication.reaction_repair_pending)
+        })
+        .map(|publication| publication.event_seq);
+    let Some(event_seq) = event_seq else {
+        return Ok(false);
+    };
+    let Some(claim) = claim_worker_terminal_publication(task, event_seq, task_id) else {
+        return Ok(false);
+    };
+
+    if let Some(tail_event) = claim.tail_event {
+        task.emit_roster_updated();
+        let _ = tail_tx.send(tail_event);
+        task.notify.notify_waiters();
+    }
+
+    let repair_pending = attempt_worker_terminal_reaction_repair(
+        event_seq,
+        task_id,
+        claim.before.system_event.clone(),
+        system_events,
+    );
+    if !stage_worker_terminal_claim_result(task, event_seq, repair_pending) {
+        restore_worker_terminal_claim(task, claim.before);
+        return Err(std::io::Error::other(
+            "worker terminal publication claim disappeared before persistence",
+        ));
+    }
+    if let Err(error) = persist_task_snapshot_now(task_store, store_dir) {
+        restore_worker_terminal_claim(task, claim.before);
+        return Err(error);
+    }
+    complete_worker_terminal_claim(task, event_seq);
+    Ok(true)
+}
+
+pub(crate) fn ingest_harness_event(
     task: &Task,
     provider: Provider,
     evt: Value,
@@ -3396,124 +4303,170 @@ fn ingest_harness_event(
     task_id: &str,
     system_events: Option<crate::system_events::SharedEventHub>,
 ) {
-    // Stream deltas arrive at token-chunk rate while a bro streams (50+/s);
-    // everything inside the lock below must be O(chunk), never O(message) —
-    // per-delta O(accumulated-message) work measurably degraded runtime
-    // worker poll times (thread-935b467d §4.6 measurements).
-    let is_stream_delta = evt.get("type").and_then(Value::as_str) == Some("stream_event");
-    let (snippet_to_emit, emit_roster, task_event_to_emit) = {
+    let publication = {
         let mut inner = task.inner.lock();
-        // Decide fork-acceptance BEFORE parsing so the parse can mutate the
-        // task's accumulated message in place (taken, not cloned) — a
-        // rejected forked event must never touch it.
-        let emitted_session_id = emitted_session_id_from_event(&evt);
-        let mut accepted = true;
-        let mut session_id_observed = false;
-        if let Some(sid) = emitted_session_id {
-            if inner.session_id == "pending" {
-                inner.session_id = sid;
-                session_id_observed = true;
-            } else if inner.session_id != sid {
-                reject_forked_session(&mut inner, &sid);
-                accepted = false;
-            }
+        project_harness_event(&mut inner, provider, evt, true, true)
+    };
+    publish_harness_event(task, publication, tail_tx, task_id, system_events.clone());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerEventProjection {
+    Duplicate {
+        through_event_seq: u64,
+        terminal_result: bool,
+    },
+    Gap {
+        expected_event_seq: u64,
+    },
+    Applied {
+        terminal_result: bool,
+    },
+}
+
+/// Apply one worker event and durably persist its projection cursor in the
+/// same task snapshot. The task projection is the idempotency authority. The
+/// worker registry may lag this write across a crash, but replay then observes
+/// `Duplicate` and advances the registry without mutating the task twice.
+pub(crate) fn ingest_worker_event_durably(
+    task: &Task,
+    provider: Provider,
+    evt: Value,
+    event_seq: u64,
+    tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+    task_id: &str,
+    system_events: Option<crate::system_events::SharedEventHub>,
+    task_store: &RwLock<TaskStore>,
+    store_dir: &std::path::Path,
+) -> std::io::Result<WorkerEventProjection> {
+    let raw_result = evt.get("type").and_then(Value::as_str) == Some("result");
+    let snapshot_committed = evt.get("type").and_then(Value::as_str) == Some("harness_milestone")
+        && evt.get("milestone").and_then(Value::as_str) == Some("session_snapshot_committed");
+    {
+        let inner = task.inner.lock();
+        let through_event_seq = inner.events.worker_event_ack();
+        if event_seq <= through_event_seq {
+            let committed_terminal = inner.status.is_terminal()
+                && inner
+                    .events
+                    .worker_terminal_publication
+                    .as_ref()
+                    .is_some_and(|publication| publication.event_seq == event_seq);
+            drop(inner);
+            drain_pending_worker_terminal_publication(
+                task,
+                tail_tx,
+                task_id,
+                system_events,
+                task_store,
+                store_dir,
+            )?;
+            return Ok(WorkerEventProjection::Duplicate {
+                through_event_seq,
+                terminal_result: committed_terminal,
+            });
         }
-        let mut task_event_to_emit = None;
-        if accepted {
-            let mut sink = EventSink {
-                // Zero-copy seed: take the accumulated message so delta
-                // appends are amortized O(chunk). apply_sink_updates below
-                // (unconditional on this path) writes it back.
-                last_assistant_message: inner.last_assistant_message.take(),
-                usage: inner.usage.clone(),
-                cost_usd: inner.cost_usd,
-                num_turns: inner.num_turns,
-                session_id: if inner.session_id != "pending" {
-                    Some(inner.session_id.clone())
+    }
+
+    let (before, publication, committed_terminal) = {
+        let mut inner = task.inner.lock();
+        let through_event_seq = inner.events.worker_event_ack();
+        let expected_event_seq = through_event_seq.saturating_add(1);
+        if event_seq != expected_event_seq {
+            return Ok(WorkerEventProjection::Gap { expected_event_seq });
+        }
+        if raw_result && inner.events.pending_worker_result.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "worker emitted another result before committing its session snapshot",
+            ));
+        }
+        let before = inner.clone();
+        let pending_result = raw_result.then(|| PendingWorkerResult {
+            event_seq,
+            event: evt.clone(),
+        });
+        let mut publication =
+            project_harness_event(&mut inner, provider, evt, !raw_result, !snapshot_committed);
+        inner.events.set_worker_event_ack(event_seq);
+        if let Some(pending_result) = pending_result {
+            inner.events.pending_worker_result = Some(pending_result);
+        }
+
+        let committed_result = snapshot_committed
+            .then(|| inner.events.pending_worker_result.take())
+            .flatten();
+        let committed_terminal = committed_result.is_some();
+        if let Some(committed_result) = committed_result {
+            debug_assert!(committed_result.event_seq < event_seq);
+            let result_is_error = committed_result
+                .event
+                .get("is_error")
+                .and_then(Value::as_bool)
+                == Some(true);
+            apply_harness_result_failure(&mut inner, &committed_result.event);
+            if inner.status == TaskStatus::Running {
+                inner.status = if result_is_error {
+                    TaskStatus::Failed
                 } else {
-                    None
-                },
-                interrupted: false,
-            };
-            provider.parse_event(&evt, &mut sink);
-            apply_cwd_updates_from_event(&mut inner, &evt);
-            inner
-                .supervision
-                .observe_event(&evt, &sink, &supervision::config(), now_ms());
-            apply_sink_updates(&mut inner, sink);
-            apply_harness_result_failure(&mut inner, &evt);
-            // Store the event LAST so it moves instead of deep-cloning.
-            // Stream deltas are not stored at all: every ring consumer
-            // either filters them at read time (compact_status_event) or
-            // skips them structurally (no message/model field) — see the
-            // wave-15 consumer inventory in thread-935b467d. Storing one
-            // per text chunk made the 512-slot ring all-deltas under
-            // streaming and deep-cloned every chunk.
-            if !is_stream_delta {
-                task_event_to_emit = Some(append_task_event(&mut inner, evt));
-            }
-        }
-        // Roster summaries rebuild + broadcast per emit; throttle the
-        // delta-rate path to ~1/s (step-boundary events always emit).
-        let now = now_ms();
-        let emit_roster = !is_stream_delta
-            || session_id_observed
-            || now.saturating_sub(inner.last_delta_roster_emit_ms) >= 1000;
-        if is_stream_delta && emit_roster {
-            inner.last_delta_roster_emit_ms = now;
-        }
-        let snippet = accepted
-            .then(|| {
-                inner.last_assistant_message.as_ref().map(|msg| {
-                    const TAIL_CHARS: usize = 160;
-                    snippet_tail(msg, TAIL_CHARS)
-                })
-            })
-            .flatten()
-            .map(|snippet| {
-                let cursor = if snippet.is_empty() {
-                    None
-                } else {
-                    inner.live_cursor += 1;
-                    Some(inner.live_cursor)
+                    TaskStatus::Completed
                 };
-                (snippet, session_id_observed, cursor)
-            })
-            .or_else(|| session_id_observed.then(|| (String::new(), true, None)));
-        (snippet, emit_roster, task_event_to_emit)
+            }
+            inner.completed_at.get_or_insert_with(now_ms);
+            inner
+                .exit_code
+                .get_or_insert(if result_is_error { 1 } else { 0 });
+            inner.live_cursor += 1;
+            let terminal_cursor = inner.live_cursor;
+            let (terminal_lifecycle, terminal_system_event) =
+                freeze_worker_terminal_lifecycle(&inner, task_id).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "snapshot marker did not produce a terminal worker task",
+                    )
+                })?;
+            inner.events.reserve_worker_terminal_publication(
+                event_seq,
+                terminal_cursor,
+                terminal_lifecycle,
+                terminal_system_event,
+            );
+            // The terminal publisher owns the single roster update after the
+            // committed snapshot, including recovery on a replacement owner.
+            publication.emit_roster = false;
+        }
+        if snapshot_committed {
+            // The raw result already published the final assistant activity.
+            // The commit marker is retained as a task event but does not repeat
+            // the same progress or reaction event.
+            publication.progress = None;
+        }
+        (before, publication, committed_terminal)
     };
 
-    if let Some(task_event) = task_event_to_emit {
-        let _ = tail_tx.send(task_event);
+    let write_result = persist_task_snapshot_now(task_store, store_dir);
+    if let Err(error) = write_result {
+        let mut inner = task.inner.lock();
+        if inner.events.worker_event_ack() == event_seq {
+            *inner = before;
+        }
+        return Err(error);
     }
 
-    if emit_roster {
-        task.emit_roster_updated();
+    publish_harness_event(task, publication, tail_tx, task_id, system_events.clone());
+    if committed_terminal {
+        drain_pending_worker_terminal_publication(
+            task,
+            tail_tx,
+            task_id,
+            system_events,
+            task_store,
+            store_dir,
+        )?;
     }
-
-    if let Some((snippet, session_id_observed, cursor)) = snippet_to_emit {
-        if session_id_observed {
-            task.notify.notify_waiters();
-        }
-        if snippet.is_empty() {
-            return;
-        }
-        let Some(cursor) = cursor else {
-            return;
-        };
-        let _ = tail_tx.send(tail::TailEvent::TaskProgress {
-            cursor,
-            task_id: task_id.to_string(),
-            activity: snippet.clone(),
-        });
-        // System events journal every emit (fs append + reaction matching);
-        // a task.progress per text DELTA wrote one journal line per token
-        // chunk (20,495 of 20,513 prod journal lines were task.progress).
-        // Step-boundary events still emit at turn cadence.
-        if !is_stream_delta && let Some(ref hub) = system_events {
-            emit_task_progress_event(hub, task_id.to_string(), snippet);
-        }
-    }
+    Ok(WorkerEventProjection::Applied {
+        terminal_result: committed_terminal,
+    })
 }
 
 async fn run_harness_in_process(
@@ -3663,6 +4616,7 @@ fn parse_dispatch_tool_placement(
 /// that uses that compatibility shape.
 ///
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn spawn_task_interactive(
     task_id: String,
     provider: Provider,
@@ -3853,7 +4807,143 @@ fn open_harness_tee(id: &str, suffix: &str) -> Option<HarnessTee> {
     })
 }
 
+fn publish_task_started(
+    task: &Task,
+    tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<&crate::system_events::SharedEventHub>,
+    task_id: &str,
+    provider: Provider,
+) {
+    task.emit_roster_added();
+    let cursor = task.next_live_cursor();
+    let _ = tail_tx.send(tail::TailEvent::TaskStarted {
+        cursor,
+        task_id: task_id.to_string(),
+        provider,
+        bro_name: None,
+    });
+    if let Some(hub) = system_events {
+        let task_id_ev = task_id.to_string();
+        let bro_ev = task.inner.lock().bro_label.clone();
+        let provider_str = provider.to_string();
+        let hub_clone = hub.clone();
+        tokio::spawn(async move {
+            let mut correlation = serde_json::Map::new();
+            correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
+            let draft = crate::system_events::SystemEventDraft {
+                kind: crate::system_events::types::SystemEventKind::TaskStarted,
+                producer: "orchestration.dispatch".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation,
+                causation_id: None,
+                payload: serde_json::json!({
+                    "task_id": task_id_ev,
+                    "provider": provider_str,
+                    "bro": bro_ev,
+                }),
+            };
+            if let Err(error) = hub_clone.emit(draft).await {
+                tracing::warn!(%error, "task.started system event emit failed");
+            }
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_reserved_task_authority(
+    id: &str,
+    provider: Provider,
+    session_id: &str,
+    cwd: &Option<String>,
+    store_dir: &std::path::Path,
+    task_store: &Arc<RwLock<TaskStore>>,
+    tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+    roster_events: &Option<RosterEventSink>,
+    bro_label: &Option<String>,
+    agent_label: &Option<String>,
+    system_events: Option<&crate::system_events::SharedEventHub>,
+    origin: bro_core::Origin,
+) -> Result<Arc<Task>, Arc<Task>> {
+    let task = Arc::new(Task {
+        inner: Mutex::new(TaskInner {
+            id: id.to_string(),
+            provider,
+            session_id: session_id.to_string(),
+            events: EventRing::new(),
+            model: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: String::new(),
+            status: TaskStatus::Running,
+            started_at: now_ms(),
+            completed_at: None,
+            exit_code: None,
+            cwd: cwd.clone(),
+            managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
+            bro_label: bro_label.clone(),
+            name: None,
+            agent_label: agent_label.clone(),
+            report: None,
+            interrupted: false,
+            recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
+            live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
+            supervision: SupervisionState::default(),
+            origin,
+            workflow_owned: workflow_owned_for_origin(origin),
+        }),
+        notify: Arc::new(Notify::new()),
+        child_id: Mutex::new(None),
+        roster_events: roster_events.clone(),
+    });
+    if let Err(error) = task_store
+        .write()
+        .insert_reserved(id.to_string(), task.clone())
+    {
+        task_store.write().release_reservation(id);
+        let failed = failed_duplicate_task(
+            id.to_string(),
+            provider,
+            session_id.to_string(),
+            cwd.clone(),
+            bro_label.clone(),
+            agent_label.clone(),
+            error.to_string(),
+            origin,
+        );
+        failed.notify.notify_waiters();
+        return Err(failed);
+    }
+    if let Err(error) = flush_persist_blocking(task_store, store_dir) {
+        {
+            let mut inner = task.inner.lock();
+            inner.status = TaskStatus::Failed;
+            inner.completed_at = Some(now_ms());
+            inner.stderr = format!("persisting task authority before spawn failed: {error}\n");
+        }
+        task.emit_roster_added();
+        task.notify.notify_waiters();
+        return Err(task);
+    }
+    publish_task_started(task.as_ref(), tail_tx, system_events, id, provider);
+    Ok(task)
+}
+
 fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask {
+    spawn_task_reserved_with_authority(task_id, params, None)
+}
+
+fn spawn_task_reserved_with_authority(
+    task_id: String,
+    params: SpawnTaskParams,
+    preinstalled_task: Option<Arc<Task>>,
+) -> SpawnedTask {
     let SpawnTaskParams {
         provider,
         args,
@@ -3932,48 +5022,40 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         cmd.env_remove(key);
     }
 
+    // Install and durably persist task authority before the child can connect
+    // or emit output. Reconnectable harness callers may preinstall it before
+    // provisioning worker authority and its initial command.
+    let task = match preinstalled_task {
+        Some(task) => task,
+        None => match install_reserved_task_authority(
+            &id,
+            provider,
+            &session_id,
+            &cwd,
+            &store_dir,
+            &task_store,
+            &tail_tx,
+            &roster_events,
+            &bro_label,
+            &agent_label,
+            system_events.as_ref(),
+            origin,
+        ) {
+            Ok(task) => task,
+            Err(task) => return SpawnedTask { task, stdin: None },
+        },
+    };
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            // Return a failed task immediately
-            let task = Arc::new(Task {
-                inner: Mutex::new(TaskInner {
-                    id: id.clone(),
-                    provider,
-                    session_id,
-                    events: EventRing::new(),
-                    model: None,
-                    last_assistant_message: None,
-                    usage: None,
-                    cost_usd: None,
-                    num_turns: None,
-                    stderr: format!("spawn error: {e}"),
-                    status: TaskStatus::Failed,
-                    started_at: now_ms(),
-                    completed_at: Some(now_ms()),
-                    exit_code: None,
-                    managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
-                    cwd,
-                    bro_label: bro_label.clone(),
-                    name: None,
-                    agent_label: agent_label.clone(),
-                    report: None,
-                    interrupted: false,
-                    recoverable: false,
-                    transcript_location: None,
-                    transcript_cursor: None,
-                    live_cursor: 0,
-                    last_delta_roster_emit_ms: 0,
-                    supervision: SupervisionState::default(),
-                    origin,
-                    workflow_owned: workflow_owned_for_origin(origin),
-                }),
-                notify: Arc::new(Notify::new()),
-                child_id: Mutex::new(None),
-                roster_events: roster_events.clone(),
-            });
-            let _ = task_store.write().insert_reserved(id, task.clone());
-            task.emit_roster_added();
+            {
+                let mut inner = task.inner.lock();
+                inner.status = TaskStatus::Failed;
+                inner.completed_at = Some(now_ms());
+                inner.stderr = format!("spawn error: {e}");
+            }
+            task.emit_roster_updated();
             request_persist(&task_store, &store_dir);
             task.notify.notify_waiters();
             return SpawnedTask { task, stdin: None };
@@ -3981,6 +5063,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
     };
 
     let pid = child.id();
+    *task.child_id.lock() = pid;
     // Interactive mode: keep stdin open and writable for the caller to drive the
     // persistent session. One-shot mode: write the spilled prompt then drop the
     // handle (closing stdin) as before.
@@ -3996,101 +5079,6 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         }
         None
     };
-    let task = Arc::new(Task {
-        inner: Mutex::new(TaskInner {
-            id: id.clone(),
-            provider,
-            session_id: session_id.clone(),
-            events: EventRing::new(),
-            model: None,
-            last_assistant_message: None,
-            usage: None,
-            cost_usd: None,
-            num_turns: None,
-            stderr: String::new(),
-            status: TaskStatus::Running,
-            started_at: now_ms(),
-            completed_at: None,
-            exit_code: None,
-            cwd: cwd.clone(),
-            managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
-            bro_label,
-            name: None,
-            agent_label,
-            report: None,
-            interrupted: false,
-            recoverable: false,
-            transcript_location: None,
-            transcript_cursor: None,
-            live_cursor: 0,
-            last_delta_roster_emit_ms: 0,
-            supervision: SupervisionState::default(),
-            origin,
-            workflow_owned: workflow_owned_for_origin(origin),
-        }),
-        notify: Arc::new(Notify::new()),
-        child_id: Mutex::new(pid),
-        roster_events: roster_events.clone(),
-    });
-
-    if let Err(err) = task_store.write().insert_reserved(id.clone(), task.clone()) {
-        task_store.write().release_reservation(&id);
-        let failed = failed_duplicate_task(
-            id,
-            provider,
-            session_id,
-            cwd,
-            None,
-            None,
-            err.to_string(),
-            origin,
-        );
-        failed.notify.notify_waiters();
-        return SpawnedTask {
-            task: failed,
-            stdin: None,
-        };
-    }
-
-    task.emit_roster_added();
-
-    // Emit tail event
-    let cursor = task.next_live_cursor();
-    let _ = tail_tx.send(tail::TailEvent::TaskStarted {
-        cursor,
-        task_id: id.clone(),
-        provider,
-        bro_name: None,
-    });
-    // Emit task.started system event. Observation-only: failures logged, not propagated.
-    if let Some(ref hub) = system_events {
-        let task_id_ev = id.clone();
-        let bro_ev = task.inner.lock().bro_label.clone();
-        let provider_str = provider.to_string();
-        let hub_clone = hub.clone();
-        tokio::spawn(async move {
-            let mut correlation = serde_json::Map::new();
-            correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
-            let draft = crate::system_events::SystemEventDraft {
-                kind: crate::system_events::types::SystemEventKind::TaskStarted,
-                producer: "orchestration.dispatch".to_string(),
-                project: None,
-                principal: None,
-                subject: None,
-                correlation,
-                causation_id: None,
-                payload: serde_json::json!({
-                    "task_id": task_id_ev,
-                    "provider": provider_str,
-                    "bro": bro_ev,
-                }),
-            };
-            if let Err(e) = hub_clone.emit(draft).await {
-                tracing::warn!("task.started system event emit failed: {e:#}");
-            }
-        });
-    }
-
     // Spawn stdout reader — signals completion via oneshot so the process
     // waiter can ensure all output is consumed before marking the task done.
     let stdout = child.stdout.take().unwrap();
@@ -4354,63 +5342,116 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         let _ = stderr_done_rx.await;
         let code = status.ok().and_then(|s| s.code());
 
-        let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind, cursor) = {
+        let (
+            worker_terminal_owned,
+            owner_terminal_needed,
+            worker_id,
+            terminal_status,
+            elapsed,
+            cost,
+            error_snippet,
+            source_session,
+            task_kind,
+            cursor,
+        ) = {
             let mut inner = task_ref_wait.inner.lock();
-            inner.exit_code = code;
-            // Preserve terminal states set during stream parsing (Cancelled
-            // on kill, Failed on session fork detection) — don't let a
-            // clean exit code flip a detected failure back to Completed.
-            if inner.status != TaskStatus::Cancelled && inner.status != TaskStatus::Failed {
-                inner.status = if code == Some(0) {
-                    TaskStatus::Completed
-                } else {
-                    TaskStatus::Failed
-                };
+            let worker_publication = inner.events.worker_terminal_publication.clone();
+            let worker_id = inner.events.worker_id.clone();
+            let owner_terminal_needed = worker_id.is_some() && worker_publication.is_none();
+            let worker_terminal_owned = worker_id.is_some()
+                || worker_publication.is_some()
+                || inner.events.pending_worker_result.is_some();
+            if worker_terminal_owned {
+                if inner.exit_code.is_none() {
+                    inner.exit_code = code;
+                }
+                inner.completed_at.get_or_insert_with(now_ms);
+                if owner_terminal_needed && inner.status == TaskStatus::Running {
+                    inner.status = TaskStatus::Failed;
+                    inner.recoverable = true;
+                    if !inner.stderr.is_empty() && !inner.stderr.ends_with('\n') {
+                        inner.stderr.push('\n');
+                    }
+                    inner
+                        .stderr
+                        .push_str("[blackbox] reconnectable worker process exited before durable terminal closeout\n");
+                }
+            } else {
+                inner.exit_code = code;
+                // Preserve terminal states set during stream parsing (Cancelled
+                // on kill, Failed on session fork detection). A clean exit code
+                // must not flip a detected failure back to Completed.
+                if inner.status != TaskStatus::Cancelled && inner.status != TaskStatus::Failed {
+                    inner.status = if code == Some(0) {
+                        TaskStatus::Completed
+                    } else {
+                        TaskStatus::Failed
+                    };
+                }
+                inner.completed_at = Some(now_ms());
+                inner.live_cursor += 1;
             }
-            inner.completed_at = Some(now_ms());
-            let elapsed = format_elapsed(inner.started_at, inner.completed_at);
-            let terminal_status = inner.status;
-            let cost = inner.cost_usd;
-            let error_snippet: String = inner.stderr.chars().take(200).collect();
-            let source_session = inner.session_id.clone();
-            let task_kind = inner.bro_label.clone();
-            inner.live_cursor += 1;
-            let cursor = inner.live_cursor;
+            let cursor = worker_publication
+                .map(|publication| publication.cursor)
+                .unwrap_or(inner.live_cursor);
             (
-                terminal_status,
-                elapsed,
-                cost,
-                error_snippet,
-                source_session,
-                task_kind,
+                worker_terminal_owned,
+                owner_terminal_needed,
+                worker_id,
+                inner.status,
+                format_elapsed(inner.started_at, inner.completed_at),
+                inner.cost_usd,
+                inner.stderr.chars().take(200).collect::<String>(),
+                inner.session_id.clone(),
+                inner.bro_label.clone(),
                 cursor,
             )
         };
-        task_ref_wait.emit_roster_updated();
-        match terminal_status {
-            TaskStatus::Completed => {
-                let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
-                    cursor,
-                    task_id: task_id_wait.clone(),
-                    elapsed: elapsed.clone(),
-                    cost,
-                    source_session,
-                    task_kind,
-                });
+        if owner_terminal_needed {
+            if let Some(worker_id) = worker_id {
+                crate::server::worker_rpc::abandon_task_worker(&bro_core::WorkerId::new(worker_id));
             }
-            TaskStatus::Failed => {
-                let _ = tail_tx_wait.send(tail::TailEvent::TaskFailed {
-                    cursor,
-                    task_id: task_id_wait.clone(),
-                    elapsed: elapsed.clone(),
-                    error: error_snippet.clone(),
-                });
+            reserve_owner_terminal_publication(&task_ref_wait, &task_id_wait);
+            if let Err(error) = flush_persist_blocking(&task_store, &store_dir) {
+                tracing::warn!(task_id = %task_id_wait, %error, "early worker exit projection persist failed");
+            } else if let Err(error) = drain_pending_worker_terminal_publication(
+                &task_ref_wait,
+                &tail_tx_wait,
+                &task_id_wait,
+                system_events_wait.clone(),
+                &task_store,
+                &store_dir,
+            ) {
+                tracing::warn!(task_id = %task_id_wait, %error, "early worker exit lifecycle publication failed");
             }
-            _ => {}
+        }
+        if !worker_terminal_owned {
+            task_ref_wait.emit_roster_updated();
+            match terminal_status {
+                TaskStatus::Completed => {
+                    let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
+                        cursor,
+                        task_id: task_id_wait.clone(),
+                        elapsed: elapsed.clone(),
+                        cost,
+                        source_session,
+                        task_kind,
+                    });
+                }
+                TaskStatus::Failed => {
+                    let _ = tail_tx_wait.send(tail::TailEvent::TaskFailed {
+                        cursor,
+                        task_id: task_id_wait.clone(),
+                        elapsed: elapsed.clone(),
+                        error: error_snippet.clone(),
+                    });
+                }
+                _ => {}
+            }
         }
         // Emit terminal system event. Observation-only: failures logged, not propagated.
         // MutexGuard dropped above so the async emit is safe to await.
-        if let Some(ref hub) = system_events_wait {
+        if !worker_terminal_owned && let Some(ref hub) = system_events_wait {
             let mut correlation = serde_json::Map::new();
             correlation.insert("task_id".into(), serde_json::json!(task_id_wait));
             let (kind, payload) = match terminal_status {
@@ -4555,7 +5596,21 @@ pub fn cancel_task(
     task: &Task,
     task_store: &RwLock<TaskStore>,
     store_dir: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let task_id = {
+        let inner = task.inner.lock();
+        if inner.status != TaskStatus::Running {
+            return Err(format!(
+                "Task already {}",
+                serde_json::to_string(&inner.status).unwrap_or_default()
+            ));
+        }
+        inner.id.clone()
+    };
+    let worker_owned = crate::server::worker_rpc::dispatch_task_cancel_if_owned(
+        &task_id,
+        now_ms().saturating_add(10_000),
+    )?;
     let mut inner = task.inner.lock();
     if inner.status != TaskStatus::Running {
         return Err(format!(
@@ -4566,17 +5621,23 @@ pub fn cancel_task(
     inner.status = TaskStatus::Cancelled;
     inner.completed_at = Some(now_ms());
     drop(inner);
+    if worker_owned {
+        reserve_owner_terminal_publication(task, &task_id);
+    }
     task.emit_roster_updated();
 
-    // Kill the child process
-    if let Some(pid) = task.child_id.lock().take() {
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    if !worker_owned {
+        // Compatibility sessions have no durable shutdown channel.
+        if let Some(pid) = task.child_id.lock().take() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
         }
     }
-    request_persist(task_store, store_dir);
+    let persisted = flush_persist_blocking(task_store, store_dir)
+        .map_err(|error| format!("persisting cancelled task failed: {error}"));
     task.notify.notify_waiters();
-    Ok(())
+    persisted.map(|()| worker_owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -5252,6 +6313,7 @@ mod tests {
     #[test]
     fn harness_input_wire_preserves_user_and_control_contracts() {
         use bro_harness::agent_loop::SessionInput;
+        use bro_protocol::{AgentMailboxDelivery, AgentMailboxMessage, AgentMailboxMessageKind};
 
         assert_eq!(
             harness_input_wire(SessionInput::User("hello".into())),
@@ -5273,6 +6335,31 @@ mod tests {
         assert_eq!(control["subtype"], "set_model");
         assert_eq!(control["request_id"], "request-1");
         assert_eq!(control["model"], "glm-worker");
+
+        let mailbox = harness_input_wire(SessionInput::AgentMailbox {
+            delivery: AgentMailboxDelivery {
+                delivery_id: "delivery-1".into(),
+                target_agent_id: bro_core::AgentId::new("agent-child"),
+                canonical_target: "/root/child".into(),
+                session_id: bro_core::SessionId::new("session-1"),
+                through_sequence: 1,
+                wake: false,
+                messages: vec![AgentMailboxMessage {
+                    message_id: "message-1".into(),
+                    sequence: 1,
+                    sender: Some(bro_core::AgentId::new("agent-root")),
+                    recipient: bro_core::AgentId::new("agent-child"),
+                    kind: AgentMailboxMessageKind::Send,
+                    body: "queued context".into(),
+                    created_at_unix_ms: 42,
+                }],
+            },
+            command_id: "command-1".into(),
+        });
+        assert_eq!(mailbox["type"], "agent_mailbox");
+        assert_eq!(mailbox["command_id"], "command-1");
+        assert_eq!(mailbox["delivery"]["delivery_id"], "delivery-1");
+        assert_eq!(mailbox["delivery"]["messages"][0]["body"], "queued context");
     }
 
     #[test]
@@ -6696,7 +7783,11 @@ exit 0
         assert!(inner.stderr.contains("400 Bad Request: boom"));
     }
 
-    fn mk_ingest_task(id: &str, session_id: &str) -> Arc<Task> {
+    fn mk_ingest_task_with_roster(
+        id: &str,
+        session_id: &str,
+        roster_events: Option<RosterEventSink>,
+    ) -> Arc<Task> {
         Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: id.to_string(),
@@ -6731,8 +7822,1030 @@ exit 0
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
-            roster_events: None,
+            roster_events,
         })
+    }
+
+    fn mk_ingest_task(id: &str, session_id: &str) -> Arc<Task> {
+        mk_ingest_task_with_roster(id, session_id, None)
+    }
+
+    #[tokio::test]
+    async fn durable_worker_ingest_publishes_once_after_persistence_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let blocked_store_dir = root.join("blocked-task-store");
+        std::fs::write(&blocked_store_dir, b"not a directory").unwrap();
+
+        let roster_seq = Arc::new(AtomicU64::new(0));
+        let (roster_tx, mut roster_rx) = tokio::sync::broadcast::channel(16);
+        let roster_sink = RosterEventSink::new(roster_seq.clone(), roster_tx);
+        let task = mk_ingest_task_with_roster("worker-task", "worker-session", Some(roster_sink));
+        let task_store = RwLock::new(TaskStore::new());
+        task_store
+            .write()
+            .insert("worker-task".to_string(), task.clone())
+            .unwrap();
+
+        let (tail_tx, mut tail_rx) = tokio::sync::broadcast::channel(16);
+        let event_store = crate::system_events::EventStore::new_at(root.join("event-journal"));
+        let outbox_store =
+            crate::system_events::OutboxStore::new(root.join("event-outbox")).unwrap();
+        let event_hub = Arc::new(crate::system_events::EventHub::new(
+            event_store,
+            outbox_store,
+            root.join("event-reactions"),
+            root.join("event-identities"),
+        ));
+        let event = serde_json::json!({
+            "type": "result",
+            "subtype": "error",
+            "is_error": true,
+            "session_id": "worker-session",
+            "result": "durable failure",
+            "num_turns": 1
+        });
+        let snapshot_committed = serde_json::json!({
+            "type": "harness_milestone",
+            "milestone": "session_snapshot_committed",
+            "session_id": "worker-session"
+        });
+
+        let error = ingest_worker_event_durably(
+            &task,
+            Provider::Minimax,
+            event.clone(),
+            1,
+            &tail_tx,
+            "worker-task",
+            Some(event_hub.clone()),
+            &task_store,
+            &blocked_store_dir,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+        ));
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.events.worker_event_ack(), 0);
+            assert_eq!(inner.events.len(), 0);
+            assert_eq!(inner.live_cursor, 0);
+            assert!(inner.last_assistant_message.is_none());
+            assert!(inner.events.worker_terminal_publication.is_none());
+            assert!(inner.events.pending_worker_result.is_none());
+        }
+        assert!(matches!(
+            tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(roster_seq.load(Ordering::SeqCst), 0);
+        assert!(
+            event_hub
+                .list_events(None, Some("task.progress"), None, None)
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_file(&blocked_store_dir).unwrap();
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                event.clone(),
+                1,
+                &tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &task_store,
+                &blocked_store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: false
+            }
+        );
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                event,
+                1,
+                &tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &task_store,
+                &blocked_store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Duplicate {
+                through_event_seq: 1,
+                terminal_result: false,
+            }
+        );
+
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.events.worker_event_ack(), 1);
+            assert_eq!(inner.events.len(), 1);
+            assert_eq!(inner.live_cursor, 2);
+            assert_eq!(inner.status, TaskStatus::Running);
+            assert!(inner.stderr.is_empty());
+            assert!(inner.events.worker_terminal_publication.is_none());
+            assert!(
+                inner
+                    .events
+                    .pending_worker_result
+                    .as_ref()
+                    .is_some_and(|pending| pending.event_seq == 1)
+            );
+            assert_eq!(
+                inner.last_assistant_message.as_deref(),
+                Some("durable failure")
+            );
+        }
+
+        let first_tail = tail_rx.try_recv().unwrap();
+        assert!(matches!(
+            first_tail,
+            tail::TailEvent::TaskEvent {
+                cursor: 1,
+                ref task_id,
+                ..
+            } if task_id == "worker-task"
+        ));
+        let second_tail = tail_rx.try_recv().unwrap();
+        assert!(matches!(
+            second_tail,
+            tail::TailEvent::TaskProgress {
+                cursor: 2,
+                ref task_id,
+                ref activity,
+            } if task_id == "worker-task" && activity == "durable failure"
+        ));
+        assert!(matches!(
+            tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        assert!(matches!(
+            roster_rx.try_recv().unwrap(),
+            bro_protocol::RosterDelta::Updated { seq: 1, task }
+                if task.task_id.as_str() == "worker-task"
+        ));
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(roster_seq.load(Ordering::SeqCst), 1);
+
+        let blocked_marker_dir = root.join("blocked-marker-store");
+        std::fs::write(&blocked_marker_dir, b"not a directory").unwrap();
+        let error = ingest_worker_event_durably(
+            &task,
+            Provider::Minimax,
+            snapshot_committed.clone(),
+            2,
+            &tail_tx,
+            "worker-task",
+            Some(event_hub.clone()),
+            &task_store,
+            &blocked_marker_dir,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+        ));
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.events.worker_event_ack(), 1);
+            assert_eq!(inner.events.len(), 1);
+            assert_eq!(inner.live_cursor, 2);
+            assert_eq!(inner.status, TaskStatus::Running);
+            assert!(inner.stderr.is_empty());
+            assert!(inner.events.worker_terminal_publication.is_none());
+            assert!(inner.events.pending_worker_result.is_some());
+        }
+        assert!(matches!(
+            tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        std::fs::remove_file(&blocked_marker_dir).unwrap();
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                snapshot_committed.clone(),
+                2,
+                &tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &task_store,
+                &blocked_marker_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: true
+            }
+        );
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                snapshot_committed,
+                2,
+                &tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &task_store,
+                &blocked_marker_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Duplicate {
+                through_event_seq: 2,
+                terminal_result: true,
+            }
+        );
+
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.events.worker_event_ack(), 2);
+            assert_eq!(inner.events.len(), 2);
+            assert_eq!(inner.live_cursor, 4);
+            assert_eq!(inner.status, TaskStatus::Failed);
+            assert!(inner.stderr.contains("durable failure"));
+            assert!(inner.events.pending_worker_result.is_none());
+            assert!(
+                inner
+                    .events
+                    .worker_terminal_publication
+                    .as_ref()
+                    .is_some_and(|publication| {
+                        publication.event_seq == 2
+                            && publication.published
+                            && !publication.reaction_repair_pending
+                            && publication.cursor == 4
+                    })
+            );
+        }
+        assert!(matches!(
+            tail_rx.try_recv().unwrap(),
+            tail::TailEvent::TaskEvent {
+                cursor: 3,
+                ref task_id,
+                ..
+            } if task_id == "worker-task"
+        ));
+        assert!(matches!(
+            tail_rx.try_recv().unwrap(),
+            tail::TailEvent::TaskFailed {
+                cursor: 4,
+                ref task_id,
+                ref error,
+                ..
+            } if task_id == "worker-task" && error.contains("durable failure")
+        ));
+        assert!(matches!(
+            tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            roster_rx.try_recv().unwrap(),
+            bro_protocol::RosterDelta::Updated { seq: 2, task }
+                if task.task_id.as_str() == "worker-task"
+                    && task.status == bro_protocol::TaskStatus::Failed
+        ));
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(roster_seq.load(Ordering::SeqCst), 2);
+
+        let mut progress_events = Vec::new();
+        for _ in 0..100 {
+            progress_events = event_hub
+                .list_events(None, Some("task.progress"), None, None)
+                .unwrap();
+            if !progress_events.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(progress_events.len(), 1);
+        assert_eq!(
+            progress_events[0]
+                .payload
+                .get("activity")
+                .and_then(Value::as_str),
+            Some("durable failure")
+        );
+        let mut failed_events = Vec::new();
+        for _ in 0..100 {
+            failed_events = event_hub
+                .list_events(None, Some("task.failed"), None, None)
+                .unwrap();
+            if !failed_events.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(failed_events.len(), 1);
+
+        let reconnectable = std::collections::BTreeSet::from(["worker-task".to_string()]);
+        let reloaded =
+            TaskStore::load_with_reconnectable_tasks(&blocked_marker_dir, u64::MAX, &reconnectable);
+        let reloaded_task = reloaded.get("worker-task").unwrap();
+        let inner = reloaded_task.inner.lock();
+        assert_eq!(inner.events.worker_event_ack(), 2);
+        assert_eq!(inner.events.len(), 2);
+        assert_eq!(inner.live_cursor, 4);
+        assert_eq!(inner.status, TaskStatus::Failed);
+        assert!(inner.events.pending_worker_result.is_none());
+        assert!(
+            inner
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    publication.event_seq == 2
+                        && publication.published
+                        && !publication.reaction_repair_pending
+                        && publication.cursor == 4
+                })
+        );
+        assert_eq!(
+            inner.last_assistant_message.as_deref(),
+            Some("durable failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_terminal_publication_recovers_on_replacement_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store_dir = root.join("tasks");
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "worker-session",
+            "result": "replacement owner result",
+            "num_turns": 1
+        });
+        let snapshot_committed = serde_json::json!({
+            "type": "harness_milestone",
+            "milestone": "session_snapshot_committed",
+            "session_id": "worker-session"
+        });
+
+        let original = mk_ingest_task("worker-task", "worker-session");
+        let original_store = RwLock::new(TaskStore::new());
+        original_store
+            .write()
+            .insert("worker-task".to_string(), original.clone())
+            .unwrap();
+        let (tail_tx, mut tail_rx) = tokio::sync::broadcast::channel(16);
+        assert_eq!(
+            ingest_worker_event_durably(
+                &original,
+                Provider::Minimax,
+                result,
+                1,
+                &tail_tx,
+                "worker-task",
+                None,
+                &original_store,
+                &store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: false
+            }
+        );
+        while tail_rx.try_recv().is_ok() {}
+
+        let blocked_event_parent = root.join("blocked-event-parent");
+        std::fs::write(&blocked_event_parent, b"not a directory").unwrap();
+        let failing_event_store =
+            crate::system_events::EventStore::new_at(blocked_event_parent.join("journal"));
+        let failing_outbox =
+            crate::system_events::OutboxStore::new(root.join("failing-outbox")).unwrap();
+        let failing_hub = Arc::new(crate::system_events::EventHub::new(
+            failing_event_store,
+            failing_outbox,
+            root.join("failing-reactions"),
+            root.join("failing-identities"),
+        ));
+        let notified = original.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        assert_eq!(
+            ingest_worker_event_durably(
+                &original,
+                Provider::Minimax,
+                snapshot_committed,
+                2,
+                &tail_tx,
+                "worker-task",
+                Some(failing_hub),
+                &original_store,
+                &store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: true
+            }
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        let mut completed_tail_events = 0;
+        while let Ok(event) = tail_rx.try_recv() {
+            if matches!(event, tail::TailEvent::TaskCompleted { .. }) {
+                completed_tail_events += 1;
+            }
+        }
+        assert_eq!(completed_tail_events, 1);
+
+        let loaded = TaskStore::load(&store_dir, u64::MAX);
+        let loaded_inner = loaded.get("worker-task").unwrap().inner.lock().clone();
+        assert_eq!(loaded_inner.events.worker_event_ack(), 2);
+        assert!(loaded_inner.events.pending_worker_result.is_none());
+        assert_eq!(loaded_inner.status, TaskStatus::Completed);
+        assert!(
+            loaded_inner
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    publication.event_seq == 2
+                        && publication.published
+                        && publication.reaction_repair_pending
+                        && publication.cursor == 4
+                })
+        );
+
+        let roster_seq = Arc::new(AtomicU64::new(0));
+        let (roster_tx, mut roster_rx) = tokio::sync::broadcast::channel(16);
+        let replacement = Arc::new(Task {
+            inner: Mutex::new(loaded_inner),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+            roster_events: Some(RosterEventSink::new(roster_seq.clone(), roster_tx)),
+        });
+        let replacement_store = RwLock::new(TaskStore::new());
+        replacement_store
+            .write()
+            .insert("worker-task".to_string(), replacement.clone())
+            .unwrap();
+        let (repair_tail_tx, mut repair_tail_rx) = tokio::sync::broadcast::channel(16);
+        let event_store = crate::system_events::EventStore::new_at(root.join("event-journal"));
+        let outbox_store =
+            crate::system_events::OutboxStore::new(root.join("event-outbox")).unwrap();
+        let event_hub = Arc::new(crate::system_events::EventHub::new(
+            event_store,
+            outbox_store,
+            root.join("event-reactions"),
+            root.join("event-identities"),
+        ));
+        let notified = replacement.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let blocked_repair_store = root.join("blocked-repair-store");
+        std::fs::write(&blocked_repair_store, b"not a directory").unwrap();
+        let error = drain_pending_worker_terminal_publication(
+            &replacement,
+            &repair_tail_tx,
+            "worker-task",
+            Some(event_hub.clone()),
+            &replacement_store,
+            &blocked_repair_store,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+        ));
+        assert!(
+            replacement
+                .inner
+                .lock()
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    publication.published && publication.reaction_repair_pending
+                })
+        );
+        assert!(matches!(
+            repair_tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        assert!(
+            drain_pending_worker_terminal_publication(
+                &replacement,
+                &repair_tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &replacement_store,
+                &store_dir,
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            repair_tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), notified)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            !drain_pending_worker_terminal_publication(
+                &replacement,
+                &repair_tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &replacement_store,
+                &store_dir,
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            repair_tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(roster_seq.load(Ordering::SeqCst), 0);
+
+        let mut completed_events = Vec::new();
+        for _ in 0..100 {
+            completed_events = event_hub
+                .list_events(None, Some("task.completed"), None, None)
+                .unwrap();
+            if !completed_events.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(completed_events.len(), 1);
+        let persisted = TaskStore::load(&store_dir, u64::MAX);
+        assert!(
+            persisted
+                .get("worker-task")
+                .unwrap()
+                .inner
+                .lock()
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    publication.event_seq == 2
+                        && publication.published
+                        && !publication.reaction_repair_pending
+                        && publication.cursor == 4
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_repairs_partial_outbox_with_frozen_draft() {
+        use bbox_system_events::system_events::types::{
+            FailurePolicy, ReactionAction, ReactionSpec, RetryPolicy,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store_dir = root.join("tasks");
+        let task = mk_ingest_task("worker-task", "original-session");
+        {
+            let mut inner = task.inner.lock();
+            inner.cost_usd = Some(1.25);
+            inner.bro_label = Some("original-kind".to_string());
+        }
+        let task_store = RwLock::new(TaskStore::new());
+        task_store
+            .write()
+            .insert("worker-task".to_string(), task.clone())
+            .unwrap();
+        let (tail_tx, mut tail_rx) = tokio::sync::broadcast::channel(16);
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "original-session",
+            "result": "frozen terminal result",
+            "num_turns": 1
+        });
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                result,
+                1,
+                &tail_tx,
+                "worker-task",
+                None,
+                &task_store,
+                &store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: false
+            }
+        );
+        while tail_rx.try_recv().is_ok() {}
+
+        let event_store = crate::system_events::EventStore::new_at(root.join("event-journal"));
+        let outbox_root = root.join("event-outbox");
+        let outbox_store = crate::system_events::OutboxStore::new(outbox_root.clone()).unwrap();
+        let event_hub = Arc::new(crate::system_events::EventHub::new(
+            event_store,
+            outbox_store,
+            root.join("event-reactions"),
+            root.join("event-identities"),
+        ));
+        event_hub
+            .install_reaction(
+                ReactionSpec {
+                    contract: "reaction/v1".to_string(),
+                    name: "terminal-reaction".to_string(),
+                    version: 1,
+                    enabled: true,
+                    event_kinds: vec!["task.completed".to_string()],
+                    when: None,
+                    idempotency_key: Some("terminal:${event.id}".to_string()),
+                    action: ReactionAction::EmitEvent {
+                        args: serde_json::json!({}),
+                    },
+                    retry: RetryPolicy::default(),
+                    on_failure: FailurePolicy::DeadLetter,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        std::fs::remove_dir_all(&outbox_root).unwrap();
+        std::fs::write(&outbox_root, b"not a directory").unwrap();
+        let snapshot_committed = serde_json::json!({
+            "type": "harness_milestone",
+            "milestone": "session_snapshot_committed",
+            "session_id": "original-session"
+        });
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                snapshot_committed,
+                2,
+                &tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &task_store,
+                &store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: true
+            }
+        );
+        let mut saw_frozen_lifecycle = false;
+        while let Ok(event) = tail_rx.try_recv() {
+            if matches!(
+                event,
+                tail::TailEvent::TaskCompleted {
+                    cursor: 4,
+                    ref task_id,
+                    cost: Some(cost),
+                    ref source_session,
+                    task_kind: Some(ref task_kind),
+                    ..
+                } if task_id == "worker-task"
+                    && cost == 1.25
+                    && source_session == "original-session"
+                    && task_kind == "original-kind"
+            ) {
+                saw_frozen_lifecycle = true;
+            }
+        }
+        assert!(saw_frozen_lifecycle);
+        let completed_events = event_hub
+            .list_events(None, Some("task.completed"), None, None)
+            .unwrap();
+        assert_eq!(completed_events.len(), 1);
+        assert_eq!(completed_events[0].payload["cost_usd"], 1.25);
+        assert!(
+            task.inner
+                .lock()
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    publication.published && publication.reaction_repair_pending
+                })
+        );
+
+        {
+            let mut inner = task.inner.lock();
+            inner.cost_usd = Some(99.0);
+            inner.stderr = "later mutable stderr".to_string();
+            inner.session_id = "later-session".to_string();
+            inner.bro_label = Some("later-kind".to_string());
+        }
+        persist_task_snapshot_now(&task_store, &store_dir).unwrap();
+        std::fs::remove_file(&outbox_root).unwrap();
+        std::fs::create_dir_all(&outbox_root).unwrap();
+
+        let replacement_store = RwLock::new(TaskStore::load(&store_dir, u64::MAX));
+        let replacement = replacement_store.read().get("worker-task").unwrap();
+        let (repair_tail_tx, mut repair_tail_rx) = tokio::sync::broadcast::channel(16);
+        assert!(
+            drain_pending_worker_terminal_publication(
+                &replacement,
+                &repair_tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &replacement_store,
+                &store_dir,
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            repair_tail_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            event_hub
+                .list_events(None, Some("task.completed"), None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        let outbox = event_hub.outbox_store().load_all().unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].reaction_name, "terminal-reaction");
+        assert!(
+            replacement
+                .inner
+                .lock()
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    publication.published && !publication.reaction_repair_pending
+                })
+        );
+        assert!(
+            !drain_pending_worker_terminal_publication(
+                &replacement,
+                &repair_tail_tx,
+                "worker-task",
+                Some(event_hub),
+                &replacement_store,
+                &store_dir,
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_clears_permanent_reaction_failure_without_gating() {
+        use bbox_system_events::system_events::types::{
+            FailurePolicy, ReactionAction, ReactionSpec, RetryPolicy,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store_dir = root.join("tasks");
+        let task = mk_ingest_task("worker-task", "worker-session");
+        let task_store = RwLock::new(TaskStore::new());
+        task_store
+            .write()
+            .insert("worker-task".to_string(), task.clone())
+            .unwrap();
+        let (tail_tx, mut tail_rx) = tokio::sync::broadcast::channel(16);
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "session_id": "worker-session",
+                    "result": "complete despite reaction configuration",
+                    "num_turns": 1
+                }),
+                1,
+                &tail_tx,
+                "worker-task",
+                None,
+                &task_store,
+                &store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: false
+            }
+        );
+        while tail_rx.try_recv().is_ok() {}
+
+        let event_hub = Arc::new(crate::system_events::EventHub::new(
+            crate::system_events::EventStore::new_at(root.join("event-journal")),
+            crate::system_events::OutboxStore::new(root.join("event-outbox")).unwrap(),
+            root.join("event-reactions"),
+            root.join("event-identities"),
+        ));
+        event_hub
+            .install_reaction(
+                ReactionSpec {
+                    contract: "reaction/v1".to_string(),
+                    name: "permanently-invalid-terminal-reaction".to_string(),
+                    version: 1,
+                    enabled: true,
+                    event_kinds: vec!["task.completed".to_string()],
+                    when: None,
+                    idempotency_key: Some("${event.missing.field}".to_string()),
+                    action: ReactionAction::EmitEvent {
+                        args: serde_json::json!({}),
+                    },
+                    retry: RetryPolicy::default(),
+                    on_failure: FailurePolicy::DeadLetter,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let notified = task.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        assert_eq!(
+            ingest_worker_event_durably(
+                &task,
+                Provider::Minimax,
+                serde_json::json!({
+                    "type": "harness_milestone",
+                    "milestone": "session_snapshot_committed",
+                    "session_id": "worker-session"
+                }),
+                2,
+                &tail_tx,
+                "worker-task",
+                Some(event_hub.clone()),
+                &task_store,
+                &store_dir,
+            )
+            .unwrap(),
+            WorkerEventProjection::Applied {
+                terminal_result: true
+            }
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        assert!(
+            task.inner
+                .lock()
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    publication.published && !publication.reaction_repair_pending
+                })
+        );
+        assert_eq!(
+            event_hub
+                .list_events(None, Some("task.completed"), None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(event_hub.outbox_store().load_all().unwrap().is_empty());
+        assert!(
+            !drain_pending_worker_terminal_publication(
+                &task,
+                &tail_tx,
+                "worker-task",
+                Some(event_hub),
+                &task_store,
+                &store_dir,
+            )
+            .unwrap()
+        );
+        let mut completed_tail_events = 0;
+        while let Ok(event) = tail_rx.try_recv() {
+            if matches!(event, tail::TailEvent::TaskCompleted { .. }) {
+                completed_tail_events += 1;
+            }
+        }
+        assert_eq!(completed_tail_events, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_flags_roll_back_when_snapshot_write_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let blocked_store_dir = root.join("blocked-task-store");
+        std::fs::write(&blocked_store_dir, b"not a directory").unwrap();
+        let roster_seq = Arc::new(AtomicU64::new(0));
+        let (roster_tx, mut roster_rx) = tokio::sync::broadcast::channel(16);
+        let task = mk_ingest_task_with_roster(
+            "worker-task",
+            "worker-session",
+            Some(RosterEventSink::new(roster_seq.clone(), roster_tx)),
+        );
+        {
+            let mut inner = task.inner.lock();
+            inner.status = TaskStatus::Completed;
+            inner.completed_at = Some(now_ms());
+            inner.exit_code = Some(0);
+            inner.live_cursor = 1;
+            let (lifecycle, system_event) =
+                freeze_worker_terminal_lifecycle(&inner, "worker-task").unwrap();
+            inner
+                .events
+                .reserve_worker_terminal_publication(1, 1, lifecycle, system_event);
+        }
+        let task_store = RwLock::new(TaskStore::new());
+        task_store
+            .write()
+            .insert("worker-task".to_string(), task.clone())
+            .unwrap();
+        let (tail_tx, mut tail_rx) = tokio::sync::broadcast::channel(16);
+        let notified = task.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let error = drain_pending_worker_terminal_publication(
+            &task,
+            &tail_tx,
+            "worker-task",
+            None,
+            &task_store,
+            &blocked_store_dir,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tail_rx.try_recv().unwrap(),
+            tail::TailEvent::TaskCompleted {
+                cursor: 1,
+                ref task_id,
+                ..
+            } if task_id == "worker-task"
+        ));
+        assert!(matches!(
+            roster_rx.try_recv().unwrap(),
+            bro_protocol::RosterDelta::Updated { seq: 1, task }
+                if task.task_id.as_str() == "worker-task"
+        ));
+        assert_eq!(roster_seq.load(Ordering::SeqCst), 1);
+        assert!(
+            task.inner
+                .lock()
+                .events
+                .worker_terminal_publication
+                .as_ref()
+                .is_some_and(|publication| {
+                    !publication.published
+                        && publication.reaction_repair_pending
+                        && !publication.publishing
+                })
+        );
     }
 
     #[test]

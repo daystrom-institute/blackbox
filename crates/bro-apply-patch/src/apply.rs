@@ -59,6 +59,10 @@ pub struct ApplyOutcome {
 /// resolved against `base`: relative paths join `base` (with `..` components
 /// collapsed lexically), absolute paths are accepted as-is. There is no
 /// containment check — see module docs.
+// This crate deliberately exposes a synchronous patch API; callers that run on
+// an async executor are responsible for placing the whole transaction on their
+// blocking pool rather than splitting its ordered filesystem effects.
+#[allow(clippy::disallowed_methods)]
 pub fn apply_patch(patch_text: &str, base: &Path) -> Result<ApplyOutcome, ApplyError> {
     let parsed = parse_patch(patch_text)?;
     let mut outcome = ApplyOutcome::default();
@@ -288,6 +292,9 @@ fn io_err(op: &'static str, path: &Path, source: std::io::Error) -> ApplyError {
 }
 
 #[cfg(test)]
+// These tests exercise the crate's intentionally synchronous filesystem API
+// directly in isolated tempdirs; no Tokio runtime is involved.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

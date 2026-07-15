@@ -435,6 +435,10 @@ impl Transport for OpenAiResponsesTransport {
         self.state.session_id = id;
     }
 
+    fn set_prompt_cache_root(&mut self, root: String) {
+        self.state.prompt_cache_root = root;
+    }
+
     fn push_user_text(&mut self, text: &str) {
         self.state.push_user_text(text);
     }

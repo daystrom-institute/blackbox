@@ -9,3 +9,6 @@
   advertised intersection.
 - The crate must not depend on any daemon, harness, fleet, blackops, corpus, or
   store implementation.
+- `ServiceToken` is the shared same-host HTTP bearer primitive. Token files are
+  regular, non-symlink, owner-only files under a private directory; values are
+  sensitive headers and must stay redacted in diagnostics.
