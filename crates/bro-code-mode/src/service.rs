@@ -1,10 +1,11 @@
 // Vendored from openai/codex codex-rs/code-mode (Apache-2.0); see crate NOTICE.
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -34,6 +36,14 @@ use crate::runtime::WaitRequest;
 use crate::runtime::WaitToPendingOutcome;
 use crate::runtime::WaitToPendingRequest;
 use crate::runtime::spawn_runtime;
+
+// Local addition (not vendored): retain enough bounded lifecycle history for
+// late wait/terminate calls without keeping isolates or actor tasks alive.
+const MAX_CELL_TOMBSTONES: usize = 256;
+
+// Local addition (not vendored): session shutdown is a bounded library
+// operation. The worker may treat expiry as a fatal shutdown failure.
+const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type CodeModeSessionResultFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -173,23 +183,215 @@ impl CodeModeSessionProvider for InProcessCodeModeSessionProvider {
     }
 }
 
+/// Local addition (not vendored): a reserved or active cell handle. The
+/// runtime sender is installed after admission so shutdown never waits behind
+/// V8 startup while holding the admission lock.
 #[derive(Clone)]
 struct CellHandle {
     control_tx: mpsc::UnboundedSender<CellControlCommand>,
-    runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
-    cancellation_token: CancellationToken,
+    runtime_tx: Arc<OnceLock<std::sync::mpsc::Sender<RuntimeCommand>>>,
+}
+
+// Local addition (not vendored): direct runtime termination is a best-effort
+// supplement to the actor's isolate termination path.
+impl CellHandle {
+    fn terminate_runtime(&self) {
+        if let Some(runtime_tx) = self.runtime_tx.get() {
+            let _ = runtime_tx.send(RuntimeCommand::Terminate);
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_tx(&self) -> Option<std::sync::mpsc::Sender<RuntimeCommand>> {
+        self.runtime_tx.get().cloned()
+    }
+}
+
+/// Local addition (not vendored): the stable cause retained in a terminal
+/// tombstone. Existing `RuntimeResponse` variants remain the wire surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CellTerminalCause {
+    Completed,
+    ExplicitTermination,
+    SessionShutdown,
+    RuntimeFailure,
+    InternalProtocolFailure,
+}
+
+/// Local addition (not vendored): immutable terminal output plus any yield
+/// boundaries whose observers disappeared before receiving them.
+#[derive(Clone, Debug)]
+struct CellTerminal {
+    cause: CellTerminalCause,
+    content_items: Vec<FunctionCallOutputContentItem>,
+    error_text: Option<String>,
+    pending_yields: VecDeque<Vec<FunctionCallOutputContentItem>>,
+    terminal_claimed: bool,
+}
+
+// Local addition (not vendored): terminal response reconstruction preserves
+// the existing exec/wait response schema.
+impl CellTerminal {
+    fn completed(
+        content_items: Vec<FunctionCallOutputContentItem>,
+        error_text: Option<String>,
+        pending_yields: VecDeque<Vec<FunctionCallOutputContentItem>>,
+    ) -> Self {
+        let cause = if error_text.is_some() {
+            CellTerminalCause::RuntimeFailure
+        } else {
+            CellTerminalCause::Completed
+        };
+        Self {
+            cause,
+            content_items,
+            error_text,
+            pending_yields,
+            terminal_claimed: false,
+        }
+    }
+
+    fn terminated(
+        cause: CellTerminalCause,
+        content_items: Vec<FunctionCallOutputContentItem>,
+        pending_yields: VecDeque<Vec<FunctionCallOutputContentItem>>,
+    ) -> Self {
+        debug_assert!(matches!(
+            cause,
+            CellTerminalCause::ExplicitTermination | CellTerminalCause::SessionShutdown
+        ));
+        Self {
+            cause,
+            content_items,
+            error_text: None,
+            pending_yields,
+            terminal_claimed: false,
+        }
+    }
+
+    fn internal_failure(
+        content_items: Vec<FunctionCallOutputContentItem>,
+        pending_yields: VecDeque<Vec<FunctionCallOutputContentItem>>,
+    ) -> Self {
+        Self {
+            cause: CellTerminalCause::InternalProtocolFailure,
+            content_items,
+            error_text: Some("exec runtime ended unexpectedly".to_string()),
+            pending_yields,
+            terminal_claimed: false,
+        }
+    }
+
+    fn response(&self, cell_id: &CellId) -> RuntimeResponse {
+        match self.cause {
+            CellTerminalCause::ExplicitTermination | CellTerminalCause::SessionShutdown => {
+                RuntimeResponse::Terminated {
+                    cell_id: cell_id.clone(),
+                    content_items: self.content_items.clone(),
+                }
+            }
+            CellTerminalCause::Completed
+            | CellTerminalCause::RuntimeFailure
+            | CellTerminalCause::InternalProtocolFailure => RuntimeResponse::Result {
+                cell_id: cell_id.clone(),
+                content_items: self.content_items.clone(),
+                error_text: self.error_text.clone(),
+            },
+        }
+    }
+
+    fn next_wait_response(&mut self, cell_id: &CellId) -> RuntimeResponse {
+        if let Some(content_items) = self.pending_yields.pop_front() {
+            RuntimeResponse::Yielded {
+                cell_id: cell_id.clone(),
+                content_items,
+            }
+        } else {
+            self.claim_response(cell_id)
+        }
+    }
+
+    fn claim_response(&mut self, cell_id: &CellId) -> RuntimeResponse {
+        self.terminal_claimed = true;
+        self.response(cell_id)
+    }
+}
+
+/// Local addition (not vendored): admission, active ownership, and retained
+/// terminal state share one serialized registry.
+struct CellRegistry {
+    accepting: bool,
+    active: HashMap<CellId, CellHandle>,
+    tombstones: HashMap<CellId, CellTerminal>,
+    tombstone_order: VecDeque<CellId>,
+}
+
+// Local addition (not vendored): registry operations enforce bounded retention
+// and atomically replace active ownership with a tombstone.
+impl CellRegistry {
+    fn new() -> Self {
+        Self {
+            accepting: true,
+            active: HashMap::new(),
+            tombstones: HashMap::new(),
+            tombstone_order: VecDeque::new(),
+        }
+    }
+
+    fn reserve(&mut self, cell_id: CellId, handle: CellHandle) -> Result<(), String> {
+        if !self.accepting {
+            return Err("code mode session is shutting down".to_string());
+        }
+        if self.active.contains_key(&cell_id) {
+            return Err(format!("exec cell {cell_id} already exists"));
+        }
+        self.tombstones.remove(&cell_id);
+        self.tombstone_order.retain(|retained| retained != &cell_id);
+        self.active.insert(cell_id, handle);
+        Ok(())
+    }
+
+    fn forget_reservation(&mut self, cell_id: &CellId) {
+        self.active.remove(cell_id);
+    }
+
+    fn retain_terminal(&mut self, cell_id: CellId, terminal: CellTerminal) {
+        self.active.remove(&cell_id);
+        self.tombstones.insert(cell_id.clone(), terminal);
+        self.tombstone_order.retain(|retained| retained != &cell_id);
+        self.tombstone_order.push_back(cell_id);
+        while self.tombstone_order.len() > MAX_CELL_TOMBSTONES {
+            if let Some(expired) = self.tombstone_order.pop_front() {
+                self.tombstones.remove(&expired);
+            }
+        }
+    }
 }
 
 struct Inner {
     stored_values: Mutex<HashMap<String, JsonValue>>,
-    cells: Mutex<HashMap<CellId, CellHandle>>,
+    // Local addition (not vendored): admission and tombstones are serialized
+    // with active-cell ownership.
+    registry: Mutex<CellRegistry>,
+    // Local addition (not vendored): shutdown waiters avoid spin polling.
+    registry_changed: Notify,
     delegate: Arc<dyn CodeModeSessionDelegate>,
-    shutting_down: AtomicBool,
+    // Local addition (not vendored): every cell token descends from this
+    // session root; delegated-call tokens descend from their cell token.
+    session_cancellation: CancellationToken,
     next_cell_id: AtomicU64,
 }
 
 pub struct CodeModeService {
     inner: Arc<Inner>,
+}
+
+/// Local addition (not vendored): one registry lookup distinguishes active,
+/// retained terminal, and unknown cells without a remove/insert race.
+enum CellLookup {
+    Active(CellHandle),
+    Terminal(RuntimeResponse),
+    Missing,
 }
 
 impl CodeModeService {
@@ -201,9 +403,10 @@ impl CodeModeService {
         Self {
             inner: Arc::new(Inner {
                 stored_values: Mutex::new(HashMap::new()),
-                cells: Mutex::new(HashMap::new()),
+                registry: Mutex::new(CellRegistry::new()),
+                registry_changed: Notify::new(),
                 delegate,
-                shutting_down: AtomicBool::new(false),
+                session_cancellation: CancellationToken::new(),
                 next_cell_id: AtomicU64::new(1),
             }),
         }
@@ -219,9 +422,6 @@ impl CodeModeService {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
-        if self.inner.shutting_down.load(Ordering::Acquire) {
-            return Err("code mode session is shutting down".to_string());
-        }
         let initial_yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
         let (response_tx, response_rx) = oneshot::channel();
         let cell_id = self.allocate_cell_id();
@@ -271,29 +471,35 @@ impl CodeModeService {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let stored_values = self.inner.stored_values.lock().await.clone();
-        let cancellation_token = CancellationToken::new();
-        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = {
-            let mut cells = self.inner.cells.lock().await;
-            if self.inner.shutting_down.load(Ordering::Acquire) {
-                return Err("code mode session is shutting down".to_string());
-            }
-            if cells.contains_key(&cell_id) {
-                return Err(format!("exec cell {cell_id} already exists"));
-            }
-
-            let (runtime_tx, runtime_control_tx, runtime_terminate_handle) =
-                spawn_runtime(stored_values, request, event_tx, pending_mode)?;
-
-            cells.insert(
-                cell_id.clone(),
-                CellHandle {
-                    control_tx,
-                    runtime_tx: runtime_tx.clone(),
-                    cancellation_token: cancellation_token.clone(),
-                },
-            );
-            (runtime_tx, runtime_control_tx, runtime_terminate_handle)
+        // Local addition (not vendored): cell and delegated-call cancellation
+        // descend from the session root, while admission is reserved before V8
+        // startup so shutdown can close admission without waiting on startup.
+        let cancellation_token = self.inner.session_cancellation.child_token();
+        let runtime_tx_slot = Arc::new(OnceLock::new());
+        let handle = CellHandle {
+            control_tx,
+            runtime_tx: Arc::clone(&runtime_tx_slot),
         };
+        self.inner
+            .registry
+            .lock()
+            .await
+            .reserve(cell_id.clone(), handle)?;
+
+        let runtime = spawn_runtime(stored_values, request, event_tx, pending_mode);
+        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = match runtime {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                self.inner
+                    .registry
+                    .lock()
+                    .await
+                    .forget_reservation(&cell_id);
+                self.inner.registry_changed.notify_waiters();
+                return Err(err);
+            }
+        };
+        let _ = runtime_tx_slot.set(runtime_tx.clone());
 
         tokio::spawn(run_cell_control(
             Arc::clone(&self.inner),
@@ -314,14 +520,43 @@ impl CodeModeService {
         Ok(())
     }
 
+    // Local addition (not vendored): normal waits consume preserved yield
+    // boundaries before observing the stable terminal response.
+    async fn lookup_wait(&self, cell_id: &CellId) -> CellLookup {
+        let mut registry = self.inner.registry.lock().await;
+        if let Some(handle) = registry.active.get(cell_id) {
+            return CellLookup::Active(handle.clone());
+        }
+        if let Some(terminal) = registry.tombstones.get_mut(cell_id) {
+            return CellLookup::Terminal(terminal.next_wait_response(cell_id));
+        }
+        CellLookup::Missing
+    }
+
+    // Local addition (not vendored): explicit terminate and pending-mode calls
+    // observe the stable terminal outcome without consuming a pending yield.
+    async fn lookup_terminal(&self, cell_id: &CellId) -> CellLookup {
+        let mut registry = self.inner.registry.lock().await;
+        if let Some(handle) = registry.active.get(cell_id) {
+            return CellLookup::Active(handle.clone());
+        }
+        if let Some(terminal) = registry.tombstones.get_mut(cell_id) {
+            return CellLookup::Terminal(terminal.claim_response(cell_id));
+        }
+        CellLookup::Missing
+    }
+
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
         let WaitRequest {
             cell_id,
             yield_time_ms,
         } = request;
-        let handle = self.inner.cells.lock().await.get(&cell_id).cloned();
-        let Some(handle) = handle else {
-            return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
+        let handle = match self.lookup_wait(&cell_id).await {
+            CellLookup::Active(handle) => handle,
+            CellLookup::Terminal(response) => return Ok(WaitOutcome::LiveCell(response)),
+            CellLookup::Missing => {
+                return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
+            }
         };
         let (response_tx, response_rx) = oneshot::channel();
         let control_message = CellControlCommand::Poll {
@@ -329,30 +564,50 @@ impl CodeModeService {
             response_tx,
         };
         if handle.control_tx.send(control_message).is_err() {
-            return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
+            // Local addition (not vendored): actor teardown installs the
+            // tombstone before dropping its command receiver.
+            return Ok(match self.lookup_wait(&cell_id).await {
+                CellLookup::Terminal(response) => WaitOutcome::LiveCell(response),
+                _ => WaitOutcome::MissingCell(missing_cell_response(cell_id)),
+            });
         }
         match response_rx.await {
             Ok(response) => Ok(WaitOutcome::LiveCell(response)),
-            Err(_) => Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id))),
+            Err(_) => Ok(match self.lookup_wait(&cell_id).await {
+                CellLookup::Terminal(response) => WaitOutcome::LiveCell(response),
+                _ => WaitOutcome::MissingCell(missing_cell_response(cell_id)),
+            }),
         }
     }
 
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
-        let handle = self.inner.cells.lock().await.get(&cell_id).cloned();
-        let Some(handle) = handle else {
-            return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
+        let handle = match self.lookup_terminal(&cell_id).await {
+            CellLookup::Active(handle) => handle,
+            CellLookup::Terminal(response) => return Ok(WaitOutcome::LiveCell(response)),
+            CellLookup::Missing => {
+                return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
+            }
         };
         let (response_tx, response_rx) = oneshot::channel();
         if handle
             .control_tx
-            .send(CellControlCommand::Terminate { response_tx })
+            .send(CellControlCommand::Terminate {
+                cause: CellTerminalCause::ExplicitTermination,
+                response_tx: Some(response_tx),
+            })
             .is_err()
         {
-            return Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)));
+            return Ok(match self.lookup_terminal(&cell_id).await {
+                CellLookup::Terminal(response) => WaitOutcome::LiveCell(response),
+                _ => WaitOutcome::MissingCell(missing_cell_response(cell_id)),
+            });
         }
         match response_rx.await {
             Ok(response) => Ok(WaitOutcome::LiveCell(response)),
-            Err(_) => Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id))),
+            Err(_) => Ok(match self.lookup_terminal(&cell_id).await {
+                CellLookup::Terminal(response) => WaitOutcome::LiveCell(response),
+                _ => WaitOutcome::MissingCell(missing_cell_response(cell_id)),
+            }),
         }
     }
 
@@ -361,11 +616,18 @@ impl CodeModeService {
         request: WaitToPendingRequest,
     ) -> Result<WaitToPendingOutcome, String> {
         let cell_id = request.cell_id;
-        let handle = self.inner.cells.lock().await.get(&cell_id).cloned();
-        let Some(handle) = handle else {
-            return Ok(WaitToPendingOutcome::MissingCell(missing_cell_response(
-                cell_id,
-            )));
+        let handle = match self.lookup_terminal(&cell_id).await {
+            CellLookup::Active(handle) => handle,
+            CellLookup::Terminal(response) => {
+                return Ok(WaitToPendingOutcome::LiveCell(
+                    ExecuteToPendingOutcome::Completed(response),
+                ));
+            }
+            CellLookup::Missing => {
+                return Ok(WaitToPendingOutcome::MissingCell(missing_cell_response(
+                    cell_id,
+                )));
+            }
         };
         let (response_tx, response_rx) = oneshot::channel();
         if handle
@@ -373,38 +635,80 @@ impl CodeModeService {
             .send(CellControlCommand::PollToPending { response_tx })
             .is_err()
         {
-            return Ok(WaitToPendingOutcome::MissingCell(missing_cell_response(
-                cell_id,
-            )));
+            return Ok(match self.lookup_terminal(&cell_id).await {
+                CellLookup::Terminal(response) => {
+                    WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Completed(response))
+                }
+                _ => WaitToPendingOutcome::MissingCell(missing_cell_response(cell_id)),
+            });
         }
         match response_rx.await {
             Ok(response) => Ok(WaitToPendingOutcome::LiveCell(response)),
-            Err(_) => Ok(WaitToPendingOutcome::MissingCell(missing_cell_response(
-                cell_id,
-            ))),
+            Err(_) => Ok(match self.lookup_terminal(&cell_id).await {
+                CellLookup::Terminal(response) => {
+                    WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Completed(response))
+                }
+                _ => WaitToPendingOutcome::MissingCell(missing_cell_response(cell_id)),
+            }),
         }
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
-        self.inner.shutting_down.store(true, Ordering::Release);
-        let handles = self
-            .inner
-            .cells
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        self.shutdown_with_timeout(SESSION_SHUTDOWN_TIMEOUT).await
+    }
+
+    // Local addition (not vendored): admission closes and accepted children
+    // are enumerated in one critical section, then shutdown waits under a
+    // bounded deadline without retaining the registry lock.
+    async fn shutdown_with_timeout(&self, shutdown_timeout: Duration) -> Result<(), String> {
+        let handles = {
+            let mut registry = self.inner.registry.lock().await;
+            registry.accepting = false;
+            registry.active.values().cloned().collect::<Vec<_>>()
+        };
+        self.inner.session_cancellation.cancel();
         for handle in handles {
-            handle.cancellation_token.cancel();
-            let (response_tx, _response_rx) = oneshot::channel();
-            let _ = handle
-                .control_tx
-                .send(CellControlCommand::Terminate { response_tx });
-            let _ = handle.runtime_tx.send(RuntimeCommand::Terminate);
+            let _ = handle.control_tx.send(CellControlCommand::Terminate {
+                cause: CellTerminalCause::SessionShutdown,
+                response_tx: None,
+            });
         }
-        while !self.inner.cells.lock().await.is_empty() {
-            tokio::task::yield_now().await;
+
+        let wait_for_cells = async {
+            loop {
+                let changed = self.inner.registry_changed.notified();
+                tokio::pin!(changed);
+                // Local addition (not vendored): register before checking the
+                // registry so actor teardown cannot race between check/wait.
+                changed.as_mut().enable();
+                if self.inner.registry.lock().await.active.is_empty() {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        if tokio::time::timeout(shutdown_timeout, wait_for_cells)
+            .await
+            .is_err()
+        {
+            let remaining_handles = self
+                .inner
+                .registry
+                .lock()
+                .await
+                .active
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let remaining = remaining_handles.len();
+            // Local addition (not vendored): after the actor deadline has
+            // already failed, apply one last best-effort runtime interruption.
+            for handle in remaining_handles {
+                handle.terminate_runtime();
+            }
+            return Err(format!(
+                "code mode session shutdown timed out with {remaining} active cell(s)"
+            ));
         }
         Ok(())
     }
@@ -418,15 +722,17 @@ impl Default for CodeModeService {
 
 impl Drop for CodeModeService {
     fn drop(&mut self) {
-        self.inner.shutting_down.store(true, Ordering::Release);
-        if let Ok(cells) = self.inner.cells.try_lock() {
-            for handle in cells.values() {
-                handle.cancellation_token.cancel();
-                let (response_tx, _response_rx) = oneshot::channel();
-                let _ = handle
-                    .control_tx
-                    .send(CellControlCommand::Terminate { response_tx });
-                let _ = handle.runtime_tx.send(RuntimeCommand::Terminate);
+        // Local addition (not vendored): Drop cannot await, but root
+        // cancellation still reaches every accepted cell and delegated call.
+        self.inner.session_cancellation.cancel();
+        if let Ok(mut registry) = self.inner.registry.try_lock() {
+            registry.accepting = false;
+            for handle in registry.active.values() {
+                let _ = handle.control_tx.send(CellControlCommand::Terminate {
+                    cause: CellTerminalCause::SessionShutdown,
+                    response_tx: None,
+                });
+                handle.terminate_runtime();
             }
         }
     }
@@ -453,6 +759,8 @@ impl CodeModeSession for CodeModeService {
     }
 }
 
+/// Local addition (not vendored): every lifecycle command is serialized by the
+/// cell actor, including the cause that first wins termination.
 enum CellControlCommand {
     Poll {
         yield_time_ms: u64,
@@ -462,18 +770,25 @@ enum CellControlCommand {
         response_tx: oneshot::Sender<ExecuteToPendingOutcome>,
     },
     Terminate {
-        response_tx: oneshot::Sender<RuntimeResponse>,
+        cause: CellTerminalCause,
+        response_tx: Option<oneshot::Sender<RuntimeResponse>>,
     },
 }
 
+/// Local addition (not vendored): explicit terminate observers are distinct
+/// from normal wait observers so preserved yields never satisfy terminate.
 enum CellResponseSender {
     Runtime(oneshot::Sender<RuntimeResponse>),
     ExecuteToPending(oneshot::Sender<ExecuteToPendingOutcome>),
+    Terminate(oneshot::Sender<RuntimeResponse>),
 }
 
-struct PendingResult {
-    content_items: Vec<FunctionCallOutputContentItem>,
-    error_text: Option<String>,
+/// Local addition (not vendored): only this actor-owned state decides whether
+/// normal completion or termination won.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CellActorState {
+    Running,
+    Terminating(CellTerminalCause),
 }
 
 struct CellControlContext {
@@ -493,62 +808,169 @@ fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
     }
 }
 
-fn pending_result_response(cell_id: &CellId, result: PendingResult) -> RuntimeResponse {
-    RuntimeResponse::Result {
-        cell_id: cell_id.clone(),
-        content_items: result.content_items,
-        error_text: result.error_text,
-    }
-}
-
-fn send_terminal_response(response_tx: CellResponseSender, response: RuntimeResponse) {
-    match response_tx {
-        CellResponseSender::Runtime(response_tx) => {
-            let _ = response_tx.send(response);
-        }
-        CellResponseSender::ExecuteToPending(response_tx) => {
-            let _ = response_tx.send(ExecuteToPendingOutcome::Completed(response));
-        }
-    }
-}
-
-fn send_or_buffer_result(
+// Local addition (not vendored): send one yield boundary to the oldest normal
+// observer, returning its content if that observer disappeared.
+fn try_send_yield(
     cell_id: &CellId,
-    result: PendingResult,
-    response_tx: &mut Option<CellResponseSender>,
-    pending_result: &mut Option<PendingResult>,
-) -> bool {
-    if let Some(response_tx) = response_tx.take() {
-        let response = pending_result_response(cell_id, result);
-        send_terminal_response(response_tx, response);
-        return true;
+    content_items: Vec<FunctionCallOutputContentItem>,
+    observers: &mut VecDeque<CellResponseSender>,
+) -> Result<(), Vec<FunctionCallOutputContentItem>> {
+    let Some(position) = observers
+        .iter()
+        .position(|observer| matches!(observer, CellResponseSender::Runtime(_)))
+    else {
+        return Err(content_items);
+    };
+    let Some(CellResponseSender::Runtime(response_tx)) = observers.remove(position) else {
+        unreachable!("normal observer position must contain a normal observer");
+    };
+    match response_tx.send(RuntimeResponse::Yielded {
+        cell_id: cell_id.clone(),
+        content_items,
+    }) {
+        Ok(()) => Ok(()),
+        Err(RuntimeResponse::Yielded { content_items, .. }) => Err(content_items),
+        Err(_) => unreachable!("yield sender only sends yielded responses"),
     }
-
-    *pending_result = Some(result);
-    false
 }
 
-fn send_yield_response(
+// Local addition (not vendored): a yield is retained even when there is no
+// observer or its request future was dropped.
+fn send_or_buffer_yield(
     cell_id: &CellId,
     content_items: &mut Vec<FunctionCallOutputContentItem>,
-    response_tx: &mut Option<CellResponseSender>,
+    observers: &mut VecDeque<CellResponseSender>,
+    pending_yields: &mut VecDeque<Vec<FunctionCallOutputContentItem>>,
 ) {
-    let Some(current_response_tx) = response_tx.take() else {
+    let boundary = std::mem::take(content_items);
+    if let Err(boundary) = try_send_yield(cell_id, boundary, observers) {
+        pending_yields.push_back(boundary);
+    }
+}
+
+// Local addition (not vendored): a late normal wait consumes exactly one
+// preserved yield boundary before registering for future output.
+fn send_preserved_yield(
+    cell_id: &CellId,
+    response_tx: oneshot::Sender<RuntimeResponse>,
+    pending_yields: &mut VecDeque<Vec<FunctionCallOutputContentItem>>,
+) -> Option<oneshot::Sender<RuntimeResponse>> {
+    let Some(content_items) = pending_yields.pop_front() else {
+        return Some(response_tx);
+    };
+    if let Err(RuntimeResponse::Yielded { content_items, .. }) =
+        response_tx.send(RuntimeResponse::Yielded {
+            cell_id: cell_id.clone(),
+            content_items,
+        })
+    {
+        pending_yields.push_front(content_items);
+    }
+    None
+}
+
+// Local addition (not vendored): pending-mode observers are fulfilled only by
+// a paused frontier or a terminal outcome, never by the normal yield surface.
+fn send_pending_frontier(
+    cell_id: &CellId,
+    content_items: &mut Vec<FunctionCallOutputContentItem>,
+    pending_tool_call_ids: &mut Vec<String>,
+    observers: &mut VecDeque<CellResponseSender>,
+) {
+    let Some(position) = observers
+        .iter()
+        .position(|observer| matches!(observer, CellResponseSender::ExecuteToPending(_)))
+    else {
         return;
     };
-    match current_response_tx {
-        CellResponseSender::Runtime(response_tx) => {
-            let _ = response_tx.send(RuntimeResponse::Yielded {
-                cell_id: cell_id.clone(),
-                content_items: std::mem::take(content_items),
-            });
-        }
-        CellResponseSender::ExecuteToPending(execute_to_pending_tx) => {
-            *response_tx = Some(CellResponseSender::ExecuteToPending(execute_to_pending_tx));
+    let Some(CellResponseSender::ExecuteToPending(response_tx)) = observers.remove(position) else {
+        unreachable!("pending observer position must contain a pending observer");
+    };
+    let _ = response_tx.send(ExecuteToPendingOutcome::Pending {
+        cell_id: cell_id.clone(),
+        content_items: std::mem::take(content_items),
+        pending_tool_call_ids: std::mem::take(pending_tool_call_ids),
+    });
+}
+
+// Local addition (not vendored): terminal delivery never consumes the retained
+// terminal record. Failed yield delivery is restored before tombstoning.
+fn send_claimed_terminal(
+    cell_id: &CellId,
+    terminal: &mut CellTerminal,
+    response_tx: oneshot::Sender<RuntimeResponse>,
+) {
+    let was_claimed = terminal.terminal_claimed;
+    let response = terminal.claim_response(cell_id);
+    if response_tx.send(response).is_err() && !was_claimed {
+        terminal.terminal_claimed = false;
+    }
+}
+
+// Local addition (not vendored): pending-mode terminal delivery participates
+// in the same single-claim transition as direct exec/wait delivery.
+fn send_claimed_pending_terminal(
+    cell_id: &CellId,
+    terminal: &mut CellTerminal,
+    response_tx: oneshot::Sender<ExecuteToPendingOutcome>,
+) {
+    let was_claimed = terminal.terminal_claimed;
+    let response = ExecuteToPendingOutcome::Completed(terminal.claim_response(cell_id));
+    if response_tx.send(response).is_err() && !was_claimed {
+        terminal.terminal_claimed = false;
+    }
+}
+
+// Local addition (not vendored): one successful observer performs the terminal
+// claim; queued and late observers receive stable replies from that state.
+fn send_terminal_observers(
+    cell_id: &CellId,
+    terminal: &mut CellTerminal,
+    observers: &mut VecDeque<CellResponseSender>,
+) {
+    while let Some(observer) = observers.pop_front() {
+        match observer {
+            CellResponseSender::Runtime(response_tx) => {
+                if let Some(content_items) = terminal.pending_yields.pop_front() {
+                    if let Err(RuntimeResponse::Yielded { content_items, .. }) =
+                        response_tx.send(RuntimeResponse::Yielded {
+                            cell_id: cell_id.clone(),
+                            content_items,
+                        })
+                    {
+                        terminal.pending_yields.push_front(content_items);
+                    }
+                } else {
+                    send_claimed_terminal(cell_id, terminal, response_tx);
+                }
+            }
+            CellResponseSender::ExecuteToPending(response_tx) => {
+                send_claimed_pending_terminal(cell_id, terminal, response_tx);
+            }
+            CellResponseSender::Terminate(response_tx) => {
+                send_claimed_terminal(cell_id, terminal, response_tx);
+            }
         }
     }
 }
 
+// Local addition (not vendored): isolate, runtime, delegated-call, and paused
+// runtime cancellation all begin after the actor records termination as winner.
+fn begin_termination(
+    cancellation_token: &CancellationToken,
+    runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
+    runtime_control_tx: &std::sync::mpsc::Sender<RuntimeControlCommand>,
+    pending_mode: PendingRuntimeMode,
+    runtime_terminate_handle: &v8::IsolateHandle,
+) {
+    cancellation_token.cancel();
+    let _ = runtime_tx.send(RuntimeCommand::Terminate);
+    terminate_paused_runtime(runtime_control_tx, pending_mode);
+    let _ = runtime_terminate_handle.terminate_execution();
+}
+
+/// Local addition (not vendored): one actor owns lifecycle transitions,
+/// observers, shared-store publication, and terminal tombstone installation.
 async fn run_cell_control(
     inner: Arc<Inner>,
     context: CellControlContext,
@@ -567,10 +989,10 @@ async fn run_cell_control(
     } = context;
     let mut content_items = Vec::new();
     let mut pending_tool_call_ids = Vec::new();
-    let mut pending_result: Option<PendingResult> = None;
-    let mut response_tx = Some(initial_response_tx);
-    let mut termination_requested = false;
-    let mut runtime_closed = false;
+    let mut pending_yields = VecDeque::new();
+    let mut observers = VecDeque::from([initial_response_tx]);
+    let mut state = CellActorState::Running;
+    let mut control_closed = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     // Most recently requested yield window. A delegated tool invocation may
     // outlive the outer cell yield window (notably a blocking shell_run inside
@@ -582,78 +1004,62 @@ async fn run_cell_control(
     let mut tool_call_tasks = JoinSet::new();
     let mut notification_tasks = JoinSet::new();
 
-    loop {
+    let mut terminal = loop {
         tokio::select! {
-            maybe_event = async {
-                if runtime_closed {
-                    std::future::pending::<Option<RuntimeEvent>>().await
-                } else {
-                    event_rx.recv().await
-                }
-            } => {
+            maybe_event = event_rx.recv() => {
                 let Some(event) = maybe_event else {
-                    runtime_closed = true;
-                    if termination_requested {
-                        if let Some(response_tx) = response_tx.take() {
-                            let response = RuntimeResponse::Terminated {
-                                cell_id: cell_id.clone(),
-                                content_items: std::mem::take(&mut content_items),
-                            };
-                            send_terminal_response(response_tx, response);
-                        }
-                        break;
-                    }
-                    if pending_result.is_none() {
-                        let result = PendingResult {
-                            content_items: std::mem::take(&mut content_items),
-                            error_text: Some("exec runtime ended unexpectedly".to_string()),
-                        };
-                        if send_or_buffer_result(
-                            &cell_id,
-                            result,
-                            &mut response_tx,
-                            &mut pending_result,
-                        ) {
-                            break;
-                        }
-                    }
-                    continue;
+                    break match state {
+                        CellActorState::Running => CellTerminal::internal_failure(
+                            std::mem::take(&mut content_items),
+                            std::mem::take(&mut pending_yields),
+                        ),
+                        CellActorState::Terminating(cause) => CellTerminal::terminated(
+                            cause,
+                            std::mem::take(&mut content_items),
+                            std::mem::take(&mut pending_yields),
+                        ),
+                    };
                 };
                 match event {
                     RuntimeEvent::Started => {
-                        yield_timer = initial_yield_time_ms.map(|initial_yield_time_ms| {
-                            Box::pin(tokio::time::sleep(Duration::from_millis(initial_yield_time_ms)))
-                        });
+                        if state == CellActorState::Running {
+                            yield_timer = initial_yield_time_ms.map(|initial_yield_time_ms| {
+                                Box::pin(tokio::time::sleep(Duration::from_millis(initial_yield_time_ms)))
+                            });
+                        }
                     }
                     RuntimeEvent::Pending => {
-                        if let Some(current_response_tx) = response_tx.take() {
-                            match current_response_tx {
-                                CellResponseSender::Runtime(runtime_response_tx) => {
-                                    response_tx =
-                                        Some(CellResponseSender::Runtime(runtime_response_tx));
-                                }
-                                CellResponseSender::ExecuteToPending(response_tx) => {
-                                    let _ = response_tx.send(ExecuteToPendingOutcome::Pending {
-                                        cell_id: cell_id.clone(),
-                                        content_items: std::mem::take(&mut content_items),
-                                        pending_tool_call_ids: std::mem::take(
-                                            &mut pending_tool_call_ids,
-                                        ),
-                                    });
-                                }
-                            }
+                        if state == CellActorState::Running {
+                            send_pending_frontier(
+                                &cell_id,
+                                &mut content_items,
+                                &mut pending_tool_call_ids,
+                                &mut observers,
+                            );
                         }
                     }
                     RuntimeEvent::ContentItem(item) => {
                         content_items.push(item);
                     }
                     RuntimeEvent::YieldRequested => {
-                        yield_timer = None;
-                        send_yield_response(&cell_id, &mut content_items, &mut response_tx);
+                        if state == CellActorState::Running {
+                            yield_timer = None;
+                            send_or_buffer_yield(
+                                &cell_id,
+                                &mut content_items,
+                                &mut observers,
+                                &mut pending_yields,
+                            );
+                        }
                     }
                     RuntimeEvent::Notify { call_id, text } => {
+                        if state != CellActorState::Running {
+                            continue;
+                        }
                         let delegate = Arc::clone(&inner.delegate);
                         let cell_id = cell_id.clone();
+                        // Local addition (not vendored): delegated notification
+                        // cancellation descends from the cell token.
                         let cancellation_token = cancellation_token.child_token();
                         notification_tasks.spawn(async move {
                             tokio::select! {
@@ -679,6 +1085,9 @@ async fn run_cell_control(
                         kind,
                         input,
                     } => {
+                        if state != CellActorState::Running {
+                            continue;
+                        }
                         if pending_mode == PendingRuntimeMode::PauseUntilResumed {
                             pending_tool_call_ids.push(id.clone());
                         }
@@ -691,6 +1100,8 @@ async fn run_cell_control(
                         };
                         let delegate = Arc::clone(&inner.delegate);
                         let runtime_tx = runtime_tx.clone();
+                        // Local addition (not vendored): delegated tool-call
+                        // cancellation descends from the cell token.
                         let cancellation_token = cancellation_token.child_token();
                         tool_call_tasks.spawn(async move {
                             let response = tokio::select! {
@@ -709,34 +1120,27 @@ async fn run_cell_control(
                         error_text,
                     } => {
                         yield_timer = None;
-                        if termination_requested {
-                            if let Some(response_tx) = response_tx.take() {
-                                let response = RuntimeResponse::Terminated {
-                                    cell_id: cell_id.clone(),
-                                    content_items: std::mem::take(&mut content_items),
-                                };
-                                send_terminal_response(response_tx, response);
-                            }
-                            break;
+                        if state != CellActorState::Running {
+                            // Termination already won. Wait for runtime closure
+                            // and never publish the runtime's staged writes.
+                            continue;
                         }
+                        // Completion wins at this serialized event boundary.
                         drain_notification_tasks(&mut notification_tasks).await;
-                        inner
-                            .stored_values
-                            .lock()
-                            .await
-                            .extend(stored_value_writes);
-                        let result = PendingResult {
-                            content_items: std::mem::take(&mut content_items),
-                            error_text,
-                        };
-                        if send_or_buffer_result(
-                            &cell_id,
-                            result,
-                            &mut response_tx,
-                            &mut pending_result,
-                        ) {
-                            break;
+                        // Local addition (not vendored): staged store writes
+                        // publish as one lock-held commit only on success.
+                        if error_text.is_none() {
+                            inner
+                                .stored_values
+                                .lock()
+                                .await
+                                .extend(stored_value_writes);
                         }
+                        break CellTerminal::completed(
+                            std::mem::take(&mut content_items),
+                            error_text,
+                            std::mem::take(&mut pending_yields),
+                        );
                     }
                 }
             }
@@ -762,20 +1166,41 @@ async fn run_cell_control(
                     });
                 }
             }
-            maybe_command = control_rx.recv() => {
+            maybe_command = async {
+                if control_closed {
+                    std::future::pending::<Option<CellControlCommand>>().await
+                } else {
+                    control_rx.recv().await
+                }
+            } => {
                 let Some(command) = maybe_command else {
-                    break;
+                    control_closed = true;
+                    if state == CellActorState::Running {
+                        state = CellActorState::Terminating(CellTerminalCause::SessionShutdown);
+                        yield_timer = None;
+                        begin_termination(
+                            &cancellation_token,
+                            &runtime_tx,
+                            &runtime_control_tx,
+                            pending_mode,
+                            &runtime_terminate_handle,
+                        );
+                    }
+                    continue;
                 };
                 match command {
                     CellControlCommand::Poll {
                         yield_time_ms,
                         response_tx: next_response_tx,
                     } => {
-                        if let Some(result) = pending_result.take() {
-                            let _ = next_response_tx.send(pending_result_response(&cell_id, result));
-                            break;
-                        }
-                        response_tx = Some(CellResponseSender::Runtime(next_response_tx));
+                        let Some(next_response_tx) = send_preserved_yield(
+                            &cell_id,
+                            next_response_tx,
+                            &mut pending_yields,
+                        ) else {
+                            continue;
+                        };
+                        observers.push_back(CellResponseSender::Runtime(next_response_tx));
                         yield_window_ms = Some(yield_time_ms);
                         yield_timer = Some(Box::pin(tokio::time::sleep(Duration::from_millis(yield_time_ms))));
                         resume_paused_runtime(&runtime_control_tx, pending_mode);
@@ -783,45 +1208,44 @@ async fn run_cell_control(
                     CellControlCommand::PollToPending {
                         response_tx: next_response_tx,
                     } => {
-                        if let Some(result) = pending_result.take() {
-                            let response = pending_result_response(&cell_id, result);
-                            let _ = next_response_tx
-                                .send(ExecuteToPendingOutcome::Completed(response));
-                            break;
-                        }
-                        response_tx =
-                            Some(CellResponseSender::ExecuteToPending(next_response_tx));
+                        observers.push_back(CellResponseSender::ExecuteToPending(next_response_tx));
                         yield_window_ms = None;
                         yield_timer = None;
                         resume_paused_runtime(&runtime_control_tx, pending_mode);
                     }
-                    CellControlCommand::Terminate { response_tx: next_response_tx } => {
-                        if let Some(result) = pending_result.take() {
-                            let _ = next_response_tx.send(pending_result_response(&cell_id, result));
-                            break;
+                    CellControlCommand::Terminate {
+                        cause,
+                        response_tx: next_response_tx,
+                    } => {
+                        if let Some(next_response_tx) = next_response_tx {
+                            observers.push_back(CellResponseSender::Terminate(next_response_tx));
                         }
-
-                        response_tx = Some(CellResponseSender::Runtime(next_response_tx));
-                        termination_requested = true;
-                        cancellation_token.cancel();
-                        yield_timer = None;
-                        let _ = runtime_tx.send(RuntimeCommand::Terminate);
-                        terminate_paused_runtime(&runtime_control_tx, pending_mode);
-                        let _ = runtime_terminate_handle.terminate_execution();
-                        if runtime_closed {
-                            if let Some(response_tx) = response_tx.take() {
-                                let response = RuntimeResponse::Terminated {
-                                    cell_id: cell_id.clone(),
-                                    content_items: std::mem::take(&mut content_items),
-                                };
-                                send_terminal_response(response_tx, response);
-                            }
-                            break;
-                        } else {
-                            continue;
+                        if state == CellActorState::Running {
+                            state = CellActorState::Terminating(cause);
+                            yield_timer = None;
+                            begin_termination(
+                                &cancellation_token,
+                                &runtime_tx,
+                                &runtime_control_tx,
+                                pending_mode,
+                                &runtime_terminate_handle,
+                            );
                         }
                     }
                 }
+            }
+            _ = cancellation_token.cancelled(), if state == CellActorState::Running => {
+                // Only session-root cancellation can arrive before the actor
+                // records another terminal winner.
+                state = CellActorState::Terminating(CellTerminalCause::SessionShutdown);
+                yield_timer = None;
+                begin_termination(
+                    &cancellation_token,
+                    &runtime_tx,
+                    &runtime_control_tx,
+                    pending_mode,
+                    &runtime_terminate_handle,
+                );
             }
             _ = async {
                 if let Some(yield_timer) = yield_timer.as_mut() {
@@ -831,16 +1255,29 @@ async fn run_cell_control(
                 }
             } => {
                 yield_timer = None;
-                send_yield_response(&cell_id, &mut content_items, &mut response_tx);
+                send_or_buffer_yield(
+                    &cell_id,
+                    &mut content_items,
+                    &mut observers,
+                    &mut pending_yields,
+                );
             }
         }
-    }
+    };
 
     let _ = runtime_tx.send(RuntimeCommand::Terminate);
     cancellation_token.cancel();
     drain_notification_tasks(&mut notification_tasks).await;
     terminate_paused_runtime(&runtime_control_tx, pending_mode);
-    inner.cells.lock().await.remove(&cell_id);
+    send_terminal_observers(&cell_id, &mut terminal, &mut observers);
+    // Local addition (not vendored): install the tombstone before dropping the
+    // actor command receiver, so racing late callers never see a false miss.
+    inner
+        .registry
+        .lock()
+        .await
+        .retain_terminal(cell_id.clone(), terminal);
+    inner.registry_changed.notify_waiters();
     inner.delegate.cell_closed(&cell_id);
 }
 
@@ -877,7 +1314,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use crate::tool_name::ToolName;
@@ -936,9 +1372,10 @@ mod tests {
     fn test_inner() -> Arc<Inner> {
         Arc::new(Inner {
             stored_values: Mutex::new(HashMap::new()),
-            cells: Mutex::new(HashMap::new()),
+            registry: Mutex::new(super::CellRegistry::new()),
+            registry_changed: tokio::sync::Notify::new(),
             delegate: Arc::new(NoopCodeModeSessionDelegate),
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            session_cancellation: tokio_util::sync::CancellationToken::new(),
             next_cell_id: AtomicU64::new(1),
         })
     }
@@ -960,6 +1397,59 @@ mod tests {
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
                 Ok(serde_json::Value::String("slow-result".to_string()))
+            })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            _call_id: String,
+            _cell_id: CellId,
+            _text: String,
+            _cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> super::NotificationFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cell_closed(&self, _cell_id: &CellId) {}
+    }
+
+    /// Local addition (not vendored): captures the delegated-call token so the
+    /// session-root cancellation hierarchy can be asserted directly.
+    struct CancellationCaptureDelegate {
+        captured_token: Mutex<Option<tokio_util::sync::CancellationToken>>,
+        token_captured: tokio::sync::Notify,
+    }
+
+    impl CancellationCaptureDelegate {
+        fn new() -> Self {
+            Self {
+                captured_token: Mutex::new(None),
+                token_captured: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn wait_for_token(&self) -> tokio_util::sync::CancellationToken {
+            loop {
+                let captured = self.token_captured.notified();
+                if let Some(token) = self.captured_token.lock().await.clone() {
+                    return token;
+                }
+                captured.await;
+            }
+        }
+    }
+
+    impl super::CodeModeSessionDelegate for CancellationCaptureDelegate {
+        fn invoke_tool<'a>(
+            &'a self,
+            _invocation: crate::runtime::CodeModeNestedToolCall,
+            cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> super::ToolInvocationFuture<'a> {
+            Box::pin(async move {
+                *self.captured_token.lock().await = Some(cancellation_token.clone());
+                self.token_captured.notify_waiters();
+                cancellation_token.cancelled().await;
+                Err("cancelled".to_string())
             })
         }
 
@@ -1182,6 +1672,350 @@ mod tests {
         );
     }
 
+    /// Local addition (not vendored): terminal output survives cancellation of
+    /// the initial request future and remains stable for later duplicate calls.
+    #[tokio::test]
+    async fn dropped_initial_observer_preserves_terminal_output() {
+        let service = CodeModeService::new();
+        let started = service
+            .execute(ExecuteRequest {
+                source: r#"text("retained");"#.to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+        let completed_cell_id = started.cell_id.clone();
+        drop(started);
+
+        let first_late_wait = tokio::time::timeout(
+            Duration::from_secs(1),
+            service.wait(WaitRequest {
+                cell_id: completed_cell_id.clone(),
+                yield_time_ms: 60_000,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let late_terminate = service.terminate(completed_cell_id.clone()).await.unwrap();
+        let second_late_wait = service
+            .wait(WaitRequest {
+                cell_id: completed_cell_id,
+                yield_time_ms: 60_000,
+            })
+            .await
+            .unwrap();
+
+        let expected = RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "retained".to_string(),
+            }],
+            error_text: None,
+        };
+        assert_eq!(first_late_wait, WaitOutcome::LiveCell(expected));
+        assert_eq!(late_terminate, first_late_wait);
+        assert_eq!(second_late_wait, first_late_wait);
+    }
+
+    /// Local addition (not vendored): a dropped initial observer cannot erase
+    /// the first explicit yield boundary even when execution then completes.
+    #[tokio::test]
+    async fn dropped_initial_observer_preserves_yield_before_terminal() {
+        let service = CodeModeService::new();
+        let started = service
+            .execute(ExecuteRequest {
+                source: r#"text("before"); yield_control(); text("after");"#.to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+        let completed_cell_id = started.cell_id.clone();
+        drop(started);
+
+        let yielded = service
+            .wait(WaitRequest {
+                cell_id: completed_cell_id.clone(),
+                yield_time_ms: 60_000,
+            })
+            .await
+            .unwrap();
+        let completed = service
+            .wait(WaitRequest {
+                cell_id: completed_cell_id.clone(),
+                yield_time_ms: 60_000,
+            })
+            .await
+            .unwrap();
+        let repeated = service
+            .wait(WaitRequest {
+                cell_id: completed_cell_id,
+                yield_time_ms: 60_000,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            yielded,
+            WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "before".to_string(),
+                }],
+            })
+        );
+        let expected_terminal = WaitOutcome::LiveCell(RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "after".to_string(),
+            }],
+            error_text: None,
+        });
+        assert_eq!(completed, expected_terminal);
+        assert_eq!(repeated, completed);
+    }
+
+    /// Local addition (not vendored): cancelling a registered wait future does
+    /// not cancel the cell or discard its eventual terminal output.
+    #[tokio::test]
+    async fn dropped_wait_observer_does_not_cancel_cell_or_output() {
+        let service = Arc::new(CodeModeService::with_delegate(Arc::new(SlowToolDelegate {
+            delay: Duration::from_millis(100),
+        })));
+        let started = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![slow_tool_definition()],
+                source: "const value = await tools.slow({}); text(String(value));".to_string(),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+        let running_cell_id = started.cell_id.clone();
+        assert!(matches!(
+            started.initial_response().await.unwrap(),
+            RuntimeResponse::Yielded { .. }
+        ));
+
+        let dropped_wait = tokio::spawn({
+            let service = Arc::clone(&service);
+            let running_cell_id = running_cell_id.clone();
+            async move {
+                service
+                    .wait(WaitRequest {
+                        cell_id: running_cell_id,
+                        yield_time_ms: 1_000,
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        dropped_wait.abort();
+        let _ = dropped_wait.await;
+
+        let retained = tokio::time::timeout(
+            Duration::from_secs(1),
+            service.wait(WaitRequest {
+                cell_id: running_cell_id,
+                yield_time_ms: 1_000,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            retained,
+            WaitOutcome::LiveCell(RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: vec![FunctionCallOutputContentItem::InputText {
+                    text: "slow-result".to_string(),
+                }],
+                error_text: None,
+            })
+        );
+    }
+
+    /// Local addition (not vendored): staged store writes publish together only
+    /// after a successful terminal result.
+    #[tokio::test]
+    async fn store_writes_publish_atomically_at_successful_completion() {
+        let service = CodeModeService::new();
+        let started = service
+            .execute(ExecuteRequest {
+                source: r#"
+store("first", 1);
+store("second", 2);
+await new Promise((resolve) => setTimeout(resolve, 50));
+text("done");
+"#
+                .to_string(),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+        let running_cell_id = started.cell_id.clone();
+        assert_eq!(
+            started.initial_response().await.unwrap(),
+            RuntimeResponse::Yielded {
+                cell_id: running_cell_id.clone(),
+                content_items: Vec::new(),
+            }
+        );
+        {
+            let stored_values = service.inner.stored_values.lock().await;
+            assert!(!stored_values.contains_key("first"));
+            assert!(!stored_values.contains_key("second"));
+        }
+
+        let completed = service
+            .wait(WaitRequest {
+                cell_id: running_cell_id,
+                yield_time_ms: 1_000,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            completed,
+            WaitOutcome::LiveCell(RuntimeResponse::Result {
+                error_text: None,
+                ..
+            })
+        ));
+        let stored_values = service.inner.stored_values.lock().await;
+        assert_eq!(stored_values.get("first"), Some(&serde_json::json!(1)));
+        assert_eq!(stored_values.get("second"), Some(&serde_json::json!(2)));
+    }
+
+    /// Local addition (not vendored): runtime errors discard all staged store
+    /// writes rather than publishing partial state.
+    #[tokio::test]
+    async fn failed_cell_does_not_publish_store_writes() {
+        let service = CodeModeService::new();
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                source: r#"store("failed", "hidden"); throw new Error("boom");"#.to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            RuntimeResponse::Result {
+                error_text: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            !service
+                .inner
+                .stored_values
+                .lock()
+                .await
+                .contains_key("failed")
+        );
+    }
+
+    /// Local addition (not vendored): explicit termination wins before runtime
+    /// completion and therefore cannot publish the runtime's staged writes.
+    #[tokio::test]
+    async fn terminated_cell_does_not_publish_store_writes() {
+        let service = CodeModeService::new();
+        let started = service
+            .execute(ExecuteRequest {
+                source: r#"
+store("terminated", "hidden");
+await new Promise(() => {});
+"#
+                .to_string(),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+        let running_cell_id = started.cell_id.clone();
+        assert!(matches!(
+            started.initial_response().await.unwrap(),
+            RuntimeResponse::Yielded { .. }
+        ));
+
+        let terminated = service.terminate(running_cell_id.clone()).await.unwrap();
+        let repeated_terminate = service.terminate(running_cell_id.clone()).await.unwrap();
+        let late_wait = service
+            .wait(WaitRequest {
+                cell_id: running_cell_id,
+                yield_time_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            terminated,
+            WaitOutcome::LiveCell(RuntimeResponse::Terminated { .. })
+        ));
+        assert_eq!(repeated_terminate, terminated);
+        assert_eq!(late_wait, terminated);
+        assert!(
+            !service
+                .inner
+                .stored_values
+                .lock()
+                .await
+                .contains_key("terminated")
+        );
+    }
+
+    /// Local addition (not vendored): repeated real runtime races prove that
+    /// completion and termination publish one stable winner with matching store
+    /// visibility.
+    #[tokio::test]
+    async fn completion_and_termination_race_has_one_stable_winner() {
+        let service = CodeModeService::new();
+
+        for iteration in 0..24 {
+            let key = format!("winner-{iteration}");
+            let started = service
+                .execute(ExecuteRequest {
+                    source: format!(r#"store("{key}", true);"#),
+                    yield_time_ms: Some(60_000),
+                    ..execute_request("")
+                })
+                .await
+                .unwrap();
+            let racing_cell_id = started.cell_id.clone();
+            let (initial, terminate) = tokio::join!(
+                started.initial_response(),
+                service.terminate(racing_cell_id.clone())
+            );
+            let initial = initial.unwrap();
+            let terminate = terminate.unwrap();
+            let WaitOutcome::LiveCell(terminate) = terminate else {
+                panic!("racing cell must retain a terminal outcome");
+            };
+            assert_eq!(terminate, initial);
+
+            let late = service
+                .wait(WaitRequest {
+                    cell_id: racing_cell_id,
+                    yield_time_ms: 1,
+                })
+                .await
+                .unwrap();
+            assert_eq!(late, WaitOutcome::LiveCell(initial));
+
+            let was_committed = service.inner.stored_values.lock().await.contains_key(&key);
+            match terminate {
+                RuntimeResponse::Result {
+                    error_text: None, ..
+                } => assert!(was_committed),
+                RuntimeResponse::Terminated { .. } => assert!(!was_committed),
+                other => panic!("unexpected race outcome: {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stored_bare_function_round_trips_between_cells() {
         let service = CodeModeService::new();
@@ -1338,10 +2172,93 @@ mod tests {
             .unwrap();
     }
 
+    /// Local addition (not vendored): session-root cancellation reaches the
+    /// cell token and its delegated-call child before shutdown completes.
+    #[tokio::test]
+    async fn shutdown_cancels_delegated_call_child_token() {
+        let delegate = Arc::new(CancellationCaptureDelegate::new());
+        let service = CodeModeService::with_delegate(delegate.clone());
+        let started = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![slow_tool_definition()],
+                source: "await tools.slow({});".to_string(),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            started.initial_response().await.unwrap(),
+            RuntimeResponse::Yielded { .. }
+        ));
+        let delegated_token =
+            tokio::time::timeout(Duration::from_secs(1), delegate.wait_for_token())
+                .await
+                .unwrap();
+
+        service.shutdown().await.unwrap();
+
+        assert!(delegated_token.is_cancelled());
+    }
+
+    /// Local addition (not vendored): a non-cooperating reserved child cannot
+    /// make the library shutdown future wait forever.
+    #[tokio::test]
+    async fn shutdown_deadline_is_bounded() {
+        let service = CodeModeService::new();
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let handle = super::CellHandle {
+            control_tx,
+            runtime_tx: Arc::new(std::sync::OnceLock::new()),
+        };
+        service
+            .inner
+            .registry
+            .lock()
+            .await
+            .reserve(cell_id("stuck"), handle)
+            .unwrap();
+
+        let error = service
+            .shutdown_with_timeout(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "code mode session shutdown timed out with 1 active cell(s)"
+        );
+        let mut registry = service.inner.registry.lock().await;
+        assert!(!registry.accepting);
+        registry.active.clear();
+    }
+
+    /// Local addition (not vendored): count-bounded tombstones evict the oldest
+    /// terminal identity while retaining the newest stable responses.
+    #[tokio::test]
+    async fn tombstone_retention_is_bounded() {
+        let mut registry = super::CellRegistry::new();
+        for index in 0..=super::MAX_CELL_TOMBSTONES {
+            registry.retain_terminal(
+                cell_id(&index.to_string()),
+                super::CellTerminal::completed(Vec::new(), None, std::collections::VecDeque::new()),
+            );
+        }
+
+        assert_eq!(registry.tombstones.len(), super::MAX_CELL_TOMBSTONES);
+        assert_eq!(registry.tombstone_order.len(), super::MAX_CELL_TOMBSTONES);
+        assert!(!registry.tombstones.contains_key(&cell_id("0")));
+        assert!(registry.tombstones.contains_key(&cell_id("1")));
+        assert!(
+            registry
+                .tombstones
+                .contains_key(&cell_id(&super::MAX_CELL_TOMBSTONES.to_string()))
+        );
+    }
+
     #[tokio::test]
     async fn start_cell_rejects_new_cell_after_shutdown_begins() {
         let service = CodeModeService::new();
-        service.inner.shutting_down.store(true, Ordering::Release);
+        service.shutdown().await.unwrap();
         let (response_tx, _response_rx) = oneshot::channel();
 
         let error = service
@@ -1356,7 +2273,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "code mode session is shutting down".to_string());
-        assert!(service.inner.cells.lock().await.is_empty());
+        assert!(service.inner.registry.lock().await.active.is_empty());
     }
 
     #[tokio::test]
@@ -1512,13 +2429,14 @@ await Promise.all([
 
         let runtime_tx = service
             .inner
-            .cells
+            .registry
             .lock()
             .await
+            .active
             .get(&cell_id("1"))
             .unwrap()
-            .runtime_tx
-            .clone();
+            .runtime_tx()
+            .unwrap();
         runtime_tx
             .send(RuntimeCommand::TimeoutFired { id: 1 })
             .unwrap();
@@ -1582,13 +2500,14 @@ await new Promise(() => {});
 
         let runtime_tx = service
             .inner
-            .cells
+            .registry
             .lock()
             .await
+            .active
             .get(&cell_id("1"))
             .unwrap()
-            .runtime_tx
-            .clone();
+            .runtime_tx()
+            .unwrap();
         runtime_tx
             .send(RuntimeCommand::TimeoutFired { id: 1 })
             .unwrap();
@@ -1653,13 +2572,14 @@ text("done");
 
         let runtime_tx = service
             .inner
-            .cells
+            .registry
             .lock()
             .await
+            .active
             .get(&cell_id("1"))
             .unwrap()
-            .runtime_tx
-            .clone();
+            .runtime_tx()
+            .unwrap();
         runtime_tx
             .send(RuntimeCommand::TimeoutFired { id: 1 })
             .unwrap();
@@ -2119,7 +3039,8 @@ image({
         let (terminate_response_tx, terminate_response_rx) = oneshot::channel();
         control_tx
             .send(CellControlCommand::Terminate {
-                response_tx: terminate_response_tx,
+                cause: super::CellTerminalCause::ExplicitTermination,
+                response_tx: Some(terminate_response_tx),
             })
             .unwrap();
         let terminate_response = async { terminate_response_rx.await.unwrap() };

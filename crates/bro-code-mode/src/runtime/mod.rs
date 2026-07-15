@@ -56,9 +56,11 @@ pub struct WaitToPendingRequest {
 /// should be treated as a code-cell lifecycle event.
 #[derive(Debug, PartialEq)]
 pub enum WaitOutcome {
-    /// The requested code cell was live when the wait command was accepted.
+    /// Local addition (not vendored): the requested code cell was live when
+    /// accepted or retained as a bounded terminal tombstone.
     LiveCell(RuntimeResponse),
-    /// The requested code cell was not live.
+    /// Local addition (not vendored): the requested code cell is unknown or
+    /// its bounded terminal tombstone has expired.
     MissingCell(RuntimeResponse),
 }
 
@@ -84,9 +86,11 @@ pub enum ExecuteToPendingOutcome {
 /// quiescent again.
 #[derive(Debug, PartialEq)]
 pub enum WaitToPendingOutcome {
-    /// The requested code cell was live when the wait command was accepted.
+    /// Local addition (not vendored): the requested code cell was live when
+    /// accepted or retained as a bounded terminal tombstone.
     LiveCell(ExecuteToPendingOutcome),
-    /// The requested code cell was not live.
+    /// Local addition (not vendored): the requested code cell is unknown or
+    /// its bounded terminal tombstone has expired.
     MissingCell(RuntimeResponse),
 }
 
