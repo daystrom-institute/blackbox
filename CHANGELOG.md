@@ -8,7 +8,40 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Added
+
+- Dispatched harness sessions reach a curated `bbox_*` tool catalog
+  (`bbox_note`, `bbox_notes`, `bbox_note_resolve`, `bbox_search`,
+  `bbox_knowledge`) through the typed worker capability RPC instead of the
+  retired MCP loopback. The daemon staples the authenticated worker's ambient
+  scope (session, task, project, bro) into each call server-side and records
+  an audit annotation when a caller-supplied value was overridden. The grant
+  is policy-gated and fail-closed; `bro_*` orchestration tools are never
+  projectable. Slice 1 of `design/bro-harness/bbox-tool-projection.md`.
+
 ### Fixed
+
+- Fleet authority lease expiry no longer regresses a committed-terminal task:
+  an expired worker lease on a Completed task retires only the worker; the
+  recorded task and attempt outcome stand.
+- A Lost fleet worker can no longer be resurrected by a stale status frame:
+  terminal-state rejection now covers status, lease renewal, connection
+  confirmation, event, and command-outcome paths, and marking a worker Lost
+  bumps its connection generation so stale connections are fenced at the
+  transport level. Capability authorization for a failed task's worker fails
+  closed.
+- A launched worker that dies before its first handshake now expires after a
+  connect deadline instead of wedging its task until daemon restart; the task
+  stays non-terminal and accepts a replacement worker.
+- The fleetd reaper/reconciler loop survives transient errors (it previously
+  exited permanently on the first error, silently stopping lease expiry and
+  worktree reconciliation), and the worktree reconciler tolerates a closeout
+  removing a worktree between its existence check and git verification.
+- Closeout push-reject recovery re-asserts that the base checkout has no
+  dirty tracked files immediately before `git reset --hard`; a dirty base now
+  aborts recovery with an operator-facing conflict instead of destroying
+  uncommitted peer work. Concurrent closeouts sharing a base repo serialize
+  their base-mutating phases.
 
 - `arch-pathology-rust` now ships its evidence-prover validator change as
   workflow v3 instead of mutating the already-installed v2 definition. This

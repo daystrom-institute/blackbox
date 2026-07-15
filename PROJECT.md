@@ -194,19 +194,23 @@ routing facts:
   through `bro-harness` (the custom
   provider harness, `crates/bro-harness`): GLM/DeepSeek/MiniMax on the Anthropic
   transport, Brodex on the OpenAI Responses transport (Codex/ChatGPT
-  backend), VibeBh (Mistral) on the OpenAI chat-completions transport. The daemon links `bro-harness` as a **library crate** (`Cargo.toml`)
-  and runs these providers **in-process** — `spawn_task_with_tool_placement`
-  routes every harness provider to `spawn_harness_in_process_task`
-  (`orchestration/mod.rs`), which calls
-  `bro_harness::agent_loop::run_with_event_callback_and_input_mcp` directly. It is
-  **not** spawned as a `bro-harness` subprocess; the Claude stream-json envelope
-  is still the event shape, but it is delivered via an in-process `EventCallback`,
-  not a child process's stdout. Transport + credentials are selected via env in
-  `brofile::resolve_provider_env`. The legacy subprocess path
-  (`exec_args::bin_with_env` / `BRO_HARNESS_BIN` / `bro-harness` on PATH) is
-  **not** the execution mechanism for these providers; the on-PATH binary is now
-  consulted only by the allocator's availability gate
-  (`provider_binary_missing`, `allocator.rs`) and legacy MCP-CLI management. See
+  backend), VibeBh (Mistral) on the OpenAI chat-completions transport. Harness
+  providers run in **child worker subprocesses by default**:
+  `spawn_task_with_tool_placement` (`orchestration/mod.rs`) routes them to
+  `spawn_harness_child_task`, which launches the `bro-harness` binary as a
+  sandbox-isolated `--worker` child speaking the versioned worker protocol
+  over a private per-host Unix socket. Daemon capabilities (corpus, atoms,
+  refactor, and the projected `bbox_*` tool catalog) reach the worker through
+  the typed worker capability RPC with daemon-side ambient-scope stapling,
+  never an MCP loopback (`design/bro-harness/harness-daemon-boundary.md`,
+  `design/bro-harness/bbox-tool-projection.md`). The **on-PATH `bro-harness`
+  binary is load-bearing** for dispatch; keep it current when rebuilding the
+  daemon. `BLACKBOX_HARNESS_EXECUTION_MODE=in-process` is the explicit
+  fallback to the legacy in-process library path
+  (`spawn_harness_in_process_task`, event delivery via in-process
+  `EventCallback`); the daemon still links `bro-harness` as a library crate
+  for that mode and for shared types. Transport + credentials are selected
+  via env in `brofile::resolve_provider_env`. See
   `design/bro-harness/anthropic-harness.md` and
   `design/bro-harness/harness-daemon-boundary.md`.
 - `codex` is a serde alias for Brodex (bro-harness/Responses); there is no

@@ -26,4 +26,5 @@ restart, and migration between runtime authorities.
 - [Fleet extraction: strangling live execution out of blackboxd](fleet-extraction.md)
 - [Agent runtime program: from Codex findings to independent services](agent-runtime-program.md)
 - [Concurrency model: planes, invariants, and the path off the bolt-on era](concurrency-model.md)
+- [Remote corpus host: dedicated blackbox machine, LAN tunnels, transcript collector](remote-corpus-host.md)
 - [Bro-harness worker protocol](../bro-harness/worker-protocol.md)

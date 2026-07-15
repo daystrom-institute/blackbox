@@ -79,10 +79,13 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
 
 - bro-harness never depends on `blackbox`. Daemon capabilities arrive only
   through `bro-capabilities` traits and fail closed when absent.
-- The daemon runs harness providers IN-PROCESS (library link, event callback
-  delivery). The `bro-harness` binary on PATH is only the allocator's
-  availability probe — changing subprocess arg shapes does not change daemon
-  dispatch, and vice versa.
+- The daemon runs harness providers in CHILD WORKER SUBPROCESSES by default
+  (`--worker` mode, versioned worker protocol over a private per-host Unix
+  socket; capabilities arrive via the typed worker capability RPC, never an
+  MCP loopback). The on-PATH `bro-harness` binary is therefore load-bearing
+  for dispatch: a stale or missing binary fails every harness dispatch.
+  `BLACKBOX_HARNESS_EXECUTION_MODE=in-process` selects the legacy in-process
+  library path (event callback delivery), kept as the explicit fallback.
 - Tests must not touch real `$HOME`/`$BRO_HOME` state: `EventLog::disabled()`
   / explicit paths exist for exactly this; the sessions dir resolves from
   `BRO_HOME`, so a leaked env var writes into the operator's real session

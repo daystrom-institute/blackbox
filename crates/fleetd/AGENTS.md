@@ -54,3 +54,17 @@ atoms, schedules, corpus stores, or harness implementation code.
   firing project closeout hooks a second time.
 - The harness process is not killed when a fleetd handle is dropped. Service
   managers must preserve worker process groups across a fleetd restart.
+
+## Sandbox credential scope (operator decision, 2026-07-15)
+
+The worker sandbox denies each worker its own provider lane's credential
+source, the service token, and peer worker/service state. It deliberately
+does NOT deny other provider lanes' credentials, `~/.ssh`, `~/.aws`, or other
+operator credentials. The threat model is accident containment for a single
+trusted operator: credentials present on the host are read-only and/or
+exactly the ones intended to be available for automation. Cross-lane and
+whole-home credential isolation are out of scope by operator decision; the
+judgment is that such mechanics create worse failure modes (agents
+mishandling or destroying tokens while delegating around denials) than the
+threat they would mitigate. Do not widen the deny set without a new operator
+decision.
