@@ -4,6 +4,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=BLACKBOX_CORPUS_BUILD_ID");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     let build_id = std::env::var("BLACKBOX_CORPUS_BUILD_ID").unwrap_or_else(|_| {
         let revision = Command::new("git")
             .args(["rev-parse", "--short=12", "HEAD"])

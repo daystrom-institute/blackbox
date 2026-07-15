@@ -49,6 +49,7 @@ fn write_embedded_sources(out: &mut String, constant: &str, root: &Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed=BLACKOPSD_BUILD_ID");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     let build_id = std::env::var("BLACKOPSD_BUILD_ID").unwrap_or_else(|_| {
         let revision = Command::new("git")
             .args(["rev-parse", "--short=12", "HEAD"])
