@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 mod agents;
 mod execution;
+mod projected;
 mod records;
 
 pub use agents::{
@@ -20,6 +21,7 @@ pub use execution::{
     ExecutionDirectiveCadence, ExecutionDispatchContext, ExecutionKind, ExecutionRequest,
     ExecutionScope, ExecutionServiceTier, ExecutionToolPolicy, WorkingSetIntent,
 };
+pub use projected::{BboxToolCapability, ProjectedToolCall, ProjectedToolOutcome, StapleOverride};
 pub use records::{
     MAX_RECORD_BYTES, RECORD_ARCHIVE_SNAPSHOT_VERSION, RecordArchiveSnapshot, RecordEnvelope,
     RecordIngestCapability, RecordIngestReceipt, RecordIngestRequest, TranscriptRecordTarget,

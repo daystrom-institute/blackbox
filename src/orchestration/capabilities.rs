@@ -14,15 +14,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bro_capabilities::{
     AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
-    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
+    CorpusLookup, ProjectedToolOutcome, RefactorCapability, RefactorPlanHandle, RefactorRequest,
+    StapleOverride,
 };
 use bro_core::BroError;
 use bro_protocol::{
-    CapabilityError, CapabilityErrorCode, CapabilityRequest, CapabilityResponse, SessionPolicy,
+    CAPABILITY_BBOX, CapabilityError, CapabilityErrorCode, CapabilityRequest, CapabilityResponse,
+    SessionCapabilityPolicy, SessionPolicy,
 };
 use parking_lot::RwLock;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use tokio::sync::Semaphore;
 
+use crate::index::SearchParams;
+use crate::knowledge::KnowledgeListParams;
+use crate::notes::{NoteListParams, NoteParams, NoteResolveParams};
 use crate::refactor::{self, RefactorPlanParams};
 use crate::server::state::{BlackboxServer, SharedState};
 use crate::tools::bro_params::AtomInvokeParams;
@@ -326,6 +333,190 @@ pub(crate) fn harness_session_services(
         .with_refactor(Arc::new(DaemonRefactor::new(state.clone())))
 }
 
+/// Curated set of `bbox_*` tools projected to dispatched harness sessions
+/// (slice 1, design/bro-harness/bbox-tool-projection.md §6). The catalog and the
+/// `dispatch_projected_bbox` match must agree. Order is stable for grant
+/// determinism.
+pub(crate) const PROJECTED_BBOX_TOOLS: &[&str] = &[
+    "bbox_note",
+    "bbox_notes",
+    "bbox_note_resolve",
+    "bbox_search",
+    "bbox_knowledge",
+];
+
+/// The projected catalog as a fine-grained grant set. Any `bro_*` name is
+/// filtered out so the mechanical recursion guard can never be defeated by a
+/// catalog edit: `bro_exec` and its siblings are never projectable.
+pub(crate) fn projected_bbox_grant() -> BTreeSet<String> {
+    PROJECTED_BBOX_TOOLS
+        .iter()
+        .filter(|name| !name.starts_with("bro_"))
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// Ambient scope field a projected tool argument is stapled from.
+#[derive(Clone, Copy)]
+enum StapleSource {
+    TaskId,
+    SessionId,
+    Project,
+    Provider,
+    Bro,
+}
+
+/// Per-tool stapling spec: `(json_field, ambient_source)`. Only tools whose
+/// argument struct carries an identity/scope field are stapled. Read/query tools
+/// (`bbox_search`, `bbox_knowledge`) have no spec: their `project` field is a
+/// cross-corpus filter, not a write scope, so forcing it would change query
+/// semantics.
+fn staple_spec(tool: &str) -> &'static [(&'static str, StapleSource)] {
+    use StapleSource::*;
+    match tool {
+        "bbox_note" => &[
+            ("task_id", TaskId),
+            ("session_id", SessionId),
+            ("project", Project),
+            ("provider", Provider),
+            ("bro", Bro),
+        ],
+        _ => &[],
+    }
+}
+
+/// Projected daemon `bbox_*` tools for one authenticated worker session. Calls
+/// route into the real daemon tool layer after ambient-scope stapling, so the
+/// projection shares governance and behavior with the wire MCP surface.
+pub(crate) struct DaemonBboxTools {
+    state: Arc<SharedState>,
+    scope: WorkerCapabilityScope,
+}
+
+impl DaemonBboxTools {
+    async fn call(
+        &self,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> CapabilityResult<ProjectedToolOutcome> {
+        let mut object = match args {
+            serde_json::Value::Object(map) => map,
+            serde_json::Value::Null => serde_json::Map::new(),
+            other => {
+                return Err(BroError::new(
+                    "capability.invalid_request",
+                    format!("projected tool arguments must be a JSON object, got {other}"),
+                ));
+            }
+        };
+        let overrides = self.apply_stapling(tool, &mut object);
+        let server = BlackboxServer::new(self.state.clone());
+        let result =
+            dispatch_projected_bbox(&server, tool, serde_json::Value::Object(object)).await?;
+        Ok(flatten_projected_result(result, overrides))
+    }
+
+    /// Override the tool's stapled argument fields with server-authoritative
+    /// ambient values, recording any caller-supplied conflict as an override.
+    fn apply_stapling(
+        &self,
+        tool: &str,
+        args: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<StapleOverride> {
+        let mut overrides = Vec::new();
+        for (field, source) in staple_spec(tool) {
+            let Some(authoritative) = self.resolve_source(*source) else {
+                continue;
+            };
+            let authoritative_value = serde_json::Value::String(authoritative);
+            if let Some(existing) = args.get(*field) {
+                if existing != &authoritative_value && !existing.is_null() {
+                    overrides.push(StapleOverride {
+                        field: (*field).to_string(),
+                        authoritative: authoritative_value.clone(),
+                        supplied: Some(existing.clone()),
+                    });
+                }
+            }
+            args.insert((*field).to_string(), authoritative_value);
+        }
+        overrides
+    }
+
+    fn resolve_source(&self, source: StapleSource) -> Option<String> {
+        match source {
+            StapleSource::TaskId => Some(self.scope.task_id.clone()),
+            StapleSource::SessionId => Some(self.scope.session_id.clone()),
+            StapleSource::Project => self
+                .scope
+                .project_root
+                .as_ref()
+                .map(|root| root.to_string_lossy().into_owned()),
+            StapleSource::Provider => self.scope.provider.clone(),
+            StapleSource::Bro => self.scope.bro.clone(),
+        }
+    }
+}
+
+/// Dispatch one projected tool by name into the real `#[tool]` handler. The
+/// arguments are schema-validated by deserializing into the tool's parameter
+/// type. This match and `PROJECTED_BBOX_TOOLS` must stay in agreement.
+async fn dispatch_projected_bbox(
+    server: &BlackboxServer,
+    tool: &str,
+    args: serde_json::Value,
+) -> CapabilityResult<CallToolResult> {
+    macro_rules! typed {
+        ($ty:ty) => {
+            serde_json::from_value::<$ty>(args)
+                .map_err(|error| BroError::new("capability.invalid_request", error.to_string()))?
+        };
+    }
+    let result: CallToolResult = match tool {
+        "bbox_note" => server.bbox_note(Parameters(typed!(NoteParams))).await,
+        "bbox_notes" => server.bbox_notes(Parameters(typed!(NoteListParams))),
+        "bbox_note_resolve" => {
+            server
+                .bbox_note_resolve(Parameters(typed!(NoteResolveParams)))
+                .await
+        }
+        "bbox_search" => server.bbox_search(Parameters(typed!(SearchParams))).await,
+        "bbox_knowledge" => {
+            server
+                .bbox_knowledge(Parameters(typed!(KnowledgeListParams)))
+                .await
+        }
+        _ => {
+            return Err(BroError::new(
+                "capability.invalid_request",
+                format!("bbox tool '{tool}' is not projected"),
+            ));
+        }
+    };
+    Ok(result)
+}
+
+/// Flatten an rmcp `CallToolResult` into the projected outcome the harness
+/// consumes: concatenate text content, carry structured content, propagate the
+/// error flag, and attach the staple audit.
+fn flatten_projected_result(
+    result: CallToolResult,
+    staple_overrides: Vec<StapleOverride>,
+) -> ProjectedToolOutcome {
+    let content = result
+        .content
+        .iter()
+        .filter_map(|item| item.as_text().map(|text| text.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ProjectedToolOutcome {
+        content,
+        is_error: result.is_error.unwrap_or(false),
+        structured_content: result.structured_content,
+        staple_overrides,
+    }
+}
+
 /// Connection-local capability authority for a reconnectable worker session.
 /// The refactor handle table lives here so handles cannot cross sessions or
 /// connection policy envelopes.
@@ -334,6 +525,8 @@ pub(crate) struct WorkerCapabilityRouter {
     corpus: DaemonCorpus,
     atoms: DaemonAtoms,
     refactor: DaemonRefactor,
+    bbox: DaemonBboxTools,
+    capability_policy: SessionCapabilityPolicy,
     scope: WorkerCapabilityScope,
     admission: Arc<Semaphore>,
 }
@@ -343,6 +536,14 @@ pub(crate) struct WorkerCapabilityScope {
     pub(crate) task_id: String,
     pub(crate) session_id: String,
     pub(crate) project_root: Option<PathBuf>,
+    /// Ambient dispatch provider (e.g. `glm`, `brodex`), stapled into projected
+    /// tool calls that carry a `provider` field. Additive for policy round-trip.
+    #[serde(default)]
+    pub(crate) provider: Option<String>,
+    /// Ambient bro identity for this dispatch, stapled into projected tool calls
+    /// that carry a `bro` field. Additive for policy round-trip.
+    #[serde(default)]
+    pub(crate) bro: Option<String>,
 }
 
 impl WorkerCapabilityRouter {
@@ -368,6 +569,18 @@ impl WorkerCapabilityRouter {
             Some(project_root) => DaemonRefactor::new_scoped(state.clone(), project_root.clone()),
             None => DaemonRefactor::new(state.clone()),
         };
+        // Fine-grained call-time authority. The projected bbox catalog lives in
+        // `allowed_operations["bbox"]`; an ungranted tool is rejected here even
+        // if the coarse `bbox` family is present.
+        let capability_policy = policy
+            .capability_policy()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let bbox = DaemonBboxTools {
+            state: state.clone(),
+            scope: scope.clone(),
+        };
         Self {
             allowed,
             corpus: DaemonCorpus {
@@ -378,6 +591,8 @@ impl WorkerCapabilityRouter {
                 project_dir,
             },
             refactor,
+            bbox,
+            capability_policy,
             scope,
             admission: Arc::new(Semaphore::new(32)),
         }
@@ -438,9 +653,38 @@ impl WorkerCapabilityRouter {
                 false,
             );
         }
+        // Fine-grained call-time authority for projected bbox tools: the tool
+        // name (the operation) must be in the granted catalog. Rejected as a
+        // structured Unauthorized before any backend work, so an ungranted or
+        // forged tool (including any bro_* name) fails closed.
+        if request.capability == CAPABILITY_BBOX
+            && !self
+                .capability_policy
+                .allows_operation(CAPABILITY_BBOX, &request.operation)
+        {
+            return capability_error(
+                call_id,
+                CapabilityErrorCode::Unauthorized,
+                format!(
+                    "bbox tool '{}' is not granted for this session",
+                    request.operation
+                ),
+                false,
+            );
+        }
 
         let deadline = request.deadline_unix_ms;
         let result_future = async {
+            // Projected bbox tools carry the tool name as the operation, so they
+            // are handled outside the fixed `(capability, operation)` match.
+            // Authorization was already verified above.
+            if request.capability == CAPABILITY_BBOX {
+                return self
+                    .bbox
+                    .call(&request.operation, request.bounded_payload)
+                    .await
+                    .and_then(encode_capability_result);
+            }
             let result: Result<serde_json::Value, BroError> =
                 match (request.capability.as_str(), request.operation.as_str()) {
                     (CAPABILITY_CORPUS, OPERATION_SEARCH_CORPUS) => {
@@ -683,6 +927,8 @@ mod tests {
                 task_id: "task-1".to_string(),
                 session_id: "session-1".to_string(),
                 project_root: Some(dir.path().canonicalize().unwrap()),
+                provider: None,
+                bro: None,
             },
         );
         let response = router
@@ -728,6 +974,8 @@ mod tests {
                 task_id: "task-1".to_string(),
                 session_id: "session-1".to_string(),
                 project_root: Some(dir.path().canonicalize().unwrap()),
+                provider: None,
+                bro: None,
             },
         );
         let response = router
@@ -773,5 +1021,183 @@ mod tests {
         let error = validate_refactor_plan_paths(&root, &plan)
             .expect_err("planner output outside the task root must be refused");
         assert_eq!(error.code, "capability.unauthorized");
+    }
+
+    fn bbox_scope(project_root: Option<PathBuf>) -> WorkerCapabilityScope {
+        WorkerCapabilityScope {
+            task_id: "bbox-task".to_string(),
+            session_id: "bbox-session".to_string(),
+            project_root,
+            provider: Some("glm".to_string()),
+            bro: Some("team::member".to_string()),
+        }
+    }
+
+    fn bbox_policy() -> SessionPolicy {
+        let mut policy = SessionPolicy {
+            allowed_capabilities: vec!["corpus".to_string(), CAPABILITY_BBOX.to_string()],
+            attributes: Default::default(),
+        };
+        let mut capability_policy = SessionCapabilityPolicy::default();
+        capability_policy
+            .allowed_operations
+            .insert(CAPABILITY_BBOX.to_string(), projected_bbox_grant());
+        policy.set_capability_policy(capability_policy).unwrap();
+        policy
+    }
+
+    /// The projected catalog is fine-grained and never contains a `bro_*`
+    /// orchestration tool, so the recursion guard cannot be defeated by a
+    /// catalog edit.
+    #[test]
+    fn projected_bbox_grant_excludes_bro_tools() {
+        let grant = projected_bbox_grant();
+        assert!(grant.contains("bbox_note"));
+        assert!(grant.contains("bbox_search"));
+        assert!(grant.contains("bbox_knowledge"));
+        assert!(
+            !grant.iter().any(|name| name.starts_with("bro_")),
+            "no bro_* tool may ever be projected"
+        );
+        assert!(!grant.contains("bro_exec"));
+    }
+
+    /// Ambient identity is stapled server-authoritatively; a caller-supplied
+    /// conflicting value is overridden and reported, not rejected.
+    #[test]
+    fn bbox_stapling_overrides_conflicting_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        let bbox = DaemonBboxTools {
+            state,
+            scope: bbox_scope(Some(root.clone())),
+        };
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "project".to_string(),
+            serde_json::Value::String("/somewhere/else".to_string()),
+        );
+        args.insert(
+            "body".to_string(),
+            serde_json::Value::String("note".to_string()),
+        );
+        let overrides = bbox.apply_stapling("bbox_note", &mut args);
+
+        assert_eq!(args["project"], serde_json::json!(root.to_string_lossy()));
+        assert_eq!(args["task_id"], serde_json::json!("bbox-task"));
+        assert_eq!(args["session_id"], serde_json::json!("bbox-session"));
+        assert_eq!(args["provider"], serde_json::json!("glm"));
+        assert_eq!(args["bro"], serde_json::json!("team::member"));
+        // Only the conflicting field is audited as an override.
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].field, "project");
+        assert_eq!(
+            overrides[0].supplied,
+            Some(serde_json::json!("/somewhere/else"))
+        );
+    }
+
+    /// Read/query tools have no staple spec: their `project` filter is left
+    /// exactly as supplied so query semantics are unchanged.
+    #[test]
+    fn bbox_query_tools_are_not_stapled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        let bbox = DaemonBboxTools {
+            state,
+            scope: bbox_scope(Some(root)),
+        };
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "project".to_string(),
+            serde_json::Value::String("filter-keyword".to_string()),
+        );
+        let overrides = bbox.apply_stapling("bbox_search", &mut args);
+        assert!(overrides.is_empty());
+        assert_eq!(args["project"], serde_json::json!("filter-keyword"));
+        assert!(!args.contains_key("task_id"));
+    }
+
+    /// An ungranted projected tool (including any `bro_*` name) is rejected
+    /// server-side even though the coarse `bbox` family is present.
+    #[tokio::test]
+    async fn worker_router_rejects_ungranted_bbox_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        let router = WorkerCapabilityRouter::new(state, &bbox_policy(), bbox_scope(Some(root)));
+
+        for forged in ["bbox_thread", "bro_exec"] {
+            let response = router
+                .dispatch(CapabilityRequest {
+                    call_id: format!("forge-{forged}"),
+                    invocation_id: None,
+                    capability: CAPABILITY_BBOX.to_string(),
+                    operation: forged.to_string(),
+                    bounded_payload: serde_json::json!({}),
+                    deadline_unix_ms: None,
+                })
+                .await;
+            assert_eq!(
+                response.structured_error().unwrap().unwrap().code,
+                CapabilityErrorCode::Unauthorized,
+                "{forged} must be rejected"
+            );
+        }
+    }
+
+    /// A granted read tool routes through the real daemon tool layer over the
+    /// generic path and returns a successful projected outcome.
+    #[tokio::test]
+    async fn worker_router_dispatches_projected_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        let router = WorkerCapabilityRouter::new(state, &bbox_policy(), bbox_scope(Some(root)));
+
+        let response = router
+            .dispatch(CapabilityRequest {
+                call_id: "search-1".to_string(),
+                invocation_id: None,
+                capability: CAPABILITY_BBOX.to_string(),
+                operation: "bbox_search".to_string(),
+                bounded_payload: serde_json::json!({"query":"needle","limit":2}),
+                deadline_unix_ms: Some(capability_now_ms().saturating_add(10_000)),
+            })
+            .await;
+        assert!(!response.is_error, "search must dispatch cleanly");
+        let outcome: ProjectedToolOutcome =
+            serde_json::from_value(response.result_or_error).unwrap();
+        assert!(outcome.staple_overrides.is_empty());
+    }
+
+    /// The coarse `bbox` family being absent from `allowed_capabilities` fails
+    /// closed before any fine-grained check.
+    #[tokio::test]
+    async fn worker_router_rejects_bbox_without_coarse_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        let policy = SessionPolicy {
+            allowed_capabilities: vec!["corpus".to_string()],
+            attributes: Default::default(),
+        };
+        let router = WorkerCapabilityRouter::new(state, &policy, bbox_scope(Some(root)));
+        let response = router
+            .dispatch(CapabilityRequest {
+                call_id: "no-family".to_string(),
+                invocation_id: None,
+                capability: CAPABILITY_BBOX.to_string(),
+                operation: "bbox_search".to_string(),
+                bounded_payload: serde_json::json!({"query":"x"}),
+                deadline_unix_ms: None,
+            })
+            .await;
+        assert_eq!(
+            response.structured_error().unwrap().unwrap().code,
+            CapabilityErrorCode::Unauthorized
+        );
     }
 }

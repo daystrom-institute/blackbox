@@ -23,8 +23,8 @@ pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 pub use worker::{
     AgentMailboxDelivery, AgentMailboxDeliveryReceipt, AgentMailboxDeliveryState,
     AgentMailboxMessage, AgentMailboxMessageKind, AuthenticationProof, BuildIdentity,
-    CapabilityAuthorization, CapabilityError, CapabilityErrorCode, CapabilityRequest,
-    CapabilityResponse, CommandOutcome, CommandOutcomeAck,
+    CAPABILITY_BBOX, CapabilityAuthorization, CapabilityError, CapabilityErrorCode,
+    CapabilityRequest, CapabilityResponse, CommandOutcome, CommandOutcomeAck,
     DOWNSTREAM_SERVICE_AVAILABILITY_ATTRIBUTE, DownstreamServiceAvailability, DrainBoundary,
     DrainCompletion, Envelope, EventAck, FeaturePolicy, FleetWelcome, HandshakeMessage,
     HandshakeReject, Heartbeat, LeaseGrant, LeaseRenewal, PolicyIdentity, ProtocolError,

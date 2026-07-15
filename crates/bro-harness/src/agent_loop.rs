@@ -1846,7 +1846,14 @@ impl Session {
             connected: policy.connected,
         });
         if let Some(update) = &initial_service_policy {
-            reg.set_disabled_tools(disabled_remote_service_tools(update));
+            let mut disabled = disabled_remote_service_tools(update);
+            // Projected bbox tools are dynamic by name, so gate the whole
+            // catalog on the coarse `bbox` family the same way the fixed-name
+            // families gate their tools.
+            if !remote_capability_available(update, bro_protocol::CAPABILITY_BBOX) {
+                disabled.extend(services.bbox_tool_names());
+            }
+            reg.set_disabled_tools(disabled);
         }
         validate_tool_arg_defaults(&cx.tool_arg_defaults, &reg);
 

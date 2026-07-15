@@ -1364,6 +1364,10 @@ fn worker_capability_scope(
         task_id: hello.task_id.as_str().to_string(),
         session_id: hello.session_id.as_str().to_string(),
         project_root: registry_project_root.or(task_project_root),
+        // Ambient identity for projected-tool stapling. Read from the daemon's
+        // own task projection, never a worker input.
+        provider: Some(inner.provider.as_str().to_string()),
+        bro: inner.bro_label.clone(),
     })
 }
 
@@ -1400,13 +1404,30 @@ fn session_policy(
         .map(WorkerFeature::new)
         .filter(|feature| offered.contains(feature))
         .collect();
-    let mut allowed_capabilities = vec!["corpus".to_string()];
+    // Corpus and the projected `bbox_*` tool family are granted to every
+    // authenticated session (bbox rides the corpus service); atom + refactor
+    // require a project root. See design/bro-harness/bbox-tool-projection.md §3.
+    let mut allowed_capabilities = vec![
+        "corpus".to_string(),
+        bro_protocol::CAPABILITY_BBOX.to_string(),
+    ];
     if scope.project_root.is_some() {
         allowed_capabilities.extend(["atom".to_string(), "refactor".to_string()]);
     }
+    // Fine-grained call-time authority: the exact projected bbox tool catalog.
+    let mut capability_policy = bro_protocol::SessionCapabilityPolicy::default();
+    capability_policy.allowed_operations.insert(
+        bro_protocol::CAPABILITY_BBOX.to_string(),
+        crate::orchestration::capabilities::projected_bbox_grant(),
+    );
     let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&(allowed_capabilities.as_slice(), &enabled_features, scope))
-            .unwrap_or_default(),
+        serde_json::to_vec(&(
+            allowed_capabilities.as_slice(),
+            &enabled_features,
+            scope,
+            &capability_policy,
+        ))
+        .unwrap_or_default(),
     ));
     let mut policy = SessionPolicy {
         allowed_capabilities,
@@ -1422,6 +1443,7 @@ fn session_policy(
             )
         })?,
     );
+    let _ = policy.set_capability_policy(capability_policy);
     let _ = policy.set_feature_policy(FeaturePolicy {
         enabled_features,
         policy: PolicyIdentity {
@@ -1752,6 +1774,8 @@ mod tests {
                 task_id: "task-1".to_string(),
                 session_id: "session-1".to_string(),
                 project_root: None,
+                provider: None,
+                bro: None,
             },
         )
         .unwrap()
@@ -1861,6 +1885,106 @@ mod tests {
                 .pending_handshake_diagnostics
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_session_routes_projected_bbox_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        *worker_authority().write() = Some(state.worker_registry.clone());
+        insert_running_task(&state, "bbox-task", "bbox-session", None);
+        let bootstrap = state
+            .worker_registry
+            .provision(
+                bro_core::TaskId::new("bbox-task"),
+                bro_core::SessionId::new("bbox-session"),
+                Some(bro_core::WorkerId::new("bbox-worker")),
+            )
+            .unwrap();
+        let (worker_stream, fleet_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        worker_stream.set_nonblocking(true).unwrap();
+        fleet_stream.set_nonblocking(true).unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve_connection(UnixStream::from_std(fleet_stream).unwrap(), server_state).await
+        });
+
+        let hello = worker_hello(&bootstrap, bootstrap.proof.clone());
+        let (negotiated, welcome) = bro_rpc::connect_worker_with_options(
+            UnixStream::from_std(worker_stream).unwrap(),
+            hello,
+            HandshakeOptions::default(),
+        )
+        .await
+        .unwrap();
+        // The grant carries the coarse family and the fine-grained catalog.
+        assert!(
+            welcome
+                .session_policy
+                .allowed_capabilities
+                .contains(&bro_protocol::CAPABILITY_BBOX.to_string())
+        );
+        let granted = welcome.session_policy.capability_policy().unwrap().unwrap();
+        assert!(granted.allows_operation(bro_protocol::CAPABILITY_BBOX, "bbox_search"));
+        assert!(!granted.allows_operation(bro_protocol::CAPABILITY_BBOX, "bbox_thread"));
+        assert!(!granted.allows_operation(bro_protocol::CAPABILITY_BBOX, "bro_exec"));
+
+        let worker = RpcPeer::spawn(negotiated, PeerConfig::default()).unwrap();
+
+        // A granted projected tool routes through the daemon tool layer.
+        let search = worker
+            .handle()
+            .request_with_id(
+                "bbox-search".to_string(),
+                WorkerMessage::CapabilityRequest(bro_protocol::CapabilityRequest {
+                    call_id: "bbox-search".to_string(),
+                    invocation_id: None,
+                    capability: bro_protocol::CAPABILITY_BBOX.to_string(),
+                    operation: "bbox_search".to_string(),
+                    bounded_payload: serde_json::json!({"query":"needle","limit":2}),
+                    deadline_unix_ms: Some(now_ms().saturating_add(10_000)),
+                }),
+                MessagePriority::Normal,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let WorkerMessage::CapabilityResponse(search) = search.body else {
+            panic!("expected capability response")
+        };
+        assert!(!search.is_error, "granted bbox tool must dispatch cleanly");
+
+        // A forged ungranted projected tool (including any bro_* name) fails
+        // closed server-side.
+        let forged = worker
+            .handle()
+            .request_with_id(
+                "bbox-forge".to_string(),
+                WorkerMessage::CapabilityRequest(bro_protocol::CapabilityRequest {
+                    call_id: "bbox-forge".to_string(),
+                    invocation_id: None,
+                    capability: bro_protocol::CAPABILITY_BBOX.to_string(),
+                    operation: "bro_exec".to_string(),
+                    bounded_payload: serde_json::json!({}),
+                    deadline_unix_ms: Some(now_ms().saturating_add(10_000)),
+                }),
+                MessagePriority::Normal,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let WorkerMessage::CapabilityResponse(forged) = forged.body else {
+            panic!("expected capability response")
+        };
+        assert!(forged.is_error, "ungranted projected tool must be rejected");
+        assert_eq!(
+            forged.structured_error().unwrap().unwrap().code,
+            bro_protocol::CapabilityErrorCode::Unauthorized
+        );
+
+        drop(worker);
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

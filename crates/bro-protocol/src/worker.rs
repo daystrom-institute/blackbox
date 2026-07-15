@@ -27,6 +27,12 @@ pub const DOWNSTREAM_SERVICE_AVAILABILITY_ATTRIBUTE: &str = "downstream_service_
 /// and atom refs admitted for one durable session.
 pub const SESSION_CAPABILITY_POLICY_ATTRIBUTE: &str = "session_capability_policy";
 
+/// Capability family for projected daemon `bbox_*` tools. The tool name travels
+/// as the capability operation; the fine-grained grant lives in
+/// `SessionCapabilityPolicy.allowed_operations["bbox"]`. See
+/// design/bro-harness/bbox-tool-projection.md.
+pub const CAPABILITY_BBOX: &str = "bbox";
+
 /// A forward-compatible worker protocol feature name.
 ///
 /// This is a newtype rather than a closed enum so a newer peer can advertise a

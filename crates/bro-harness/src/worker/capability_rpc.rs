@@ -14,9 +14,10 @@ use async_trait::async_trait;
 use bro_capabilities::{
     AgentCapability, AgentIdentity, AgentMessageRequest, AgentSpawnRequest, AgentStatus,
     AgentSummary, AgentTarget, AgentWaitRequest, AgentWake, AtomCapability, AtomInvocation,
-    AtomOutput, AttemptOutcome, CorpusCapability, CorpusHit, CorpusLookup, ExecutionAccepted,
-    ExecutionCapability, ExecutionRequest, RefactorCapability, RefactorPlanHandle, RefactorRequest,
-    ToolCallOutput, ToolCapability, ToolInvocation,
+    AtomOutput, AttemptOutcome, BboxToolCapability, CorpusCapability, CorpusHit, CorpusLookup,
+    ExecutionAccepted, ExecutionCapability, ExecutionRequest, ProjectedToolCall,
+    ProjectedToolOutcome, RefactorCapability, RefactorPlanHandle, RefactorRequest, ToolCallOutput,
+    ToolCapability, ToolInvocation,
 };
 use bro_core::{AttemptId, BroError, SessionId};
 use bro_protocol::{
@@ -132,6 +133,9 @@ impl RpcCapabilityClient {
         if allowed.contains(CAPABILITY_EXECUTION) {
             services = services.with_execution(shared.clone());
         }
+        if allowed.contains(bro_protocol::CAPABILITY_BBOX) {
+            services = services.with_bbox(shared.clone(), bbox_catalog(policy));
+        }
         if allowed.contains(CAPABILITY_AGENT) {
             services = services.with_agent(shared);
         }
@@ -155,11 +159,13 @@ impl RpcCapabilityClient {
             .flatten()
             .unwrap_or_default();
         let shared = Arc::new(self.clone());
+        let bbox_catalog = bbox_catalog(policy);
         HarnessSessionServices::standalone()
             .with_corpus(shared.clone())
             .with_atoms(shared.clone())
             .with_refactor(shared.clone())
             .with_execution(shared.clone())
+            .with_bbox(shared.clone(), bbox_catalog)
             .with_agent(shared)
             // The session starts disconnected. The supervisor enqueues the
             // first connected policy before generation activation and before
@@ -175,7 +181,7 @@ impl RpcCapabilityClient {
     async fn call<Request, Response>(
         &self,
         capability: &'static str,
-        operation: &'static str,
+        operation: &str,
         request: &Request,
     ) -> Result<Response, BroError>
     where
@@ -189,7 +195,7 @@ impl RpcCapabilityClient {
     async fn call_for_invocation<Request, Response>(
         &self,
         capability: &'static str,
-        operation: &'static str,
+        operation: &str,
         invocation_id: Option<&str>,
         request: &Request,
     ) -> Result<Response, BroError>
@@ -211,7 +217,9 @@ impl RpcCapabilityClient {
             ));
         }
         let availability = match capability {
-            CAPABILITY_CORPUS | CAPABILITY_REFACTOR => connection.downstream_availability.corpus,
+            CAPABILITY_CORPUS | CAPABILITY_REFACTOR | bro_protocol::CAPABILITY_BBOX => {
+                connection.downstream_availability.corpus
+            }
             CAPABILITY_ATOM | CAPABILITY_AGENT => connection.downstream_availability.blackops,
             _ => ServiceAvailability::Unavailable,
         };
@@ -342,6 +350,25 @@ impl CorpusCapability for RpcCapabilityClient {
     async fn search_corpus(&self, lookup: CorpusLookup) -> Result<Vec<CorpusHit>, BroError> {
         self.call(CAPABILITY_CORPUS, OPERATION_SEARCH_CORPUS, &lookup)
             .await
+    }
+}
+
+#[async_trait]
+impl BboxToolCapability for RpcCapabilityClient {
+    async fn call_bbox_tool(
+        &self,
+        invocation_id: &str,
+        call: ProjectedToolCall,
+    ) -> Result<ProjectedToolOutcome, BroError> {
+        // The tool name is the capability operation; the arguments are the
+        // bounded payload. Ambient scope is stapled daemon-side.
+        self.call_for_invocation(
+            bro_protocol::CAPABILITY_BBOX,
+            call.tool.as_str(),
+            Some(invocation_id),
+            &call.arguments,
+        )
+        .await
     }
 }
 
@@ -593,6 +620,24 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Granted projected `bbox_*` tool names for a session, read from the
+/// fine-grained `SessionCapabilityPolicy.allowed_operations["bbox"]` grant. An
+/// unparsable or absent grant yields an empty catalog, so the projection fails
+/// closed by registering no projected tools.
+fn bbox_catalog(policy: &SessionPolicy) -> BTreeSet<String> {
+    policy
+        .capability_policy()
+        .ok()
+        .flatten()
+        .and_then(|capability_policy| {
+            capability_policy
+                .allowed_operations
+                .get(bro_protocol::CAPABILITY_BBOX)
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -600,7 +645,8 @@ mod tests {
     use bro_core::{AgentId, TaskId, WorkerId};
     use bro_protocol::{
         AuthenticationProof, BuildIdentity, DownstreamServiceAvailability, FeaturePolicy,
-        FleetWelcome, LeaseGrant, PolicyIdentity, WORKER_PROTOCOL_V1, WorkerFeature, WorkerHello,
+        FleetWelcome, LeaseGrant, PolicyIdentity, SessionCapabilityPolicy, WORKER_PROTOCOL_V1,
+        WorkerFeature, WorkerHello,
     };
     use bro_rpc::{
         FleetHandshakeGrant, HandshakeAuthorityReject, HandshakeOptions, PeerConfig, RpcPeer,
@@ -892,5 +938,43 @@ mod tests {
         assert!(!initial.connected);
         assert!(initial.allowed_capabilities.contains(CAPABILITY_CORPUS));
         assert!(!initial.allowed_capabilities.contains(CAPABILITY_AGENT));
+    }
+
+    fn bbox_policy(tools: &[&str]) -> SessionPolicy {
+        let mut policy = policy(&[bro_protocol::CAPABILITY_BBOX]);
+        let mut capability_policy = SessionCapabilityPolicy::default();
+        capability_policy.allowed_operations.insert(
+            bro_protocol::CAPABILITY_BBOX.to_string(),
+            tools.iter().map(|name| (*name).to_string()).collect(),
+        );
+        policy.set_capability_policy(capability_policy).unwrap();
+        policy
+    }
+
+    /// A session granted a projected bbox catalog registers exactly those tools
+    /// by name; a session with no grant registers none (fail closed by absence).
+    #[test]
+    fn session_services_register_only_granted_bbox_tools() {
+        let (client, _) = RpcCapabilityClient::new(SessionId::new("session-1"));
+        let services = client.session_services(&bbox_policy(&["bbox_note", "bbox_search"]));
+        let names = services
+            .capability_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("bbox_note"));
+        assert!(names.contains("bbox_search"));
+        assert!(!names.contains("bbox_knowledge"));
+        assert_eq!(services.bbox_tool_names(), vec!["bbox_note", "bbox_search"]);
+
+        // No grant → no projected tools registered.
+        let ungranted = client.session_services(&policy(&[CAPABILITY_CORPUS]));
+        assert!(
+            !ungranted
+                .capability_tools()
+                .into_iter()
+                .any(|tool| tool.name().starts_with("bbox_"))
+        );
+        assert!(ungranted.bbox_tool_names().is_empty());
     }
 }

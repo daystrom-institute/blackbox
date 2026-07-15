@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AgentCapability, AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup,
-    ExecutionCapability, RefactorCapability, RefactorRequest, ToolCallOutput, ToolCapability,
-    ToolInvocation,
+    AgentCapability, AtomCapability, AtomInvocation, BboxToolCapability, CorpusCapability,
+    CorpusLookup, ExecutionCapability, ProjectedToolCall, RefactorCapability, RefactorRequest,
+    ToolCallOutput, ToolCapability, ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
@@ -35,6 +35,11 @@ pub struct HarnessSessionServices {
     refactor: Option<Arc<dyn RefactorCapability>>,
     execution: Option<Arc<dyn ExecutionCapability>>,
     agent: Option<Arc<dyn AgentCapability>>,
+    /// Projected daemon `bbox_*` tools plus the granted tool-name catalog. The
+    /// catalog is the exact set the daemon admitted for this session; each name
+    /// becomes one model-facing tool that routes through `bbox`.
+    bbox: Option<Arc<dyn BboxToolCapability>>,
+    bbox_catalog: BTreeSet<String>,
     remote_policy: Option<RemoteServicePolicy>,
 }
 
@@ -82,6 +87,19 @@ impl HarnessSessionServices {
         self
     }
 
+    /// Install the projected `bbox_*` tool capability plus the granted catalog
+    /// of tool names. An empty catalog registers no projected tools even when a
+    /// client is present, so a session with no grant fails closed by absence.
+    pub fn with_bbox(
+        mut self,
+        capability: Arc<dyn BboxToolCapability>,
+        catalog: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.bbox = Some(capability);
+        self.bbox_catalog = catalog.into_iter().collect();
+        self
+    }
+
     pub(crate) fn with_remote_policy(
         mut self,
         allowed_capabilities: impl IntoIterator<Item = String>,
@@ -126,6 +144,17 @@ impl HarnessSessionServices {
         self.agent.clone()
     }
 
+    pub fn bbox(&self) -> Option<Arc<dyn BboxToolCapability>> {
+        self.bbox.clone()
+    }
+
+    /// Granted projected `bbox_*` tool names for this session, in stable order.
+    /// The visibility gate uses this to hide the whole group when the `bbox`
+    /// family is unavailable on the live connection.
+    pub fn bbox_tool_names(&self) -> Vec<String> {
+        self.bbox_catalog.iter().cloned().collect()
+    }
+
     /// Resolve the session's generic tool seam, installing the worker-local
     /// implementation when no caller supplied a typed client.
     pub(crate) fn tool_or_insert_with(
@@ -152,7 +181,82 @@ impl HarnessSessionServices {
         if let Some(agent) = self.agent() {
             tools.extend(crate::agent_tools::tools(agent));
         }
+        if let Some(bbox) = self.bbox() {
+            for name in &self.bbox_catalog {
+                tools.push(Arc::new(ProjectedBboxTool {
+                    client: bbox.clone(),
+                    name: name.clone(),
+                }));
+            }
+        }
         tools
+    }
+}
+
+/// One projected daemon `bbox_*` tool. The model calls it by its real name; the
+/// call routes through the `bbox` capability RPC, where the daemon staples
+/// ambient scope and schema-validates the arguments. The input schema is a
+/// permissive object for slice 1 (the daemon is the schema authority); the
+/// description points at the identical `bbox_*` MCP tool.
+struct ProjectedBboxTool {
+    client: Arc<dyn BboxToolCapability>,
+    name: String,
+}
+
+#[async_trait]
+impl Tool for ProjectedBboxTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "Projected blackbox daemon tool. Arguments match the blackbox MCP tool \
+         of the same name; the daemon staples ambient session/task/project/bro \
+         identity and schema-validates the arguments."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "description": "Arguments for the blackbox tool of this name. \
+                            Ambient identity fields are stapled server-side.",
+            "additionalProperties": true
+        })
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let arguments = match input {
+            Value::Object(_) | Value::Null => input,
+            other => {
+                return ToolResult::Error(format!(
+                    "{}: arguments must be a JSON object, got {other}",
+                    self.name
+                ));
+            }
+        };
+        let Some(invocation_id) = cx.invocation_id() else {
+            return ToolResult::Error(
+                "projected bbox tool call is missing its stable tool invocation identity".into(),
+            );
+        };
+        match self
+            .client
+            .call_bbox_tool(
+                invocation_id,
+                ProjectedToolCall {
+                    tool: self.name.clone(),
+                    arguments,
+                },
+            )
+            .await
+        {
+            Ok(outcome) if outcome.is_error => ToolResult::Error(outcome.content),
+            Ok(outcome) => match outcome.structured_content {
+                Some(value) => ToolResult::Json(value),
+                None => ToolResult::Text(outcome.content),
+            },
+            Err(e) => ToolResult::Error(format!("{} failed: {}: {}", self.name, e.code, e.message)),
+        }
     }
 }
 
