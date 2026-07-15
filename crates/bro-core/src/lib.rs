@@ -102,6 +102,10 @@ id_type!(BroId);
 id_type!(SessionId);
 id_type!(TaskId);
 id_type!(AtomRef);
+id_type!(WorkerId);
+id_type!(OperationId);
+id_type!(AttemptId);
+id_type!(CommandId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroError {

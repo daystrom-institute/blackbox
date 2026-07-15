@@ -8,6 +8,41 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "bro-harness", disable_help_flag = false)]
 pub struct Cli {
+    /// Additive Milestone-0 worker protocol probe. This connects to fleetd,
+    /// completes the versioned handshake, exchanges one event and one status
+    /// command, then exits. It does not run a provider turn or claim session
+    /// authority.
+    #[arg(long = "worker-probe", default_value_t = false)]
+    pub worker_probe: bool,
+
+    /// fleetd's same-host Unix-domain worker socket. Required by
+    /// `--worker-probe`; later worker modes use the same explicit endpoint.
+    #[arg(long = "fleet-socket")]
+    pub fleet_socket: Option<String>,
+
+    /// Fleet-owned task identity for worker authentication.
+    #[arg(long = "task-id")]
+    pub task_id: Option<String>,
+
+    /// Fleet-owned worker identity. Defaults to a fresh UUID in probe mode.
+    #[arg(long = "worker-id")]
+    pub worker_id: Option<String>,
+
+    /// Path to a user-private file containing the one-time bootstrap
+    /// credential. Probe mode deliberately avoids putting the secret in argv;
+    /// production workers later receive the same material through a protected
+    /// session configuration or inherited descriptor.
+    #[arg(long = "bootstrap-secret-file")]
+    pub bootstrap_secret_file: Option<String>,
+
+    /// Worker protocol generations advertised during handshake.
+    #[arg(
+        long = "worker-protocol-versions",
+        value_delimiter = ',',
+        default_value = "1"
+    )]
+    pub worker_protocol_versions: Vec<u16>,
+
     /// The user turn. May be omitted when the daemon moves a large prompt to
     /// stdin (`move_large_prompt_arg_to_stdin`); in that case stdin is read.
     #[arg(short = 'p', long = "prompt")]

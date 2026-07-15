@@ -1056,6 +1056,7 @@ dependencies = [
  "bro-core",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1143,6 +1144,7 @@ dependencies = [
  "bro-core",
  "bro-lsp",
  "bro-protocol",
+ "bro-rpc",
  "bro-tools",
  "chrono",
  "clap",
@@ -1185,6 +1187,18 @@ dependencies = [
  "bro-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bro-rpc"
+version = "0.0.1"
+dependencies = [
+ "bro-core",
+ "bro-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

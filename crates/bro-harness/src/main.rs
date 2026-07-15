@@ -19,6 +19,13 @@ async fn main() {
         .init();
 
     let cli = bro_harness::cli::Cli::parse();
+    if cli.worker_probe {
+        if let Err(e) = bro_harness::worker::run_probe(&cli).await {
+            tracing::error!("worker probe failed: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = bro_harness::agent_loop::run(cli).await {
         // Surface the failure on stderr; the daemon captures it as the task's
         // stderr and marks the task failed on non-zero exit.

@@ -1,0 +1,17 @@
+[package]
+name = "bro-rpc"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+bro-protocol = { path = "../bro-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "net", "sync", "time"] }
+
+[dev-dependencies]
+bro-core = { path = "../bro-core" }
+
+[lints.clippy]
+disallowed_methods = "deny"

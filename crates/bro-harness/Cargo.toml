@@ -2,6 +2,7 @@
 name = "bro-harness"
 version = "0.0.1"
 edition = "2024"
+build = "build.rs"
 
 # The bro-harness headless coding agent. It can run as a daemon-spawned
 # subprocess or, in later slices, as a linked library while preserving the same
@@ -23,6 +24,7 @@ path = "src/lib.rs"
 bro-core = { path = "../bro-core" }
 bro-protocol = { path = "../bro-protocol" }
 bro-capabilities = { path = "../bro-capabilities" }
+bro-rpc = { path = "../bro-rpc" }
 bro-code-mode = { path = "../bro-code-mode" }
 bro-apply-patch = { path = "../bro-apply-patch" }
 bro-tools = { path = "../bro-tools" }

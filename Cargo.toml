@@ -6,6 +6,7 @@ members = [
     "crates/bro-core",
     "crates/bro-protocol",
     "crates/bro-capabilities",
+    "crates/bro-rpc",
     "crates/bro-tools",
     "crates/bro-harness",
     "crates/bro-lsp",
