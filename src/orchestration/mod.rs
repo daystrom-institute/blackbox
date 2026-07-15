@@ -56,13 +56,67 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
 ];
 
 const PROMPT_STDIN_ARG_BYTES_THRESHOLD: usize = 64 * 1024;
+const HARNESS_EXECUTION_MODE_ENV: &str = "BLACKBOX_HARNESS_EXECUTION_MODE";
+const HARNESS_SPAWN_SCRUB_ENV: &str = "BRO_HARNESS_SPAWN_SCRUB";
 
-fn harness_controls()
--> &'static RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>> {
-    static CONTROLS: OnceLock<
-        RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>>,
-    > = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HarnessExecutionMode {
+    Child,
+    InProcess,
+}
+
+#[derive(Clone)]
+enum HarnessControlSender {
+    InProcess(bro_harness::agent_loop::SessionInputSender),
+    Child(tokio::sync::mpsc::UnboundedSender<bro_harness::agent_loop::SessionInput>),
+}
+
+impl HarnessControlSender {
+    fn send(&self, input: bro_harness::agent_loop::SessionInput) -> Result<(), ()> {
+        match self {
+            Self::InProcess(tx) => tx.send(input).map_err(|_| ()),
+            Self::Child(tx) => tx.send(input).map_err(|_| ()),
+        }
+    }
+}
+
+fn harness_controls() -> &'static RwLock<HashMap<String, HarnessControlSender>> {
+    static CONTROLS: OnceLock<RwLock<HashMap<String, HarnessControlSender>>> = OnceLock::new();
     CONTROLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn harness_input_wire(input: bro_harness::agent_loop::SessionInput) -> Value {
+    match input {
+        bro_harness::agent_loop::SessionInput::User(text) => serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+            },
+        }),
+        bro_harness::agent_loop::SessionInput::Control {
+            subtype,
+            request_id,
+            mut raw,
+        } => {
+            if !raw.is_object() {
+                raw = serde_json::json!({});
+            }
+            let object = raw.as_object_mut().expect("normalized JSON object");
+            object
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String("control_request".to_string()));
+            object
+                .entry("subtype".to_string())
+                .or_insert_with(|| Value::String(subtype));
+            if let Some(request_id) = request_id {
+                object
+                    .entry("request_id".to_string())
+                    .or_insert_with(|| Value::String(request_id));
+            }
+            raw
+        }
+    }
 }
 
 // ── Task-store persist actor (control-plane starvation fix) ─────────────────
@@ -195,13 +249,9 @@ pub(crate) fn flush_persist_blocking(store: &RwLock<TaskStore>, store_dir: &std:
     }
 }
 
-/// Translate a `bro_protocol::SessionCommand` — the daemon↔client control-plane
-/// contract (harness-daemon-boundary.md §8/§11) — into the harness's internal
-/// `SessionInput` and deliver it to a live in-process session. The protocol enum
-/// is the shared schema; this is the one place it crosses into harness-local
-/// types. Every variant maps to a genuinely-handled harness path (no acked
-/// no-ops): UserTurn→User, Interrupt→interrupt control, SetModel→set_model
-/// control, Compact→the `/compact` in-stream slash command.
+/// Translate a `bro_protocol::SessionCommand` into the harness's internal
+/// input and deliver it through either the rollback in-process channel or the
+/// production child worker's NDJSON writer.
 pub fn apply_session_command(
     task_id: &str,
     command: bro_protocol::SessionCommand,
@@ -213,7 +263,7 @@ pub fn apply_session_command(
         .read()
         .get(task_id)
         .cloned()
-        .ok_or_else(|| format!("task {task_id} has no live in-process harness control channel"))?;
+        .ok_or_else(|| format!("task {task_id} has no live harness control channel"))?;
 
     let input = match command {
         SessionCommand::UserTurn { text } => SessionInput::User(text),
@@ -256,9 +306,7 @@ pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result
                 .read()
                 .get(task_id)
                 .cloned()
-                .ok_or_else(|| {
-                    format!("task {task_id} has no live in-process harness control channel")
-                })?;
+                .ok_or_else(|| format!("task {task_id} has no live harness control channel"))?;
             tx.send(bro_harness::agent_loop::SessionInput::Control {
                 subtype: "interrupt".to_string(),
                 request_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -2227,9 +2275,7 @@ pub struct SpawnTaskParams {
 /// in one-shot mode (closed after the prompt) and on spawn failure.
 pub struct SpawnedTask {
     pub task: Arc<Task>,
-    // Read only by the (removed) fleet in-process interactive launch; kept with
-    // `spawn_task_interactive` until the daemon-side dispatch is consolidated.
-    #[allow(dead_code)]
+    // The harness child adapter moves this handle into its NDJSON writer.
     pub stdin: Option<tokio::process::ChildStdin>,
 }
 
@@ -2737,6 +2783,271 @@ fn worktree_base_repo(path: &std::path::Path) -> Option<std::path::PathBuf> {
     crate::git::linked_worktree_base(path)
 }
 
+fn take_harness_execution_mode(
+    env_overrides: &mut Option<HashMap<String, String>>,
+) -> HarnessExecutionMode {
+    let per_session = env_overrides
+        .as_mut()
+        .and_then(|overrides| overrides.remove(HARNESS_EXECUTION_MODE_ENV));
+    let configured = per_session.or_else(|| std::env::var(HARNESS_EXECUTION_MODE_ENV).ok());
+    match configured.as_deref().map(str::trim) {
+        None | Some("") | Some("child") => HarnessExecutionMode::Child,
+        Some("in-process") | Some("in_process") => HarnessExecutionMode::InProcess,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "invalid harness execution mode; using production child mode"
+            );
+            HarnessExecutionMode::Child
+        }
+    }
+}
+
+struct HarnessChildLaunch {
+    args: Vec<String>,
+    initial_prompt: String,
+    env_overrides: HashMap<String, String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_harness_child_launch(
+    provider: Provider,
+    mut args: Vec<String>,
+    cwd: Option<&str>,
+    env_overrides: Option<HashMap<String, String>>,
+    shell_env: Option<std::collections::BTreeMap<String, String>>,
+    tool_placement: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, String>>,
+    self_mcp_url: Option<&str>,
+) -> anyhow::Result<HarnessChildLaunch> {
+    let initial_prompt = take_cli_value_arg(&mut args, "-p")
+        .or_else(|| take_cli_value_arg(&mut args, "--prompt"))
+        .ok_or_else(|| anyhow::anyhow!("harness child launch requires an initial prompt"))?;
+
+    set_cli_value_arg(&mut args, "--input-format", "stream-json".to_string());
+    ensure_cli_flag(&mut args, "--replay-user-messages");
+    ensure_cli_flag(&mut args, "--exit-when-idle");
+    ensure_cli_flag(&mut args, "--daemon-worker");
+    if let Some(cwd) = cwd {
+        set_cli_value_arg(&mut args, "--cwd", cwd.to_string());
+    }
+    if let Some(tool_defaults) = tool_defaults {
+        set_cli_value_arg(
+            &mut args,
+            "--additional-context",
+            serde_json::to_string(&tool_defaults)?,
+        );
+    }
+    if let Some(shell_env) = shell_env {
+        set_cli_value_arg(&mut args, "--shell-env", serde_json::to_string(&shell_env)?);
+    }
+
+    if let Some(config) = build_harness_mcp_config(&mut args, tool_placement, self_mcp_url)? {
+        set_cli_value_arg(&mut args, "--mcp-config", config.to_json()?);
+    }
+
+    let mut env_overrides = env_overrides.unwrap_or_default();
+    env_overrides
+        .entry("BRO_HARNESS_PROVIDER".to_string())
+        .or_insert_with(|| provider.as_str().to_string());
+    if let Ok(bro_home) = std::env::var("BRO_HOME") {
+        env_overrides
+            .entry("BRO_HOME".to_string())
+            .or_insert(bro_home);
+    }
+    let mut scrub_keys = BLACKBOX_SERVICE_ENV_VARS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    scrub_keys.extend(env_overrides.keys().cloned());
+    scrub_keys.insert(HARNESS_SPAWN_SCRUB_ENV.to_string());
+    env_overrides.insert(
+        HARNESS_SPAWN_SCRUB_ENV.to_string(),
+        scrub_keys.into_iter().collect::<Vec<_>>().join(","),
+    );
+
+    Ok(HarnessChildLaunch {
+        args,
+        initial_prompt,
+        env_overrides,
+    })
+}
+
+fn set_cli_value_arg(args: &mut Vec<String>, flag: &str, value: String) {
+    let _ = take_cli_value_arg(args, flag);
+    args.extend([flag.to_string(), value]);
+}
+
+fn ensure_cli_flag(args: &mut Vec<String>, flag: &str) {
+    if !args.iter().any(|arg| arg == flag) {
+        args.push(flag.to_string());
+    }
+}
+
+fn spawn_child_control_writer(
+    task_id: String,
+    mut stdin: tokio::process::ChildStdin,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<bro_harness::agent_loop::SessionInput>,
+) {
+    tokio::spawn(async move {
+        while let Some(input) = rx.recv().await {
+            let mut line = match serde_json::to_vec(&harness_input_wire(input)) {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::warn!(task_id = %task_id, %error, "failed to serialize harness input");
+                    break;
+                }
+            };
+            line.push(b'\n');
+            if let Err(error) = stdin.write_all(&line).await {
+                tracing::debug!(task_id = %task_id, %error, "harness child stdin closed");
+                break;
+            }
+        }
+        let _ = stdin.shutdown().await;
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn failed_harness_child_setup(
+    task_id: String,
+    provider: Provider,
+    session_id: String,
+    cwd: Option<String>,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    roster_events: Option<RosterEventSink>,
+    bro_label: Option<String>,
+    agent_label: Option<String>,
+    error: anyhow::Error,
+    origin: bro_core::Origin,
+) -> Arc<Task> {
+    if let Err(reservation_error) = task_store.write().reserve_id(&task_id) {
+        if let Some(existing) = task_store.read().get(&task_id) {
+            return existing;
+        }
+        return failed_duplicate_task(
+            task_id,
+            provider,
+            session_id,
+            cwd,
+            bro_label,
+            agent_label,
+            reservation_error.to_string(),
+            origin,
+        );
+    }
+    let mut task = failed_duplicate_task(
+        task_id.clone(),
+        provider,
+        session_id,
+        cwd,
+        bro_label,
+        agent_label,
+        format!("harness child setup failed: {error:#}"),
+        origin,
+    );
+    Arc::get_mut(&mut task)
+        .expect("new failed task is unique")
+        .roster_events = roster_events;
+    if task_store
+        .write()
+        .insert_reserved(task_id, task.clone())
+        .is_err()
+    {
+        return task;
+    }
+    task.emit_roster_added();
+    request_persist(&task_store, &store_dir);
+    task.notify.notify_waiters();
+    task
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_harness_child_task(
+    task_id: String,
+    provider: Provider,
+    args: Vec<String>,
+    session_id: String,
+    cwd: Option<String>,
+    env_overrides: Option<HashMap<String, String>>,
+    shell_env: Option<std::collections::BTreeMap<String, String>>,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    roster_events: Option<RosterEventSink>,
+    bro_label: Option<String>,
+    agent_label: Option<String>,
+    tool_placement: Option<BTreeMap<String, String>>,
+    tool_defaults: Option<BTreeMap<String, String>>,
+    _session_services: HarnessSessionServices,
+    system_events: Option<crate::system_events::SharedEventHub>,
+    origin: bro_core::Origin,
+) -> Arc<Task> {
+    let self_mcp_url = std::env::var("BLACKBOX_MCP_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .map(|url| crate::dispatch_mcp::dispatch_mcp_url_for_origin(&url, origin));
+    let launch = match prepare_harness_child_launch(
+        provider,
+        args,
+        cwd.as_deref(),
+        env_overrides,
+        shell_env,
+        tool_placement,
+        tool_defaults,
+        self_mcp_url.as_deref(),
+    ) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return failed_harness_child_setup(
+                task_id,
+                provider,
+                session_id,
+                cwd,
+                store_dir,
+                task_store,
+                roster_events,
+                bro_label,
+                agent_label,
+                error,
+                origin,
+            );
+        }
+    };
+
+    let spawned = spawn_task_interactive(
+        task_id.clone(),
+        provider,
+        launch.args,
+        session_id,
+        cwd,
+        Some(launch.env_overrides),
+        store_dir,
+        task_store,
+        tail_tx,
+        roster_events,
+        bro_label,
+        agent_label,
+        system_events,
+        origin,
+    );
+    if let Some(stdin) = spawned.stdin {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(bro_harness::agent_loop::SessionInput::User(
+            launch.initial_prompt,
+        ));
+        harness_controls()
+            .write()
+            .insert(task_id.clone(), HarnessControlSender::Child(tx));
+        spawn_child_control_writer(task_id.clone(), stdin, rx);
+        if spawned.task.inner.lock().status.is_terminal() {
+            harness_controls().write().remove(&task_id);
+        }
+    }
+    spawned.task
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_task_with_tool_placement(
     task_id: String,
@@ -2757,6 +3068,8 @@ pub fn spawn_task_with_tool_placement(
     system_events: Option<crate::system_events::SharedEventHub>,
     origin: bro_core::Origin,
 ) -> Arc<Task> {
+    let mut env_overrides = env_overrides;
+    let harness_mode = take_harness_execution_mode(&mut env_overrides);
     // A session must never inherit the daemon's process cwd ($HOME under
     // launchd): a dispatch without an explicit cwd used to confine the
     // session's file tools to the operator's home directory and write there
@@ -2790,8 +3103,7 @@ pub fn spawn_task_with_tool_placement(
     let dispatch_shell_env = project_dispatch_shell_env(cwd.as_deref());
     // Cockpit dispatches additionally carry the operator's fleet.json
     // `mcpServers`, injected as `--mcp-config` argv that
-    // build_in_process_mcp_config consumes at spawn (and that a future
-    // standalone harness subprocess would parse itself) — see
+    // build_harness_mcp_config consumes at spawn for both execution modes. See
     // fleet_mcp_dispatch_args for the origin policy.
     let mut args = args;
     args.extend(fleet_mcp_dispatch_args(provider, origin));
@@ -2803,26 +3115,48 @@ pub fn spawn_task_with_tool_placement(
             | Provider::Brodex
             | Provider::VibeBh
     ) {
-        return spawn_harness_in_process_task(
-            task_id,
-            provider,
-            args,
-            session_id,
-            cwd,
-            env_overrides,
-            dispatch_shell_env,
-            store_dir,
-            task_store,
-            tail_tx,
-            roster_events.clone(),
-            bro_label,
-            agent_label,
-            tool_placement,
-            tool_defaults,
-            session_services,
-            system_events,
-            origin,
-        );
+        return match harness_mode {
+            HarnessExecutionMode::Child => spawn_harness_child_task(
+                task_id,
+                provider,
+                args,
+                session_id,
+                cwd,
+                env_overrides,
+                dispatch_shell_env,
+                store_dir,
+                task_store,
+                tail_tx,
+                roster_events,
+                bro_label,
+                agent_label,
+                tool_placement,
+                tool_defaults,
+                session_services,
+                system_events,
+                origin,
+            ),
+            HarnessExecutionMode::InProcess => spawn_harness_in_process_task(
+                task_id,
+                provider,
+                args,
+                session_id,
+                cwd,
+                env_overrides,
+                dispatch_shell_env,
+                store_dir,
+                task_store,
+                tail_tx,
+                roster_events,
+                bro_label,
+                agent_label,
+                tool_placement,
+                tool_defaults,
+                session_services,
+                system_events,
+                origin,
+            ),
+        };
     }
 
     // CLI providers: shells inherit the spawned child's process env, so the
@@ -2937,7 +3271,7 @@ fn spawn_harness_in_process_task(
     let (control_tx, control_rx) = bro_harness::agent_loop::session_input_channel();
     harness_controls()
         .write()
-        .insert(task_id.clone(), control_tx);
+        .insert(task_id.clone(), HarnessControlSender::InProcess(control_tx));
     let callback = Arc::new(move |evt: Value| {
         ingest_harness_event(
             &task_for_events,
@@ -2957,7 +3291,7 @@ fn spawn_harness_in_process_task(
                 .filter(|s| !s.is_empty())
                 .map(|url| crate::dispatch_mcp::dispatch_mcp_url_for_origin(&url, origin));
             let mcp_config =
-                build_in_process_mcp_config(&mut args, tool_placement, self_mcp_url.as_deref())?;
+                build_harness_mcp_config(&mut args, tool_placement, self_mcp_url.as_deref())?;
             run_harness_in_process(
                 args,
                 cwd,
@@ -3030,6 +3364,30 @@ fn snippet_tail(msg: &str, n: usize) -> String {
     }
 }
 
+/// Apply the harness stream contract for a terminal errored result.
+///
+/// A harness turn reports provider and tool failures in-band and may still
+/// exit successfully because the stream itself was delivered correctly. Both
+/// the in-process rollback path and the child process path must therefore
+/// derive task failure from the event, not only from the process exit status.
+fn apply_harness_result_failure(inner: &mut TaskInner, evt: &Value) {
+    if evt.get("type").and_then(Value::as_str) != Some("result")
+        || evt.get("is_error").and_then(Value::as_bool) != Some(true)
+    {
+        return;
+    }
+
+    if inner.status != TaskStatus::Cancelled {
+        inner.status = TaskStatus::Failed;
+    }
+    if let Some(msg) = evt.get("result").and_then(Value::as_str)
+        && !msg.trim().is_empty()
+    {
+        inner.stderr.push_str(msg);
+        inner.stderr.push('\n');
+    }
+}
+
 fn ingest_harness_event(
     task: &Task,
     provider: Provider,
@@ -3083,24 +3441,7 @@ fn ingest_harness_event(
                 .supervision
                 .observe_event(&evt, &sink, &supervision::config(), now_ms());
             apply_sink_updates(&mut inner, sink);
-            // A terminal `result` event with `is_error: true` fails the task and
-            // preserves the message in stderr. The subprocess path derives this
-            // from a non-zero exit code, but the in-process harness loop returns
-            // Ok regardless of turn outcome, so without this an errored turn
-            // would be recorded as a silent successful completion (gap-32113fd4).
-            if evt.get("type").and_then(Value::as_str) == Some("result")
-                && evt.get("is_error").and_then(Value::as_bool) == Some(true)
-            {
-                if inner.status != TaskStatus::Cancelled {
-                    inner.status = TaskStatus::Failed;
-                }
-                if let Some(msg) = evt.get("result").and_then(Value::as_str)
-                    && !msg.trim().is_empty()
-                {
-                    inner.stderr.push_str(msg);
-                    inner.stderr.push('\n');
-                }
-            }
+            apply_harness_result_failure(&mut inner, &evt);
             // Store the event LAST so it moves instead of deep-cloning.
             // Stream deltas are not stored at all: every ring consumer
             // either filters them at read time (compact_status_event) or
@@ -3228,7 +3569,7 @@ async fn run_harness_in_process(
     .await
 }
 
-fn build_in_process_mcp_config(
+fn build_harness_mcp_config(
     args: &mut Vec<String>,
     tool_placement: Option<BTreeMap<String, String>>,
     self_mcp_url: Option<&str>,
@@ -3317,13 +3658,10 @@ fn parse_dispatch_tool_placement(
 /// difference is that stdin stays open.
 ///
 /// Args should already include `--input-format stream-json` (and typically
-/// `--replay-user-messages`); the initial `-p <prompt>` becomes the first user
-/// turn, subsequent turns/controls are written to the returned stdin.
+/// `--replay-user-messages`). The caller owns initial and later messages through
+/// the returned stdin; it may still keep an initial `-p` argument for a driver
+/// that uses that compatibility shape.
 ///
-/// Orphaned by the §7 fleet-daemon-only cut (its only caller was the fleet
-/// in-process launch). Kept until the daemon-side dispatch is consolidated;
-/// remove together with the rest of the in-process spawn machinery.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_task_interactive(
     task_id: String,
@@ -3335,6 +3673,7 @@ pub fn spawn_task_interactive(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    roster_events: Option<RosterEventSink>,
     bro_label: Option<String>,
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
@@ -3371,7 +3710,7 @@ pub fn spawn_task_interactive(
         store_dir,
         task_store,
         tail_tx,
-        roster_events: None,
+        roster_events,
         bro_label,
         agent_label,
         system_events,
@@ -3577,6 +3916,19 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         }
     }
     for key in BLACKBOX_SERVICE_ENV_VARS {
+        if interactive
+            && *key == "BRO_HOME"
+            && matches!(
+                provider,
+                Provider::Glm
+                    | Provider::Deepseek
+                    | Provider::Minimax
+                    | Provider::Brodex
+                    | Provider::VibeBh
+            )
+        {
+            continue;
+        }
         cmd.env_remove(key);
     }
 
@@ -3831,6 +4183,16 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                                 now_ms(),
                             );
                             apply_sink_updates(&mut inner, sink);
+                            if matches!(
+                                provider,
+                                Provider::Glm
+                                    | Provider::Deepseek
+                                    | Provider::Minimax
+                                    | Provider::Brodex
+                                    | Provider::VibeBh
+                            ) {
+                                apply_harness_result_failure(&mut inner, &evt);
+                            }
                         }
                         let snippet_to_emit = accepted
                             .then(|| {
@@ -4093,6 +4455,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         }
 
         // Persist and notify waiters
+        harness_controls().write().remove(&task_id_wait);
         request_persist(&task_store, &store_dir);
         task_ref_wait.notify.notify_waiters();
     });
@@ -4840,7 +5203,9 @@ mod tests {
 
         let task_id = "test-session-command-mapping";
         let (tx, mut rx) = session_input_channel();
-        harness_controls().write().insert(task_id.to_string(), tx);
+        harness_controls()
+            .write()
+            .insert(task_id.to_string(), HarnessControlSender::InProcess(tx));
 
         // UserTurn -> User
         apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
@@ -4881,11 +5246,263 @@ mod tests {
         let err =
             apply_session_command("no-such-live-task", bro_protocol::SessionCommand::Interrupt)
                 .unwrap_err();
-        assert!(err.contains("no live in-process harness control channel"));
+        assert!(err.contains("no live harness control channel"));
     }
 
     #[test]
-    fn in_process_mcp_config_strips_cli_arg_and_applies_dispatch_placement() {
+    fn harness_input_wire_preserves_user_and_control_contracts() {
+        use bro_harness::agent_loop::SessionInput;
+
+        assert_eq!(
+            harness_input_wire(SessionInput::User("hello".into())),
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+            })
+        );
+
+        let control = harness_input_wire(SessionInput::Control {
+            subtype: "set_model".into(),
+            request_id: Some("request-1".into()),
+            raw: serde_json::json!({"model": "glm-worker"}),
+        });
+        assert_eq!(control["type"], "control_request");
+        assert_eq!(control["subtype"], "set_model");
+        assert_eq!(control["request_id"], "request-1");
+        assert_eq!(control["model"], "glm-worker");
+    }
+
+    #[test]
+    fn harness_execution_mode_defaults_child_and_allows_scoped_rollback() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.remove(HARNESS_EXECUTION_MODE_ENV);
+
+        let mut no_override = None;
+        assert_eq!(
+            take_harness_execution_mode(&mut no_override),
+            HarnessExecutionMode::Child
+        );
+
+        env.set(HARNESS_EXECUTION_MODE_ENV, "child");
+        let mut rollback = Some(HashMap::from([(
+            HARNESS_EXECUTION_MODE_ENV.to_string(),
+            "in-process".to_string(),
+        )]));
+        assert_eq!(
+            take_harness_execution_mode(&mut rollback),
+            HarnessExecutionMode::InProcess
+        );
+        assert!(
+            !rollback
+                .as_ref()
+                .unwrap()
+                .contains_key(HARNESS_EXECUTION_MODE_ENV),
+            "the daemon-only selector must not leak into the worker env"
+        );
+    }
+
+    #[test]
+    fn harness_child_launch_carries_session_policy_without_prompt_in_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let bro_home = root.join("bro-home");
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BRO_HOME", &bro_home);
+        env.set("BLACKBOX_MCP_NAME", "selfbox");
+
+        let launch = prepare_harness_child_launch(
+            Provider::Glm,
+            vec![
+                "-p".into(),
+                "initial prompt".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--session-id".into(),
+                "session-1".into(),
+                "--model".into(),
+                "glm-worker".into(),
+            ],
+            Some(root.to_str().unwrap()),
+            Some(HashMap::from([(
+                "ZHIPU_API_KEY".to_string(),
+                "transport-secret".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "RUSTC_WRAPPER".to_string(),
+                "sccache".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "mcp__selfbox__bbox_stats".to_string(),
+                "in-box".to_string(),
+            )])),
+            Some(BTreeMap::from([(
+                "builtin:file_read.file_path".to_string(),
+                "src/lib.rs".to_string(),
+            )])),
+            Some("http://127.0.0.1:7264/mcp?surface=agent-internal"),
+        )
+        .unwrap();
+
+        assert_eq!(launch.initial_prompt, "initial prompt");
+        assert!(!launch.args.iter().any(|arg| arg == "-p"));
+        for flag in [
+            "--replay-user-messages",
+            "--exit-when-idle",
+            "--daemon-worker",
+        ] {
+            assert!(launch.args.iter().any(|arg| arg == flag), "missing {flag}");
+        }
+        let arg_value = |flag: &str| {
+            launch
+                .args
+                .iter()
+                .position(|arg| arg == flag)
+                .and_then(|idx| launch.args.get(idx + 1))
+                .map(String::as_str)
+        };
+        assert_eq!(arg_value("--input-format"), Some("stream-json"));
+        assert_eq!(arg_value("--cwd"), root.to_str());
+        assert_eq!(arg_value("--session-id"), Some("session-1"));
+        assert_eq!(arg_value("--model"), Some("glm-worker"));
+        assert_eq!(
+            serde_json::from_str::<Value>(arg_value("--shell-env").unwrap()).unwrap(),
+            serde_json::json!({"RUSTC_WRAPPER": "sccache"})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(arg_value("--additional-context").unwrap()).unwrap(),
+            serde_json::json!({"builtin:file_read.file_path": "src/lib.rs"})
+        );
+        let mcp =
+            bro_harness::mcp::McpConfig::from_json(arg_value("--mcp-config").unwrap()).unwrap();
+        assert!(mcp.servers.iter().any(|server| matches!(
+            server,
+            bro_harness::mcp::McpServerConfig::Http { name, url, .. }
+                if name == "selfbox"
+                    && url == "http://127.0.0.1:7264/mcp?surface=agent-internal"
+        )));
+        assert_eq!(
+            launch.env_overrides.get("BRO_HOME"),
+            Some(&bro_home.to_string_lossy().into_owned())
+        );
+        let scrub = launch
+            .env_overrides
+            .get(HARNESS_SPAWN_SCRUB_ENV)
+            .unwrap()
+            .split(',')
+            .collect::<HashSet<_>>();
+        assert!(scrub.contains("ZHIPU_API_KEY"));
+        assert!(scrub.contains("BRO_HOME"));
+        assert!(scrub.contains(HARNESS_SPAWN_SCRUB_ENV));
+    }
+
+    #[test]
+    fn harness_error_result_fails_task_and_preserves_diagnostic() {
+        let task = test_task("worker-error", TaskStatus::Running, Provider::Glm);
+        let event = serde_json::json!({
+            "type": "result",
+            "is_error": true,
+            "result": "synthetic worker failure",
+        });
+        let mut inner = task.inner.lock();
+        apply_harness_result_failure(&mut inner, &event);
+        assert_eq!(inner.status, TaskStatus::Failed);
+        assert_eq!(inner.stderr, "synthetic worker failure\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_worker_error_is_isolated_even_when_process_exits_zero() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let worker = root.join("fake-bro-harness");
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+if [ "$FAKE_CHILD_MODE" = "error" ]; then
+  printf '%s\n' '{"type":"result","subtype":"error","is_error":true,"result":"synthetic child failure","usage":{},"num_turns":1}'
+  exit 0
+fi
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"sibling completed","usage":{},"num_turns":1}'
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&worker).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&worker, permissions).unwrap();
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BRO_HARNESS_BIN", &worker);
+        env.set("BRO_HOME", root.join("bro-home"));
+        env.remove(HARNESS_EXECUTION_MODE_ENV);
+        env.remove("BLACKBOX_MCP_URL");
+
+        let store_dir = root.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let task_store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _) = tokio::sync::broadcast::channel(16);
+        let spawn = |task_id: &str, session_id: &str, mode: &str| {
+            spawn_task_with_tool_placement(
+                task_id.to_string(),
+                Provider::Glm,
+                vec![
+                    "-p".into(),
+                    "probe".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--session-id".into(),
+                    session_id.to_string(),
+                ],
+                session_id.to_string(),
+                Some(root.to_string_lossy().into_owned()),
+                Some(HashMap::from([(
+                    "FAKE_CHILD_MODE".to_string(),
+                    mode.to_string(),
+                )])),
+                store_dir.clone(),
+                task_store.clone(),
+                tail_tx.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                HarnessSessionServices::standalone(),
+                None,
+                bro_core::Origin::AgentDispatch,
+            )
+        };
+
+        let failed = spawn("child-failed", "session-failed", "error");
+        assert!(wait_for_task_with_timeout(&failed, Some(5.0)).await);
+        {
+            let inner = failed.inner.lock();
+            assert_eq!(inner.status, TaskStatus::Failed);
+            assert_eq!(inner.exit_code, Some(0));
+            assert!(inner.stderr.contains("synthetic child failure"));
+        }
+
+        let sibling = spawn("child-sibling", "session-sibling", "success");
+        assert!(wait_for_task_with_timeout(&sibling, Some(5.0)).await);
+        {
+            let inner = sibling.inner.lock();
+            assert_eq!(inner.status, TaskStatus::Completed);
+            assert_eq!(inner.exit_code, Some(0));
+            assert_eq!(
+                inner.last_assistant_message.as_deref(),
+                Some("sibling completed")
+            );
+        }
+        assert_eq!(failed.inner.lock().status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn harness_mcp_config_strips_cli_arg_and_applies_dispatch_placement() {
         let mut env = crate::util::TestEnvGuard::new();
         env.set("BLACKBOX_MCP_NAME", "selfbox");
 
@@ -4909,7 +5526,7 @@ mod tests {
             "--effort".to_string(),
             "low".to_string(),
         ];
-        let config = build_in_process_mcp_config(
+        let config = build_harness_mcp_config(
             &mut args,
             Some(BTreeMap::from([(
                 "mcp__external__placed".to_string(),
@@ -4949,12 +5566,12 @@ mod tests {
     }
 
     #[test]
-    fn in_process_mcp_config_uses_supplied_self_mcp_surface_url() {
+    fn harness_mcp_config_uses_supplied_self_mcp_surface_url() {
         let mut env = crate::util::TestEnvGuard::new();
         env.set("BLACKBOX_MCP_NAME", "selfbox");
         let mut args = Vec::new();
 
-        let config = build_in_process_mcp_config(
+        let config = build_harness_mcp_config(
             &mut args,
             None,
             Some("http://127.0.0.1:7264/mcp?surface=agent-internal"),
@@ -4996,7 +5613,7 @@ mod tests {
         // Cockpit origin end-to-end: fleet.json beside the selected config
         // (BLACKBOX_CONFIG keys the lookup, keeping the test off the host's
         // real config) lands in the dispatch argv as `--mcp-config`, and
-        // build_in_process_mcp_config merges it with the transient blackbox
+        // build_harness_mcp_config merges it with the transient blackbox
         // server — the same consumption the spawn path runs.
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -5018,7 +5635,7 @@ mod tests {
         let mut args = fleet_mcp_dispatch_args(Provider::Glm, bro_core::Origin::Cockpit);
         assert_eq!(args[0], "--mcp-config");
 
-        let config = build_in_process_mcp_config(
+        let config = build_harness_mcp_config(
             &mut args,
             None,
             Some("http://127.0.0.1:7264/mcp?surface=default"),

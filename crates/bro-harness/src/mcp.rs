@@ -97,6 +97,79 @@ impl McpConfig {
             tool_placement: parse_tool_placement_value(&v),
         })
     }
+
+    /// Serialize the transport-neutral MCP config back to the harness CLI
+    /// shape. Daemon workerization uses this after merging the transient
+    /// blackbox MCP endpoint and per-dispatch placement policy.
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        let mut servers = serde_json::Map::new();
+        for server in &self.servers {
+            let (name, value) = match server {
+                McpServerConfig::Http {
+                    name,
+                    url,
+                    headers,
+                    exclude_tools,
+                } => (
+                    name,
+                    serde_json::json!({
+                        "type": "http",
+                        "url": url,
+                        "headers": headers,
+                        "exclude_tools": exclude_tools,
+                    }),
+                ),
+                McpServerConfig::Sse {
+                    name,
+                    url,
+                    headers,
+                    exclude_tools,
+                } => (
+                    name,
+                    serde_json::json!({
+                        "type": "sse",
+                        "url": url,
+                        "headers": headers,
+                        "exclude_tools": exclude_tools,
+                    }),
+                ),
+                McpServerConfig::Stdio {
+                    name,
+                    command,
+                    args,
+                    env,
+                } => (
+                    name,
+                    serde_json::json!({
+                        "type": "stdio",
+                        "command": command,
+                        "args": args,
+                        "env": env,
+                    }),
+                ),
+                McpServerConfig::InProcess { name, .. } => {
+                    anyhow::bail!("cannot serialize in-process MCP server {name} for a worker")
+                }
+            };
+            servers.insert(name.clone(), value);
+        }
+        let placements = self
+            .tool_placement
+            .iter()
+            .map(|(name, placement)| {
+                let placement = match placement {
+                    ToolPlacement::InBox => "in-box",
+                    ToolPlacement::OutBox => "out-box",
+                    ToolPlacement::Both => "both",
+                };
+                (name.clone(), Value::String(placement.to_string()))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        Ok(serde_json::to_string(&serde_json::json!({
+            "mcpServers": servers,
+            "tool_placement": placements,
+        }))?)
+    }
 }
 
 #[derive(Clone)]
@@ -729,6 +802,79 @@ mod tests {
             }
             _ => panic!("expected http server"),
         }
+    }
+
+    #[test]
+    fn cli_json_config_round_trips_worker_transports_and_placement() {
+        let original = McpConfig::from_json(
+            r#"{
+                "mcpServers": {
+                    "blackbox": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:7264/mcp",
+                        "headers": {"X-Dispatch": "worker"},
+                        "exclude_tools": ["bro_exec"]
+                    },
+                    "events": {
+                        "type": "sse",
+                        "url": "http://127.0.0.1:7265/events"
+                    },
+                    "local": {
+                        "type": "stdio",
+                        "command": "/opt/bin/local-mcp",
+                        "args": ["--once"],
+                        "env": {"LOCAL_SCOPE": "worker"}
+                    }
+                },
+                "tool_placement": {
+                    "mcp__blackbox__bbox_stats": "in-box",
+                    "mcp__local__probe": "both"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let encoded = original.to_json().unwrap();
+        let decoded = McpConfig::from_json(&encoded).unwrap();
+
+        assert_eq!(decoded.servers.len(), 3);
+        assert!(decoded.servers.iter().any(|server| matches!(
+            server,
+            McpServerConfig::Http {
+                name,
+                url,
+                headers,
+                exclude_tools,
+            } if name == "blackbox"
+                && url == "http://127.0.0.1:7264/mcp"
+                && headers.get("X-Dispatch").map(String::as_str) == Some("worker")
+                && exclude_tools == &["bro_exec".to_string()]
+        )));
+        assert!(decoded.servers.iter().any(|server| matches!(
+            server,
+            McpServerConfig::Sse { name, url, .. }
+                if name == "events" && url == "http://127.0.0.1:7265/events"
+        )));
+        assert!(decoded.servers.iter().any(|server| matches!(
+            server,
+            McpServerConfig::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } if name == "local"
+                && command == "/opt/bin/local-mcp"
+                && args == &["--once".to_string()]
+                && env.get("LOCAL_SCOPE").map(String::as_str) == Some("worker")
+        )));
+        assert_eq!(
+            decoded.tool_placement.get("mcp__blackbox__bbox_stats"),
+            Some(&ToolPlacement::InBox)
+        );
+        assert_eq!(
+            decoded.tool_placement.get("mcp__local__probe"),
+            Some(&ToolPlacement::Both)
+        );
     }
 
     #[test]

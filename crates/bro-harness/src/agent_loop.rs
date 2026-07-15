@@ -104,6 +104,20 @@ impl Tool for FinalResultTool {
 
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
+    if cli.daemon_worker {
+        let scrub = std::env::var("BRO_HARNESS_SPAWN_SCRUB")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .collect();
+        return bro_tools::shell::with_spawn_scrub(
+            scrub,
+            run_with_emitter(cli, None, None, HarnessSessionServices::standalone()),
+        )
+        .await;
+    }
     run_with_emitter(cli, None, None, HarnessSessionServices::standalone()).await
 }
 
@@ -224,6 +238,7 @@ async fn run_session(
     services: HarnessSessionServices,
 ) -> Result<()> {
     let replay = cli.replay_user_messages;
+    let exit_when_idle = cli.exit_when_idle;
     let mut session = Session::build(
         &cli,
         callback.clone(),
@@ -239,7 +254,7 @@ async fn run_session(
     // The stdin reader runs as its own task so control messages (interrupt)
     // arrive while a turn is in flight. It owns a clone of the emitter purely to
     // honour `--replay-user-messages`.
-    let input_rx = spawn_stdin_reader(
+    let mut input_rx = spawn_stdin_reader(
         replay,
         make_emitter(sid.clone(), callback.clone(), Some(session.event_log())),
     );
@@ -254,7 +269,13 @@ async fn run_session(
         pending.push_back(p);
     }
 
-    session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    if exit_when_idle {
+        await_first_controlled_input(&mut session, &mut input_rx, &ctrl_emitter, &mut pending)
+            .await;
+        session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    } else {
+        session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    }
     let body = session.persist_body()?;
     let path = session.store_path().to_path_buf();
     tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
@@ -510,6 +531,32 @@ async fn session_loop_until_idle(
         }
     }
     Ok(())
+}
+
+/// Child compatibility mode sends the initial prompt over stdin rather than
+/// argv. Wait for that first message before switching to non-blocking idle
+/// draining, otherwise process startup can outrun the stdin reader and exit
+/// without executing a turn.
+async fn await_first_controlled_input(
+    session: &mut Session,
+    input_rx: &mut mpsc::UnboundedReceiver<Input>,
+    ctrl_emitter: &Emitter,
+    pending: &mut VecDeque<String>,
+) {
+    while pending.is_empty() {
+        match input_rx.recv().await {
+            Some(Input::User(prompt)) => pending.push_back(prompt),
+            Some(Input::Control {
+                subtype,
+                req_id,
+                raw,
+            }) => {
+                session.apply_control(&subtype, &raw);
+                ctrl_emitter.control_response_success(req_id.as_deref());
+            }
+            None => break,
+        }
+    }
 }
 
 async fn run_prompt_with_controls(
@@ -3460,6 +3507,37 @@ mod tests {
             &["alpha".to_string(), "beta".to_string()]
         );
         assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn exit_when_idle_waits_for_delayed_first_stdin_turn() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            tx.send(Input::User("delayed prompt".into())).unwrap();
+        });
+        let ctrl = Emitter::new("ctrl".into());
+        let mut pending = VecDeque::new();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            await_first_controlled_input(&mut session, &mut rx, &ctrl, &mut pending),
+        )
+        .await
+        .expect("worker must wait for the daemon's first stdin message");
+        writer.await.unwrap();
+        assert_eq!(pending.front().map(String::as_str), Some("delayed prompt"));
+
+        session_loop_until_idle(&mut session, rx, &ctrl, pending)
+            .await
+            .unwrap();
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(
+            user_turns_after_initial_context(&users),
+            &["delayed prompt".to_string()]
+        );
+        assert_eq!(shared.completed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

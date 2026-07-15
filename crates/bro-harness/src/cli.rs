@@ -60,6 +60,19 @@ pub struct Cli {
     #[arg(long = "input-format")]
     pub input_format: Option<String>,
 
+    /// Daemon-supervised compatibility mode: consume queued stdin messages
+    /// but exit once the current turn and all already-buffered controls are
+    /// complete. This preserves the pre-worker one-task-per-dispatch lifecycle
+    /// while moving provider and V8 execution into this process.
+    #[arg(long = "exit-when-idle", default_value_t = false)]
+    pub exit_when_idle: bool,
+
+    /// Marks a same-host daemon-supervised worker. Shell children scrub the
+    /// host/session env keys named by `BRO_HARNESS_SPAWN_SCRUB` while provider
+    /// transports in this process retain them.
+    #[arg(long = "daemon-worker", default_value_t = false, hide = true)]
+    pub daemon_worker: bool,
+
     /// Re-emit each stdin user message back on stdout as a `user` event (gated
     /// on stream-json in/out). Mirrors the claude CLI's `--replay-user-messages`.
     #[arg(long = "replay-user-messages", default_value_t = false)]
