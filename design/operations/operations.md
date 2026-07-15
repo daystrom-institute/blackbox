@@ -15,6 +15,7 @@ bundle/doctor support, and evented coordination.
 ## Docs
 
 - [Config And Artifact Operations](config-artifacts/config-and-artifact-operations.md)
+- [Pluggable Secrets Providers](config-artifacts/secrets-provider.md)
 - [Evented Coordination](events/evented-coordination.md)
 
 ## Crosscuts

@@ -306,6 +306,9 @@ or system memories and link/pointer from here.
   First domain + charter: `specs/bro-harness/bro-harness-spec.md`.
 - `design/list-design-docs.sh` - list design docs whose frontmatter lifecycle
   is `proposed` or `partial`.
+- `design/connectors/` - topic home for remote-source connectors: pluggable
+  adapters onto remote file/document stores (Google Drive, OneDrive/
+  SharePoint, iCloud, WebDAV, S3) mounted as indexable projects.
 - `design/corpus/` - topic home for agentic corpus, knowledge/memory, notes,
   storage, code navigation, provenance, roadmap, and Badgey designs.
 - `design/orchestration/` - topic home for atoms, agents, workflows,
