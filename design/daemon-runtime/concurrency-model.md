@@ -57,6 +57,15 @@ brief: "Holistic concurrency architecture for blackboxd: current as-built map, t
 > File:line citations are point-in-time from the original survey at commit
 > 9cb5228; verify against code.
 
+> **2026-07 process-topology revision.** The rejection of a second Tokio runtime
+> in this document remains valid as a scheduling decision inside one process. It
+> did not decide whether corpus, fleet coordination, and harness sessions should
+> share a process, build, or restart domain. The
+> [process topology](process-topology.md) now distributes the logical planes
+> across blackboxd, blackopsd, fleetd, and per-session bro-harness workers. The lock,
+> blocking-I/O, owner-actor, backpressure, and snapshot invariants below remain
+> binding inside every resulting service.
+
 ## 0. Thesis
 
 blackboxd grew by rapid bolt-on: every new subsystem (stores, indexing,
@@ -197,6 +206,12 @@ These are the rules new code must satisfy and migration drives old code toward:
   *valid* JSON error envelope.
 
 ## 4. Target architecture: four planes, owner actors
+
+The diagram below is the target ownership shape within the original blackboxd
+consolidation. Under the process topology, control and dispatch move primarily
+to blackopsd, fleetd, and bro-harness workers, while corpus stores and indexes
+remain in blackboxd. Plane messages that cross processes use typed RPC; messages
+within a process continue using owner actors and bounded channels.
 
 ### 4.1 Plane map
 
@@ -354,8 +369,10 @@ fleet load, and Phases 0–2 remove the amplifiers first.
 - `thread-935b467d` A1–A4 are Phase 0/1/2 instances; the thread remains the
   execution tracker.
 - `gap-a4e13310` (notes fsync + batch resolve) is subsumed by Phase 1.
-- The harness–daemon boundary doc (design/bro-harness/harness-daemon-boundary.md)
-  is upstream context: in-process consolidation is *why* harness load now
-  shares the daemon runtime, which is what makes I1/I2 load-bearing.
+- [Process topology](process-topology.md) supersedes the in-process placement but
+  not these concurrency invariants. I1 through I7 apply independently inside
+  blackboxd, blackopsd, fleetd, and each worker.
+- [Harness-daemon boundary](../bro-harness/harness-daemon-boundary.md) defines the
+  compile and capability constraints across those processes.
 - `TaskPersister` + the system-events journal/outbox are prior art for the
   owner-actor pattern; this doc generalizes rather than invents.

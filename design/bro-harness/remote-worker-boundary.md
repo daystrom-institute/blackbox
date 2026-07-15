@@ -1,5 +1,5 @@
 ---
-title: "The remote-worker boundary: what stays in the daemon when the harness leaves the box"
+title: "The remote-worker boundary: what stays service-side when the harness leaves the box"
 kind: design
 lifecycle: proposed
 corpus: blackbox-design
@@ -7,31 +7,34 @@ topic:
   - bro-harness
   - orchestration
   - daemon-runtime
-brief: "What irreducibly remains in blackboxd when a harness worker runs in its own container or on another machine — and what dissolves. The forcing scenario: 'current files on disk' stops being one thing; daemon and worker hold different filesystem truths. Two findings. (1) Placement follows truth domains, and semantic_status is already the placement function: lsp_verified/syntax_only are claims about the working set (computed where the files are → worker), indexed_hints is a claim about the corpus (computed where the index is → daemon). (2) Isolation does not relocate granular governance — it dissolves it. Per-call guards (RX-V2 allowlists, hash guards, cwd cross-worktree checks, runtime apply gating) were compensating for a shared host working tree; with a private working set they demote from governance to quality mechanics, and operator authority concentrates at exactly two boundaries the daemon owns for free: dispatch (capability composition — absence beats filtering) and integration (what artifacts re-enter canonical state). Residency test for everything else: daemon-side iff shared mutable state across workers/sessions, or the coordination point itself. Companion of refactor-tools-v2.md; extends harness-daemon-boundary.md to the distributed rung."
+brief: "Extends the same-host worker topology to a private container or another machine. Working-set semantic claims are computed beside worker files, corpus claims remain in blackboxd, blackopsd retains operational and integration intent, and fleetd owns live execution."
 ---
 
-# The remote-worker boundary: what stays in the daemon when the harness leaves the box
+# The remote-worker boundary: what stays service-side when the harness leaves the box
 
-> **Status: proposed.** The in-process consolidation
-> ([`harness-daemon-boundary.md`](./harness-daemon-boundary.md)) is current
-> reality and a deliberate forcing function for defects and friction. This doc
-> designs the *return trip*: the harness as an isolated worker — its own
-> container, eventually another machine. Nothing here is v1 work; the point is
-> to know which of today's components are load-bearing architecture and which
-> are scaffolding coupled to the shared-filesystem era, so we stop reinforcing
-> the scaffolding.
+> **Status: proposed.** The
+> [same-host process topology](../daemon-runtime/process-topology.md) now makes
+> bro-harness a per-session worker, fleetd the execution authority, and
+> blackopsd the operational authority. This doc
+> designs the next rung: a worker with a private filesystem, its own container,
+> or another machine. The local worker proves lifecycle isolation; this document
+> owns the additional truth, transport, artifact, and trust boundaries.
+>
+> V8 stays inside the harness worker. A separate V8 companion is not a rung on
+> this gradient because it would not create a new working-set or authority
+> domain. See [code-mode runtime lifecycle](code-mode-runtime-lifecycle.md).
 
 ## 0. Thesis
 
 When a worker gets its own filesystem, "current files on disk" bifurcates: the
 worker holds **working-set truth** (the mutable checkout it is editing) and the
-daemon holds **corpus truth** (the indexed, historical, cross-project view).
-Every tool placement question resolves by asking which truth the tool consumes —
+blackboxd holds **corpus truth** (the indexed, historical, cross-project view).
+Every tool placement question resolves by asking which truth the tool consumes,
 and the answer key already shipped: `semantic_status`. `lsp_verified` and
 `syntax_only` are claims about working-set bytes and can only be computed where
 those bytes live; `indexed_hints` is a claim about a corpus snapshot and stays
-with the index. Today's daemon conflates the lanes only because both happen to
-read the same disk.
+with the index. The same-host worker and blackboxd can still see one disk, but
+the private-worker rung makes that accidental overlap disappear.
 
 The second finding is the sharper one: **isolation dissolves granular
 governance rather than relocating it.** The per-call enforcement that grew in
@@ -39,14 +42,16 @@ the refactor/apply machinery was protecting a *shared* host working tree from
 concurrent agents. A worker on a private clone has nobody to protect its
 scratch space from. What survives as governance is exactly two boundaries —
 **dispatch** (what capabilities go into the box) and **integration** (what
-artifacts come back out) — and the daemon owns both by construction. Everything
+artifacts come back out). blackopsd owns the intent and policy at both;
+fleetd enforces the concrete execution envelope. Everything
 between them demotes to quality mechanics the worker runs for its own benefit.
 
-What must remain daemon-side then passes a single test: **shared mutable state
-across workers/sessions, or the coordination point itself.** The list is short:
-the corpus, the shared stores, the orchestration singleton, ingress, credential
-brokering, and the integration boundary. Notably absent: LSP, code-nav, refactor
-machinery, validation, apply, and runtime surface enforcement.
+What must remain service-side then passes a single test: **durable corpus truth,
+shared mutable state across workers/sessions, or the coordination point itself.**
+The list is short: blackboxd corpus and stores; blackopsd orchestration, ingress,
+and integration intent; fleetd workers, credentials, and live execution.
+Notably absent are LSP, code navigation, working-set refactor machinery,
+validation, apply, and local runtime enforcement.
 
 ## 1. The forcing scenario
 
@@ -73,10 +78,10 @@ first place."
 | | Working-set truth | Corpus truth |
 |---|---|---|
 | **What** | the agent's mutable checkout | indexed/historical/cross-project view |
-| **Owner** | the worker (harness) | the daemon, permanently |
+| **Owner** | the worker (harness) | blackboxd, permanently |
 | **Tools** | tree-sitter lanes (`bbox_code_query/refs/outline`), slices, refactor plan+apply, LSP servers and their session pool, validation runs | tantivy symbols, `bbox_hybrid_search`, graph walks, knowledge, blame/provenance, transcripts |
 | **`semantic_status`** | `lsp_verified`, `syntax_only` | `indexed_hints` |
-| **Crossing mechanism** | does not cross; executes in the worker | MCP out-box, as today (`CorpusCapability` seam) |
+| **Crossing mechanism** | does not cross; executes in the worker | typed capability through fleetd to blackboxd |
 
 Three consequences:
 
@@ -161,34 +166,37 @@ audited at re-entry.**
 
 ## 5. The residency test and the irreducible list
 
-> Daemon-side iff: **shared mutable state across workers/sessions, or the
-> coordination point itself.**
+> Service-side iff: **durable corpus truth, shared mutable state across
+> workers/sessions, or the coordination point itself.**
 
-| Stays in the daemon | Why it passes |
+| Stays service-side | Owner and reason |
 |---|---|
-| **The corpus** — tantivy, graph, embeddings, transcripts, blame/provenance | aggregates across projects, sessions, machines; workers query out-box |
-| **Shared stores** — knowledge, decisions, threads, notes, inbox, pins, roadmap, whiteboards | multi-writer state; daemon owns consistency and review lanes |
-| **The orchestration singleton** — dispatch, teams, workflows, crons, cross-worker promise coordination, the seq-ordered steer/interrupt plane | singleton by definition; a worker cannot own the thing that owns workers |
-| **Ingress** — webhooks, pollers, system events | needs a stable address; ephemeral workers have none |
-| **Credential brokering** | keys are minted/injected per-dispatch, never baked into images (capability = tool + credential + scope) |
-| **The integration boundary** (§4.2) | the re-entry point into every shared store above |
+| **The corpus**: tantivy, graph, embeddings, transcripts, blame/provenance | blackboxd aggregates across projects, sessions, and machines |
+| **Durable shared stores**: knowledge, decisions, threads, notes, pins, roadmap | blackboxd owns corpus consistency and review lanes |
+| **The operational singleton**: teams, agents, workflows, atoms, crons, cross-worker coordination | blackopsd owns durable intent and policy |
+| **The execution singleton**: attempts, workers, worktrees, steer/interrupt | fleetd owns live execution truth |
+| **Ingress**: webhooks, pollers, schedules | blackopsd provides the stable operational address |
+| **Credential brokering** | fleetd scopes credentials per dispatch; images contain none |
+| **The integration boundary** | blackopsd decides admission; fleetd moves live artifacts; blackboxd records accepted evidence |
 
 And the explicit not-list, because it is the answer to the question this doc
-exists for: **LSP, code-nav, refactor machinery, validation, apply, slices/file
-tools, runtime surface enforcement.** None of it. The daemon-side flat
-`bbox_code_*` read adapters survive as the operator-attended projection — the
-daemon's host checkout is itself a legitimate working set for interactive
-sessions. The refactor surface does not even keep that projection: per
+exists for: **LSP, code navigation, working-set refactor machinery, validation,
+apply, slices/file tools, runtime surface enforcement.** None of it. Same-host
+operator sessions use a harness worker against the host checkout, which is a
+legitimate working set. The refactor surface does not keep a blackboxd-local
+projection: per
 [`refactor-tools-v2.md`](./refactor-tools-v2.md) §7 (decided), refactor tooling
 becomes **in-harness only**; external/MCP-only agents direct refactoring via
 ad-hoc `bro_exec`/`bro_resume` orchestration or consume a canned atom.
 
 ## 6. The isolation gradient is the migration path
 
-Three rungs, independently useful; design for rung 3, ship rung 2 first:
+Three rungs, independently useful; design for rung 3, ship rung 1 first:
 
-1. **In-process (today).** Shared disk, shared process. The deliberate
-   defect-surfacing mode. All guards load-bearing.
+1. **Same-host harness worker.** Separate process, shared host worktree. This is
+   the target in [Process topology](../daemon-runtime/process-topology.md). It
+   isolates session lifecycle and V8, but shared-filesystem guards remain
+   load-bearing.
 2. **Container + bind-mount of the host worktree.** Process/network isolation,
    *shared* disk. Daemon-side tools keep working; near-zero code-nav work; this
    is [`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md)'s
@@ -241,10 +249,8 @@ is operational work, not architecture work.
 ## 9. Relationship
 
 - **Extends** [`harness-daemon-boundary.md`](./harness-daemon-boundary.md) to
-  the distributed rung: the in-process consolidation is current reality and the
-  forcing function; this doc is the shape consolidation must not paint over.
-  The §12.1 corpus/execution split escape hatch is this doc's rung 2-3 seen
-  from the daemon side.
+  the distributed rung. The local worker protocol remains the lifecycle base;
+  this document adds private filesystem, artifact transfer, and remote trust.
 - **Sibling of** [`refactor-tools-v2.md`](./refactor-tools-v2.md) — that doc
   owns the worker-side DSL that makes §7's deletion (no daemon reach-in) hold;
   this doc owns topology and residency.

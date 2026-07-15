@@ -4,22 +4,25 @@ kind: design-hub
 corpus: blackbox-design
 topic:
   - bro-harness
-brief: "Nav hub for the bro-harness design cluster: the custom headless coding agent that speaks provider APIs directly behind one Transport, runs its own tool loop, and emits the Claude stream-json envelope. Top-level abstraction — daemon-independent by invariant. Sorts the cluster into shipped as-built records and a proposed backlog."
+brief: "Nav hub for the bro-harness design cluster: the custom headless coding-agent worker that speaks provider APIs directly behind one Transport, runs its own tool and V8 loops, records a session event log, and connects to fleetd through a typed worker protocol."
 ---
 
 # Bro-Harness
 
 `bro-harness` (`crates/bro-harness`, `crates/bro-tools`) is the custom headless
 coding agent that speaks provider APIs directly behind one `Transport` interface,
-runs its own tool-calling loop, and emits the Claude stream-json envelope so it
-slots into the existing dispatch seam (GLM/DeepSeek on the Anthropic transport,
-Brodex on OpenAI Responses). See `PROJECT.md` → "Provider & Agent Surfaces" for
-routing facts.
+runs its own tool-calling and V8 code-mode loops, and records the session event
+stream. The target production unit is one supervised worker process per session.
+It connects to fleetd for live control and authorized remote capabilities;
+fleetd routes operational calls to blackopsd and corpus calls to blackboxd.
+Provider, context, local tools, working-copy LSP, and V8 state remain local.
+See `PROJECT.md` under "Provider & Agent Surfaces" for routing facts.
 
 **Top-level abstraction, not an orchestration sub-topic.** By invariant the
-harness shares *code* with the daemon (workspace crates like `bro-tools`) but
-**never a runtime dependency** — no MCP/RPC backchannel. It runs with the daemon
-down; the only daemon↔harness contract is the stdout stream-json envelope.
+harness never depends on fleetd or blackboxd implementation crates. Its one
+production service relationship is an authenticated, session-scoped RPC to
+fleetd. The shared contract bottom and `bro-rpc` keep this runtime dependency
+typed without introducing an implementation cycle.
 
 This page is the **nav waypoint** — start here, then follow a link. Per-feature
 detail lives in each linked doc; this hub keeps only the sort.
@@ -52,11 +55,10 @@ points to a backlog doc.
   `ToolFilter`. Subsumes the backlog web_search-fallback + result-normalization
   bullets.
 - [Remote-worker boundary](remote-worker-boundary.md) — proposed: what
-  irreducibly stays in the daemon when a harness worker runs in its own
-  container/machine. Working-set vs corpus truth (`semantic_status` is the
-  placement function); isolation *dissolves* granular governance into two
-  boundaries the daemon owns (dispatch composition + integration re-entry);
-  residency test = shared mutable state or the coordination point.
+  irreducibly stays in blackboxd and fleetd when a harness worker gets a private
+  container or machine. Working-set versus corpus truth remains the placement
+  function; isolation concentrates governance at fleet dispatch and artifact
+  re-entry.
 - [Refactor tools v2: the in-box DSL](refactor-tools-v2.md) — proposed: dissolve
   the 100+-kind `bbox-refactor` catalog into code-mode cell programs over a
   small binding algebra (facts `code.*`/`lsp.*`/`analysis.*`, EditSet algebra,
@@ -76,6 +78,28 @@ points to a backlog doc.
   optional choke point, composed at dispatch); sessions/batching/no durable
   promises in-box. Tenant test: refactor + diagnostics ship as namespaces with
   zero runtime changes.
+- [Codex mainline adoption map](codex-mainline-adoption.md) - proposed ordering
+  for the July 2026 source refresh: code-mode correctness, model-visible state,
+  native agent capability, then smaller context/MCP/disclosure follow-ons.
+- [Code-mode runtime lifecycle](code-mode-runtime-lifecycle.md) - proposed cell
+  actor, terminal-state, cancellation, observation, and in-worker V8 lifecycle
+  beneath the existing `exec`/`wait` surface.
+- [Worker protocol](worker-protocol.md) - proposed handshake, authenticated
+  reconnect, event replay, idempotent controls, leases, and session-scoped
+  capability RPC between bro-harness and fleetd.
+- [Model-visible World State](model-visible-world-state.md) - proposed typed,
+  persisted generalization of `reference_context_item` and dispatch emission
+  baselines, including retained-fragment repair.
+- [Model-facing agent capability](model-facing-agent-capability.md) - proposed
+  spawn/message/followup/interrupt/list/wait surface backed by a fail-closed
+  capability: blackopsd owns logical identity/mailboxes and fleetd owns concrete
+  execution attempts.
+- [Blackops service boundary](../daemon-runtime/blackops-service-boundary.md) -
+  proposed operational plane for agents, workflows, atoms, schedules, and
+  integration intent, separate from fleetd's live execution plane.
+- [Agent runtime program](../daemon-runtime/agent-runtime-program.md) - the
+  implementation spine joining the Codex refresh, workerization, fleetd,
+  blackboxd slimming, World State, and native agents.
 
 ## Backlog (proposed — pick this up)
 
@@ -125,16 +149,20 @@ points to a backlog doc.
 
 ## Cluster conventions
 
-- The async/temporal layer (sessions, checkpoints, pending refs) is
-  **harness-owned**, never behind MCP; MCP tools stay synchronous unary.
-- Shares **code** with the daemon, never a **runtime** dependency; capabilities
-  the harness needs (LSP sessions, etc.) are shared by extracting into a linked
-  crate, not by calling a daemon service.
+- The per-session async/temporal layer is harness-owned. Live tasks, workers,
+  worktrees, and leases are fleetd-owned. Logical agents, mailboxes, workflows,
+  and atoms are blackopsd-owned. None is hidden behind a synchronous MCP
+  fiction.
+- The harness has a typed runtime dependency on fleetd through the worker
+  protocol, never a compile dependency on fleetd or blackboxd implementations.
+- Working-copy LSP and local tools live in the worker. Corpus capabilities route
+  through fleetd and fail closed when unavailable.
 - The `side` persistence spine is the keystone — clipboard, nudge ledger, todos,
   and (future) neuralyze checkpoints all ride it; nothing stateful needs new
   persistence machinery.
 - Privilege lives in `SafetyPolicy` + the brofile allow/deny layer. Nudges steer,
   they never gate; neuralyze rewinds, it never escalates privilege.
-- Session-scoped state only — no cross-session / cross-bro sharing.
+- Harness state is session-scoped. Cross-session coordination happens through
+  fleetd-brokered contracts whose operational authority lives in blackopsd.
 - Provider-agnostic ambient text uses **bare** tool names (`bbox_note`, not
   `mcp__blackbox__bbox_note`); FQDN surfacing is a per-CLI concern.

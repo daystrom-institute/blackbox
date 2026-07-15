@@ -38,6 +38,13 @@ brief: "A convergence charter: make bro-harness's model-facing machinery — bas
 
 # Codexification
 
+> **2026-07 refresh.** The staged `reference_context_item` work described here
+> has shipped in narrow form. [Model-visible World State](model-visible-world-state.md)
+> is the proposed generalization for mutable context, informed by Codex
+> main@8aae858958. See the [adoption map](codex-mainline-adoption.md) for the
+> current sequence; this document remains the original loop/context convergence
+> record.
+
 ## 0. Thesis
 
 **Adopt codex's model-facing machinery as verbatim as the two API shapes allow.**

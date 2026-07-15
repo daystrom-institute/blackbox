@@ -20,6 +20,12 @@ brief: "The platform layer under refactor-tools-v2.md and any later in-box domai
 > ([`narf-data-model.md`](./narf-data-model.md),
 > [`narf-typed-cells.md`](./narf-typed-cells.md)) it says so explicitly and
 > says what it is *not* salvaging.
+>
+> **Runtime ownership.** This document owns value composition and namespace
+> semantics. [Code-mode runtime lifecycle](code-mode-runtime-lifecycle.md) owns
+> cell state, cancellation, observation, shutdown, and the in-worker V8
+> lifecycle beneath this DSL. The per-session harness process is the failure
+> boundary.
 
 ## 0. Thesis
 

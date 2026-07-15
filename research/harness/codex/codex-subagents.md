@@ -5,30 +5,95 @@ corpus: blackbox-research
 track: harness
 harness: codex
 axis: subagents
-version: "0.136.0"
-last_verified: "0.136.0"
+version: "main@8aae858958"
+last_verified: "main@8aae858958"
 status: enriched
 confidence: high
 topic:
   - harness
   - codex
   - subagents
-brief: "Codex subagents (v1/v2): full lifecycle verbs — spawn_agent, send_input (interrupt flag), send_message (queue, no turn) vs followup_task (triggers turn), resume_agent, wait_agent, list_agents, close_agent; hierarchical canonical task names (/root/task1/task_3). CSV fan-out (spawn_agents_on_csv, max_concurrency 16, worker-only report_agent_job_result). SessionSource-gated visibility; depth-limited; rich status enum. Anti-delegation-by-default steering."
+brief: "Codex multi-agent v2 exposes spawn_agent, queue-only send_message, turn-triggering followup_task, non-destructive interrupt_agent, list_agents, and mailbox-oriented wait_agent. Canonical task paths persist across cold root resume, targeted descendants load lazily, partial history forks are supported, and an extension-level AgentRunner makes forked agent execution reusable outside the collaboration tool family."
 ---
 
-# Codex · Subagents
+# Codex - Subagents
 
-> Mined from codex-rs source (`~/repos/codex/codex-rs`) by DeepSeek-v4-pro / GLM-5.1 bros, 2026-06-02. **confidence: high** (file:line).
-See axis: [Subagents](../subagents.md) · snapshot: [Codex 0.136.0](codex-0.136.0.md).
+See axis: [Subagents](../subagents.md) and snapshot:
+[Codex main@8aae858958](codex-main-8aae858958.md).
 
-**Finding.** Two API versions. **Lifecycle verbs:** `spawn_agent`, `send_input` (v1, `interrupt=true` for immediate redirect), `send_message` (v2, queue-only, no new turn) vs `followup_task` (v2, triggers a turn), `resume_agent`, `wait_agent` (min/default/max timeout), `list_agents` (`path_prefix` filter), `close_agent`. V2 uses **hierarchical canonical task names** (`/root/task1/task_3`). **CSV fan-out:** `spawn_agents_on_csv` (`{column}` templating, `max_concurrency`=16, `max_runtime`=1800s, optional output_schema); workers must `report_agent_job_result` (worker-only tool; missing = failure). **Role-gated visibility** via `SessionSource`/`SubAgentSource`; sub-agents inherit parent config + can nest; `exceeds_thread_spawn_depth_limit` enforces depth. Status enum: pending_init/running/interrupted/shutdown/not_found/{completed}/{errored}. Steering is **anti-delegation-by-default** ("Only use spawn_agent if and only if the user explicitly asks").
+## Finding
 
-**Evidence.**
-- `core/src/tools/handlers/multi_agents_spec.rs:113-260` — lifecycle verbs (send_input interrupt, wait, resume, close)
-- `core/src/tools/handlers/agent_jobs_spec.rs:6-97` — CSV fan-out + worker-only report
-- `core/src/tools/handlers/multi_agents.rs:28` — `exceeds_thread_spawn_depth_limit`
+Codex retains legacy v1 and CSV worker surfaces, but its current v2 contract is
+mailbox-oriented and keeps agent identity alive independently of the current
+turn.
 
-**Vs the axis.** Confirms ALL the subagent extensions: lifecycle verbs, role-differentiated visibility, CSV fan-out. Topology (path/depth) is shared with [session-lifecycle](../session-lifecycle.md).
+**Confidence: high.** The schemas, handlers, rollout items, and restore path are
+open source at the captured revision.
+
+### Current v2 lifecycle
+
+- `spawn_agent` creates a child with a required lowercase task name, an initial
+  message, and a history fork policy of none, all, or the most recent N turns.
+- `send_message` queues a message promptly but does not trigger a new turn.
+- `followup_task` triggers an idle target and otherwise delivers at a safe
+  message boundary while sampling or after the pending tool call.
+- `interrupt_agent` stops the target's current turn but leaves the agent alive
+  and addressable for later messages or work.
+- `list_agents` lists live descendants with an optional canonical path-prefix
+  filter. It no longer exposes the last task message.
+- `wait_agent` waits on the caller's mailbox. It returns a summary of which
+  agents have updates, a user-steer interruption summary, or a timeout summary,
+  not the message content itself.
+
+The distinction between queueing, triggering, and interrupting is structural.
+It avoids overloading one `send_input(interrupt=...)` call with three lifecycle
+meanings.
+
+### Identity, persistence, and configuration
+
+V2 routes by canonical names such as `/root/task1/task_3`. Task and message
+payload fields are marked encrypted in the model schema while routing metadata
+remains available to the control plane. Agent communication is persisted as
+typed rollout items.
+
+Cold root resume restores descendant identities and graph position. A targeted
+message can lazily load a descendant runtime rather than eagerly restarting the
+whole tree. The `AgentRunner` extension encapsulates starting a resolved prompt
+in a forked thread with trace propagation and returns thread and turn IDs.
+
+Spawned agents inherit the parent model by default. Model and reasoning
+overrides are separately gated, bounded, and filtered to models compatible with
+the active multi-agent backend.
+
+Delegation remains policy-controlled. The default guidance is conservative,
+but AGENTS.md or an invoked skill may explicitly authorize delegation.
+
+### Legacy and batch surfaces
+
+V1 still exposes `send_input`, `resume_agent`, and close semantics under a
+namespace. CSV fan-out remains a separate worker-job surface with bounded
+concurrency and structured row reporting. Those are compatibility surfaces, not
+the v2 lifecycle recommended for a new harness design.
+
+## Evidence
+
+- `codex-rs/core/src/tools/handlers/multi_agents_spec.rs` - v1/v2 schemas and
+  steering text.
+- `codex-rs/core/src/tools/handlers/multi_agents_v2/` - current handlers.
+- `codex-rs/ext/agent/src/lib.rs` - reusable forked-thread runner.
+- Commits `5b22a8e5b1`, `b4f0f3eff1`, `088239294a`, `ea15456284`,
+  `92938d880e`, `64c0e2fa1b`, and `6629e08702`.
+
+## Vs the axis
+
+The refresh sharpens "continuation" into three independent verbs: message,
+follow-up, and interrupt. It also shows that persisted identity plus lazy runtime
+materialization is more useful than treating completion as object destruction.
+Topology remains shared with [session lifecycle](../session-lifecycle.md).
 
 ## Open
-<!-- v1↔v2 migration; mailbox interplay with send_message. -->
+
+- Worktree and sandbox isolation remain environment/orchestrator concerns, not
+  properties of the generic v2 tool schema.
+- Source presence does not establish which product configurations enable v2 by
+  default.

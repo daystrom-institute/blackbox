@@ -48,7 +48,7 @@ discovery, deferral, and progress is the anti-bloat keystone.
 | Subject | MCP transports | Discovery model | Deferred loading | Namespacing | Cell |
 |---|---|---|---|---|---|
 | Claude | stdio/SSE/HTTP | _TBD_ | tool-search (names→schema) | FQDN | [claude](claude/claude-mcp.md) |
-| Codex | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [codex](codex/codex-mcp.md) |
+| Codex | stdio/SSE/streamable HTTP | threshold-gated direct vs deferred | ranked tool search; shared runtime planning | `mcp__server__tool` | [codex](codex/codex-mcp.md) |
 | Antigravity | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [antigravity](antigravity/antigravity-mcp.md) |
 | Vibe | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [vibe](vibe/vibe-mcp.md) |
 
@@ -73,6 +73,9 @@ finding should also cover:
   skill/app mention can auto-install MCP dependencies, and a plugin `@mention`
   can activate a whole bundle (skills + MCP + apps + hooks) under one namespace.
   The model must not assume the tool list is fixed at session start.
+- **Catalog reuse is not call authority** - a sanitized process cache may reuse
+  stable tool definitions for startup, while live connections remain the only
+  source for annotations, approvals, instructions, and execution.
 
 ## Feeds
 

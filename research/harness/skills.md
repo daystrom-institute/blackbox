@@ -44,7 +44,7 @@ the invocation contract, and how arguments thread through.
 | Subject | Discovery | Who invokes | Progressive disclosure | Args | Cell |
 |---|---|---|---|---|---|
 | Claude | listed w/ descriptions | agent + user (`/name`) | yes (body on invoke) | yes | [claude](claude/claude-skills.md) |
-| Codex | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [codex](codex/codex-skills.md) |
+| Codex | extension-owned catalog with prompt-visible metadata | agent + user mention/tool routes | body and selected instructions through tools/World State | file/tool arguments | [codex](codex/codex-skills.md) |
 | Antigravity | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [antigravity](antigravity/antigravity-skills.md) |
 | Vibe | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [vibe](vibe/vibe-skills.md) |
 
@@ -63,6 +63,10 @@ the invocation contract, and how arguments thread through.
 - **Mention-triggered provisioning** — mentioning a skill with unmet MCP
   dependencies can auto-install + auth them before the next turn (the tool
   surface expands mid-session). Cross-ref [mcp](mcp.md).
+- **Shadow-before-withholding** - evaluate a bounded deterministic selector
+  against actual skill invocation before using it to hide catalog entries.
+  Measure reduction, latency, hit, and rank; keep the existing visible catalog
+  authoritative during the experiment.
 
 ## Feeds
 

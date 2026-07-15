@@ -5,30 +5,81 @@ corpus: blackbox-research
 track: harness
 harness: codex
 axis: builtin-tools
-version: "0.136.0"
-last_verified: "0.136.0"
+version: "main@8aae858958"
+last_verified: "main@8aae858958"
 status: enriched
 confidence: high
 topic:
   - harness
   - codex
   - builtin-tools
-brief: "Codex tools: 12+ specs as ToolSpec::Function (JSON args) or ToolSpec::Freeform (Lark grammar — apply_patch is non-JSON, 'do not wrap in JSON'). Typed output_schema on several (spawn_agent, view_image, list/wait_agent) but None on shell/patch. Per-tool parallel-safety (read_only_hint auto-qualifies MCP tools). Steering language is inline Rust string literals (spawn_agent anti-delegation framework; goal blocked-audit)."
+brief: "Codex retains JSON, freeform-grammar, output-schema, and parallel-safety tool contracts. New model-facing built-ins expose remaining context tokens, request a new context window without resetting environment state, return current UTC time, sleep interruptibly, and temporarily wait for a deferred execution environment; code mode adds a dedicated generated-image egress helper."
 ---
 
-# Codex · Built-in Tools
+# Codex - Built-in Tools
 
-> Mined from codex-rs source (`~/repos/codex/codex-rs`) by DeepSeek-v4-pro / GLM-5.1 bros, 2026-06-02. **confidence: high** (file:line).
-See axis: [Built-in Tools](../builtin-tools.md) · snapshot: [Codex 0.136.0](codex-0.136.0.md).
+See axis: [Built-in Tools](../builtin-tools.md) and snapshot:
+[Codex main@8aae858958](codex-main-8aae858958.md).
 
-**Finding.** 12+ named specs: `exec_command`/`write_stdin`/`shell_command`, `apply_patch`, `view_image`, `update_plan`, `create/get/update_goal`, `request_user_input`, `request_permissions`, MCP resource tools, `spawn_agents_on_csv`/`report_agent_job_result`, plugin-install tools, + dynamic/MCP. Two tool *kinds*: `ToolSpec::Function(ResponsesApiTool)` (JSON) and `ToolSpec::Freeform(FreeformTool)` (**Lark grammar, non-JSON** — `apply_patch` uses `*** Begin Patch` markers, "do not wrap the patch in JSON"). **Typed output schemas** on several tools (spawn/view_image/list/wait) but `None` on shell/patch (freeform raw text). **Per-tool parallel-safety**: MCP `read_only_hint` auto-qualifies; `parallel.rs` runs concurrent calls via JoinSet. **Steering** is inline Rust string literals: `spawn_agent` carries a "when to delegate vs do it yourself" framework; `update_goal` an anti-pattern ("Do not use blocked merely because the work is hard").
+## Finding
 
-**Evidence.**
-- `core/src/tools/handlers/apply_patch_spec.rs:8` — "This is a FREEFORM tool, so do not wrap the patch in JSON."
-- `core/src/tools/handlers/multi_agents_spec.rs:319-380` — per-tool output schemas
-- `core/src/tools/handlers/mcp.rs:77` — `supports_parallel_tool_calls || read_only_hint`
+The earlier tool I/O contract remains: JSON functions, grammar-constrained
+freeform tools, optional output schemas, per-tool concurrency classification,
+and steering in the tool description. This refresh focuses on newly added
+model-facing primitives.
 
-**Vs the axis.** Confirms ALL the tool-I/O-contract extensions: output schemas, invocation format (JSON vs Lark freeform), per-tool concurrency, agent-authored elicitation (`request_user_input`), and self-describing steering.
+**Confidence: high.** The tool schemas and handlers are open source at the
+captured revision.
+
+### Context agency
+
+- `get_context_remaining` has no arguments and returns
+  `{ "tokens_left": integer | null }`.
+- `new_context` requests a new context window and explicitly preserves
+  environment state.
+
+These are context-capacity tools, not durable goal-budget tools. They expose the
+state and transition of the active model window while leaving orchestration
+budgets to the goal/runtime layer.
+
+### Time and waiting
+
+- `clock.curr_time` returns current UTC time in a structured code-mode-friendly
+  result.
+- `clock.sleep` supports long but bounded sleeps and is interruptible by new
+  input. Sleep state is represented through the extension-owned item lifecycle.
+- `wait_for_environment` appears only while a deferred executor environment is
+  starting and is replaced by that environment's actual tools when ready.
+
+These tools make waiting explicit and interruptible rather than hiding it in a
+blocking tool call.
+
+### Code-mode result helper
+
+`generatedImage(...)` distinguishes an image-generation result from generic
+image forwarding. Generic `image(...)` rejects remote HTTP(S) URLs and accepts
+data URLs or typed tool image content.
+
+The pre-existing shell, patch, plan, goal, elicitation, MCP resource, batch
+agent, plugin, dynamic, and image-view tools remain part of the broader catalog.
+
+## Evidence
+
+- `codex-rs/core/src/tools/handlers/get_context_remaining_spec.rs`.
+- `codex-rs/core/src/tools/handlers/new_context_window_spec.rs`.
+- `codex-rs/core/src/tools/handlers/current_time.rs`, `sleep.rs`, and
+  `wait_for_environment.rs`.
+- `codex-rs/code-mode-protocol/src/description.rs` - generated-image helper.
+
+## Vs the axis
+
+The new tools expose two useful surface patterns: model-visible capacity
+introspection and interruptible waiting. Both return control-plane facts without
+granting new filesystem or network authority.
 
 ## Open
-<!-- Full verbatim tooldoc for exec_command (sandbox params already in privilege-approvals). -->
+
+- `wait_for_environment` is meaningful only for harnesses with dynamically
+  materialized execution environments.
+- Durable scheduled wakeups remain distinct from an interruptible sleep inside
+  a live turn.

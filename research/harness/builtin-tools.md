@@ -49,7 +49,7 @@ is the highest-value output of this whole track.
 | Subject | File-edit shape | Shell model | Negative-guidance style | Todo/Task | Cell |
 |---|---|---|---|---|---|
 | Claude | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [claude](claude/claude-builtin-tools.md) |
-| Codex | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [codex](codex/codex-builtin-tools.md) |
+| Codex | freeform grammar plus dedicated patch | yielded session shell | inline schema/tool-description guidance | plan, goal, agents, context-window controls | [codex](codex/codex-builtin-tools.md) |
 | Antigravity | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [antigravity](antigravity/antigravity-builtin-tools.md) |
 | Vibe | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [vibe](vibe/vibe-builtin-tools.md) |
 
@@ -79,6 +79,11 @@ cover the **tool I/O contract**:
 - **Agent-authored elicitation** — a tool by which the model asks the operator a
   *structured* question (header / question / options); the inverse of context
   injection (the model produces UI). cf. this harness's `AskUserQuestion`.
+- **Context-window controls** - a read-only remaining-token tool and an explicit
+  new-window request let the model manage context capacity without conflating it
+  with durable goal budgets or resetting environment state.
+- **Interruptible wait tools** - sleep/wait surfaces should yield to new user
+  input rather than becoming unsteerable blocking calls.
 
 ## Feeds
 

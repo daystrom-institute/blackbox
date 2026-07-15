@@ -4,11 +4,11 @@ kind: research-axis
 corpus: blackbox-research
 track: harness
 axis: metatools
-status: stub
+status: enriched
 topic:
   - harness
   - metatools
-brief: "Cross-harness axis for programmable tool composition: the ability to write scripts (JS or otherwise) that orchestrate tool calls with logic, loops, conditionals, and state — keeping intermediate results in script variables rather than the model's context window. Distinct from flat tool surfaces (builtin-tools) and subagent delegation (subagents) — metatools are a programmable composition layer between the model and the tool surface. Confirmed in Codex (code-mode) and Claude Code (Workflows); bro-harness clipboard/ref-chaining is a related but distinct point on the same spectrum."
+brief: "Cross-harness axis for programmable tool composition: scripts orchestrate tool or agent leaves while keeping intermediate results outside model context. Confirmed in Codex and bro-harness code mode and Claude Code Workflows. The current Codex refresh adds runtime ownership and failure domain as a dimension independent of the JavaScript substrate."
 ---
 
 # Axis: Metatools
@@ -71,20 +71,31 @@ deterministic code, and what the script's tool-calling surface looks like.**
 
 | Subject | Runtime | Tool surface | State model | Scope | Determinism | Cell |
 |---|---|---|---|---|---|---|
-| Codex | V8 isolate (`exec`/`wait`) | `await tools.<name>(args)` — every tool projected as typed JS function | JS vars (ephemeral) + `store`/`load` (per-session KV) | Within a turn (fresh isolate each `exec`) | Fresh isolate each call; `yield_control` for mid-execution output | [codex](codex/codex-skills.md) (skills cell, lines 16/24-31) |
+| Codex | V8 cell actor, in-process or supervised companion (`exec`/`wait`) | `await tools.<name>(args)`; admitted tools projected as typed JS functions | JS vars (ephemeral) + atomic `store`/`load` commit to per-session KV | Within a turn; fresh cell per `exec` | Linearized termination, hierarchical cancellation, preserved yield/output boundaries | [codex](codex/codex-metatools.md) |
 | Claude Code | Bun-bundled runtime | `agent(prompt, opts)` — spawns subagent; `parallel()`/`pipeline()` for fan-out | JS vars (script scope) + journal (resume cache) | Across turns (resumable within session; saved scripts across sessions) | `Math.random()`/`Date.now()`/`new Date()` banned; completed agents cached | _stub_ |
-| bro-harness | — (no metatool runtime) | — (no scriptable composition layer) | — | — | — | — |
+| bro-harness | V8 isolate (`exec`/`wait`) | admitted built-ins and MCP tools projected through one capability seam | JS vars + per-session `store`/`load`, with local namespace/function-store additions | Within a dispatch | In-process provider; lifecycle predates Codex's cell-actor hardening | [design](../../design/bro-harness/code-mode-cell-dsl.md) |
 | Antigravity | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _stub_ |
 | Vibe | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _stub_ |
 
-> bro-harness's clipboard/ref-chaining achieves the same *goal* (keep intermediate
-> results out of context) through a fundamentally different *mechanism*: the model
-> passes refs between tool calls within the normal tool-calling loop. There is no
-> scripting runtime, no composition language, no programmable layer. The model
-> remains the orchestrator; refs are a data-passing optimization, not a metatool
-> — they belong on a different axis. Listed here as a boundary case to make the
-> axis definition sharper: metatools require a **scriptable composition runtime**
-> interposed between the model and the tools.
+> The bro-harness row changed after the original axis capture: it now ships a
+> Codex-derived V8 code-mode runtime. Clipboard/ref chaining remains a distinct
+> model-driven data-passing mechanism, but it is no longer bro-harness's only
+> answer to keeping intermediate values out of context.
+
+### Runtime ownership is independent of scripting substrate
+
+The current Codex refresh adds another orthogonal dimension. "V8 isolate" names
+the JavaScript substrate, not the process failure domain. The same `exec`/`wait`
+contract can be implemented by an in-process isolate or by a companion process
+that delegates admitted tool calls back to the parent. A finding should record
+both substrate and ownership, plus terminal-state and cancellation guarantees.
+
+Blackbox's promoted design takes a different containment cut from Codex: it
+makes the entire bro-harness session a worker process and keeps V8 in that
+worker. This preserves the same lesson about isolate versus process ownership
+while also separating provider, tool, context, and V8 lifecycle from the corpus
+and operational/fleet daemons. See the
+[process topology](../../design/daemon-runtime/process-topology.md).
 
 ### Key divergence: tool-calling granularity
 
@@ -134,9 +145,9 @@ by composition policy + ancestor depth/budget (`../../src/tools/atoms/compositio
 > — lives in [narf-draft2.md](narf-draft2.md) (§2–§3). NARF is the concrete
 > bro-harness answer to this axis's last open invariant.
 
-### Boundary case: bro-harness clipboard (not a metatool)
+### Boundary case: bro-harness clipboard (not itself a metatool)
 
-bro-harness's clipboard achieves the same *goal* (keep intermediate results out of
+bro-harness's clipboard still achieves the same *goal* (keep intermediate results out of
 context) through ref-chaining within the normal model-driven tool-calling loop.
 The model passes `ref:abc123` instead of inlining a 50KB tool result; the ref
 resolves when the downstream tool reads it. But there is no scripting runtime, no
@@ -154,8 +165,11 @@ model's context window. They diverge on *how*:
 - **Codex**: JS variables in a V8 isolate. The isolate dies; the vars die with it.
 - **Claude Workflows**: JS variables in the script runtime. The script is
   persistent; vars are ephemeral per run but the journal caches completed agents.
-- **bro-harness**: refs. The model passes `ref:abc123` instead of inlining a 50KB
-  tool result. The ref resolves when the downstream tool reads it.
+- **bro-harness code mode**: JavaScript variables inside the shipped V8 runtime,
+  with per-session storage and local function/namespace additions.
+- **bro-harness clipboard**: refs remain a second, model-driven mechanism. The
+  model passes `ref:abc123` instead of inlining a large tool result and the
+  downstream tool resolves it.
 
 ## Open invariants
 
@@ -169,17 +183,16 @@ model's context window. They diverge on *how*:
   backend-polymorphic grain. The remaining tradeoff is real but narrower: a
   capability leaf must declare its grain (cost, effects, supervision) so the
   runtime can schedule it. See [narf-draft2.md](narf-draft2.md) §2.
-- Does the `code_mode_only` radical-gating pattern (ONLY exec/wait as direct tools)
-  have a Claude Workflows equivalent? *(NARF proposes adopting it as the default
-  primary-interface mode — `narf_exec`/`narf_wait` with all capability behind the
-  sandbox; see [narf-draft2.md](narf-draft2.md) §5.)*
+- The `code_mode_only` radical-gating pattern now exists in Codex and
+  bro-harness: `exec`/`wait` are the authorial surface and flat tools remain
+  deferred/loadable behind code mode. Whether Claude Workflows has an equivalent
+  remains open.
 - ~~Is there a bro-harness path from ref-chaining to a scriptable composition
-  runtime, or does daemon-independence preclude it?~~ **Answered (proposed,
-  2026-06-02):** yes — NARF. The composition substrate (V8 + refs + promises +
-  local-file tx) stays harness-local and daemon-free; capability leaves (atoms,
-  code graph, refactor backend) arrive over the existing MCP injection seam and
-  fail closed when the daemon is absent. Daemon-independence is preserved, not
-  precluded. See [narf-draft2.md](narf-draft2.md) §6.
+  runtime, or does daemon-independence preclude it?~~ **Answered (shipped):**
+  bro-harness now carries a harness-local V8 runtime. Host tools enter through
+  the filtered `ToolCapability` seam and daemon-owned features enter through
+  bottom-contract traits that fail closed when absent. The proposed cell DSL now
+  builds on a real substrate rather than defining one from scratch.
 
 ## See also
 
@@ -188,6 +201,10 @@ model's context window. They diverge on *how*:
   interface. The forward synthesis this axis feeds.
 - [narf.md](narf.md) — the v1 NARF braindump (breadcrumb map + exploratory
   script sketches).
+- [codex/codex-metatools.md](codex/codex-metatools.md) - Codex main refresh,
+  including actor lifecycle and process-owned V8.
+- [../../design/bro-harness/code-mode-runtime-lifecycle.md](../../design/bro-harness/code-mode-runtime-lifecycle.md)
+  - the promoted bro-harness runtime design.
 
 ## Discovery provenance
 
@@ -196,6 +213,8 @@ Code Workflows, 2026-06-02. Codex code-mode was live-probed against the installe
 `codex 0.135.0` (Homebrew) with `--enable code_mode --enable code_mode_only`;
 claims are high-confidence from direct observation of `exec` tool calls, nested
 tool dispatch from JS, `store`/`load` persistence, and `ALL_TOOLS` enumeration.
+The runtime-ownership and lifecycle dimensions were refreshed from Codex source
+at `main@8aae858958` on 2026-07-14.
 Claude Code Workflows were confirmed against the official documentation at
 `code.claude.com/docs/zh-CN/workflows` and the community skill API reference at
 `github.com/ray-amjad/claude-code-workflow-creator`; the feature is pre-release

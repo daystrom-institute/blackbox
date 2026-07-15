@@ -46,7 +46,7 @@ verbatim.
 | Subject | Where | # prompts | Trigger | Retention tail | Cell |
 |---|---|---|---|---|---|
 | Claude | client | _TBD_ | _TBD_ | _TBD_ | [claude](claude/claude-compaction.md) |
-| Codex | server (OAuth) + inline fallback | _TBD_ | proactive pre-sample | token-budgeted | [codex](codex/codex-compaction.md) |
+| Codex | streamed remote, `/responses/compact`, or inline | provider/config selected | proactive pre-sample plus model-requested rollover | token-budgeted with identified window lineage | [codex](codex/codex-compaction.md) |
 | Antigravity | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [antigravity](antigravity/antigravity-compaction.md) |
 | Vibe | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [vibe](vibe/vibe-compaction.md) |
 
@@ -69,6 +69,15 @@ verbatim.
   boundary) is a *sibling* mechanism owned by
   [session-lifecycle](session-lifecycle.md): it erases backward, whereas
   compaction summarizes forward.
+- **Context-window identity** - compaction can advance a first/previous/current
+  window chain while preserving thread and environment identity. This makes the
+  boundary model-visible and reconstructable rather than an anonymous rewrite.
+- **Model-facing capacity** - remaining-token introspection and an explicit
+  new-window request let the model participate in timing without giving it
+  authority over unrelated durable goal budgets.
+- **Bounded safe reconstruction** - resume may load from the most recent
+  reconstructable compaction checkpoint, but must fall back to full history when
+  that suffix cannot prove a valid baseline.
 
 ## Feeds
 

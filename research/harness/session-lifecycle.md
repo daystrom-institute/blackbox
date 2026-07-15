@@ -60,6 +60,11 @@ self-knowledge.
 
 **Synthesis (4 subjects).** **Rewind/rollback is a 4-way convergence** — every subject can undo history at a boundary (codex `ThreadRolledBack`, claude `/rewind`, vibe `RewindManager`, agy "rewind to step"), and claude+vibe share the **file-snapshot restore** mechanism. **Persisted spawn topology** (depth/path/graph) is **codex-distinctive**; others keep subagents flat or ephemeral. Storage uniquely moving to SQLite in agy. This confirms session-lifecycle as a real axis (de-conflict rewind↔compaction noted in Open invariants).
 
+**Codex refresh (main@8aae858958).** Durable identity is now explicitly
+separable from live runtime materialization: descendant names/topology restore
+on cold root resume and a targeted message lazily loads the runtime. Context
+windows also have first/previous/current UUIDv7 lineage within the same thread.
+
 ## Open invariants
 
 <!-- TODO(synthesis): -->

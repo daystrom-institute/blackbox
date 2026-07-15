@@ -46,7 +46,7 @@ recurring vs trigger-gated) is as important as the content.
 | Subject | Sys-prompt split | Overlay file | Reminder cadence | Todo reinjection | Cell |
 |---|---|---|---|---|---|
 | Claude | _TBD_ | CLAUDE.md | _TBD_ | _TBD_ | [claude](claude/claude-context-management.md) |
-| Codex | _TBD_ | AGENTS.md | _TBD_ | _TBD_ | [codex](codex/codex-context-management.md) |
+| Codex | cache-stable base plus role-split fragments | AGENTS.md | typed World State diffs and retained-fragment repair | goal/extension state owned | [codex](codex/codex-context-management.md) |
 | Antigravity | _TBD_ | GEMINI.md | _TBD_ | _TBD_ | [antigravity](antigravity/antigravity-context-management.md) |
 | Vibe | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [vibe](vibe/vibe-context-management.md) |
 
@@ -72,6 +72,12 @@ recurring vs trigger-gated) is as important as the content.
   as fragments but are modeled as a distinct axis
   ([modes-personas](modes-personas.md)); this axis carries the assembly
   mechanics, that axis carries the contracts.
+- **Persisted model-visible state** - stable section IDs, typed snapshots, merge
+  patches, and absent/unknown/known reconstruction make "what the model already
+  knows" durable across resume, rollback, fork, and compaction.
+- **Retained-fragment repair** - if a persisted snapshot claims a section is
+  known but retained history no longer contains its rendered fragment, inject
+  it once instead of trusting stale bookkeeping.
 
 ## Feeds
 

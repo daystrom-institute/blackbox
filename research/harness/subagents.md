@@ -44,7 +44,7 @@ a registry of specialized agent *types* with distinct tool access and prompts.
 | Subject | Spawn tool | Agent types | Isolation | Parallel? | Cell |
 |---|---|---|---|---|---|
 | Claude | Task/Agent | yes (registry) | worktree opt-in | yes (capped) | [claude](claude/claude-subagents.md) |
-| Codex | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [codex](codex/codex-subagents.md) |
+| Codex | `spawn_agent` plus message/followup/interrupt/list/wait lifecycle | config-derived roles; optional compatible model override | execution-environment owned | yes, depth-limited plus CSV worker surface | [codex](codex/codex-subagents.md) |
 | Antigravity | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [antigravity](antigravity/antigravity-subagents.md) |
 | Vibe | _TBD_ | _TBD_ | _TBD_ | _TBD_ | [vibe](vibe/vibe-subagents.md) |
 
@@ -57,9 +57,10 @@ a registry of specialized agent *types* with distinct tool access and prompts.
 
 ## Codex-lens extensions
 
-- **Lifecycle verbs** — beyond spawn/wait: fork (with a selectable history
-  slice), interrupt mid-turn, close (with descendant cascade), resume, list, and
-  no-turn `send_message` vs turn-triggering `followup_task`.
+- **Lifecycle verbs** - beyond spawn/wait: fork with a selectable history
+  slice, non-destructive interrupt, list, queue-only `send_message`, and
+  turn-triggering `followup_task`. Legacy v1 retains close/resume; v2 keeps
+  identity addressable across turns and cold resume.
 - **Role-differentiated tool visibility** — worker sub-agents may see tools the
   orchestrator does not (and vice-versa), gated by session-source identity — a
   harness-enforced role contract, not just a prompt.
@@ -67,6 +68,9 @@ a registry of specialized agent *types* with distinct tool access and prompts.
   structured result schema.
 - **Topology** — depth / path (`/root/child`) / persisted parent→child graph is
   owned by [session-lifecycle](session-lifecycle.md).
+- **Mailbox wait** - waiting can wake on agent updates, final-status notices,
+  user steering, or timeout without inlining message content into the wait
+  result.
 
 ## Feeds
 

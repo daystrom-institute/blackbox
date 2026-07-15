@@ -189,7 +189,7 @@ The axis set is itself a versioned, evolving artifact — not a fixed truth.
 | Subject | Folder | Current snapshot | Backend / transport | State |
 |---|---|---|---|---|
 | Claude Code | `claude/` | [`claude-2.1.160.md`](claude/claude-2.1.160.md) | Anthropic Messages | **seeded + backfilled** (worked exemplar) |
-| Codex | `codex/` | [`codex-0.136.0.md`](codex/codex-0.136.0.md) | OpenAI Responses | stub (source: `~/repos/codex`) |
+| Codex | `codex/` | [`codex-main-8aae858958.md`](codex/codex-main-8aae858958.md) | OpenAI Responses | **enriched** source snapshot; supersedes 0.136.0 |
 | Antigravity | `antigravity/` | _seeding_ | Google / Antigravity | **replaces deprecated Gemini CLI**; source: `~/repos/antigravity-cli` + installed 1.107.0 |
 | Vibe | `vibe/` | [`vibe-2.9.6.md`](vibe/vibe-2.9.6.md) | Mistral (`mistral-vibe`) | stub; source: `~/repos/mistral-vibe` + installed 2.9.6 |
 

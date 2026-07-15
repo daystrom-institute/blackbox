@@ -20,14 +20,14 @@ describes behavior that matters for implementation, verify it against the code,
   code navigation, and corpus-facing assistants.
 - [Orchestration](orchestration/orchestration.md) - atoms, agents, workflows,
   supervision, phase decomposition, and runtime handoff.
-- [Bro-Harness](bro-harness/bro-harness.md) - the custom headless coding agent:
-  transports, tool surface, clipboard, tool chaining, hooks, diagnostics,
-  neuralyze. Daemon-independent by invariant.
-- [Fleet TUI](fleet-tui/fleet-tui.md) - `bro fleet`, the multi-provider cockpit
-  for live-driving many concurrent entrypoint agents in-process.
-- [Daemon Runtime](daemon-runtime/daemon-runtime.md) - blackboxd's execution
-  architecture: tokio topology, plane isolation, lock discipline, and
-  persistence actors.
+- [Bro-Harness](bro-harness/bro-harness.md) - the per-session coding-agent
+  worker: provider transports, tool and V8 loops, context, worker RPC, hooks,
+  diagnostics, and neuralyze.
+- [Fleet TUI](fleet-tui/fleet-tui.md) - `bro fleet`, the thin multi-provider
+  cockpit for live-driving fleetd-owned agents.
+- [Daemon Runtime](daemon-runtime/daemon-runtime.md) - process authority across
+  blackboxd, blackopsd, fleetd, and bro-harness workers, plus per-process Tokio
+  topology, plane isolation, lock discipline, and persistence actors.
 - [Refactor Tools](refactor-tools/refactor-tools.md) - structural refactor
   machinery, refactor atoms, Rust expansion, and Java gap closure.
 - [Integrations](integrations/integrations.md) - Obsidian, Slack, and other
