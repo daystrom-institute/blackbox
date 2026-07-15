@@ -28,6 +28,14 @@ use crate::model::{
 use crate::ports::{CapabilityRouter, FleetRepository, IdentityGenerator};
 use crate::roster::project_task;
 
+/// Grace period a launched worker gets to complete its initial handshake
+/// before fleetd retires the unconnected worker authority. A worker in
+/// `AwaitingInitialConnection` holds no lease, so without a deadline a process
+/// that dies before its first handshake would pin the task's worker slot
+/// forever and block any replacement provision. Kept generous relative to the
+/// default lease so a slow process launch is not reaped mid-startup.
+const INITIAL_CONNECT_DEADLINE_MS: u64 = 120_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeasePolicy {
     pub lease_duration_ms: u64,
@@ -928,6 +936,7 @@ where
                 .get_mut(&worker_id)
                 .ok_or_else(|| FleetError::not_found("worker", worker_id.to_string()))?;
             fence_worker(worker, connection_generation)?;
+            reject_terminal_worker(worker)?;
             if worker.connection_confirmed {
                 return Ok(false);
             }
@@ -987,6 +996,7 @@ where
                 .get_mut(&worker_id)
                 .ok_or_else(|| FleetError::not_found("worker", worker_id.to_string()))?;
             fence_worker(worker, connection_generation)?;
+            reject_terminal_worker(worker)?;
             if event_seq <= worker.event_ack {
                 return Ok(EventAck {
                     through_event_seq: worker.event_ack,
@@ -1287,6 +1297,7 @@ where
                 .get_mut(&worker_id)
                 .ok_or_else(|| FleetError::not_found("worker", worker_id.to_string()))?;
             fence_worker(worker, connection_generation)?;
+            reject_terminal_worker(worker)?;
             if outcome.command_seq <= worker.command_outcome_ack {
                 return Ok(CommandOutcomeAck {
                     through_command_seq: worker.command_outcome_ack,
@@ -1376,6 +1387,7 @@ where
                 .get_mut(&worker_id)
                 .ok_or_else(|| FleetError::not_found("worker", worker_id.to_string()))?;
             fence_worker(worker, connection_generation)?;
+            reject_terminal_worker(worker)?;
             let lease = worker
                 .lease
                 .as_mut()
@@ -1439,6 +1451,7 @@ where
                 .get_mut(&worker_id)
                 .ok_or_else(|| FleetError::not_found("worker", worker_id.to_string()))?;
             fence_worker(worker, connection_generation)?;
+            reject_terminal_worker(worker)?;
             if status.worker_id != worker.worker_id
                 || status.task_id != worker.task_id
                 || status.session_id != worker.session_id
@@ -1498,6 +1511,10 @@ where
                 .ok_or_else(|| FleetError::not_found("worker", worker_id.to_string()))?;
             fence_worker(worker, connection_generation)?;
             worker.state = WorkerAuthorityState::Lost;
+            // Fence any still-live transport connection so a stale frame on the
+            // old generation cannot resurrect a worker we just retired.
+            worker.connection_generation =
+                next_counter(worker.connection_generation, "worker connection generation")?;
             worker.pending_terminal_projection = None;
             worker.updated_at_unix_ms = now_unix_ms;
             let task_id = worker.task_id.clone();
@@ -1511,38 +1528,76 @@ where
                 .workers
                 .values()
                 .filter(|worker| {
-                    !worker.state.is_terminal()
-                        && worker.lease.as_ref().is_some_and(|lease| {
-                            now_unix_ms
-                                > lease
-                                    .expires_at_unix_ms
-                                    .saturating_add(lease.reattach_grace_ms)
-                        })
+                    if worker.state.is_terminal() {
+                        return false;
+                    }
+                    // A worker that launched but never finished its initial
+                    // handshake holds no lease. Reap it once its provisioning age
+                    // crosses the connect deadline so a dead pre-handshake process
+                    // cannot pin the task's worker slot forever.
+                    if worker.state == WorkerAuthorityState::AwaitingInitialConnection
+                        && worker.lease.is_none()
+                    {
+                        return now_unix_ms
+                            > worker
+                                .updated_at_unix_ms
+                                .saturating_add(INITIAL_CONNECT_DEADLINE_MS);
+                    }
+                    worker.lease.as_ref().is_some_and(|lease| {
+                        now_unix_ms
+                            > lease
+                                .expires_at_unix_ms
+                                .saturating_add(lease.reattach_grace_ms)
+                    })
                 })
                 .map(|worker| worker.worker_id.clone())
                 .collect();
             let mut transitioned_attempts = Vec::new();
             for worker_id in &expired {
-                let task_id = {
+                let (task_id, was_awaiting_initial) = {
                     let worker = snapshot
                         .workers
                         .get_mut(worker_id)
                         .ok_or_else(|| FleetError::not_found("worker", worker_id.to_string()))?;
+                    let awaiting_initial =
+                        worker.state == WorkerAuthorityState::AwaitingInitialConnection;
                     worker.state = WorkerAuthorityState::Lost;
+                    // Fence any still-live transport connection for this worker so
+                    // a stale frame on the old generation cannot resurrect it.
+                    worker.connection_generation =
+                        next_counter(worker.connection_generation, "worker connection generation")?;
                     worker.updated_at_unix_ms = now_unix_ms;
-                    worker.task_id.clone()
+                    (worker.task_id.clone(), awaiting_initial)
                 };
+                // Never regress a committed terminal task. A lapsed lease only
+                // invalidates the worker connection; a Completed (or already
+                // Failed) result stays authoritative. The worker is still marked
+                // Lost above so its provider slot can be reclaimed.
+                let task_is_terminal = snapshot
+                    .tasks
+                    .get(&task_id)
+                    .is_some_and(|task| task.status.is_terminal());
+                if task_is_terminal {
+                    continue;
+                }
                 if let Some(task) = snapshot.tasks.get_mut(&task_id) {
-                    task.status = TaskStatus::Failed;
                     task.recoverable = true;
-                    task.completed_at_unix_ms = Some(now_unix_ms);
                     task.last_event_at_unix_ms = task.last_event_at_unix_ms.max(now_unix_ms);
-                    if let Some(attempt_id) = &task.attempt_id
-                        && let Some(attempt) = snapshot.attempts.get_mut(attempt_id)
-                    {
-                        attempt.state = AttemptState::Lost;
-                        attempt.updated_at_unix_ms = now_unix_ms;
-                        transitioned_attempts.push(attempt.clone());
+                    if was_awaiting_initial {
+                        // The launched process died before it ever handshook, so
+                        // the task never started. Keep it provisionable (its
+                        // status stays non-terminal) so a replacement worker can
+                        // attach to the same task instead of wedging it.
+                    } else {
+                        task.status = TaskStatus::Failed;
+                        task.completed_at_unix_ms = Some(now_unix_ms);
+                        if let Some(attempt_id) = &task.attempt_id
+                            && let Some(attempt) = snapshot.attempts.get_mut(attempt_id)
+                        {
+                            attempt.state = AttemptState::Lost;
+                            attempt.updated_at_unix_ms = now_unix_ms;
+                            transitioned_attempts.push(attempt.clone());
+                        }
                     }
                     refresh_task_roster(snapshot, &task_id)?;
                 }
@@ -2443,6 +2498,20 @@ fn fence_worker(worker: &WorkerAuthorityRecord, connection_generation: u64) -> F
             expected: worker.connection_generation,
             actual: connection_generation,
         });
+    }
+    Ok(())
+}
+
+/// Fail closed on any post-handshake frame from a worker whose authority has
+/// already reached a terminal state (Lost or Terminal). Matching the terminal
+/// guard `accept_handshake` already applies keeps a retired worker from being
+/// resurrected to Active by a late frame that happens to carry a still-matching
+/// connection generation.
+fn reject_terminal_worker(worker: &WorkerAuthorityRecord) -> FleetResult<()> {
+    if worker.state.is_terminal() {
+        return Err(FleetError::InvalidState(
+            "worker authority is terminal".into(),
+        ));
     }
     Ok(())
 }
@@ -3775,6 +3844,211 @@ mod tests {
         assert_eq!(
             snapshot.attempts.get(&accepted.attempt_id).unwrap().state,
             AttemptState::Lost
+        );
+    }
+
+    #[test]
+    fn lease_expiry_never_regresses_a_committed_terminal_task() {
+        let (authority, _) = authority();
+        let (accepted, provisioned, _) = connect(&authority, "committed", 10);
+        // Commit a terminal Completed outcome while the worker is still Active
+        // with a live lease (the worker only goes Terminal via a separate
+        // observe_status frame that never arrives here).
+        authority
+            .transition_attempt(&accepted.attempt_id, AttemptState::Running, Value::Null, 13)
+            .unwrap();
+        authority
+            .transition_attempt(
+                &accepted.attempt_id,
+                AttemptState::Completed,
+                serde_json::json!({"ok": true}),
+                14,
+            )
+            .unwrap();
+        let before = authority.snapshot().unwrap();
+        assert_eq!(
+            before.tasks.get(&accepted.task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            before.workers.get(&provisioned.worker_id).unwrap().state,
+            WorkerAuthorityState::Active
+        );
+
+        // Let the lease lapse well past its reattach grace, then expire.
+        let expired = authority.expire_stale(10_000).unwrap();
+        assert_eq!(expired, vec![provisioned.worker_id.clone()]);
+        let after = authority.snapshot().unwrap();
+        // The committed result must stand: task Completed, attempt Completed.
+        assert_eq!(
+            after.tasks.get(&accepted.task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            after.roster.get(&accepted.task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            after.attempts.get(&accepted.attempt_id).unwrap().state,
+            AttemptState::Completed
+        );
+        // The worker connection itself is still retired.
+        assert_eq!(
+            after.workers.get(&provisioned.worker_id).unwrap().state,
+            WorkerAuthorityState::Lost
+        );
+    }
+
+    #[test]
+    fn expired_worker_cannot_be_resurrected_by_a_stale_active_status() {
+        let (authority, _) = authority();
+        let (accepted, provisioned, handshake) = connect(&authority, "resurrect", 10);
+        let live_generation = handshake.welcome.connection_generation;
+
+        // Let the lease lapse and expire the worker. Its task fails recoverably.
+        let expired = authority.expire_stale(10_000).unwrap();
+        assert_eq!(expired, vec![provisioned.worker_id.clone()]);
+        let snapshot = authority.snapshot().unwrap();
+        assert_eq!(
+            snapshot.tasks.get(&accepted.task_id).unwrap().status,
+            TaskStatus::Failed
+        );
+        let lost_worker = snapshot.workers.get(&provisioned.worker_id).unwrap();
+        assert_eq!(lost_worker.state, WorkerAuthorityState::Lost);
+        // Expiry bumped the connection generation to fence stale transports.
+        let fenced_generation = lost_worker.connection_generation;
+        assert!(fenced_generation > live_generation);
+
+        let active_status = |generation: u64| WorkerStatus {
+            worker_id: provisioned.worker_id.clone(),
+            task_id: accepted.task_id.clone(),
+            session_id: accepted.session_id.clone(),
+            worker_build: BuildIdentity {
+                version: "1.0.0".into(),
+                build_id: "worker-build".into(),
+            },
+            protocol_version: WORKER_PROTOCOL_V1,
+            connection_generation: generation,
+            last_local_event_seq: 0,
+            last_fleet_command_seq: 0,
+            state: WorkerLifecycleState::Active,
+        };
+
+        // A replayed Active status on the old (now stale) generation is fenced
+        // out at the transport level.
+        assert!(matches!(
+            authority.observe_status(
+                &provisioned.worker_id,
+                live_generation,
+                active_status(live_generation),
+                10_001,
+            ),
+            Err(FleetError::StaleConnectionGeneration { .. })
+        ));
+        // Even a frame that carries the new generation is rejected because the
+        // worker authority is terminal; it must never flip back to Active.
+        assert!(matches!(
+            authority.observe_status(
+                &provisioned.worker_id,
+                fenced_generation,
+                active_status(fenced_generation),
+                10_002,
+            ),
+            Err(FleetError::InvalidState(_))
+        ));
+        assert_eq!(
+            authority
+                .snapshot()
+                .unwrap()
+                .workers
+                .get(&provisioned.worker_id)
+                .unwrap()
+                .state,
+            WorkerAuthorityState::Lost
+        );
+
+        // A capability call for the failed task must fail closed on either
+        // generation.
+        let request = CapabilityRequest {
+            call_id: "call-after-expiry".into(),
+            invocation_id: None,
+            capability: "corpus.search".into(),
+            operation: "search".into(),
+            bounded_payload: Value::Null,
+            deadline_unix_ms: None,
+        };
+        assert!(matches!(
+            authority.authorize_capability(&provisioned.worker_id, live_generation, &request),
+            Err(FleetError::StaleConnectionGeneration { .. })
+        ));
+        assert!(matches!(
+            authority.authorize_capability(&provisioned.worker_id, fenced_generation, &request),
+            Err(FleetError::CapabilityUnauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn unconnected_initial_worker_expires_and_frees_the_task_for_a_replacement() {
+        let (authority, _) = authority();
+        let accepted = authority
+            .admit_execution(request("never-connects"), 10)
+            .unwrap();
+        // Provision a worker whose process is (notionally) launched but which
+        // never completes its initial handshake, so it holds no lease.
+        let first = authority.provision_worker(&accepted.task_id, 20).unwrap();
+        let provisioned_snapshot = authority.snapshot().unwrap();
+        assert_eq!(
+            provisioned_snapshot
+                .workers
+                .get(&first.worker_id)
+                .unwrap()
+                .state,
+            WorkerAuthorityState::AwaitingInitialConnection
+        );
+
+        // A replacement must be refused while the unconnected worker is live.
+        assert!(matches!(
+            authority.provision_worker(&accepted.task_id, 21),
+            Err(FleetError::InvalidState(_))
+        ));
+        // Not yet past the connect deadline: nothing expires.
+        assert!(
+            authority
+                .expire_stale(20 + INITIAL_CONNECT_DEADLINE_MS)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Past the connect deadline the dead pre-handshake worker is reaped.
+        let expired = authority
+            .expire_stale(20 + INITIAL_CONNECT_DEADLINE_MS + 1)
+            .unwrap();
+        assert_eq!(expired, vec![first.worker_id.clone()]);
+        let after = authority.snapshot().unwrap();
+        assert_eq!(
+            after.workers.get(&first.worker_id).unwrap().state,
+            WorkerAuthorityState::Lost
+        );
+        // The task never started, so it stays provisionable (non-terminal) and
+        // is flagged recoverable rather than being wedged forever.
+        let task = after.tasks.get(&accepted.task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.recoverable);
+
+        // A replacement worker can now be provisioned for the same task.
+        let replacement = authority
+            .provision_worker(&accepted.task_id, 20 + INITIAL_CONNECT_DEADLINE_MS + 2)
+            .unwrap();
+        assert_ne!(replacement.worker_id, first.worker_id);
+        assert_eq!(
+            authority
+                .snapshot()
+                .unwrap()
+                .workers
+                .get(&replacement.worker_id)
+                .unwrap()
+                .state,
+            WorkerAuthorityState::AwaitingInitialConnection
         );
     }
 
