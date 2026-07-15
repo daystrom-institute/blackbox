@@ -140,13 +140,25 @@ impl WorktreeManager {
                             // missing path as a recoverable completion, not a
                             // reason to terminate the reconciliation loop.
                             self.release_missing(&record).await?;
-                        } else {
-                            verify_materialized_worktree(
-                                Path::new(&record.base_repo),
-                                Path::new(&record.path),
-                                &self.root,
-                            )
-                            .await?;
+                        } else if let Err(error) = verify_materialized_worktree(
+                            Path::new(&record.base_repo),
+                            Path::new(&record.path),
+                            &self.root,
+                        )
+                        .await
+                        {
+                            // A concurrent closeout can remove the git worktree
+                            // between the path_is_missing pre-check above and this
+                            // verification, so the git commands fail against a
+                            // path that vanished underneath us. Re-check the path:
+                            // if it is now gone, treat it as the same recoverable
+                            // completion as the pre-check case rather than
+                            // surfacing a hard error that would kill the loop.
+                            if path_is_missing(Path::new(&record.path)).await? {
+                                self.release_missing(&record).await?;
+                            } else {
+                                return Err(error);
+                            }
                         }
                     } else {
                         self.materialize(&record).await?;

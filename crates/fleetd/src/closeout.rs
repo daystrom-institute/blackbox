@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::closeout_driver::{
     CloseoutErrorClass as DriverError, CloseoutHooks, CloseoutOutcome as DriverOutcome,
@@ -17,6 +21,23 @@ use crate::{FleetdError, FleetdResult};
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
 const MAX_HOOK_TIMEOUT_SECS: u64 = 900;
 const MAX_HOOK_SCRIPTLETS: usize = 64;
+
+/// Per-base-repo serialization for closeout runs. Concurrent closeouts on
+/// different managed worktrees of the SAME base repo mutate that one base
+/// checkout (fetch, ff-base, ff-merge, push, and the push-reject reset), so
+/// running them in parallel interleaves those git operations against a shared
+/// index/HEAD. This keyed map hands each base repo its own async mutex; closeouts
+/// on distinct base repos still run concurrently. The map only grows with the set
+/// of distinct base repos a long-lived daemon touches (bounded in practice).
+static BASE_REPO_LOCKS: LazyLock<StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn base_repo_lock(base_repo: &Path) -> Arc<AsyncMutex<()>> {
+    let mut map = BASE_REPO_LOCKS.lock().expect("base repo lock map poisoned");
+    map.entry(base_repo.to_path_buf())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
 
 pub(crate) async fn run(
     worktrees: &WorktreeManager,
@@ -68,7 +89,9 @@ pub(crate) async fn run(
     let dry_run = request.dry_run;
     let disposition_for_driver = disposition.clone();
 
-    let joined = tokio::task::spawn_blocking(move || {
+    // Stage 1: resolve and validate the driver request (git reads only). This
+    // yields the base repo path, which keys the per-base serialization below.
+    let driver = tokio::task::spawn_blocking(move || {
         let cx_root = PathBuf::from(&requested_worktree);
         let worktree_arg =
             (!requested_worktree.trim().is_empty()).then_some(requested_worktree.as_str());
@@ -91,6 +114,20 @@ pub(crate) async fn run(
         driver.paths = paths;
         driver.dry_run = dry_run;
         driver.closeout_hooks = hooks;
+        Ok::<_, String>(driver)
+    })
+    .await
+    .map_err(|error| FleetdError::Conflict(format!("closeout driver task failed: {error}")))?
+    .map_err(FleetdError::InvalidRequest)?;
+
+    // Serialize the base-mutating phases against other closeouts on the same base
+    // repo. Held across stage 2 so fetch/ff/reset/push never interleave with a
+    // sibling worktree's closeout in the shared base checkout.
+    let base_lock = base_repo_lock(&driver.base_repo);
+    let _base_guard = base_lock.lock().await;
+
+    // Stage 2: run the (base-mutating) closeout phases under the base lock.
+    let joined = tokio::task::spawn_blocking(move || {
         let canonical_worktree = driver.worktree.clone();
         let outcome = if driver.disposition == "keep" {
             DriverOutcome::Success {
@@ -105,11 +142,11 @@ pub(crate) async fn run(
         } else {
             run_closeout_phases(&driver)
         };
-        Ok::<_, String>((outcome, canonical_worktree))
+        (outcome, canonical_worktree)
     })
     .await
     .map_err(|error| FleetdError::Conflict(format!("closeout driver task failed: {error}")))?;
-    let (driver_outcome, canonical_worktree) = joined.map_err(FleetdError::InvalidRequest)?;
+    let (driver_outcome, canonical_worktree) = joined;
     let removed = outcome_removed_worktree(&driver_outcome);
     let wire = to_wire_outcome(&driver_outcome);
     if removed {

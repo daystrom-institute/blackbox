@@ -1110,6 +1110,32 @@ fn recover_push_reject(req: &CloseoutRequest) -> PushRecoveryOutcome {
         };
     }
 
+    // `base_repo` is the operator's primary worktree, shared with peer agents
+    // whose uncommitted work must never be destroyed. The preflight cleanliness
+    // check ran before push and is stale by now, so re-assert that tracked files
+    // are clean immediately before the destructive `git reset --hard`. If a peer
+    // dirtied a tracked file in the meantime, abort recovery and let the operator
+    // reconcile manually rather than clobbering their work.
+    match tracked_files_dirty(base_repo) {
+        Ok(true) => {
+            return PushRecoveryOutcome::Failed(push_recovery_dirty_base(
+                req,
+                format!(
+                    "push was rejected and origin/{target} moved, but the base repository has uncommitted changes to tracked files; refusing to `git reset --hard {remote_ref}` over them. Reconcile the base worktree manually, then retry the closeout."
+                ),
+            ));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return PushRecoveryOutcome::Failed(push_recovery_dirty_base(
+                req,
+                format!(
+                    "push was rejected and origin/{target} moved, but the base repository cleanliness re-check failed before `git reset --hard {remote_ref}`; refusing to reset. Reconcile the base worktree manually, then retry the closeout. Cause: {e:#}"
+                ),
+            ));
+        }
+    }
+
     if let Err(e) = git_run(base_repo, &["reset", "--hard", &remote_ref]) {
         return PushRecoveryOutcome::Failed(push_recovery_failure(
             req,
@@ -1158,6 +1184,25 @@ fn push_recovery_failure(req: &CloseoutRequest, recovery: &str, message: String)
             "error": message,
             "message": message,
             "recovery": recovery,
+            "ref": format!("origin/{}", req.target),
+        }),
+    }
+}
+
+/// Recovery abort raised when the base worktree gained uncommitted tracked-file
+/// changes between preflight and the push-reject `git reset --hard`. Classed as
+/// `BaseNotReady` (a dirty base is exactly that) so the operator is pointed at
+/// reconciling the base checkout, not at the remote push.
+fn push_recovery_dirty_base(req: &CloseoutRequest, message: String) -> PhaseResult {
+    PhaseResult {
+        phase: CloseoutPhase::Push,
+        repo_cwd: req.base_repo.clone(),
+        ok: false,
+        error_class: CloseoutErrorClass::BaseNotReady,
+        content: json!({
+            "error": message,
+            "message": message,
+            "recovery": "reset_to_origin_aborted_dirty_base",
             "ref": format!("origin/{}", req.target),
         }),
     }
@@ -1336,6 +1381,17 @@ fn ensure_base_ready_for_publish(base_repo: &Path, target: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// True when the repository has uncommitted changes to tracked files. Untracked
+/// files (`?? ...` porcelain entries) are ignored: `git reset --hard` does not
+/// destroy them, so they are not a reason to abort recovery. Any staged or
+/// unstaged modification, deletion, rename, or unmerged entry counts as dirty.
+fn tracked_files_dirty(repo: &Path) -> anyhow::Result<bool> {
+    let raw = git_capture(repo, &["status", "--porcelain=v1"])?;
+    Ok(raw
+        .lines()
+        .any(|line| !line.trim().is_empty() && !line.starts_with("??")))
+}
+
 fn changed_paths(repo: &Path) -> anyhow::Result<Vec<String>> {
     let raw = git_capture(repo, &["status", "--porcelain=v1"])?;
     Ok(raw
@@ -1442,4 +1498,141 @@ fn sanitize_path_component(raw: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.name", "Fleet Test"]);
+        git(path, &["config", "user.email", "fleet@example.invalid"]);
+        git(path, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn tracked_files_dirty_ignores_untracked_but_catches_modifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("tracked.txt"), b"one\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "seed"]);
+
+        // Clean tree: not dirty.
+        assert!(!tracked_files_dirty(&repo).unwrap());
+
+        // Untracked file alone: `git reset --hard` will not destroy it, so it
+        // must not count as dirty.
+        std::fs::write(repo.join("untracked.txt"), b"scratch\n").unwrap();
+        assert!(!tracked_files_dirty(&repo).unwrap());
+
+        // Modified tracked file: dirty.
+        std::fs::write(repo.join("tracked.txt"), b"two\n").unwrap();
+        assert!(tracked_files_dirty(&repo).unwrap());
+    }
+
+    // BUG 2 regression: when origin has moved and the base worktree gained
+    // uncommitted tracked-file changes after preflight, push-reject recovery must
+    // abort before `git reset --hard origin/<target>` instead of clobbering the
+    // peer's work.
+    #[test]
+    fn recover_push_reject_aborts_reset_when_base_has_dirty_tracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        // Bare origin.
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+
+        // Base worktree: seed commit A, publish to origin.
+        let base = root.join("base");
+        init_repo(&base);
+        std::fs::write(base.join("file.txt"), b"A\n").unwrap();
+        git(&base, &["add", "file.txt"]);
+        git(&base, &["commit", "-qm", "A"]);
+        git(
+            &base,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&base, &["push", "-q", "origin", "main"]);
+
+        // A peer clone advances origin/main to commit B. The base checkout stays
+        // at A, so after fetch, origin/main is NOT an ancestor of base HEAD and
+        // recovery reaches the reset-to-origin branch.
+        let peer = root.join("peer");
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                peer.to_str().unwrap(),
+            ],
+        );
+        git(&peer, &["config", "user.name", "Peer Test"]);
+        git(&peer, &["config", "user.email", "peer@example.invalid"]);
+        git(&peer, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(peer.join("file.txt"), b"B\n").unwrap();
+        git(&peer, &["commit", "-aqm", "B"]);
+        git(&peer, &["push", "-q", "origin", "main"]);
+
+        // Peer agent dirties a tracked file in the shared base checkout after
+        // preflight already passed.
+        std::fs::write(base.join("file.txt"), b"peer-uncommitted-work\n").unwrap();
+        let head_before = git_capture(&base, &["rev-parse", "HEAD"]).unwrap();
+
+        let req = CloseoutRequest {
+            worktree: base.clone(),
+            base_repo: base.clone(),
+            branch: "bro-fleet/feature".to_string(),
+            target: "main".to_string(),
+            disposition: "publish".to_string(),
+            confirm: true,
+            commit_message: None,
+            paths: vec![],
+            dry_run: false,
+            closeout_hooks: None,
+        };
+
+        let outcome = recover_push_reject(&req);
+        match outcome {
+            PushRecoveryOutcome::Failed(result) => {
+                assert_eq!(result.error_class, CloseoutErrorClass::BaseNotReady);
+                assert_eq!(
+                    result.content["recovery"],
+                    json!("reset_to_origin_aborted_dirty_base")
+                );
+            }
+            PushRecoveryOutcome::Recovered(_) => {
+                panic!("recovery must not reset over a dirty base worktree");
+            }
+        }
+
+        // The destructive reset must not have run: HEAD unchanged and the peer's
+        // uncommitted content preserved.
+        let head_after = git_capture(&base, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head_before, head_after, "reset --hard must not have run");
+        let contents = std::fs::read_to_string(base.join("file.txt")).unwrap();
+        assert_eq!(contents, "peer-uncommitted-work\n");
+    }
 }

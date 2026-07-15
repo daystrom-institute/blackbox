@@ -315,26 +315,40 @@ impl Fleetd {
                     tokio::select! {
                         _ = reaper_shutdown.cancelled() => return Ok(()),
                         _ = ticker.tick() => {
-                            let expired = authority
-                                .call(|authority| authority.expire_stale(now_ms()).map_err(Into::into))
-                                .await?;
-                            if !expired.is_empty() {
+                            // A single tick must never take the whole reaper down.
+                            // Lease expiry, provider release, and worktree
+                            // reconciliation each hit git and the authority actor,
+                            // any of which can fail transiently (e.g. a worktree
+                            // vanishing under a concurrent closeout). Log per-tick
+                            // errors and keep ticking; the loop only exits on the
+                            // shutdown cancellation branch above.
+                            let tick: FleetdResult<()> = async {
+                                let expired = authority
+                                    .call(|authority| authority.expire_stale(now_ms()).map_err(Into::into))
+                                    .await?;
+                                if !expired.is_empty() {
+                                    let snapshot = authority
+                                        .call(|authority| authority.snapshot().map_err(Into::into))
+                                        .await?;
+                                    roster.publish_authority(&snapshot);
+                                }
                                 let snapshot = authority
                                     .call(|authority| authority.snapshot().map_err(Into::into))
                                     .await?;
-                                roster.publish_authority(&snapshot);
+                                for task in snapshot.tasks.values().filter(|task| task.status.is_terminal()) {
+                                    let task_id = task.task_id.clone();
+                                    authority.call(move |authority| {
+                                        authority.release_provider(&task_id, now_ms()).map(|_| ()).map_err(Into::into)
+                                    }).await?;
+                                }
+                                if let Some(worktrees) = &worktrees {
+                                    worktrees.reconcile().await?;
+                                }
+                                Ok(())
                             }
-                            let snapshot = authority
-                                .call(|authority| authority.snapshot().map_err(Into::into))
-                                .await?;
-                            for task in snapshot.tasks.values().filter(|task| task.status.is_terminal()) {
-                                let task_id = task.task_id.clone();
-                                authority.call(move |authority| {
-                                    authority.release_provider(&task_id, now_ms()).map(|_| ()).map_err(Into::into)
-                                }).await?;
-                            }
-                            if let Some(worktrees) = &worktrees {
-                                worktrees.reconcile().await?;
+                            .await;
+                            if let Err(error) = tick {
+                                tracing::warn!(%error, "fleetd reaper tick failed; continuing");
                             }
                         }
                     }
