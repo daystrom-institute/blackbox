@@ -10,6 +10,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- `arch-pathology-rust` now ships its evidence-prover validator change as
+  workflow v3 instead of mutating the already-installed v2 definition. This
+  preserves immutable artifact references and lets blackopsd import shipped
+  and installed catalogs together during the service cutover.
 - `blackboxd --help` / `--version` are side-effect-free: they print and
   exit before any store open, background worker, port bind, or tokio
   runtime; unknown flags exit 2 instead of silently starting a daemon

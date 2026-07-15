@@ -378,7 +378,7 @@ omitted when nothing was refuted). The PD-dispatch handoff
 | panel teamplate ×4 | `system-defaults/refactor/pathology/teamplates/{java,rust}-pathology-panel.json` (arch) + `{java,rust}-perf-pathology-panel.json` (perf) |
 | facilitator brofile ×4 | `{java,rust}-architecture-pathologist.json` (v2, `agent_name=facilitator`) + `{java,rust}-performance-pathologist.json` |
 | packet ×1 | `…/packets/pathology-review/whiteboard-participation.json` (v2; shared by all four flows) |
-| workflow ×4 | `system-defaults/workflows/refactor/{arch-pathology-java,arch-pathology-rust,perf-pathology-java,perf-pathology-rust}.json` (v2) |
+| workflow ×4 | `system-defaults/workflows/refactor/{arch-pathology-java,arch-pathology-rust,perf-pathology-java,perf-pathology-rust}.json` (v2; `arch-pathology-rust` v3 after its validator contract changed) |
 
 The language-agnostic `perf-pathology.json` (v1) is superseded by the two
 per-language perf workflows; `docs/perf-pathology-dispatch.md` should be updated

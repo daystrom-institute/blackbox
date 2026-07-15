@@ -1,6 +1,6 @@
 {
   "name": "arch-pathology-rust",
-  "version": 2,
+  "version": 3,
   "vars_schema": {
     "project_dir": {
       "kind": "string",

@@ -144,6 +144,7 @@ pub async fn import_catalog(
     workflows.extend(installed_workflows);
 
     let installed_atoms = atoms.iter().filter(|document| !document.shipped).count();
+    let atoms = deduplicate_documents("atom", atoms)?;
     let brofiles = reference_map("brofile", brofiles)?;
     let workflows = reference_map("workflow", workflows)?;
     let mut definitions = Vec::with_capacity(atoms.len());
@@ -330,6 +331,28 @@ fn reference_map(
     kind: &str,
     documents: Vec<CatalogDocument>,
 ) -> BlackopsdResult<BTreeMap<String, Value>> {
+    Ok(deduplicate_documents(kind, documents)?
+        .into_iter()
+        .map(|document| {
+            let name = required_string(&document.value, "name", &document.source)
+                .expect("deduplicated catalog document has a name");
+            let version = artifact_version(
+                document
+                    .value
+                    .get("version")
+                    .expect("deduplicated catalog document has a version"),
+                &document.source,
+            )
+            .expect("deduplicated catalog document has a valid version");
+            (format!("{kind}:{name}@{version}"), document.value)
+        })
+        .collect())
+}
+
+fn deduplicate_documents(
+    kind: &str,
+    documents: Vec<CatalogDocument>,
+) -> BlackopsdResult<Vec<CatalogDocument>> {
     let mut values = BTreeMap::new();
     for document in documents {
         let name = required_string(&document.value, "name", &document.source)?;
@@ -343,15 +366,26 @@ fn reference_map(
             &document.source,
         )?;
         let reference = format!("{kind}:{name}@{version}");
-        if let Some(previous) = values.insert(reference.clone(), document.value.clone())
-            && previous != document.value
-        {
-            return Err(BlackopsdError::InvalidRequest(format!(
-                "catalog reference {reference} has conflicting immutable definitions"
-            )));
+        match values.entry(reference.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(document);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().value != document.value {
+                    return Err(BlackopsdError::InvalidRequest(format!(
+                        "catalog reference {reference} has conflicting immutable definitions"
+                    )));
+                }
+                // Identical installed and embedded documents are one immutable
+                // artifact. Prefer the shipped source so durable definitions
+                // remain stable when an installed catalog moves on disk.
+                if document.shipped && !entry.get().shipped {
+                    entry.insert(document);
+                }
+            }
         }
     }
-    Ok(values)
+    Ok(values.into_values().collect())
 }
 
 fn to_definition(
@@ -410,7 +444,6 @@ fn to_definition(
         | AtomImplementation::Adapter { .. }
         | AtomImplementation::Consultant { .. } => {}
     }
-    body.insert("catalog_source".into(), Value::String(document.source));
     Ok(DefinitionInstallRequest {
         kind: DefinitionKind::Atom,
         name: artifact.name,
@@ -552,6 +585,7 @@ mod tests {
             .unwrap();
         let request = to_definition(echo, &brofiles, &workflows).unwrap();
         assert_eq!(request.version, "v1");
+        assert!(request.body.get("catalog_source").is_none());
         let definition = OperationalDefinition {
             key: blackops_core::DefinitionKey {
                 kind: DefinitionKind::Atom,
@@ -570,6 +604,35 @@ mod tests {
             }
         );
         assert!(SHIPPED_ATOM_SOURCES.len() > 100);
+    }
+
+    #[test]
+    fn duplicate_catalog_references_are_content_addressed_before_import() {
+        let value = json!({"name": "same", "version": 1, "payload": "stable"});
+        let installed = CatalogDocument {
+            source: "/operator/catalog/same.json".into(),
+            value: value.clone(),
+            shipped: false,
+        };
+        let shipped = CatalogDocument {
+            source: "system-defaults/atoms/same.json".into(),
+            value: value.clone(),
+            shipped: true,
+        };
+        let unique =
+            deduplicate_documents("atom", vec![installed.clone(), shipped.clone()]).unwrap();
+        assert_eq!(unique.len(), 1);
+        assert!(unique[0].shipped, "the path-stable shipped source must win");
+
+        let mut conflicting = installed;
+        conflicting.value["payload"] = json!("changed-without-version");
+        let error = deduplicate_documents("atom", vec![shipped, conflicting]).unwrap_err();
+        assert!(matches!(
+            error,
+            BlackopsdError::InvalidRequest(detail)
+                if detail.contains("atom:same@v1")
+                    && detail.contains("conflicting immutable definitions")
+        ));
     }
 
     #[test]
