@@ -1024,6 +1024,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bbox-corpus-index",
  "bro-capabilities",
  "bro-core",
@@ -1131,9 +1132,11 @@ name = "bro-capabilities"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bro-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 

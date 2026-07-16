@@ -6,8 +6,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use bro_capabilities::{
-    CorpusHit, MAX_RECORD_BYTES, RECORD_ARCHIVE_SNAPSHOT_VERSION, RecordArchiveSnapshot,
-    RecordEnvelope, RecordIngestReceipt, RecordIngestRequest, TranscriptRecordTarget,
+    CorpusHit, InlineTranscriptIncrement, MAX_RECORD_BYTES, RECORD_ARCHIVE_SNAPSHOT_VERSION,
+    RecordArchiveSnapshot, RecordEnvelope, RecordIngestReceipt, RecordIngestRequest,
+    TRANSCRIPT_INCREMENT_KIND, TranscriptRecordTarget, inline_transcript_increments,
 };
 use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
@@ -64,11 +65,63 @@ impl RecordStore {
             validate_record(record)?;
         }
 
+        let increments = inline_transcript_increments(&request.records)?;
+
         let mut state = self.state.lock();
         let mut next = state.clone();
         let mut accepted = 0usize;
         let mut deduplicated = 0usize;
+
+        // Inline transcript increments bypass the retained-records map: the
+        // collector-archive file is the durable copy, the per-stream byte
+        // cursor is the idempotency authority, and retaining megabyte payloads
+        // in the full-rewrite snapshot would make catch-up quadratic. They are
+        // exempt from producer-cursor tracking for the same reason; replays
+        // dedupe by byte range instead of by retained record identity.
+        for increment in &increments {
+            let tail = next
+                .transcript_cursors
+                .get(&increment.stream)
+                .copied()
+                .unwrap_or(0);
+            if increment.byte_end <= tail {
+                deduplicated = deduplicated.saturating_add(1);
+                continue;
+            }
+            if increment.byte_start > tail {
+                return Err(bro_core::BroError::new(
+                    "record_ingest.transcript_increment_gap",
+                    format!(
+                        "stream {} submitted byte_start {}; expected contiguous byte_start {tail}",
+                        increment.stream, increment.byte_start
+                    ),
+                ));
+            }
+            if increment.byte_start < tail {
+                return Err(bro_core::BroError::new(
+                    "record_ingest.transcript_increment_overlap",
+                    format!(
+                        "stream {} submitted byte range {}..{} overlapping acknowledged tail {tail}",
+                        increment.stream, increment.byte_start, increment.byte_end
+                    ),
+                ));
+            }
+            self.append_collector_increment(increment)
+                .map_err(|error| {
+                    bro_core::BroError::new(
+                        "record_ingest.transcript_archive_failed",
+                        error.to_string(),
+                    )
+                })?;
+            next.transcript_cursors
+                .insert(increment.stream.clone(), increment.byte_end);
+            accepted = accepted.saturating_add(1);
+        }
+
         for record in request.records {
+            if record.kind == TRANSCRIPT_INCREMENT_KIND {
+                continue;
+            }
             let cursor = parse_cursor(&record)?;
             match next.records.get(&record.record_id) {
                 Some(existing) if existing == &record => {
@@ -140,6 +193,81 @@ impl RecordStore {
             .parent()
             .expect("record snapshot always has a parent")
             .join("transcript-archive")
+    }
+
+    /// Root of the corpus-owned archives for satellite-collector transcript
+    /// increments. Layout mirrors the source machines
+    /// (`<host>/<source>/<account>/<relative_path>`) so the ordinary
+    /// interactive adapters can scan these directories as additional roots.
+    pub fn collector_archive_root(&self) -> PathBuf {
+        self.path
+            .parent()
+            .expect("record snapshot always has a parent")
+            .join("collector-archive")
+    }
+
+    /// Resolved archive path for one increment. Every component was validated
+    /// traversal-free by `inline_transcript_increments`.
+    fn collector_archive_path(&self, increment: &InlineTranscriptIncrement) -> PathBuf {
+        let host = increment
+            .producer
+            .strip_prefix("collector:")
+            .unwrap_or(&increment.producer);
+        let mut path = self
+            .collector_archive_root()
+            .join(host)
+            .join(&increment.source)
+            .join(&increment.account);
+        for component in increment.relative_path.split('/') {
+            path.push(component);
+        }
+        path
+    }
+
+    // Archive appends are the synchronous durability boundary for collector
+    // increments: bytes are fsynced before the stream cursor may advance.
+    #[allow(clippy::disallowed_methods)]
+    fn append_collector_increment(
+        &self,
+        increment: &InlineTranscriptIncrement,
+    ) -> anyhow::Result<()> {
+        use std::io::{Seek as _, SeekFrom};
+
+        let path = self.collector_archive_path(increment);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("collector archive path has no parent"))?;
+        create_private_dirs_recursive(self.collector_archive_root().as_path(), parent)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        // The acknowledged cursor, not the file length, is the truth about
+        // where good bytes end: a crash between append and snapshot persist
+        // leaves a tail beyond the cursor, which the retry now truncates away.
+        // A file SHORTER than the acknowledged cursor means the archive lost
+        // durable bytes; extending it would silently backfill a NUL hole, so
+        // that fails closed instead.
+        let current = file.metadata()?.len();
+        if current < increment.byte_start {
+            anyhow::bail!(
+                "collector archive {} is shorter ({current}) than the acknowledged cursor {}",
+                path.display(),
+                increment.byte_start
+            );
+        }
+        if current > increment.byte_start {
+            file.set_len(increment.byte_start)?;
+        }
+        file.seek(SeekFrom::Start(increment.byte_start))?;
+        file.write_all(&increment.bytes)?;
+        file.sync_all()?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
 
     /// Copy pending fleet logs into corpus-owned private storage before their
@@ -423,6 +551,21 @@ fn transcript_archive_error(error: impl std::fmt::Display) -> bro_core::BroError
     bro_core::BroError::new("record_ingest.transcript_archive_failed", error.to_string())
 }
 
+// Every directory level under the collector-archive root is created private,
+// not only the leaf, so nested archive layouts never inherit broad modes.
+fn create_private_dirs_recursive(root: &Path, leaf: &Path) -> anyhow::Result<()> {
+    create_private_dir(root)?;
+    let relative = leaf
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("collector archive leaf escapes its root"))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        create_private_dir(&current)?;
+    }
+    Ok(())
+}
+
 // Private state roots are synchronously established before any durable record
 // or archive file is opened beneath them.
 #[allow(clippy::disallowed_methods)]
@@ -662,6 +805,170 @@ mod tests {
             .unwrap();
         assert_eq!(repaired["worker-1"].through_event_seq, 1);
         assert_eq!(std::fs::read_to_string(archive).unwrap(), first);
+    }
+
+    fn increment(cursor: &str, byte_start: u64, raw: &[u8]) -> RecordEnvelope {
+        use base64::Engine as _;
+        let byte_end = byte_start + raw.len() as u64;
+        RecordEnvelope {
+            record_id: bro_capabilities::inline_transcript_record_id(
+                "collector:host-b1",
+                "claude",
+                "claude",
+                "projects/repo-a/session-1.jsonl",
+                byte_start,
+                byte_end,
+            ),
+            producer: "collector:host-b1".into(),
+            cursor: cursor.into(),
+            kind: TRANSCRIPT_INCREMENT_KIND.into(),
+            occurred_at: None,
+            subject: Some("session-1".into()),
+            attributes: BTreeMap::from([
+                ("source".into(), "claude".into()),
+                ("account".into(), "claude".into()),
+                ("session_id".into(), "session-1".into()),
+                (
+                    "relative_path".into(),
+                    "projects/repo-a/session-1.jsonl".into(),
+                ),
+            ]),
+            payload: serde_json::json!({
+                "byte_start": byte_start,
+                "byte_end": byte_end,
+                "bytes_b64": base64::engine::general_purpose::STANDARD.encode(raw),
+            }),
+        }
+    }
+
+    const INCREMENT_STREAM: &str =
+        "collector:host-b1/claude/claude/projects/repo-a/session-1.jsonl";
+
+    #[test]
+    fn inline_increment_appends_archive_without_retaining_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = RecordStore::open(&root).unwrap();
+        let receipt = store
+            .ingest(RecordIngestRequest {
+                records: vec![
+                    increment("1", 0, b"{\"a\":1}\n"),
+                    increment("2", 8, b"{\"b\":2}\n"),
+                ],
+            })
+            .unwrap();
+        assert_eq!((receipt.accepted, receipt.deduplicated), (2, 0));
+        assert_eq!(receipt.transcript_cursors.get(INCREMENT_STREAM), Some(&16));
+        assert!(receipt.producer_cursors.is_empty());
+        assert!(store.all_records().is_empty());
+
+        let archive = store
+            .collector_archive_root()
+            .join("host-b1/claude/claude/projects/repo-a/session-1.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&archive).unwrap(),
+            "{\"a\":1}\n{\"b\":2}\n"
+        );
+
+        // Replay of the full prefix is an idempotent dedupe, not a conflict.
+        let replay = store
+            .ingest(RecordIngestRequest {
+                records: vec![increment("1", 0, b"{\"a\":1}\n")],
+            })
+            .unwrap();
+        assert_eq!((replay.accepted, replay.deduplicated), (0, 1));
+
+        // A gap beyond the acknowledged tail fails closed.
+        let error = store
+            .ingest(RecordIngestRequest {
+                records: vec![increment("3", 24, b"{\"c\":3}\n")],
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "record_ingest.transcript_increment_gap");
+    }
+
+    #[test]
+    fn inline_increment_survives_restart_and_heals_torn_archive_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = RecordStore::open(&root).unwrap();
+        store
+            .ingest(RecordIngestRequest {
+                records: vec![increment("1", 0, b"{\"a\":1}\n")],
+            })
+            .unwrap();
+        let archive = store
+            .collector_archive_root()
+            .join("host-b1/claude/claude/projects/repo-a/session-1.jsonl");
+        drop(store);
+
+        // Simulate a crash that appended bytes past the acknowledged cursor.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&archive)
+                .unwrap();
+            file.write_all(b"{\"torn").unwrap();
+        }
+
+        let reopened = RecordStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.transcript_cursors().get(INCREMENT_STREAM),
+            Some(&8)
+        );
+        let receipt = reopened
+            .ingest(RecordIngestRequest {
+                records: vec![increment("2", 8, b"{\"b\":2}\n")],
+            })
+            .unwrap();
+        assert_eq!(receipt.accepted, 1);
+        assert_eq!(
+            std::fs::read_to_string(&archive).unwrap(),
+            "{\"a\":1}\n{\"b\":2}\n"
+        );
+    }
+
+    #[test]
+    fn inline_increment_fails_closed_when_archive_lost_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = RecordStore::open(&root).unwrap();
+        store
+            .ingest(RecordIngestRequest {
+                records: vec![increment("1", 0, b"{\"a\":1}\n")],
+            })
+            .unwrap();
+        let archive = store
+            .collector_archive_root()
+            .join("host-b1/claude/claude/projects/repo-a/session-1.jsonl");
+        std::fs::write(&archive, b"{\"a\"").unwrap();
+
+        let error = store
+            .ingest(RecordIngestRequest {
+                records: vec![increment("2", 8, b"{\"b\":2}\n")],
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "record_ingest.transcript_archive_failed");
+    }
+
+    #[test]
+    fn mixed_batches_route_increments_and_operational_records_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = RecordStore::open(&root).unwrap();
+        let receipt = store
+            .ingest(RecordIngestRequest {
+                records: vec![
+                    increment("1", 0, b"{\"a\":1}\n"),
+                    record("record-1", "1", serde_json::json!({"result": "needle"})),
+                ],
+            })
+            .unwrap();
+        assert_eq!((receipt.accepted, receipt.deduplicated), (2, 0));
+        assert_eq!(store.all_records().len(), 1);
+        assert_eq!(receipt.producer_cursors.get("blackopsd"), Some(&"1".into()));
+        assert_eq!(receipt.transcript_cursors.get(INCREMENT_STREAM), Some(&8));
     }
 
     #[cfg(unix)]

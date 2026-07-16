@@ -118,6 +118,13 @@ impl CorpusService {
         let records = request.records.clone();
         let targets = transcript_record_targets(&records)?;
         let mut receipt = self.records.ingest(request)?;
+        // Inline transcript increments are archived by the store and indexed
+        // from their archive files on the ordinary reindex pass; projecting
+        // them as operational records would index base64 payload blobs.
+        let records: Vec<_> = records
+            .into_iter()
+            .filter(|record| record.kind != bro_capabilities::TRANSCRIPT_INCREMENT_KIND)
+            .collect();
         let pending = targets
             .iter()
             .filter(|(stream, target)| {

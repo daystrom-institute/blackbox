@@ -193,6 +193,13 @@ pub(crate) async fn internal_record_ingest_handler(
     let result = tokio::task::spawn_blocking(move || {
         let targets = bro_capabilities::transcript_record_targets(&records)?;
         let mut receipt = record_store.ingest(request)?;
+        // Inline transcript increments are archived by the store and indexed
+        // from their archive files on the ordinary reindex pass; projecting
+        // them as operational records would index base64 payload blobs.
+        let records: Vec<_> = records
+            .into_iter()
+            .filter(|record| record.kind != bro_capabilities::TRANSCRIPT_INCREMENT_KIND)
+            .collect();
         let pending = targets
             .iter()
             .filter(|(stream, target)| {
@@ -205,11 +212,13 @@ pub(crate) async fn internal_record_ingest_handler(
             .collect();
         let archived = record_store.archive_transcript_targets(&pending, &transcript_roots)?;
         let archive_root = record_store.transcript_archive_root();
-        index_writer
-            .upsert_operational_records_blocking(records, archived, vec![archive_root])
-            .map_err(|error| {
-                bro_core::BroError::new("record_ingest.index_failed", error.to_string())
-            })?;
+        if !records.is_empty() || !archived.is_empty() {
+            index_writer
+                .upsert_operational_records_blocking(records, archived, vec![archive_root])
+                .map_err(|error| {
+                    bro_core::BroError::new("record_ingest.index_failed", error.to_string())
+                })?;
+        }
         if !targets.is_empty() {
             let acknowledged = targets
                 .into_iter()
