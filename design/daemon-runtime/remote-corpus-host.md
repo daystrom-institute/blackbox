@@ -121,24 +121,27 @@ embedding behavior is finally graphed.
 **Estate placement resolution (2026-07-16): separate overlay repo.** The
 infra repo self-describes as PlanGlobal-estate-scoped and converge-controlled
 ("mixing two change-control regimes in one repo forces one of them to lie");
-blackbox is personal tooling on a different cadence. The manifests live in a
-small personal overlay repo (working name `bbox-cage`): Deployment/
-StatefulSet, Longhorn PVCs, Services with tailscale exposure, secret refs,
-all pinned to a dedicated namespace with its own ServiceAccount so personal
-workloads cannot touch estate workloads. The only infra-repo touch is one
-Flux source registration (a `GitRepository` plus a namespace-constrained
-`Kustomization` pointing at the overlay repo), which is the `flux/`
-directory's declared mechanism working as designed, not a scope change.
-Boundaries: anything node-host-level (sysctls, storage prep, node labels)
-still goes through the infra repo's canonical ansible, though nothing
-currently planned needs that; the cluster platform baseline (Longhorn,
+blackbox is personal tooling on a different cadence. The deployment lives in
+a small personal overlay repo (`bbox-cage`, created 2026-07-16): namespace,
+staged service-token Secret, RWO `cage-block` PVCs, single-replica Recreate
+Deployments with the non-loopback opt-ins and health probes, ClusterIP
+Services, and tailscale LoadBalancer exposure. Correction to an earlier
+draft of this paragraph: the infra repo's `flux/` directory is EMPTY pending
+the estate's Flux bootstrap, so there is no Flux source to register yet.
+The cage's actual converge mechanism today is Pulumi, and `bbox-cage` is
+therefore a standalone Pulumi stack converged by explicit `pulumi up`
+against the same cluster, requiring ZERO changes to the infra repo at all;
+it converts to a Flux source when the estate bootstrap lands. Boundaries:
+anything node-host-level (sysctls, storage prep, node labels) still goes
+through the infra repo's canonical ansible, though nothing currently planned
+needs that; the cluster platform baseline (`cage-block` replicated storage,
 ingress, observability, the tailscale operator) already covers blackbox's
-needs with zero pulumi/ansible changes. Satellite-side packaging (collector
-launchd plists, install scripts) is machine bootstrap, which the infra repo
-explicitly excludes: it lives in this repo's `deploy/`, beside the existing
-daemon service files. The service token reaches the cluster through the
-homelab's established vault-sourced secret path; match whatever mechanism
-the overlay's Flux setup uses (confirm during manifest authoring).
+needs. Satellite-side packaging (collector launchd plists, install scripts)
+is machine bootstrap, which the infra repo explicitly excludes: it lives in
+this repo's `deploy/`, beside the existing daemon service files. The service
+token reaches the cluster as Pulumi secret config sourced from the operator's
+vault env contract, and must be the SAME value as the satellites' token
+files so collectors and fleetd keep authenticating across the cutover.
 
 ## Alternative host: a dedicated Mac
 
