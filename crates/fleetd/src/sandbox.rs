@@ -21,7 +21,7 @@ pub(crate) struct WorkerSandbox {
     bro_root: PathBuf,
     protected_peer_service_roots: Vec<PathBuf>,
     worker_socket: PathBuf,
-    denied_loopback_ports: Vec<u16>,
+    denied_service_ports: Vec<u16>,
 }
 
 pub(crate) struct WorkerSandboxConfig {
@@ -33,7 +33,7 @@ pub(crate) struct WorkerSandboxConfig {
     pub(crate) bro_root: PathBuf,
     pub(crate) protected_peer_service_roots: Vec<PathBuf>,
     pub(crate) worker_socket: PathBuf,
-    pub(crate) denied_loopback_ports: Vec<u16>,
+    pub(crate) denied_service_ports: Vec<u16>,
 }
 
 struct WorkerSandboxScope {
@@ -63,7 +63,7 @@ impl WorkerSandbox {
             bro_root,
             protected_peer_service_roots,
             worker_socket,
-            denied_loopback_ports,
+            denied_service_ports,
         } = config;
         let worker_binary = canonical_protected_file(&worker_binary, "bro-harness worker binary")?;
         let service_token_file =
@@ -110,7 +110,7 @@ impl WorkerSandbox {
                 "fleet worker socket must be contained by the fleet state directory".into(),
             ));
         }
-        let denied_loopback_ports = denied_loopback_ports
+        let denied_service_ports = denied_service_ports
             .into_iter()
             .filter(|port| *port != 0)
             .collect::<BTreeSet<_>>()
@@ -134,7 +134,7 @@ impl WorkerSandbox {
                 bro_root,
                 protected_peer_service_roots,
                 worker_socket,
-                denied_loopback_ports,
+                denied_service_ports,
             };
             sandbox.probe_macos_seatbelt().await?;
             Ok(sandbox)
@@ -158,7 +158,7 @@ impl WorkerSandbox {
                 bro_root,
                 protected_peer_service_roots,
                 worker_socket,
-                denied_loopback_ports,
+                denied_service_ports,
             };
             sandbox.probe_external_launcher().await?;
             Ok(sandbox)
@@ -168,7 +168,7 @@ impl WorkerSandbox {
         {
             let _ = external_launcher;
             let _ = worker_socket;
-            let _ = denied_loopback_ports;
+            let _ = denied_service_ports;
             Err(FleetdError::InvalidConfiguration(
                 "authority workers have no supported process sandbox on this platform".into(),
             ))
@@ -272,7 +272,7 @@ impl WorkerSandbox {
         command
             .arg("-p")
             .arg(macos_seatbelt_profile(
-                &self.denied_loopback_ports,
+                &self.denied_service_ports,
                 scope.protected_paths.len(),
                 self.protected_peer_service_roots.len(),
                 scope.protected_entry_patterns.len(),
@@ -417,7 +417,7 @@ impl WorkerSandbox {
         for path in &scope.protected_paths {
             command.arg("--protected-path").arg(path);
         }
-        for port in &self.denied_loopback_ports {
+        for port in &self.denied_service_ports {
             command.arg("--deny-loopback-port").arg(port.to_string());
         }
     }
@@ -463,7 +463,7 @@ impl WorkerSandbox {
         for path in &scope.protected_paths {
             command.arg("--protected-path").arg(path);
         }
-        for port in &self.denied_loopback_ports {
+        for port in &self.denied_service_ports {
             command.arg("--deny-loopback-port").arg(port.to_string());
         }
         let output = command
@@ -496,7 +496,7 @@ impl WorkerSandbox {
 
 #[cfg(target_os = "macos")]
 fn macos_seatbelt_profile(
-    denied_loopback_ports: &[u16],
+    denied_service_ports: &[u16],
     protected_path_count: usize,
     protected_service_root_count: usize,
     protected_entry_pattern_count: usize,
@@ -587,9 +587,19 @@ fn macos_seatbelt_profile(
             "(deny file-write* (regex (param \"PROTECTED_ENTRY_PATTERN_{index}\")))\n"
         ));
     }
-    for port in denied_loopback_ports {
+    // Deny each service port on EVERY host, not just loopback. Seatbelt's
+    // network filter only accepts `*` or `localhost` as the host component
+    // (a specific remote IP is rejected at profile-compile time), so a wildcard
+    // host is the only way to express "the worker may not reach the corpus
+    // endpoint" when that endpoint is a remote cluster service rather than a
+    // loopback tunnel port. These ports are dedicated blackbox service ports
+    // (7264-7266 plus any configured upstream port), never a port a worker
+    // legitimately needs, so wildcarding the host is precise enough and leaves
+    // provider egress on 443 untouched. Loopback tunnel ports remain covered
+    // because `*:port` is a strict superset of `localhost:port`.
+    for port in denied_service_ports {
         profile.push_str(&format!(
-            "(deny network-outbound (remote ip \"localhost:{port}\"))\n"
+            "(deny network-outbound (remote ip \"*:{port}\"))\n"
         ));
     }
     profile
@@ -1000,7 +1010,7 @@ mod tests {
                 corpus_index.clone(),
             ],
             worker_socket: socket_path.clone(),
-            denied_loopback_ports: vec![service_port],
+            denied_service_ports: vec![service_port],
         })
         .await
         .unwrap();
@@ -1147,7 +1157,10 @@ if /usr/bin/curl --silent --show-error --max-time 1 --request POST --data mutati
             )));
         }
         for port in [7264, 7265, 7266] {
-            assert!(profile.contains(&format!(
+            // Host-agnostic `*:port` so a remote cluster corpus endpoint on that
+            // port is denied too, not only the loopback tunnel form.
+            assert!(profile.contains(&format!("(deny network-outbound (remote ip \"*:{port}\"))")));
+            assert!(!profile.contains(&format!(
                 "(deny network-outbound (remote ip \"localhost:{port}\"))"
             )));
         }

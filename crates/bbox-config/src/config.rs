@@ -133,6 +133,8 @@ struct RawDaemonConfig {
     pub mcp_session_keepalive_secs: u64,
     #[serde(default = "default_daemon_poller_min_interval_secs")]
     pub poller_min_interval_secs: u64,
+    #[serde(default = "default_daemon_allow_nonloopback_bind")]
+    pub allow_nonloopback_bind: bool,
 }
 
 fn default_daemon_port() -> u16 {
@@ -140,6 +142,12 @@ fn default_daemon_port() -> u16 {
 }
 fn default_daemon_bind() -> String {
     "127.0.0.1".to_string()
+}
+/// Fail-closed by default: the corpus role refuses a non-loopback bind unless
+/// this is explicitly set. Intended for containerized/cluster deployment where
+/// blackboxd (corpus role) is fronted by the cluster's ingress/LoadBalancer.
+fn default_daemon_allow_nonloopback_bind() -> bool {
+    false
 }
 fn default_daemon_mcp_name() -> String {
     "blackbox".to_string()
@@ -336,6 +344,9 @@ pub struct DaemonConfig {
     pub task_ttl_ms: u64,
     pub mcp_session_keepalive_secs: u64,
     pub poller_min_interval_secs: u64,
+    /// Opt-in that lets the corpus role bind a non-loopback address. Default
+    /// false keeps the loopback fail-closed guard in `server::run`.
+    pub allow_nonloopback_bind: bool,
 }
 
 /// Index configuration
@@ -409,6 +420,7 @@ impl Config {
                 task_ttl_ms: default_daemon_task_ttl_ms(),
                 mcp_session_keepalive_secs: default_daemon_mcp_session_keepalive_secs(),
                 poller_min_interval_secs: default_daemon_poller_min_interval_secs(),
+                allow_nonloopback_bind: default_daemon_allow_nonloopback_bind(),
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -474,6 +486,14 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !bind.trim().is_empty()
     {
         raw.daemon.bind = bind;
+    }
+
+    // Explicit opt-in for a non-loopback corpus-role bind (cluster deployment).
+    // Fail-closed by default; see `server::run` for the guard it relaxes.
+    if let Ok(val) = std::env::var("BBOX_ALLOW_NONLOOPBACK_BIND")
+        && !val.trim().is_empty()
+    {
+        raw.daemon.allow_nonloopback_bind = val == "1" || val.eq_ignore_ascii_case("true");
     }
 
     if let Ok(mcp_name) = std::env::var("BLACKBOX_MCP_NAME")
@@ -689,6 +709,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             task_ttl_ms: raw.daemon.task_ttl_ms,
             mcp_session_keepalive_secs: raw.daemon.mcp_session_keepalive_secs,
             poller_min_interval_secs: raw.daemon.poller_min_interval_secs,
+            allow_nonloopback_bind: raw.daemon.allow_nonloopback_bind,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,

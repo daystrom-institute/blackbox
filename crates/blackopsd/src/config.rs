@@ -57,6 +57,28 @@ pub struct BlackopsdConfig {
 
     #[arg(long, env = "BLACKOPSD_UPSTREAM_TIMEOUT_MS", default_value_t = 30_000)]
     pub upstream_timeout_ms: u64,
+
+    /// Explicit opt-in that lets blackopsd bind a non-loopback address. Default
+    /// false keeps the same-host loopback fail-closed guard. Intended for
+    /// containerized/cluster deployment where blackopsd runs as a k8s workload.
+    #[arg(
+        long,
+        env = "BLACKOPSD_ALLOW_NONLOOPBACK_BIND",
+        default_value_t = false
+    )]
+    pub allow_nonloopback_bind: bool,
+
+    /// Explicit opt-in that lets the upstream service URLs target a non-loopback
+    /// host so an agent/cluster machine can address the corpus service directly.
+    /// Default false keeps the loopback fail-closed guard. The plain-HTTP and
+    /// no-credentials rejections are NOT relaxed by this flag: TLS termination,
+    /// if ever needed, belongs to the cluster ingress, not this client URL.
+    #[arg(
+        long,
+        env = "BLACKOPSD_ALLOW_NONLOOPBACK_SERVICE_URLS",
+        default_value_t = false
+    )]
+    pub allow_nonloopback_service_urls: bool,
 }
 
 impl Default for BlackopsdConfig {
@@ -72,6 +94,8 @@ impl Default for BlackopsdConfig {
             default_model: "glm-4.7".into(),
             reconcile_interval_ms: 1_000,
             upstream_timeout_ms: 30_000,
+            allow_nonloopback_bind: false,
+            allow_nonloopback_service_urls: false,
         }
     }
 }
@@ -98,9 +122,9 @@ impl BlackopsdConfig {
     }
 
     pub fn validate(&self) -> BlackopsdResult<()> {
-        if !self.bind.ip().is_loopback() {
+        if !self.bind.ip().is_loopback() && !self.allow_nonloopback_bind {
             return Err(BlackopsdError::Configuration(
-                "blackopsd is a same-host service and must bind a loopback address".into(),
+                "blackopsd is a same-host service and must bind a loopback address; set BLACKOPSD_ALLOW_NONLOOPBACK_BIND=true (allow_nonloopback_bind) to opt in for cluster deployment".into(),
             ));
         }
         if self.reconcile_interval_ms == 0 || self.upstream_timeout_ms == 0 {
@@ -113,8 +137,16 @@ impl BlackopsdConfig {
                 "fleetd and blackboxd URLs must not be empty".into(),
             ));
         }
-        validate_loopback_http_url("fleetd", &self.fleetd_url)?;
-        validate_loopback_http_url("blackboxd", &self.blackboxd_url)?;
+        validate_service_http_url(
+            "fleetd",
+            &self.fleetd_url,
+            self.allow_nonloopback_service_urls,
+        )?;
+        validate_service_http_url(
+            "blackboxd",
+            &self.blackboxd_url,
+            self.allow_nonloopback_service_urls,
+        )?;
         Provider::from_str(&self.default_provider).map_err(|_| {
             BlackopsdError::Configuration("default provider is not recognized".into())
         })?;
@@ -163,13 +195,22 @@ fn default_catalog_dir(state_dir: &std::path::Path) -> PathBuf {
     state_dir.parent().unwrap_or(state_dir).join("artifacts")
 }
 
-fn validate_loopback_http_url(service: &str, raw: &str) -> BlackopsdResult<()> {
+/// Validate an upstream service URL. Plain HTTP is required and embedded
+/// credentials are rejected unconditionally: the LAN design carries the bearer
+/// out-of-band and terminates TLS (if ever needed) at the cluster ingress, not
+/// in this client URL. `allow_nonloopback` relaxes only the loopback-host
+/// requirement so a cluster/agent machine can address the corpus directly.
+fn validate_service_http_url(
+    service: &str,
+    raw: &str,
+    allow_nonloopback: bool,
+) -> BlackopsdResult<()> {
     let url = reqwest::Url::parse(raw).map_err(|error| {
         BlackopsdError::Configuration(format!("{service} URL is invalid: {error}"))
     })?;
     if url.scheme() != "http" {
         return Err(BlackopsdError::Configuration(format!(
-            "{service} URL must use plain HTTP on the loopback interface"
+            "{service} URL must use plain HTTP (TLS termination belongs to the cluster ingress)"
         )));
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -188,9 +229,9 @@ fn validate_loopback_http_url(service: &str, raw: &str) -> BlackopsdResult<()> {
         || ip_host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback());
-    if !loopback {
+    if !loopback && !allow_nonloopback {
         return Err(BlackopsdError::Configuration(format!(
-            "{service} URL must target localhost, 127.0.0.0/8, or ::1"
+            "{service} URL must target localhost, 127.0.0.0/8, or ::1; set BLACKOPSD_ALLOW_NONLOOPBACK_SERVICE_URLS=true (allow_nonloopback_service_urls) to point at a remote cluster service"
         )));
     }
     if url.query().is_some() || url.fragment().is_some() {
@@ -274,6 +315,54 @@ mod tests {
                 ..BlackopsdConfig::default()
             };
             assert!(config.validate().is_err(), "{url} must be rejected");
+        }
+    }
+
+    #[test]
+    fn non_loopback_bind_fails_closed_then_opts_in() {
+        let mut config = BlackopsdConfig {
+            bind: "0.0.0.0:7266".parse().unwrap(),
+            ..BlackopsdConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "non-loopback bind must fail closed"
+        );
+        config.allow_nonloopback_bind = true;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn non_loopback_service_url_opts_in_without_weakening_scheme_or_credentials() {
+        // Fail-closed by default.
+        let remote = BlackopsdConfig {
+            blackboxd_url: "http://192.0.2.10:7264".into(),
+            ..BlackopsdConfig::default()
+        };
+        assert!(remote.validate().is_err());
+
+        // Opt-in accepts a remote plain-HTTP host.
+        let opted_in = BlackopsdConfig {
+            blackboxd_url: "http://192.0.2.10:7264".into(),
+            allow_nonloopback_service_urls: true,
+            ..BlackopsdConfig::default()
+        };
+        opted_in.validate().unwrap();
+
+        // The opt-in does NOT relax the https or credentials rejections.
+        for url in [
+            "https://192.0.2.10:7264",
+            "http://user:pass@192.0.2.10:7264",
+        ] {
+            let config = BlackopsdConfig {
+                blackboxd_url: url.into(),
+                allow_nonloopback_service_urls: true,
+                ..BlackopsdConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "{url} must stay rejected even with the non-loopback opt-in"
+            );
         }
     }
 }

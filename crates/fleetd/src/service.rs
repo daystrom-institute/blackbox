@@ -62,7 +62,7 @@ impl Fleetd {
                 bro_root: config.state_dir.join("bro"),
                 protected_peer_service_roots: config.protected_peer_service_roots(),
                 service_token_file: config.service_token_path().to_path_buf(),
-                denied_loopback_ports: config.denied_worker_service_ports(),
+                denied_service_ports: config.denied_worker_service_ports(),
                 external_sandbox_launcher: config.worker_sandbox_launcher.clone(),
             })
             .await?,

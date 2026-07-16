@@ -74,6 +74,19 @@ pub struct FleetdConfig {
     #[arg(long, env = "FLEETD_BLACKBOXD_URL")]
     pub blackboxd_url: Option<String>,
 
+    /// Explicit opt-in that lets `blackopsd_url` / `blackboxd_url` target a
+    /// non-loopback host so an agent machine can address the cluster corpus
+    /// service directly. Default false keeps the loopback fail-closed guard.
+    /// Plain HTTP is still required (TLS termination, if ever needed, belongs
+    /// to the cluster ingress). SSH tunnels that keep the URL on loopback
+    /// remain the supported alternative when the wire must be encrypted.
+    #[arg(
+        long,
+        env = "FLEETD_ALLOW_NONLOOPBACK_SERVICE_URLS",
+        default_value_t = false
+    )]
+    pub allow_nonloopback_service_urls: bool,
+
     /// blackopsd durable authority root hidden from every worker process.
     #[arg(long, env = "FLEETD_BLACKOPSD_STATE_DIR")]
     pub blackopsd_state_dir: Option<PathBuf>,
@@ -133,6 +146,7 @@ impl Default for FleetdConfig {
             shadow_source: None,
             blackopsd_url: None,
             blackboxd_url: None,
+            allow_nonloopback_service_urls: false,
             blackopsd_state_dir: None,
             blackopsd_catalog_dir: None,
             corpus_state_dir: None,
@@ -264,14 +278,16 @@ impl FleetdConfig {
                 "authority mode has no supported worker sandbox on this platform".into(),
             ));
         }
+        // The shadow-replication source is always same-host; it is never the
+        // remote corpus, so it stays loopback-only regardless of the opt-in.
         if let Some(source) = &self.shadow_source {
-            validate_loopback_http_url("shadow source", source)?;
+            validate_service_http_url("shadow source", source, false)?;
         }
         if let Some(url) = &self.blackopsd_url {
-            validate_loopback_http_url("blackopsd URL", url)?;
+            validate_service_http_url("blackopsd URL", url, self.allow_nonloopback_service_urls)?;
         }
         if let Some(url) = &self.blackboxd_url {
-            validate_loopback_http_url("blackboxd URL", url)?;
+            validate_service_http_url("blackboxd URL", url, self.allow_nonloopback_service_urls)?;
         }
         Ok(())
     }
@@ -431,12 +447,19 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     path
 }
 
-fn validate_loopback_http_url(label: &str, raw: &str) -> FleetdResult<()> {
+/// Validate an upstream service URL. Plain HTTP is required unconditionally
+/// (TLS termination, if ever needed, belongs to the cluster ingress).
+/// `allow_nonloopback` relaxes only the loopback-host requirement so an agent
+/// machine can point at a remote cluster corpus service directly.
+fn validate_service_http_url(label: &str, raw: &str, allow_nonloopback: bool) -> FleetdResult<()> {
     let url = reqwest::Url::parse(raw).map_err(|error| {
-        FleetdError::InvalidConfiguration(format!(
-            "{label} must be a valid http loopback URL: {error}"
-        ))
+        FleetdError::InvalidConfiguration(format!("{label} must be a valid http URL: {error}"))
     })?;
+    if url.scheme() != "http" {
+        return Err(FleetdError::InvalidConfiguration(format!(
+            "{label} must use plain http (TLS termination belongs to the cluster ingress)"
+        )));
+    }
     let host = url
         .host_str()
         .unwrap_or_default()
@@ -446,9 +469,9 @@ fn validate_loopback_http_url(label: &str, raw: &str) -> FleetdResult<()> {
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback());
-    if url.scheme() != "http" || !loopback {
+    if !loopback && !allow_nonloopback {
         return Err(FleetdError::InvalidConfiguration(format!(
-            "{label} must use http with a loopback host"
+            "{label} must use a loopback host; set FLEETD_ALLOW_NONLOOPBACK_SERVICE_URLS=true (allow_nonloopback_service_urls) to point at a remote cluster service"
         )));
     }
     Ok(())
@@ -552,6 +575,50 @@ mod tests {
     }
 
     #[test]
+    fn non_loopback_service_urls_opt_in_but_keep_http_only() {
+        // Fail-closed by default.
+        let remote = FleetdConfig {
+            blackboxd_url: Some("http://192.0.2.10:7264".into()),
+            ..FleetdConfig::default()
+        };
+        assert!(matches!(
+            remote.normalized(),
+            Err(FleetdError::InvalidConfiguration(_))
+        ));
+
+        // Opt-in accepts a remote plain-HTTP blackboxd/blackopsd host.
+        let opted_in = FleetdConfig {
+            blackboxd_url: Some("http://192.0.2.10:7264".into()),
+            blackopsd_url: Some("http://corpus.internal:7266".into()),
+            allow_nonloopback_service_urls: true,
+            ..FleetdConfig::default()
+        };
+        opted_in.normalized().unwrap();
+
+        // The opt-in does NOT relax the https rejection.
+        let tls = FleetdConfig {
+            blackboxd_url: Some("https://192.0.2.10:7264".into()),
+            allow_nonloopback_service_urls: true,
+            ..FleetdConfig::default()
+        };
+        assert!(matches!(
+            tls.normalized(),
+            Err(FleetdError::InvalidConfiguration(_))
+        ));
+
+        // The shadow-replication source stays loopback-only under the opt-in.
+        let remote_shadow = FleetdConfig {
+            shadow_source: Some("http://192.0.2.10:7265".into()),
+            allow_nonloopback_service_urls: true,
+            ..FleetdConfig::default()
+        };
+        assert!(matches!(
+            remote_shadow.normalized(),
+            Err(FleetdError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
     fn worker_boundary_denies_default_and_configured_service_ports() {
         let config = FleetdConfig {
             bind: "127.0.0.1:7365".parse().unwrap(),
@@ -566,6 +633,21 @@ mod tests {
             config.denied_worker_service_ports(),
             vec![7264, 7265, 7266, 7365, 7464, 7564, 7566]
         );
+    }
+
+    #[test]
+    fn worker_boundary_denies_a_remote_corpus_endpoint_port() {
+        // With the opt-in, a remote corpus URL on a custom port must still land
+        // in the worker deny set so the worker cannot reach it directly; the
+        // sandbox denies that port host-agnostically (`*:port`).
+        let config = FleetdConfig {
+            blackboxd_url: Some("http://192.0.2.10:9264".into()),
+            allow_nonloopback_service_urls: true,
+            ..FleetdConfig::default()
+        }
+        .normalized()
+        .unwrap();
+        assert!(config.denied_worker_service_ports().contains(&9264));
     }
 
     #[cfg(target_os = "macos")]

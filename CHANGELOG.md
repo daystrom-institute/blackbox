@@ -8,6 +8,26 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Changed
+
+- Corpus services can now be pointed at a remote LAN/cluster deployment through
+  explicit, fail-closed-by-default opt-ins; the loopback guards are unchanged
+  unless an operator sets the new flags. blackboxd (corpus role) accepts a
+  non-loopback bind with `BBOX_ALLOW_NONLOOPBACK_BIND=1`
+  (`daemon.allow_nonloopback_bind`). blackopsd accepts a non-loopback bind with
+  `BLACKOPSD_ALLOW_NONLOOPBACK_BIND` and a non-loopback `blackboxd_url` /
+  `fleetd_url` with `BLACKOPSD_ALLOW_NONLOOPBACK_SERVICE_URLS`. fleetd accepts a
+  non-loopback `blackboxd_url` / `blackopsd_url` with
+  `FLEETD_ALLOW_NONLOOPBACK_SERVICE_URLS` so an agent machine can address the
+  cluster corpus directly. Each denial names its opt-in. The opt-ins relax only
+  the loopback-host requirement: plain HTTP stays mandatory and credentials in
+  the URL stay rejected (TLS termination belongs to the cluster ingress). The
+  worker sandbox continues to deny workers direct access to the corpus/ops
+  endpoints: the macOS Seatbelt profile now denies each service port on every
+  host (`*:port`), so a configured remote corpus endpoint is blocked, not only
+  loopback tunnel ports. Slice 0 of
+  `design/daemon-runtime/remote-corpus-host.md`.
+
 ### Added
 
 - Dispatched harness sessions reach a curated `bbox_*` tool catalog

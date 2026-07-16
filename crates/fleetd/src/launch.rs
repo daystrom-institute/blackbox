@@ -55,7 +55,7 @@ pub struct ProcessWorkerLauncherConfig {
     pub bro_root: PathBuf,
     pub protected_peer_service_roots: Vec<PathBuf>,
     pub service_token_file: PathBuf,
-    pub denied_loopback_ports: Vec<u16>,
+    pub denied_service_ports: Vec<u16>,
     pub external_sandbox_launcher: Option<PathBuf>,
 }
 
@@ -69,7 +69,7 @@ impl ProcessWorkerLauncher {
             bro_root,
             protected_peer_service_roots,
             service_token_file,
-            denied_loopback_ports,
+            denied_service_ports,
             external_sandbox_launcher,
         } = config;
         let worker_root = create_private_directory(&worker_root).await?;
@@ -83,7 +83,7 @@ impl ProcessWorkerLauncher {
             bro_root: bro_root.clone(),
             protected_peer_service_roots,
             worker_socket: worker_socket.clone(),
-            denied_loopback_ports,
+            denied_service_ports,
         })
         .await?;
         Ok(Self {

@@ -19,9 +19,12 @@ pub async fn run() -> anyhow::Result<()> {
     let store_dir = opened.store_dir;
     let bind_host = opened.bind_host;
     let bind_is_loopback = opened.bind_is_loopback;
-    if runtime_role == RuntimeRole::Corpus && !bind_is_loopback {
+    if runtime_role == RuntimeRole::Corpus
+        && !bind_is_loopback
+        && !cfg.daemon.allow_nonloopback_bind
+    {
         anyhow::bail!(
-            "blackboxd corpus role exposes private capability and record endpoints and must bind to loopback"
+            "blackboxd corpus role exposes private capability and record endpoints and must bind to loopback; set BBOX_ALLOW_NONLOOPBACK_BIND=1 (daemon.allow_nonloopback_bind) to opt in for containerized/cluster deployment behind a trusted ingress"
         );
     }
     start_background_tasks(shared.clone(), runtime_role).await?;
