@@ -1,0 +1,21 @@
+{
+  "id": "gap-4045f786",
+  "title": "fleetd MCP tools/call rejects the MCP-standard _meta field, breaking all blackbox-fleet tools from Claude Code",
+  "gap_kind": "mcp_surface",
+  "domain": "fleetd",
+  "wanted_capability": "fleetd's MCP adapter should accept (and ignore) the optional _meta member on tools/call params, like the rmcp-based corpus (7264) and blackops (7266) servers do. Claude Code attaches _meta (progress token) to every tools/call, so every blackbox-fleet tool invocation fails with 'invalid tools/call parameters: unknown field _meta, expected name or arguments' even though auth and initialize succeed. Deserialization of CallToolRequestParams must tolerate unknown/optional spec members instead of deny-unknown-fields.",
+  "missing_primitive": "spec-tolerant CallToolRequestParams deserialization in fleetd's hand-rolled MCP adapter",
+  "fallback_used": "Called bro_dashboard via a raw curl streamable-HTTP shim that omits _meta (worked, stateless: no mcp-session-id issued)",
+  "evidence": [
+    "mcp__blackbox-fleet__bro_dashboard error: invalid tools/call parameters: unknown field `_meta`, expected `name` or `arguments` (2026-07-15, Claude Code 2.1.211)",
+    "blackops_workflow_list on 7266 succeeds with identical client, so only fleetd's adapter is strict"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/fleetd/tools-call-meta-field-rejected",
+  "resolution": "addressed",
+  "created_at": "2026-07-16T04:01:48Z",
+  "updated_at": "2026-07-16T04:14:00Z",
+  "resolved_at": "2026-07-16T04:14:00Z",
+  "resolution_note": "fleetd ToolCall now accepts the MCP-reserved _meta member (crates/fleetd/src/mcp.rs) while retaining deny_unknown_fields typo protection; unit tests cover both accept-_meta and reject-unknown. Verified live post-redeploy: tools/call bro_dashboard with _meta progressToken returns data on 127.0.0.1:7265."
+}

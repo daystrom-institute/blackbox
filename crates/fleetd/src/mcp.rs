@@ -37,6 +37,11 @@ struct ToolCall {
     name: String,
     #[serde(default = "empty_object")]
     arguments: Value,
+    // MCP reserves `_meta` on request params (progress tokens etc.); clients
+    // like Claude Code attach it to every tools/call. Accept and ignore it
+    // while still rejecting genuinely unknown fields.
+    #[serde(default, rename = "_meta")]
+    _meta: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,4 +377,32 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
         "id": id,
         "error": {"code": code, "message": message}
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolCall;
+    use serde_json::json;
+
+    #[test]
+    fn tool_call_accepts_reserved_meta_member() {
+        let call: ToolCall = serde_json::from_value(json!({
+            "name": "bro_dashboard",
+            "arguments": {"limit": 5},
+            "_meta": {"progressToken": 3}
+        }))
+        .expect("_meta is reserved by the MCP spec and must parse");
+        assert_eq!(call.name, "bro_dashboard");
+        assert_eq!(call.arguments, json!({"limit": 5}));
+    }
+
+    #[test]
+    fn tool_call_still_rejects_unknown_fields() {
+        let error = serde_json::from_value::<ToolCall>(json!({
+            "name": "bro_dashboard",
+            "argument": {}
+        }))
+        .expect_err("typo'd members must still be rejected");
+        assert!(error.to_string().contains("argument"));
+    }
 }
