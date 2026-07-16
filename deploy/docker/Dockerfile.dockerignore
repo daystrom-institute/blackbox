@@ -1,0 +1,17 @@
+# Build-context trim. BuildKit honors <dockerfile>.dockerignore when the build
+# is invoked as `docker build -f deploy/docker/Dockerfile <root-context>`, which
+# is exactly what build.sh does. Paths are relative to the build context (the
+# repo root). Keep the multi-GB target dirs and VCS/agent cruft out of the
+# context upload so the emulated amd64 build stays tractable.
+#
+# NOTE: build.rs needs .git for the BLACKBOX_BUILD_ID stamp, so .git is NOT
+# ignored here; build.sh instead passes the build id in as a fallback when a
+# shallow/absent .git would otherwise degrade the stamp.
+target/
+**/target/
+.claude/
+.claude/worktrees/
+*.log
+node_modules/
+site/node_modules/
+**/*.rs.bk

@@ -4,7 +4,9 @@ This is the page for keeping a running daemon healthy. It is deliberately
 not the design tour. For graph and retrieval mechanics, see
 [Graph And Retrieval Internals](graph-retrieval-internals.md). For index,
 embedding, and compaction implementation details, see
-[Index And Embedding Internals](index-embedding-internals.md).
+[Index And Embedding Internals](index-embedding-internals.md). For running the
+corpus services as Linux containers on the k3s cluster (the cage), see
+[deploy/docker/README.md](../deploy/docker/README.md).
 
 ## What healthy looks like
 
