@@ -18,9 +18,7 @@ use walkdir::WalkDir;
 use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::{FieldHandles, FileMeta, ReindexConfig};
-use crate::transcripts::adapters::{
-    TranscriptAdapterRegistry, TranscriptReadAdapter, TranscriptScanTarget,
-};
+use crate::transcripts::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
 use crate::transcripts::projection::{normalized_to_doc, normalized_to_tool_call_doc};
 use crate::transcripts::types::TranscriptLocation;
 
@@ -159,7 +157,7 @@ pub fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
 /// indexed it (observed live: gap-4629bbeb probe sessions, 2026-06-10
 /// 18:09 pass "purged 2 deleted").
 pub fn scan_adapter_source_files(config: &ReindexConfig, files: &mut Vec<(String, u64, u64)>) {
-    let registry = TranscriptAdapterRegistry::from_reindex_config(config);
+    let registry = crate::transcripts::registry_from_reindex_config(config);
     for adapter in registry.adapters() {
         for target in [
             TranscriptScanTarget::Sessions,
@@ -239,7 +237,7 @@ pub fn index_transcripts_via_adapters(
     tool_edges: &ToolEdgeContext,
     commit_progress: bool,
 ) -> Result<()> {
-    let registry = TranscriptAdapterRegistry::from_reindex_config(config);
+    let registry = crate::transcripts::registry_from_reindex_config(config);
     for adapter in registry.adapters() {
         let sessions = adapter
             .scan_locations(TranscriptScanTarget::Sessions)

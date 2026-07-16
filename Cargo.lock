@@ -401,6 +401,7 @@ dependencies = [
  "bbox-chunker",
  "bbox-corpus-core",
  "bbox-edge-sidecar",
+ "bbox-transcript-read",
  "bro-core",
  "bro-transcript",
  "dirs",
@@ -795,6 +796,20 @@ dependencies = [
  "anyhow",
  "bbox-knowledge",
  "bbox-util",
+]
+
+[[package]]
+name = "bbox-transcript-read"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bro-core",
+ "bro-transcript",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]

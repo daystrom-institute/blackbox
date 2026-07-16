@@ -57,9 +57,7 @@ pub fn find_session_file(
         additional_harness_sessions_dirs: Vec::new(),
         operational_records_path: None,
     };
-    let registry = crate::transcripts::adapters::TranscriptAdapterRegistry::from_reindex_config(
-        &registry_config,
-    );
+    let registry = crate::transcripts::registry_from_reindex_config(&registry_config);
     for provider in [
         bro_core::Provider::Glm,
         bro_core::Provider::Deepseek,

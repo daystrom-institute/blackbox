@@ -1,7 +1,6 @@
-use crate::index::ReindexConfig;
 use bro_core::Provider;
 
-use super::types::{
+use crate::types::{
     TranscriptBatch, TranscriptCursor, TranscriptLocation, TranscriptReadError, TranscriptSnapshot,
     TranscriptSource,
 };
@@ -50,44 +49,19 @@ impl TranscriptAdapterRegistry {
         Self { adapters }
     }
 
-    /// Registry for index-time scans. Every source root must be explicit in
-    /// the config — harness sessions dir, interactive claude roots, codex
-    /// root, gemini tmp root are all `None`/empty in hermetic test indexes —
-    /// so reindex never silently scans the operator's real state.
-    pub fn from_reindex_config(config: &ReindexConfig) -> Self {
-        let mut adapters: Vec<Box<dyn TranscriptReadAdapter>> = Vec::new();
-        if let Some(dir) = &config.harness_sessions_dir {
-            adapters.extend(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(dir));
-        }
-        for dir in &config.additional_harness_sessions_dirs {
-            adapters.extend(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(dir));
-        }
-        if !config.roots.is_empty() {
-            adapters.push(Box::new(super::interactive::ClaudeTranscriptAdapter::new(
-                config.roots.clone(),
-            )));
-        }
-        if let Some(codex_root) = config.codex_root.clone() {
-            adapters.push(Box::new(super::interactive::CodexTranscriptAdapter::new(
-                codex_root,
-            )));
-        }
-        if let Some(tmp_root) = config.gemini_tmp_root.clone() {
-            adapters.push(Box::new(super::interactive::GeminiTranscriptAdapter::new(
-                tmp_root,
-            )));
-        }
-        Self::new(adapters)
-    }
-
     /// Registry for runtime lookups (`locate` for task transcript handles).
     /// Resolves the harness sessions dir from the live environment — the
     /// daemon exports `BRO_HOME` during startup, matching where in-process
     /// harness sessions write. Interactive sources are index-time only:
     /// tasks are never dispatched to them, so they have no runtime handles.
+    ///
+    /// The index-time registry (`from_reindex_config`) is config-dependent and
+    /// lives in `bbox-corpus-index` (see
+    /// `bbox_corpus_index::transcripts::registry_from_reindex_config`) so this
+    /// leaf crate stays config-agnostic.
     pub fn from_runtime_config() -> Self {
-        let dir = super::harness_sessions::env_sessions_dir();
-        Self::new(super::harness_sessions::HarnessSessionsAdapter::all_for_dir(&dir))
+        let dir = crate::harness_sessions::env_sessions_dir();
+        Self::new(crate::harness_sessions::HarnessSessionsAdapter::all_for_dir(&dir))
     }
 
     pub fn adapters(&self) -> impl Iterator<Item = &dyn TranscriptReadAdapter> {

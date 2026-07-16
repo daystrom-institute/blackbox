@@ -14,7 +14,7 @@ use super::tool_edges::ToolEdgeContext;
 use super::writer_actor::IndexWriterActor;
 use super::{FieldHandles, ReindexConfig};
 use crate::projects::ProjectRecord;
-use bbox_corpus_index::transcripts::adapters::{TranscriptAdapterRegistry, TranscriptScanTarget};
+use bbox_corpus_index::transcripts::adapters::TranscriptScanTarget;
 
 // At the default 120s interval this is one full refresh per day. Full
 // project refreshes rewrite managed derived sidecars and trigger legacy
@@ -414,7 +414,7 @@ pub fn backfill_tool_edges_for_project(
     let edges_dir =
         bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
     let ctx = ToolEdgeContext::for_project(project.clone(), edges_dir.clone());
-    let registry = TranscriptAdapterRegistry::from_reindex_config(config);
+    let registry = bbox_corpus_index::transcripts::registry_from_reindex_config(config);
     let mut collected: Vec<bbox_edge_index::edge_index::Edge> = Vec::new();
 
     for adapter in registry.adapters() {

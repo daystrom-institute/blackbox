@@ -478,6 +478,37 @@ impl NormalizedTranscriptEvent {
             self.session_id
         ))
     }
+
+    /// Reconstruct the parser-native [`ParsedEvent`] this event normalized
+    /// from. Tantivy-free inverse of [`Self::from_parsed_event`]; the tantivy
+    /// projection (`bbox_corpus_index::transcripts::projection`) builds on it,
+    /// but it lives here because it is an inherent method on the type and needs
+    /// no index dependency.
+    pub fn to_parsed_event(&self) -> Option<ParsedEvent> {
+        let role = self.role.into();
+        Some(ParsedEvent {
+            role,
+            content: self.content.clone(),
+            session_id: self.session_id.clone(),
+            timestamp: self.timestamp.clone(),
+            git_branch: self.git_branch.clone(),
+            is_subagent: self.is_subagent,
+            agent_slug: self.agent_slug.clone(),
+            cwd: self.cwd.clone(),
+            tool_call: self.tool_call.clone().map(Into::into),
+        })
+    }
+
+    pub fn is_indexable(&self) -> bool {
+        matches!(
+            self.kind,
+            TranscriptEventKind::Message
+                | TranscriptEventKind::Thinking
+                | TranscriptEventKind::ToolUse
+                | TranscriptEventKind::ToolResult
+                | TranscriptEventKind::Developer
+        )
+    }
 }
 
 fn event_kind_for(role: MessageRole, tool_call: Option<&ToolCallInfo>) -> TranscriptEventKind {
