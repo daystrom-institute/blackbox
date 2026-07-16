@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  bbox-collector launchd agent template for a macOS satellite host.
+  Substitute __HOME__ with the target user's home, install to
+  ~/Library/LaunchAgents/com.daystrom.bbox-collector.plist, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daystrom.bbox-collector.plist
+  See deploy/collector/README.md.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.daystrom.bbox-collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/bbox-collector</string>
+    <string>--config</string>
+    <string>__HOME__/.config/blackbox/collector.toml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>RUST_LOG</key>
+    <string>bbox_collector=info</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/bbox-collector.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/bbox-collector.log</string>
+</dict>
+</plist>

@@ -30,6 +30,22 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `bbox-collector`: a slim satellite log-shipper binary that tails interactive
+  `claude` and `codex` transcript roots on a source machine and ships inline
+  byte-increment records to the corpus host's `POST /internal/records`. It
+  needs no fleetd and no bro plane, and its dependency tree carries no tantivy,
+  no v8, and no corpus-index (it links only the tantivy-free
+  `bbox-transcript-read` reading layer plus the `bro-capabilities` wire
+  contract; enforced by `scripts/acceptance-collector-deps.sh`). Shipping uses
+  strict-prefix reads (only through the last complete newline, never a torn
+  tail) with the corpus server as the cursor authority: a local sidecar caches
+  per-stream byte tails for fast resume, and startup / gap / overlap recovery
+  resyncs by POSTing an empty batch and adopting the server's acknowledged
+  tails. There is no local spool; the provider's own session file is the
+  backlog, so an unreachable corpus just retries next tick with capped
+  backoff. Packaging (launchd plist, systemd unit, example config, setup
+  README) lives in `deploy/collector/`. Slice 2c of
+  `design/daemon-runtime/remote-corpus-host.md`.
 - Dispatched harness sessions reach a curated `bbox_*` tool catalog
   (`bbox_note`, `bbox_notes`, `bbox_note_resolve`, `bbox_search`,
   `bbox_knowledge`) through the typed worker capability RPC instead of the
