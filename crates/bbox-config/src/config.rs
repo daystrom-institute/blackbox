@@ -137,6 +137,25 @@ struct RawDaemonConfig {
     pub allow_nonloopback_bind: bool,
 }
 
+/// Dev-checkout fallback for the system-memory defaults directory. This crate
+/// was peeled out of the workspace root, so `CARGO_MANIFEST_DIR` points at
+/// `crates/bbox-config`, while `system-defaults/` lives at the workspace root
+/// two levels up. Prefer a crate-local dir if one ever exists, then the
+/// workspace root; return the workspace-root candidate either way so the
+/// startup error names the path a dev checkout is expected to have.
+fn dev_defaults_memories_dir() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let crate_local = manifest.join("system-defaults").join("memories");
+    if crate_local.is_dir() {
+        return crate_local;
+    }
+    manifest
+        .join("..")
+        .join("..")
+        .join("system-defaults")
+        .join("memories")
+}
+
 fn default_daemon_port() -> u16 {
     7264
 }
@@ -1019,7 +1038,7 @@ fn resolve_paths(
     //   1. BLACKBOX_DEFAULTS_DIR env var → $VAR/memories
     //   2. [paths].defaults_dir config field → $FIELD/memories
     //   3. <exe_dir>/../share/blackbox/memories (installed binary layout)
-    //   4. CARGO_MANIFEST_DIR/system-defaults/memories (dev fallback)
+    //   4. workspace-root system-defaults/memories (dev fallback)
     let defaults_memories_dir = if let Ok(env) = std::env::var("BLACKBOX_DEFAULTS_DIR")
         && !env.trim().is_empty()
     {
@@ -1033,14 +1052,10 @@ fn resolve_paths(
             .map(|prefix| prefix.join("share").join("blackbox").join("memories"));
         match exe_relative {
             Some(p) if p.exists() => p,
-            _ => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("system-defaults")
-                .join("memories"),
+            _ => dev_defaults_memories_dir(),
         }
     } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("system-defaults")
-            .join("memories")
+        dev_defaults_memories_dir()
     };
 
     // user_memories_dir: 3-tier resolution, None when config path is unavailable
