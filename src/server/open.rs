@@ -79,6 +79,11 @@ pub(super) fn open_shared_state(
     idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
     idx.add_harness_sessions_dir(cfg.paths.bro_home.join("record-ingest/transcript-archive"));
     idx.set_operational_records_path(cfg.paths.bro_home.join("record-ingest/records.json"));
+    // Satellite-collector transcript archives (inline-payload increments from
+    // remote source machines) join the interactive adapter scan set; the
+    // registry rescans this root per reindex pass, so new satellite hosts
+    // index without a restart.
+    idx.set_collector_archive_root(cfg.paths.bro_home.join("record-ingest/collector-archive"));
     // Interactive Gemini chats (claude/codex roots already travel inside
     // ReindexConfig; gemini's tmp root is resolved here, same explicit-only
     // contract — gap-5af6d773).

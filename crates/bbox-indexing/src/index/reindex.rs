@@ -573,6 +573,7 @@ mod tests {
             additional_harness_sessions_dirs: vec![sessions_dir],
             operational_records_path: None,
             gemini_tmp_root: None,
+            collector_archive_root: None,
         };
 
         let (schema, fields) = crate::index::build_schema();
@@ -634,6 +635,100 @@ mod tests {
         assert!(saw_user, "user prompt doc present");
     }
 
+    /// End-to-end for the satellite-collector lane: a claude-format session
+    /// file under `collector-archive/<host>/claude/<account>/projects/...`
+    /// (the layout the inline-increment appender writes) is discovered by the
+    /// per-pass archive scan and indexed with its account label intact, and
+    /// joins the purge scan set so a rebuild cannot erase shipped history.
+    #[test]
+    fn collector_archive_claude_session_indexes_into_test_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let account_root = root
+            .join("collector-archive")
+            .join("host-b2")
+            .join("claude")
+            .join("claude");
+        let projects_dir = account_root.join("projects").join("-repo-sat");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let session_path = projects_dir.join("11111111-2222-3333-4444-555555555555.jsonl");
+        std::fs::write(
+            &session_path,
+            concat!(
+                r#"{"type":"user","sessionId":"11111111-2222-3333-4444-555555555555","timestamp":"2026-07-16T01:00:00.000Z","cwd":"/repo/sat","message":{"role":"user","content":[{"type":"text","text":"ship the satellite increment"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"11111111-2222-3333-4444-555555555555","timestamp":"2026-07-16T01:00:05.000Z","cwd":"/repo/sat","message":{"role":"assistant","content":[{"type":"text","text":"increment shipped and archived"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let config = ReindexConfig {
+            roots: Vec::new(),
+            codex_root: None,
+            meta_path: root.join("_meta.json"),
+            projects_path: root.join("projects.json"),
+            knowledge_path: root.join("kb.json"),
+            threads_path: root.join("threads.json"),
+            roadmap_path: root.join("roadmap.json"),
+            harness_sessions_dir: None,
+            additional_harness_sessions_dirs: Vec::new(),
+            operational_records_path: None,
+            gemini_tmp_root: None,
+            collector_archive_root: Some(root.join("collector-archive")),
+        };
+
+        let (schema, fields) = crate::index::build_schema();
+        let idx_dir = root.join("idx");
+        std::fs::create_dir_all(&idx_dir).unwrap();
+        let index = tantivy::Index::create_in_dir(&idx_dir, schema).unwrap();
+        crate::index::register_code_tokenizer(&index);
+        let mut writer = index.writer(50_000_000).unwrap();
+        let mut meta = HashMap::new();
+        let (mut files, mut docs, mut skipped) = (0u64, 0u64, 0u64);
+        let tool_edges = ToolEdgeContext::from_config(&config, false).unwrap();
+
+        index_transcripts_via_adapters(
+            &config,
+            fields,
+            &mut writer,
+            &mut meta,
+            &mut files,
+            &mut docs,
+            &mut skipped,
+            &tool_edges,
+            false,
+        )
+        .unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(files, 1, "one archived session discovered");
+        assert_eq!(docs, 2, "user + assistant docs indexed");
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_text(fields.session_id, "11111111-2222-3333-4444-555555555555"),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let hits = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        for (_score, addr) in hits {
+            let doc: TantivyDocument = searcher.doc(addr).unwrap();
+            assert_eq!(first_text(&doc, fields.account), "claude");
+            assert_eq!(first_text(&doc, fields.project), "/repo/sat");
+        }
+
+        let scan = scan_all_source_files(&config);
+        let session_path_str = session_path.to_string_lossy().to_string();
+        assert!(
+            scan.iter().any(|(p, _, _)| *p == session_path_str),
+            "collector-archived session must be in the purge scan set"
+        );
+    }
+
     /// Purge contract: every adapter-discovered transcript file must appear in
     /// `scan_all_source_files`, because the purge phase deletes index docs for
     /// any indexed `file_path` absent from that set. Regression for the live
@@ -668,6 +763,7 @@ mod tests {
             additional_harness_sessions_dirs: Vec::new(),
             operational_records_path: None,
             gemini_tmp_root: None,
+            collector_archive_root: None,
         };
 
         let files = scan_all_source_files(&config);

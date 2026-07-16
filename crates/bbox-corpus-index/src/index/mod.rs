@@ -151,6 +151,14 @@ pub struct ReindexConfig {
     /// hermetic-by-default contract as `harness_sessions_dir`: `None`
     /// disables the adapter. Set via [`TranscriptIndex::set_gemini_tmp_root`].
     pub gemini_tmp_root: Option<PathBuf>,
+    /// Corpus-owned archive root for satellite-collector transcript
+    /// increments (`record-ingest/collector-archive`), laid out as
+    /// `<host>/<source>/<account>/<source-relative-path>` so each account dir
+    /// is a valid interactive adapter root. Scanned per registry build, so
+    /// new satellite hosts are discovered on the next reindex pass without a
+    /// daemon restart. Same hermetic-by-default contract: `None` disables
+    /// discovery. Set via [`TranscriptIndex::set_collector_archive_root`].
+    pub collector_archive_root: Option<PathBuf>,
 }
 
 pub struct TranscriptIndex {
@@ -264,6 +272,7 @@ impl TranscriptIndex {
             additional_harness_sessions_dirs: Vec::new(),
             operational_records_path: None,
             gemini_tmp_root: None,
+            collector_archive_root: None,
         };
 
         Ok(Self {
@@ -345,6 +354,13 @@ impl TranscriptIndex {
     /// daemon startup; left unset (disabled) in hermetic test indexes.
     pub fn set_gemini_tmp_root(&mut self, tmp_root: PathBuf) {
         self.config.gemini_tmp_root = Some(tmp_root);
+    }
+
+    /// Enable discovery of satellite-collector transcript archives beneath
+    /// `root`. Called by daemon startup; left unset (disabled) in hermetic
+    /// test indexes.
+    pub fn set_collector_archive_root(&mut self, root: PathBuf) {
+        self.config.collector_archive_root = Some(root);
     }
 
     pub fn is_empty(&self) -> bool {

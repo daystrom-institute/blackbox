@@ -56,6 +56,7 @@ pub fn find_session_file(
         harness_sessions_dir: Some(crate::transcripts::harness_sessions::env_sessions_dir()),
         additional_harness_sessions_dirs: Vec::new(),
         operational_records_path: None,
+        collector_archive_root: None,
     };
     let registry = crate::transcripts::registry_from_reindex_config(&registry_config);
     for provider in [
