@@ -41,6 +41,11 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- fleetd's MCP adapter accepts the spec-reserved `_meta` member on
+  `tools/call` (progress tokens from clients like Claude Code) instead of
+  rejecting the whole call with `unknown field '_meta'`; genuinely unknown
+  fields are still rejected. Previously every `blackbox-fleet` tool call from
+  a spec-compliant client failed at the envelope. (gap-4045f786)
 - Fleet authority lease expiry no longer regresses a committed-terminal task:
   an expired worker lease on a Completed task retires only the worker; the
   recorded task and attempt outcome stand.
