@@ -134,33 +134,35 @@ Two k8s footguns:
 The image defaults point the env at `.../service.token` on the state volume -
 the reconciled real-file location, not a Secret mount.
 
-### Non-loopback bind (opt-in, pending)
+### Non-loopback bind (explicit opt-in)
 
-Both services **fail closed on a non-loopback bind today**:
-
-- blackboxd corpus role: `src/server/run.rs`.
-- blackopsd: `crates/blackopsd/src/config.rs::validate`.
-
-A parallel change adds an explicit **non-loopback opt-in** (config field + env
-override) for containerized deployment. Once it lands, the Deployment sets, per
-service:
+Both services **fail closed on a non-loopback bind by default**. The explicit
+opt-ins shipped in 8ccd120b; the Deployment sets, per service:
 
 ```
 # blackboxd
 BBOX_BIND=0.0.0.0
-<NON_LOOPBACK_OPT_IN_ENV>=1    # placeholder: use the real knob name
+BBOX_ALLOW_NONLOOPBACK_BIND=1          # config: daemon.allow_nonloopback_bind
 
 # blackopsd
 BLACKOPSD_BIND=0.0.0.0:7266
-<NON_LOOPBACK_OPT_IN_ENV>=1    # placeholder: use the real knob name
+BLACKOPSD_ALLOW_NONLOOPBACK_BIND=1     # config: allow_nonloopback_bind
 ```
 
 The images deliberately default to the **safe loopback bind** so the current
 binary boots; the manifest overrides the bind together with the opt-in. If
-blackopsd talks to the corpus service across a pod boundary, its `blackboxd_url`
-validator (loopback-only today) needs the same opt-in. SSH tunnels claiming the
-freed loopback ports remain a supported alternative that keeps every URL
-loopback (see the design doc's transport section).
+blackopsd talks to the corpus service across a pod boundary, it also needs
+`BLACKOPSD_ALLOW_NONLOOPBACK_SERVICE_URLS=1` to relax its `blackboxd_url`
+validator. Client machines pointing fleetd at the cluster set
+`FLEETD_ALLOW_NONLOOPBACK_SERVICE_URLS=1` (fleetd itself has no non-loopback
+bind opt-in; its bind stays loopback).
+
+Cluster exposure goes through the **Tailscale Kubernetes operator** already
+running on the cage: annotate the Service (or use `ingress class: tailscale`)
+so each service becomes a tagged tailnet node with a stable MagicDNS name and
+a WireGuard-encrypted, ACL-gated path from the source machines. See the design
+doc's transport section for the rationale and the fallback options (plaintext
+LAN LoadBalancer, SSH tunnels).
 
 ### Health probes
 

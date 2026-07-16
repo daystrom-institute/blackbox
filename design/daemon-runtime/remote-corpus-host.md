@@ -1,7 +1,7 @@
 ---
 title: "Remote corpus host: corpus on the cage, LAN transport, transcript collector"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -84,10 +84,31 @@ provisioned to each machine's local owner-only 0600 file and to the cluster
 as a secret through the homelab's established secret-sourcing path (never
 committed). The file-trust checks in `crates/bro-rpc/src/auth.rs` are
 local-only and the comparison is by value, so `auth.rs` needs no
-modification. Plaintext HTTP on the switched LAN is an accepted risk under
-the single-trusted-operator threat model; tunnels are the documented
-upgrade if that changes. A mesh overlay (Tailscale) was rejected: it solves
-a roaming problem this deployment does not have.
+modification.
+
+**Transport resolution (2026-07-16).** An earlier draft rejected a mesh
+overlay (Tailscale) as solving a roaming problem this deployment does not
+have; that rejection assumed no mesh existed. In fact the operator's tailnet
+already spans the estate: b1 is a member, the cage runs a subnet router
+advertising the k3s service CIDR and the LAN, and the **Tailscale Kubernetes
+operator** is deployed in the cluster. The primary transport is therefore
+operator-exposed tagged tailnet nodes: the overlay manifests annotate the
+blackboxd/blackopsd Services (or use `ingress class: tailscale`) so each gets
+a stable MagicDNS name and a WireGuard-encrypted, tailnet-ACL-gated path from
+every source machine. This dominates both fallbacks: versus plaintext LAN it
+adds encryption and ACLs; versus SSH tunnels it removes per-machine tunnel
+management. Tailnet addresses are non-loopback, so the client-side opt-ins
+(`FLEETD_ALLOW_NONLOOPBACK_SERVICE_URLS`,
+`BLACKOPSD_ALLOW_NONLOOPBACK_SERVICE_URLS`) are exercised exactly as designed,
+bearer auth remains the application-layer check, and the worker sandbox denies
+the tailnet corpus endpoint the same way it denies the local ports. Plaintext
+LAN via the cluster LoadBalancer and SSH tunnels remain documented fallbacks.
+Validation note: confirm the tailscale path goes direct (sub-ms on-LAN)
+rather than DERP-relayed before cutover; cold path discovery can relay
+initially. Source-machine access links are 1GbE today (the 10GbE fabric is
+intra-cluster); steady-state corpus traffic is orders of magnitude below
+that, and one-time transfers (state copy, collector catch-up) are
+minutes-scale, so link speed is not a constraint.
 
 ## Deployment and estate placement
 
@@ -95,11 +116,29 @@ Corpus deployment follows the homelab's converge discipline: Linux container
 images for blackboxd (corpus role) and blackopsd, manifests reconciled by
 Flux, state on Longhorn volumes, health probes on `/healthz` / `/readyz`,
 and the existing observability stack scraping the services so reindex and
-embedding behavior is finally graphed. The infra repo's self-description
-currently scopes it to the PlanGlobal estate; landing blackbox manifests
-there requires the operator's one-line amendment to that scope note so the
-repo's docs stay truthful, or a small separate overlay repo targeting the
-same cluster. Either is fine; the choice is the operator's.
+embedding behavior is finally graphed.
+
+**Estate placement resolution (2026-07-16): separate overlay repo.** The
+infra repo self-describes as PlanGlobal-estate-scoped and converge-controlled
+("mixing two change-control regimes in one repo forces one of them to lie");
+blackbox is personal tooling on a different cadence. The manifests live in a
+small personal overlay repo (working name `bbox-cage`): Deployment/
+StatefulSet, Longhorn PVCs, Services with tailscale exposure, secret refs,
+all pinned to a dedicated namespace with its own ServiceAccount so personal
+workloads cannot touch estate workloads. The only infra-repo touch is one
+Flux source registration (a `GitRepository` plus a namespace-constrained
+`Kustomization` pointing at the overlay repo), which is the `flux/`
+directory's declared mechanism working as designed, not a scope change.
+Boundaries: anything node-host-level (sysctls, storage prep, node labels)
+still goes through the infra repo's canonical ansible, though nothing
+currently planned needs that; the cluster platform baseline (Longhorn,
+ingress, observability, the tailscale operator) already covers blackbox's
+needs with zero pulumi/ansible changes. Satellite-side packaging (collector
+launchd plists, install scripts) is machine bootstrap, which the infra repo
+explicitly excludes: it lives in this repo's `deploy/`, beside the existing
+daemon service files. The service token reaches the cluster through the
+homelab's established vault-sourced secret path; match whatever mechanism
+the overlay's Flux setup uses (confirm during manifest authoring).
 
 ## Alternative host: a dedicated Mac
 
@@ -131,11 +170,22 @@ A new slim standalone binary (working name `bbox-collector`), shaped like a
 log shipper (Filebeat/Alloy): tail transcript roots, keep a durable local
 registry/cursor, push increments to the corpus host with at-least-once
 delivery, spool locally while the corpus is unreachable, catch up on
-reconnect. It links the already-peeled transcript adapters and cursor store
-from `crates/bbox-corpus-index/src/transcripts/` as a library; it must not
-link tantivy, vectors, EdgeIndex, or V8. A blackboxd "shipper role" was
-rejected because the `blackbox` crate drags the whole corpus stack onto
-machines that only need tailing.
+reconnect. It links the transcript adapters and cursor store as a library;
+it must not link tantivy, vectors, EdgeIndex, or V8. A blackboxd "shipper
+role" was rejected because the `blackbox` crate drags the whole corpus stack
+onto machines that only need tailing.
+
+**Crate peel prerequisite.** The adapters currently live in
+`crates/bbox-corpus-index/src/transcripts/`, and that crate links tantivy
+(`projection.rs` and the projector half of `harness_sessions.rs` produce
+`TantivyDocument`s). The tantivy-free reading layer — `types.rs`,
+`adapters.rs`, `cursor_store.rs`, `interactive.rs`, and the strict prefix
+reader (`read_fleet_event_log_prefix`) — peels into a new leaf crate
+(working name `bbox-transcript-read`) that both `bbox-corpus-index` and the
+collector link; projection stays behind in `bbox-corpus-index`. The parsing
+layer (`bro-transcript`) is already a leaf. Consumer-cleavage boundary,
+compiler-enforced: the collector crate must build with no tantivy in its
+dependency tree.
 
 Adapter-specific cursor semantics carry over from the existing code rather
 than a generic byte-offset registry:
@@ -166,6 +216,49 @@ first attach). Two extensions are required:
    per producer, so two machines with identical project paths cannot collide
    on the wire. The local cursor-store fingerprint stays host-local and
    unchanged.
+
+### Wire contract: resolved decisions (2026-07-16)
+
+- **Payload shape: raw committed bytes plus source metadata.** A record
+  carries the increment's raw bytes (through the last complete newline for
+  JSONL sources) plus source kind, account, session id, and original path.
+  The collector does not normalize or parse for shipping; parser-version
+  authority stays on the corpus so a reindex can reproject history with a
+  newer parser.
+- **Landing zone: the corpus-owned transcript archive.** Inline increments
+  append into per-stream archive files under the existing corpus-owned
+  transcript-archive machinery, and those archives participate in ordinary
+  indexing, change detection, and purge scans as additional adapter roots
+  (the invariant the fleet archives already follow). This buys projection,
+  schema migration, and full-rebuild survival for free instead of inventing
+  a second projection path. The known touch points: the target-extraction
+  gate in `bro-capabilities/src/records.rs` (today hardcoded to
+  producer=fleetd, kind=session.event_committed, path-based), the projection
+  selection in `bbox-indexing`'s writer actor (and its mirror in the
+  standalone `blackbox-corpus-service`), and an inline-variant landing step
+  beside `project_fleet_event_log`.
+- **Idempotency: deterministic record ids.** `record_id` is a hash of
+  (producer, stream, byte range) so spool replays and crash-recovery
+  resubmissions dedupe instead of conflicting. The collector persists a
+  monotonic per-producer record cursor locally, beside the existing
+  cursor-store sidecar.
+- **Chunking.** Increments are chunked to fit `MAX_RECORD_BYTES` and the
+  256-records-per-batch ingest cap; catch-up throughput is bounded by
+  request overhead and server-side indexing before the wire.
+- **Strict prefix reads only.** Append-only JSONL sources ship through the
+  last complete newline (`read_fleet_event_log_prefix` is the model). The
+  lenient interactive adapters advance their cursor to EOF even past a torn
+  final line (`interactive.rs`, `next_byte_cursor`), which is acceptable for
+  reindex-time scans but silently drops events in a shipper; the collector
+  must not reuse that path.
+- **The source file is the spool.** For append-only sources an unacked
+  increment simply leaves the local cursor unadvanced; the provider's own
+  session file is the durable backlog, and no separate spool is written.
+  Only Gemini-style whole-JSON snapshot sources (mutable files in a tmp
+  root) need a real local spool before shipping.
+- **N satellites from day one.** Producer identity is per-host, so new
+  source machines (e.g. B2 when it joins the fabric) onboard by installing
+  the collector and provisioning the bearer token; no protocol change.
 
 ## What does not move
 
@@ -213,9 +306,16 @@ doc, and is deliberately the last slice.
 
 | Slice | Delivers | Depends on | Risk |
 |---|---|---|---|
-| 0. Linux images + bind/URL opt-in + secret provisioning | Container builds of blackboxd (corpus role) and blackopsd; explicit non-loopback opt-in on the bind and URL guards (fail-closed default); bearer value provisioned to machines and cluster | - | Low-Med (small code, mostly build/ops) |
-| 1. Corpus on the cage | Flux-reconciled deployment on Longhorn volumes; the entire RAM relief: HNSW, tantivy, EdgeIndex, reindex/merge/compaction overlap leave the agent machines; observability scrapes the corpus | 0 | Low-Med |
-| 2. Collector | `bbox-collector` binary; inline-payload ingest kind; per-host producer id; local spool. Day-one for the cage: no transcripts originate on the cluster, and collector catch-up from cursor zero doubles as the transcript migration path | 0, ingest extension | Med (the new server code) |
+| 0. Linux images + bind/URL opt-in + secret provisioning | DONE (42e9fe5c, 8ccd120b). Container builds of blackboxd (corpus role) and blackopsd; explicit non-loopback opt-in on the bind and URL guards (fail-closed default); bearer value provisioned to machines and cluster | - | Low-Med (small code, mostly build/ops) |
+| 1. Corpus on the cage | Overlay-repo manifests + one Flux source registration in the infra repo; tailscale-operator service exposure; Longhorn volumes; observability scrapes the corpus. Note: deployment alone delivers no RAM relief while the local corpus daemon still runs; the payoff lands at cutover (slice 2 gates decommission) | 0 | Low-Med |
+| 2a. Transcript-read crate peel | `bbox-transcript-read` leaf crate (types, adapters, cursor store, interactive readers, strict prefix reader), tantivy-free; `bbox-corpus-index` keeps projection and relinks the leaf | - | Low (mechanical, compiler-checked) |
+| 2b. Inline-payload ingest extension | Inline transcript-increment record kind landing in the corpus-owned transcript archive as adapter roots; per-host producer id; deterministic record ids | 0 | Med (the new server code) |
+| 2c. Collector binary | `bbox-collector`: strict-prefix shipping loop, per-source cursor semantics, gemini snapshot spool, launchd/systemd packaging in `deploy/`. Day-one for the cage: no transcripts originate on the cluster, and collector catch-up from cursor zero doubles as the transcript migration path | 2a, 2b | Med |
 | 3. Multi-fleetd identity + blackopsd fan-out | Cross-machine blackopsd-originated dispatch | 0 | High (new protocol surface); defer until needed |
 | 4. AR-001 completion | Lean corpus binary; public corpus MCP served off the peeled state | 1 | Med |
 | 5. Repo mirroring for source indexing | Cross-project code search over agent-machine repos via connectors | independent | Low-Med |
+
+Cutover (after 1 + 2c): retarget fleetd/clients at the tailnet service names,
+run collector catch-up as the transcript migration, decommission the local
+corpus daemon. That decommission, not the deployment, is where the RAM
+relief is realized.
