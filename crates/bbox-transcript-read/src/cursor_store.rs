@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{TranscriptCursor, TranscriptLocation};
+use crate::types::{TranscriptCursor, TranscriptLocation};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CursorStoreFile {
@@ -145,13 +145,13 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::super::types::TranscriptSource;
+    use crate::types::TranscriptSource;
     use tempfile::tempdir;
 
     use bro_core::Provider;
 
     use super::*;
-    use crate::transcripts::types::TranscriptStorage;
+    use crate::types::TranscriptStorage;
 
     fn location(path: PathBuf) -> TranscriptLocation {
         TranscriptLocation {

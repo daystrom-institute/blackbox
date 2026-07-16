@@ -1,7 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::cursor_store::TranscriptCursorStore;
 use crate::transcripts::types::{NormalizedTranscriptEvent, TranscriptCursor};
 use crate::workflow::wait::ProviderEventWait;
@@ -159,7 +158,7 @@ impl WorkflowRunner<'_> {
             bail!("provider {provider} has no resolved session id yet");
         }
         let config = self.server.state.idx.read().reindex_config();
-        let registry = TranscriptAdapterRegistry::from_reindex_config(&config);
+        let registry = crate::transcripts::registry_from_reindex_config(&config);
         let adapter = registry
             .adapter(provider)
             .ok_or_else(|| anyhow!("no transcript adapter registered for provider {provider}"))?;

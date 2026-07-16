@@ -1,37 +1,14 @@
 use tantivy::TantivyDocument;
 
 use crate::index::FieldHandles;
-use bro_transcript::{ParsedEvent, ToolCallKind};
+use bro_transcript::ToolCallKind;
 
-use super::types::{NormalizedTranscriptEvent, TranscriptEventKind};
+use super::types::NormalizedTranscriptEvent;
 
-impl NormalizedTranscriptEvent {
-    pub fn to_parsed_event(&self) -> Option<ParsedEvent> {
-        let role = self.role.into();
-        Some(ParsedEvent {
-            role,
-            content: self.content.clone(),
-            session_id: self.session_id.clone(),
-            timestamp: self.timestamp.clone(),
-            git_branch: self.git_branch.clone(),
-            is_subagent: self.is_subagent,
-            agent_slug: self.agent_slug.clone(),
-            cwd: self.cwd.clone(),
-            tool_call: self.tool_call.clone().map(Into::into),
-        })
-    }
-
-    pub fn is_indexable(&self) -> bool {
-        matches!(
-            self.kind,
-            TranscriptEventKind::Message
-                | TranscriptEventKind::Thinking
-                | TranscriptEventKind::ToolUse
-                | TranscriptEventKind::ToolResult
-                | TranscriptEventKind::Developer
-        )
-    }
-}
+// The tantivy-free inverse projections `to_parsed_event` / `is_indexable` are
+// inherent methods on `NormalizedTranscriptEvent`, so they live with the type
+// in the `bbox-transcript-read` leaf crate (`transcripts::types`). This module
+// keeps only the tantivy doc builders below, which the leaf cannot host.
 
 #[allow(clippy::too_many_arguments)]
 pub fn normalized_to_doc(
@@ -227,7 +204,7 @@ fn tool_target(input: &serde_json::Value, kind: ToolCallKind, tool_name: &str) -
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::TranscriptSource;
+    use super::super::types::{TranscriptEventKind, TranscriptSource};
     use serde_json::json;
 
     use bro_core::Provider;

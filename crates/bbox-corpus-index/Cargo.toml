@@ -30,6 +30,7 @@ walkdir = "2"
 bbox-chunker = { path = "../bbox-chunker" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
+bbox-transcript-read = { path = "../bbox-transcript-read" }
 bro-core = { path = "../bro-core" }
 bro-transcript = { path = "../bro-transcript" }
 

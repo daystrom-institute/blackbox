@@ -28,6 +28,7 @@ members = [
     # into the daemon under their original module path.
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
+    "crates/bbox-transcript-read",
     "crates/bbox-corpus-index",
     "crates/bbox-edge-sidecar",
     "crates/bbox-chunker",

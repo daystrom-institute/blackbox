@@ -1,0 +1,26 @@
+[package]
+name = "bbox-transcript-read"
+version = "0.0.1"
+edition = "2024"
+
+# Tantivy-free transcript READING layer, peeled out of `bbox-corpus-index`
+# (remote-corpus-host collector prerequisite, slice 2a). Holds the transcript
+# source types, the read-adapter trait + registry, the cursor store, the
+# interactive-CLI adapters (Claude/Codex/Gemini), and the harness-sessions
+# reader (including the strict prefix reader `read_fleet_event_log_prefix`).
+# The tantivy PROJECTION half stays in `bbox-corpus-index`. Both this crate and
+# the future transcript collector link it; the collector must build with no
+# tantivy in its dependency tree, so this crate must never gain a tantivy edge.
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+bro-core = { path = "../bro-core" }
+bro-transcript = { path = "../bro-transcript" }
+
+[dev-dependencies]
+tempfile = "3"

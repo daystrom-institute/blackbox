@@ -20,8 +20,8 @@ use walkdir::WalkDir;
 
 use bro_transcript as parser;
 
-use super::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
-use super::types::{
+use crate::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
+use crate::types::{
     NormalizedTranscriptEvent, RawTranscriptRef, TranscriptBatch, TranscriptCursor,
     TranscriptLocation, TranscriptReadError, TranscriptSource, TranscriptStorage,
 };
@@ -905,7 +905,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.events[4].role,
-            super::super::types::TranscriptRole::ToolResult
+            crate::types::TranscriptRole::ToolResult
         );
     }
 
