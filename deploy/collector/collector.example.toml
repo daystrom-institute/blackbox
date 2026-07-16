@@ -1,0 +1,41 @@
+# bbox-collector configuration (example).
+#
+# Copy to ~/.config/blackbox/collector.toml on macOS/linux, or point the binary
+# at any path with `bbox-collector --config <path>` or BBOX_COLLECTOR_CONFIG.
+#
+# Every value here can be overridden by an env var (the override allowlist):
+#   BBOX_COLLECTOR_CORPUS_URL, BBOX_COLLECTOR_TOKEN_FILE, BBOX_COLLECTOR_HOST_ID,
+#   BBOX_COLLECTOR_POLL_INTERVAL_SECS, BBOX_COLLECTOR_STATE_DIR
+
+# Base URL of the corpus host (no trailing /internal/records). LAN peer.
+corpus_url = "http://corpus.lan:7264"
+
+# Owner-only (chmod 0600) file holding the 64-hex shared service token. The
+# collector fails closed if this file is missing or world-readable.
+service_token_file = "/Users/me/.local/state/blackbox/service.token"
+
+# Optional stable per-host id stamped into producer = "collector:<host-id>".
+# Omit to derive-and-persist one (hostname if available, else a random id).
+# host_id = "studio-mac-1"
+
+# Tick cadence in seconds (default 30). Also caps the reconnect backoff.
+poll_interval_secs = 30
+
+# Host-local state dir for the cursor sidecar and persisted host id.
+# Defaults to ~/.local/state/blackbox/collector.
+# state_dir = "/Users/me/.local/state/blackbox/collector"
+
+# Claude account roots: one entry per account. `path` is the directory that
+# contains `projects/` and `history.jsonl` (usually ~/.claude).
+[[claude_roots]]
+account = "claude"
+path = "/Users/me/.claude"
+
+# A second labelled account (optional).
+# [[claude_roots]]
+# account = "work"
+# path = "/Users/me/.claude-work"
+
+# Optional codex root: the directory that contains `sessions/` (usually
+# ~/.codex). Remove if this machine has no codex sessions.
+codex_root = "/Users/me/.codex"

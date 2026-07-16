@@ -1,0 +1,19 @@
+[Unit]
+Description=Blackbox satellite transcript collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bbox-collector --config %h/.config/blackbox/collector.toml
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=bbox_collector=info
+WorkingDirectory=%h
+# The collector reads only transcript roots and its own state dir, and holds an
+# owner-only service token; keep it unprivileged.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

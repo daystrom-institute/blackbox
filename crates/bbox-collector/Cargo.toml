@@ -1,0 +1,47 @@
+[package]
+name = "bbox-collector"
+version = "0.0.1"
+edition = "2024"
+
+# Slim satellite log-shipper for interactive provider transcripts (remote-corpus
+# -host design, slice 2c: design/daemon-runtime/remote-corpus-host.md). Tails
+# claude/codex transcript roots on a source machine and ships inline-payload
+# byte increments to the corpus host's POST /internal/records. Structured as a
+# lib (core logic, unit-testable) plus a thin bin.
+#
+# HARD INVARIANT: the dependency tree must never gain tantivy, rusty_v8, or
+# bbox-corpus-index. The collector links only the tantivy-free reading layer
+# (bbox-transcript-read), the wire contract (bro-capabilities), and bro-core.
+# Enforced by scripts/acceptance-collector-deps.sh.
+
+[lib]
+name = "bbox_collector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bbox-collector"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "signal", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+bbox-transcript-read = { path = "../bbox-transcript-read" }
+bro-capabilities = { path = "../bro-capabilities" }
+bro-core = { path = "../bro-core" }
+bro-rpc = { path = "../bro-rpc" }
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["macros"] }
+blackbox-corpus-service = { path = "../blackbox-corpus-service" }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

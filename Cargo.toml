@@ -29,6 +29,7 @@ members = [
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
     "crates/bbox-transcript-read",
+    "crates/bbox-collector",
     "crates/bbox-corpus-index",
     "crates/bbox-edge-sidecar",
     "crates/bbox-chunker",
