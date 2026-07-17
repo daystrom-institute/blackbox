@@ -926,6 +926,7 @@ mod tests {
             is_git_repo: false,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 

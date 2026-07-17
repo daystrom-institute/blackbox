@@ -20,6 +20,7 @@ mod tests {
             is_git_repo: false,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -4327,6 +4328,7 @@ mod rx_f2b_obligation_tests {
             is_git_repo: false,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -5067,6 +5069,7 @@ mod rx_f2a_capture_tests {
             is_git_repo: false,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -5514,6 +5517,7 @@ impl Cache {
                 is_git_repo: false,
                 languages: Default::default(),
                 aliases: Default::default(),
+                ..Default::default()
             }],
         )
         .unwrap_err();
@@ -5607,6 +5611,7 @@ impl Cache {
                 is_git_repo: false,
                 languages: Default::default(),
                 aliases: Default::default(),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -5678,6 +5683,7 @@ impl Cache {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -6837,6 +6843,7 @@ mod extract_rust_crate_tests {
             is_git_repo: false,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -7188,6 +7195,7 @@ mod extract_rust_crate_e2e {
             is_git_repo: false,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 

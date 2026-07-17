@@ -13,5 +13,6 @@ anyhow = "1"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 regex = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
 tempfile = "3"
 bbox-util = { path = "../bbox-util" }

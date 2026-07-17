@@ -80,10 +80,7 @@ pub fn registry_from_reindex_config(config: &ReindexConfig) -> TranscriptAdapter
 #[allow(clippy::disallowed_methods)]
 fn scan_collector_archive_roots(
     root: &std::path::Path,
-) -> (
-    Vec<(String, std::path::PathBuf)>,
-    Vec<std::path::PathBuf>,
-) {
+) -> (Vec<(String, std::path::PathBuf)>, Vec<std::path::PathBuf>) {
     let mut claude_roots = Vec::new();
     let mut codex_roots = Vec::new();
     let hosts = match std::fs::read_dir(root) {

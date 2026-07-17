@@ -530,6 +530,7 @@ fn make_probe_runner(project_dir: &str) -> crate::probe::CodeNavProbeRunner {
         is_git_repo: true,
         languages: std::collections::BTreeSet::new(),
         aliases: Default::default(),
+        ..Default::default()
     };
     crate::probe::CodeNavProbeRunner::new(None, vec![project_record])
 }

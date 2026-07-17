@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rmcp::handler::server::router::tool::ToolRouter;
 use serde::Serialize;
 use serde_json::Value;
@@ -56,6 +56,17 @@ pub(crate) struct SharedState {
     pub(crate) pins_persister: StorePersister<Pins>,
     pub(crate) projects: Arc<RwLock<ProjectRegistry>>,
     pub(crate) projects_persister: StorePersister<ProjectRegistry>,
+    /// Remote-source connector mount records — sibling of `projects`
+    /// (design/connectors/remote-source-connectors.md). A mount feeds one
+    /// registered project's materialization root; `connectors_runtime.rs`
+    /// owns the sync/registration orchestration this store backs.
+    pub(crate) mounts: Arc<RwLock<bbox_connectors::MountStore>>,
+    pub(crate) mounts_persister: StorePersister<bbox_connectors::MountStore>,
+    /// Per-mount in-flight sync lock, keyed by `mount_id`. Held by every
+    /// sync pass (initial, manual `bbox_mount_sync`, periodic loop) and by
+    /// `bbox_mount_unregister`, so sync and unregister/re-sync can never
+    /// race the same mount. See `connectors_runtime::InFlightGuard`.
+    pub(crate) mount_sync_locks: Arc<Mutex<std::collections::HashSet<String>>>,
     pub(crate) packets: RwLock<Packets>,
     /// Generation-validated cache of MCP surface decisions; see
     /// `server::surface::SurfaceDecisionCache`. Keeps the wire head from
@@ -276,6 +287,10 @@ impl SharedState {
         self.projects_persister.request_durable().await
     }
 
+    pub(crate) async fn persist_mounts_durable(&self) -> anyhow::Result<()> {
+        self.mounts_persister.request_durable().await
+    }
+
     pub(crate) fn record_signal(&self, ev: SignalEvent) {
         let mut log = self.signal_log.write();
         if log.len() >= SIGNAL_LOG_CAP {
@@ -447,6 +462,12 @@ impl SharedState {
         if projects_needs_persist {
             projects_persister.request();
         }
+        let mounts_path = store_dir.join("blackbox-mounts.json");
+        let mounts_store = Arc::new(RwLock::new(
+            bbox_connectors::MountStore::open(&mounts_path).unwrap(),
+        ));
+        let mounts_persister =
+            StorePersister::spawn("mounts-test", mounts_store.clone(), mounts_path);
 
         let (edge_rebuild_nudge_tx, edge_rebuild_nudge_rx) = std::sync::mpsc::sync_channel(1);
         SharedState {
@@ -465,6 +486,9 @@ impl SharedState {
             pins_persister,
             projects: projects_store,
             projects_persister,
+            mounts: mounts_store,
+            mounts_persister,
+            mount_sync_locks: Arc::new(Mutex::new(std::collections::HashSet::new())),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),

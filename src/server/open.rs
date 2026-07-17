@@ -213,6 +213,14 @@ pub(super) fn open_shared_state(
         projects_persister.request();
     }
 
+    let mounts_path = cfg.paths.mounts_path.clone();
+    let mounts_store = Arc::new(RwLock::new(bbox_connectors::MountStore::open(
+        &mounts_path,
+    )?));
+    tracing::info!("Mount store: {}", mounts_path.display());
+    let mounts_persister =
+        StorePersister::spawn("mounts", mounts_store.clone(), mounts_path.clone());
+
     let packets_dir = cfg.paths.packets_dir.clone();
     let packets_store = Packets::open(&packets_dir)?;
     tracing::info!("Packets store: {}", packets_dir.display());
@@ -315,6 +323,9 @@ pub(super) fn open_shared_state(
         pins_persister,
         projects: projects_store,
         projects_persister,
+        mounts: mounts_store,
+        mounts_persister,
+        mount_sync_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         packets: RwLock::new(packets_store),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts_store),

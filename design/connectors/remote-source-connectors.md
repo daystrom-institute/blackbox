@@ -399,6 +399,22 @@ catalog grows by demand without core changes.
    expiring roughly monthly, Advanced Data Protection gated), workable
    only as a monitored fallback lane with human re-auth alerts on
    Mac-less hosts. On a signed-in Mac the mirror IS the integration.
+1a. **`git` (shipped, stage 2 - operator-directed deviation from the above
+   ordering).** Mirrors a clone URL (plus optional `#<ref>`) into the
+   materialization root via the git CLI (`crates/bbox-connectors::
+   git_connector`). Scope is a clone URL; cursors are commit SHAs
+   (`git diff --name-status --find-renames` between the last-synced and
+   current SHA drives incremental syncs, `ls-tree` a full walk); auth is
+   entirely ambient (ssh agent, credential helper, or a token the operator
+   already embedded in the URL) - the connector never stores a credential
+   and redacts userinfo out of the scope before it can reach `MountRecord`,
+   logs, or an error message. Reports `bulk_materializes() = true`: syncs
+   run `git reset --hard <sha>` and reconcile the manifest against the
+   diff, rather than the generic per-entry fetch loop. Built ahead of the
+   catalog's local_mirror/gdrive ordering above because the immediate need
+   was mirroring agent-machine repos into the cluster corpus host, not
+   drive/document ingestion; the connector interface made this a same-shape
+   addition regardless of catalog position.
 2. **`gdrive` (Google Drive API).** Changes API for cursors, `files.export`
    for native docs, file-ID addressing (exact under Drive's duplicate-name
    model). Auth realities that shape the flow: Google's device-code grant

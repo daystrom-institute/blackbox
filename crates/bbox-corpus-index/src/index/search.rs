@@ -1694,6 +1694,7 @@ mod agentic_project_file_tests {
             is_git_repo: canonical.join(".git").exists(),
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         std::fs::write(
             projects_path,

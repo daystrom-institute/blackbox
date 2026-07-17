@@ -1250,6 +1250,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let chunk = Chunk {
             project_id: "proj1234".into(),
@@ -1302,6 +1303,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let chunk = Chunk {
             project_id: "proj1234".into(),
@@ -1352,6 +1354,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let chunks = finalize_chunks(
             &project,
@@ -1415,6 +1418,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let chunks = finalize_chunks(
             &project,
@@ -1486,6 +1490,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let left = br#"
         {

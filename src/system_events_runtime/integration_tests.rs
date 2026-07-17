@@ -60,6 +60,11 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     ));
     let projects_persister =
         StorePersister::spawn("projects-test", projects.clone(), projects_path);
+    let mounts_path = tmp.path().join("blackbox-mounts.json");
+    let mounts = Arc::new(RwLock::new(
+        bbox_connectors::MountStore::open(&mounts_path).unwrap(),
+    ));
+    let mounts_persister = StorePersister::spawn("mounts-test", mounts.clone(), mounts_path);
     let packets = Packets::open(tmp.path()).unwrap();
     let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
     let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
@@ -80,6 +85,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         pins_persister,
         projects,
         projects_persister,
+        mounts,
+        mounts_persister,
+        mount_sync_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         packets: RwLock::new(packets),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),
         artifacts: RwLock::new(artifacts),

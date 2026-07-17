@@ -22,6 +22,7 @@ pub mod graph;
 pub mod knowledge;
 pub mod macros;
 pub mod mcp_surface;
+pub mod mounts;
 pub mod notes;
 pub mod orchestrate;
 pub mod packets;

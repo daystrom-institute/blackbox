@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::language::Language;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ProjectRecord {
     pub project_id: String,
     #[serde(default)]
@@ -24,6 +24,27 @@ pub struct ProjectRecord {
     /// unique across the registry — conflicting claims fail closed.
     #[serde(default)]
     pub aliases: BTreeSet<String>,
+    /// Where this project's files come from. Defaults to `LocalFs` and is
+    /// serde-defaulted so stores written before remote mounts existed
+    /// (design/connectors/remote-source-connectors.md) parse unchanged.
+    #[serde(default)]
+    pub source: ProjectSource,
+}
+
+/// A project's file origin. `RemoteMount` projects are fed by a
+/// `bbox-connectors` mount's materialization root rather than an
+/// operator-managed checkout; consumers that assume git (repo probes,
+/// provenance) already handle `repo_id = None`, which every mount project
+/// carries since materialization roots are never git repos in their own
+/// right.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectSource {
+    #[default]
+    LocalFs,
+    RemoteMount {
+        mount_id: String,
+    },
 }
 
 /// Resolved project identity plus the concrete checkout view that produced

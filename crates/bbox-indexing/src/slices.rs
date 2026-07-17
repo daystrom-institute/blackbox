@@ -1226,6 +1226,7 @@ mod tests {
             is_git_repo: true,
             languages: BTreeSet::new(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let p = SliceInsertTextParams {
             project_dir: Some(path_string(&worktree.canonicalize().unwrap())),

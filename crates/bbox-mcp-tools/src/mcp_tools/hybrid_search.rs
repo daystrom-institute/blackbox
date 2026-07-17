@@ -1929,6 +1929,7 @@ pdf_figure = "voyage_visual"
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }];
 
         // The registered root resolves to the registry id.

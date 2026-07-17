@@ -398,6 +398,27 @@ dependencies = [
  "regex",
  "serde",
  "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "bbox-connectors"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bbox-corpus-core",
+ "bbox-stores",
+ "bbox-util",
+ "glob",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -982,6 +1003,7 @@ dependencies = [
  "bbox-chunker",
  "bbox-code-nav",
  "bbox-config",
+ "bbox-connectors",
  "bbox-corpus-core",
  "bbox-corpus-index",
  "bbox-edge-index",

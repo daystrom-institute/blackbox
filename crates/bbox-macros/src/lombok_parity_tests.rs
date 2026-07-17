@@ -72,6 +72,7 @@ fn run_macro_strategy(
         is_git_repo: false,
         languages: std::collections::BTreeSet::new(),
         aliases: Default::default(),
+        ..Default::default()
     };
     let runner = CodeNavProbeRunner::new(None, vec![project_record]);
     let ctx = MacroPlannerContext::new(backend, None, Box::new(runner));

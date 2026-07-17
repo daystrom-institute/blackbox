@@ -3,6 +3,7 @@
 //! Provides a centralized configuration system using figment with the following
 //! precedence: defaults < file < env < flags.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -115,6 +116,8 @@ struct RawConfig {
     #[serde(default)]
     pub paths: RawPathsConfig,
     pub roadmap: RawRoadmapConfig,
+    #[serde(default)]
+    pub connectors: ConnectorsConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -297,6 +300,78 @@ struct RawRoadmapConfig {
     pub template_path: Option<PathBuf>,
 }
 
+/// `[connectors.<alias>]` config for remote-source connector mounts
+/// (design/connectors/remote-source-connectors.md). Config-alias-with-`type`
+/// pattern, same shape as `[embed.providers.<alias>]`
+/// (`bbox_embed::embed::ProviderConfigs`): the table key is the operator-
+/// facing alias a mount's `connector` param names, `type` selects the
+/// implementation. The builtin `git` type needs no config fields today —
+/// this exists so future connector types (gdrive, graph, webdav, s3) have a
+/// place to declare credentials/tenant/etc without a shape change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct GitConnectorConfig {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConnectorAliasConfig {
+    Git(GitConnectorConfig),
+}
+
+/// Connector alias map. The builtin `git` alias is always available even
+/// when the config declares nothing — `get("git")` synthesizes it, mirroring
+/// `bbox_embed::embed::ProviderConfigs`'s built-in provider aliases. Any
+/// other alias must be declared under `[connectors.<alias>]` with an
+/// explicit `type`; an undeclared, non-`git` alias resolves to `None` so
+/// callers fail closed with remediation text.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorsConfig {
+    aliases: BTreeMap<String, ConnectorAliasConfig>,
+}
+
+impl ConnectorsConfig {
+    pub fn get(&self, alias: &str) -> Option<ConnectorAliasConfig> {
+        if let Some(config) = self.aliases.get(alias) {
+            return Some(config.clone());
+        }
+        if alias == "git" {
+            return Some(ConnectorAliasConfig::Git(GitConnectorConfig::default()));
+        }
+        None
+    }
+}
+
+impl Serialize for ConnectorsConfig {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.aliases.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConnectorsConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let raw = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+        let mut aliases = BTreeMap::new();
+        for (alias, value) in raw {
+            if value.get("type").is_none() {
+                return Err(D::Error::custom(format!(
+                    "connector alias `{alias}` is missing required field `type`"
+                )));
+            }
+            let config = value
+                .try_into::<ConnectorAliasConfig>()
+                .map_err(|err| D::Error::custom(format!("connector alias `{alias}`: {err}")))?;
+            aliases.insert(alias, config);
+        }
+        Ok(Self { aliases })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ProjectConfig {
     #[serde(default)]
@@ -342,6 +417,12 @@ pub struct ResolvedPathConfig {
     pub notes_path: PathBuf,
     pub pins_path: PathBuf,
     pub projects_path: PathBuf,
+    /// Sibling of `projects_path`: the `bbox-connectors` `MountRecord` store
+    /// (design/connectors/remote-source-connectors.md). Mirrors
+    /// `bbox_connectors::mount_record::default_mount_store_path`'s own
+    /// `BLACKBOX_MOUNTS_PATH` handling so the daemon's resolved path and the
+    /// library's documented default never drift apart.
+    pub mounts_path: PathBuf,
     pub packets_dir: PathBuf,
     pub artifacts_dir: PathBuf,
     pub bro_home: PathBuf,
@@ -431,6 +512,7 @@ pub struct Config {
     pub transcripts: TranscriptConfig,
     pub paths: ResolvedPathConfig,
     pub roadmap: RoadmapConfig,
+    pub connectors: ConnectorsConfig,
 }
 
 impl Config {
@@ -494,6 +576,7 @@ impl Config {
                 write_path: None,
                 template_path: None,
             },
+            connectors: ConnectorsConfig::default(),
         }
     }
 }
@@ -792,6 +875,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             write_path: raw.roadmap.write_path,
             template_path: raw.roadmap.template_path,
         },
+        connectors: raw.connectors,
     })
 }
 
@@ -1011,6 +1095,12 @@ fn resolve_paths(
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("projects.json"));
 
+    let mounts_path = std::env::var("BLACKBOX_MOUNTS_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("blackbox-mounts.json"));
+
     let packets_dir = std::env::var("BLACKBOX_PACKETS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -1107,6 +1197,7 @@ fn resolve_paths(
         notes_path,
         pins_path,
         projects_path,
+        mounts_path,
         packets_dir,
         artifacts_dir,
         bro_home,

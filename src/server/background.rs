@@ -22,6 +22,7 @@ pub(super) async fn start_background_tasks(
     spawn_runtime_metrics_sampler();
     start_bbox_watcher(&shared);
     crate::embed_runtime::spawn_embed_residue_sweeper(shared.clone());
+    super::mount_sync::spawn_mount_sync_loop(shared.clone());
     if role == RuntimeRole::Compatibility {
         compact_system_events(&shared);
         super::worker_rpc::start_worker_rpc(shared.clone())?;

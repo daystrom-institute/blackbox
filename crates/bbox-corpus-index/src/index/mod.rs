@@ -1098,6 +1098,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let chunk = bbox_chunker::Chunk {
             project_id: "proj1234".into(),
@@ -1250,6 +1251,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let chunk = bbox_chunker::Chunk {
             project_id: "proj-cn-d3".into(),
@@ -1335,6 +1337,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let content = "pub fn measured() { println!(\"full content\"); }";
         let chunk = bbox_chunker::Chunk {

@@ -531,6 +531,7 @@ fn integration_plan_lower_apply_with_real_sidecar() {
         is_git_repo: true,
         languages: std::collections::BTreeSet::new(),
         aliases: Default::default(),
+        ..Default::default()
     };
     let probe_runner = crate::probe::CodeNavProbeRunner::new(
         None, // no LSP — syntactic probes only

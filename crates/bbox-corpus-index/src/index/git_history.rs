@@ -336,6 +336,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -436,6 +437,7 @@ mod tests {
             is_git_repo: true,
             languages: Default::default(),
             aliases: Default::default(),
+            ..Default::default()
         };
         let mut meta: HashMap<String, FileMeta> = HashMap::new();
         let edges_dir = state.path().join("edges");

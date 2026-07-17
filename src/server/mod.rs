@@ -2,6 +2,7 @@ mod background;
 pub mod dispatch;
 pub mod handler;
 mod mcp;
+pub mod mount_sync;
 mod open;
 pub mod progress;
 pub mod response;
@@ -80,6 +81,7 @@ impl BlackboxServer {
             state,
             runtime_role: RuntimeRole::Compatibility,
             tool_router: crate::tools::projects::router()
+                + crate::tools::mounts::router()
                 + crate::tools::notes::router()
                 + crate::tools::gaps::router()
                 + crate::tools::threads::router()
@@ -122,6 +124,7 @@ impl BlackboxServer {
             state,
             runtime_role: RuntimeRole::Corpus,
             tool_router: crate::tools::projects::router()
+                + crate::tools::mounts::router()
                 + crate::tools::notes::router()
                 + crate::tools::gaps::router()
                 + crate::tools::threads::router()

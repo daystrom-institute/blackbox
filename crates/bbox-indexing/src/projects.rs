@@ -7,7 +7,9 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 pub use bbox_corpus_core::language::Language;
-pub use bbox_corpus_core::project_record::{CheckoutContext, ProjectContext, ProjectRecord};
+pub use bbox_corpus_core::project_record::{
+    CheckoutContext, ProjectContext, ProjectRecord, ProjectSource,
+};
 
 use bbox_corpus_core::entity_ref;
 use bbox_stores::store_persister::StoreSnapshot;
@@ -177,6 +179,7 @@ impl ProjectRegistry {
             is_git_repo,
             languages,
             aliases: BTreeSet::new(),
+            ..Default::default()
         };
         self.store.projects.push(record.clone());
         self.store
@@ -385,6 +388,19 @@ impl ProjectRegistry {
         record.aliases = declared.clone();
         Ok(true)
     }
+
+    /// Set `selector`'s `source` marker (design/connectors/
+    /// remote-source-connectors.md). Used by mount registration to flip a
+    /// freshly-registered project's source from the `LocalFs` default to
+    /// `RemoteMount { mount_id }` once the mount's materialization root has
+    /// been registered as a normal project. Returns the updated record.
+    pub fn set_source(&mut self, selector: &str, source: ProjectSource) -> Result<ProjectRecord> {
+        let idx = self
+            .resolve_project_index(selector)?
+            .with_context(|| format!("project not registered: {selector}"))?;
+        self.store.projects[idx].source = source;
+        Ok(self.store.projects[idx].clone())
+    }
 }
 
 /// An alias resolves only when exactly one registered project claims it —
@@ -451,6 +467,7 @@ pub fn managed_fleet_worktree_project(
         is_git_repo: true,
         languages: base.languages.clone(),
         aliases: BTreeSet::new(),
+        ..Default::default()
     })
 }
 
@@ -890,6 +907,48 @@ mod tests {
     }
 
     #[test]
+    fn set_source_flips_project_source_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("mount-root");
+        fs::create_dir_all(&project).unwrap();
+        let store_path = dir.path().join("projects.json");
+        let mut registry = ProjectRegistry::open(&store_path).unwrap();
+        let record = registry.register_path(&project).unwrap();
+        assert_eq!(record.source, ProjectSource::default());
+
+        let updated = registry
+            .set_source(
+                &record.project_id,
+                ProjectSource::RemoteMount {
+                    mount_id: "deadbeef".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            updated.source,
+            ProjectSource::RemoteMount {
+                mount_id: "deadbeef".to_string()
+            }
+        );
+        assert_eq!(
+            registry
+                .resolve(&record.project_id)
+                .unwrap()
+                .unwrap()
+                .source,
+            ProjectSource::RemoteMount {
+                mount_id: "deadbeef".to_string()
+            }
+        );
+
+        assert!(
+            registry
+                .set_source("not-registered", ProjectSource::LocalFs)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn register_this_repo_and_sibling_have_stable_project_ids() {
         let dir = tempfile::tempdir().unwrap();
         let this_repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1173,6 +1232,7 @@ mod tests {
             is_git_repo: true,
             languages: BTreeSet::new(),
             aliases: BTreeSet::new(),
+            ..Default::default()
         }
     }
 
@@ -1550,6 +1610,7 @@ mod tests {
             is_git_repo: true,
             languages: BTreeSet::new(),
             aliases: Default::default(),
+            ..Default::default()
         }];
 
         // Managed worktree → (base scope, worktree write-dir).

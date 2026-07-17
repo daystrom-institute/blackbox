@@ -40,6 +40,7 @@ pub enum ToolCategory {
     Workspace,
     Macros,
     Operations,
+    Connectors,
 }
 
 impl ToolCategory {
@@ -64,6 +65,7 @@ impl ToolCategory {
             Self::Workspace => "Workspace tools",
             Self::Macros => "Macro registry",
             Self::Operations => "Operations",
+            Self::Connectors => "Remote-source connectors",
         }
     }
 
@@ -119,6 +121,9 @@ impl ToolCategory {
             }
             Self::Operations => {
                 "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands."
+            }
+            Self::Connectors => {
+                "Mount remote sources (git clone URLs today; drives later) as registered, indexable projects: register/list/sync/unregister with connector-side change cursors and a policy engine. Deep docs live in design/connectors/remote-source-connectors.md; deliberately not hot-rendered."
             }
         }
     }
@@ -383,6 +388,36 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(
             r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,
         ),
+    },
+    ToolDoc {
+        name: "bbox_mount_register",
+        category: ToolCategory::Connectors,
+        summary: "Register a remote-source connector mount: validate the connector against scope (fail closed), create the mount record, and run the initial sync in the background (returns immediately with mount_id + sync status, like registration-time project indexing). Once the initial sync materializes files, the materialization root auto-registers as a normal project with source=RemoteMount. Re-registering an existing (connector, scope) pair returns the existing mount, not a duplicate. Poll bbox_mount_list for sync state and project_id.",
+        when_to_use: "Use to mount a remote source (today: a git clone URL, optionally `#<ref>`) as an indexable project. Poll bbox_mount_list for sync state and project_id after registering.",
+        example: Some(
+            r#"bbox_mount_register(connector="git", scope="https://example.invalid/repo.git#main")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_mount_list",
+        category: ToolCategory::Connectors,
+        summary: "List registered remote-source connector mounts with connector, scope, materialization_root, project_id, cursor presence, and last_sync (fetched/skipped/deleted/renamed/errors/degradations).",
+        when_to_use: "Use to check mount sync state or find a mount's project_id after bbox_mount_register.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_mount_sync",
+        category: ToolCategory::Connectors,
+        summary: "Run a manual sync pass for one registered mount. full=true discards the stored cursor and forces a full walk. Refuses with status=\"busy\" when a sync for this mount (manual or the periodic background pass) is already in flight - no error, just try again shortly.",
+        when_to_use: "Use to force a resync without waiting for the periodic background pass, or to recover a mount whose cursor needs a full-walk reset.",
+        example: Some(r#"bbox_mount_sync(mount="a1b2c3d4", full=true)"#),
+    },
+    ToolDoc {
+        name: "bbox_mount_unregister",
+        category: ToolCategory::Connectors,
+        summary: "Unregister a mount. Mirrors bbox_project_unregister's attached-state refusal: refuses when the underlying project still has project-scoped refs unless force=true. remove_files=true additionally deletes the materialization root and manifest, refused unless the root carries the ownership marker stamped at materialization time; default false keeps bytes on disk.",
+        when_to_use: "Use to drop a mount. Prefer force=false first to see attached-ref counts, then force=true to accept orphaning; add remove_files=true only when the materialized bytes should also go.",
+        example: Some(r#"bbox_mount_unregister(mount="a1b2c3d4", remove_files=true)"#),
     },
     // ── Refactor mechanization ───────────────────────────────────────
     ToolDoc {

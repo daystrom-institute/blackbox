@@ -32,6 +32,7 @@ fn registered_for(dir: &TempDir) -> Vec<ProjectRecord> {
         is_git_repo: false,
         languages: BTreeSet::new(),
         aliases: Default::default(),
+        ..Default::default()
     }]
 }
 
