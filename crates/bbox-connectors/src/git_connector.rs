@@ -331,6 +331,11 @@ async fn object_exists(root: &Path, sha: &str) -> bool {
 async fn diff_name_status(root: &Path, from: &str, to: &str) -> Result<String> {
     run_git(
         &[
+            // Without quotepath=false, git C-quotes non-ASCII paths
+            // (`"Ko\305\202..."` with literal quotes and octal escapes) and
+            // the parsed path never matches any real file.
+            "-c",
+            "core.quotepath=false",
             "diff",
             "--name-status",
             "--find-renames",
@@ -348,7 +353,11 @@ async fn diff_name_status(root: &Path, from: &str, to: &str) -> Result<String> {
 /// Submodules are deliberately not materialized: their content belongs to
 /// a different repository, mountable as its own mount.
 async fn blob_paths(root: &Path, sha: &str) -> Result<HashSet<String>> {
-    let output = run_git(&["ls-tree", "-r", sha], Some(root)).await?;
+    let output = run_git(
+        &["-c", "core.quotepath=false", "ls-tree", "-r", sha],
+        Some(root),
+    )
+    .await?;
     let mut paths = HashSet::new();
     for line in output.lines() {
         if line.is_empty() {
@@ -692,6 +701,50 @@ mod tests {
             }
         );
         assert_eq!(changes[3].entry.path, "new.txt");
+    }
+
+    #[tokio::test]
+    async fn non_ascii_paths_materialize_unquoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let remote = base.join("remote");
+        init_fixture_repo(&remote, "main");
+        // Non-ASCII filename: git C-quotes this in ls-tree/diff output
+        // unless core.quotepath=false, and the quoted form matches no file.
+        write_and_commit(
+            &remote,
+            "attachments/faktura_Kołodziejczyk.pdf",
+            "pdfish\n",
+            "add non-ascii path",
+        );
+
+        let root = base.join("mount-root");
+        let manifest_path = base.join("manifest.json");
+        let mount = mount(file_url(&remote), &root);
+        let connector = GitConnector::new();
+
+        let summary = sync_mount(&connector, &mount, &manifest_path, None)
+            .await
+            .unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert_eq!(summary.fetched, 1);
+        assert!(
+            root.join("attachments/faktura_Kołodziejczyk.pdf").is_file(),
+            "non-ascii path must materialize under its real name"
+        );
+
+        // Incremental leg: modify the file and re-sync from the cursor.
+        write_and_commit(
+            &remote,
+            "attachments/faktura_Kołodziejczyk.pdf",
+            "pdfish v2\n",
+            "modify non-ascii path",
+        );
+        let summary2 = sync_mount(&connector, &mount, &manifest_path, summary.next_cursor)
+            .await
+            .unwrap();
+        assert!(summary2.errors.is_empty(), "{:?}", summary2.errors);
+        assert_eq!(summary2.fetched, 1);
     }
 
     #[tokio::test]
