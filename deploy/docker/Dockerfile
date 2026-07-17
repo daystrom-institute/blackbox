@@ -90,6 +90,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
+        openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user. Fixed uid/gid so mounted volume ownership is
