@@ -16,9 +16,18 @@ pub(super) fn build_http_app(
     ct: &CancellationToken,
     role: RuntimeRole,
 ) -> axum::Router {
-    let server_config = StreamableHttpServerConfig::default()
+    let mut server_config = StreamableHttpServerConfig::default()
         .with_cancellation_token(ct.child_token())
         .with_stateful_mode(true);
+    // rmcp's DNS-rebinding guard allows loopback Host headers only by
+    // default. A containerized corpus role served through a non-loopback
+    // name (e.g. a tailscale-operator MagicDNS hostname) declares the extra
+    // names via config/env; loopback stays allowed alongside them.
+    if !cfg.daemon.mcp_allowed_hosts.is_empty() {
+        let mut allowed: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+        allowed.extend(cfg.daemon.mcp_allowed_hosts.iter().cloned());
+        server_config = server_config.with_allowed_hosts(allowed);
+    }
 
     let shared_for_mcp = shared.clone();
     let session_keep_alive = cfg.daemon.mcp_session_keepalive_secs;

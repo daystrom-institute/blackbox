@@ -135,6 +135,8 @@ struct RawDaemonConfig {
     pub poller_min_interval_secs: u64,
     #[serde(default = "default_daemon_allow_nonloopback_bind")]
     pub allow_nonloopback_bind: bool,
+    #[serde(default)]
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// Dev-checkout fallback for the system-memory defaults directory. This crate
@@ -366,6 +368,13 @@ pub struct DaemonConfig {
     /// Opt-in that lets the corpus role bind a non-loopback address. Default
     /// false keeps the loopback fail-closed guard in `server::run`.
     pub allow_nonloopback_bind: bool,
+    /// Extra Host header values the MCP transport accepts alongside the
+    /// loopback defaults (rmcp's DNS-rebinding guard). Needed when the
+    /// containerized corpus role is served through a non-loopback name,
+    /// e.g. a tailscale-operator MagicDNS hostname. Entries may carry a
+    /// port (`name` or `name:port`). Empty (the default) keeps the guard
+    /// loopback-only.
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// Index configuration
@@ -440,6 +449,7 @@ impl Config {
                 mcp_session_keepalive_secs: default_daemon_mcp_session_keepalive_secs(),
                 poller_min_interval_secs: default_daemon_poller_min_interval_secs(),
                 allow_nonloopback_bind: default_daemon_allow_nonloopback_bind(),
+                mcp_allowed_hosts: Vec::new(),
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -513,6 +523,19 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !val.trim().is_empty()
     {
         raw.daemon.allow_nonloopback_bind = val == "1" || val.eq_ignore_ascii_case("true");
+    }
+
+    // Extra MCP Host-header allowlist entries (comma-separated) for serving
+    // the corpus role through a non-loopback name (cluster deployment).
+    if let Ok(hosts) = std::env::var("BBOX_MCP_ALLOWED_HOSTS")
+        && !hosts.trim().is_empty()
+    {
+        raw.daemon.mcp_allowed_hosts = hosts
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(String::from)
+            .collect();
     }
 
     if let Ok(mcp_name) = std::env::var("BLACKBOX_MCP_NAME")
@@ -729,6 +752,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             mcp_session_keepalive_secs: raw.daemon.mcp_session_keepalive_secs,
             poller_min_interval_secs: raw.daemon.poller_min_interval_secs,
             allow_nonloopback_bind: raw.daemon.allow_nonloopback_bind,
+            mcp_allowed_hosts: raw.daemon.mcp_allowed_hosts.clone(),
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,
