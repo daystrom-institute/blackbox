@@ -298,7 +298,20 @@ pub(crate) async fn sync_one_mount(
     mount_id: &str,
     full: bool,
 ) -> Result<SyncSummary> {
-    let _guard = InFlightGuard::acquire(&state.mount_sync_locks, mount_id)?;
+    let sync_start = std::time::Instant::now();
+    let _guard = match InFlightGuard::acquire(&state.mount_sync_locks, mount_id) {
+        Ok(guard) => guard,
+        Err(err) => {
+            crate::server::bbox_metrics::record_mount_sync(
+                mount_id,
+                "busy",
+                sync_start.elapsed().as_secs_f64(),
+                0,
+                0,
+            );
+            return Err(err);
+        }
+    };
 
     let (record, cfg_snapshot) = {
         let mounts = state.mounts.read();
@@ -330,6 +343,13 @@ pub(crate) async fn sync_one_mount(
                 }
             }
             let _ = state.persist_mounts_durable().await;
+            crate::server::bbox_metrics::record_mount_sync(
+                mount_id,
+                "error",
+                sync_start.elapsed().as_secs_f64(),
+                0,
+                0,
+            );
             return Err(err);
         }
     };
@@ -380,6 +400,13 @@ pub(crate) async fn sync_one_mount(
         }
     }
 
+    crate::server::bbox_metrics::record_mount_sync(
+        mount_id,
+        "ok",
+        sync_start.elapsed().as_secs_f64(),
+        summary.fetched,
+        summary.deleted,
+    );
     Ok(summary)
 }
 
@@ -441,6 +468,16 @@ pub(crate) async fn run_sync_and_register_project(
     };
     state.persist_projects_durable().await?;
 
+    // Mirror bbox_project_register's post-registration repo-owned load
+    // (src/tools/projects.rs): pull the mount's committed `.bbox/knowledge/`
+    // into the query surface and enqueue its embeds, so a mounted repo's
+    // durable knowledge is searchable without a daemon restart. Runs BEFORE
+    // project_id lands on the mount record: that field is the documented
+    // "registration complete" poll signal (bbox_mount_register tool doc),
+    // so everything the signal promises must already hold when it appears.
+    crate::server::routes::sync_kb_project_roots(state);
+    crate::server::routes::enqueue_project_knowledge_embeds(state, &project_record.canonical_path);
+
     {
         let mut mounts = state.mounts.write();
         if let Some(mut record) = mounts.get(mount_id).cloned() {
@@ -457,13 +494,6 @@ pub(crate) async fn run_sync_and_register_project(
         }
     }
     state.persist_mounts_durable().await?;
-
-    // Mirror bbox_project_register's post-registration repo-owned load
-    // (src/tools/projects.rs): pull the mount's committed `.bbox/knowledge/`
-    // into the query surface and enqueue its embeds, so a mounted repo's
-    // durable knowledge is searchable without a daemon restart.
-    crate::server::routes::sync_kb_project_roots(state);
-    crate::server::routes::enqueue_project_knowledge_embeds(state, &project_record.canonical_path);
 
     Ok(summary)
 }

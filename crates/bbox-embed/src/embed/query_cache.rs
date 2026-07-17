@@ -160,7 +160,8 @@ fn embed_query_cached_with(
 
 fn embed_single_blocking(provider: &dyn EmbeddingProvider, query: &str) -> Result<Vec<f32>> {
     let inputs = vec![EmbedInput::Text(query.to_string())];
-    let outputs = match tokio::runtime::Handle::try_current() {
+    let start = Instant::now();
+    let call_result = match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| {
             handle.block_on(provider.embed_batch(&inputs, EmbedInputType::Query))
         }),
@@ -168,7 +169,14 @@ fn embed_single_blocking(provider: &dyn EmbeddingProvider, query: &str) -> Resul
             let runtime = tokio::runtime::Runtime::new().context("creating embedding runtime")?;
             runtime.block_on(provider.embed_batch(&inputs, EmbedInputType::Query))
         }
-    }?;
+    };
+    crate::metrics::record_provider_call(
+        provider.id(),
+        provider.query_model(),
+        start.elapsed(),
+        call_result.as_ref().err(),
+    );
+    let outputs = call_result?;
     outputs
         .into_iter()
         .next()

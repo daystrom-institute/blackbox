@@ -98,11 +98,23 @@ impl BlackboxServer {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_mount_register", elapsed_ms = ms, bytes = text.len(), "ok");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_mount_register",
+                    start.elapsed().as_secs_f64(),
+                    Some(text.len()),
+                    true,
+                );
                 Self::ok_text(&text)
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_mount_register", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_mount_register",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -143,11 +155,23 @@ impl BlackboxServer {
                 .unwrap_or_default();
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_mount_sync", elapsed_ms = ms, bytes = text.len(), "ok");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_mount_sync",
+                    start.elapsed().as_secs_f64(),
+                    Some(text.len()),
+                    true,
+                );
                 Self::ok_text(&text)
             }
             Err(e) if e.downcast_ref::<connectors_runtime::MountBusy>().is_some() => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_mount_sync", elapsed_ms = ms, "busy");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_mount_sync",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    true,
+                );
                 Self::ok_json(&json!({
                     "status": "busy",
                     "mount_id": mount_id,
@@ -157,6 +181,12 @@ impl BlackboxServer {
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_mount_sync", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_mount_sync",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -180,11 +210,23 @@ impl BlackboxServer {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_mount_unregister", elapsed_ms = ms, bytes = text.len(), "ok");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_mount_unregister",
+                    start.elapsed().as_secs_f64(),
+                    Some(text.len()),
+                    true,
+                );
                 Self::ok_text(&text)
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_mount_unregister", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_mount_unregister",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }

@@ -4,5 +4,6 @@
 
 pub mod code_nav;
 pub mod index;
+mod metrics;
 pub mod projects;
 pub mod slices;

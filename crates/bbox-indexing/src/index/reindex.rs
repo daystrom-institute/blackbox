@@ -124,6 +124,7 @@ pub(super) fn execute_reindex_pass(
     writer: &mut IndexWriter,
     drain: &mut dyn FnMut(&mut IndexWriter),
 ) -> Result<String> {
+    let pass_start = std::time::Instant::now();
     // Reload meta at pass start (a prior pass may have committed since the
     // scheduler's speculative scan).
     let mut meta = if full {
@@ -300,6 +301,7 @@ pub(super) fn execute_reindex_pass(
         // detecting that precisely isn't worth the bookkeeping — an empty
         // commit is cheap and keeps drained ops from straddling passes.
         writer.commit()?;
+        record_reindex_metrics(index, pass_start);
         return Ok(summary);
     }
 
@@ -318,7 +320,20 @@ pub(super) fn execute_reindex_pass(
         "auto-reindex: indexed {indexed_files} files ({indexed_docs} docs), skipped {skipped} unchanged, purged {purged} deleted, segments {segments}"
     );
     tracing::info!("{}", summary);
+    record_reindex_metrics(index, pass_start);
     Ok(summary)
+}
+
+/// `bbox.reindex.duration` + the `bbox.index.documents`/`bbox.index.segments`
+/// point-in-time gauges, recorded from `index.searchable_segment_metas()`
+/// (already-loaded segment metadata, no new `Searcher`/reader needed).
+fn record_reindex_metrics(index: &Index, pass_start: Instant) {
+    let documents: u64 = index
+        .searchable_segment_metas()
+        .map(|metas| metas.iter().map(|meta| meta.num_docs() as u64).sum())
+        .unwrap_or(0);
+    let segments = segment_count(index) as u64;
+    crate::metrics::record_reindex_pass(pass_start.elapsed(), documents, segments);
 }
 
 // The reindex writer actor synchronously snapshots retained records before it

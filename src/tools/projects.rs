@@ -184,12 +184,24 @@ impl BlackboxServer {
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_register",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 return Self::err_text(&format!("Error: {e:#}"));
             }
         };
         if let Err(e) = self.state.persist_projects_durable().await {
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+            crate::server::bbox_metrics::record_tool_call(
+                "bbox_project_register",
+                start.elapsed().as_secs_f64(),
+                None,
+                false,
+            );
             return Self::err_text(&format!("Error: {e:#}"));
         }
         // Phase 2: heavy fs work (MCP migration, config load, artifact discovery,
@@ -305,11 +317,23 @@ impl BlackboxServer {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, bytes = text.len(), "ok");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_register",
+                    start.elapsed().as_secs_f64(),
+                    Some(text.len()),
+                    true,
+                );
                 Self::ok_text(&text)
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_register", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_register",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -360,6 +384,12 @@ impl BlackboxServer {
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_rename",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 return Self::err_text(&format!("Error: {e:#}"));
             }
         };
@@ -367,6 +397,12 @@ impl BlackboxServer {
             if let Err(e) = self.state.persist_projects_durable().await {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_rename",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 return Self::err_text(&format!("Error: {e:#}"));
             }
         }
@@ -437,11 +473,23 @@ impl BlackboxServer {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, bytes = text.len(), "ok");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_rename",
+                    start.elapsed().as_secs_f64(),
+                    Some(text.len()),
+                    true,
+                );
                 Self::ok_text(&text)
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_rename",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -532,11 +580,23 @@ impl BlackboxServer {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_project_unregister", elapsed_ms = ms, bytes = text.len(), "ok");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_unregister",
+                    start.elapsed().as_secs_f64(),
+                    Some(text.len()),
+                    true,
+                );
                 Self::ok_text(&text)
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_unregister", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_unregister",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }
@@ -585,6 +645,12 @@ impl BlackboxServer {
                 if !dry_run && let Err(e) = self.state.kb_persister.request_durable().await {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
                     tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %e, "err");
+                    crate::server::bbox_metrics::record_tool_call(
+                        "bbox_project_eject",
+                        start.elapsed().as_secs_f64(),
+                        None,
+                        false,
+                    );
                     return Self::err_text(&format!("Error: {e:#}"));
                 }
                 match serde_json::to_string_pretty(&json!({
@@ -602,12 +668,24 @@ impl BlackboxServer {
                     Ok(text) => {
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
                         tracing::info!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, bytes = text.len(), "ok");
+                        crate::server::bbox_metrics::record_tool_call(
+                            "bbox_project_eject",
+                            start.elapsed().as_secs_f64(),
+                            Some(text.len()),
+                            true,
+                        );
                         Self::ok_text(&text)
                     }
                     Err(e) => {
                         let err = anyhow::Error::new(e);
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
                         tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %err, "err");
+                        crate::server::bbox_metrics::record_tool_call(
+                            "bbox_project_eject",
+                            start.elapsed().as_secs_f64(),
+                            None,
+                            false,
+                        );
                         Self::err_text(&format!("Error: {err:#}"))
                     }
                 }
@@ -615,6 +693,12 @@ impl BlackboxServer {
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_project_eject",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }

@@ -23,6 +23,10 @@ bro-transcript = { path = "../bro-transcript" }
 parking_lot = "0.12"
 tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
+# API-only: bbox.reindex.duration at the periodic reindex pass, via the
+# process-wide global meter (see bbox-embed's Cargo.toml comment on the
+# same pattern).
+opentelemetry = "0.32"
 rmcp = { version = "1.4", features = [
     "server",
     "macros",

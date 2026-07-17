@@ -123,7 +123,29 @@ fn document_group_key(entity_id: &str) -> &str {
 /// `VisualPayloadRef` (bytes loaded from the visual payload sidecar at this
 /// point, not held in the pending queue). Returns one vector per request,
 /// in batch order.
+/// Times and classifies the call for `bbox.embed.provider.duration` /
+/// `bbox.embed.provider.errors` (attrs: provider id, document model - every
+/// call here embeds with the `Document` role), then dispatches to the
+/// provider-shape-specific path. Wrapping at this single choke point
+/// covers all three worker call sites (`worker_loop`'s throttled and
+/// unthrottled dispatch, `isolate_poison_batch`'s retry) without touching
+/// their call sites.
 async fn embed_batch_requests(
+    provider: &dyn EmbeddingProvider,
+    batch: &[EmbedRequest],
+) -> Result<Vec<Vec<f32>>> {
+    let start = std::time::Instant::now();
+    let result = embed_batch_requests_inner(provider, batch).await;
+    crate::metrics::record_provider_call(
+        provider.id(),
+        provider.document_model(),
+        start.elapsed(),
+        result.as_ref().err(),
+    );
+    result
+}
+
+async fn embed_batch_requests_inner(
     provider: &dyn EmbeddingProvider,
     batch: &[EmbedRequest],
 ) -> Result<Vec<Vec<f32>>> {

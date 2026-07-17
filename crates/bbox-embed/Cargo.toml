@@ -24,6 +24,12 @@ bbox-visual-store = { path = "../bbox-visual-store" }
 parking_lot = "0.12"
 tracing = "0.1"
 chrono = "0.4"
+# API-only (no sdk/exporter): records provider call duration/error metrics
+# through the process-wide global meter that blackboxd's
+# server/telemetry.rs installs when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+# global::meter() is a documented no-op before that install, so this crate
+# stays instrumented unconditionally with zero coupling to the daemon.
+opentelemetry = "0.32"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 rmcp = { version = "1.4", features = [

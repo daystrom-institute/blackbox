@@ -48,6 +48,12 @@ impl BlackboxServer {
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_thread",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 return Self::err_text(&format!("Error: {e:#}"));
             }
         };
@@ -56,6 +62,12 @@ impl BlackboxServer {
             if let Err(e) = self.state.persist_threads_durable().await {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call(
+                    "bbox_thread",
+                    start.elapsed().as_secs_f64(),
+                    None,
+                    false,
+                );
                 return Self::err_text(&format!("Error: {e:#}"));
             }
         }
@@ -76,6 +88,12 @@ impl BlackboxServer {
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, bytes = mutation.message.len(), "ok");
+        crate::server::bbox_metrics::record_tool_call(
+            "bbox_thread",
+            start.elapsed().as_secs_f64(),
+            Some(mutation.message.len()),
+            true,
+        );
         Self::ok_text(&mutation.message)
     }
 

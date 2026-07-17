@@ -24,6 +24,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
+# OTel export (env-gated: OTEL_EXPORTER_OTLP_ENDPOINT unset keeps today's
+# fmt-only subscriber; see src/telemetry.rs). blackopsd is a separate
+# crate from blackboxd (no shared dependency), so this mirrors
+# transcript-search/src/server/telemetry.rs's trace+log pipeline rather
+# than importing it -- see that module's doc comment for the full
+# disabled-vs-enabled contract this mirrors. Metrics export is left to
+# blackboxd stage 1; blackopsd has no bbox.* domain instruments defined
+# yet, so a metrics pipeline here would have nothing to export.
+opentelemetry = "0.32.0"
+opentelemetry_sdk = "0.32.1"
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "trace", "logs"] }
+opentelemetry-semantic-conventions = "0.32.1"
+tracing-opentelemetry = "0.33.0"
+opentelemetry-appender-tracing = "0.32.0"
+hostname = "0.4.2"
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

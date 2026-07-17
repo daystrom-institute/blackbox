@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 pub async fn run() -> anyhow::Result<()> {
     let home = dirs::home_dir().expect("cannot determine home directory");
     let migrated = util::migrate_legacy_defaults(&home)?;
-    init_logging(&home, migrated);
+    let telemetry_guard = init_logging(&home, migrated);
 
     let runtime_role = RuntimeRole::from_env()?;
     let opened = open_shared_state(&home, runtime_role)?;
@@ -52,6 +52,7 @@ pub async fn run() -> anyhow::Result<()> {
         ct,
         cfg.daemon.shutdown_grace_secs,
         runtime_role,
+        telemetry_guard,
     )
     .await
 }

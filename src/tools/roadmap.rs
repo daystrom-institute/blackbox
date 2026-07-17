@@ -195,11 +195,13 @@ impl BlackboxServer {
             Ok(text) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "blackbox::tool", tool = "bbox_roadmap", elapsed_ms = ms, bytes = text.len(), "ok");
+                crate::server::bbox_metrics::record_tool_call("bbox_roadmap", start.elapsed().as_secs_f64(), Some(text.len()), true);
                 Self::ok_text(&text)
             }
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_roadmap", elapsed_ms = ms, error = %e, "err");
+                crate::server::bbox_metrics::record_tool_call("bbox_roadmap", start.elapsed().as_secs_f64(), None, false);
                 Self::err_text(&format!("Error: {e:#}"))
             }
         }

@@ -152,6 +152,31 @@ impl HybridDegraded {
     }
 }
 
+/// `bbox.search.degraded` - one increment per degradation reason present
+/// on the response, attr `kind` in `rerank_unavailable` | `vector_unavailable`
+/// | `partition_busy`. `skipped_partitions` has no single reason shape (a
+/// dims mismatch, an unmapped route, or the vector store still warming all
+/// land there - see the three insert sites above), so a reason string
+/// containing "warming" or "busy" reports as `partition_busy` and anything
+/// else - including `vector_errors` provider-call failures - reports as
+/// `vector_unavailable`.
+fn record_degraded_metrics(degraded: &HybridDegraded) {
+    if degraded.rerank_unavailable.is_some() {
+        crate::bbox_search_metrics::record_degraded("rerank_unavailable");
+    }
+    for _ in degraded.vector_errors.values() {
+        crate::bbox_search_metrics::record_degraded("vector_unavailable");
+    }
+    for reason in degraded.skipped_partitions.values() {
+        let kind = if reason.contains("warming") || reason.contains("busy") {
+            "partition_busy"
+        } else {
+            "vector_unavailable"
+        };
+        crate::bbox_search_metrics::record_degraded(kind);
+    }
+}
+
 pub fn hybrid_search(
     index: &TranscriptIndex,
     knowledge: &Knowledge,
@@ -384,6 +409,7 @@ pub fn hybrid_search_typed(
 
     let next_steps = build_next_steps(&results);
     let text = render_text(query, &results, &next_steps, &vector_status, &degraded);
+    record_degraded_metrics(&degraded);
     Ok(HybridSearchResponse {
         text,
         next_steps,

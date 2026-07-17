@@ -1,10 +1,14 @@
+use super::telemetry;
 use crate::config;
 use crate::dispatch_mcp::dispatch_mcp_url;
 use crate::util;
-use std::io;
 use std::path::{Path, PathBuf};
 
-pub(super) fn init_logging(home: &Path, migrated: Vec<String>) {
+/// Installs the global tracing subscriber (env-gated OTLP export layered
+/// in via `telemetry::init` - see that module's doc for the exact
+/// disabled-vs-enabled behavior) and returns the guard the daemon's
+/// shutdown path flushes before exit.
+pub(super) fn init_logging(home: &Path, migrated: Vec<String>) -> telemetry::TelemetryGuard {
     let log_dir = util::blackbox_log_dir(home);
     std::fs::create_dir_all(&log_dir).expect("failed to create log directory");
     let file_appender = tracing_appender::rolling::Builder::new()
@@ -15,20 +19,7 @@ pub(super) fn init_logging(home: &Path, migrated: Vec<String>) {
         .build(&log_dir)
         .expect("failed to create log appender");
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "blackbox=info".into());
-
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(file_appender)
-                .with_ansi(false),
-        )
-        .init();
+    let guard = telemetry::init("blackboxd", env!("CARGO_PKG_VERSION"), file_appender);
 
     std::panic::set_hook(Box::new(|info| {
         tracing::error!("PANIC: {}", info);
@@ -42,6 +33,7 @@ pub(super) fn init_logging(home: &Path, migrated: Vec<String>) {
     for msg in migrated {
         tracing::info!("migrated legacy blackbox path: {msg}");
     }
+    guard
 }
 
 fn expand_home_path(home: &Path, path: &str) -> PathBuf {

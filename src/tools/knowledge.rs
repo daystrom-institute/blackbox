@@ -56,11 +56,18 @@ fn entry_ids(entries_block: &str) -> Vec<String> {
 fn log_tool_ok(tool: &'static str, start: std::time::Instant, bytes: usize) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes, "ok");
+    crate::server::bbox_metrics::record_tool_call(
+        tool,
+        start.elapsed().as_secs_f64(),
+        Some(bytes),
+        true,
+    );
 }
 
 fn log_tool_err(tool: &'static str, start: std::time::Instant, err: &anyhow::Error) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %err, "err");
+    crate::server::bbox_metrics::record_tool_call(tool, start.elapsed().as_secs_f64(), None, false);
 }
 
 /// Rescope an absolute-path `project` filter through worktree→base project

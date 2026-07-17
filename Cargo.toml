@@ -136,6 +136,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+# OTel export (env-gated: OTEL_EXPORTER_OTLP_ENDPOINT unset keeps today's
+# fmt-only subscriber; see src/server/telemetry.rs). Pinned to one compatible
+# 0.32 line across the api/sdk/otlp/appender/tracing-bridge crates -- they
+# version in lockstep upstream and a mismatched set fails to compile.
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "trace", "metrics", "logs"] }
+opentelemetry-semantic-conventions = "0.32.1"
+tracing-opentelemetry = "0.33.0"
+opentelemetry-appender-tracing = "0.32.0"
+hostname = "0.4.2"
+
 # Time
 chrono = "0.4"
 

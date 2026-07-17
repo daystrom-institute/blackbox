@@ -186,6 +186,21 @@ pub(crate) async fn internal_record_ingest_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(request): axum::Json<bro_capabilities::RecordIngestRequest>,
 ) -> impl IntoResponse {
+    // Snapshot per-producer record/byte counts before `request` moves into
+    // the blocking closure below - `bbox.ingest.*` labels by `host_id`,
+    // which maps to the record's `producer` stream name (RecordEnvelope
+    // carries no separate host identifier).
+    let mut ingest_counts_by_producer: HashMap<String, (u64, u64)> = HashMap::new();
+    for record in &request.records {
+        let bytes = serde_json::to_vec(record)
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
+        let entry = ingest_counts_by_producer
+            .entry(record.producer.clone())
+            .or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
     let records = request.records.clone();
     let record_store = state.record_ingest.clone();
     let index_writer = state.index_writer.clone();
@@ -232,10 +247,15 @@ pub(crate) async fn internal_record_ingest_handler(
     .map_err(|error| bro_core::BroError::new("record_ingest.worker_failed", error.to_string()))
     .and_then(|result| result);
     match result {
-        Ok(receipt) => (
-            axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!(receipt)),
-        ),
+        Ok(receipt) => {
+            for (producer, (count, bytes)) in &ingest_counts_by_producer {
+                crate::server::bbox_metrics::record_ingest_batch(producer, *count, *bytes, "ok");
+            }
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!(receipt)),
+            )
+        }
         Err(error) => {
             let (status, retryable) = match error.code.as_str() {
                 "record_ingest.idempotency_conflict" => (axum::http::StatusCode::CONFLICT, false),
@@ -246,6 +266,14 @@ pub(crate) async fn internal_record_ingest_handler(
                 }
                 _ => (axum::http::StatusCode::BAD_REQUEST, false),
             };
+            for (producer, (count, bytes)) in &ingest_counts_by_producer {
+                crate::server::bbox_metrics::record_ingest_batch(
+                    producer,
+                    *count,
+                    *bytes,
+                    &error.code,
+                );
+            }
             (
                 status,
                 axum::Json(serde_json::json!({

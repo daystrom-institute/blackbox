@@ -1,4 +1,5 @@
 mod background;
+pub(crate) mod bbox_metrics;
 pub mod dispatch;
 pub mod handler;
 mod mcp;
@@ -18,6 +19,7 @@ pub mod storage_gc;
 pub mod store_helpers;
 pub mod surface;
 pub mod tail;
+mod telemetry;
 pub(crate) mod worker_rpc;
 pub mod workflow_capabilities;
 pub mod workflow_runtime;

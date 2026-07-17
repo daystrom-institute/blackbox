@@ -4,3 +4,4 @@
 
 pub mod embed;
 pub mod embed_queue;
+mod metrics;

@@ -54,6 +54,16 @@ out explicitly under `Changed` or `Removed`.
   an audit annotation when a caller-supplied value was overridden. The grant
   is policy-gated and fail-closed; `bro_*` orchestration tools are never
   projectable. Slice 1 of `design/bro-harness/bbox-tool-projection.md`.
+- blackboxd and blackopsd emit OTLP traces, metrics, and logs, gated by
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (unset keeps today's fmt-only logging
+  byte-for-byte, no background export tasks). Covers the MCP tool-call seam
+  (`bbox.tool.duration`/`errors`/`response_bytes`, every `#[tool]` handler),
+  record ingest, mount sync, tokio runtime health, the embed queue and
+  provider calls, vector partition health, hybrid search degradation, and
+  reindex/storage GC - see `src/server/telemetry.rs` for the full instrument
+  list and the disabled/enabled contract. `OTEL_TRACES_SAMPLER_ARG` and
+  `OTEL_METRIC_EXPORT_INTERVAL` (default 15s) are respected. Stage 1 of
+  bbox-otel; bbox-cage deployment env and dashboards are a later stage.
 
 ### Fixed
 

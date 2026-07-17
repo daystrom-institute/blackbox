@@ -1,9 +1,11 @@
+use super::telemetry::TelemetryGuard;
 use super::{RuntimeRole, SharedState};
 use crate::{config, embed_queue, vectors};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -12,11 +14,15 @@ pub(super) async fn serve_until_shutdown(
     ct: CancellationToken,
     shutdown_grace_secs: u64,
     runtime_role: RuntimeRole,
+    telemetry_guard: TelemetryGuard,
 ) -> anyhow::Result<()> {
     spawn_config_reload_handler(shared.clone());
     spawn_shutdown_signal_handler(ct.clone());
     serve_with_grace_period(listener, app, &ct, shutdown_grace_secs).await?;
     persist_shutdown_state(shared, store_dir, runtime_role);
+    // Flush spans/metrics/logs still buffered in the OTLP batch/periodic
+    // exporters before the process exits. No-op when telemetry is disabled.
+    telemetry_guard.shutdown();
     tracing::info!("blackboxd shut down");
     Ok(())
 }

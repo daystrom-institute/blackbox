@@ -89,6 +89,7 @@ fn run_storage_gc_pass(state: &SharedState) -> anyhow::Result<()> {
 
     let (deleted, errors) = storage_health::apply_gc(&candidates);
     if errors.is_empty() {
+        crate::server::bbox_metrics::record_storage_gc_bytes_pruned(deletable_bytes);
         tracing::info!(
             deleted = deleted.len(),
             planned = deletable_count,
