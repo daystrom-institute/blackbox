@@ -267,7 +267,7 @@ impl Shipper {
 
             let mut shipped_bytes = 0u64;
             let mut confirmed_tail = tail;
-            for batch in records.chunks(MAX_BATCH_RECORDS) {
+            for batch in size_bounded_batches(&records) {
                 let intended_tail = batch_end_offset(batch);
                 match self.client.ingest(batch.to_vec()).await {
                     Ok(receipt) => {
@@ -345,6 +345,43 @@ impl Shipper {
         tracing::debug!(adopted, "resynced stream cursors from server");
         Ok(())
     }
+}
+
+/// The server's HTTP body cap is 2 MiB (axum's default on the blackboxd
+/// corpus role; pinned `MAX_HTTP_BODY_BYTES` on the standalone service), and
+/// a full 256-record batch of near-`MAX_RECORD_BYTES` increments is two
+/// orders of magnitude over it. Batches are therefore bounded by cumulative
+/// encoded size as well as record count, with headroom for the request
+/// envelope and separators. Surfaced by the first live catch-up: large
+/// session files 413'd until this cap existed.
+const MAX_BATCH_BYTES: usize = 1_500_000;
+
+/// Split ordered records into contiguous batches that respect both the
+/// server's `MAX_INGEST_BATCH` record count and the HTTP body budget. A
+/// single record larger than the budget still gets its own batch (the
+/// per-record `MAX_RECORD_BYTES` cap keeps it under the server body limit).
+fn size_bounded_batches(
+    records: &[bro_capabilities::RecordEnvelope],
+) -> Vec<&[bro_capabilities::RecordEnvelope]> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (index, record) in records.iter().enumerate() {
+        let encoded = serde_json::to_vec(record)
+            .map(|body| body.len())
+            .unwrap_or(MAX_BATCH_BYTES);
+        let count = index - start;
+        if count > 0 && (count >= MAX_BATCH_RECORDS || bytes + encoded > MAX_BATCH_BYTES) {
+            batches.push(&records[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += encoded;
+    }
+    if start < records.len() {
+        batches.push(&records[start..]);
+    }
+    batches
 }
 
 /// Extract the highest `byte_end` in a batch (the batch tiles one stream
@@ -436,5 +473,61 @@ fn source_label(source: TranscriptSource) -> String {
         // Gemini and harness sources are out of scope for the v1 inline
         // increment contract; discovery never produces them.
         other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn record_with_payload(index: usize, payload_bytes: usize) -> bro_capabilities::RecordEnvelope {
+        bro_capabilities::RecordEnvelope {
+            record_id: format!("r-{index}"),
+            producer: "collector:test".into(),
+            cursor: (index + 1).to_string(),
+            kind: bro_capabilities::TRANSCRIPT_INCREMENT_KIND.into(),
+            occurred_at: None,
+            subject: None,
+            attributes: BTreeMap::new(),
+            payload: serde_json::json!({
+                "byte_end": (index as u64 + 1) * 10,
+                "bytes_b64": "x".repeat(payload_bytes),
+            }),
+        }
+    }
+
+    #[test]
+    fn batches_respect_count_and_body_budget_and_preserve_order() {
+        // 600KB-encoded records: three would exceed the 1.5MB budget, so
+        // batches must hold at most two.
+        let records: Vec<_> = (0..5).map(|i| record_with_payload(i, 600_000)).collect();
+        let batches = size_bounded_batches(&records);
+        assert!(batches.iter().all(|batch| {
+            batch.len() <= MAX_BATCH_RECORDS
+                && batch
+                    .iter()
+                    .map(|r| serde_json::to_vec(r).unwrap().len())
+                    .sum::<usize>()
+                    <= MAX_BATCH_BYTES
+        }));
+        let flattened: Vec<_> = batches.iter().flat_map(|b| b.iter()).collect();
+        assert_eq!(flattened.len(), records.len());
+        assert!(
+            flattened
+                .iter()
+                .zip(&records)
+                .all(|(a, b)| a.record_id == b.record_id)
+        );
+
+        // Tiny records fall back to the count cap.
+        let tiny: Vec<_> = (0..300).map(|i| record_with_payload(i, 16)).collect();
+        let tiny_batches = size_bounded_batches(&tiny);
+        assert_eq!(tiny_batches[0].len(), MAX_BATCH_RECORDS);
+        assert_eq!(tiny_batches.len(), 2);
+
+        // A single oversized record still ships alone rather than stalling.
+        let big = vec![record_with_payload(0, MAX_BATCH_BYTES + 10)];
+        assert_eq!(size_bounded_batches(&big).len(), 1);
     }
 }
