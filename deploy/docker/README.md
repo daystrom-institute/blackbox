@@ -102,7 +102,7 @@ image's `blackbox` user) or set `fsGroup: 10001`.
 
 | Service | Mount point | State env |
 |---|---|---|
-| blackboxd | `/var/lib/blackbox` | `BLACKBOX_STATE_DIR=/var/lib/blackbox/state` (image default). Derived stores (`BLACKBOX_KNOWLEDGE_PATH`, `BLACKBOX_THREADS_PATH`, `TRANSCRIPT_SEARCH_INDEX_PATH`, ...) default under it; override individually only if you split volumes. |
+| blackboxd | `/var/lib/blackbox` | `BLACKBOX_STATE_DIR=/var/lib/blackbox/state` (image default). Store paths (`BLACKBOX_KNOWLEDGE_PATH`, `BLACKBOX_THREADS_PATH`, ...) default under it. The tantivy index does NOT: `TRANSCRIPT_SEARCH_INDEX_PATH` defaults to the XDG data dir (the container's ephemeral overlay), so the manifest MUST pin it onto the volume (e.g. `/var/lib/blackbox/state/index`) or every pod roll discards the index. |
 | blackopsd | `/var/lib/blackopsd` | `BLACKOPSD_STATE_DIR=/var/lib/blackopsd/state` (image default). |
 
 ### Service token (mounted Secret)
