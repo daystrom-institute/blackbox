@@ -115,7 +115,19 @@ impl RemoteSourceConnector for GitConnector {
         let (changes, degraded, is_full_walk) = match &cursor {
             Some(ChangeCursor(sha)) if object_exists(root, sha).await => {
                 let diff = diff_name_status(root, sha, &target_sha).await?;
-                (parse_name_status(&diff, &target_sha)?, false, false)
+                let blobs = blob_paths(root, &target_sha).await?;
+                let changes = parse_name_status(&diff, &target_sha)?
+                    .into_iter()
+                    // Deletes stay: the path is absent from the target tree
+                    // by definition, and a delete of a never-materialized
+                    // gitlink no-ops at the manifest. Everything else must
+                    // be a real blob (see blob_paths).
+                    .filter(|change| {
+                        matches!(change.kind, RemoteChangeKind::Deleted)
+                            || blobs.contains(&change.entry.path)
+                    })
+                    .collect();
+                (changes, false, false)
             }
             Some(_) => (full_walk_changes(root, &target_sha).await?, true, true),
             None => (full_walk_changes(root, &target_sha).await?, false, true),
@@ -329,13 +341,38 @@ async fn diff_name_status(root: &Path, from: &str, to: &str) -> Result<String> {
     .await
 }
 
+/// Paths that are real blobs at `sha`. Filters out gitlink (submodule)
+/// entries - mode 160000, type `commit` - which `--name-only` and
+/// name-status listings surface like files but which have no readable
+/// content in the checkout (the working-tree path is a directory).
+/// Submodules are deliberately not materialized: their content belongs to
+/// a different repository, mountable as its own mount.
+async fn blob_paths(root: &Path, sha: &str) -> Result<HashSet<String>> {
+    let output = run_git(&["ls-tree", "-r", sha], Some(root)).await?;
+    let mut paths = HashSet::new();
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut fields = meta.split_whitespace();
+        let _mode = fields.next();
+        if fields.next() == Some("blob") {
+            paths.insert(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
 async fn full_walk_changes(root: &Path, target_sha: &str) -> Result<Vec<RemoteChange>> {
-    let output = run_git(&["ls-tree", "-r", "--name-only", target_sha], Some(root)).await?;
-    Ok(output
-        .lines()
-        .filter(|line| !line.is_empty())
+    let mut paths: Vec<String> = blob_paths(root, target_sha).await?.into_iter().collect();
+    paths.sort();
+    Ok(paths
+        .into_iter()
         .map(|path| RemoteChange {
-            entry: make_entry(path, target_sha),
+            entry: make_entry(&path, target_sha),
             kind: RemoteChangeKind::Added,
         })
         .collect())
@@ -655,6 +692,53 @@ mod tests {
             }
         );
         assert_eq!(changes[3].entry.path, "new.txt");
+    }
+
+    #[tokio::test]
+    async fn submodule_gitlinks_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let sub = base.join("sub");
+        init_fixture_repo(&sub, "main");
+        write_and_commit(&sub, "inner.txt", "inner\n", "add inner");
+
+        let remote = base.join("remote");
+        init_fixture_repo(&remote, "main");
+        write_and_commit(&remote, "a.txt", "hello\n", "add a");
+        // Gitlink entry: `ls-tree` reports it mode 160000 / type commit, and
+        // the checked-out path is a directory - the exact shape that made
+        // bulk materialize fail before the blob filter.
+        run_fixture(
+            &remote,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.to_str().unwrap(),
+                "vendored",
+            ],
+        );
+        run_fixture(&remote, &["commit", "-m", "add submodule"]);
+
+        let root = base.join("mount-root");
+        let manifest_path = base.join("manifest.json");
+        let mount = mount(file_url(&remote), &root);
+        let connector = GitConnector::new();
+
+        let summary = sync_mount(&connector, &mount, &manifest_path, None)
+            .await
+            .unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        // a.txt + .gitmodules are blobs; the `vendored` gitlink is not.
+        assert_eq!(summary.fetched, 2);
+        let manifest = crate::manifest::Manifest::open(&manifest_path).unwrap();
+        assert!(
+            manifest
+                .entries()
+                .all(|e| !e.logical_path.starts_with("vendored")),
+            "gitlink path must not enter the manifest"
+        );
     }
 
     #[tokio::test]

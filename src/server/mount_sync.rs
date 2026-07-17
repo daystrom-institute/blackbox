@@ -84,7 +84,7 @@ async fn run_pass(state: &Arc<SharedState>) {
                 {
                     tracing::debug!(mount_id = %mount_id, "periodic mount sync skipped: already in flight");
                 } else {
-                    tracing::warn!(mount_id = %mount_id, error = %err, "periodic mount sync failed");
+                    tracing::warn!(mount_id = %mount_id, error = format_args!("{err:#}"), "periodic mount sync failed");
                 }
             }
         }

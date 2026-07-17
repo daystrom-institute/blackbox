@@ -44,6 +44,12 @@ pub struct MountRecord {
     pub created_at: String,
     #[serde(default)]
     pub last_sync: Option<SyncSummary>,
+    /// Full error chain of the most recent FAILED sync, cleared on the next
+    /// success. A failed sync does not update `last_sync`, so without this
+    /// field a mount whose syncs always fail is indistinguishable from one
+    /// that never synced - silence is never a verdict.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// Deterministic id for a (connector kind, remote scope) pair. `scope`
@@ -179,6 +185,7 @@ mod tests {
             policy: MountPolicy::default(),
             created_at: "2026-07-16T00:00:00Z".to_string(),
             last_sync: None,
+            last_error: None,
         }
     }
 

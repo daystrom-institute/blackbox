@@ -254,6 +254,7 @@ pub(crate) async fn register_mount(
         policy,
         created_at: crate::util::now_iso(),
         last_sync: None,
+        last_error: None,
     };
     {
         let mut mounts = state.mounts.write();
@@ -314,13 +315,31 @@ pub(crate) async fn sync_one_mount(
     let manifest = manifest_path(&state.store_dir, mount_id);
     let cursor = if full { None } else { record.cursor.clone() };
 
-    let summary = run_sync_on_blocking_pool(connector, mount_config, manifest, cursor).await?;
+    let summary = match run_sync_on_blocking_pool(connector, mount_config, manifest, cursor).await {
+        Ok(summary) => summary,
+        Err(err) => {
+            // Stamp the failure on the record: a failed sync does not update
+            // last_sync, so without last_error a chronically failing mount
+            // is indistinguishable in bbox_mount_list from one that never
+            // synced.
+            {
+                let mut mounts = state.mounts.write();
+                if let Some(mut current) = mounts.get(mount_id).cloned() {
+                    current.last_error = Some(format!("{err:#}"));
+                    mounts.upsert(current);
+                }
+            }
+            let _ = state.persist_mounts_durable().await;
+            return Err(err);
+        }
+    };
 
     {
         let mut mounts = state.mounts.write();
         if let Some(mut current) = mounts.get(mount_id).cloned() {
             current.cursor = summary.next_cursor.clone();
             current.last_sync = Some(summary.clone());
+            current.last_error = None;
             mounts.upsert(current);
         }
     }
