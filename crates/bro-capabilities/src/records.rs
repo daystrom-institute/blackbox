@@ -270,7 +270,17 @@ pub fn inline_transcript_increments(
                 "decoded byte length must equal byte_end - byte_start",
             ));
         }
-        if bytes.last() != Some(&b'\n') {
+        // A single provider line can exceed MAX_RECORD_BYTES (large tool
+        // results); such a line ships as several byte-contiguous chunks where
+        // only the FINAL chunk ends the line. Non-final chunks declare
+        // line_complete=false explicitly; the default (absent/true) keeps the
+        // strict ends-on-newline invariant that guards torn-tail shipping.
+        let line_complete = record
+            .payload
+            .get("line_complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if line_complete && bytes.last() != Some(&b'\n') {
             return Err(invalid_transcript_increment(
                 "increment must end on a complete line",
             ));
@@ -305,9 +315,7 @@ fn required_payload_u64(record: &RecordEnvelope, key: &str) -> CapabilityResult<
         .payload
         .get(key)
         .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            invalid_transcript_increment(format!("{key} is required and must be a u64"))
-        })
+        .ok_or_else(|| invalid_transcript_increment(format!("{key} is required and must be a u64")))
 }
 
 fn base64_decode(encoded: &str) -> CapabilityResult<Vec<u8>> {
@@ -493,9 +501,19 @@ mod tests {
         torn_tail.payload = serde_json::json!({
             "byte_start": 0,
             "byte_end": 4,
-            "bytes_b64": torn_bytes,
+            "bytes_b64": torn_bytes.clone(),
         });
-        assert!(inline_transcript_increments(&[torn_tail]).is_err());
+        assert!(inline_transcript_increments(&[torn_tail.clone()]).is_err());
+
+        // The same bytes pass as an explicit continuation chunk of an
+        // oversized line; the default (absent/true) stays strict.
+        torn_tail.payload = serde_json::json!({
+            "byte_start": 0,
+            "byte_end": 4,
+            "bytes_b64": torn_bytes,
+            "line_complete": false,
+        });
+        assert!(inline_transcript_increments(&[torn_tail]).is_ok());
     }
 
     #[test]

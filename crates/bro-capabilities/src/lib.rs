@@ -25,9 +25,9 @@ pub use projected::{BboxToolCapability, ProjectedToolCall, ProjectedToolOutcome,
 pub use records::{
     COLLECTOR_PRODUCER_PREFIX, INLINE_TRANSCRIPT_SOURCES, InlineTranscriptIncrement,
     MAX_RECORD_BYTES, RECORD_ARCHIVE_SNAPSHOT_VERSION, RecordArchiveSnapshot, RecordEnvelope,
-    RecordIngestCapability, RecordIngestReceipt, RecordIngestRequest,
-    TRANSCRIPT_INCREMENT_KIND, TranscriptRecordTarget, inline_transcript_increments,
-    inline_transcript_record_id, transcript_record_targets,
+    RecordIngestCapability, RecordIngestReceipt, RecordIngestRequest, TRANSCRIPT_INCREMENT_KIND,
+    TranscriptRecordTarget, inline_transcript_increments, inline_transcript_record_id,
+    transcript_record_targets,
 };
 
 pub type CapabilityResult<T> = Result<T, BroError>;

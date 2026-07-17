@@ -65,31 +65,10 @@ impl StreamKey {
     }
 }
 
-#[derive(Debug)]
-pub enum BuildError {
-    /// A single line is too large to fit one record without splitting it (which
-    /// would break the ends-on-newline invariant). The stream is skipped.
-    OversizedLine { byte_start: u64, byte_end: u64 },
-}
-
-impl std::fmt::Display for BuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BuildError::OversizedLine {
-                byte_start,
-                byte_end,
-            } => write!(
-                f,
-                "single transcript line at bytes {byte_start}..{byte_end} exceeds MAX_RECORD_BYTES"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BuildError {}
-
 /// Split `data` (which MUST end on `\n`) into a contiguous ascending sequence
-/// of increment records starting at file offset `base_offset`.
+/// of increment records starting at file offset `base_offset`. Oversized
+/// single lines split into continuation chunks (`line_complete=false` on all
+/// but the last), so building never fails.
 ///
 /// `next_cursor` allocates the monotonic per-producer record cursor stamped
 /// into each record's `cursor` field.
@@ -99,7 +78,7 @@ pub fn build_increment_records(
     base_offset: u64,
     data: &[u8],
     mut next_cursor: impl FnMut() -> u64,
-) -> Result<Vec<RecordEnvelope>, BuildError> {
+) -> Vec<RecordEnvelope> {
     debug_assert!(
         data.last() == Some(&b'\n'),
         "build_increment_records requires a complete-line buffer"
@@ -114,18 +93,41 @@ pub fn build_increment_records(
         let byte_end = base_offset + chunk_end as u64;
 
         let record = increment_record(producer, key, byte_start, byte_end, chunk, next_cursor());
-        // Guard the single-line-too-large case: only possible when the chunk is
-        // exactly one line (otherwise next_chunk_end would have split earlier).
         if compact_len(&record) > MAX_RECORD_BYTES {
-            return Err(BuildError::OversizedLine {
-                byte_start,
-                byte_end,
-            });
+            // A single line too large for one record (only possible when the
+            // chunk is exactly one line; next_chunk_end would have split
+            // earlier otherwise). Ship it as byte-contiguous sub-chunks where
+            // every chunk but the last declares line_complete=false; the
+            // server relaxes the ends-on-newline check for exactly those.
+            // Real transcripts hit this on large tool results (>1MB lines),
+            // and skipping would wedge the stream at this line forever.
+            let mut sub_start = chunk_start;
+            while sub_start < chunk_end {
+                let sub_end = (sub_start + TARGET_RAW_CHUNK).min(chunk_end);
+                let mut record = increment_record(
+                    producer,
+                    key,
+                    base_offset + sub_start as u64,
+                    base_offset + sub_end as u64,
+                    &data[sub_start..sub_end],
+                    next_cursor(),
+                );
+                if sub_end < chunk_end {
+                    let payload = record
+                        .payload
+                        .as_object_mut()
+                        .expect("increment payload is always an object");
+                    payload.insert("line_complete".into(), serde_json::Value::Bool(false));
+                }
+                records.push(record);
+                sub_start = sub_end;
+            }
+        } else {
+            records.push(record);
         }
-        records.push(record);
         chunk_start = chunk_end;
     }
-    Ok(records)
+    records
 }
 
 /// Find the end offset of the next chunk: accumulate whole lines until adding
@@ -256,8 +258,7 @@ mod tests {
         let records = build_increment_records("collector:host-b1", &key(), 0, data, || {
             cursor += 1;
             cursor
-        })
-        .unwrap();
+        });
         // Small input -> a single contiguous record covering the whole buffer.
         assert_eq!(records.len(), 1);
         let increments = inline_transcript_increments(&records).unwrap();
@@ -284,8 +285,7 @@ mod tests {
         let records = build_increment_records("collector:h", &key(), 0, &data, || {
             cursor += 1;
             cursor
-        })
-        .unwrap();
+        });
         assert!(records.len() > 1, "large buffer must split into chunks");
 
         let increments = inline_transcript_increments(&records).unwrap();
@@ -301,12 +301,44 @@ mod tests {
     }
 
     #[test]
-    fn oversized_single_line_is_reported_not_shipped() {
-        // One line whose base64 + envelope exceeds MAX_RECORD_BYTES.
+    fn oversized_single_line_splits_into_continuation_chunks() {
+        // One line whose base64 + envelope exceeds MAX_RECORD_BYTES: it must
+        // split into byte-contiguous sub-chunks where only the last ends the
+        // line, every record fits the cap, and the server contract accepts
+        // the sequence (line_complete=false relaxes the newline rule).
         let mut data = vec![b'x'; MAX_RECORD_BYTES];
         data.push(b'\n');
-        let err = build_increment_records("collector:h", &key(), 0, &data, || 1).unwrap_err();
-        assert!(matches!(err, BuildError::OversizedLine { .. }));
+        let mut cursor = 0u64;
+        let records = build_increment_records("collector:h", &key(), 0, &data, || {
+            cursor += 1;
+            cursor
+        });
+        assert!(records.len() > 1, "oversized line must split");
+        for record in &records {
+            assert!(serde_json::to_vec(record).unwrap().len() <= MAX_RECORD_BYTES);
+        }
+        for (index, record) in records.iter().enumerate() {
+            let complete = record
+                .payload
+                .get("line_complete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            assert_eq!(complete, index == records.len() - 1);
+        }
+
+        let increments = inline_transcript_increments(&records).unwrap();
+        assert_eq!(increments.first().unwrap().byte_start, 0);
+        assert_eq!(increments.last().unwrap().byte_end, data.len() as u64);
+        for pair in increments.windows(2) {
+            assert_eq!(pair[0].byte_end, pair[1].byte_start);
+        }
+        assert_eq!(*increments.last().unwrap().bytes.last().unwrap(), b'\n');
+
+        // A truncated sequence (missing the final line-completing chunk) is
+        // still valid at the wire layer; byte contiguity carries recovery
+        // across ticks, and the archive tail reads as torn until completed.
+        let partial = inline_transcript_increments(&records[..records.len() - 1]);
+        assert!(partial.is_ok());
     }
 
     #[test]

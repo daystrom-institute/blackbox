@@ -258,12 +258,9 @@ impl Shipper {
             }
 
             let records =
-                match build_increment_records(&self.producer, &discovered.key, tail, &data, || {
+                build_increment_records(&self.producer, &discovered.key, tail, &data, || {
                     self.cursors.next_record_cursor()
-                }) {
-                    Ok(records) => records,
-                    Err(error) => return Err(ShipError::Skipped(error.to_string())),
-                };
+                });
 
             let mut shipped_bytes = 0u64;
             let mut confirmed_tail = tail;
