@@ -339,6 +339,26 @@ pub(crate) async fn sync_one_mount(
         state
             .reindex_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // A mount's repo-owned `.bbox` state (knowledge, gaps) changes ONLY
+        // through sync passes - there is no fs watcher on mount roots - so a
+        // changed sync must also refresh the repo-owned stores the way the
+        // watcher does for local projects. No-op when the mount predates its
+        // project registration (project_id None: registration below runs the
+        // same refresh itself).
+        let has_project = {
+            let mounts = state.mounts.read();
+            mounts
+                .get(mount_id)
+                .map(|record| record.project_id.is_some())
+                .unwrap_or(false)
+        };
+        if has_project {
+            crate::server::routes::sync_kb_project_roots(state);
+            crate::server::routes::enqueue_project_knowledge_embeds(
+                state,
+                &record.materialization_root,
+            );
+        }
     }
 
     Ok(summary)
@@ -418,6 +438,13 @@ pub(crate) async fn run_sync_and_register_project(
         }
     }
     state.persist_mounts_durable().await?;
+
+    // Mirror bbox_project_register's post-registration repo-owned load
+    // (src/tools/projects.rs): pull the mount's committed `.bbox/knowledge/`
+    // into the query surface and enqueue its embeds, so a mounted repo's
+    // durable knowledge is searchable without a daemon restart.
+    crate::server::routes::sync_kb_project_roots(state);
+    crate::server::routes::enqueue_project_knowledge_embeds(state, &project_record.canonical_path);
 
     Ok(summary)
 }

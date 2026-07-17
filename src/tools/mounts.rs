@@ -305,6 +305,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mount_registration_loads_committed_repo_owned_knowledge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_fixture_repo(tmp.path());
+
+        // A committed project entry as it lands in git (project omitted on
+        // disk), mirroring projects.rs's
+        // register_loads_and_counts_committed_project_knowledge.
+        let entry = crate::knowledge::KnowledgeEntry {
+            id: "m0000001".into(),
+            title: "mounted repo rule".into(),
+            content: "committed convention travels with the mount".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: crate::knowledge::Category::Convention,
+            scope: crate::knowledge::Scope::Project,
+            project: None,
+            providers: vec![],
+            priority: crate::knowledge::Priority::Standard,
+            weight: 100,
+            status: crate::knowledge::Status::Active,
+            approval: crate::knowledge::Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: vec![],
+            rationale: None,
+            expires_at: None,
+            source: "user".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        std::fs::create_dir_all(repo.join(".bbox").join("knowledge")).unwrap();
+        std::fs::write(
+            repo.join(".bbox").join("knowledge").join("m0000001.json"),
+            serde_json::to_string(&entry).unwrap(),
+        )
+        .unwrap();
+        run_git(&repo, &["add", ".bbox"]);
+        run_git(&repo, &["commit", "-m", "add repo-owned knowledge"]);
+
+        let server = test_server(&tmp);
+        let register = server
+            .bbox_mount_register(Parameters(MountRegisterParams {
+                connector: "git".to_string(),
+                scope: file_url(&repo),
+                path: None,
+                policy: None,
+                project_alias: None,
+            }))
+            .await;
+        assert_ne!(register.is_error, Some(true));
+        let mount_id = result_json(&register)["mount_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let _ = wait_for_mount(&server, &mount_id, |m| !m["project_id"].is_null()).await;
+        assert!(
+            server.state.kb.read().entry("m0000001").is_some(),
+            "mounted repo's committed .bbox/knowledge entry should load once the \
+             mount's project registers, without a daemon restart"
+        );
+    }
+
+    #[tokio::test]
     async fn register_syncs_in_background_and_registers_project_with_mount_source() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_fixture_repo(tmp.path());
