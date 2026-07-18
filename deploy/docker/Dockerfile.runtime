@@ -1,0 +1,94 @@
+# syntax=docker/dockerfile:1.7
+#
+# Runtime-only image assembly for prebuilt Blackbox binaries.
+#
+# This is the runtime half of deploy/docker/Dockerfile, split out so build
+# pipelines that compile the workspace OUTSIDE docker (native builders, warm
+# build caches, CI clones) can assemble the same runtime images from a small
+# context without re-running the source build inside the image build. The
+# multi-stage Dockerfile remains the self-contained path; keep the runtime
+# stages of both files in sync.
+#
+# Expected build context layout (caller-assembled):
+#
+#   out/blackboxd                 release binary, linux target matching the base
+#   out/blackopsd                 release binary
+#   system-defaults/memories/     system memory defaults (required at boot)
+#
+# Build:
+#   docker build -f Dockerfile.runtime --target blackboxd  -t blackbox-blackboxd:<tag>  <context>
+#   docker build -f Dockerfile.runtime --target blackopsd  -t blackbox-blackopsd:<tag>  <context>
+#
+# The binaries must be built for a glibc no newer than this base image
+# (bookworm = glibc 2.36); build on a bookworm-based builder.
+
+# ---------------------------------------------------------------------------
+# Shared runtime base: slim Debian with the runtime deps both services need.
+# Mirrors deploy/docker/Dockerfile `runtime-base` exactly: git is a RUNTIME
+# dependency (corpus indexer + provenance exporter shell out), ca-certificates
+# for TLS egress (rustls-native-certs), openssh-client for ssh-auth git
+# connector mounts.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime-base
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        ca-certificates \
+        openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root runtime user. Fixed uid/gid so mounted volume ownership is
+# predictable in the k8s manifests (chown the PVC / set fsGroup to 10001).
+RUN groupadd --gid 10001 blackbox \
+    && useradd --uid 10001 --gid 10001 --home-dir /home/blackbox --create-home blackbox
+
+# ---------------------------------------------------------------------------
+# blackboxd (corpus role) runtime image. Port 7264.
+# ---------------------------------------------------------------------------
+FROM runtime-base AS blackboxd
+COPY out/blackboxd /usr/local/bin/blackboxd
+
+# System memory defaults are REQUIRED at boot; ship them at the
+# installed-layout path so tier-3 resolution finds them (see the multi-stage
+# Dockerfile for the resolution order).
+COPY system-defaults/memories /usr/local/share/blackbox/memories
+
+ENV HOME=/home/blackbox \
+    BLACKBOX_STATE_DIR=/var/lib/blackbox/state \
+    BLACKBOX_RUNTIME_ROLE=corpus \
+    BBOX_PORT=7264
+
+# Image default stays the safe loopback bind; the deployment sets the
+# non-loopback bind together with its explicit opt-in env.
+ENV BLACKBOX_SERVICE_TOKEN_FILE=/var/lib/blackbox/state/service.token
+
+USER blackbox
+WORKDIR /var/lib/blackbox
+VOLUME ["/var/lib/blackbox"]
+EXPOSE 7264
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/7264 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && grep -q "200 OK" <&3' || exit 1
+
+ENTRYPOINT ["/usr/local/bin/blackboxd"]
+
+# ---------------------------------------------------------------------------
+# blackopsd runtime image. Port 7266.
+# ---------------------------------------------------------------------------
+FROM runtime-base AS blackopsd
+COPY out/blackopsd /usr/local/bin/blackopsd
+
+ENV HOME=/home/blackbox \
+    BLACKOPSD_STATE_DIR=/var/lib/blackopsd/state
+
+ENV BLACKBOX_SERVICE_TOKEN_FILE=/var/lib/blackopsd/service.token
+
+USER blackbox
+WORKDIR /var/lib/blackopsd
+VOLUME ["/var/lib/blackopsd"]
+EXPOSE 7266
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/7266 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && grep -q "200 OK" <&3' || exit 1
+
+ENTRYPOINT ["/usr/local/bin/blackopsd"]
