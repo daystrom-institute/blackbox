@@ -22,12 +22,15 @@
 # (crates/blackopsd) for the native container target in one pass.
 # ---------------------------------------------------------------------------
 #
-# Debian bookworm is chosen deliberately so the builder glibc matches the
-# bookworm-slim runtime glibc (2.36). Rust must be >= 1.88 for the let-chains
-# and Rust 2024 edition this workspace uses; `rust:1-bookworm` floats to the
-# latest stable 1.x to avoid staleness. Pin to an exact `rust:1.NN-bookworm`
-# tag if you need bit-reproducible builds.
-FROM rust:1-bookworm AS builder
+# Debian trixie is chosen deliberately so the builder glibc matches the
+# trixie-slim runtime glibc (2.41). Trixie (not bookworm) is load-bearing for
+# git at RUNTIME: the provenance exporter uses `git notes append --separator`
+# (git >= 2.44), bookworm ships 2.39, and bookworm-backports does not carry
+# git. Rust must be >= 1.88 for the let-chains and Rust 2024 edition this
+# workspace uses; `rust:1-trixie` floats to the latest stable 1.x to avoid
+# staleness. Pin to an exact `rust:1.NN-trixie` tag if you need
+# bit-reproducible builds.
+FROM rust:1-trixie AS builder
 
 # The daemon links bro-harness -> bro-code-mode -> the `v8` crate (rusty_v8),
 # whose build script downloads a PREBUILT static librusty_v8 per target from
@@ -85,18 +88,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ca-certificates is required for the outbound HTTPS call to the Voyage
 # embedding API (and any other TLS egress). Both binaries use rustls, which
 # reads the system trust store via rustls-native-certs.
-FROM debian:bookworm-slim AS runtime-base
-# git comes from bookworm-backports: the provenance exporter uses
-# `git notes append --separator`, which needs git >= 2.44; bookworm's own
-# git 2.39 fails that call at runtime (caught by the corpus-core git-notes
-# round-trip test on the first Linux CI run).
-RUN echo 'deb http://deb.debian.org/debian bookworm-backports main' \
-      > /etc/apt/sources.list.d/backports.list \
-    && apt-get update \
+# trixie-slim, not bookworm-slim: the provenance exporter uses
+# `git notes append --separator`, which needs git >= 2.44. Bookworm ships
+# 2.39 (caught failing at runtime by the corpus-core git-notes round-trip
+# test on the first Linux CI run) and bookworm-backports does not carry git;
+# trixie clears 2.44 natively. Must stay in glibc lockstep with the builder
+# stage above (trixie = 2.41 on both sides).
+FROM debian:trixie-slim AS runtime-base
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        git \
         ca-certificates \
         openssh-client \
-    && apt-get install -y --no-install-recommends -t bookworm-backports git \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user. Fixed uid/gid so mounted volume ownership is

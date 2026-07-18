@@ -20,7 +20,7 @@
 #   docker build -f Dockerfile.runtime --target blackopsd  -t blackbox-blackopsd:<tag>  <context>
 #
 # The binaries must be built for a glibc no newer than this base image
-# (bookworm = glibc 2.36); build on a bookworm-based builder.
+# (trixie = glibc 2.41); build on a trixie-based builder.
 
 # ---------------------------------------------------------------------------
 # Shared runtime base: slim Debian with the runtime deps both services need.
@@ -29,18 +29,18 @@
 # for TLS egress (rustls-native-certs), openssh-client for ssh-auth git
 # connector mounts.
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime-base
-# git comes from bookworm-backports: the provenance exporter uses
-# `git notes append --separator`, which needs git >= 2.44; bookworm's own
-# git 2.39 fails that call at runtime (caught by the corpus-core git-notes
-# round-trip test on the first Linux CI run).
-RUN echo 'deb http://deb.debian.org/debian bookworm-backports main' \
-      > /etc/apt/sources.list.d/backports.list \
-    && apt-get update \
+# trixie-slim, not bookworm-slim: the provenance exporter uses
+# `git notes append --separator`, which needs git >= 2.44. Bookworm ships
+# 2.39 (caught failing at runtime by the corpus-core git-notes round-trip
+# test on the first Linux CI run) and bookworm-backports does not carry git;
+# trixie clears 2.44 natively. Must stay in glibc lockstep with the builder
+# (trixie = 2.41 on both sides).
+FROM debian:trixie-slim AS runtime-base
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        git \
         ca-certificates \
         openssh-client \
-    && apt-get install -y --no-install-recommends -t bookworm-backports git \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user. Fixed uid/gid so mounted volume ownership is
