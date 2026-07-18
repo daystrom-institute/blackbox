@@ -1,12 +1,26 @@
-# bbox-connectors - remote source connectors (stage 1: library only)
+# bbox-connectors - connector observation and source projection contracts
 
 Pluggable adapters onto remote file/document stores, materialized into a
 local root and then indexed by the existing (unmodified) pipeline. Design
 authority: `design/connectors/remote-source-connectors.md`. This crate is
 stage 1 of that design: the trait, the sync driver, the manifest/policy/
 materialization machinery, the `MountRecord` store, and the `git`
-connector. No daemon wiring, MCP tools (`bbox_mount_*`), or poller
-integration yet - that is stage 2.
+connector. The crate also owns the API-dataset observation and deterministic
+`GraphProjection` boundary used to build connector-managed reflective graphs.
+No daemon wiring, MCP tools (`bbox_mount_*`), or poller integration yet.
+
+## Observation and projection boundary
+
+`ObservationBatch` is the accepted, replayable boundary between remote
+observation and graph projection. It carries stable remote identities,
+versions, typed payloads or deletion markers, reconciliation mode, and a
+proposed named-checkpoint transition. It never carries credentials.
+
+`GraphProjection` is synchronous and pure: the same batch, prior accepted
+snapshot, schema, and projection version must produce the same `GraphDelta`.
+It must not contact a remote API, read ambient state, persist checkpoints, or
+mutate the prior snapshot. `SourceProjectionStore` owns validation and the
+atomic graph-plus-checkpoint acceptance step.
 
 ## Core invariant: read-only
 

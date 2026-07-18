@@ -12,6 +12,7 @@
 pub mod connector;
 pub mod driver;
 pub mod git_connector;
+pub mod graph_projection;
 pub mod manifest;
 pub mod materialize;
 pub mod mount_record;
@@ -21,6 +22,9 @@ pub mod types;
 pub use connector::{BulkMaterializeOutcome, RemoteSourceConnector};
 pub use driver::{SyncSummary, sync_mount};
 pub use git_connector::GitConnector;
+pub use graph_projection::{
+    GraphProjection, ObservationBatch, ObservationRecord, ProjectionContext,
+};
 pub use manifest::{EntryState, Manifest, ManifestEntry};
 pub use mount_record::{
     MountRecord, MountStore, compute_mount_id, default_materialization_root,

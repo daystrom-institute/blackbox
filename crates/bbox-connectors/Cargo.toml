@@ -19,6 +19,7 @@ hex = "0.4"
 unicode-normalization = "0.1"
 glob = "0.3"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-project-graph = { path = "../bbox-project-graph" }
 bbox-util = { path = "../bbox-util" }
 bbox-stores = { path = "../bbox-stores" }
 

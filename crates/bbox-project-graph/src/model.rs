@@ -31,6 +31,7 @@ pub enum GraphScope {
 #[serde(rename_all = "snake_case")]
 pub enum GraphAuthority {
     Project,
+    Connector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -38,6 +39,7 @@ pub enum GraphAuthority {
 pub enum RetentionPolicy {
     ProjectOwned,
     LocalScratch,
+    ConnectorManaged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +117,7 @@ pub struct ProjectGraphEdge {
 pub enum GraphSource {
     Committed,
     LocalScratch,
+    ConnectorManaged,
 }
 
 impl GraphSource {
@@ -122,13 +125,15 @@ impl GraphSource {
         match self {
             Self::Committed => RetentionPolicy::ProjectOwned,
             Self::LocalScratch => RetentionPolicy::LocalScratch,
+            Self::ConnectorManaged => RetentionPolicy::ConnectorManaged,
         }
     }
 
-    pub fn relative_root(self) -> &'static str {
+    pub fn relative_root(self) -> Option<&'static str> {
         match self {
-            Self::Committed => ".bbox/graphs",
-            Self::LocalScratch => ".bbox/local/graphs",
+            Self::Committed => Some(".bbox/graphs"),
+            Self::LocalScratch => Some(".bbox/local/graphs"),
+            Self::ConnectorManaged => None,
         }
     }
 }
@@ -213,7 +218,7 @@ pub fn meta_schema_floor() -> MetaSchemaFloor {
     }
 }
 
-pub(crate) fn project_generation(
+pub fn build_generation(
     key: GraphKey,
     descriptor: GraphDescriptor,
     schema: GraphSchema,
@@ -471,6 +476,19 @@ impl ProjectGraphCatalog {
         &mut self,
         candidate: GraphGeneration,
     ) -> Result<Arc<GraphGeneration>, CatalogPublishError> {
+        if self.entries.keys().any(|key| {
+            key.scope_id == candidate.key.scope_id
+                && key.graph_id == candidate.key.graph_id
+                && key.source != candidate.key.source
+        }) {
+            return Err(CatalogPublishError {
+                code: "graph.ambiguous_source".into(),
+                message: format!(
+                    "graph `{}` already has an accepted generation from another authority source",
+                    candidate.key.graph_id
+                ),
+            });
+        }
         if let Some(current) = self.entries.get(&candidate.key) {
             if candidate.descriptor.generation < current.descriptor.generation {
                 return Err(CatalogPublishError {
@@ -511,17 +529,29 @@ impl ProjectGraphCatalog {
             graph_id: graph_id.to_string(),
             source: GraphSource::Committed,
         };
-        self.entries.get(&committed).cloned().or_else(|| {
-            include_local.then(|| {
+        self.entries
+            .get(&committed)
+            .cloned()
+            .or_else(|| {
                 self.entries
                     .get(&GraphKey {
                         scope_id: scope_id.to_string(),
                         graph_id: graph_id.to_string(),
-                        source: GraphSource::LocalScratch,
+                        source: GraphSource::ConnectorManaged,
                     })
                     .cloned()
-            })?
-        })
+            })
+            .or_else(|| {
+                include_local.then(|| {
+                    self.entries
+                        .get(&GraphKey {
+                            scope_id: scope_id.to_string(),
+                            graph_id: graph_id.to_string(),
+                            source: GraphSource::LocalScratch,
+                        })
+                        .cloned()
+                })?
+            })
     }
 
     pub fn remove(&mut self, key: &GraphKey) {
@@ -552,7 +582,9 @@ impl ProjectGraphCatalog {
     pub fn known_refs(&self, include_local: bool) -> Vec<EntityRef> {
         self.entries
             .values()
-            .filter(|generation| include_local || generation.key.source == GraphSource::Committed)
+            .filter(|generation| {
+                include_local || generation.key.source != GraphSource::LocalScratch
+            })
             .flat_map(|generation| generation.known_refs())
             .collect()
     }
@@ -560,7 +592,9 @@ impl ProjectGraphCatalog {
     pub fn vertex_count(&self, include_local: bool) -> usize {
         self.entries
             .values()
-            .filter(|generation| include_local || generation.key.source == GraphSource::Committed)
+            .filter(|generation| {
+                include_local || generation.key.source != GraphSource::LocalScratch
+            })
             .map(|generation| generation.vertices.len())
             .sum()
     }

@@ -11,8 +11,20 @@
   replacement. Invalid, rolled-back, or same-generation divergent candidates
   never replace the prior accepted generation.
 - The descriptor owns authority, schema compatibility, custody, and generation
-  metadata. M1 accepts project authority only. Connector projection authority,
-  checkpoint coupling, evidence endpoints, text/vector retrieval, and hosted
-  auth remain outside this crate.
+  metadata. Project authority is file-backed and tenant-owned. Connector
+  authority is accepted only through `SourceProjectionStore`, uses
+  connector-managed retention, and couples the validated graph delta and named
+  checkpoint transition in one atomic snapshot write.
+- Connector projections advance by exactly one generation, are idempotent only
+  for an exact replay of the most recently accepted batch, and fail closed on
+  checkpoint conflicts, schema rollback, connector identity changes, or
+  conflicting delta operations. The status view exposes accepted generation,
+  versions, observation freshness, and named checkpoints without credential
+  material.
+- Connector-managed storage is not a file-backed project graph root.
+  `ProjectGraphCatalog` can hold its accepted generations, but discovery under
+  `.bbox/graphs` and `.bbox/local/graphs` never synthesizes connector state.
+  Evidence endpoints, text/vector retrieval, and hosted auth remain outside
+  this crate.
 - Tests use canonicalized per-test roots and never read or write real HOME or
   XDG state.

@@ -4,8 +4,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    EdgeTypeDefinition, GraphDescriptor, GraphSchema, GraphSource, ProjectGraphEdge,
-    ProjectGraphVertex, RetentionPolicy, VertexTypeDefinition,
+    EdgeTypeDefinition, GraphAuthority, GraphDescriptor, GraphSchema, GraphSource,
+    ProjectGraphEdge, ProjectGraphVertex, RetentionPolicy, VertexTypeDefinition,
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -131,13 +131,59 @@ fn validate_descriptor(
             "generation must be positive",
         ));
     }
-    if descriptor.projection_version.is_some() || descriptor.source_connector.is_some() {
-        errors.push(ValidationError::new(
-            "descriptor.source_projection_deferred",
-            "graph.json",
-            None,
-            "projection_version and source_connector are unavailable for project-owned M1 graphs",
-        ));
+    match descriptor.authority {
+        GraphAuthority::Project => {
+            if source == GraphSource::ConnectorManaged {
+                errors.push(ValidationError::new(
+                    "descriptor.authority_source_mismatch",
+                    "graph.json",
+                    None,
+                    "project authority cannot use connector-managed storage",
+                ));
+            }
+            if descriptor.projection_version.is_some() || descriptor.source_connector.is_some() {
+                errors.push(ValidationError::new(
+                    "descriptor.project_projection_fields",
+                    "graph.json",
+                    None,
+                    "project-owned graphs cannot declare projection_version or source_connector",
+                ));
+            }
+        }
+        GraphAuthority::Connector => {
+            if source != GraphSource::ConnectorManaged {
+                errors.push(ValidationError::new(
+                    "descriptor.authority_source_mismatch",
+                    "graph.json",
+                    None,
+                    "connector authority requires connector-managed storage",
+                ));
+            }
+            if descriptor
+                .projection_version
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                errors.push(ValidationError::new(
+                    "descriptor.missing_projection_version",
+                    "graph.json",
+                    None,
+                    "connector-managed graphs require a non-empty projection_version",
+                ));
+            }
+            if descriptor
+                .source_connector
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                errors.push(ValidationError::new(
+                    "descriptor.missing_source_connector",
+                    "graph.json",
+                    None,
+                    "connector-managed graphs require a non-empty source_connector",
+                ));
+            }
+        }
     }
     let expected_retention = source.retention_policy();
     if descriptor.retention_policy != expected_retention {

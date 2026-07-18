@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     GraphDescriptor, GraphGeneration, GraphKey, GraphSchema, GraphSource, ProjectGraphEdge,
-    ProjectGraphVertex, ValidationError, project_generation, validate_graph, validate_graph_id,
+    ProjectGraphVertex, ValidationError, build_generation, validate_graph, validate_graph_id,
 };
 
 const GRAPH_FILE: &str = "graph.json";
@@ -153,7 +153,7 @@ pub fn load_graph(scope_id: &str, project_root: &Path, location: &GraphLocation)
         Some(fingerprint.clone()),
     );
     let generation = if report.valid {
-        Some(project_generation(
+        Some(build_generation(
             GraphKey {
                 scope_id: scope_id.to_string(),
                 graph_id: location.graph_id.clone(),
@@ -173,7 +173,10 @@ pub fn load_graph(scope_id: &str, project_root: &Path, location: &GraphLocation)
 }
 
 fn discover_under(project_root: &Path, source: GraphSource) -> Vec<GraphLocation> {
-    let root = project_root.join(source.relative_root());
+    let Some(relative_root) = source.relative_root() else {
+        return Vec::new();
+    };
+    let root = project_root.join(relative_root);
     let Ok(entries) = fs::read_dir(&root) else {
         return Vec::new();
     };
@@ -194,7 +197,13 @@ fn discover_under(project_root: &Path, source: GraphSource) -> Vec<GraphLocation
 }
 
 fn graph_directory(project_root: &Path, source: GraphSource, graph_id: &str) -> PathBuf {
-    project_root.join(source.relative_root()).join(graph_id)
+    project_root
+        .join(
+            source
+                .relative_root()
+                .expect("file-backed graph source must have a relative root"),
+        )
+        .join(graph_id)
 }
 
 fn read_stable_documents(directory: &Path) -> Result<Vec<Vec<u8>>, Vec<ValidationError>> {

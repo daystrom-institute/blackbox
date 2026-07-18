@@ -408,6 +408,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bbox-corpus-core",
+ "bbox-project-graph",
  "bbox-stores",
  "bbox-util",
  "glob",
