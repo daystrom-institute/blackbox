@@ -86,11 +86,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # embedding API (and any other TLS egress). Both binaries use rustls, which
 # reads the system trust store via rustls-native-certs.
 FROM debian:bookworm-slim AS runtime-base
-RUN apt-get update \
+# git comes from bookworm-backports: the provenance exporter uses
+# `git notes append --separator`, which needs git >= 2.44; bookworm's own
+# git 2.39 fails that call at runtime (caught by the corpus-core git-notes
+# round-trip test on the first Linux CI run).
+RUN echo 'deb http://deb.debian.org/debian bookworm-backports main' \
+      > /etc/apt/sources.list.d/backports.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
-        git \
         ca-certificates \
         openssh-client \
+    && apt-get install -y --no-install-recommends -t bookworm-backports git \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user. Fixed uid/gid so mounted volume ownership is
