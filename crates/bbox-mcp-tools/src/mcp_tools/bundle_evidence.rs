@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::mcp_tools::find_paths::{render_node, render_path};
-use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
+use crate::mcp_tools::inspect::resolve_evidence_edge;
+use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection};
+use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_edge_index::edge_index::EdgeIndex;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_providers::entity_loader;
 use bbox_providers::providers::ProviderContext;
 
@@ -82,7 +84,10 @@ pub fn bundle_evidence(
     let omitted_path_ids = p.path_ids.len().saturating_sub(PATH_CAP);
     for path_id in p.path_ids.iter().take(PATH_CAP) {
         match cache.get(PROCESS_SESSION_KEY, path_id) {
-            Some(path) => paths.push(path),
+            Some(mut path) => {
+                refresh_path_evidence(ctx, &mut path);
+                paths.push(path);
+            }
             None => stale_path_ids.push(path_id.clone()),
         }
     }
@@ -227,17 +232,43 @@ fn intra_bundle_edges(
             .cloned()
             .collect::<Vec<_>>();
         forward.extend(ctx.project_graph_forward_edges(source));
-        for edge in forward {
+        for mut edge in forward {
+            resolve_evidence_edge(ctx, &mut edge);
             if set.contains(&edge.target) {
                 edges.push(json!({
                     "source": edge.source.to_string(),
                     "kind": edge.kind,
                     "target": edge.target.to_string(),
+                    "provenance": edge.provenance,
+                    "confidence": edge.confidence,
+                    "properties": edge.metadata,
                 }));
             }
         }
     }
     edges
+}
+
+fn refresh_path_evidence(ctx: &ProviderContext<'_>, path: &mut CachedPath) {
+    for step in &mut path.steps {
+        if !step.metadata.contains_key("evidence.binding_id") {
+            continue;
+        }
+        let (source, target) = match step.direction {
+            PathDirection::Out => (step.from.clone(), step.to.clone()),
+            PathDirection::In => (step.to.clone(), step.from.clone()),
+        };
+        let mut edge = Edge {
+            source,
+            kind: step.edge_kind.clone(),
+            target,
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: step.metadata.clone(),
+        };
+        resolve_evidence_edge(ctx, &mut edge);
+        step.metadata = edge.metadata;
+    }
 }
 
 /// Surfaces 2-hop convergences: pairs of bundled entities (A, B) that share

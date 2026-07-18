@@ -455,6 +455,7 @@ pub fn graph_defined_edge_types(generation: &GraphGeneration) -> BTreeSet<String
 #[derive(Debug, Default)]
 pub struct ProjectGraphCatalog {
     entries: BTreeMap<GraphKey, Arc<GraphGeneration>>,
+    evidence_bindings: BTreeMap<(String, String), crate::EvidenceBinding>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -554,6 +555,50 @@ impl ProjectGraphCatalog {
             })
     }
 
+    pub fn has_source(&self, scope_id: &str, graph_id: &str, source: GraphSource) -> bool {
+        self.entries.contains_key(&GraphKey {
+            scope_id: scope_id.to_string(),
+            graph_id: graph_id.to_string(),
+            source,
+        })
+    }
+
+    pub fn replace_evidence_scope(
+        &mut self,
+        scope_id: &str,
+        bindings: Vec<crate::EvidenceBinding>,
+    ) -> Result<(), Vec<crate::EvidenceValidationError>> {
+        let document = crate::EvidenceDocument {
+            version: crate::EVIDENCE_DOCUMENT_VERSION,
+            scope_id: scope_id.to_string(),
+            bindings,
+        };
+        let errors = crate::validate_evidence_document(scope_id, &document);
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        self.evidence_bindings
+            .retain(|(accepted_scope, _), _| accepted_scope != scope_id);
+        for binding in document.bindings {
+            self.evidence_bindings
+                .insert((scope_id.to_string(), binding.binding_id.clone()), binding);
+        }
+        Ok(())
+    }
+
+    pub fn remove_evidence_scope(&mut self, scope_id: &str) {
+        self.evidence_bindings
+            .retain(|(accepted_scope, _), _| accepted_scope != scope_id);
+    }
+
+    pub fn evidence_bindings(&self, scope_id: &str) -> Vec<crate::EvidenceBinding> {
+        self.evidence_bindings
+            .iter()
+            .filter(|((accepted_scope, _), _)| accepted_scope == scope_id)
+            .map(|(_, binding)| binding.clone())
+            .collect()
+    }
+
     pub fn remove(&mut self, key: &GraphKey) {
         self.entries.remove(key);
     }
@@ -580,13 +625,27 @@ impl ProjectGraphCatalog {
     }
 
     pub fn known_refs(&self, include_local: bool) -> Vec<EntityRef> {
-        self.entries
+        let mut refs = self
+            .entries
             .values()
             .filter(|generation| {
                 include_local || generation.key.source != GraphSource::LocalScratch
             })
             .flat_map(|generation| generation.known_refs())
-            .collect()
+            .collect::<Vec<_>>();
+        for binding in self
+            .evidence_bindings
+            .values()
+            .filter(|binding| !crate::binding_hidden_by_local_policy(binding, self, include_local))
+        {
+            if !refs.contains(&binding.source) {
+                refs.push(binding.source.clone());
+            }
+            if !refs.contains(&binding.target) {
+                refs.push(binding.target.clone());
+            }
+        }
+        refs
     }
 
     pub fn vertex_count(&self, include_local: bool) -> usize {
@@ -608,27 +667,41 @@ impl ProjectGraphCatalog {
     }
 
     fn edges_for(&self, entity: &EntityRef, include_local: bool, forward: bool) -> Vec<Edge> {
-        let EntityRef::ProjectGraphVertex {
-            scope_id, graph_id, ..
-        } = entity
-        else {
-            return Vec::new();
+        let mut edges = match entity {
+            EntityRef::ProjectGraphVertex {
+                scope_id, graph_id, ..
+            } => self
+                .get(scope_id, graph_id, include_local)
+                .map(|generation| {
+                    generation
+                        .projected_edges
+                        .iter()
+                        .filter(|edge| {
+                            if forward {
+                                &edge.source == entity
+                            } else {
+                                &edge.target == entity
+                            }
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
         };
-        self.get(scope_id, graph_id, include_local)
-            .map(|generation| {
-                generation
-                    .projected_edges
-                    .iter()
-                    .filter(|edge| {
-                        if forward {
-                            &edge.source == entity
+        edges.extend(
+            self.evidence_bindings
+                .values()
+                .filter(|binding| {
+                    !crate::binding_hidden_by_local_policy(binding, self, include_local)
+                        && if forward {
+                            &binding.source == entity
                         } else {
-                            &edge.target == entity
+                            &binding.target == entity
                         }
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+                })
+                .map(|binding| crate::binding_edge(binding, self, include_local)),
+        );
+        edges
     }
 }

@@ -252,7 +252,90 @@ fn full_neighborhood(
     neighborhood
         .reverse
         .extend(ctx.project_graph_reverse_edges(r));
+    for edge in neighborhood
+        .forward
+        .iter_mut()
+        .chain(neighborhood.reverse.iter_mut())
+    {
+        resolve_evidence_edge(ctx, edge);
+    }
     neighborhood
+}
+
+pub fn resolve_evidence_edge(ctx: &ProviderContext<'_>, edge: &mut Edge) {
+    let Some(scope_id) = edge.metadata.get("evidence.scope_id").cloned() else {
+        return;
+    };
+    let source_generation = edge
+        .metadata
+        .get("evidence.source_generation")
+        .and_then(|value| value.parse::<u64>().ok());
+    let target_generation = edge
+        .metadata
+        .get("evidence.target_generation")
+        .and_then(|value| value.parse::<u64>().ok());
+    let source_status = evidence_endpoint_status(ctx, &scope_id, &edge.source, source_generation);
+    let target_status = evidence_endpoint_status(ctx, &scope_id, &edge.target, target_generation);
+    edge.metadata
+        .insert("evidence.source_status".into(), source_status.into());
+    edge.metadata
+        .insert("evidence.target_status".into(), target_status.into());
+    edge.metadata.insert(
+        "evidence.freshness".into(),
+        aggregate_evidence_status(source_status, target_status).into(),
+    );
+}
+
+fn evidence_endpoint_status(
+    ctx: &ProviderContext<'_>,
+    scope_id: &str,
+    entity: &EntityRef,
+    expected_generation: Option<u64>,
+) -> &'static str {
+    if evidence_entity_scope(entity).is_some_and(|entity_scope| entity_scope != scope_id) {
+        return "unauthorized";
+    }
+    match entity_loader::load(ctx, entity) {
+        Ok(view) => {
+            if expected_generation.is_some_and(|expected| {
+                view.properties
+                    .get("generation")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|current| current != expected)
+            }) {
+                "stale"
+            } else {
+                "current"
+            }
+        }
+        Err(_)
+            if matches!(entity, EntityRef::ProjectGraphVertex { .. })
+                && expected_generation.is_some() =>
+        {
+            "stale"
+        }
+        Err(_) => "missing",
+    }
+}
+
+fn evidence_entity_scope(entity: &EntityRef) -> Option<&str> {
+    match entity {
+        EntityRef::ProjectGraphVertex { scope_id, .. } => Some(scope_id),
+        EntityRef::ProjectFile { project_id, .. }
+        | EntityRef::ProjectFileV2 { project_id, .. }
+        | EntityRef::Symbol { project_id, .. }
+        | EntityRef::SymbolV2 { project_id, .. } => Some(project_id),
+        _ => None,
+    }
+}
+
+fn aggregate_evidence_status(source: &str, target: &str) -> &'static str {
+    for status in ["unauthorized", "stale", "missing", "unresolved"] {
+        if source == status || target == status {
+            return status;
+        }
+    }
+    "current"
 }
 
 fn filtered_neighborhood(
@@ -394,15 +477,17 @@ fn render_text(input: InspectText<'_>) -> String {
     } else {
         for edge in forward {
             text.push_str(&format!(
-                "  -->[{}] {}\n",
+                "  -->[{}{}] {}\n",
                 edge.kind,
+                rendered_edge_freshness(edge),
                 labeled_ref(&edge.target, edge.target_label.as_deref())
             ));
         }
         for edge in reverse {
             text.push_str(&format!(
-                "  <--[{}] {}\n",
+                "  <--[{}{}] {}\n",
                 edge.kind,
+                rendered_edge_freshness(edge),
                 labeled_ref(&edge.source, edge.source_label.as_deref())
             ));
         }
@@ -427,6 +512,13 @@ fn render_text(input: InspectText<'_>) -> String {
         }
     }
     text
+}
+
+fn rendered_edge_freshness(edge: &RenderedEdge) -> String {
+    edge.properties
+        .get("evidence.freshness")
+        .map(|status| format!(" {status}"))
+        .unwrap_or_default()
 }
 
 fn labeled_ref(entity_ref: &str, label: Option<&str>) -> String {

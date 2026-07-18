@@ -5,7 +5,7 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::mcp_tools::inspect::compact_label;
+use crate::mcp_tools::inspect::{compact_label, resolve_evidence_edge};
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection, PathStep};
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
 use bbox_edge_index::edge_index::EdgeIndex;
@@ -155,7 +155,8 @@ fn bfs(
         if entry.steps.len() >= max_depth {
             continue;
         }
-        for (edge_kind, direction, next) in expansions(ctx, edge_index, &entry.current, edge_filter)
+        for (edge_kind, direction, next, metadata) in
+            expansions(ctx, edge_index, &entry.current, edge_filter)
         {
             if entry.visited.contains(&next) {
                 continue;
@@ -166,6 +167,7 @@ fn bfs(
                 edge_kind,
                 to: next.clone(),
                 direction,
+                metadata,
             });
             if to.is_some_and(|target| target == &next)
                 || to_type.is_some_and(|target_type| next.entity_type() == target_type)
@@ -192,31 +194,85 @@ fn expansions(
     edge_index: &EdgeIndex,
     current: &EntityRef,
     edge_filter: Option<&HashSet<String>>,
-) -> Vec<(String, PathDirection, EntityRef)> {
+) -> Vec<(
+    String,
+    PathDirection,
+    EntityRef,
+    std::collections::BTreeMap<String, String>,
+)> {
     let mut out = Vec::new();
     // forward_edges_with_synthesis surfaces the transcript -> session
     // IN_SESSION edge at query time (see its doc comment on EdgeIndex) so a
     // transcript ref is reachable to its session even without a materialized
     // edge. Forward only: the reverse enumeration isn't a pure function of
     // the session ref, so it isn't synthesized here.
-    for edge in edge_index.forward_edges_with_synthesis(current) {
+    for mut edge in edge_index.forward_edges_with_synthesis(current) {
+        resolve_evidence_edge(ctx, &mut edge);
         if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-            out.push((edge.kind.clone(), PathDirection::Out, edge.target.clone()));
+            if edge
+                .metadata
+                .get("evidence.target_status")
+                .is_none_or(|status| status != "unauthorized")
+            {
+                out.push((
+                    edge.kind.clone(),
+                    PathDirection::Out,
+                    edge.target.clone(),
+                    edge.metadata.clone(),
+                ));
+            }
         }
     }
     for edge in edge_index.reverse_edges(current) {
+        let mut edge = edge.clone();
+        resolve_evidence_edge(ctx, &mut edge);
         if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-            out.push((edge.kind.clone(), PathDirection::In, edge.source.clone()));
+            if edge
+                .metadata
+                .get("evidence.source_status")
+                .is_none_or(|status| status != "unauthorized")
+            {
+                out.push((
+                    edge.kind.clone(),
+                    PathDirection::In,
+                    edge.source.clone(),
+                    edge.metadata.clone(),
+                ));
+            }
         }
     }
-    for edge in ctx.project_graph_forward_edges(current) {
+    for mut edge in ctx.project_graph_forward_edges(current) {
+        resolve_evidence_edge(ctx, &mut edge);
         if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-            out.push((edge.kind.clone(), PathDirection::Out, edge.target.clone()));
+            if edge
+                .metadata
+                .get("evidence.target_status")
+                .is_none_or(|status| status != "unauthorized")
+            {
+                out.push((
+                    edge.kind.clone(),
+                    PathDirection::Out,
+                    edge.target.clone(),
+                    edge.metadata.clone(),
+                ));
+            }
         }
     }
-    for edge in ctx.project_graph_reverse_edges(current) {
+    for mut edge in ctx.project_graph_reverse_edges(current) {
+        resolve_evidence_edge(ctx, &mut edge);
         if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-            out.push((edge.kind.clone(), PathDirection::In, edge.source.clone()));
+            if edge
+                .metadata
+                .get("evidence.source_status")
+                .is_none_or(|status| status != "unauthorized")
+            {
+                out.push((
+                    edge.kind.clone(),
+                    PathDirection::In,
+                    edge.source.clone(),
+                    edge.metadata.clone(),
+                ));
+            }
         }
     }
     out
@@ -283,12 +339,27 @@ pub fn render_path(ctx: &ProviderContext<'_>, path: &CachedPath) -> String {
             let from = render_node(ctx, &step.from);
             let to = render_node(ctx, &step.to);
             match step.direction {
-                PathDirection::Out => format!("{from} --{}--> {to}", step.edge_kind),
-                PathDirection::In => format!("{from} <--{}-- {to}", step.edge_kind),
+                PathDirection::Out => format!(
+                    "{from} --{}{}--> {to}",
+                    step.edge_kind,
+                    rendered_evidence_status(&step.metadata)
+                ),
+                PathDirection::In => format!(
+                    "{from} <--{}{}-- {to}",
+                    step.edge_kind,
+                    rendered_evidence_status(&step.metadata)
+                ),
             }
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn rendered_evidence_status(metadata: &std::collections::BTreeMap<String, String>) -> String {
+    metadata
+        .get("evidence.freshness")
+        .map(|status| format!(" [{status}]"))
+        .unwrap_or_default()
 }
 
 pub fn render_node(ctx: &ProviderContext<'_>, r: &EntityRef) -> String {
@@ -375,5 +446,33 @@ mod tests {
             5,
         );
         assert_eq!(by_type.len(), 1);
+    }
+
+    #[test]
+    fn bfs_does_not_cross_unauthorized_evidence_endpoint() {
+        let source = EntityRef::parse("knowledge:record-1").unwrap();
+        let target = EntityRef::parse("project_graph_vertex:scope-b:source:asset-1").unwrap();
+        let index = EdgeIndex::from_edges_for_tests(vec![Edge {
+            source: source.clone(),
+            kind: "record:CORRESPONDS_TO".into(),
+            target: target.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: std::collections::BTreeMap::from([
+                ("evidence.binding_id".into(), "binding-1".into()),
+                ("evidence.scope_id".into(), "scope-a".into()),
+            ]),
+        }]);
+        let paths = bfs(
+            &ProviderContext::empty_for_tests(),
+            &index,
+            source,
+            Some(&target),
+            None,
+            None,
+            1,
+            5,
+        );
+        assert!(paths.is_empty());
     }
 }

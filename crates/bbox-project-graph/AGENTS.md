@@ -24,7 +24,16 @@
 - Connector-managed storage is not a file-backed project graph root.
   `ProjectGraphCatalog` can hold its accepted generations, but discovery under
   `.bbox/graphs` and `.bbox/local/graphs` never synthesizes connector state.
-  Evidence endpoints, text/vector retrieval, and hosted auth remain outside
-  this crate.
+  Text/vector retrieval and hosted auth remain outside this crate.
+- Cross-graph and cross-entity evidence is a project-owned overlay at
+  `.bbox/evidence/bindings.json`, separate from every graph authority plane.
+  Connector generation replacement never edits or deletes these bindings.
+  Evidence candidates replace one scope atomically only after full validation;
+  a malformed candidate leaves the prior accepted set intact.
+- Evidence bindings use canonical `EntityRef` endpoints and generic edge kinds.
+  They carry assertion authority, observation or mapping provenance, asserted
+  time, and optional endpoint generations. Endpoint freshness is resolved at
+  traversal time. Missing, stale, unauthorized, and unresolved endpoints remain
+  diagnosable, while traversal never crosses an unauthorized endpoint.
 - Tests use canonicalized per-test roots and never read or write real HOME or
   XDG state.

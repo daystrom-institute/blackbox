@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ pub struct PathStep {
     pub edge_kind: String,
     pub to: EntityRef,
     pub direction: PathDirection,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +110,7 @@ mod tests {
             edge_kind: "SUPERSEDES".into(),
             to: EntityRef::parse(&format!("knowledge:to{n}")).unwrap(),
             direction: PathDirection::Out,
+            metadata: BTreeMap::new(),
         }
     }
 

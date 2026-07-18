@@ -374,6 +374,21 @@ stale or unresolved and remain diagnosable.
 Exit gate: a synthetic API-dataset connector advances a source graph through
 create, update, delete, checkpoint resume, and schema reprojection.
 
+Accepted implementation contract:
+
+- connector-managed generations live in a dedicated source projection store,
+  not under either project-authored graph root;
+- one atomic snapshot accepts the descriptor, schema, normalized graph facts,
+  source observation references, and named checkpoint transition together;
+- generations advance by exactly one, and only an exact replay of the most
+  recently accepted batch is idempotent;
+- rejected graph validation, checkpoint conflict, schema rollback, or snapshot
+  integrity failure leaves the accepted generation and checkpoint set
+  unchanged;
+- status exposes generation, schema and projection versions, graph
+  fingerprint, latest observation time, reconciliation mode, and named
+  checkpoints without credential material.
+
 ## 9. Milestone 3: cross-graph and cross-entity evidence
 
 Resolve the evidence endpoint limitation tracked by `gap-161aedc6`:
@@ -391,6 +406,23 @@ only gives the graph and evidence layers a stable generic reference boundary.
 
 Exit gate: a tenant record vertex traverses through a source vertex to a
 materialized project file, and the reverse traversal preserves provenance.
+
+Accepted implementation contract:
+
+- tenant-owned bindings live in `.bbox/evidence/bindings.json`, outside both
+  project-authored graph facts and connector-managed source snapshots;
+- bindings use canonical `EntityRef` endpoints and generic edge kinds, with no
+  connector-specific entity variants;
+- each binding records assertion authority, asserted time, observation or
+  mapping provenance, and optional endpoint generations;
+- a complete valid document replaces one scope's accepted binding set; an
+  invalid candidate leaves the prior accepted set intact;
+- endpoint status is resolved at traversal and bundle time as current, stale,
+  missing, unauthorized, or unresolved;
+- inspection retains non-current bindings for diagnosis, while path traversal
+  never crosses an unauthorized endpoint;
+- connector reprojection or deletion changes freshness status but cannot
+  delete tenant-owned bindings.
 
 ## 10. Milestone 4: graph-aware connector runtime
 
@@ -636,14 +668,16 @@ Decided by this campaign:
   profile.
 - Require explicit placement policy for remote bytes.
 - Gate hosted Xero operation on concrete Keycloak and OpenBao integration.
+- Commit source graph state and named checkpoint transitions in one atomic
+  source-projection snapshot.
+- Store cross-plane evidence as a tenant-owned binding overlay, separate from
+  both graph authority planes.
 
 Still open:
 
 - the exact retained-observation policy needed for offline reprojection;
 - whether source schemas ship with the connector binary, as versioned corpus
   artifacts, or through a signed package registry;
-- whether graph generations and checkpoint commits share one storage
-  transaction or use a recoverable two-phase protocol;
 - the minimum Xero entity set needed before the Files action can avoid broad
   reconciliation;
 - which graph properties are eligible for text or vector indexing by default;

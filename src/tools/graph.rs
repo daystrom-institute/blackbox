@@ -747,6 +747,339 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_bindings_cross_graphs_and_project_files_with_freshness() {
+        use bbox_project_graph::{
+            EVIDENCE_DOCUMENT_VERSION, EvidenceAssertionAuthority, EvidenceBinding,
+            EvidenceDocument,
+        };
+
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        write_project_graph_fixture(
+            &project_root,
+            "records",
+            false,
+            json!({
+                "version": 1,
+                "namespace": "record",
+                "vertex_types": {
+                    "record:Item": {"properties": {"name": "string"}}
+                },
+                "edge_types": []
+            }),
+            vec![json!({
+                "id": "item-1",
+                "type": "record:Item",
+                "label": "Item one",
+                "properties": {"name": "Item one"}
+            })],
+            vec![],
+        );
+        write_project_graph_fixture(
+            &project_root,
+            "source",
+            false,
+            json!({
+                "version": 1,
+                "namespace": "dataset",
+                "vertex_types": {
+                    "dataset:Asset": {"properties": {"name": "string"}}
+                },
+                "edge_types": []
+            }),
+            vec![json!({
+                "id": "asset-1",
+                "type": "dataset:Asset",
+                "label": "Asset one",
+                "properties": {"name": "Asset one"}
+            })],
+            vec![],
+        );
+
+        let server = test_server(&store);
+        let project_record = server
+            .state
+            .projects
+            .write()
+            .register_path(&project_root)
+            .unwrap();
+        let scope_id = project_record.project_id;
+        let record_ref = crate::entity_ref::EntityRef::ProjectGraphVertex {
+            scope_id: scope_id.clone(),
+            graph_id: "records".into(),
+            vertex_id: "item-1".into(),
+        };
+        let source_ref = crate::entity_ref::EntityRef::ProjectGraphVertex {
+            scope_id: scope_id.clone(),
+            graph_id: "source".into(),
+            vertex_id: "asset-1".into(),
+        };
+        let file_ref = crate::entity_ref::EntityRef::ProjectFile {
+            project_id: scope_id.clone(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "chunkhash".into(),
+            occurrence_idx: 0,
+        };
+        let evidence = EvidenceDocument {
+            version: EVIDENCE_DOCUMENT_VERSION,
+            scope_id: scope_id.clone(),
+            bindings: vec![
+                EvidenceBinding {
+                    binding_id: "record-source".into(),
+                    scope_id: scope_id.clone(),
+                    source: record_ref.clone(),
+                    kind: "record:CORRESPONDS_TO".into(),
+                    target: source_ref.clone(),
+                    assertion_authority: EvidenceAssertionAuthority::Project,
+                    observation_id: None,
+                    mapping_version: Some("mapping-v1".into()),
+                    asserted_at: "2026-01-01T00:00:00Z".into(),
+                    source_generation: Some(1),
+                    target_generation: Some(1),
+                },
+                EvidenceBinding {
+                    binding_id: "source-file".into(),
+                    scope_id: scope_id.clone(),
+                    source: source_ref.clone(),
+                    kind: "dataset:EVIDENCED_BY".into(),
+                    target: file_ref.clone(),
+                    assertion_authority: EvidenceAssertionAuthority::Connector,
+                    observation_id: Some("observation-file-1".into()),
+                    mapping_version: None,
+                    asserted_at: "2026-01-01T00:00:00Z".into(),
+                    source_generation: Some(1),
+                    target_generation: None,
+                },
+            ],
+        };
+        let evidence_path = project_root.join(".bbox/evidence/bindings.json");
+        fs::create_dir_all(evidence_path.parent().unwrap()).unwrap();
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        {
+            let idx = server.state.idx.write();
+            let fields = idx.field_handles();
+            let mut writer = idx.index_handle().writer(50_000_000).unwrap();
+            let mut file = tantivy::TantivyDocument::new();
+            file.add_text(fields.doc_type, "project_file");
+            file.add_text(fields.project_id, &scope_id);
+            file.add_text(fields.project, project_root.to_string_lossy());
+            file.add_text(fields.file_path, "evidence.txt");
+            file.add_text(fields.content, "bounded public fixture evidence");
+            file.add_text(fields.entity_id, file_ref.to_string());
+            file.add_text(fields.chunk_hash, "chunkhash");
+            writer.add_document(file).unwrap();
+            writer.commit().unwrap();
+            idx.reader_reload_for_test();
+        }
+
+        let selector = project_root.to_string_lossy().into_owned();
+        for graph_id in ["records", "source"] {
+            let result = server
+                .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                    project: selector.clone(),
+                    graph_id: graph_id.into(),
+                    include_local: None,
+                }))
+                .await;
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+            assert_eq!(body["accepted"], true, "{body}");
+            assert_eq!(body["evidence_binding_count"], 2, "{body}");
+            assert!(body["evidence_error"].is_null(), "{body}");
+        }
+
+        let inspected = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: record_ref.to_string(),
+                edge_types: Some("record:CORRESPONDS_TO".into()),
+                direction: Some("out".into()),
+                per_type_limit: Some(5),
+                property_mode: Some("full".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let inspected: serde_json::Value = serde_json::from_str(&extract_text(&inspected)).unwrap();
+        let first_hop = &inspected["edges"]["out"][0];
+        assert_eq!(first_hop["target"], source_ref.to_string());
+        assert_eq!(first_hop["properties"]["evidence.freshness"], "current");
+        assert_eq!(
+            first_hop["properties"]["evidence.mapping_version"],
+            "mapping-v1"
+        );
+
+        let paths = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: record_ref.to_string(),
+                to: Some(file_ref.to_string()),
+                to_type: None,
+                edge_types: Some(crate::mcp_tools::find_paths::EdgeTypesParam::Many(vec![
+                    "record:CORRESPONDS_TO".into(),
+                    "dataset:EVIDENCED_BY".into(),
+                ])),
+                max_depth: Some(2),
+                limit: Some(5),
+                include_local_graphs: None,
+            }))
+            .await;
+        let paths: serde_json::Value = serde_json::from_str(&extract_text(&paths)).unwrap();
+        assert_eq!(paths["paths"].as_array().unwrap().len(), 1, "{paths}");
+        let path_id = paths["paths"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            paths["paths"][0]["steps"][1]["metadata"]["evidence.freshness"],
+            "current"
+        );
+
+        let bundle = server
+            .bbox_bundle_evidence(Parameters(BundleEvidenceParams {
+                question: "How is the record tied to file evidence?".into(),
+                entity_refs: vec![
+                    record_ref.to_string(),
+                    source_ref.to_string(),
+                    file_ref.to_string(),
+                ],
+                path_ids: vec![path_id.clone()],
+                property_mode: Some("summary".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let bundle: serde_json::Value = serde_json::from_str(&extract_text(&bundle)).unwrap();
+        assert!(
+            bundle["intra_bundle_edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| {
+                    edge["kind"] == "dataset:EVIDENCED_BY"
+                        && edge["properties"]["evidence.observation_id"] == "observation-file-1"
+                        && edge["provenance"] == "explicit"
+                }),
+            "{bundle}"
+        );
+
+        let reverse = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: file_ref.to_string(),
+                edge_types: Some("dataset:EVIDENCED_BY".into()),
+                direction: Some("in".into()),
+                per_type_limit: Some(5),
+                property_mode: Some("full".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let reverse: serde_json::Value = serde_json::from_str(&extract_text(&reverse)).unwrap();
+        let reverse_edge = &reverse["edges"]["in"][0];
+        assert_eq!(reverse_edge["source"], source_ref.to_string());
+        assert_eq!(
+            reverse_edge["properties"]["evidence.observation_id"],
+            "observation-file-1"
+        );
+        assert_eq!(
+            reverse_edge["properties"]["evidence.target_status"],
+            "current"
+        );
+
+        fs::write(project_root.join(".bbox/graphs/source/vertices.jsonl"), "").unwrap();
+        let descriptor_path = project_root.join(".bbox/graphs/source/graph.json");
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&fs::read(&descriptor_path).unwrap()).unwrap();
+        descriptor["generation"] = json!(2);
+        fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&descriptor).unwrap(),
+        )
+        .unwrap();
+        let refreshed = server
+            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                project: selector,
+                graph_id: "source".into(),
+                include_local: None,
+            }))
+            .await;
+        let refreshed: serde_json::Value = serde_json::from_str(&extract_text(&refreshed)).unwrap();
+        assert_eq!(refreshed["accepted"], true, "{refreshed}");
+        assert_eq!(refreshed["evidence_binding_count"], 2);
+
+        let stale = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: record_ref.to_string(),
+                edge_types: Some("record:CORRESPONDS_TO".into()),
+                direction: Some("out".into()),
+                per_type_limit: Some(5),
+                property_mode: Some("full".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let stale: serde_json::Value = serde_json::from_str(&extract_text(&stale)).unwrap();
+        assert_eq!(
+            stale["edges"]["out"][0]["properties"]["evidence.target_status"],
+            "stale"
+        );
+        assert_eq!(
+            server
+                .state
+                .project_graphs
+                .read()
+                .evidence_bindings(&scope_id)
+                .len(),
+            2
+        );
+
+        let stale_bundle = server
+            .bbox_bundle_evidence(Parameters(BundleEvidenceParams {
+                question: "Is the retained evidence path still current?".into(),
+                entity_refs: vec![record_ref.to_string(), file_ref.to_string()],
+                path_ids: vec![path_id],
+                property_mode: Some("summary".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let stale_bundle: serde_json::Value =
+            serde_json::from_str(&extract_text(&stale_bundle)).unwrap();
+        assert_eq!(
+            stale_bundle["paths"][0]["steps"][0]["metadata"]["evidence.target_status"],
+            "stale"
+        );
+        assert_eq!(
+            stale_bundle["paths"][0]["steps"][1]["metadata"]["evidence.source_status"],
+            "stale"
+        );
+
+        let mut invalid_evidence = evidence;
+        invalid_evidence.bindings[0].mapping_version = None;
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&invalid_evidence).unwrap(),
+        )
+        .unwrap();
+        let rejected = server
+            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                project: project_root.to_string_lossy().into_owned(),
+                graph_id: "records".into(),
+                include_local: None,
+            }))
+            .await;
+        let rejected: serde_json::Value = serde_json::from_str(&extract_text(&rejected)).unwrap();
+        assert_eq!(rejected["accepted"], true, "{rejected}");
+        assert!(rejected["evidence_error"].is_string(), "{rejected}");
+        assert_eq!(rejected["evidence_binding_count"], 2);
+        assert_eq!(
+            server
+                .state
+                .project_graphs
+                .read()
+                .evidence_bindings(&scope_id)
+                .len(),
+            2,
+            "invalid candidate must not replace the prior accepted evidence set"
+        );
+    }
+
+    #[tokio::test]
     async fn scratch_graphs_are_excluded_by_default_on_tool_surfaces() {
         let store = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
