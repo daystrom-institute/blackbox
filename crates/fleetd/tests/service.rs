@@ -163,6 +163,15 @@ fn config(root: &std::path::Path, mode: FleetMode) -> FleetdConfig {
     if mode == FleetMode::Shadow {
         config.shadow_source = Some("http://127.0.0.1:7264".into());
     }
+    // Linux authority validation requires an external worker sandbox
+    // launcher path (macOS uses the built-in Seatbelt and rejects one).
+    // These tests inject a CapturingLauncher and never build the real
+    // sandbox, so any root-owned executable satisfies the config invariant
+    // without being probed or run.
+    #[cfg(target_os = "linux")]
+    if mode.is_authority() {
+        config.worker_sandbox_launcher = Some("/bin/true".into());
+    }
     config
 }
 

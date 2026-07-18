@@ -1336,12 +1336,15 @@ mod tests {
             .parse()
             .unwrap();
         // SIGKILL is immediate, but the reparented grandchild may linger as a
-        // zombie until init/launchd reaps it (macOS and Linux both); poll with
-        // a bound instead of asserting instantly.
+        // zombie until its reaper collects it; poll with a bound instead of
+        // asserting instantly. The assertion is about LIVE members (a zombie
+        // holds no locks and runs no code): kill(-pgid, 0) alone is not
+        // enough, because it also succeeds for zombie-only groups, and in a
+        // container whose PID 1 never reaps orphans (the CI pod) that state
+        // can persist past any bound.
         let mut group_gone = false;
         for _ in 0..100 {
-            // SAFETY: kill(2) with signal 0 probes group existence only.
-            if unsafe { libc::kill(-pgid, 0) } != 0 {
+            if !group_has_live_members(pgid) {
                 group_gone = true;
                 break;
             }
@@ -1351,6 +1354,46 @@ mod tests {
             group_gone,
             "process group {pgid} still has live members after timeout kill"
         );
+    }
+
+    /// True while process group `pgid` contains at least one non-zombie
+    /// member. On Linux this walks /proc (state Z members are dead for the
+    /// purposes of the kill contract); elsewhere it falls back to the
+    /// kill(2) signal-0 probe, which suffices where init reaps orphans
+    /// promptly (macOS launchd).
+    fn group_has_live_members(pgid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                // SAFETY: kill(2) with signal 0 probes group existence only.
+                return (unsafe { libc::kill(-pgid, 0) }) == 0;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                    continue;
+                }
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    continue;
+                };
+                // /proc/<pid>/stat: "pid (comm) state ppid pgrp ..."; comm may
+                // contain spaces/parens, so parse from the LAST ')'.
+                let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+                    continue;
+                };
+                let mut fields = rest.split_whitespace();
+                let state = fields.next();
+                let pgrp = fields.nth(1).and_then(|s| s.parse::<i32>().ok());
+                if pgrp == Some(pgid) && state != Some("Z") {
+                    return true;
+                }
+            }
+            false
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: kill(2) with signal 0 probes group existence only.
+            (unsafe { libc::kill(-pgid, 0) }) == 0
+        }
     }
 
     #[tokio::test]

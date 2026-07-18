@@ -486,6 +486,10 @@ mod tests {
         let config = FleetdConfig {
             mode: FleetMode::Authority,
             state_dir: PathBuf::from("/tmp/fleetd-config-test"),
+            // Linux authority validation requires a launcher path (macOS
+            // rejects one); presence is all validate() checks here.
+            #[cfg(target_os = "linux")]
+            worker_sandbox_launcher: Some(PathBuf::from("/bin/true")),
             ..FleetdConfig::default()
         }
         .normalized()
@@ -648,6 +652,19 @@ mod tests {
         .normalized()
         .unwrap();
         assert!(config.denied_worker_service_ports().contains(&9264));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_authority_requires_an_external_sandbox_launcher() {
+        let config = FleetdConfig {
+            mode: FleetMode::Authority,
+            ..FleetdConfig::default()
+        };
+        assert!(matches!(
+            config.normalized(),
+            Err(FleetdError::InvalidConfiguration(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
