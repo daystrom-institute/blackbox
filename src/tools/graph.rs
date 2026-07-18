@@ -17,6 +17,7 @@ use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::PathBuf;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::graph_tools()
@@ -44,6 +45,26 @@ pub(crate) struct DescribeSchemaParams {
     /// Convenience mode. `full` includes installed agents; `orientation` keeps
     /// the compact default.
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProjectGraphListParams {
+    /// Registered project id, alias, base path, or worktree path. Omit to
+    /// list committed graphs for every registered project.
+    pub project: Option<String>,
+    /// Include `.bbox/local/graphs` scratch graphs. Defaults false.
+    #[serde(default)]
+    pub include_local: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProjectGraphExactParams {
+    /// Registered project id, alias, base path, or worktree path.
+    pub project: String,
+    pub graph_id: String,
+    /// Include `.bbox/local/graphs` scratch graphs. Defaults false.
+    #[serde(default)]
+    pub include_local: Option<bool>,
 }
 
 impl DescribeSchemaParams {
@@ -77,10 +98,19 @@ impl BlackboxServer {
                     ));
                 }
             };
+            let include_local = p.include_local_graphs.unwrap_or(false);
+            if let Some(error) = crate::project_graph_runtime::refresh_ref_error(
+                &server.state,
+                &entity_ref,
+                include_local,
+            ) {
+                return Ok(error);
+            }
             let edge_index = server.state.edge_index.read();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(&edge_index);
+                    .with_edge_index(&edge_index)
+                    .with_local_project_graphs(include_local);
             mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, &edge_index)
         })
         .await
@@ -108,6 +138,78 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bbox_project_graph_list",
+        description = "List project-owned reflective graphs and their validation status. Committed .bbox/graphs entries are included by default; .bbox/local/graphs scratch entries require include_local=true."
+    )]
+    pub(crate) async fn bbox_project_graph_list(
+        &self,
+        Parameters(p): Parameters<ProjectGraphListParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_project_graph_list", move || {
+            let include_local = p.include_local.unwrap_or(false);
+            let projects = match graph_projects(&server, p.project.as_deref()) {
+                Ok(projects) => projects,
+                Err(error) => return Ok(error),
+            };
+            crate::project_graph_runtime::list_graphs(&server.state, projects, include_local)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "bbox_project_graph_validate",
+        description = "Structurally validate one project graph and atomically publish its complete generation when valid. Reports stable error codes with source file and JSONL line numbers. Scratch graphs require include_local=true."
+    )]
+    pub(crate) async fn bbox_project_graph_validate(
+        &self,
+        Parameters(p): Parameters<ProjectGraphExactParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_project_graph_validate", move || {
+            let include_local = p.include_local.unwrap_or(false);
+            let (scope_id, root) = match graph_project(&server, &p.project) {
+                Ok(project) => project,
+                Err(error) => return Ok(error),
+            };
+            crate::project_graph_runtime::validate_graph(
+                &server.state,
+                &scope_id,
+                &root,
+                &p.graph_id,
+                include_local,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "bbox_project_graph_describe",
+        description = "Describe one accepted reflective graph generation, including its descriptor, project schema document, fixed meta-schema floor, counts, and source location. Scratch graphs require include_local=true."
+    )]
+    pub(crate) async fn bbox_project_graph_describe(
+        &self,
+        Parameters(p): Parameters<ProjectGraphExactParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_project_graph_describe", move || {
+            let include_local = p.include_local.unwrap_or(false);
+            let (scope_id, root) = match graph_project(&server, &p.project) {
+                Ok(project) => project,
+                Err(error) => return Ok(error),
+            };
+            crate::project_graph_runtime::describe_graph(
+                &server.state,
+                &scope_id,
+                &root,
+                &p.graph_id,
+                include_local,
+            )
+        })
+        .await
+    }
+
+    #[tool(
         name = "bbox_find_paths",
         description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent."
     )]
@@ -117,10 +219,26 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_find_paths", move || {
+            let include_local = p.include_local_graphs.unwrap_or(false);
+            for raw in std::iter::once(Some(p.from.as_str()))
+                .chain(std::iter::once(p.to.as_deref()))
+                .flatten()
+            {
+                if let Ok(entity) = entity_ref::EntityRef::parse(raw)
+                    && let Some(error) = crate::project_graph_runtime::refresh_ref_error(
+                        &server.state,
+                        &entity,
+                        include_local,
+                    )
+                {
+                    return Ok(error);
+                }
+            }
             let edge_index = server.state.edge_index.read();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(&edge_index);
+                    .with_edge_index(&edge_index)
+                    .with_local_project_graphs(include_local);
             mcp_tools::find_paths::find_paths(
                 &p,
                 &provider_ctx,
@@ -141,10 +259,23 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_bundle_evidence", move || {
+            let include_local = p.include_local_graphs.unwrap_or(false);
+            for raw in &p.entity_refs {
+                if let Ok(entity) = entity_ref::EntityRef::parse(raw)
+                    && let Some(error) = crate::project_graph_runtime::refresh_ref_error(
+                        &server.state,
+                        &entity,
+                        include_local,
+                    )
+                {
+                    return Ok(error);
+                }
+            }
             let edge_index = server.state.edge_index.read();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
-                    .with_edge_index(&edge_index);
+                    .with_edge_index(&edge_index)
+                    .with_local_project_graphs(include_local);
             mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
@@ -165,6 +296,17 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
+            for raw in &p.refs {
+                if let Ok(entity) = entity_ref::EntityRef::parse(raw)
+                    && let Some(error) = crate::project_graph_runtime::refresh_ref_error(
+                        &server.state,
+                        &entity,
+                        false,
+                    )
+                {
+                    return Ok(error);
+                }
+            }
             let edge_index = server.state.edge_index.read();
             let provider_ctx =
                 ProviderContext::new_with_ext(server.state.corpus_stores(), server.state.as_ref())
@@ -261,11 +403,59 @@ impl BlackboxServer {
     }
 }
 
+fn graph_project(server: &BlackboxServer, raw: &str) -> Result<(String, PathBuf), String> {
+    let projects = server.state.projects.read().list();
+    let Some(context) = crate::projects::resolve_project_context(
+        raw,
+        &projects,
+        crate::projects::ResolveIntent::Read,
+    ) else {
+        return Err(project_graph_bad_input(raw));
+    };
+    let root = context
+        .checkout
+        .map(|checkout| PathBuf::from(checkout.checkout_dir))
+        .unwrap_or_else(|| PathBuf::from(context.host_root));
+    Ok((context.project_id, root))
+}
+
+fn graph_projects(
+    server: &BlackboxServer,
+    raw: Option<&str>,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    match raw {
+        Some(raw) => graph_project(server, raw).map(|project| vec![project]),
+        None => Ok(server
+            .state
+            .projects
+            .read()
+            .list()
+            .into_iter()
+            .map(|project| (project.project_id, PathBuf::from(project.canonical_path)))
+            .collect()),
+    }
+}
+
+fn project_graph_bad_input(raw: &str) -> String {
+    json!({
+        "status": "error.bad_input",
+        "error": {
+            "code": "error.bad_input",
+            "field": "project",
+            "message": format!("project `{raw}` is not registered"),
+            "suggested_fix": "Pass a registered project id, alias, base path, or worktree path."
+        }
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifacts;
     use crate::server::state::SharedState;
+    use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
@@ -275,6 +465,367 @@ mod tests {
     fn extract_text(result: &CallToolResult) -> String {
         let wire = serde_json::to_value(result).unwrap();
         wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    fn write_project_graph_fixture(
+        root: &Path,
+        graph_id: &str,
+        local: bool,
+        schema: serde_json::Value,
+        vertices: Vec<serde_json::Value>,
+        edges: Vec<serde_json::Value>,
+    ) {
+        let relative = if local {
+            ".bbox/local/graphs"
+        } else {
+            ".bbox/graphs"
+        };
+        let dir = root.join(relative).join(graph_id);
+        fs::create_dir_all(&dir).unwrap();
+        let retention = if local {
+            "local_scratch"
+        } else {
+            "project_owned"
+        };
+        fs::write(
+            dir.join("graph.json"),
+            serde_json::to_vec_pretty(&json!({
+                "descriptor_version": 1,
+                "scope": "project",
+                "graph_id": graph_id,
+                "authority": "project",
+                "schema_id": format!("{graph_id}-schema"),
+                "schema_version": schema["version"],
+                "retention_policy": retention,
+                "generation": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("schema.json"),
+            serde_json::to_vec_pretty(&schema).unwrap(),
+        )
+        .unwrap();
+        let jsonl = |rows: Vec<serde_json::Value>| {
+            let mut text = rows
+                .into_iter()
+                .map(|row| serde_json::to_string(&row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text
+        };
+        fs::write(dir.join("vertices.jsonl"), jsonl(vertices)).unwrap();
+        fs::write(dir.join("edges.jsonl"), jsonl(edges)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_unrelated_schemas_validate_describe_inspect_traverse_and_bundle() {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        write_project_graph_fixture(
+            &project_root,
+            "repo",
+            false,
+            json!({
+                "version": 1,
+                "namespace": "repo",
+                "vertex_types": {
+                    "repo:Module": {
+                        "required": ["path", "source"],
+                        "properties": {
+                            "path": "string",
+                            "source": {"file": "string", "tags": ["string"]}
+                        }
+                    },
+                    "repo:Invariant": {
+                        "required": ["claim"],
+                        "properties": {"claim": "string"}
+                    }
+                },
+                "edge_types": [{
+                    "type": "repo:CONSTRAINED_BY",
+                    "from_type": "repo:Module",
+                    "to_type": "repo:Invariant",
+                    "required": ["confidence"],
+                    "properties": {"confidence": "number"}
+                }]
+            }),
+            vec![
+                json!({
+                    "id": "src/tools/graph.rs",
+                    "type": "repo:Module",
+                    "label": "graph tools",
+                    "properties": {
+                        "path": "src/tools/graph.rs",
+                        "source": {"file": "PROJECT.md", "tags": ["graph", "tools"]}
+                    }
+                }),
+                json!({
+                    "id": "canonical-refs",
+                    "type": "repo:Invariant",
+                    "label": "canonical refs",
+                    "properties": {"claim": "entity refs round trip"}
+                }),
+            ],
+            vec![json!({
+                "from": "src/tools/graph.rs",
+                "type": "repo:CONSTRAINED_BY",
+                "to": "canonical-refs",
+                "properties": {"confidence": 1}
+            })],
+        );
+        write_project_graph_fixture(
+            &project_root,
+            "deployments",
+            false,
+            json!({
+                "version": 1,
+                "namespace": "ops",
+                "vertex_types": {
+                    "ops:Service": {
+                        "required": ["healthy", "owners"],
+                        "properties": {"healthy": "boolean", "owners": ["string"]}
+                    },
+                    "ops:Region": {
+                        "required": ["capacity"],
+                        "properties": {"capacity": "number"}
+                    }
+                },
+                "edge_types": [{
+                    "type": "ops:DEPLOYED_IN",
+                    "from_type": "ops:Service",
+                    "to_type": "ops:Region",
+                    "properties": {"rollout": {"wave": "number", "approved": "boolean"}}
+                }]
+            }),
+            vec![
+                json!({
+                    "id": "api",
+                    "type": "ops:Service",
+                    "label": "public api",
+                    "properties": {"healthy": true, "owners": ["platform"]}
+                }),
+                json!({
+                    "id": "north",
+                    "type": "ops:Region",
+                    "label": "north region",
+                    "properties": {"capacity": 3}
+                }),
+            ],
+            vec![json!({
+                "from": "api",
+                "type": "ops:DEPLOYED_IN",
+                "to": "north",
+                "properties": {"rollout": {"wave": 2, "approved": true}}
+            })],
+        );
+
+        let server = test_server(&store);
+        let record = server
+            .state
+            .projects
+            .write()
+            .register_path(&project_root)
+            .unwrap();
+        let project_selector = project_root.to_string_lossy().into_owned();
+        for graph_id in ["repo", "deployments"] {
+            let result = server
+                .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                    project: project_selector.clone(),
+                    graph_id: graph_id.into(),
+                    include_local: None,
+                }))
+                .await;
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+            assert_eq!(body["validation"]["valid"], true, "{body}");
+            assert_eq!(body["accepted"], true, "{body}");
+        }
+
+        let described = server
+            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+                project: project_selector,
+                graph_id: "repo".into(),
+                include_local: None,
+            }))
+            .await;
+        let described: serde_json::Value = serde_json::from_str(&extract_text(&described)).unwrap();
+        assert_eq!(described["status"], "ok");
+        assert_eq!(
+            described["meta_schema"]["vertex_types"][0],
+            "meta:VertexType"
+        );
+        assert_eq!(described["schema"]["namespace"], "repo");
+
+        let module_ref = format!(
+            "project_graph_vertex:{}:repo:src/tools/graph.rs",
+            record.project_id
+        );
+        let invariant_ref = format!(
+            "project_graph_vertex:{}:repo:canonical-refs",
+            record.project_id
+        );
+        let inspected = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: module_ref.clone(),
+                edge_types: None,
+                direction: Some("out".into()),
+                per_type_limit: Some(10),
+                property_mode: Some("full".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let inspected: serde_json::Value = serde_json::from_str(&extract_text(&inspected)).unwrap();
+        assert_eq!(inspected["status"], "ok", "{inspected}");
+        assert_eq!(inspected["properties"]["type"], "repo:Module");
+        assert!(
+            inspected["edges"]["out"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| {
+                    edge["kind"] == "repo:CONSTRAINED_BY" && edge["properties"]["confidence"] == "1"
+                })
+        );
+
+        let paths = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: module_ref.clone(),
+                to: Some(invariant_ref.clone()),
+                to_type: None,
+                edge_types: Some(crate::mcp_tools::find_paths::EdgeTypesParam::One(
+                    "repo:CONSTRAINED_BY".into(),
+                )),
+                max_depth: Some(2),
+                limit: Some(5),
+                include_local_graphs: None,
+            }))
+            .await;
+        let paths: serde_json::Value = serde_json::from_str(&extract_text(&paths)).unwrap();
+        assert_eq!(paths["paths"].as_array().unwrap().len(), 1, "{paths}");
+        let path_id = paths["paths"][0]["id"].as_str().unwrap().to_string();
+
+        let bundle = server
+            .bbox_bundle_evidence(Parameters(BundleEvidenceParams {
+                question: "What constrains the graph tools?".into(),
+                entity_refs: vec![module_ref, invariant_ref],
+                path_ids: vec![path_id],
+                property_mode: Some("summary".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let bundle: serde_json::Value = serde_json::from_str(&extract_text(&bundle)).unwrap();
+        assert_eq!(bundle["status"], "ok", "{bundle}");
+        assert_eq!(bundle["paths"].as_array().unwrap().len(), 1);
+        assert!(
+            bundle["intra_bundle_edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| edge["kind"] == "repo:CONSTRAINED_BY")
+        );
+
+        let deployment_ref = format!("project_graph_vertex:{}:deployments:api", record.project_id);
+        let deployment = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: deployment_ref,
+                edge_types: Some("ops:DEPLOYED_IN".into()),
+                direction: Some("out".into()),
+                per_type_limit: Some(5),
+                property_mode: Some("full".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let deployment: serde_json::Value =
+            serde_json::from_str(&extract_text(&deployment)).unwrap();
+        assert_eq!(deployment["status"], "ok", "{deployment}");
+        assert_eq!(deployment["properties"]["type"], "ops:Service");
+    }
+
+    #[tokio::test]
+    async fn scratch_graphs_are_excluded_by_default_on_tool_surfaces() {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        write_project_graph_fixture(
+            &project_root,
+            "scratch",
+            true,
+            json!({
+                "version": 1,
+                "namespace": "scratch",
+                "vertex_types": {
+                    "scratch:Note": {"properties": {"text": "string"}}
+                },
+                "edge_types": []
+            }),
+            vec![json!({
+                "id": "note-1",
+                "type": "scratch:Note",
+                "label": "scratch note",
+                "properties": {"text": "local only"}
+            })],
+            vec![],
+        );
+        let server = test_server(&store);
+        let record = server
+            .state
+            .projects
+            .write()
+            .register_path(&project_root)
+            .unwrap();
+        let selector = project_root.to_string_lossy().into_owned();
+
+        let default_list = server
+            .bbox_project_graph_list(Parameters(ProjectGraphListParams {
+                project: Some(selector.clone()),
+                include_local: None,
+            }))
+            .await;
+        let default_list: serde_json::Value =
+            serde_json::from_str(&extract_text(&default_list)).unwrap();
+        assert!(default_list["graphs"].as_array().unwrap().is_empty());
+
+        let local_list = server
+            .bbox_project_graph_list(Parameters(ProjectGraphListParams {
+                project: Some(selector),
+                include_local: Some(true),
+            }))
+            .await;
+        let local_list: serde_json::Value =
+            serde_json::from_str(&extract_text(&local_list)).unwrap();
+        assert_eq!(local_list["graphs"].as_array().unwrap().len(), 1);
+
+        let note_ref = format!("project_graph_vertex:{}:scratch:note-1", record.project_id);
+        let excluded = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: note_ref.clone(),
+                edge_types: None,
+                direction: None,
+                per_type_limit: Some(5),
+                property_mode: Some("full".into()),
+                include_local_graphs: None,
+            }))
+            .await;
+        let excluded: serde_json::Value = serde_json::from_str(&extract_text(&excluded)).unwrap();
+        assert_eq!(excluded["status"], "error.invalid_project_graph");
+
+        let included = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: note_ref,
+                edge_types: None,
+                direction: None,
+                per_type_limit: Some(5),
+                property_mode: Some("full".into()),
+                include_local_graphs: Some(true),
+            }))
+            .await;
+        let included: serde_json::Value = serde_json::from_str(&extract_text(&included)).unwrap();
+        assert_eq!(included["status"], "ok", "{included}");
     }
     /// Symbols are edge-projected vertices: the indexer derives their edges
     /// but writes no entity doc (gap-496fe07f). A symbol ref the edge
@@ -308,6 +859,7 @@ mod tests {
                         direction: None,
                         per_type_limit: Some(5),
                         property_mode: Some("full".into()),
+                        include_local_graphs: None,
                     }))
                     .await;
                 serde_json::from_str::<serde_json::Value>(&extract_text(&result)).unwrap()
@@ -552,6 +1104,7 @@ mod tests {
                         direction: None,
                         per_type_limit: Some(5),
                         property_mode: Some("full".into()),
+                        include_local_graphs: None,
                     }))
                     .await;
                 serde_json::from_str::<serde_json::Value>(&extract_text(&result)).unwrap()

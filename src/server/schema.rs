@@ -47,6 +47,10 @@ impl BlackboxServer {
         counts.insert("thread".into(), self.state.threads.read().all().len());
         counts.insert("note".into(), self.state.notes.read().all().len());
         counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
+        counts.insert(
+            "project_graph_vertex".into(),
+            self.state.project_graphs.read().vertex_count(false),
+        );
         // Brofile and agent vertices live in the artifact catalog. They
         // don't naturally appear in EdgeIndex entity counts until a
         // DERIVED_FROM / SUPERSEDES edge points at them; until that

@@ -19,6 +19,7 @@ pub enum EntityType {
     File,
     ProjectFile,
     ProjectFileV2,
+    ProjectGraphVertex,
     Session,
     Thread,
     Note,
@@ -36,13 +37,14 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 20] = [
+    pub const ALL: [EntityType; 21] = [
         EntityType::Knowledge,
         EntityType::SystemMemory,
         EntityType::Transcript,
         EntityType::File,
         EntityType::ProjectFile,
         EntityType::ProjectFileV2,
+        EntityType::ProjectGraphVertex,
         EntityType::Session,
         EntityType::Thread,
         EntityType::Note,
@@ -67,6 +69,7 @@ impl EntityType {
             EntityType::File => "file",
             EntityType::ProjectFile => "project_file",
             EntityType::ProjectFileV2 => "project_file_v2",
+            EntityType::ProjectGraphVertex => "project_graph_vertex",
             EntityType::Session => "session",
             EntityType::Thread => "thread",
             EntityType::Note => "note",
@@ -97,6 +100,9 @@ impl EntityType {
             }
             EntityType::ProjectFileV2 => {
                 "project_file_v2:<project_id>:<snapshot_id>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>"
+            }
+            EntityType::ProjectGraphVertex => {
+                "project_graph_vertex:<scope_id>:<graph_id>:<vertex_id>"
             }
             EntityType::Session => "session:<provider>:<session_id>",
             EntityType::Thread => "thread:<thread_id>",
@@ -169,6 +175,11 @@ pub enum EntityRef {
         rel_path_hash: String,
         chunk_hash: String,
         occurrence_idx: u32,
+    },
+    ProjectGraphVertex {
+        scope_id: String,
+        graph_id: String,
+        vertex_id: String,
     },
     Session {
         provider: String,
@@ -257,6 +268,7 @@ impl EntityRef {
             EntityType::File => parse_file(input, rest),
             EntityType::ProjectFile => parse_project_file(input, rest),
             EntityType::ProjectFileV2 => parse_project_file_v2(input, rest),
+            EntityType::ProjectGraphVertex => parse_project_graph_vertex(input, rest),
             EntityType::Session => parse_session(input, rest),
             EntityType::Thread => parse_single(input, rest, EntityType::Thread, |thread_id| {
                 EntityRef::Thread { thread_id }
@@ -326,6 +338,18 @@ impl EntityRef {
             } => Ok(format!(
                 "project_file_v2:{project_id}:{snapshot_id}:{rel_path_hash}:{chunk_hash}:{occurrence_idx}"
             )),
+            EntityRef::ProjectGraphVertex {
+                scope_id,
+                graph_id,
+                vertex_id,
+            } => {
+                validate_project_graph_ref_field("scope_id", scope_id, false)?;
+                validate_project_graph_ref_field("graph_id", graph_id, false)?;
+                validate_project_graph_ref_field("vertex_id", vertex_id, true)?;
+                Ok(format!(
+                    "project_graph_vertex:{scope_id}:{graph_id}:{vertex_id}"
+                ))
+            }
             EntityRef::Session {
                 provider,
                 session_id,
@@ -386,6 +410,7 @@ impl EntityRef {
             EntityRef::File { .. } => EntityType::File,
             EntityRef::ProjectFile { .. } => EntityType::ProjectFile,
             EntityRef::ProjectFileV2 { .. } => EntityType::ProjectFileV2,
+            EntityRef::ProjectGraphVertex { .. } => EntityType::ProjectGraphVertex,
             EntityRef::Session { .. } => EntityType::Session,
             EntityRef::Thread { .. } => EntityType::Thread,
             EntityRef::Note { .. } => EntityType::Note,
@@ -451,6 +476,32 @@ impl fmt::Display for EntityRef {
 fn validate_provider(provider: &str) -> Result<(), EntityRefRenderError> {
     if provider.is_empty() || provider.contains(':') {
         Err(EntityRefRenderError::invalid_provider(provider))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_project_graph_ref_field(
+    field: &'static str,
+    value: &str,
+    allow_colon: bool,
+) -> Result<(), EntityRefRenderError> {
+    if value.is_empty()
+        || (!allow_colon && value.contains(':'))
+        || value.chars().any(char::is_control)
+    {
+        Err(EntityRefRenderError {
+            field,
+            value: value.to_string(),
+            message: format!(
+                "project graph ref field `{field}` must be non-empty{} and contain no control characters: `{value}`",
+                if allow_colon {
+                    ""
+                } else {
+                    ", must not contain ':'"
+                }
+            ),
+        })
     } else {
         Ok(())
     }
@@ -613,6 +664,31 @@ fn parse_project_file_v2(input: &str, rest: &str) -> Result<EntityRef, EntityRef
         chunk_hash: non_empty(input, parts[3], EntityType::ProjectFileV2, "chunk_hash")?
             .to_string(),
         occurrence_idx: parse_u32(input, parts[4], EntityType::ProjectFileV2, "occurrence_idx")?,
+    })
+}
+
+fn parse_project_graph_vertex(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    let (scope_id, tail) = split_first(input, rest, EntityType::ProjectGraphVertex, "graph_id")?;
+    let (graph_id, vertex_id) =
+        split_first(input, tail, EntityType::ProjectGraphVertex, "vertex_id")?;
+    let scope_id = non_empty(input, scope_id, EntityType::ProjectGraphVertex, "scope_id")?;
+    let graph_id = non_empty(input, graph_id, EntityType::ProjectGraphVertex, "graph_id")?;
+    let vertex_id = non_empty(
+        input,
+        vertex_id,
+        EntityType::ProjectGraphVertex,
+        "vertex_id",
+    )?;
+    if scope_id.chars().any(char::is_control)
+        || graph_id.chars().any(char::is_control)
+        || vertex_id.chars().any(char::is_control)
+    {
+        return Err(shape_error(input, EntityType::ProjectGraphVertex));
+    }
+    Ok(EntityRef::ProjectGraphVertex {
+        scope_id: scope_id.to_string(),
+        graph_id: graph_id.to_string(),
+        vertex_id: vertex_id.to_string(),
     })
 }
 
@@ -1156,6 +1232,19 @@ mod tests {
     }
 
     #[test]
+    fn project_graph_vertex_ref_preserves_colons_in_vertex_id() {
+        let rendered = "project_graph_vertex:d723917f:repo:repo:Module:src/tools/graph.rs";
+        let parsed = EntityRef::parse(rendered).unwrap();
+        assert_eq!(parsed.render(), rendered);
+        assert_eq!(parsed.entity_type(), EntityType::ProjectGraphVertex);
+        assert!(matches!(
+            parsed,
+            EntityRef::ProjectGraphVertex { ref vertex_id, .. }
+                if vertex_id == "repo:Module:src/tools/graph.rs"
+        ));
+    }
+
+    #[test]
     fn symbol_v2_ref_round_trips_with_colons_in_qualified_name() {
         let rendered = "symbol_v2:proj1234:head-repo1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:crate::module::Type::method:defhash";
         let parsed = EntityRef::parse(rendered).unwrap();
@@ -1242,17 +1331,22 @@ mod tests {
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            6 => EntityRef::Session {
+            6 => EntityRef::ProjectGraphVertex {
+                scope_id: rng.hex(8),
+                graph_id: rng.token("graph-"),
+                vertex_id: format!("{}:{}", rng.token("vertex-"), rng.token("nested-")),
+            },
+            7 => EntityRef::Session {
                 provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("sub-")),
             },
-            7 => EntityRef::Thread {
+            8 => EntityRef::Thread {
                 thread_id: rng.token("thread-"),
             },
-            8 => EntityRef::Note {
+            9 => EntityRef::Note {
                 note_id: rng.token("note-"),
             },
-            9 => EntityRef::Symbol {
+            10 => EntityRef::Symbol {
                 project_id: rng.hex(8),
                 qualified_name: format!(
                     "{}::{}::{}",
@@ -1262,7 +1356,7 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            10 => EntityRef::SymbolV2 {
+            11 => EntityRef::SymbolV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 qualified_name: format!(
@@ -1273,36 +1367,36 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            11 => EntityRef::Brofile {
+            12 => EntityRef::Brofile {
                 name: rng.token("bro-"),
             },
-            12 => EntityRef::Whiteboard {
+            13 => EntityRef::Whiteboard {
                 board_id: rng.token("board-"),
             },
-            13 => EntityRef::Commit {
+            14 => EntityRef::Commit {
                 repo_id: rng.hex(8),
                 sha: rng.hex(40),
             },
-            14 => EntityRef::Task {
+            15 => EntityRef::Task {
                 task_id: rng.token("task-"),
             },
-            15 => EntityRef::BashCall {
+            16 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            16 => EntityRef::Agent {
+            17 => EntityRef::Agent {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
             },
-            17 => EntityRef::Packet {
+            18 => EntityRef::Packet {
                 selector: format!("domain:{}", rng.token("packet-domain-")),
             },
-            18 => EntityRef::Artifact {
+            19 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),
             },
-            19 => EntityRef::RoadmapItem {
+            20 => EntityRef::RoadmapItem {
                 id: rng.token("roadmap-"),
             },
             _ => unreachable!(),

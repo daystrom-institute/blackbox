@@ -272,6 +272,16 @@ fn edge_families() -> Vec<serde_json::Value> {
             "Use format-specific edges for document links, rich document regions, and extracted media structures.",
         ),
         family(
+            "Reflective project graph",
+            &[
+                "meta:INSTANCE_OF",
+                "meta:FROM_TYPE",
+                "meta:TO_TYPE",
+                "project-defined",
+            ],
+            "Use the fixed meta edges to inspect project-owned schema data, then traverse graph-defined edge kinds exactly as declared by that graph.",
+        ),
+        family(
             "Tool-call",
             &["EDITED_FILE", "EDITED_BY_SESSION", "READ_FILE", "RAN_BASH"],
             "Use tool-call edges for transcript events that touched files or executed shell commands.",

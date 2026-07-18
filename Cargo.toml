@@ -54,6 +54,7 @@ members = [
     "crates/bbox-system-events",
     "crates/bbox-indexing",
     "crates/bbox-connectors",
+    "crates/bbox-project-graph",
     "crates/bbox-providers",
     "crates/bbox-embed",
     "crates/bbox-mcp-tools",
@@ -232,6 +233,7 @@ bbox-tool-docs = { path = "crates/bbox-tool-docs" }
 bbox-system-events = { path = "crates/bbox-system-events" }
 bbox-indexing = { path = "crates/bbox-indexing" }
 bbox-connectors = { path = "crates/bbox-connectors" }
+bbox-project-graph = { path = "crates/bbox-project-graph" }
 bbox-providers = { path = "crates/bbox-providers" }
 bbox-embed = { path = "crates/bbox-embed" }
 bbox-mcp-tools = { path = "crates/bbox-mcp-tools" }

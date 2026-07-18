@@ -56,6 +56,10 @@ pub(crate) struct SharedState {
     pub(crate) pins_persister: StorePersister<Pins>,
     pub(crate) projects: Arc<RwLock<ProjectRegistry>>,
     pub(crate) projects_persister: StorePersister<ProjectRegistry>,
+    /// Accepted reflective project-graph generations. Source files are loaded
+    /// and validated outside the lock, then one complete generation replaces
+    /// the prior entry under the write guard.
+    pub(crate) project_graphs: RwLock<crate::project_graph::ProjectGraphCatalog>,
     /// Remote-source connector mount records — sibling of `projects`
     /// (design/connectors/remote-source-connectors.md). A mount feeds one
     /// registered project's materialization root; `connectors_runtime.rs`
@@ -391,6 +395,7 @@ impl SharedState {
             packets: &self.packets,
             artifacts: &self.artifacts,
             whiteboards: self.whiteboards.as_ref(),
+            project_graphs: self,
             store_dir: &self.store_dir,
         }
     }
@@ -486,6 +491,7 @@ impl SharedState {
             pins_persister,
             projects: projects_store,
             projects_persister,
+            project_graphs: RwLock::new(crate::project_graph::ProjectGraphCatalog::default()),
             mounts: mounts_store,
             mounts_persister,
             mount_sync_locks: Arc::new(Mutex::new(std::collections::HashSet::new())),

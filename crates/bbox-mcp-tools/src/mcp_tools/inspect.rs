@@ -17,6 +17,10 @@ pub struct InspectEntityParams {
     pub direction: Option<String>,
     pub per_type_limit: Option<usize>,
     pub property_mode: Option<String>,
+    /// Include explicitly opted-in `.bbox/local/graphs` scratch graphs.
+    /// Defaults false.
+    #[serde(default)]
+    pub include_local_graphs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +68,8 @@ struct RenderedEdge {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_label: Option<String>,
     direction: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,7 +93,7 @@ pub fn bad_input(entity_ref: &str, message: impl AsRef<str>) -> String {
             "code": "error.bad_input",
             "message": message.as_ref(),
             "field": "entity_ref",
-            "suggested_fix": "Use a canonical EntityRef such as knowledge:<entry_id>, project_file:<project_id>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>, or commit:<repo_id>:<sha>."
+            "suggested_fix": "Use a canonical EntityRef such as knowledge:<entry_id>, project_file:<project_id>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>, project_graph_vertex:<scope_id>:<graph_id>:<vertex_id>, or commit:<repo_id>:<sha>."
         },
         "entity_ref": entity_ref,
     })
@@ -107,11 +113,16 @@ pub fn not_found(r: &EntityRef, similar_refs: Vec<String>) -> String {
     .to_string()
 }
 
-pub fn similar_refs(edge_index: &EdgeIndex, r: &EntityRef) -> Vec<String> {
+pub fn similar_refs(
+    ctx: &ProviderContext<'_>,
+    edge_index: &EdgeIndex,
+    r: &EntityRef,
+) -> Vec<String> {
     let needle = r.to_string();
     let prefix = r.entity_type().as_str();
-    edge_index
-        .known_refs()
+    let mut known = edge_index.known_refs();
+    known.extend(ctx.project_graph_known_refs());
+    known
         .into_iter()
         .map(|known| known.to_string())
         .filter(|known| known.starts_with(prefix))
@@ -136,9 +147,9 @@ pub fn inspect_entity(
     let provider = providers::provider_for(r.entity_type());
     let mut entity = match entity_loader::load(ctx, r) {
         Ok(entity) => entity,
-        Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
+        Err(_) => return Ok(not_found(r, similar_refs(ctx, edge_index, r))),
     };
-    let full_neighborhood = full_neighborhood(edge_index, r);
+    let full_neighborhood = full_neighborhood(ctx, edge_index, r);
     entity.neighborhood = filtered_neighborhood(
         &full_neighborhood,
         direction,
@@ -223,14 +234,25 @@ fn parse_edge_filter(raw: Option<&str>) -> Option<HashSet<String>> {
     )
 }
 
-fn full_neighborhood(edge_index: &EdgeIndex, r: &EntityRef) -> Neighborhood {
-    Neighborhood {
+fn full_neighborhood(
+    ctx: &ProviderContext<'_>,
+    edge_index: &EdgeIndex,
+    r: &EntityRef,
+) -> Neighborhood {
+    let mut neighborhood = Neighborhood {
         // forward_edges_with_synthesis fills in the transcript -> session
         // IN_SESSION edge at query time when it isn't materialized (see its
         // doc comment). This is forward only; reverse has no counterpart.
         forward: edge_index.forward_edges_with_synthesis(r),
         reverse: edge_index.reverse_edges(r).into_iter().cloned().collect(),
-    }
+    };
+    neighborhood
+        .forward
+        .extend(ctx.project_graph_forward_edges(r));
+    neighborhood
+        .reverse
+        .extend(ctx.project_graph_reverse_edges(r));
+    neighborhood
 }
 
 fn filtered_neighborhood(
@@ -286,6 +308,7 @@ fn render_edges(ctx: &ProviderContext<'_>, edges: &[Edge], direction: &str) -> V
             target: edge.target.to_string(),
             target_label: compact_label(ctx, &edge.target, None),
             direction: direction.to_string(),
+            properties: edge.metadata.clone(),
         })
         .collect()
 }
@@ -448,6 +471,7 @@ mod tests {
             direction: None,
             per_type_limit: Some(0),
             property_mode: Some("summary".into()),
+            include_local_graphs: None,
         };
         let r = EntityRef::parse(&params.entity_ref).unwrap();
         let rendered = inspect_entity(
@@ -480,6 +504,7 @@ mod tests {
             direction: None,
             per_type_limit: None,
             property_mode: Some("summary".into()),
+            include_local_graphs: None,
         };
         let r = EntityRef::parse(&params.entity_ref).unwrap();
         let rendered = inspect_entity(
@@ -524,6 +549,7 @@ mod tests {
             direction: None,
             per_type_limit: Some(0),
             property_mode: Some("summary".into()),
+            include_local_graphs: None,
         };
         let r = EntityRef::parse(&params.entity_ref).unwrap();
         let rendered = inspect_entity(

@@ -85,6 +85,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         pins_persister,
         projects,
         projects_persister,
+        project_graphs: RwLock::new(crate::project_graph::ProjectGraphCatalog::default()),
         mounts,
         mounts_persister,
         mount_sync_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
