@@ -579,3 +579,13 @@ its auth flow.
   stale) or a supervised Apache Tika server sidecar, adopted behind a new
   chunker rather than inside connectors. Demand-driven; explicitly not a
   connector concern.
+
+## Relationship to graph-native connectors
+
+The
+[Graph-native connector campaign](reflective-graph-connector-program.md)
+preserves this design as the file-tree connector profile and orders the
+additional contracts needed for API datasets, graph projections, and targeted
+connector actions. The reflective graph owns generic schema and fact
+validation; this design continues to own file-tree observation,
+materialization, and sync behavior.

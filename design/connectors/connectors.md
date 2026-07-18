@@ -4,16 +4,16 @@ kind: design-hub
 corpus: blackbox-design
 topic:
   - connectors
-brief: "Hub for remote-source connectors: pluggable adapters onto remote file and document stores, mounted as indexable blackbox projects."
+brief: "Hub for remote-source connectors: file-tree mounts, API-dataset projections, connector actions, custody policy, and graph-native source integration."
 ---
 
 # Connectors
 
-Connector designs cover the pluggable adapter layer between blackbox's
-indexing pipeline and remote file/document stores (Google Drive,
-OneDrive/SharePoint, iCloud Drive, WebDAV, S3-compatible stores, and future
-sources), including the mountable-project model, sync/freshness semantics,
-and the connector catalog.
+Connector designs cover the pluggable adapter layer between Blackbox and remote
+sources. File-tree connectors mount remote documents as indexable projects.
+API-dataset connectors observe typed remote state, project it into source-owned
+graphs, expose targeted actions, and place remote bytes according to explicit
+custody policy.
 
 Credential handling for connectors is owned by the secrets layer:
 [Pluggable Secrets Providers](../operations/config-artifacts/secrets-provider.md).
@@ -21,11 +21,13 @@ Credential handling for connectors is owned by the secrets layer:
 ## Docs
 
 - [Remote Source Connectors](remote-source-connectors.md)
+- [Graph-native connector campaign](reflective-graph-connector-program.md)
 
 ## Crosscuts
 
 - [Corpus](../corpus/corpus.md) - the chunker registry, multimodal pipeline,
-  and embedding routes that indexed remote content rides.
+  reflective graph, evidence edges, and embedding routes that remote content
+  rides.
 - [Operations](../operations/operations.md) - config lifecycle and the
   secrets provider layer.
 - [Daemon Runtime](../daemon-runtime/daemon-runtime.md) - sync workers live

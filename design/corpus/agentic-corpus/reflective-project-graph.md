@@ -594,3 +594,16 @@ The first useful version needs only:
 - exact inspect and graph traversal.
 
 Everything else is optional pressure discovered from use.
+
+## Relationship to connector delivery
+
+The
+[Graph-native connector campaign](../../connectors/reflective-graph-connector-program.md)
+pulls this kernel forward as the common substrate for connector-owned source
+graphs and tenant-owned record graphs. It preserves this document's small
+reflective floor while sequencing the additional authority, generic endpoint,
+evidence, and retrieval contracts required by a versioned Xero source schema.
+
+The [Agentic Corpus Platform](agentic-corpus-platform.md) owns the later
+indexing and retrieval integration. Connector observation, byte placement,
+credential custody, and witness history remain outside the graph kernel.

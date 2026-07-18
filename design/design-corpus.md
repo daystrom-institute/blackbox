@@ -16,8 +16,8 @@ describes behavior that matters for implementation, verify it against the code,
 
 ## Topic Hubs
 
-- [Connectors](connectors/connectors.md) - pluggable adapters onto remote
-  file/document stores, mounted as indexable projects.
+- [Connectors](connectors/connectors.md) - file-tree mounts, API-dataset
+  projections, graph-native source integration, actions, and custody policy.
 - [Corpus](corpus/corpus.md) - search, provenance, knowledge, notes, storage,
   code navigation, and corpus-facing assistants.
 - [Orchestration](orchestration/orchestration.md) - atoms, agents, workflows,

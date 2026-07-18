@@ -28,6 +28,7 @@ projects them into a typed entity graph, and exposes search/provenance surfaces.
 
 ## Crosscuts
 
+- [Graph-native connector campaign](../../connectors/reflective-graph-connector-program.md)
 - [Knowledge And Memory](../knowledge/knowledge-and-memory.md)
 - [Storage And Performance](../storage/storage-and-performance.md)
 - [Code Navigation](../code-navigation/code-navigation.md)
