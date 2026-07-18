@@ -132,6 +132,48 @@ uses, including nested `tools.*` / namespace calls and session-scoped
 Do not record exact test counts in this file. Counts stale quickly and do not
 help an agent choose the right validation.
 
+## Where Heavy Work Runs
+
+On the operator's estate, the dev machine is the control plane, not the
+compute tier: it runs agent sessions, the daemon, editing, and the tight
+per-crate loop (`cargo check -p <crate>`, targeted nextest) - and not much
+else. macOS code-signing assessment makes churning through freshly built
+test binaries pathologically slow locally (every workspace test run mints
+~50 never-seen binaries; each first exec waits on syspolicyd), while the
+cluster runs them at rated speed. Reach for the cluster-backed tooling BY
+DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
+`build/README.md` is the runbook):
+
+- **Full verification of a pushed ref** (workspace nextest full profile,
+  clippy, concurrency lint) runs on the cluster:
+  `~/repos/bbox-cage/build/submit-bbox-verify.sh --ref <ref>`. Local
+  full-suite runs are the fallback, not the default, and running someone
+  else's ref locally is an anti-pattern.
+- **linux/amd64 images** build on the cluster:
+  `~/repos/bbox-cage/build/submit-bbox-build.sh --ref <ref>` (native amd64
+  in a warm ZFS clone; QEMU emulation and controller-host docker builds are
+  legacy fallbacks).
+- **Interactive heavy worktrees are lanes, not local disk**: from the
+  operator's estate root, `bin/estate lane create <name> --family bbox`
+  gives a cluster-backed checkout at `~/lanes/<name>/blackbox`; cargo,
+  rustc, and sccache route into a builder pod automatically, keyed on cwd.
+  Lane creation kicks a background warm build (minutes); read the lane
+  contract `~/repos/bbox-cage/build/lanes/BBOX_LANE_WORK.md` before heavy
+  work. Worker loss is lane loss - push anything durable.
+- **What stays local**: file edits, single-crate checks and tests, and the
+  arm64 macOS daemon binary build/deploy (launchd) - the cluster produces
+  Linux artifacts only.
+
+**Dispatch propagation**: when orchestrating subordinate agents into heavy
+blackbox work, create a lane, pass the lane path as the dispatch cwd, and
+put ONE line in the prompt: read `BBOX_LANE_WORK.md` (path above) before
+heavy work. Restate situational constraints in the dispatch prompt; older
+worktrees carry older copies of this file.
+
+Contributors without the operator's estate: everything above degrades to
+the plain local commands in Validation; nothing in the repo depends on the
+cluster.
+
 ## Runtime & State
 
 `blackboxd` is a single long-lived user service, not a per-session stdio child.
