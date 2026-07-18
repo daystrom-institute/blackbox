@@ -37,6 +37,7 @@ mod tests {
             "system_memory:sm-agentic-opening-sequence",
             "file:README.md",
             "project_file:proj1234:relhash:chunkhash:0",
+            "project_graph_vertex:proj1234:repo:src/tools/graph.rs",
             "transcript:claude:session123:42:0",
             "session:claude:session123",
             "thread:thread-12345678",

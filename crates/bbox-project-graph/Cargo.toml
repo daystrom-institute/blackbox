@@ -1,0 +1,17 @@
+[package]
+name = "bbox-project-graph"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-chunker = { path = "../bbox-chunker" }
+bbox-edge-index = { path = "../bbox-edge-index" }
+
+[dev-dependencies]
+tempfile = "3"

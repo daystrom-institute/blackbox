@@ -8,6 +8,7 @@ pub mod knowledge;
 pub mod note;
 pub mod packet;
 pub mod project_file;
+pub mod project_graph;
 pub mod roadmap_item;
 pub mod session;
 pub mod symbol;
@@ -41,6 +42,20 @@ pub struct EntityView {
     pub entity_type: EntityType,
     pub properties: BTreeMap<String, String>,
     pub neighborhood: Neighborhood,
+}
+
+/// Read-only bridge from the generic provider/traversal layer into the
+/// daemon-owned accepted project-graph generation catalog. The provider crate
+/// names only canonical refs, scalar properties, and existing graph edges.
+pub trait ProjectGraphAccess: Send + Sync {
+    fn entity_properties(
+        &self,
+        entity: &EntityRef,
+        include_local: bool,
+    ) -> Result<Option<BTreeMap<String, String>>>;
+    fn forward_edges(&self, entity: &EntityRef, include_local: bool) -> Vec<Edge>;
+    fn reverse_edges(&self, entity: &EntityRef, include_local: bool) -> Vec<Edge>;
+    fn known_refs(&self, include_local: bool) -> Vec<EntityRef>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +101,7 @@ pub struct CorpusStores<'a> {
     pub packets: &'a RwLock<Packets>,
     pub artifacts: &'a RwLock<ArtifactCatalog>,
     pub whiteboards: &'a WhiteboardRegistry,
+    pub project_graphs: &'a dyn ProjectGraphAccess,
     pub store_dir: &'a std::path::Path,
 }
 
@@ -103,6 +119,7 @@ pub struct ProviderContext<'a> {
     /// this is present. Absent → those providers keep the strict
     /// indexed-doc requirement.
     edges: Option<&'a bbox_edge_index::edge_index::EdgeIndex>,
+    include_local_project_graphs: bool,
 }
 
 impl<'a> ProviderContext<'a> {
@@ -111,6 +128,7 @@ impl<'a> ProviderContext<'a> {
             stores: Some(stores),
             ext: None,
             edges: None,
+            include_local_project_graphs: false,
         }
     }
 
@@ -122,6 +140,7 @@ impl<'a> ProviderContext<'a> {
             stores: Some(stores),
             ext: Some(ext),
             edges: None,
+            include_local_project_graphs: false,
         }
     }
 
@@ -130,11 +149,17 @@ impl<'a> ProviderContext<'a> {
         self
     }
 
+    pub fn with_local_project_graphs(mut self, include_local: bool) -> Self {
+        self.include_local_project_graphs = include_local;
+        self
+    }
+
     pub fn empty_for_tests() -> Self {
         Self {
             stores: None,
             ext: None,
             edges: None,
+            include_local_project_graphs: false,
         }
     }
 
@@ -148,6 +173,48 @@ impl<'a> ProviderContext<'a> {
 
     pub fn edge_index(&self) -> Option<&'a bbox_edge_index::edge_index::EdgeIndex> {
         self.edges
+    }
+
+    pub fn project_graph_properties(
+        &self,
+        entity: &EntityRef,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        match self.stores() {
+            Some(stores) => stores
+                .project_graphs
+                .entity_properties(entity, self.include_local_project_graphs),
+            None => Ok(None),
+        }
+    }
+
+    pub fn project_graph_forward_edges(&self, entity: &EntityRef) -> Vec<Edge> {
+        self.stores()
+            .map(|stores| {
+                stores
+                    .project_graphs
+                    .forward_edges(entity, self.include_local_project_graphs)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn project_graph_reverse_edges(&self, entity: &EntityRef) -> Vec<Edge> {
+        self.stores()
+            .map(|stores| {
+                stores
+                    .project_graphs
+                    .reverse_edges(entity, self.include_local_project_graphs)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn project_graph_known_refs(&self) -> Vec<EntityRef> {
+        self.stores()
+            .map(|stores| {
+                stores
+                    .project_graphs
+                    .known_refs(self.include_local_project_graphs)
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -217,6 +284,7 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(file::FileProvider),
             Box::new(project_file::ProjectFileProvider),
             Box::new(project_file::ProjectFileV2Provider),
+            Box::new(project_graph::ProjectGraphProvider),
             Box::new(transcript::TranscriptProvider),
             Box::new(session::SessionProvider),
             Box::new(thread::ThreadProvider),

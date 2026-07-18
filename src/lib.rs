@@ -75,6 +75,7 @@ mod orchestration;
 // `crate::packets` so existing call sites resolve unchanged.
 use bbox_mcp_tools::path_cache;
 use bbox_packets as packets;
+use bbox_project_graph as project_graph;
 use bbox_stores::pins;
 /// The transcript parser lives in the shared `bro-transcript` crate (the
 /// daemon's indexer and the `bro` cockpit both link it). Re-exported as
@@ -83,6 +84,7 @@ pub use bro_transcript as parser;
 mod pollers;
 use bbox_indexing::projects;
 use bbox_providers::providers;
+mod project_graph_runtime;
 mod providers_ext;
 // `search` (rrf/rerank) and `template` extracted into bbox-corpus-core;
 // aliased back so existing call sites resolve unchanged. (`query` callers

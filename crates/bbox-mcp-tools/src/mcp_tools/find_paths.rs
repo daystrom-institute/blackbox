@@ -21,6 +21,10 @@ pub struct FindPathsParams {
     pub edge_types: Option<EdgeTypesParam>,
     pub max_depth: Option<usize>,
     pub limit: Option<usize>,
+    /// Include explicitly opted-in `.bbox/local/graphs` scratch graphs.
+    /// Defaults false.
+    #[serde(default)]
+    pub include_local_graphs: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -74,6 +78,7 @@ pub fn find_paths(
     // of breadth across other files reachable in the same step budget.
     let raw_limit = limit.saturating_mul(8).max(20);
     let raw = bfs(
+        ctx,
         edge_index,
         from,
         to.as_ref(),
@@ -128,6 +133,7 @@ fn path_terminal_file_key(entity: &EntityRef) -> Option<String> {
 }
 
 fn bfs(
+    ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
     from: EntityRef,
     to: Option<&EntityRef>,
@@ -149,7 +155,8 @@ fn bfs(
         if entry.steps.len() >= max_depth {
             continue;
         }
-        for (edge_kind, direction, next) in expansions(edge_index, &entry.current, edge_filter) {
+        for (edge_kind, direction, next) in expansions(ctx, edge_index, &entry.current, edge_filter)
+        {
             if entry.visited.contains(&next) {
                 continue;
             }
@@ -181,6 +188,7 @@ fn bfs(
 }
 
 fn expansions(
+    ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
     current: &EntityRef,
     edge_filter: Option<&HashSet<String>>,
@@ -197,6 +205,16 @@ fn expansions(
         }
     }
     for edge in edge_index.reverse_edges(current) {
+        if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
+            out.push((edge.kind.clone(), PathDirection::In, edge.source.clone()));
+        }
+    }
+    for edge in ctx.project_graph_forward_edges(current) {
+        if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
+            out.push((edge.kind.clone(), PathDirection::Out, edge.target.clone()));
+        }
+    }
+    for edge in ctx.project_graph_reverse_edges(current) {
         if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
             out.push((edge.kind.clone(), PathDirection::In, edge.source.clone()));
         }
@@ -312,7 +330,8 @@ mod tests {
             metadata: Default::default(),
         };
         let index = EdgeIndex::from_edges_for_tests(vec![edge]);
-        let paths = bfs(&index, a, Some(&b), None, None, 3, 5);
+        let ctx = ProviderContext::empty_for_tests();
+        let paths = bfs(&ctx, &index, a, Some(&b), None, None, 3, 5);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0][0].direction, PathDirection::Out);
     }
@@ -326,7 +345,17 @@ mod tests {
         let session = EntityRef::parse("session:claude:sess-1").unwrap();
         let index = EdgeIndex::default();
 
-        let paths = bfs(&index, transcript.clone(), Some(&session), None, None, 3, 5);
+        let ctx = ProviderContext::empty_for_tests();
+        let paths = bfs(
+            &ctx,
+            &index,
+            transcript.clone(),
+            Some(&session),
+            None,
+            None,
+            3,
+            5,
+        );
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].len(), 1);
         assert_eq!(paths[0][0].edge_kind, "IN_SESSION");
@@ -336,6 +365,7 @@ mod tests {
         // Reachable by to_type too (mirrors the max-depth/limit-boundary
         // traversal an agent would actually run).
         let by_type = bfs(
+            &ctx,
             &index,
             transcript,
             None,

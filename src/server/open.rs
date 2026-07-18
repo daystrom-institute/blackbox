@@ -323,6 +323,7 @@ pub(super) fn open_shared_state(
         pins_persister,
         projects: projects_store,
         projects_persister,
+        project_graphs: RwLock::new(crate::project_graph::ProjectGraphCatalog::default()),
         mounts: mounts_store,
         mounts_persister,
         mount_sync_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),

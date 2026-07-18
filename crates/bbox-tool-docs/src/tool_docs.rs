@@ -23,6 +23,7 @@ pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 pub enum ToolCategory {
     Transcripts,
     Graph,
+    ProjectGraphs,
     Projects,
     Refactor,
     Knowledge,
@@ -48,6 +49,7 @@ impl ToolCategory {
         match self {
             Self::Transcripts => "Transcripts",
             Self::Graph => "Agentic graph",
+            Self::ProjectGraphs => "Reflective project graphs",
             Self::Projects => "Projects",
             Self::Refactor => "Refactor mechanization",
             Self::Knowledge => "Knowledge",
@@ -75,6 +77,9 @@ impl ToolCategory {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
             Self::Graph => "Inspect entities, graph vocabulary, paths, bundles, and retrieval.",
+            Self::ProjectGraphs => {
+                "List, validate, and describe project-owned reflective graph files."
+            }
             Self::Projects => "Register project roots for later file indexing.",
             Self::Refactor => {
                 "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run plans, hash-checked apply, transaction composition, file moves, and parse validation. Inspection is multi-language for supported grammars; writable plan kinds may be generic or language-scoped. Pull `sm-refactor` first, then any relevant language runbook via `bbox_knowledge` for exact plan kinds, arguments, and validation expectations. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
@@ -288,6 +293,27 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Catalog agentic-corpus entity types and edge families. Default is compact orientation for grounding: graph vocabulary, filterable fields, population counts, and traversal tips without the installed-agent catalog. Pass include_agents=true or mode=\"full\" only when you need installed-agent discovery.",
         when_to_use: "Step 1 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use once per session for compact orientation; cache the schema mentally. Also use before `bbox_inspect_entity`, `bbox_find_paths`, or evidence bundling when you need graph vocabulary or edge filters. For installed-agent discovery, opt in with include_agents=true.",
         example: Some("bbox_describe_schema()"),
+    },
+    ToolDoc {
+        name: "bbox_project_graph_list",
+        category: ToolCategory::ProjectGraphs,
+        summary: "List project-owned reflective graphs and their validation status. Committed .bbox/graphs entries are included by default; .bbox/local/graphs scratch entries require include_local=true.",
+        when_to_use: "Use before describing or inspecting an unfamiliar project graph. Pass a registered project id, alias, base path, or worktree path to scope the list. Keep include_local omitted unless the caller explicitly wants ignored scratch state.",
+        example: Some(r#"bbox_project_graph_list(project="/repo/worktree")"#),
+    },
+    ToolDoc {
+        name: "bbox_project_graph_describe",
+        category: ToolCategory::ProjectGraphs,
+        summary: "Describe one accepted reflective graph generation, including its descriptor, project schema document, fixed meta-schema floor, counts, and source location. Scratch graphs require include_local=true.",
+        when_to_use: "Use after bbox_project_graph_list to learn a graph's project-defined vertex and edge types before exact inspection or traversal. Scratch graphs require include_local=true.",
+        example: Some(r#"bbox_project_graph_describe(project="/repo", graph_id="repo")"#),
+    },
+    ToolDoc {
+        name: "bbox_project_graph_validate",
+        category: ToolCategory::ProjectGraphs,
+        summary: "Structurally validate one project graph and atomically publish its complete generation when valid. Reports stable error codes with source file and JSONL line numbers. Scratch graphs require include_local=true.",
+        when_to_use: "Use after editing graph.json, schema.json, vertices.jsonl, or edges.jsonl. A valid higher generation replaces the accepted graph atomically; invalid, rolled-back, and same-generation divergent content does not. Scratch graphs require include_local=true.",
+        example: Some(r#"bbox_project_graph_validate(project="/repo", graph_id="repo")"#),
     },
     ToolDoc {
         name: "bbox_find_paths",
@@ -2303,6 +2329,11 @@ mod tests {
         for entry in entries {
             let entry = entry.unwrap_or_else(|err| panic!("failed to read source entry: {err}"));
             let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with("._") {
+                // NFS-backed macOS lanes can expose AppleDouble sidecars next
+                // to source files. They are binary metadata, never Rust input.
+                continue;
+            }
             if path.is_dir() {
                 collect_rust_files(&path, out);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {

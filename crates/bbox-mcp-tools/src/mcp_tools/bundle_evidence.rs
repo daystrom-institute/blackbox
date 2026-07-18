@@ -25,6 +25,10 @@ pub struct BundleEvidenceParams {
     /// `summary` truncates long string properties. `none` omits properties.
     #[serde(default)]
     pub property_mode: Option<String>,
+    /// Include explicitly opted-in `.bbox/local/graphs` scratch graphs.
+    /// Defaults false.
+    #[serde(default)]
+    pub include_local_graphs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,10 +88,10 @@ pub fn bundle_evidence(
     }
 
     let refs = entities.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>();
-    let mut intra_bundle_edges = intra_bundle_edges(edge_index, &refs);
+    let mut intra_bundle_edges = intra_bundle_edges(ctx, edge_index, &refs);
     let intra_bundle_edges_truncated = intra_bundle_edges.len() > INTRA_BUNDLE_EDGE_CAP;
     intra_bundle_edges.truncate(INTRA_BUNDLE_EDGE_CAP);
-    let mut intra_bundle_convergences = intra_bundle_convergences(edge_index, &refs);
+    let mut intra_bundle_convergences = intra_bundle_convergences(ctx, edge_index, &refs);
     let intra_bundle_convergences_truncated =
         intra_bundle_convergences.len() > INTRA_BUNDLE_EDGE_CAP;
     intra_bundle_convergences.truncate(INTRA_BUNDLE_EDGE_CAP);
@@ -209,11 +213,21 @@ fn truncate_property(value: &str, max_chars: usize) -> String {
     out
 }
 
-fn intra_bundle_edges(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_json::Value> {
+fn intra_bundle_edges(
+    ctx: &ProviderContext<'_>,
+    edge_index: &EdgeIndex,
+    refs: &[EntityRef],
+) -> Vec<serde_json::Value> {
     let set = refs.iter().collect::<HashSet<_>>();
     let mut edges = Vec::new();
     for source in refs {
-        for edge in edge_index.forward_edges(source) {
+        let mut forward = edge_index
+            .forward_edges(source)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        forward.extend(ctx.project_graph_forward_edges(source));
+        for edge in forward {
             if set.contains(&edge.target) {
                 edges.push(json!({
                     "source": edge.source.to_string(),
@@ -236,7 +250,11 @@ fn intra_bundle_edges(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_j
 /// Direct edges (1-hop) already surface in `intra_bundle_edges`; this fills
 /// in the structurally more common case where bundled chunks aren't
 /// directly connected but share an originating event.
-fn intra_bundle_convergences(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_json::Value> {
+fn intra_bundle_convergences(
+    ctx: &ProviderContext<'_>,
+    edge_index: &EdgeIndex,
+    refs: &[EntityRef],
+) -> Vec<serde_json::Value> {
     use std::collections::HashMap;
     // For each ref, gather the set of (neighbor_ref, edge_kind, direction)
     // tuples reachable in one hop. Direction lets us distinguish the source
@@ -250,6 +268,12 @@ fn intra_bundle_convergences(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<
         }
         for edge in edge_index.reverse_edges(r) {
             neighbors.push((edge.source.clone(), edge.kind.clone(), "in"));
+        }
+        for edge in ctx.project_graph_forward_edges(r) {
+            neighbors.push((edge.target, edge.kind, "out"));
+        }
+        for edge in ctx.project_graph_reverse_edges(r) {
+            neighbors.push((edge.source, edge.kind, "in"));
         }
         neighbors_by_ref.insert(idx, neighbors);
     }
@@ -364,6 +388,7 @@ mod tests {
             entity_refs: vec!["knowledge:abc123".into()],
             path_ids: vec!["P999".into()],
             property_mode: None,
+            include_local_graphs: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -392,6 +417,7 @@ mod tests {
             ],
             path_ids: Vec::new(),
             property_mode: None,
+            include_local_graphs: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -433,6 +459,7 @@ mod tests {
             entity_refs: vec!["not-a-ref".into()],
             path_ids: Vec::new(),
             property_mode: None,
+            include_local_graphs: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -459,6 +486,7 @@ mod tests {
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
             path_ids: Vec::new(),
             property_mode: None,
+            include_local_graphs: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -516,6 +544,7 @@ mod tests {
             entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
             path_ids: Vec::new(),
             property_mode: Some("summary".into()),
+            include_local_graphs: None,
         };
 
         let rendered = bundle_evidence(
