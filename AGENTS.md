@@ -71,6 +71,10 @@ The `research/` corpus (sibling of `design/`, mapped by `research/research-corpu
 
 `specs/` is the canon corpus (`corpus: blackbox-spec`): normative, source-grounded contracts for what each subsystem should be/do — the third sibling of `design/` (intent) and `research/` (description). Status lifecycle `draft → specified → ratified`; per-clause source-tier grading (`standard`/`vendor`/`research`/`derived`), no RFC-2119 keywords; backfilled by inverting code + design + research; the conformance section wires clauses to code/intent/evidence anchors. Charter: `specs/specs-corpus.md`.
 
+**Heavy work offloads to the cluster by default (build/verify/lanes)**
+
+Heavy blackbox work offloads to the operator's cluster BY DEFAULT: full verification via `~/repos/bbox-cage/build/submit-bbox-verify.sh --ref <ref>`, linux/amd64 images via `~/repos/bbox-cage/build/submit-bbox-build.sh`, and interactive heavy worktrees via `bin/estate lane create <name> --family bbox` from the operator's estate root (cargo/rustc/sccache route into the lane pod keyed on cwd; read `~/repos/bbox-cage/build/lanes/BBOX_LANE_WORK.md` before heavy work; worker loss is lane loss, push durable work). Local stays: file edits, single-crate check/test loops, and the arm64 macOS daemon build/deploy. PROJECT.md 'Where Heavy Work Runs' is the full contract; contributors without the estate fall back to the plain local gates.
+
 ### Forgejo Coordination Identity
 
 **Distinct Forgejo Identities For Agent Audit Trail**

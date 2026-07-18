@@ -1,0 +1,20 @@
+{
+  "id": "891f4a74",
+  "title": "Heavy work offloads to the cluster by default (build/verify/lanes)",
+  "content": "Heavy blackbox work offloads to the operator's cluster BY DEFAULT: full verification via `~/repos/bbox-cage/build/submit-bbox-verify.sh --ref <ref>`, linux/amd64 images via `~/repos/bbox-cage/build/submit-bbox-build.sh`, and interactive heavy worktrees via `bin/estate lane create <name> --family bbox` from the operator's estate root (cargo/rustc/sccache route into the lane pod keyed on cwd; read `~/repos/bbox-cage/build/lanes/BBOX_LANE_WORK.md` before heavy work; worker loss is lane loss, push durable work). Local stays: file edits, single-crate check/test loops, and the arm64 macOS daemon build/deploy. PROJECT.md 'Where Heavy Work Runs' is the full contract; contributors without the estate fall back to the plain local gates.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Operator approved verbatim (bbox-build-cluster session, 2026-07-18): agents must reach for cluster-backed tooling by default.",
+  "source": "user",
+  "created_at": "2026-07-18T05:55:00Z",
+  "updated_at": "2026-07-18T05:55:00Z",
+  "recall_count": 0
+}
