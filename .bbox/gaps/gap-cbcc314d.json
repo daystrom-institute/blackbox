@@ -1,0 +1,21 @@
+{
+  "id": "gap-cbcc314d",
+  "title": "Cross-host project identity: b1-path selectors resolve via dead local_fs entries instead of repo_id twins",
+  "gap_kind": "ontology",
+  "domain": "project-taxonomy",
+  "wanted_capability": "Repo_id-based selector convergence in resolve_project_context: on the cage, the 16 migrated local_fs registry entries carry b1 absolute paths that do not exist on the host, yet they are the ONLY bridge that lets b1 clients' path selectors resolve (selector order is exact path -> unique alias -> fs canonicalization; aliases forbid `/` so a path can never be an alias, and fs canonicalization fails for nonexistent paths). Their remote_mount twins share repo_id (e.g. transcript-search: local_fs 89bd722f and remote_mount c5b12dd0 both repo d4a1e491) but scoped reads do not converge across them. Wanted: read-side resolution that maps a selector hitting a source=local_fs record whose path is absent on this host onto its repo_id twin (per the remote-source-connectors design note: mount remote identity \"can back a future cross-host alias convergence, mirroring what repo_id does\"). Until then the dead entries MUST NOT be unregistered: removal breaks every b1-side project-scoped call against the cage daemon.",
+  "fallback_used": "Kept the 16 stale local_fs entries in the cage registry as the functioning b1-selector bridge; documented that they are load-bearing, not corpses.",
+  "evidence": [
+    "crates/bbox-indexing/src/projects.rs:322 resolve_project_index selector order",
+    "crates/bbox-indexing/src/projects.rs:362 valid_alias forbids /",
+    "design/connectors/remote-source-connectors.md cross-host alias convergence note",
+    "thread-21347ce5"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "ontology/project-taxonomy/cross-host-repo-id-convergence",
+  "resolution": "unresolved",
+  "thread_id": "thread-21347ce5",
+  "created_at": "2026-07-17T20:24:46Z",
+  "updated_at": "2026-07-17T20:24:46Z"
+}

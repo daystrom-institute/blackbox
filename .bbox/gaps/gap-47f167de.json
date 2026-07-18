@@ -1,0 +1,22 @@
+{
+  "id": "gap-47f167de",
+  "title": "Container vector partitions land on the pod overlay: no env override for vectors dir, image misses XDG_STATE_HOME",
+  "gap_kind": "tooling",
+  "domain": "deploy-docker",
+  "wanted_capability": "The vector store root should honor the containerized-state contract: either derive from BLACKBOX_STATE_DIR when set, offer a dedicated env override (e.g. BLACKBOX_VECTORS_DIR), or the image should set XDG_STATE_HOME to the PVC. bbox-vectors default_vectors_dir() resolves dirs::state_dir() ($XDG_STATE_HOME or $HOME/.local/state), and vectors::global() opens it unconditionally (src/server/open.rs open_unloaded + lib.rs global()), so in the deploy/docker image (which sets HOME and BLACKBOX_STATE_DIR but not XDG_STATE_HOME) every pod roll silently discards all voyage partitions and re-buys the full embed backfill. Same footgun class as TRANSCRIPT_SEARCH_INDEX_PATH (fixed in f9bfbe9e); the Dockerfile comment \"point every store env at it\" claims coverage the vectors dir does not have.",
+  "fallback_used": "Pinned XDG_STATE_HOME=/var/lib/blackbox/state/xdg-state (and the blackopsd twin) in the bbox-cage pulumi stack env, observed vectors materialize on the PVC, re-fired bbox_reembed(route=transcripts, include_transcripts=true).",
+  "evidence": [
+    "crates/bbox-vectors/src/lib.rs:314 default_vectors_dir",
+    "crates/bbox-vectors/src/lib.rs:166 global() get_or_init",
+    "src/server/open.rs:373 open_unloaded(default_vectors_dir())",
+    "deploy/docker/Dockerfile:116-119 HOME/BLACKBOX_STATE_DIR without XDG_STATE_HOME",
+    "thread-d2eee1c0 (cage: 19224 -> 4120 active vectors on pod rollout 2026-07-17)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/deploy-docker/vectors-dir-ephemeral-overlay",
+  "resolution": "unresolved",
+  "thread_id": "thread-d2eee1c0",
+  "created_at": "2026-07-17T03:08:24Z",
+  "updated_at": "2026-07-17T03:08:24Z"
+}

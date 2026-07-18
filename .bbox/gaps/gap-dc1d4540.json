@@ -1,0 +1,20 @@
+{
+  "id": "gap-dc1d4540",
+  "title": "Transcripts embed backfill has no run-to-convergence mode: each reembed call drives one 10k wave",
+  "gap_kind": "tooling",
+  "domain": "embed-runtime",
+  "wanted_capability": "An unattended convergence path for the transcripts bucket. The residue sweeper deliberately never auto-sweeps transcripts (heavy corpus scan guard, embed_runtime.rs ~line 831), and bbox_reembed's message claims \"residue past the queue cap converges automatically via the background sweeper\", which is false for the transcripts route: each explicit call enqueues one MAX_ROUTE_QUEUE_DEPTH (10k) wave and then progress halts. A ~279k-doc corpus cutover needs ~27 hand-driven waves. Wanted: either an opt-in run-to-convergence flag on bbox_reembed(transcripts) that keeps refilling until enqueueable residue is zero (keeping the guard as the consent gate), or at minimum a truthful tool message for the guarded route.",
+  "fallback_used": "Background shell driver looping tools/call bbox_reembed over the streamable-HTTP MCP endpoint (?surface=interactive + service-token bearer), waiting for queue drain per wave, terminating on partition active_count flatline (scratchpad backfill-driver.sh, cage cutover 2026-07-17).",
+  "evidence": [
+    "src/embed_runtime.rs:831 transcripts never auto-swept",
+    "src/embed_runtime.rs:82 misleading convergence message",
+    "thread-d2eee1c0"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/embed-runtime/transcripts-backfill-run-to-convergence",
+  "resolution": "unresolved",
+  "thread_id": "thread-d2eee1c0",
+  "created_at": "2026-07-17T03:51:25Z",
+  "updated_at": "2026-07-17T03:51:25Z"
+}
