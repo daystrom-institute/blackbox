@@ -311,8 +311,26 @@ pub fn self_recall_probe(route: &str, sample_every: usize, k: usize) -> Result<O
     store.self_recall_probe(route, sample_every, k)
 }
 
+/// Resolve the vector store root (gap-47f167de).
+///
+/// Order:
+/// 1. `BLACKBOX_VECTORS_DIR` — explicit override, used as-is.
+/// 2. `BLACKBOX_STATE_DIR` — `<state>/vectors`, the containerized-state
+///    contract (the deploy image sets it onto the mounted volume; before
+///    this, vectors silently resolved to the pod's ephemeral overlay via
+///    XDG and every pod roll discarded all partitions).
+/// 3. The legacy XDG state path (`$XDG_STATE_HOME`/`~/.local/state` +
+///    `blackbox/vectors`).
+///
+/// Self-healing back-compat: when rule 2 applies but `<state>/vectors` has
+/// no partitions while the legacy XDG path does, the legacy path stays in
+/// use (with a warning) — a resolution-rule change must never strand
+/// existing partitions, which is the exact failure this function fixes.
 pub fn default_vectors_dir() -> PathBuf {
-    dirs::state_dir()
+    if let Some(dir) = std::env::var_os("BLACKBOX_VECTORS_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let legacy = dirs::state_dir()
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -320,7 +338,28 @@ pub fn default_vectors_dir() -> PathBuf {
                 .join("state")
         })
         .join("blackbox")
-        .join("vectors")
+        .join("vectors");
+    if let Some(state) = std::env::var_os("BLACKBOX_STATE_DIR").filter(|v| !v.is_empty()) {
+        let candidate = PathBuf::from(state).join("vectors");
+        if !dir_has_entries(&candidate) && dir_has_entries(&legacy) {
+            tracing::warn!(
+                legacy = %legacy.display(),
+                candidate = %candidate.display(),
+                "vector store using legacy XDG path (it holds partitions; the \
+                 BLACKBOX_STATE_DIR-derived dir is empty). Move the partitions to the \
+                 derived dir or pin BLACKBOX_VECTORS_DIR to make this explicit."
+            );
+            return legacy;
+        }
+        return candidate;
+    }
+    legacy
+}
+
+fn dir_has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -2193,5 +2232,52 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "a\\b"] {
             assert!(store.remove_partition(bad).is_err(), "accepted `{bad}`");
         }
+    }
+
+    /// gap-47f167de: resolution order for the vector store root. Env
+    /// mutation is safe under nextest (process-per-test). HOME and
+    /// XDG_STATE_HOME are pinned into the tempdir so the legacy path stays
+    /// isolated on every platform (dirs::state_dir() is None on macOS,
+    /// where the fallback derives from HOME instead of XDG).
+    #[test]
+    fn default_vectors_dir_resolution_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        // SAFETY: process-per-test under nextest.
+        unsafe {
+            std::env::set_var("HOME", &root);
+            std::env::set_var("XDG_STATE_HOME", root.join("xdg"));
+            std::env::remove_var("BLACKBOX_VECTORS_DIR");
+            std::env::remove_var("BLACKBOX_STATE_DIR");
+        }
+
+        // 3: nothing set → the platform's legacy path (inside the tempdir
+        // via the pinned HOME/XDG). Capture it as the expected legacy.
+        let legacy = default_vectors_dir();
+        assert!(
+            legacy.starts_with(&root),
+            "legacy path escaped the tempdir: {}",
+            legacy.display()
+        );
+
+        // 2: BLACKBOX_STATE_DIR derives <state>/vectors (legacy empty).
+        // SAFETY: process-per-test under nextest.
+        unsafe { std::env::set_var("BLACKBOX_STATE_DIR", &state) };
+        assert_eq!(default_vectors_dir(), state.join("vectors"));
+
+        // Back-compat: legacy holds partitions, derived dir empty → legacy.
+        std::fs::create_dir_all(legacy.join("some-route")).unwrap();
+        assert_eq!(default_vectors_dir(), legacy);
+
+        // Derived dir gains content → derived wins again.
+        std::fs::create_dir_all(state.join("vectors").join("route")).unwrap();
+        assert_eq!(default_vectors_dir(), state.join("vectors"));
+
+        // 1: explicit override beats everything.
+        // SAFETY: process-per-test under nextest.
+        unsafe { std::env::set_var("BLACKBOX_VECTORS_DIR", root.join("explicit")) };
+        assert_eq!(default_vectors_dir(), root.join("explicit"));
     }
 }

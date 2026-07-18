@@ -124,7 +124,10 @@ COPY --from=builder /src/system-defaults/memories /usr/local/share/blackbox/memo
 
 # HOME is where dirs::home_dir() resolves; keep it writable. State lives on a
 # mounted volume; point every store env at it. Mount a writable PVC at
-# /var/lib/blackbox in the k8s manifest.
+# /var/lib/blackbox in the k8s manifest. The vector store derives
+# <BLACKBOX_STATE_DIR>/vectors (BLACKBOX_VECTORS_DIR overrides;
+# gap-47f167de); the tantivy index still needs an explicit
+# TRANSCRIPT_SEARCH_INDEX_PATH pin in the manifest (see README).
 ENV HOME=/home/blackbox \
     BLACKBOX_STATE_DIR=/var/lib/blackbox/state \
     BLACKBOX_RUNTIME_ROLE=corpus \
