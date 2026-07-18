@@ -210,7 +210,19 @@ impl ServerHandler for BlackboxServer {
                 None,
             ));
         }
+        // Root span per tool call: the one chokepoint every tool dispatch
+        // passes through, so Tempo gets a trace per MCP call without
+        // per-handler span instrumentation. otel.name lifts the tool name
+        // into the exported span name (tracing-opentelemetry convention);
+        // events emitted inside the handler ride along as span events and
+        // correlate the Loki records via trace id.
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "bbox.tool",
+            otel.name = %format!("tool:{}", request.name),
+            tool = %request.name,
+        );
         let tcc = ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        self.tool_router.call(tcc).instrument(span).await
     }
 }
