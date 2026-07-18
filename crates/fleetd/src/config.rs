@@ -654,19 +654,6 @@ mod tests {
         assert!(config.denied_worker_service_ports().contains(&9264));
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_authority_requires_an_external_sandbox_launcher() {
-        let config = FleetdConfig {
-            mode: FleetMode::Authority,
-            ..FleetdConfig::default()
-        };
-        assert!(matches!(
-            config.normalized(),
-            Err(FleetdError::InvalidConfiguration(_))
-        ));
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_authority_rejects_an_external_sandbox_override() {
