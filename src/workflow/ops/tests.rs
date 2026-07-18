@@ -1379,6 +1379,7 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
             .kb
             .write()
             .upsert_generated(knowledge::KnowledgeEntry {
+                repo_placed: false,
                 id: id.into(),
                 title: id.into(),
                 content: content.into(),

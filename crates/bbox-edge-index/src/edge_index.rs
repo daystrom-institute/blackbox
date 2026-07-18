@@ -1100,6 +1100,7 @@ mod tests {
             .upsert_generated(KnowledgeEntry {
                 id: "aaaabbbb".into(),
                 title: "A".into(),
+                repo_placed: false,
                 content: "claim A".into(),
                 cluster: None,
                 variants: Default::default(),

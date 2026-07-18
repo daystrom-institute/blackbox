@@ -163,6 +163,7 @@ mod tests {
     fn knowledge_doc_carries_entity_id_and_content() {
         let (_schema, fields) = crate::index::build_schema();
         let entry = KnowledgeEntry {
+            repo_placed: false,
             id: "abc12345".into(),
             title: "Render lifecycle".into(),
             content: "bbox_render publishes approved knowledge".into(),
@@ -202,6 +203,7 @@ mod tests {
     #[test]
     fn superseded_knowledge_entries_remain_indexable() {
         let mut entry = KnowledgeEntry {
+            repo_placed: false,
             id: "abc12345".into(),
             title: "Original decision".into(),
             content: "first decision about postgres consolidation".into(),
@@ -246,6 +248,7 @@ mod tests {
         let kb_dir = repo_root.join(".bbox").join("knowledge");
         std::fs::create_dir_all(&kb_dir).unwrap();
         let entry = KnowledgeEntry {
+            repo_placed: false,
             id: "proj0001".into(),
             title: "repo convention".into(),
             content: "REPO_OWNED_SEARCHABLE".into(),

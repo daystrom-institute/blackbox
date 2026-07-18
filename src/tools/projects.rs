@@ -743,6 +743,7 @@ mod tests {
 
         // A committed project entry as it lands in git (project omitted on disk).
         let entry = knowledge::KnowledgeEntry {
+            repo_placed: false,
             id: "r0000001".into(),
             title: "repo rule".into(),
             content: "committed convention".into(),

@@ -1846,6 +1846,7 @@ pdf_figure = "voyage_visual"
             version: 1,
             write_redirects: Default::default(),
             entries: vec![KnowledgeEntry {
+                repo_placed: false,
                 id: "vector-only".into(),
                 title: "Vector only".into(),
                 content: "semantic-only content".into(),

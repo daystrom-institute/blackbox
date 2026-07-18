@@ -592,6 +592,7 @@ mod tests {
 
     fn test_entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
+            repo_placed: false,
             id: id.into(),
             title: "actor test entry".into(),
             content: content.into(),

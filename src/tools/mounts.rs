@@ -355,6 +355,7 @@ mod tests {
         // disk), mirroring projects.rs's
         // register_loads_and_counts_committed_project_knowledge.
         let entry = crate::knowledge::KnowledgeEntry {
+            repo_placed: false,
             id: "m0000001".into(),
             title: "mounted repo rule".into(),
             content: "committed convention travels with the mount".into(),
