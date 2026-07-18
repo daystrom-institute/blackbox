@@ -1,0 +1,20 @@
+{
+  "id": "gap-4e2db371",
+  "title": "Remote corpus daemon cannot render project provider files or read repo-owned knowledge",
+  "gap_kind": "mcp_surface",
+  "domain": "render-lifecycle",
+  "wanted_capability": "bbox_render scope=project (and repo-owned .bbox/knowledge reads/writes) against a checkout that lives on a satellite machine, when blackboxd runs as the remote corpus host (cage). The remote daemon has no filesystem access to the checkout: real render fails with ENOENT and dry-run silently shows a central-store-only view that would clobber the 71 repo-owned entries down to 1 if written. Needs a satellite-side render path (collector/fleetd-mediated, or a bbox CLI render against the local checkout) or an explicit fail-closed guard naming the limitation. Same limitation recursively: bbox_gap and bbox_learn project-scoped writes land in the remote daemon's state instead of the repo-owned .bbox/ stores (this file is a hand-mirror of the daemon-side gap record).",
+  "evidence": [
+    "bbox_render project ENOENT + dry-run showing 1 entry vs 71 repo-owned (2026-07-18)",
+    "design/daemon-runtime/remote-corpus-host.md",
+    "local 7264 closed; corpus role served from the cage deployment",
+    ".bbox/knowledge/891f4a74.json + AGENTS.md block hand-materialized as the workaround"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/render-lifecycle/remote-corpus-project-render",
+  "notes": "Filed via the remote daemon (record exists in its store under the same dedupe_key); mirrored here so the repo-owned gap store stays authoritative per the repo-owned-project-state convention.",
+  "resolution": "unresolved",
+  "created_at": "2026-07-18T06:00:00Z",
+  "updated_at": "2026-07-18T06:00:00Z"
+}
