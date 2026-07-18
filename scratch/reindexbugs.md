@@ -140,7 +140,7 @@ Fix:
 Full git ingestion loads all commits, then calls `git diff-tree` once per commit
 to derive `COMMIT_TOUCHED_FILE` edges.
 
-Current registered repositories include about 17,301 commits, with `planglobal`
+Current registered repositories include about 17,301 commits, with the largest client repo
 at about 14,359 commits.
 
 Impact:

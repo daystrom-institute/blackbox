@@ -119,7 +119,7 @@ and the existing observability stack scraping the services so reindex and
 embedding behavior is finally graphed.
 
 **Estate placement resolution (2026-07-16): separate overlay repo.** The
-infra repo self-describes as PlanGlobal-estate-scoped and converge-controlled
+infra repo self-describes as work-estate-scoped and converge-controlled
 ("mixing two change-control regimes in one repo forces one of them to lie");
 blackbox is personal tooling on a different cadence. The deployment lives in
 a small personal overlay repo (`bbox-cage`, created 2026-07-16): namespace,
