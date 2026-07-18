@@ -3269,6 +3269,185 @@ pub(crate) async fn roster_handler(
 
     Ok(axum::Json(entries))
 }
+// ── /render/plan + /render/ack — satellite render (gap-4e2db371) ─────────
+//
+// A remote corpus daemon cannot materialize files on the operator's
+// machine (provider-memory renders, repo-owned knowledge/gap placement).
+// These routes serve the computed plan to a satellite `bro render`, which
+// owns the local writes and acks repo-owned placements. Registered in the
+// ALWAYS-ON router (both roles): the corpus role is exactly the deployment
+// that needs them, and a local compatibility daemon serving them is
+// harmless (the client is then simply an alternative to bbox_render).
+
+#[derive(Deserialize)]
+pub(crate) struct RenderPlanQuery {
+    /// global | project | both; defaults like bbox_render (project present
+    /// → both, else global).
+    pub scope: Option<String>,
+    /// The CLIENT's canonical project path: used purely as the entry scope
+    /// key and relpath base, never touched on this filesystem.
+    pub project: Option<String>,
+    /// Entry-scope override for managed-worktree renders (see
+    /// rescope_render_project; the satellite passes both when it targets a
+    /// worktree checkout).
+    pub scope_project: Option<String>,
+    /// Client-side `<project>/PROJECT.md` existence (replaces the daemon's
+    /// local probe).
+    pub has_project_md: Option<bool>,
+    /// The client's shared-include path (~/.blackbox/BLACKBOX.md expanded);
+    /// provider bodies embed a reference to it.
+    pub common_path: Option<String>,
+}
+
+pub(crate) async fn render_plan_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(q): Query<RenderPlanQuery>,
+) -> Result<axum::Json<bro_protocol::RenderPlanV1>, (axum::http::StatusCode, String)> {
+    use bro_protocol::{RenderPlanItemV1, RenderPlanV1, RepoRecordV1};
+    use sha2::Digest;
+
+    let bad = |msg: String| (axum::http::StatusCode::BAD_REQUEST, msg);
+    let scope = q
+        .scope
+        .as_deref()
+        .unwrap_or(if q.project.is_some() { "both" } else { "global" });
+    let do_global = matches!(scope, "global" | "both");
+    let do_project = matches!(scope, "project" | "both") && q.project.is_some();
+    if !do_global && !do_project {
+        return Err(bad(format!(
+            "nothing to plan: scope={scope} project={}",
+            q.project.as_deref().unwrap_or("<none>")
+        )));
+    }
+
+    let mut items = Vec::new();
+    let mut repo_records = Vec::new();
+    {
+        let kb = state.kb.read();
+        if do_global {
+            let common_path = q
+                .common_path
+                .clone()
+                .unwrap_or_else(|| "~/.blackbox/BLACKBOX.md".to_string());
+            for (target, block) in kb
+                .render_plan_global(Path::new(&common_path))
+                .map_err(|e| bad(format!("global plan: {e:#}")))?
+            {
+                items.push(RenderPlanItemV1::ManagedRegion { target, block });
+            }
+        }
+        if do_project {
+            let project = q.project.as_deref().unwrap();
+            let scope_dir = q.scope_project.as_deref().unwrap_or(project);
+            for (file_name, contents) in kb
+                .render_plan_project(scope_dir, q.has_project_md.unwrap_or(false))
+                .map_err(|e| bad(format!("project plan: {e:#}")))?
+            {
+                items.push(RenderPlanItemV1::WholeFile {
+                    file_name,
+                    contents,
+                });
+            }
+            for (id, relpath, contents) in kb
+                .repo_pending_records(scope_dir)
+                .map_err(|e| bad(format!("pending knowledge: {e:#}")))?
+            {
+                repo_records.push(RepoRecordV1 {
+                    store: "knowledge".into(),
+                    id,
+                    relpath,
+                    contents,
+                });
+            }
+        }
+    }
+    if do_project {
+        let scope_dir = q
+            .scope_project
+            .as_deref()
+            .or(q.project.as_deref())
+            .unwrap();
+        for (id, relpath, contents) in state
+            .gaps
+            .read()
+            .repo_pending_records(scope_dir)
+            .map_err(|e| bad(format!("pending gaps: {e:#}")))?
+        {
+            repo_records.push(RepoRecordV1 {
+                store: "gaps".into(),
+                id,
+                relpath,
+                contents,
+            });
+        }
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    for item in &items {
+        match item {
+            RenderPlanItemV1::WholeFile {
+                file_name,
+                contents,
+            } => {
+                hasher.update(file_name.as_bytes());
+                hasher.update(contents.as_bytes());
+            }
+            RenderPlanItemV1::ManagedRegion { target, block } => {
+                hasher.update(target.as_bytes());
+                hasher.update(block.as_bytes());
+            }
+        }
+    }
+    for r in &repo_records {
+        hasher.update(r.relpath.as_bytes());
+        hasher.update(r.contents.as_bytes());
+    }
+    let render_hash = format!("{:x}", hasher.finalize());
+
+    Ok(axum::Json(RenderPlanV1 {
+        version: 1,
+        render_hash,
+        items,
+        repo_records,
+    }))
+}
+
+pub(crate) async fn render_ack_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<bro_protocol::RenderAckV1>,
+) -> Result<axum::Json<bro_protocol::RenderAckResponseV1>, (axum::http::StatusCode, String)> {
+    let knowledge_marked = if req.knowledge_ids.is_empty() {
+        0
+    } else {
+        let marked = state
+            .kb
+            .write()
+            .mark_repo_placed(&req.project, &req.knowledge_ids);
+        if marked > 0 {
+            state.kb_persister.request();
+        }
+        marked
+    };
+    let gaps_marked = if req.gap_ids.is_empty() {
+        0
+    } else {
+        state
+            .gaps
+            .write()
+            .mark_repo_placed(&req.project, &req.gap_ids)
+            .map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("gap ack: {e:#}"),
+                )
+            })?
+    };
+    Ok(axum::Json(bro_protocol::RenderAckResponseV1 {
+        knowledge_marked,
+        gaps_marked,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

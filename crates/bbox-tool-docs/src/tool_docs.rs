@@ -663,7 +663,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_render",
         category: ToolCategory::Knowledge,
         summary: "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.",
-        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches host-wide memory files; `project` writes project-local provider files that include PROJECT.md by reference. Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches host-wide memory files; `project` writes project-local provider files that include PROJECT.md by reference. On a remote corpus host this tool refuses (it cannot materialize files on the operator's machine): run `bro render` on the machine that owns the files instead — it pulls the daemon's render plan and applies it locally, including pending repo-owned knowledge/gap records. Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: Some(r#"bbox_render(scope="project", project="/repo/x")"#),
     },
     ToolDoc {
@@ -2087,6 +2087,7 @@ pub fn sync_into_knowledge(kb: &mut bbox_knowledge::knowledge::Knowledge) -> Res
     let entry = KnowledgeEntry {
         id: TOOL_DOC_ENTRY_ID.to_string(),
         title: "Blackbox tool reference".to_string(),
+        repo_placed: false,
         content,
         cluster: None,
         variants: Default::default(),

@@ -869,6 +869,7 @@ mod tests {
         created_at: &str,
     ) -> GapNote {
         GapNote {
+            repo_placed: false,
             id: id.into(),
             title: title.into(),
             gap_kind,

@@ -48,6 +48,20 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_render", move || {
+            // Fail closed on the remote corpus host (gap-4e2db371): this
+            // daemon's filesystem is not the operator's. A global render
+            // would "succeed" into container-local provider files nobody
+            // reads; a project render would either ENOENT or present a
+            // central-store-only dry-run view as the whole truth. Renders
+            // are satellite-side there.
+            if server.runtime_role == crate::server::RuntimeRole::Corpus {
+                anyhow::bail!(
+                    "bbox_render is disabled on the corpus host: it cannot materialize files on \
+                     the operator's machine. Run `bro render` (optionally --project <dir>) on the \
+                     machine that owns the files; it pulls this daemon's render plan and applies \
+                     it locally."
+                );
+            }
             let mut p = p;
             if p.project.is_some() {
                 let projects = server.state.projects.read().list();

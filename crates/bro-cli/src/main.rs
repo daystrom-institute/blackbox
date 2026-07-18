@@ -28,6 +28,7 @@ mod fleet_classifier;
 mod fleet_tui;
 mod logging;
 mod mcp_call;
+mod render_apply;
 #[cfg(test)]
 mod test_backend;
 
@@ -58,6 +59,9 @@ enum BroCommand {
     Orchestrate(OrchestrateArgs),
     /// MCP helpers - call daemon tools over streamable HTTP
     Mcp(mcp_call::McpArgs),
+    /// Apply the daemon's render plan locally (satellite-side provider
+    /// files + repo-owned record placement; gap-4e2db371)
+    Render(render_apply::RenderArgs),
     /// Fleet cockpit — dispatch and live-drive many top-level agents
     Fleet(FleetArgs),
     /// Single-agent cockpit — launch one agent into the Fleet transcript view
@@ -728,6 +732,7 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Tail(args) => rt.block_on(run_tail_stream_printer(TailSelectors::from(args))),
         BroCommand::Orchestrate(args) => rt.block_on(run_orchestrate(args)),
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
+        BroCommand::Render(args) => rt.block_on(render_apply::run(args)),
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
             rt.block_on(fleet_tui::run(args.cwd, args.daemon_url, args.force))

@@ -39,8 +39,13 @@ impl BlackboxServer {
                 p.write_dir = write_dir;
             }
             let (id, created) = server.state.gaps.write().file(&p)?;
+            let pending = p
+                .project
+                .as_deref()
+                .and_then(|d| crate::gaps::repo_pending_note(d, &id))
+                .unwrap_or_default();
             if created {
-                Ok(format!("Gap {id} filed (dedupe_key={})", p.dedupe_key))
+                Ok(format!("Gap {id} filed (dedupe_key={}){pending}", p.dedupe_key))
             } else {
                 Ok(format!(
                     "Gap already open as {id} (same dedupe_key); pass allow_recurrence=true to tally a recurrence, or reference {id} from a follow-up"

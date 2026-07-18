@@ -56,7 +56,12 @@ pub(super) fn build_http_app(
         .route(
             "/internal/records",
             axum::routing::post(internal_record_ingest_handler),
-        );
+        )
+        // Satellite render (gap-4e2db371): always-on for BOTH roles — the
+        // remote corpus role is exactly the deployment whose satellites
+        // need the plan; keep these out of the Compatibility-only block.
+        .route("/render/plan", axum::routing::get(render_plan_handler))
+        .route("/render/ack", axum::routing::post(render_ack_handler));
     let app = if role == RuntimeRole::Compatibility {
         app.route("/tail", axum::routing::get(tail_handler))
             .route("/roster", axum::routing::get(roster_handler))

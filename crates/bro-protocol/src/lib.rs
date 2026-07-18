@@ -9,8 +9,14 @@ use serde_json::Value;
 
 mod dispatch;
 mod dispatch_context;
+mod render_plan;
 mod transcript;
 mod worker;
+
+pub use render_plan::{
+    GENERATED_HEADER_PREFIX, MANAGED_END, MANAGED_START, RenderAckResponseV1, RenderAckV1,
+    RenderPlanItemV1, RenderPlanV1, RepoRecordV1,
+};
 
 pub use dispatch::{
     CloseoutErrorClass, CloseoutHooksWire, CloseoutOutcome, CloseoutPhase, CloseoutRequest,

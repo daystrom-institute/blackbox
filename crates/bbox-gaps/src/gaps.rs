@@ -195,6 +195,12 @@ pub struct GapNote {
     pub bro: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Repo-owned file was placed by a satellite (`bro render` drain + ack)
+    /// while this daemon could not see the checkout (remote corpus host,
+    /// gap-4e2db371). Stays central for listing until the committed copy
+    /// reaches this daemon; excluded from future render-plan repo records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repo_placed: bool,
     pub created_at: String,
     /// Defaulted on deserialize (backfilled from `created_at` at repo-file
     /// load) so a committed gap file written without it — by hand, by an
@@ -334,6 +340,7 @@ impl GapNote {
             title,
             gap_kind,
             domain,
+            repo_placed: false,
             wanted_capability,
             missing_primitive: str_field(object, "missing_primitive"),
             fallback_used: str_field(object, "fallback_used"),
@@ -565,6 +572,21 @@ fn repo_gaps_dir(project_dir: &Path) -> PathBuf {
 /// first project-scoped `bbox_gap`.
 pub fn project_is_repo_owned(project_dir: &Path) -> bool {
     repo_gaps_dir(project_dir).is_dir()
+}
+
+/// A one-line placement note for tool results when this daemon cannot see
+/// the project checkout at all (remote corpus host, gap-4e2db371): the gap
+/// stays central with repo-owned placement pending until a satellite drains
+/// it (`bro render`).
+pub fn repo_pending_note(project: &str, gap_id: &str) -> Option<String> {
+    if !project.starts_with('/') || Path::new(project).is_dir() {
+        return None;
+    }
+    Some(format!(
+        "; repo-owned placement PENDING (this daemon cannot see {project}) — run \
+         `bro render --project {project}` on the machine that owns the checkout to \
+         place .bbox/gaps/{gap_id}.json"
+    ))
 }
 
 /// Load every project-scoped gap committed under `<project>/.bbox/gaps/`,
@@ -943,6 +965,7 @@ impl GapStore {
 
         let now = Self::now_iso();
         let gap = GapNote {
+            repo_placed: false,
             id: Self::gen_id(),
             title: p.title.trim().to_string(),
             gap_kind,
@@ -1037,6 +1060,60 @@ impl GapStore {
         }
         gap.write_dir = Some(dir.to_string());
         Ok(())
+    }
+
+    // ── Satellite render plan (gap-4e2db371) ──────────────────────────
+
+    /// Project-scoped gaps this daemon could NOT place repo-owned (no
+    /// visible checkout) that a satellite should drain into the repo:
+    /// `(id, relpath, contents)` in the committed-file serialization
+    /// `persist_repo_gap_entries` uses.
+    pub fn repo_pending_records(&self, project: &str) -> Result<Vec<(String, String, String)>> {
+        let mut records = Vec::new();
+        for g in &self.data.gaps {
+            if g.project.as_deref() != Some(project) || g.repo_placed {
+                continue;
+            }
+            let placeable_here = project_is_repo_owned(Path::new(project))
+                || g
+                    .write_dir
+                    .as_deref()
+                    .is_some_and(|d| project_is_repo_owned(Path::new(d)));
+            if placeable_here {
+                continue; // this daemon can place it itself
+            }
+            let mut on_disk = g.clone();
+            on_disk.project = None;
+            on_disk.write_dir = None;
+            let bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+            records.push((
+                g.id.clone(),
+                format!(".bbox/gaps/{}.json", g.id),
+                String::from_utf8(bytes)?,
+            ));
+        }
+        Ok(records)
+    }
+
+    /// Satellite ack: the listed gaps now exist as committed repo files.
+    /// They stay central for listing but leave the pending set.
+    pub fn mark_repo_placed(&mut self, project: &str, ids: &[String]) -> Result<usize> {
+        let now = Self::now_iso();
+        let mut marked = 0usize;
+        for g in &mut self.data.gaps {
+            if g.project.as_deref() == Some(project)
+                && !g.repo_placed
+                && ids.iter().any(|id| id == &g.id)
+            {
+                g.repo_placed = true;
+                g.updated_at = now.clone();
+                marked += 1;
+            }
+        }
+        if marked > 0 {
+            self.save()?;
+        }
+        Ok(marked)
     }
 
     pub fn resolve(&mut self, p: &GapResolveParams) -> Result<String> {
@@ -1436,6 +1513,44 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].impact, GapImpact::High);
         assert_eq!(listed[0].gap_kind, GapKind::Tooling);
+    }
+
+    #[test]
+    fn repo_pending_records_round_trip_through_mark_placed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let mut params = file_params("Unplaceable", "tooling/test-domain/unplaceable");
+        params.scope = Some("project".into());
+        // A checkout this daemon cannot see: stays central, pending.
+        params.project = Some("/no/such/checkout/anywhere".into());
+        let (id, created) = store.file(&params).unwrap();
+        assert!(created);
+
+        let pending = store
+            .repo_pending_records("/no/such/checkout/anywhere")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let (pid, relpath, contents) = &pending[0];
+        assert_eq!(pid, &id);
+        assert_eq!(relpath, &format!(".bbox/gaps/{id}.json"));
+        assert!(!contents.contains("\"project\""));
+
+        assert_eq!(
+            store
+                .mark_repo_placed("/no/such/checkout/anywhere", &[id.clone()])
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .repo_pending_records("/no/such/checkout/anywhere")
+                .unwrap()
+                .is_empty(),
+            "placed gaps must leave the pending set"
+        );
+        // Still listed centrally.
+        assert_eq!(store.query(&GapListParams::default()).len(), 1);
     }
 
     #[test]
