@@ -385,7 +385,7 @@ fn parse_cargo_json_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let line_no = primary
-            .and_then(|s| s.get("line_start").or_else(|| s.get("line_start")))
+            .and_then(|s| s.get("line_start"))
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
         let column_no = primary
@@ -658,7 +658,7 @@ fn anchor_diagnostics(root: &Path, cwd: &Path, diagnostics: &mut [BuildDiagnosti
     // file touched by many diagnostics is read once.
     let mut cache: BTreeMap<PathBuf, Option<(String, Vec<u8>)>> = BTreeMap::new();
 
-    let mut file_sha_bytes = |cache: &mut BTreeMap<PathBuf, Option<(String, Vec<u8>)>>,
+    let file_sha_bytes = |cache: &mut BTreeMap<PathBuf, Option<(String, Vec<u8>)>>,
                               resolved: &Path| {
         if let Some(entry) = cache.get(resolved) {
             return entry.clone();

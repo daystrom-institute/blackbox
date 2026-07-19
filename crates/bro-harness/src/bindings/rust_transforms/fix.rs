@@ -1,4 +1,4 @@
-//! `rust.fixRound` — classify rustc/clippy diagnostics into edit proposals.
+//! `rust.fixRound` - classify rustc/clippy diagnostics into edit proposals.
 //!
 //! The loop engine of the rust compile-fix surface
 //! (design/refactor-tools/rust/rust-isolate-surface.md §2.2, §3.1). It
@@ -25,8 +25,8 @@ use bro_tools::{Tool, ToolAnnotations, ToolCx, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::code_facts::Span;
-use super::ledger::{AuthorityTier, ProvenanceLedger};
+use crate::bindings::code_facts::Span;
+use crate::bindings::ledger::{AuthorityTier, ProvenanceLedger};
 
 /// `rust.fixRound` tool. Holds the session-shared provenance ledger so
 /// verbatim compiler suggestions enter the lineage at `compiler_suggested`
@@ -338,7 +338,7 @@ fn synthesize_visibility_bump(
             span,
             new_text,
             provenance: AuthorityTier::SyntaxOnly.as_str(),
-            code: Some("E0603/E0624/E0616".to_string()),
+            code: code.map(|c| c.to_string()),
         });
     }
     None
@@ -598,10 +598,10 @@ mod tests {
     }
 
     #[test]
-    fn add_use_synthesis_floors_at_syntax_only() {
-        // An E0432 whose suggestion replacement is a `use` decl synthesizes
-        // an add-use proposal at syntax_only (planner guess, not compiler
-        // bytes for the insert position).
+    fn machine_applicable_takes_precedence_over_add_use_synthesis() {
+        // An E0432 whose suggestion replacement is a `use` decl: the verbatim
+        // MachineApplicable suggestion fires first (compiler_suggested),
+        // so the add-use synthesis arm (syntax_only) is never reached.
         let sha = bbox_refactor::sha256_hex(b"fixture");
         let suggestion = json!({
             "file": "src/lib.rs",
@@ -616,14 +616,9 @@ mod tests {
                 "content_sha256": sha,
             }
         });
-        // E0432 with a MachineApplicable suggestion: the verbatim suggestion
-        // path fires first (compiler_suggested), so this exercises the
-        // fallback by using a non-E0308 code the classifier routes to add-use
-        // AFTER the machine-applicable path already consumed it.
         let diag = diag_with_suggestion("E0432", "unresolved import", suggestion);
         let result = result_json(fix_round().classify(std::slice::from_ref(&diag), None));
         let changes = result["changes"].as_array().unwrap();
-        // The machine-applicable suggestion fires first at compiler_suggested.
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0]["provenance"], "compiler_suggested");
     }

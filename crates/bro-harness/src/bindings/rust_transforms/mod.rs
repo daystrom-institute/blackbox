@@ -1,4 +1,4 @@
-//! `rust.*` — the rust transform cell bindings.
+//! `rust.*` - the rust transform cell bindings.
 //!
 //! Design home: `design/refactor-tools/rust/rust-isolate-surface.md`.
 //! Trust model + porting recipe: `crates/bro-harness/src/bindings/AGENTS.md`.
@@ -24,14 +24,14 @@ use bro_code_mode::ToolNamespaceDescription;
 use bro_tools::{Tool, ToolAnnotations, ToolCx, ToolResult};
 use serde_json::{Value, json};
 
-use super::ledger::ProvenanceLedger;
+use crate::bindings::ledger::ProvenanceLedger;
 
-/// `rust.describe` — depth-on-demand contract for one rust transform
+/// `rust.describe` - depth-on-demand contract for one rust transform
 /// (matches the `analysis.describe` / `java.describe` pattern; the namespace
 /// index stays a compact one-liner).
 pub struct RustDescribe;
 
-const FIX_ROUND_CONTRACT: &str = r#"rust.fixRound — classify rustc/clippy diagnostics into reviewable edit proposals + explicit leftovers.
+const FIX_ROUND_CONTRACT: &str = r#"rust.fixRound - classify rustc/clippy diagnostics into reviewable edit proposals + explicit leftovers.
 
 WHAT IT DOES
   Takes the `build.gate` diagnostics shape verbatim (the `diagnostics[]` array
@@ -46,7 +46,7 @@ WHAT IT DOES
     - Classifier-synthesized proposals (add-use from E0432/E0433/E0282,
       visibility-bump from E0603/E0624/E0616, add-use from E0599) are
       synthesized at `syntax_only`. The replacement text may come from the
-      compiler, but the INSERT POSITION is a planner guess — honesty about
+      compiler, but the INSERT POSITION is a planner guess - honesty about
       sourcing is what the provenance ladder preserves.
     - Borrow-checker / trait-bound / move errors (E0277, E0382, E0502,
       E0507, E0596) and uncategorized diagnostics become `leftovers`. They
@@ -69,7 +69,7 @@ PARAMS
                                        `restrict_to_files`).
 
 RETURNS { changes, findings, leftovers, counts, issuance }
-  changes[]: each is `{ span, new_text, provenance, code? }` —
+  changes[]: each is `{ span, new_text, provenance, code? }` -
     span          hash-anchored Span (from the build.gate suggestion span;
                   re-derive via code.read if absent)
     new_text      verbatim `suggested_replacement` bytes (compiler_suggested)
@@ -77,7 +77,7 @@ RETURNS { changes, findings, leftovers, counts, issuance }
     provenance    "compiler_suggested" | "syntax_only"
     code?         the diagnostic code that motivated the proposal
   findings[]: review notes (e.g. visibility_bump_proposed)
-  leftovers[]: each is `{ message, code?, reason }` — diagnostics the cell
+  leftovers[]: each is `{ message, code?, reason }` - diagnostics the cell
     must address by hand.
   counts: { changes, leftovers }
 
