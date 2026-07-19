@@ -77,6 +77,12 @@ struct Leftover {
 
 impl RustFixRound {
     fn classify(&self, diagnostics: &[Value], restrict: Option<&[String]>) -> ToolResult {
+        if diagnostics.is_empty() {
+            return ToolResult::Error(
+                "rust.fixRound: no diagnostics to classify (pass build.gate diagnostics[] or raw_json)"
+                    .to_string(),
+            );
+        }
         let mut changes: Vec<ChangeProposal> = Vec::new();
         let mut leftovers: Vec<Leftover> = Vec::new();
         let mut findings: Vec<Value> = Vec::new();
