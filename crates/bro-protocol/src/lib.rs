@@ -9,6 +9,7 @@ use serde_json::Value;
 
 mod dispatch;
 mod dispatch_context;
+mod fleetd;
 mod transcript;
 mod worker;
 
@@ -18,6 +19,9 @@ pub use dispatch::{
 };
 pub use dispatch_context::{
     DISPATCH_CONTEXT_VERSION, DirectiveCadence, DispatchContext, DispatchDirective, DispatchScope,
+};
+pub use fleetd::{
+    DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState, SessionSummary,
 };
 pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
 pub use worker::{REDACTED, SecretEnv, WorkerSpawnSpec};
