@@ -499,7 +499,8 @@ bro-lsp spawns rust-analyzer with a scrubbed environment: (1) PATH with the
 lane shim dir (`~/.lane/shims`, overridable via `BRO_LSP_LANE_SHIM_DIR`)
 removed, so `cargo`/`rustc` resolve to the host rustup proxies; (2)
 `CARGO_TARGET_DIR` set to a host-local per-root dir
-(`BRO_LSP_RA_TARGET_DIR` or `~/.cache/blackbox/ra-target/<sha256(root)[:16]>`);
+(`BRO_LSP_RA_TARGET_DIR` or `<dirs::cache_dir>/blackbox/ra-target/<sha256(root)[:16]>`, i.e.
+`~/Library/Caches/blackbox/ra-target/` on macOS, `~/.cache/blackbox/ra-target/` on Linux);
 (3) `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` unset, so a sccache lane
 shim cannot re-enter the pod. v2 (recorded, not built): pod-side
 rust-analyzer with a bidirectional URI translation layer. Rejected:
