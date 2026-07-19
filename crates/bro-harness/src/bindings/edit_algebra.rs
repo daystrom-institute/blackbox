@@ -761,21 +761,30 @@ impl Tool for EditsApply {
         // semantic_status is the weakest link across every member; file
         // creations are cell-authored content, so they count syntax_only.
         let mut lineage_lsp = 0usize;
+        let mut lineage_compiler = 0usize;
         let mut lineage_syntax = set.creates.len() + set.deletes.len();
         for accum in set.files.values() {
             for le in &accum.edits {
                 match le.tier {
                     AuthorityTier::LspVerified => lineage_lsp += 1,
+                    AuthorityTier::CompilerSuggested => lineage_compiler += 1,
                     AuthorityTier::SyntaxOnly => lineage_syntax += 1,
                 }
             }
         }
-        let semantic_status = if lineage_syntax == 0 {
-            AuthorityTier::LspVerified.as_str()
+        let semantic_tier = if lineage_syntax > 0 {
+            AuthorityTier::SyntaxOnly
+        } else if lineage_compiler > 0 {
+            AuthorityTier::CompilerSuggested
         } else {
-            AuthorityTier::SyntaxOnly.as_str()
+            AuthorityTier::LspVerified
         };
-        let lineage = json!({ "lsp_verified": lineage_lsp, "syntax_only": lineage_syntax });
+        let semantic_status = semantic_tier.as_str();
+        let lineage = json!({
+            "lsp_verified": lineage_lsp,
+            "compiler_suggested": lineage_compiler,
+            "syntax_only": lineage_syntax
+        });
 
         // Resolve every touched path inside the root before any work.
         let mut resolved_edits: Vec<(String, PathBuf, FileAccum)> = Vec::new();
@@ -1694,17 +1703,110 @@ mod tests {
         assert_eq!(result["semantic_status"], "syntax_only", "{result}");
         assert_eq!(result["lineage"]["syntax_only"], 1);
     }
+
+    #[tokio::test]
+    async fn compiler_suggested_merge_applies_compiler_suggested() {
+        // rust.fixRound records verbatim MachineApplicable suggestions at the
+        // compiler_suggested tier; edits.merge recognizes them by content
+        // digest and edits.apply surfaces that lineage.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (_, beta) = beta_span(&root, &cx).await;
+
+        let ledger = Arc::new(ProvenanceLedger::default());
+        let span: Span = serde_json::from_value(beta["span"].clone()).unwrap();
+        ledger.record_changes(
+            "rust.fixRound",
+            AuthorityTier::CompilerSuggested,
+            [(&span, RENAMED_BETA)],
+        );
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        let merged = json_of(
+            EditsMerge(store.clone(), ledger)
+                .call(
+                    json!({ "es": es, "changes": [{ "span": beta["span"], "new_text": RENAMED_BETA }] }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(merged["ledgered"], 1, "{merged}");
+
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["semantic_status"], "compiler_suggested", "{result}");
+        assert_eq!(result["lineage"]["compiler_suggested"], 1);
+        assert_eq!(result["lineage"]["lsp_verified"], 0);
+        assert_eq!(result["lineage"]["syntax_only"], 0);
+    }
+
+    #[tokio::test]
+    async fn compiler_suggested_floors_above_syntax_only_in_mixed_set() {
+        // A compiler_suggested change + a cell-authored change: the weakest
+        // link is syntax_only, so the set's status floors there even though
+        // one member is compiler-authored.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (store, cx) = set_up(&root);
+        let (items, beta) = beta_span(&root, &cx).await;
+        let alpha = items["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "Alpha")
+            .unwrap()
+            .clone();
+
+        let ledger = Arc::new(ProvenanceLedger::default());
+        let span: Span = serde_json::from_value(beta["span"].clone()).unwrap();
+        ledger.record_changes(
+            "rust.fixRound",
+            AuthorityTier::CompilerSuggested,
+            [(&span, RENAMED_BETA)],
+        );
+
+        let es = json_of(EditsBegin(store.clone()).call(json!({}), &cx).await)
+            .as_str()
+            .unwrap()
+            .to_string();
+        json_of(
+            EditsMerge(store.clone(), ledger)
+                .call(
+                    json!({ "es": es, "changes": [{ "span": beta["span"], "new_text": RENAMED_BETA }] }),
+                    &cx,
+                )
+                .await,
+        );
+        json_of(
+            EditsInsertBefore(store.clone())
+                .call(
+                    json!({ "es": es, "span": alpha["span"], "text": "/// Cell-authored doc.\n" }),
+                    &cx,
+                )
+                .await,
+        );
+
+        let result = json_of(EditsApply(store).call(json!({ "es": es }), &cx).await);
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["semantic_status"], "syntax_only", "{result}");
+        assert_eq!(result["lineage"]["compiler_suggested"], 1);
+        assert_eq!(result["lineage"]["syntax_only"], 1);
+    }
 }
 
 /// Hand-authored namespace documentation + TS declarations (cell-dsl §5.2).
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "edits".to_string(),
-        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / deleteFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, stale_delete, invalid_edits, create_exists, parse_error_after_apply, write_failed, delete_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile/deleteFile entries, and any hand-rewritten change floor at syntax_only. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
+        description: "The edit algebra and its apply choke point — the ONLY mutation path for source edits; prefer it over file_write/shell for span-shaped changes. Build: begin() → replace/insertBefore/insertAfter/delete (consume hash-anchored Spans from code.*) / createFile / deleteFile / merge (fold lsp.rename changes in) → apply(). NO confirm flag: a clean EditSet applies; detected conditions bounce with `applied: false` and findings [{kind, file, detail, resolution_hint}] (kinds: stale_span, stale_delete, invalid_edits, create_exists, parse_error_after_apply, write_failed, delete_failed) — repair by re-deriving fresh facts, rebuilding the edits, and applying again. Writes are atomic with snapshot/rollback; tree_sitter_no_errors validation runs by default and rolls back broken syntax. All spans for one file must carry the SAME content_sha256 (one read generation). After a successful apply every Span minted before it is stale — re-derive facts before further edits. Run `cargo check`/tests via shell AFTER a successful apply; apply itself only guarantees parseability. semantic_status is lineage-computed host-side at apply (weakest link): edits merged UNMODIFIED from an authority like lsp.rename keep lsp_verified; cell-authored edits, createFile/deleteFile entries, and any hand-rewritten change floor at syntax_only; compiler-suggested edits (rust.fixRound verbatim MachineApplicable suggestions) keep compiler_suggested. Provenance is recognized by content, not claimed — writing a status into a value does nothing."
             .to_string(),
         declarations: r#"type Finding = { kind: "stale_span" | "stale_delete" | "invalid_edits" | "create_exists" | "parse_error_after_apply" | "write_failed" | "delete_failed"; file: string; detail: string; resolution_hint: string };
-	type SemanticStatus = "lsp_verified" | "syntax_only";  // lineage-computed weakest link, recomputed host-side at apply; cell-supplied claims are ignored
-	type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; deleted?: boolean; content_sha256: string }[]; semantic_status: SemanticStatus; lineage: { lsp_verified: number; syntax_only: number }; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation; mint fresh Spans from it without re-calling code.items
+	type SemanticStatus = "lsp_verified" | "compiler_suggested" | "syntax_only";  // lineage-computed weakest link, recomputed host-side at apply; cell-supplied claims are ignored
+	type Applied = { applied: true; es: string; summary: { file: string; edits?: number; bytes_before?: number; bytes_after?: number; created?: boolean; deleted?: boolean; content_sha256: string }[]; semantic_status: SemanticStatus; lineage: { lsp_verified: number; compiler_suggested: number; syntax_only: number }; validations: { validation: string; status: string; files_checked: number }[] };  // content_sha256 is the NEW generation; mint fresh Spans from it without re-calling code.items
 	type Bounced = { applied: false; es: string; findings: Finding[]; rolled_back?: boolean; semantic_status: SemanticStatus };
 	type ReplaceTextResult = { es: string; file: string; edit_count: number; span: Span; match_count: 1 };
 	declare const edits: {

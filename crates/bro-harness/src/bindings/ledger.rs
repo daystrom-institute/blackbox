@@ -38,6 +38,15 @@ pub enum AuthorityTier {
     /// Bytes a program manipulated without semantic authority — the floor,
     /// and the tier of every cell-authored edit.
     SyntaxOnly,
+    /// Authored by the compiler (rustc/clippy) as a verbatim
+    /// `MachineApplicable` `suggested_replacement`, recognized by the ledger
+    /// at consumption. Stronger than a tree-sitter guess (the compiler
+    /// asserts it compiles), weaker than a semantics-preserving server
+    /// transformation (the compiler suggests what compiles, not what was
+    /// meant). Recorded only for edits whose span AND replacement come
+    /// verbatim from a compiler suggestion (design/refactor-tools/rust/
+    /// rust-isolate-surface.md §8.1).
+    CompilerSuggested,
     /// Authored by a language server (rename, code action) and recognized
     /// by the ledger at consumption.
     LspVerified,
@@ -47,6 +56,7 @@ impl AuthorityTier {
     pub fn as_str(self) -> &'static str {
         match self {
             AuthorityTier::SyntaxOnly => "syntax_only",
+            AuthorityTier::CompilerSuggested => "compiler_suggested",
             AuthorityTier::LspVerified => "lsp_verified",
         }
     }
@@ -211,11 +221,26 @@ mod tests {
 
     #[test]
     fn weakest_link_ordering() {
-        assert!(AuthorityTier::SyntaxOnly < AuthorityTier::LspVerified);
+        assert!(AuthorityTier::SyntaxOnly < AuthorityTier::CompilerSuggested);
+        assert!(AuthorityTier::CompilerSuggested < AuthorityTier::LspVerified);
         assert_eq!(
             AuthorityTier::LspVerified.min(AuthorityTier::SyntaxOnly),
             AuthorityTier::SyntaxOnly
         );
+        assert_eq!(
+            AuthorityTier::CompilerSuggested.min(AuthorityTier::LspVerified),
+            AuthorityTier::CompilerSuggested
+        );
+    }
+
+    #[test]
+    fn as_str_round_trips_all_tiers() {
+        assert_eq!(AuthorityTier::SyntaxOnly.as_str(), "syntax_only");
+        assert_eq!(
+            AuthorityTier::CompilerSuggested.as_str(),
+            "compiler_suggested"
+        );
+        assert_eq!(AuthorityTier::LspVerified.as_str(), "lsp_verified");
     }
 
     #[test]
