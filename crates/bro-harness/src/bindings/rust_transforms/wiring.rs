@@ -194,23 +194,18 @@ impl Tool for RustModuleWiring {
 /// selector.
 pub struct RustSetVisibility(pub Arc<ProvenanceLedger>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum VisibilityTarget {
     /// Top-level items (fns, structs, enums, ...). Calls
     /// `rewrite_rust_item_visibility`.
+    #[default]
     Item,
     /// Impl methods. Calls `rewrite_rust_item_visibility` with
     /// `item_kinds=["impl_method"]` and optional `impl_name` disambiguation.
     Method,
     /// Struct fields. Calls `rewrite_rust_field_visibility`.
     Field,
-}
-
-impl Default for VisibilityTarget {
-    fn default() -> Self {
-        VisibilityTarget::Item
-    }
 }
 
 #[derive(Deserialize)]

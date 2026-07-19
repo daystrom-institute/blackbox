@@ -37,10 +37,10 @@ pub(super) fn relativize(root: &Path, path: &str) -> Result<String, String> {
     if let Ok(rel) = p.strip_prefix(root) {
         return Ok(rel.to_string_lossy().to_string());
     }
-    if let Ok(canon) = root.canonicalize() {
-        if let Ok(rel) = p.strip_prefix(&canon) {
-            return Ok(rel.to_string_lossy().to_string());
-        }
+    if let Ok(canon) = root.canonicalize()
+        && let Ok(rel) = p.strip_prefix(&canon)
+    {
+        return Ok(rel.to_string_lossy().to_string());
     }
     Err(format!("plan touches `{path}` outside the worktree root"))
 }
@@ -62,10 +62,10 @@ pub(super) fn resolve_workspace_file(root: &Path, file: &str, tool: &str) -> Res
 }
 
 /// Split a planner's FileEdits into:
-///   - `changes`: hash-anchored span edits for `edits.merge` (existing files)
-///   - `creates`: whole-content `{path, content}` for `edits.createFile`
-///                (new files the planner emitted as `0..0` empty-hash edits)
-///   - `would_change_files` / `would_create_files`: preview metadata
+/// - `changes`: hash-anchored span edits for `edits.merge` (existing files)
+/// - `creates`: whole-content `{path, content}` for `edits.createFile`
+///   (new files the planner emitted as `0..0` empty-hash edits)
+/// - `would_change_files` / `would_create_files`: preview metadata
 ///
 /// Mirrors the java.* adapter shape verbatim. `preview_only` zeros the
 /// `changes`/`creates` payloads while keeping the metadata, matching the

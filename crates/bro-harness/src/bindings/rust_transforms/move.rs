@@ -569,8 +569,7 @@ impl Tool for RustInlineModToFile {
         // Target path is in the plan edits; surface it for the cell.
         let target_rel = plan
             .edits
-            .iter()
-            .nth(1)
+            .get(1)
             .and_then(|edit| relativize(&root, &edit.path).ok());
         let mut findings: Vec<Value> = Vec::new();
         for note in &plan.leftovers {
