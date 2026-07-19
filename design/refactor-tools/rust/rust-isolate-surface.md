@@ -166,7 +166,8 @@ same plumbing and subsumes v1's `rust_ra_classify_callbacks` use case.
 
 The trust model: operator authority arrives dispatch-side, never as a cell
 argument (a cell-authored `acknowledge_*` is confirm theater).
-`rust.moveStructFields` (`acknowledge_repr`) and `rust.migrateErrorType`
+`rust.moveStructFields` (`acknowledge_repr`), `rust.migrateErrorType`
+(`acknowledge_public_api_change`), and `rust.migrateTypeUsages`
 (`acknowledge_public_api_change`) consume RX-V1 opt-outs. No `java.*`
 transform needed this channel yet, so it is ratified here (decided, §8.2):
 
