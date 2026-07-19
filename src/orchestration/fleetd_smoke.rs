@@ -299,6 +299,228 @@ mod smoke {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
+    /// The full re-adoption drill, against a real fleetd and a real task
+    /// store: the daemon ingests part of a session, dies, and the replacement
+    /// daemon has to find the still-running child, reattach it to its task, and
+    /// replay exactly the events it missed while it was gone.
+    ///
+    /// The stub gates its second batch on a file the test creates only AFTER
+    /// the disconnect, so "events produced while no daemon was attached" is
+    /// deterministic rather than a sleep race. Those events reach fleetd's
+    /// stdout relay with no owner attached and are dropped on purpose (that is
+    /// the documented invariant); the durable event log is the backlog, and
+    /// replay is what closes the gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_daemon_reattaches_the_task_and_replays_what_it_missed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let fleetd = FleetdProcess::start(&root.join("state")).await;
+
+        let log = root.join("drill.events.jsonl");
+        let gate = root.join("resume.gate");
+        let stub_path = root.join("drill.sh");
+        // The two sinks carry DIFFERENT shapes, and getting this wrong is the
+        // whole reason this drill is worth having. stdout is the raw
+        // stream-json envelope. The durable log is the harness `EventLog`
+        // wrapper, `{"ts":...,"event":{...}}`, which is what fleetd's replay
+        // reads `event.seq` out of. A stub that wrote raw envelopes to the log
+        // would make replay silently find no seq-carrying lines and send
+        // nothing.
+        std::fs::write(
+            &stub_path,
+            format!(
+                "#!/bin/sh\n\
+                 emit() {{\n\
+                 \x20 printf '{{\"type\":\"assistant\",\"seq\":%s}}\\n' \"$1\"\n\
+                 \x20 printf '{{\"ts\":\"2026-07-19T00:00:00.000Z\",\"event\":\
+{{\"type\":\"assistant\",\"seq\":%s}}}}\\n' \"$1\" >> '{log}'\n\
+                 }}\n\
+                 for n in 1 2 3; do emit \"$n\"; done\n\
+                 while [ ! -f '{gate}' ]; do sleep 0.05; done\n\
+                 for n in 4 5; do emit \"$n\"; done\n\
+                 exec sleep 300\n",
+                log = log.display(),
+                gate = gate.display(),
+            ),
+        )
+        .expect("write drill stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let stub = stub_path.to_string_lossy().into_owned();
+
+        // A real task store with a real task, and the re-adoption env armed,
+        // exactly as daemon startup does it.
+        let store = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::orchestration::TaskStore::new(),
+        ));
+        let (tail_tx, _tail_rx) = tokio::sync::broadcast::channel(256);
+        let task = crate::orchestration::spawn_in_process_task(
+            "drill-task".to_string(),
+            bro_core::Provider::Glm,
+            "drill-session".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("drill-task".to_string(), task.clone())
+            .ok();
+        crate::orchestration::install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+        );
+
+        // ---- the first daemon: spawn, wire ingest, get the cursor to 3 ----
+        let first = FleetdExecutor::new(fleetd.config());
+        let live = first
+            .spawn(spec_for(
+                &stub,
+                "drill-session",
+                "drill-task",
+                &log,
+                &root,
+            ))
+            .await
+            .expect("fleetd accepted the drill spawn");
+        let survivor_pid = live.pid.expect("fleetd reported the pid");
+        let ingest = crate::orchestration::spawn_harness_ingest_loop(
+            task.clone(),
+            bro_core::Provider::Glm,
+            "drill-task".to_string(),
+            root.clone(),
+            tail_tx.clone(),
+            None,
+            live.events,
+        );
+        await_cursor(&task, 3).await;
+
+        // ---- the daemon dies mid-session ----
+        ingest.abort();
+        drop(live.control);
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            process_is_alive(survivor_pid),
+            "the child must outlive the daemon: that is the entire point"
+        );
+
+        // Pin the cursor before opening the gate. Without this the final
+        // `await_cursor(5)` could pass vacuously if 4 and 5 had somehow already
+        // been ingested; asserting EXACTLY 3 here is what makes the rest of the
+        // test a genuine proof that replay delivered them.
+        assert_eq!(
+            task.inner.lock().harness_ingest_seq,
+            3,
+            "the dead daemon ingested through seq 3 and no further"
+        );
+
+        // Only now does the child emit 4 and 5. No daemon is attached, so
+        // fleetd drops the relay and only the durable log keeps them.
+        std::fs::write(&gate, b"go").expect("open the gate");
+
+        // Wait until both have actually landed in the durable log BEFORE the
+        // replacement daemon connects. Without this barrier the test is a race:
+        // if the child emitted them a moment later, they would arrive over the
+        // live relay instead and the test would pass whether or not replay
+        // works at all. (It did exactly that before this wait was added.)
+        await_log_contains(&log, r#""seq":5"#).await;
+
+        // ---- the replacement daemon ----
+        let second = FleetdExecutor::new(fleetd.config());
+        let nudge_log = root.join("nudge.events.jsonl");
+        let nudge_stub = write_stub(
+            &root,
+            "nudge.sh",
+            &[r#"{"type":"system","seq":1}"#],
+            &nudge_log,
+            "exit 0\n",
+        );
+        // Dispatching forces the connect, and the connect runs the re-adoption
+        // sweep before it hands back a command lane.
+        let mut nudge = second
+            .spawn(spec_for(
+                &nudge_stub,
+                "nudge-session",
+                "nudge-task",
+                &nudge_log,
+                &root,
+            ))
+            .await
+            .expect("the replacement daemon can dispatch");
+        let _ = recv_line(&mut nudge.events).await;
+
+        // The replay closed the gap: 4 and 5 were produced while nothing was
+        // listening, and the cursor moved only because they were replayed off
+        // the durable log and ingested.
+        await_cursor(&task, 5).await;
+
+        let inner = task.inner.lock();
+        assert_eq!(
+            inner.status,
+            crate::orchestration::TaskStatus::Running,
+            "a reattached session is live, not failed"
+        );
+        drop(inner);
+        assert_eq!(
+            *task.child_id.lock(),
+            Some(survivor_pid),
+            "the reattached task points at the surviving child"
+        );
+
+        drop(second);
+        drop(fleetd);
+    }
+
+    /// Poll the durable event log until it contains `needle`. This is the
+    /// barrier that makes the replay assertion honest: it proves the events
+    /// existed on disk, with no daemon attached, before the replacement daemon
+    /// ever dialed.
+    async fn await_log_contains(log: &Path, needle: &str) {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while tokio::time::Instant::now() < deadline {
+            if std::fs::read_to_string(log)
+                .map(|text| text.contains(needle))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{needle} never reached the durable log at {}", log.display());
+    }
+
+    /// Poll the task's durable ingest cursor up to the deadline. Polling beats
+    /// a fixed sleep: replay is asynchronous, and a too-short sleep would make
+    /// this flaky while a too-long one would slow every run.
+    async fn await_cursor(task: &std::sync::Arc<crate::orchestration::Task>, want: u64) {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while tokio::time::Instant::now() < deadline {
+            let seen = task.inner.lock().harness_ingest_seq;
+            if seen >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "cursor never reached {want} (stuck at {})",
+            task.inner.lock().harness_ingest_seq
+        );
+    }
+
     /// The executor must fail LOUDLY when fleetd is unreachable, never fall back to
     /// spawning the worker as a daemon child. A silent downgrade would reintroduce
     /// exactly the restart-drops-sessions problem this slice removes, invisibly.
