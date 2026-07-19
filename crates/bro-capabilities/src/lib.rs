@@ -1,46 +1,20 @@
-//! Capability traits supplied to in-process bro sessions.
+//! The generic host-tool capability seam consumed by code-mode cells.
 //!
-//! The traits live below both implementers: the daemon can implement them, the
-//! harness can consume them, and absence remains a fail-closed runtime choice.
+//! Daemon-owned capabilities (corpus search, atoms, knowledge, ...) reach a
+//! harness session through the daemon's server-filtered MCP catalog, never
+//! through trait slots here. The seam rule: a harness-side dependency on
+//! daemon-side function is either plain MCP or a deliberately-designed typed
+//! RPC contract; this crate holds only the harness-internal [`ToolCapability`]
+//! seam that projects the already-filtered session tool set into code-mode
+//! cells. (The in-process-era `AtomCapability` / `CorpusCapability` trait
+//! slots were deleted 2026-07-19 with zero implementers; see
+//! design/daemon-runtime/locality-first-decomposition.md section 2.)
 
 use async_trait::async_trait;
-use bro_core::{AtomRef, BroError};
+use bro_core::BroError;
 use serde::{Deserialize, Serialize};
 
 pub type CapabilityResult<T> = Result<T, BroError>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AtomInvocation {
-    pub atom: AtomRef,
-    pub input_json: serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AtomOutput {
-    pub output_json: serde_json::Value,
-}
-
-#[async_trait]
-pub trait AtomCapability: Send + Sync {
-    async fn invoke_atom(&self, invocation: AtomInvocation) -> CapabilityResult<AtomOutput>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CorpusLookup {
-    pub query: String,
-    pub limit: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CorpusHit {
-    pub id: String,
-    pub text: String,
-}
-
-#[async_trait]
-pub trait CorpusCapability: Send + Sync {
-    async fn search_corpus(&self, lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>>;
-}
 
 /// One host built-in tool invocation: the tool's registered name plus its raw
 /// JSON input. This is the generic "invoke a bro-tools built-in by name" seam —
