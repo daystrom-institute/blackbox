@@ -151,8 +151,17 @@ impl Tool for RustExtractImplMethods {
         if params.item_names.is_empty() {
             return ToolResult::Error("item_names is required and must not be empty".to_string());
         }
-        let source_path = resolve_path(&cx.root, &params.source);
-        let target_path = resolve_path(&cx.root, &params.target);
+        let root = cx.root.clone();
+        // Sync fs + tree-sitter work runs inside call_blocking, off the tokio
+        // worker (concurrency-model section 5), matching every other binding.
+        bro_tools::tool::call_blocking(move || Self::run(params, &root)).await
+    }
+}
+
+impl RustExtractImplMethods {
+    fn run(params: ExtractImplMethodsInput, root: &std::path::Path) -> ToolResult {
+        let source_path = resolve_path(root, &params.source);
+        let target_path = resolve_path(root, &params.target);
         if source_path == target_path {
             return ToolResult::Error("source and target must be different files".to_string());
         }

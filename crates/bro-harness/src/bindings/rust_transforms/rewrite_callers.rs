@@ -121,8 +121,16 @@ impl Tool for RustRewriteModuleCallers {
                 "item_names is required and must not be empty".to_string(),
             );
         }
+        let root = cx.root.clone();
+        // Sync fs + walk work runs inside call_blocking, off the tokio worker
+        // (concurrency-model section 5), matching every other binding.
+        bro_tools::tool::call_blocking(move || Self::run(params, &root)).await
+    }
+}
 
-        let project_dir = resolve_path(&cx.root, &params.project_dir);
+impl RustRewriteModuleCallers {
+    fn run(params: RewriteModuleCallersInput, root: &std::path::Path) -> ToolResult {
+        let project_dir = resolve_path(root, &params.project_dir);
         if !project_dir.is_dir() {
             return ToolResult::Error(format!(
                 "project_dir is not a directory: {}",
@@ -175,7 +183,7 @@ impl Tool for RustRewriteModuleCallers {
             .unwrap_or(&[])
             .iter()
             .map(|f| {
-                let p = resolve_path(&cx.root, f);
+                let p = resolve_path(root, f);
                 std::fs::canonicalize(&p).unwrap_or(p)
             })
             .collect();
