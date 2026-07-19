@@ -2558,8 +2558,8 @@ mod tests {
         assert!(err.contains("Unknown bro or brofile"), "got: {err}");
     }
 
-    #[test]
-    fn prune_task_ids_drops_only_listed_terminal_tasks() {
+    #[tokio::test]
+    async fn prune_task_ids_drops_only_listed_terminal_tasks() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
@@ -2567,7 +2567,9 @@ mod tests {
         // A completed task named explicitly — no status given, so the
         // any-terminal rule applies and it matches despite the legacy
         // default being "failed".
-        server.bro_prune(Parameters(prune_params(Some(vec!["drop-me".into()]), None)));
+        server
+            .bro_prune(Parameters(prune_params(Some(vec!["drop-me".into()]), None)))
+            .await;
 
         let store = server.state.task_store.read();
         assert!(
@@ -2578,16 +2580,18 @@ mod tests {
         assert!(store.get("keep-other").is_some(), "unlisted task kept");
     }
 
-    #[test]
-    fn prune_task_ids_never_drops_running_even_if_listed() {
+    #[tokio::test]
+    async fn prune_task_ids_never_drops_running_even_if_listed() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
 
-        server.bro_prune(Parameters(prune_params(
-            Some(vec!["keep-running".into(), "drop-me".into()]),
-            None,
-        )));
+        server
+            .bro_prune(Parameters(prune_params(
+                Some(vec!["keep-running".into(), "drop-me".into()]),
+                None,
+            )))
+            .await;
 
         let store = server.state.task_store.read();
         assert!(
@@ -2600,17 +2604,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_task_ids_with_explicit_status_must_also_match_status() {
+    #[tokio::test]
+    async fn prune_task_ids_with_explicit_status_must_also_match_status() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
 
         // drop-me is Completed; an explicit status=failed must exclude it.
-        server.bro_prune(Parameters(prune_params(
-            Some(vec!["drop-me".into()]),
-            Some("failed".into()),
-        )));
+        server
+            .bro_prune(Parameters(prune_params(
+                Some(vec!["drop-me".into()]),
+                Some("failed".into()),
+            )))
+            .await;
 
         let store = server.state.task_store.read();
         assert!(
@@ -2619,14 +2625,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_without_task_ids_keeps_legacy_failed_default() {
+    #[tokio::test]
+    async fn prune_without_task_ids_keeps_legacy_failed_default() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
 
         // No task_ids, no status → legacy behavior: only failed tasks drop.
-        server.bro_prune(Parameters(prune_params(None, None)));
+        server.bro_prune(Parameters(prune_params(None, None))).await;
 
         let store = server.state.task_store.read();
         assert!(

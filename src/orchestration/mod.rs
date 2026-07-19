@@ -928,6 +928,7 @@ mod roster_view_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Cockpit,
@@ -5835,7 +5836,8 @@ mod tests {
             None,
             None,
             bro_core::Origin::AgentDispatch,
-        );
+        )
+        .await;
 
         env.set("BRO_HARNESS_BIN", &healthy_bin);
         let healthy = spawn_task_with_tool_placement(
@@ -5860,7 +5862,8 @@ mod tests {
             None,
             None,
             bro_core::Origin::AgentDispatch,
-        );
+        )
+        .await;
 
         tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_task(&failed))
             .await
@@ -6377,6 +6380,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -6872,6 +6876,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -6908,6 +6913,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -6961,6 +6967,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -7013,6 +7020,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -7245,6 +7253,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -7984,6 +7993,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8082,6 +8092,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8136,6 +8147,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8479,6 +8491,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8521,6 +8534,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8569,6 +8583,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8613,6 +8628,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8669,6 +8685,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8718,6 +8735,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
