@@ -48,7 +48,7 @@
           },
           "allow_cross_partition_delegation": {
             "type": "boolean",
-            "description": "When false (default in spirit), any cross-partition call resolved by rust_ra_classify_callbacks blocks the run. When true, the atom widens visibility on cross-partition callees to pub(crate) and proceeds."
+            "description": "When false (default in spirit), any cross-partition call found by analysis.implPartition and confirmed with lsp.definition or lsp.references blocks the run. When true, the atom widens visibility on cross-partition callees to pub(crate) and proceeds."
           },
           "apply": {
             "type": "boolean"
