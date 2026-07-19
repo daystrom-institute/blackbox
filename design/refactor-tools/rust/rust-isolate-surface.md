@@ -281,7 +281,7 @@ the verb gets a language-specific name.
 | `lsp.references` | `textDocument/references` | Authoritative find-usages (G10 authoritative lane); JDTLS symmetric. |
 | `lsp.assist` | `codeAction` + `codeAction/resolve` | List-then-apply: bare call returns the server's offered actions at the span (kind/title/index, capped); `select` applies one through resolve -> WorkspaceEdit -> hash-anchored changes. Free-form kind/title filter, no allowlist (§8.4). Mechanical guards: snippet-edit actions flattened or refused, command-returning actions refused with a pointer at `lsp.executeCommand`. Unlocks extract-function (G11), generate-derive (G20), inline, add-missing-impl-members. `lsp_verified` lineage. |
 | `lsp.definition` | `textDocument/definition` | Goto-declaration at a span; subsumes the `rust_ra_classify_callbacks` use case. |
-| `lsp.executeCommand` (upgrade) | result conversion | WorkspaceEdit results hash-anchored host-side like `lsp.rename` output; unlocks `rust-analyzer.ssr` as an `lsp_verified` campaign tool. |
+| `lsp.executeCommand` (upgrade) | result conversion | WorkspaceEdit results hash-anchored host-side like `lsp.rename` output. Consults `executeCommandProvider.commands` and fails closed on unregistered commands. (SSR does NOT ride this: RA 1.96 serves `rust-analyzer.ssr` only via codeAction, so SSR folds into `lsp.assist`.) |
 
 `bro-lsp` grows `codeAction`, `codeAction/resolve`, `references`,
 `definition`; all fail closed (RX-V3), all bounded (capped result lists, no
@@ -490,6 +490,42 @@ Escape hatch: if probing shows agents misfiling rust questions against Java
 verbs (or vice versa), split after the first two rust reductions land, while
 the move is cheap.
 
+### 8.6 rust-analyzer build data on lane checkouts: host target dir + shim-stripped spawn env
+
+Decision: v1 keeps rust-analyzer on the HOST and makes its child builds
+host-consistent. When an `lsp.*` session's root is under a lane checkout
+(`~/lanes/<name>/...`, canonicalized) or `BRO_LSP_RA_HOST_BUILD=1` is set,
+bro-lsp spawns rust-analyzer with a scrubbed environment: (1) PATH with the
+lane shim dir (`~/.lane/shims`, overridable via `BRO_LSP_LANE_SHIM_DIR`)
+removed, so `cargo`/`rustc` resolve to the host rustup proxies; (2)
+`CARGO_TARGET_DIR` set to a host-local per-root dir
+(`BRO_LSP_RA_TARGET_DIR` or `~/.cache/blackbox/ra-target/<sha256(root)[:16]>`);
+(3) `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` unset, so a sccache lane
+shim cannot re-enter the pod. v2 (recorded, not built): pod-side
+rust-analyzer with a bidirectional URI translation layer. Rejected:
+documenting rust `lsp.*` as unsupported in lanes (strands the semantic tier
+exactly where agents work); sharing the lane `target/` between pod and host
+(the proc-macro dylib format mismatch is the original bug).
+
+Reasoning: rust-analyzer derives build data by running `cargo metadata` and
+`cargo check` (flycheck) as child processes resolved through its own PATH
+with cwd at the workspace root. On a lane checkout two things conspire
+against the host server: the cwd-keyed shim routes those children back into
+the Linux pod, and the pod-built `target/` holds ELF proc-macro `.so` files
+the host proc-macro server cannot load. The two knobs that matter (which
+cargo runs, where artifacts land) are both environment-level, so scrubbing
+the spawn env fixes the whole chain with no initializationOptions surgery,
+no URI translation layer, and no fight with user `rust-analyzer.toml`
+config. The per-root host target dir costs one cold host-side build (proc
+macros + build scripts; minutes on a cold cache, incremental after) and can
+never collide with pod artifacts. Path detection keeps the common case
+zero-config; the explicit env var covers non-lane NFS/sshfs layouts.
+
+Related readiness fix (gap-eeeab3bc, phase 2.0): `observe_rust_analyzer_status`
+must evaluate the `health` field (`error` before the `quiescent`
+early-return, message carried into detail) so a broken workspace load fails
+closed instead of marking Ready and serving silent nulls.
+
 ## 9. Migration close-out (part of "complete", not an afterthought)
 
 - `sm-refactor-rust` currently teaches the v1 `bbox_refactor_plan` API in
@@ -516,16 +552,26 @@ the move is cheap.
    file/module/god-impl splitting runs end-to-end with compiler-gated
    repair. **Dogfood probe**: split `java_transforms.rs` (698K of rust)
    using only this surface, then run the RETRO prompt on the probe session.
-3. **Semantic tier**: `bro-lsp` `codeAction`/resolve -> `lsp.assist`;
-   `lsp.definition`; `executeCommand` WorkspaceEdit conversion (SSR);
-   `rust.extractTrait`, `rust.moveStructFields` + `rust.updateCallers` +
+3. **Phase 2.0 (RA substrate, inserted after probing)**: readiness
+   `health`-field ordering + `lsp.status` detail surfacing (gap-eeeab3bc);
+   lane-aware RA spawn env per §8.6 (gap-8637bb39); orphan RA child reap on
+   errored session shutdown. Without this the semantic tier cannot be
+   validated where agents actually work.
+4. **Semantic tier**: `bro-lsp` `codeAction`/resolve -> `lsp.assist`;
+   `lsp.definition`; `rust.extractTrait`,
+   `rust.moveStructFields` + `rust.updateCallers` +
    `rust.addDelegateField`, `rust.migrateErrorType`,
-   `rust.migrateTypeUsages`, `rust.liftToFree`.
-4. **Campaign scale + close-out**: `rust.extractCrateScaffold` + crate-peel
+   `rust.migrateTypeUsages`, `rust.liftToFree`. SSR re-route (probed
+   2026-07-19): RA 1.96 answers `executeCommand rust-analyzer.ssr` with "No
+   delegateCommandHandler", so SSR folds into `lsp.assist` via codeAction;
+   the executeCommand WorkspaceEdit conversion is kept generic, consults
+   `executeCommandProvider.commands` from server capabilities, and fails
+   closed on unregistered commands.
+5. **Campaign scale + close-out**: `rust.extractCrateScaffold` + crate-peel
    recipe, `analysis.workspaceDag`, `toml.ensureTable`,
    `rust.migrateStringFieldToEnum`, `rust_match_arm_to_strategy` disposition;
    `sm-refactor-rust` rewrite, delegation prompt, atom re-point.
 
-Phases 1-2 are where daily rust development lives; phases 3-4 make the
+Phases 1-2 are where daily rust development lives; phases 3-5 make the
 surface complete. Each phase ends with an isolate-probe validation pass and
 gap-filed friction, not with a doc claim.
