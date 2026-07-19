@@ -32,7 +32,45 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::worker::WorkerSpawnSpec;
+use crate::worker::{REDACTED, WorkerSpawnSpec};
+
+/// The shared-secret bearer token, as it crosses the wire.
+///
+/// A newtype for exactly one reason: `DaemonToFleetd` derives `Debug`, and a
+/// plain `String` field would print the secret into any log line or error that
+/// formats a message. Serde is transparent (the wire form is the bare string,
+/// because the executor must receive the real value); `Debug`/`Display` are
+/// not. Same shape and same rationale as [`crate::SecretEnv`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BearerToken(String);
+
+impl BearerToken {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// The raw secret, for a constant-time comparison against the loaded
+    /// `ServiceToken`. Never log or `Display` the result.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("BearerToken")
+            .field(&REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BearerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(REDACTED)
+    }
+}
 
 /// Protocol version for the daemon<->fleetd channel, offered/selected through
 /// the `bro_rpc` handshake. Bump when a change is not additively decodable by
@@ -43,6 +81,16 @@ pub const FLEETD_PROTOCOL_VERSION: u16 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum DaemonToFleetd {
+    /// Present the shared-secret bearer token. This MUST be the first
+    /// post-handshake envelope on a connection; fleetd refuses everything
+    /// else until it has verified the token.
+    ///
+    /// It rides here rather than in the `bro_rpc` handshake because that
+    /// handshake is payload-generic by design: it negotiates protocol version
+    /// and build compatibility for any same-host channel and deliberately
+    /// knows nothing about what the daemon and fleetd say to each other. The
+    /// token check is this contract's concern, so it lives in this contract.
+    Authenticate { token: BearerToken },
     /// Spawn a supervised worker child from a fully-resolved spec. fleetd
     /// re-derives no policy from it beyond final binary path resolution.
     Spawn { spec: Box<WorkerSpawnSpec> },
@@ -76,6 +124,10 @@ pub enum DaemonToFleetd {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum FleetdToDaemon {
+    /// The connection is authenticated and is now the owner connection. The
+    /// echoed `connection_generation` is the one fleetd allocated for this
+    /// connection: any older connection is fenced out as of this message.
+    Ready { connection_generation: u64 },
     /// A [`DaemonToFleetd::Spawn`] produced a live child.
     SessionStarted {
         session_id: String,
@@ -205,6 +257,9 @@ mod tests {
     #[test]
     fn daemon_messages_round_trip() {
         for message in [
+            DaemonToFleetd::Authenticate {
+                token: BearerToken::new("a".repeat(64)),
+            },
             DaemonToFleetd::Spawn {
                 spec: Box::new(sample_spec()),
             },
@@ -232,6 +287,9 @@ mod tests {
     #[test]
     fn fleetd_messages_round_trip() {
         for message in [
+            FleetdToDaemon::Ready {
+                connection_generation: 3,
+            },
             FleetdToDaemon::SessionStarted {
                 session_id: "sess-1".to_string(),
                 task_id: "task-1".to_string(),
@@ -341,6 +399,33 @@ mod tests {
             panic!("expected spawn");
         };
         assert_eq!(*spec, sample_spec());
+    }
+
+    /// The bearer token must reach fleetd verbatim on the wire and must never
+    /// reach a log line through the enum's derived `Debug`.
+    #[test]
+    fn bearer_token_serializes_plainly_and_debugs_redacted() {
+        let message = DaemonToFleetd::Authenticate {
+            token: BearerToken::new("f".repeat(64)),
+        };
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(
+            value["token"],
+            json!("f".repeat(64)),
+            "the real secret must cross the wire"
+        );
+
+        let debug = format!("{message:?}");
+        assert!(debug.contains("REDACTED"), "{debug}");
+        assert!(
+            !debug.contains(&"f".repeat(64)),
+            "the secret must never appear in Debug: {debug}"
+        );
+        assert_eq!(
+            format!("{}", BearerToken::new("f".repeat(64))),
+            "REDACTED",
+            "Display must not leak the secret either"
+        );
     }
 
     /// Optional fields stay off the wire when absent, so an `Event` frame for
