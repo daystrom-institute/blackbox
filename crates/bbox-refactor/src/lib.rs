@@ -63,7 +63,7 @@ pub(crate) mod rust_match_strategy;
 pub(crate) mod rust_migrate_types;
 pub(crate) mod rust_minimize_imports;
 pub(crate) mod rust_move_fields;
-pub(crate) mod rust_move_with_callers;
+pub mod rust_move_with_callers;
 pub mod rust_partition;
 pub(crate) mod rust_public_api;
 pub(crate) mod rust_ra_classify_callbacks;
@@ -1180,11 +1180,11 @@ pub struct ParseErrorExcerpt {
     pub snippet: String,
 }
 
-struct ParsedSource {
-    path: PathBuf,
-    language: &'static str,
-    source: String,
-    tree: Tree,
+pub struct ParsedSource {
+    pub path: PathBuf,
+    pub language: &'static str,
+    pub source: String,
+    pub tree: Tree,
 }
 
 pub fn status(p: &RefactorStatusParams) -> Result<String> {
@@ -5245,7 +5245,7 @@ fn compute_run_id(p: &RefactorRunParams, project_dir: &Path) -> String {
     hex[..16].to_string()
 }
 
-fn ensure_non_overlapping(edits: &[TextEdit]) -> Result<()> {
+pub fn ensure_non_overlapping(edits: &[TextEdit]) -> Result<()> {
     let mut ranges = edits
         .iter()
         .map(|edit| (edit.byte_start, edit.byte_end))

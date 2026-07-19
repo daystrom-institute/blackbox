@@ -16,6 +16,8 @@
 //! `rust.describe` at runtime (values stay in the isolate, no prompt bloat).
 
 mod fix;
+mod impl_extract;
+mod rewrite_callers;
 
 use std::sync::Arc;
 
@@ -99,6 +101,90 @@ IDIOM
   // round.leftovers is the manual punch list.
 "#;
 
+const EXTRACT_IMPL_METHODS_CONTRACT: &str = r#"rust.extractImplMethods - move named Rust impl methods from one file into another.
+
+WHAT IT DOES
+  Ports the v1 `extract_rust_impl_methods` synthesis. Moves named methods out of
+  one `impl` block into another file, preserving attributes/modifiers (async
+  etc.), rebasing `super::` paths one module deeper when the target is a child
+  module of the source (foo.rs -> foo/bar.rs), and applying visibility overrides.
+
+  - Explicit `visibility` overrides every moved method regardless of original.
+  - Without explicit visibility, only originally-private moved methods widen to
+    `pub(super)` when the parent still references them after deletion; existing
+    `pub`/`pub(crate)`/`pub(super)` are preserved.
+  - If the target already has a matching impl block (same type name), moved
+    methods are appended inside it; otherwise a new impl block is created.
+  - `target_prelude` text (e.g. `use` statements) is inserted after shebang /
+    inner attrs / inner doc comments in the target file, when absent.
+  - rmcp `tool_router` wrapper generation is deliberately NOT ported (repo-
+    specific; recipe material).
+
+PARAMS
+  source: string           Source file path (relative to worktree root, or absolute).
+  target: string           Target file path.
+  item_names: string[]     Names of the impl methods to move (required, non-empty).
+  impl_name?: string       Optional impl block name disambiguator (the type name in
+                               `impl Foo`). Required when a method name matches
+                               multiple impl blocks.
+  visibility?: string      Optional explicit visibility for every moved method
+                               (e.g. "pub", "pub(crate)", "pub(super)").
+  target_prelude?: string  Optional text to insert after shebang/inner attrs/doc
+                               comments in the target (e.g. use statements).
+
+RETURNS { changes, creates, findings, leftovers, counts, provenance }
+  changes[]:  SpanChange for edits.merge (source deletions + target insertions).
+  creates[]:  { path, content } for edits.createFile (only when the target file
+              is new/empty; otherwise the target edits are inline).
+  findings[]: always [] (reserved for future findings).
+  leftovers[]: string descriptions of methods NOT moved.
+  counts: { moved: number, leftovers: number }
+  provenance: "syntax_only"
+
+NEVER WRITES. Feed `changes` into `edits.merge` and `creates` into
+`edits.createFile`, then `edits.apply`. The transform is NOT idempotent over its
+own output: target-exists refusal during the next extract is the DONE signal.
+"#;
+
+const REWRITE_MODULE_CALLERS_CONTRACT: &str = r#"rust.rewriteModuleCallers - rewrite caller prefixes after a module move.
+
+WHAT IT DOES
+  Ports the caller-prefix rewrite half of v1 `move_rust_items_with_callers`,
+  decomposed per design §3.1 (composable after any extract or move; NOT fused
+  with extraction). For each named moved item, rewrites every
+  `<source_simple>::<item>` occurrence in other project .rs files to
+  `<target_simple>::<item>`, including inside `use` declarations.
+  Word-boundary checked.
+
+  Known v1 limits (documented):
+  - Simple-name segment match only. `crate::foo::source_simple::Item` gets
+    rewritten; `crate::foo::Item` (where the canonical path skipped
+    `source_simple`) does not.
+  - No splitting of multi-import use trees.
+  - No alias awareness.
+
+PARAMS
+  project_dir: string       Project directory for the caller walk (relative to
+                               worktree root, or absolute). Skips target/,
+                               build/, node_modules/, .git/.
+  item_names: string[]      Names of the moved items (required, non-empty).
+  module_name?: string      Source module's simple name. Required in the
+                               decomposed model (no attached source file).
+  target_prelude?: string   Target module's simple name. Required in the
+                               decomposed model.
+  skip_files?: string[]     File paths to skip during the walk (source/target
+                               of the extract/move; already covered).
+
+RETURNS { changes, findings, counts, provenance }
+  changes[]:  SpanChange for edits.merge (caller prefix rewrites).
+  findings[]: capped-change notices when the 2000-change limit is hit.
+  counts: { files_touched: number, rewrites: number }
+  provenance: "syntax_only"
+
+BOUNDED: the 2000-change cap honors the isolate-heap discipline. A cap finding
+means narrow the file set and re-run.
+"#;
+
 #[async_trait]
 impl Tool for RustDescribe {
     fn name(&self) -> &str {
@@ -132,8 +218,14 @@ impl Tool for RustDescribe {
             .unwrap_or_default();
         match transform {
             "fixRound" => ToolResult::Json(json!({ "contract": FIX_ROUND_CONTRACT })),
+            "extractImplMethods" => {
+                ToolResult::Json(json!({ "contract": EXTRACT_IMPL_METHODS_CONTRACT }))
+            }
+            "rewriteModuleCallers" => {
+                ToolResult::Json(json!({ "contract": REWRITE_MODULE_CALLERS_CONTRACT }))
+            }
             other => ToolResult::Error(format!(
-                "rust.describe: unknown transform `{other}` (available: fixRound)"
+                "rust.describe: unknown transform `{other}` (available: fixRound, extractImplMethods, rewriteModuleCallers)"
             )),
         }
     }
@@ -144,6 +236,8 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(RustDescribe) as Arc<dyn Tool>,
         Arc::new(fix::RustFixRound(ledger)) as Arc<dyn Tool>,
+        Arc::new(impl_extract::RustExtractImplMethods) as Arc<dyn Tool>,
+        Arc::new(rewrite_callers::RustRewriteModuleCallers) as Arc<dyn Tool>,
     ]
 }
 
@@ -153,16 +247,22 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "rust".to_string(),
-        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, findings, leftovers} for edits.merge and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape)."
+        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, findings, leftovers} for edits.merge and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. extractImplMethods - move named Rust impl methods from one file into another; preserves attributes/modifiers, rebases super:: paths, applies visibility overrides. rewriteModuleCallers - rewrite caller prefixes after a module move; <source_simple>::<item> to <target_simple>::<item> in all project .rs files, word-boundary checked."
             .to_string(),
         declarations: r#"type RustChangeProposal = { span: Span; new_text: string; provenance: "compiler_suggested" | "syntax_only"; code?: string };
 type RustLeftover = { message: string; code?: string; reason: string };
 type RustFixRoundResult = { changes: RustChangeProposal[]; findings: ({ finding: string } & Record<string, unknown>)[]; leftovers: RustLeftover[]; counts: { changes: number; leftovers: number }; issuance: string };
+type RustExtractImplMethodsResult = { changes: SpanChange[]; creates: { path: string; content: string }[]; findings: Record<string, unknown>[]; leftovers: string[]; counts: { moved: number; leftovers: number }; provenance: "syntax_only" };
+type RustRewriteModuleCallersResult = { changes: SpanChange[]; findings: Record<string, unknown>[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
 declare const rust: {
   /** Full contract (params, result vocabulary, recipe) for one rust transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Classify rustc/clippy build.gate diagnostics into edit proposals + leftovers. Verbatim MachineApplicable suggestions become compiler_suggested changes; add-use/visibility-bump proposals are syntax_only; borrow-checker/trait-bound errors are leftovers. NEVER writes: feed {changes} into edits.merge. */
   fixRound(args: { diagnostics: Record<string, unknown>[]; raw_json?: string; restrict_to_files?: string[]; restrictToFiles?: string[] }): Promise<RustFixRoundResult>;
+  /** Move named Rust impl methods from one file into another. Preserves attributes/modifiers, rebases super:: paths one module deeper, applies visibility overrides. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFile. */
+  extractImplMethods(args: { source: string; target: string; item_names: string[]; impl_name?: string; visibility?: string; target_prelude?: string }): Promise<RustExtractImplMethodsResult>;
+  /** Rewrite caller prefixes after a module move: <source_simple>::<item> -> <target_simple>::<item> in all project .rs files, word-boundary checked. Composable after any extract/move. NEVER writes: feed {changes} into edits.merge. */
+  rewriteModuleCallers(args: { project_dir: string; item_names: string[]; module_name?: string; target_prelude?: string; skip_files?: string[] }): Promise<RustRewriteModuleCallersResult>;
 };"#
             .to_string(),
     }

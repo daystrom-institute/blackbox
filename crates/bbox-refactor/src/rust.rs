@@ -2,10 +2,10 @@ use super::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
-pub(crate) struct RustImplMethod {
-    pub(crate) impl_name: String,
-    pub(crate) impl_byte_start: usize,
-    pub(crate) item: SyntaxItem,
+pub struct RustImplMethod {
+    pub impl_name: String,
+    pub impl_byte_start: usize,
+    pub item: SyntaxItem,
 }
 
 #[derive(Debug, Clone)]
@@ -1741,7 +1741,7 @@ pub(crate) fn plan_rust_organize_imports(
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
-pub(crate) fn rust_impl_methods_target_edits(
+pub fn rust_impl_methods_target_edits(
     target_path: &Path,
     target_source: &str,
     target_prelude: Option<&str>,
@@ -2343,7 +2343,7 @@ pub(crate) fn validate_rust_use_path(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse_rust_file(path: &Path) -> Result<ParsedSource> {
+pub fn parse_rust_file(path: &Path) -> Result<ParsedSource> {
     let parsed = parse_source_file(path)?;
     if parsed.language != "rust" {
         bail!("{} is not a Rust source file", path.display());
@@ -2370,7 +2370,7 @@ pub(crate) fn rust_status_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
     items
 }
 
-pub(crate) fn rust_impl_methods(parsed: &ParsedSource) -> Vec<RustImplMethod> {
+pub fn rust_impl_methods(parsed: &ParsedSource) -> Vec<RustImplMethod> {
     let root = parsed.tree.root_node();
     let mut cursor = root.walk();
     root.named_children(&mut cursor)
