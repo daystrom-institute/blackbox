@@ -125,6 +125,10 @@ out explicitly under `Changed` or `Removed`.
   Wire-verified (2026-07-19 probe): beta header + `?beta=true`,
   `cache_control` breakpoints, and `output_config.effort` accepted;
   server-side prompt caching engages and reports `cache_read_input_tokens`.
+  Allocator built-ins map the lane into every tier (`k3` at medium/high/max
+  for standard/premium/deepthink, `kimi-k2.7-code-highspeed` at low for
+  economy and drones) and both pools (`coding` weight 0.85, `any` weight
+  0.6); all tier effort pins were probe-verified against the endpoint.
 - Ensemble workflow nodes accept a `board` binding (template → whiteboard
   id) for engine-driven board auto-apply (gap-7fbefe13): each member's
   STRICT-JSON output — one object or an array of
