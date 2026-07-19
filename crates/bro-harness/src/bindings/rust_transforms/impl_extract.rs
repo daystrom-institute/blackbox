@@ -233,8 +233,11 @@ impl Tool for RustExtractImplMethods {
             })
             .collect();
 
-        // Source edits: delete the selected methods.
-        let source_edits: Vec<TextEdit> = selected
+        // Source edits: delete the selected methods. Sort by byte_start and
+        // merge adjacent/overlapping edits (adjacent methods share trivia
+        // ranges when tree-sitter's leading_trivia_start / trailing_trivia_end
+        // of consecutive items touch or overlap).
+        let mut source_edits: Vec<TextEdit> = selected
             .iter()
             .map(|method| TextEdit {
                 byte_start: method.item.leading_trivia_start,
@@ -242,9 +245,22 @@ impl Tool for RustExtractImplMethods {
                 replacement: String::new(),
             })
             .collect();
-        if let Err(e) = ensure_non_overlapping(&source_edits) {
-            return ToolResult::Error(format!("source edits overlap: {e:#}"));
+        source_edits.sort_by_key(|e| e.byte_start);
+        let mut merged: Vec<TextEdit> = Vec::new();
+        for edit in source_edits {
+            if let Some(last) = merged.last_mut() {
+                if edit.byte_start <= last.byte_end {
+                    // Overlapping or touching — merge into one span.
+                    last.byte_end = last.byte_end.max(edit.byte_end);
+                    continue;
+                }
+            }
+            merged.push(edit);
         }
+        if let Err(e) = ensure_non_overlapping(&merged) {
+            return ToolResult::Error(format!("source edits overlap after merge: {e:#}"));
+        }
+        let source_edits = merged;
 
         // Check if parent still references moved methods after deletion.
         let parent_after_move = match apply_text_edits(&parsed.source, &source_edits) {
