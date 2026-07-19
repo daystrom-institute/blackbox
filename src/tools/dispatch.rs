@@ -2547,7 +2547,7 @@ mod tests {
         .unwrap();
         orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None).unwrap();
 
-        let (provider, _lens, opts, _env, _cwd, _filters, coerce, _ctx) = server
+        let (provider, _lens, opts, _env, _cwd, _filters, _tool_defaults, coerce, _ctx) = server
             .resolve_exec_target(Some("orc-fallback"), None, None)
             .expect("standalone brofile resolves by name");
         assert_eq!(provider, Provider::Glm);
@@ -2913,10 +2913,20 @@ mod tests {
             );
         }
 
-        let (provider, session_id, _lens, _opts, _env, cwd, _filters, _coerce_ws, _runtime_lease) =
-            server
-                .resolve_resume_target(Some("blue::reviewer"), None, None, None)
-                .unwrap();
+        let (
+            provider,
+            session_id,
+            _lens,
+            _opts,
+            _env,
+            cwd,
+            _filters,
+            _tool_defaults,
+            _coerce_ws,
+            _runtime_lease,
+        ) = server
+            .resolve_resume_target(Some("blue::reviewer"), None, None, None)
+            .unwrap();
         assert_eq!(provider, Provider::Deepseek);
         assert_eq!(session_id, "sid-blue");
         assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
