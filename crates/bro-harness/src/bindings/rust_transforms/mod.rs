@@ -21,6 +21,7 @@ mod helpers;
 mod impl_extract;
 mod imports;
 mod lift_free;
+mod migrate;
 mod r#move;
 mod move_struct_fields;
 mod rewrite_callers;
@@ -415,6 +416,66 @@ then edits.apply. Follow with rust.updateCallers to rewrite self.field accesses
 through a delegate field.
 "#;
 
+const MIGRATE_ERROR_TYPE_CONTRACT: &str = r#"rust.migrateErrorType - rewrite an error type in named function signatures and mapped construction sites.
+
+WHAT IT DOES
+  Ports v1 `rewrite_rust_error_type`. It rewrites the named functions' error
+  return types and maps `OldError::Variant` construction sites according to
+  `errorMapping`. It also reports every `?` site so the compile-fix loop can
+  resolve conversions the planner cannot prove.
+
+RX-V1 OPERATOR AUTHORITY
+  Public error types require `acknowledge_public_api_change`. This is NOT a
+  cell argument. The host reads only the dispatch-side ToolArgDefaults entry:
+    default:rust.migrateErrorType.acknowledge_public_api_change=true
+  A public migration without that grant refuses. A consumed grant is returned
+  in `operator_opt_outs_used`.
+
+PARAMS
+  source: string                       Workspace-relative Rust source file.
+  oldText: string                      Existing error type name.
+  newText: string                      Replacement error type name.
+  itemNames: string[]                  Function names whose return signatures change.
+  errorMapping?: Record<string,string> Old variant to new variant mapping.
+
+RETURNS { changes, creates, findings, operator_opt_outs_used, provenance }
+  findings includes `question_mark_sites`, each classified as text_compatible
+  when the replacement type has a From implementation, otherwise unknown.
+
+NEVER WRITES. Feed changes into edits.merge and then edits.apply. Follow with
+the rust.fixRound compile loop for unresolved `?` conversions.
+"#;
+
+const MIGRATE_TYPE_USAGES_CONTRACT: &str = r#"rust.migrateTypeUsages - migrate supported Rust type usage positions.
+
+WHAT IT DOES
+  Ports v1 `migrate_rust_type_usages`. It replaces supported references to
+  `moduleName` with the selected replacement form:
+  bareConcrete, boxDyn, arcDyn, rcDyn, implTrait, or
+  genericParamTBoundedTrait. Unsupported or intentionally skipped locations
+  are reported in findings.
+
+RX-V1 OPERATOR AUTHORITY
+  This transform can alter public type signatures. It requires the
+  dispatch-side ToolArgDefaults entry:
+    default:rust.migrateTypeUsages.acknowledge_public_api_change=true
+  The cell schema deliberately has no acknowledgement parameter. A consumed
+  grant is returned in `operator_opt_outs_used`.
+
+PARAMS
+  source: string             Workspace-relative Rust source file.
+  moduleName: string         Type name to migrate.
+  replacementKind: string    One of bareConcrete, boxDyn, arcDyn, rcDyn,
+                             implTrait, genericParamTBoundedTrait.
+  newText: string            Replacement type or trait text.
+
+RETURNS { changes, creates, findings, operator_opt_outs_used, provenance }
+  findings includes `migration_skipped` for unsupported/refused positions.
+
+NEVER WRITES. Feed changes into edits.merge and then edits.apply. Follow with
+the rust.fixRound compile loop.
+"#;
+
 const UPDATE_CALLERS_CONTRACT: &str = r#"rust.updateCallers - rewrite callers through a delegate field (RX-S2b).
 
 WHAT IT DOES
@@ -571,6 +632,12 @@ impl Tool for RustDescribe {
             "moveStructFields" => {
                 ToolResult::Json(json!({ "contract": MOVE_STRUCT_FIELDS_CONTRACT }))
             }
+            "migrateErrorType" => {
+                ToolResult::Json(json!({ "contract": MIGRATE_ERROR_TYPE_CONTRACT }))
+            }
+            "migrateTypeUsages" => {
+                ToolResult::Json(json!({ "contract": MIGRATE_TYPE_USAGES_CONTRACT }))
+            }
             "updateCallers" => ToolResult::Json(json!({ "contract": UPDATE_CALLERS_CONTRACT })),
             "extractTrait" => ToolResult::Json(json!({ "contract": EXTRACT_TRAIT_CONTRACT })),
             "liftToFree" => ToolResult::Json(json!({ "contract": LIFT_TO_FREE_CONTRACT })),
@@ -578,7 +645,7 @@ impl Tool for RustDescribe {
                 ToolResult::Json(json!({ "contract": REWRITE_MODULE_CALLERS_CONTRACT }))
             }
             other => ToolResult::Error(format!(
-                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, moveStructFields, updateCallers, extractTrait, liftToFree, rewriteModuleCallers)"
+                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, moveStructFields, migrateErrorType, migrateTypeUsages, updateCallers, extractTrait, liftToFree, rewriteModuleCallers)"
             )),
         }
     }
@@ -597,6 +664,8 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
         Arc::new(move_struct_fields::RustMoveStructFields(Arc::clone(
             &ledger,
         ))) as Arc<dyn Tool>,
+        Arc::new(migrate::RustMigrateErrorType(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(migrate::RustMigrateTypeUsages(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(update_callers::RustUpdateCallers(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(extract_trait::RustExtractTrait(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(lift_free::RustLiftToFree(Arc::clone(&ledger))) as Arc<dyn Tool>,
@@ -629,6 +698,7 @@ type RustExtractImplMethodsResult = { changes: SpanChange[]; creates: { path: st
 type RustRewriteModuleCallersResult = { changes: SpanChange[]; findings: Record<string, unknown>[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
 type RustOrganizeImportsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; mode: "minimize"; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
 type RustMoveStructFieldsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; operator_opt_outs_used: string[]; provenance: "syntax_only" };
+type RustMigrationResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; operator_opt_outs_used: string[]; provenance: "syntax_only" };
 type RustUpdateCallersResult = { changes: RustSpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
 type RustExtractTraitResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; dyn_compatible: boolean; object_safety_report: { generic_methods: string[]; self_by_value_methods: string[]; associated_constants: string[]; dyn_compatible: boolean }; call_site_warnings: string[]; trait_in_scope_required: string[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
 type RustLiftRefusalReason = { method: string; reason: string };
@@ -652,6 +722,10 @@ declare const rust: {
   organizeImports(args: { source: string; mode?: "minimize" | "organize"; allow_wildcards?: string[]; remove_unused_wildcards?: boolean }): Promise<RustOrganizeImportsResult>;
   /** Move named fields from one struct to another (RX-S1). The acknowledge_repr operator opt-out (required for non-default #[repr] structs) arrives dispatch-side via ToolArgDefaults lookup, never as cell input. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFile. Follow with rust.updateCallers. */
   moveStructFields(args: { source: string; target: string; structName: string; itemNames: string[]; visibility?: string }): Promise<RustMoveStructFieldsResult>;
+  /** Rewrite an error type in named function signatures and mapped construction sites. Public-API acknowledgement arrives only dispatch-side through ToolArgDefaults. NEVER writes: feed {changes} into edits.merge. */
+  migrateErrorType(args: { source: string; oldText: string; newText: string; itemNames: string[]; errorMapping?: Record<string, string> }): Promise<RustMigrationResult>;
+  /** Migrate supported uses of a Rust type. Public-API acknowledgement arrives only dispatch-side through ToolArgDefaults. NEVER writes: feed {changes} into edits.merge. */
+  migrateTypeUsages(args: { source: string; moduleName: string; replacementKind: "bareConcrete" | "boxDyn" | "arcDyn" | "rcDyn" | "implTrait" | "genericParamTBoundedTrait"; newText: string }): Promise<RustMigrationResult>;
   /** Rewrite callers through a delegate field (RX-S2b). Companion to moveStructFields: conservatively rewrites self.field and self.method(args) to go through a delegate field. Unrewriteable accessors surface in findings. NEVER writes: feed {changes} into edits.merge. */
   updateCallers(args: { source: string; structName?: string; delegateField: string; target?: string; delegateType?: string; itemNames: string[] }): Promise<RustUpdateCallersResult>;
   /** Extract selected inherent impl methods into a trait and trait impl. Reports object safety, call-site warnings, and files that require the trait in scope. NEVER writes: feed {changes} into edits.merge and {creates} into edits.createFile. */
