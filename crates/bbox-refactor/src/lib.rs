@@ -30,7 +30,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub mod facts;
 mod rust;
-use rust::*;
+pub use rust::*;
 mod java;
 use java::*;
 pub use java::{
