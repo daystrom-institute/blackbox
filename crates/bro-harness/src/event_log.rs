@@ -109,6 +109,34 @@ impl EventLog {
         &self.path
     }
 
+    /// Scan `path` (if present) for the highest `event.seq` value written by
+    /// a prior process run of this session, for the session-open seq-counter
+    /// reconciliation performed in `session.rs`: `max(snapshot.last_event_seq,
+    /// max_seq_in_log(path))`. The snapshot alone is not sufficient: a crash
+    /// between turn-boundary persists can leave the snapshot stale while the
+    /// log (append-only, durable up to the last drained event) already
+    /// recorded higher `seq` values, and reusing those values for a
+    /// *different* event on the next run would poison a fleetd cursor.
+    ///
+    /// Best-effort and read-only: an absent or unreadable file returns 0
+    /// (fresh session behavior); a malformed line (e.g. a partial line from
+    /// a crash mid-write) or a pre-seq line (written before this field
+    /// existed, no `event.seq` key) is skipped rather than failing the scan.
+    /// One-time cost at session open, never on the hot path.
+    // one-time session-open reconciliation read, before the loop serves turns.
+    #[allow(clippy::disallowed_methods)]
+    pub fn max_seq_in_log(path: &Path) -> u64 {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|v| v["event"]["seq"].as_u64())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Append one envelope event as a timestamped line. Best-effort.
     pub fn append_event(&self, event: &Value) {
         self.append_line(json!({
@@ -352,5 +380,68 @@ mod tests {
         let log = EventLog::disabled();
         log.append_event(&json!({"type": "assistant"}));
         assert_eq!(log.path(), Path::new(""));
+    }
+
+    // -----------------------------------------------------------------
+    // max_seq_in_log (session-open seq reconciliation)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn max_seq_in_log_is_zero_for_absent_file() {
+        let dir = unique_dir("seq-absent");
+        assert_eq!(EventLog::max_seq_in_log(&dir.join("nope.events.jsonl")), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_seq_in_log_finds_the_highest_seq_regardless_of_line_order() {
+        let dir = unique_dir("seq-scan");
+        let log = EventLog::at_path(dir.join("s.events.jsonl"));
+
+        log.append_event(&json!({"type": "assistant", "seq": 1}));
+        log.append_event(&json!({"type": "assistant", "seq": 2}));
+        log.append_event(&json!({"type": "result", "seq": 4}));
+        log.flush_blocking();
+
+        assert_eq!(EventLog::max_seq_in_log(log.path()), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_seq_in_log_skips_lines_without_a_seq_field() {
+        // Pre-existing sessions logged before `seq` was added carry no
+        // `event.seq` key at all, so the scan must skip them, not treat a
+        // missing key as seq 0 that could mask a real (higher) later value,
+        // and must not panic on lines that never had a seq to begin with.
+        let dir = unique_dir("seq-legacy-lines");
+        let log = EventLog::at_path(dir.join("s.events.jsonl"));
+
+        log.append_event(&json!({"type": "assistant"})); // pre-seq line
+        log.append_event(&json!({"type": "result", "seq": 7}));
+        log.flush_blocking();
+
+        assert_eq!(EventLog::max_seq_in_log(log.path()), 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_seq_in_log_tolerates_a_malformed_trailing_line() {
+        // A crash mid-write_all can leave a partial (non-JSON) last line;
+        // the scan must skip it rather than fail the whole reconciliation.
+        let dir = unique_dir("seq-malformed");
+        let log = EventLog::at_path(dir.join("s.events.jsonl"));
+        log.append_event(&json!({"type": "assistant", "seq": 3}));
+        log.flush_blocking();
+
+        // Append a truncated (invalid JSON) line directly, simulating a
+        // torn write.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(log.path()).unwrap();
+            write!(f, "{{\"ts\":\"2026-01-01T00:00:00Z\",\"event\":{{\"seq\":9").unwrap();
+        }
+
+        assert_eq!(EventLog::max_seq_in_log(log.path()), 3);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
