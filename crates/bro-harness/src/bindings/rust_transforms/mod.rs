@@ -16,6 +16,9 @@
 //! `rust.describe` at runtime (values stay in the isolate, no prompt bloat).
 
 mod fix;
+mod helpers;
+mod r#move;
+mod wiring;
 
 use std::sync::Arc;
 
@@ -99,6 +102,154 @@ IDIOM
   // round.leftovers is the manual punch list.
 "#;
 
+const EXTRACT_ITEMS_CONTRACT: &str = r#"rust.extractItems - move top-level Rust items into a (new) submodule.
+
+WHAT IT DOES
+  Ports v1 extract_rust_items_to_submodule + extract_rust_items +
+  move_rust_items_with_local_deps + extract_rust_section as ONE transform
+  (design/refactor-tools/rust/rust-isolate-surface.md §3.1). Plain extract
+  when wiring knobs unset; compound mode (default) does scaffolded target +
+  `mod <name>;` in parent + visibility bumps on moved items AND their struct
+  fields + extract + auto-pruned `use <module>::{...};` re-import.
+
+  Knob boundary (§8.3): the five knobs select the SYNTHESIS SHAPE; the host
+  dependency analysis runs ALWAYS and reports in findings (never knob-gated).
+  Per-item visibility maps are orchestration and live in rust.setVisibility
+  after; any deep_analysis-style toggle is rejected categorically.
+
+PARAMS
+  source: string                     Parent module file (workspace-relative).
+  target: string                     New submodule file (workspace-relative).
+  itemNames: string[]                Top-level item names to move.
+  itemKinds?: string[]               Optional syntax item kinds to narrow names.
+  moduleName?: string                Module name for `mod <name>;`. Defaults to
+                                       the target file stem (must match it).
+  visibility?: string                Visibility floor for items + fields.
+                                       Compound mode. Defaults to `pub(super)`.
+  targetPrelude?: string             New file prelude. Defaults to `use super::*;`.
+  withLocalDeps?: boolean            Move the exclusive private dependency
+                                       closure of the seeds (not just the seeds).
+  section?: {startMarker?, endMarker?,  Section addressing: select items by
+              startLine?, endLine?}     source-region bounds.
+  mergeIntoExistingTarget?: boolean  Append to a non-empty target instead of
+                                       refusing.
+  useDeclVisibility?: string         Visibility of the parent re-export
+                                       (private | pub | pub(crate) | pub(super)).
+  useDeclItems?: string[]            Explicit re-export subset of itemNames
+                                       (defaults to auto-prune: only names still
+                                       referenced in the post-deletion source).
+  previewOnly?: boolean              Return findings + metadata but zero
+                                       changes/creates.
+
+RETURNS { title, changes, creates, findings, preview_only, mode,
+           would_change_files, would_create_files, provenance }
+  changes[]:   { span, new_text } for edits.merge (source-side edits)
+  creates[]:   { path, content } for edits.createFile (new target file)
+  findings[]:  always-on dependency analysis (local_dependency_closure when
+               withLocalDeps, external_references, suggested_clusters) +
+               planner notes + moved_item entries
+  mode:        "compound" | "with_local_deps" | "section"
+
+NEVER WRITES. Feed `changes` into edits.merge and `creates` into
+edits.createFile, then edits.apply. NOT idempotent over its own output: a
+re-call after a successful apply hits the target-exists refusal - that is
+the DONE signal, not a retry. store() the result if you need it in later
+cells.
+
+IDIOM
+  const r = await rust.extractItems({ source: "src/big.rs",
+    target: "src/big/helpers.rs", itemNames: ["Helper", "build"] });
+  const es = await edits.begin();
+  await edits.merge({ es, changes: r.changes });
+  for (const c of r.creates) await edits.createFile({ es, path: c.path, content: c.content });
+  await edits.apply({ es });
+  // re-run cargo check to verify; rust.fixRound handles follow-up diagnostics.
+"#;
+
+const INLINE_MOD_TO_FILE_CONTRACT: &str = r#"rust.inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file.
+
+WHAT IT DOES
+  Ports v1 inline_mod_to_file_submodule (design §3.1). Extracts the body of
+  an inline `mod foo { ... }` into a submodule file and replaces the block
+  with `mod foo;`. Outer attributes such as `#[cfg(test)]` stay attached to
+  the retained declaration - they are written above `mod foo`, not inside
+  the body, so the in-place rewrite naturally preserves them.
+
+  Target auto-derivation (Rust 2018+ module layout):
+    `parent.rs` + `mod tests` -> `parent/tests.rs`
+    `lib.rs` / `main.rs` / `mod.rs` + `mod foo` -> `foo.rs` (flat sibling)
+  Explicit `target` overrides the derivation.
+
+  Refuses non-empty targets (operator-scaffolded empty file is accepted).
+  Body de-indentation strips the longest common run of leading spaces.
+
+PARAMS
+  source: string       File containing the inline mod (workspace-relative).
+  moduleName: string   The mod name to inline.
+  target?: string      Optional explicit target path (auto-derived when unset).
+  previewOnly?: boolean
+
+RETURNS { title, changes, creates, findings, preview_only, target,
+           would_change_files, would_create_files, provenance }
+  target: the resolved target path (useful when auto-derived).
+
+NEVER WRITES. Feed changes -> edits.merge, creates -> edits.createFile.
+NOT idempotent: re-call after apply hits the target-exists refusal (DONE).
+"#;
+
+const MODULE_WIRING_CONTRACT: &str = r#"rust.moduleWiring - one conservative Rust module-graph edit.
+
+WHAT IT DOES
+  Ports v1 rust_module_wiring + the absorbed mod/use micro-kinds (design
+  §3.1). One action per call:
+
+    add_mod     insert `<vis>mod <name>;` (idempotent: refuses duplicates)
+    remove_mod  delete an existing `mod <name>;` declaration
+    add_use     insert `<vis>use <path>;` (idempotent: refuses verbatim dups)
+    remove_use  delete an existing `use <path>;` line (any visibility)
+
+  Tree-sitter validated. The planner refuses duplicates and missing targets
+  with actionable errors.
+
+PARAMS
+  source: string        File to edit (workspace-relative).
+  action: string        "add_mod" | "remove_mod" | "add_use" | "remove_use".
+  moduleName?: string   Required for mod actions.
+  usePath?: string      Required for use actions (e.g. `std::collections::HashMap`,
+                        `child::{A, B}`).
+  visibility?: string   Optional prefix (`pub`, `pub(crate)`, `pub(super)`).
+
+RETURNS { title, changes, findings, action, would_change_files, provenance }
+
+NEVER WRITES. Feed changes -> edits.merge -> edits.apply.
+"#;
+
+const SET_VISIBILITY_CONTRACT: &str = r#"rust.setVisibility - rewrite visibility of items, impl methods, or struct fields.
+
+WHAT IT DOES
+  Ports v1 rewrite_rust_item_visibility + rewrite_rust_field_visibility as
+  one transform with a targetKind selector (design §3.1). Only the
+  visibility prefix is rewritten; async/unsafe/const qualifiers are
+  preserved (the planner rewrites the prefix up to the keyword byte).
+
+PARAMS
+  source: string       File to edit (workspace-relative).
+  visibility: string   New visibility: `pub`, `pub(crate)`, `pub(super)`,
+                       or `private` (empty prefix).
+  targetKind?: string  "item" (default) | "method" | "field".
+  itemNames: string[]  Item / struct / method names.
+  implName?: string    Impl name disambiguator for method targets when
+                       multiple impls define the same method name.
+
+RETURNS { title, changes, findings, target_kind, would_change_files, provenance }
+  findings[] includes one `visibility_rewritten` entry per rewritten item.
+
+NEVER WRITES. Feed changes -> edits.merge -> edits.apply. For a moved-item
+visibility bump baked into an extract, prefer rust.extractItems (compound
+mode bakes item + field visibility in one pass); use this transform for
+standalone visibility edits or post-extract adjustments.
+"#;
+
 #[async_trait]
 impl Tool for RustDescribe {
     fn name(&self) -> &str {
@@ -132,8 +283,12 @@ impl Tool for RustDescribe {
             .unwrap_or_default();
         match transform {
             "fixRound" => ToolResult::Json(json!({ "contract": FIX_ROUND_CONTRACT })),
+            "extractItems" => ToolResult::Json(json!({ "contract": EXTRACT_ITEMS_CONTRACT })),
+            "inlineModToFile" => ToolResult::Json(json!({ "contract": INLINE_MOD_TO_FILE_CONTRACT })),
+            "moduleWiring" => ToolResult::Json(json!({ "contract": MODULE_WIRING_CONTRACT })),
+            "setVisibility" => ToolResult::Json(json!({ "contract": SET_VISIBILITY_CONTRACT })),
             other => ToolResult::Error(format!(
-                "rust.describe: unknown transform `{other}` (available: fixRound)"
+                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility)"
             )),
         }
     }
@@ -143,7 +298,11 @@ impl Tool for RustDescribe {
 pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(RustDescribe) as Arc<dyn Tool>,
-        Arc::new(fix::RustFixRound(ledger)) as Arc<dyn Tool>,
+        Arc::new(fix::RustFixRound(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(r#move::RustExtractItems(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(r#move::RustInlineModToFile(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(wiring::RustModuleWiring(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(wiring::RustSetVisibility(ledger)) as Arc<dyn Tool>,
     ]
 }
 
@@ -153,16 +312,33 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "rust".to_string(),
-        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, findings, leftovers} for edits.merge and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape)."
+        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import; knobs select synthesis shape (withLocalDeps, section, mergeIntoExistingTarget, useDeclVisibility, useDeclItems) while dependency analysis runs always and reports in findings. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. moduleWiring - one conservative module-graph edit (add_mod/remove_mod/add_use/remove_use, idempotent). setVisibility - rewrite visibility of items, impl methods, or struct fields; preserves async/unsafe/const qualifiers."
             .to_string(),
         declarations: r#"type RustChangeProposal = { span: Span; new_text: string; provenance: "compiler_suggested" | "syntax_only"; code?: string };
 type RustLeftover = { message: string; code?: string; reason: string };
 type RustFixRoundResult = { changes: RustChangeProposal[]; findings: ({ finding: string } & Record<string, unknown>)[]; leftovers: RustLeftover[]; counts: { changes: number; leftovers: number }; issuance: string };
+type RustSpanChange = { span: Span; new_text: string };
+type RustCreate = { path: string; content: string };
+type RustWouldChangeFile = { path: string; edit_count: number; replacement_bytes: number };
+type RustWouldCreateFile = { path: string; bytes: number };
+type RustSectionBounds = { startMarker?: string; endMarker?: string; startLine?: number; endLine?: number };
+type RustExtractItemsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; mode: "compound" | "with_local_deps" | "section"; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
+type RustInlineModToFileResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; preview_only: boolean; target: string; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
+type RustModuleWiringResult = { title: string; changes: RustSpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; action: "add_mod" | "remove_mod" | "add_use" | "remove_use"; would_change_files: RustWouldChangeFile[]; provenance: "syntax_only" };
+type RustSetVisibilityResult = { title: string; changes: RustSpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; target_kind: "item" | "method" | "field"; would_change_files: RustWouldChangeFile[]; provenance: "syntax_only" };
 declare const rust: {
   /** Full contract (params, result vocabulary, recipe) for one rust transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
   /** Classify rustc/clippy build.gate diagnostics into edit proposals + leftovers. Verbatim MachineApplicable suggestions become compiler_suggested changes; add-use/visibility-bump proposals are syntax_only; borrow-checker/trait-bound errors are leftovers. NEVER writes: feed {changes} into edits.merge. */
   fixRound(args: { diagnostics: Record<string, unknown>[]; raw_json?: string; restrict_to_files?: string[]; restrictToFiles?: string[] }): Promise<RustFixRoundResult>;
+  /** Move top-level Rust items into a (new) submodule. Compound mode (default): scaffolded target + `mod <name>;` + visibility bumps + auto-pruned use decl. Knobs select synthesis shape; dependency analysis runs always. Feed {changes, creates} into edits.merge/createFile. NOT idempotent: target-exists refusal after apply is the DONE signal. */
+  extractItems(args: { source: string; target: string; itemNames: string[]; itemKinds?: string[]; moduleName?: string; visibility?: string; targetPrelude?: string; withLocalDeps?: boolean; section?: RustSectionBounds; mergeIntoExistingTarget?: boolean; useDeclVisibility?: string; useDeclItems?: string[]; previewOnly?: boolean }): Promise<RustExtractItemsResult>;
+  /** Inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. Target auto-derived (parent.rs -> parent/<name>.rs; lib.rs/main.rs/mod.rs -> flat sibling). Refuses non-empty targets. Feed {changes, creates} into edits.merge/createFile. */
+  inlineModToFile(args: { source: string; moduleName: string; target?: string; previewOnly?: boolean }): Promise<RustInlineModToFileResult>;
+  /** One conservative Rust module-graph edit: add_mod, remove_mod, add_use, or remove_use. Idempotent (rejects duplicates and missing targets). Feed {changes} into edits.merge. */
+  moduleWiring(args: { source: string; action: "add_mod" | "remove_mod" | "add_use" | "remove_use"; moduleName?: string; usePath?: string; visibility?: string }): Promise<RustModuleWiringResult>;
+  /** Rewrite visibility of top-level items, impl methods, or struct fields. Preserves async/unsafe/const qualifiers (only the visibility prefix is rewritten). targetKind: item (default), method, or field. implName disambiguates methods. Feed {changes} into edits.merge. */
+  setVisibility(args: { source: string; visibility: string; itemNames: string[]; targetKind?: "item" | "method" | "field"; implName?: string }): Promise<RustSetVisibilityResult>;
 };"#
             .to_string(),
     }
