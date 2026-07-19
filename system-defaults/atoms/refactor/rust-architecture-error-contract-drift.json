@@ -151,7 +151,7 @@
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v2"
+      "brofile_ref": "brofile:rust-architecture-pathologist@v2"
     },
     "supervision": {
       "oracle": "default"
