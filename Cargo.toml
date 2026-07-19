@@ -18,6 +18,11 @@ members = [
     "crates/bro-apply-patch",
     "crates/bro-slack",
 
+    # The per-machine fleet supervisor (slice 5). Its dependency ceiling is
+    # narrow BY DESIGN and asserted by scripts/acceptance-fleetd-deps.sh: no
+    # blackbox, no bro-harness, no bbox-* crate, no tantivy, no V8.
+    "crates/fleetd",
+
     # Daemon-internal corpus crates peeled out of the root `blackbox` crate for
     # build parallelism (NOT bro-harness crates). Pure leaves: they depend only
     # on external crates, never on blackbox internals, and are re-exported back

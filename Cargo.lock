@@ -2073,6 +2073,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleetd"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bro-core",
+ "bro-protocol",
+ "bro-rpc",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

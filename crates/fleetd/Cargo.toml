@@ -1,0 +1,47 @@
+# The per-machine fleet supervisor (slice 5 of
+# design/daemon-runtime/locality-first-decomposition.md).
+#
+# DEPENDENCY CEILING, enforced by scripts/acceptance-fleetd-deps.sh: the whole
+# point of extracting this binary is that it rarely changes and never restarts
+# when the daemon does. It must not link `blackbox`, `bro-harness`,
+# `bro-code-mode`, `bro-capabilities`, any `bbox-*` crate, tantivy, or V8.
+# It talks to the contract bottom (bro-protocol) over the transport substrate
+# (bro-rpc) and spawns processes. That is the entire job.
+[package]
+name = "fleetd"
+version = "0.0.1"
+edition = "2024"
+build = "build.rs"
+
+[[bin]]
+name = "fleetd"
+path = "src/main.rs"
+
+[dependencies]
+bro-protocol = { path = "../bro-protocol" }
+bro-rpc = { path = "../bro-rpc" }
+
+anyhow = "1"
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+bro-core = { path = "../bro-core" }
+serde_json = "1"
+tempfile = "3"
+
+[lints.clippy]
+disallowed_methods = "deny"
