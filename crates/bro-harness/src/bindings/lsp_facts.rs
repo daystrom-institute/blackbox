@@ -1377,7 +1377,7 @@ pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
