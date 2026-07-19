@@ -108,6 +108,14 @@ struct Cli {
     /// Max wall time per --cell/--cell-file, including automatic waits.
     #[arg(long, value_name = "SECONDS", default_value_t = 900)]
     cell_timeout: u64,
+
+    /// Host tool-arg default table as a JSON string map
+    /// ({"default:<tool>.<param>": "value", ...}), the same grammar as
+    /// BRO_HARNESS_TOOL_DEFAULTS (which is the fallback when the flag is
+    /// absent). Operator-authority grants (RX-V1) reach bindings through
+    /// this channel, never as cell-authored arguments.
+    #[arg(long, value_name = "JSON")]
+    tool_defaults: Option<String>,
 }
 
 struct IsolateSurface {
@@ -144,7 +152,7 @@ async fn build_surface(mcp_config: Option<&str>) -> IsolateSurface {
 /// Minimal `ToolCx` rooted at `root` — same shape as the test helper, all
 /// shared state defaulted. Read-only bindings only touch `root`; the shell/
 /// edit sinks are wired so `edits.*`/`shell_run` also work when exercised.
-fn make_cx(root: PathBuf) -> ToolCx {
+fn make_cx(root: PathBuf, tool_arg_defaults: ToolArgDefaults) -> ToolCx {
     ToolCx {
         root,
         safety: Arc::new(SafetyPolicy::new()),
@@ -154,8 +162,24 @@ fn make_cx(root: PathBuf) -> ToolCx {
         edits: Arc::new(StdMutex::new(EditSink::default())),
         session_env: Arc::new(BTreeMap::new()),
         shell_env: Arc::new(BTreeMap::new()),
-        tool_arg_defaults: Arc::new(ToolArgDefaults::default()),
+        tool_arg_defaults: Arc::new(tool_arg_defaults),
     }
+}
+
+/// Load the host tool-arg default table: `--tool-defaults` JSON wins, then
+/// the BRO_HARNESS_TOOL_DEFAULTS env var (same grammar as the harness's
+/// --additional-context path), else empty.
+fn load_tool_defaults(cli_json: Option<&str>) -> Result<ToolArgDefaults> {
+    let raw = match cli_json {
+        Some(raw) => serde_json::from_str::<BTreeMap<String, String>>(raw)
+            .context("parse --tool-defaults as a JSON string map")?,
+        None => match std::env::var("BRO_HARNESS_TOOL_DEFAULTS") {
+            Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
+                .context("parse BRO_HARNESS_TOOL_DEFAULTS as a JSON string map")?,
+            _ => BTreeMap::new(),
+        },
+    };
+    ToolArgDefaults::parse_map(raw).map_err(anyhow::Error::msg)
 }
 
 fn find_tool<'a>(tools: &'a [Arc<dyn Tool>], name: &str) -> Result<&'a Arc<dyn Tool>> {
@@ -378,6 +402,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     let surface = build_surface(mcp_config.as_deref()).await;
+    let tool_defaults = load_tool_defaults(cli.tool_defaults.as_deref())?;
 
     if cli.list {
         let mut names: Vec<&str> = surface.tools.iter().map(|t| t.name()).collect();
@@ -401,7 +426,7 @@ async fn main() -> Result<()> {
             .clone()
             .ok_or_else(|| anyhow!("--root <DIR> is required to evaluate a cell"))?;
         let sources = read_cell_sources(&cli)?;
-        let cx = make_cx(root);
+        let cx = make_cx(root, tool_defaults);
         let execution = execute_cell_sources(
             sources,
             &cx,
@@ -448,7 +473,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let cx = make_cx(root);
+    let cx = make_cx(root, tool_defaults);
     let result = tool.call(input, &cx).await;
     shutdown_session_owned_children(&cx, &surface).await;
     if !emit_tool_result(result, cli.field.as_deref())? {
@@ -464,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn cell_mode_preserves_kv_and_functions_across_cells() {
         let dir = tempfile::tempdir().unwrap();
-        let cx = make_cx(dir.path().to_path_buf());
+        let cx = make_cx(dir.path().to_path_buf(), ToolArgDefaults::default());
         let surface = build_surface(None).await;
         let results = execute_cell_sources(
             vec![
@@ -490,7 +515,7 @@ mod tests {
     async fn cell_mode_dispatches_nested_workspace_tools() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("probe.txt"), "hello from cell").unwrap();
-        let cx = make_cx(dir.path().to_path_buf());
+        let cx = make_cx(dir.path().to_path_buf(), ToolArgDefaults::default());
         let surface = build_surface(None).await;
         let results = execute_cell_sources(
             vec![
@@ -513,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn cell_mode_auto_waits_until_a_yielded_cell_completes() {
         let dir = tempfile::tempdir().unwrap();
-        let cx = make_cx(dir.path().to_path_buf());
+        let cx = make_cx(dir.path().to_path_buf(), ToolArgDefaults::default());
         let surface = build_surface(None).await;
         let results = execute_cell_sources(
             vec![
@@ -580,7 +605,7 @@ text("after");"#
         );
 
         let dir = tempfile::tempdir().unwrap();
-        let cx = make_cx(dir.path().to_path_buf());
+        let cx = make_cx(dir.path().to_path_buf(), ToolArgDefaults::default());
         let results = execute_cell_sources(
             vec![
                 "const r = await tools.mcp__fake__echo({ a: 1 }); text(JSON.stringify(r));"

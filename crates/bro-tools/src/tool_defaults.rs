@@ -154,6 +154,19 @@ impl ToolArgDefaults {
         self.rules.is_empty()
     }
 
+    /// Host-side grant lookup for operator-authority flags (RX-V1): the value
+    /// of the Default rule exactly matching (tool, param), if any. Bindings
+    /// query this instead of reading merged tool input, so a cell-authored
+    /// flag of the same name stays a schema error. Pin rules are enforcement,
+    /// not grants, and are ignored here. Values are raw strings; bindings
+    /// parse their own booleans.
+    pub fn lookup(&self, tool_name: &str, param: &str) -> Option<&str> {
+        self.selected_rules(tool_name, Flavor::Default)
+            .into_iter()
+            .find(|rule| rule.param == param)
+            .map(|rule| rule.value.as_str())
+    }
+
     pub fn apply(
         &self,
         tool_name: &str,
@@ -369,6 +382,48 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn lookup_returns_default_rule_value_for_exact_param() {
+        let defaults = table(&[
+            ("default:rust.moveStructFields.acknowledge_repr", "true"),
+            ("default:rust.moveStructFields.other_param", "x"),
+            ("pin:rust.moveStructFields.acknowledge_repr", "false"),
+            ("default:rust.*.acknowledge_public_api_change", "true"),
+        ]);
+        assert_eq!(
+            defaults.lookup("rust.moveStructFields", "acknowledge_repr"),
+            Some("true"),
+            "exact Default rule is a grant"
+        );
+        assert_eq!(
+            defaults.lookup("rust.moveStructFields", "other_param"),
+            Some("x")
+        );
+        assert_eq!(
+            defaults.lookup("rust.migrateErrorType", "acknowledge_public_api_change"),
+            Some("true"),
+            "glob patterns match by the same alias logic as apply"
+        );
+        assert_eq!(
+            defaults.lookup("rust.moveStructFields", "missing"),
+            None,
+            "no rule, no grant"
+        );
+        assert_eq!(
+            defaults.lookup("java.moveStructFields", "acknowledge_public_api_change"),
+            None,
+            "glob prefix does not cross the language boundary"
+        );
+    }
+
+    #[test]
+    fn lookup_ignores_pin_rules() {
+        // Pins are enforcement, not grants: a pinned value must never read
+        // as operator authority for an RX-V1 flag.
+        let defaults = table(&[("pin:rust.moveStructFields.acknowledge_repr", "true")]);
+        assert_eq!(defaults.lookup("rust.moveStructFields", "acknowledge_repr"), None);
     }
 
     #[test]
