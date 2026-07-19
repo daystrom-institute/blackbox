@@ -33,11 +33,31 @@ use super::code_facts::Span;
 
 /// Authority tier of an edit's producer. Ordering is the weakest-link rule:
 /// the smallest tier across an EditSet is the set's `semantic_status`.
+///
+/// The three tiers, weakest to strongest:
+/// - [`AuthorityTier::SyntaxOnly`] - cell-authored bytes or planner guesses
+///   (tree-sitter synthesis, classifier-proposed edits). The floor.
+/// - [`AuthorityTier::CompilerSuggested`] - a rustc/clippy
+///   `MachineApplicable` `suggested_replacement` copied verbatim (span +
+///   replacement). Stronger than a tree-sitter guess (the compiler asserts
+///   the suggestion compiles), weaker than `LspVerified` (the compiler
+///   suggests what compiles, not what was meant). Recorded only by
+///   `rust.fixRound` and only for verbatim suggestion bytes.
+/// - [`AuthorityTier::LspVerified`] - authored by a language server (rename,
+///   code action) and recognized by the ledger at consumption. Semantics-
+///   preserving by the server's contract.
+///
+/// Tiers are authorship lineage, not outcome guarantees; the terminal
+/// `cargo check` in every recipe is the outcome gate (design
+/// refactor-tools/rust/rust-isolate-surface.md section 8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthorityTier {
-    /// Bytes a program manipulated without semantic authority — the floor,
+    /// Bytes a program manipulated without semantic authority - the floor,
     /// and the tier of every cell-authored edit.
     SyntaxOnly,
+    /// A compiler-authored `MachineApplicable` suggestion, verbatim. Sits
+    /// between `SyntaxOnly` and `LspVerified`.
+    CompilerSuggested,
     /// Authored by a language server (rename, code action) and recognized
     /// by the ledger at consumption.
     LspVerified,
@@ -47,6 +67,7 @@ impl AuthorityTier {
     pub fn as_str(self) -> &'static str {
         match self {
             AuthorityTier::SyntaxOnly => "syntax_only",
+            AuthorityTier::CompilerSuggested => "compiler_suggested",
             AuthorityTier::LspVerified => "lsp_verified",
         }
     }

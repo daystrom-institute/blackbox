@@ -760,22 +760,36 @@ impl Tool for EditsApply {
         // (cell-dsl §4) — never from anything the cell claims. The set's
         // semantic_status is the weakest link across every member; file
         // creations are cell-authored content, so they count syntax_only.
+        // Three tiers (weakest -> strongest): SyntaxOnly, CompilerSuggested
+        // (rust.fixRound verbatim MachineApplicable bytes), LspVerified.
         let mut lineage_lsp = 0usize;
+        let mut lineage_compiler = 0usize;
         let mut lineage_syntax = set.creates.len() + set.deletes.len();
         for accum in set.files.values() {
             for le in &accum.edits {
                 match le.tier {
                     AuthorityTier::LspVerified => lineage_lsp += 1,
+                    AuthorityTier::CompilerSuggested => lineage_compiler += 1,
                     AuthorityTier::SyntaxOnly => lineage_syntax += 1,
                 }
             }
         }
-        let semantic_status = if lineage_syntax == 0 {
-            AuthorityTier::LspVerified.as_str()
-        } else {
+        // Weakest link: the smallest tier present wins. creates/deletes
+        // always count as syntax_only, so any non-zero lineage_syntax floors
+        // the set; otherwise compiler_suggested beats nothing; lsp_verified
+        // only when nothing weaker is present.
+        let semantic_status = if lineage_syntax > 0 {
             AuthorityTier::SyntaxOnly.as_str()
+        } else if lineage_compiler > 0 {
+            AuthorityTier::CompilerSuggested.as_str()
+        } else {
+            AuthorityTier::LspVerified.as_str()
         };
-        let lineage = json!({ "lsp_verified": lineage_lsp, "syntax_only": lineage_syntax });
+        let lineage = json!({
+            "lsp_verified": lineage_lsp,
+            "compiler_suggested": lineage_compiler,
+            "syntax_only": lineage_syntax
+        });
 
         // Resolve every touched path inside the root before any work.
         let mut resolved_edits: Vec<(String, PathBuf, FileAccum)> = Vec::new();
