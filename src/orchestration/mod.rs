@@ -5879,6 +5879,199 @@ mod tests {
         assert_eq!(healthy.inner.lock().status, TaskStatus::Completed);
     }
 
+    /// The durable cursor advances only for events that carry a `seq`, and
+    /// only after ingest. It is what a re-adopting daemon replays from, so an
+    /// event without a seq must leave it alone (replay more, never less).
+    #[tokio::test]
+    async fn ingest_advances_the_durable_cursor_only_on_seq_carrying_events() {
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let task = spawn_in_process_task(
+            "cursor-task".to_string(),
+            Provider::Workflow,
+            "cursor-session".to_string(),
+            None,
+            root.clone(),
+            Arc::new(RwLock::new(TaskStore::new())),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::Workflow,
+        );
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let join = spawn_harness_ingest_loop(
+            task.clone(),
+            Provider::Glm,
+            "cursor-task".to_string(),
+            root,
+            tail_tx,
+            None,
+            events_rx,
+        );
+
+        for line in [
+            r#"{"type":"system","seq":4}"#,
+            // No seq: a pre-upgrade harness build. Must not advance.
+            r#"{"type":"assistant"}"#,
+            r#"{"type":"assistant","seq":7}"#,
+            // Out of order: the cursor is a high-water mark, never a rewind,
+            // or a replay would re-deliver events already applied.
+            r#"{"type":"assistant","seq":5}"#,
+        ] {
+            events_tx.send(line.to_string()).unwrap();
+        }
+        drop(events_tx);
+        join.await.expect("ingest loop drains to EOF");
+
+        assert_eq!(
+            task.inner.lock().harness_ingest_seq,
+            7,
+            "cursor is the high-water mark of seq-carrying ingested events"
+        );
+    }
+
+    /// Re-adoption is the payoff of the whole slice: a task the previous
+    /// daemon gave up on gets put back to Running, its restart notice
+    /// stripped, its control/kill lanes re-registered, and its own cursor
+    /// handed back so the caller can replay from exactly there.
+    ///
+    /// Installs the process-global re-adoption env, which is fine because
+    /// nextest is process-per-test (the repo's mandated runner).
+    #[tokio::test]
+    async fn readoption_revives_a_task_the_restart_gave_up_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+
+        let task = spawn_in_process_task(
+            "adopt-task".to_string(),
+            Provider::Glm,
+            "adopt-session".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("adopt-task".to_string(), task.clone())
+            .ok();
+        {
+            // Exactly the state `TaskStore::load` leaves behind for a task
+            // that was running when the daemon went down.
+            let mut inner = task.inner.lock();
+            inner.status = TaskStatus::Failed;
+            inner.recoverable = true;
+            inner.completed_at = Some(now_ms());
+            inner.harness_ingest_seq = 12;
+            inner.stderr.push_str(
+                "\n[blackbox] server restarted while task was running. \
+                 The provider session is still on disk; retry with \
+                 `bro_resume(session_id=...)` to continue the conversation \
+                 rather than starting a fresh session.",
+            );
+        }
+
+        install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store.clone(),
+            tail_tx,
+            None,
+        );
+
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (_events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let cursor = readopt_harness_session(ReadoptedSession {
+            session_id: "adopt-session".to_string(),
+            task_id: "adopt-task".to_string(),
+            pid: Some(4242),
+            state: bro_protocol::SessionState::Running,
+            control: control_tx,
+            killer: executor::WorkerKill::via_fleetd(
+                "adopt-session".to_string(),
+                tokio::sync::mpsc::unbounded_channel().0,
+            ),
+            events: events_rx,
+            outcome: outcome_rx,
+        });
+
+        assert_eq!(
+            cursor,
+            Some(12),
+            "the caller replays from the task's own durable cursor"
+        );
+        let inner = task.inner.lock();
+        assert_eq!(
+            inner.status,
+            TaskStatus::Running,
+            "a live child means the task is live, whatever the restart concluded"
+        );
+        assert!(!inner.recoverable);
+        assert_eq!(inner.completed_at, None);
+        assert!(
+            !inner.stderr.contains("server restarted"),
+            "the restart notice is wrong once the session is back: {}",
+            inner.stderr
+        );
+        drop(inner);
+        assert_eq!(*task.child_id.lock(), Some(4242));
+        assert!(
+            harness_controls().read().contains_key("adopt-task"),
+            "the control lane must be reachable again for bro_steer"
+        );
+        assert!(
+            harness_killers().read().contains_key("adopt-task"),
+            "cancel must reach the re-adopted child"
+        );
+    }
+
+    /// A session fleetd holds that the task store never heard of is declined,
+    /// which is what makes the caller leave it running instead of reaping it.
+    #[tokio::test]
+    async fn readoption_declines_a_session_no_task_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root,
+            store,
+            tail_tx,
+            None,
+        );
+
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (_events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let cursor = readopt_harness_session(ReadoptedSession {
+            session_id: "ghost-session".to_string(),
+            task_id: "ghost-task".to_string(),
+            pid: Some(9999),
+            state: bro_protocol::SessionState::Running,
+            control: control_tx,
+            killer: executor::WorkerKill::via_fleetd(
+                "ghost-session".to_string(),
+                tokio::sync::mpsc::unbounded_channel().0,
+            ),
+            events: events_rx,
+            outcome: outcome_rx,
+        });
+        assert_eq!(cursor, None, "an unknown session is declined, not adopted");
+    }
+
     #[test]
     fn fleet_mcp_dispatch_args_is_cockpit_only() {
         // The gate must short-circuit BEFORE any fleet.json read: automation

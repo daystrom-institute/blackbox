@@ -98,6 +98,16 @@ Deliberate deltas, all documented at their call sites:
 - Terminal-session GC is ack-driven only: a session is forgotten when it has
   exited AND the daemon has acknowledged through its last seq.
 
+## Split, not hand-rolled
+
+The connection is split with `bro_rpc::NegotiatedIo::split`, which carries the
+negotiated `ConnectionBinding` onto both halves so generation fencing still
+runs on every frame. This replaced a hand-rolled re-framing here (splitting the
+`UnixStream` and rebuilding two `FramedIo`s with `validate_envelope` called
+manually). The daemon-side client needs the identical shape, and two hand-rolled
+copies of a fencing-critical primitive is one too many. Do not reintroduce a
+local version.
+
 ## Wire note
 
 The design doc's slice 5 contract paragraph says "newline-delimited JSON".
