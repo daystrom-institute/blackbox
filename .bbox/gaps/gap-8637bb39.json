@@ -1,0 +1,23 @@
+{
+  "id": "gap-8637bb39",
+  "title": "rust-analyzer cannot work against lane checkouts: pod-built Linux target/ breaks host RA build data",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools",
+  "wanted_capability": "The lsp.* rust semantic tier (rename/hover/references/assist) needs rust-analyzer to function where agents work, and agents work in lanes. Today RA on macOS pointed at a lane checkout reads a pod-built Linux target/ (proc-macro .so ELF files it cannot load) and its own cargo check children route back into the Linux pod via the $PWD shim, so build data never matches the host. Need one of: (a) RA spawn config (rust-analyzer.toml / initializationOptions) that redirects cargo.targetDir + check.buildScripts to a host-only target dir with a shim bypass (overrideCommand), (b) a documented pod-side RA remote-LSP path, or (c) explicit guidance that rust lsp.* is unsupported in lanes. Blocks live lane validation of the rust isolate semantic tier (design/refactor-tools/rust/rust-isolate-surface.md section 3.3).",
+  "missing_primitive": "an LSP spawn configuration for lane checkouts that gives rust-analyzer host-platform build data (target-dir override + shim-bypassing cargo for build scripts/proc macros), or a documented pod-side RA story",
+  "fallback_used": "Run lsp.* against non-lane checkouts (main repo) with a long wait_ready_ms budget, or against small fixtures; live-validate rust semantic-tier work outside lanes until this is designed.",
+  "evidence": [
+    "~/lanes/bpool4/blackbox/target/debug/deps/*.so are x86-64 ELF (pod-built)",
+    "/Users/invidious/.lane/shims/cargo routes purely on $PWD, no bypass",
+    "thread-edfd5ab5",
+    "control fixture /tmp/ra-mini: lsp.rename applied lsp_verified (binding healthy)"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "tooling/refactor-tools/lsp-rust-analyzer-lane-target-mismatch",
+  "notes": "Refinement from the WP-LSP-REFS lane gate (2026-07-19): the lsp_references_cell integration test ran end-to-end against a REAL rust-analyzer in lane bpool2 and passed. Small no-proc-macro fixture crates work in lanes; the breakage is specific to workspaces whose target/ holds pod-built Linux proc-macro .so files (the blackbox workspace itself). So the semantic tier is usable in lanes for fixture-scale validation today, and the build-data strategy question (host-platform target dir vs pod-side RA) is scoped to full-workspace RA, not all lane RA.",
+  "resolution": "unresolved",
+  "thread_id": "thread-edfd5ab5",
+  "created_at": "2026-07-19T07:03:33Z",
+  "updated_at": "2026-07-19T10:02:54Z"
+}

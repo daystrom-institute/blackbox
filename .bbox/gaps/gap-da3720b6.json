@@ -1,0 +1,23 @@
+{
+  "id": "gap-da3720b6",
+  "title": "bro_exec with NFS-resident cwd wedges in session-start doc-tree read (open(2) never returns)",
+  "gap_kind": "tooling",
+  "domain": "orchestration",
+  "wanted_capability": "Dispatch to lane checkouts (the documented PROJECT.md pattern: claim lane, pass path as dispatch cwd) must not wedge. Observed 2026-07-19 on the prod daemon (started Jul 18 03:24): every bro_exec with cwd under /Users/invidious/lanes/* stalled forever before session_start; stacks show UserInstructions::from_project -> read_doc_tree -> read_to_string -> open(2) blocked indefinitely on NFS regular files, while metadata syscalls on the same tree succeed and non-daemon processes open the same files in 3ms. Non-lane cwd dispatch is unaffected. A prod daemon restart likely clears it (operator-gated; not attempted). Two independent fixes worth doing regardless: (1) bound the doc-tree read with a timeout and degrade to no-overlay with a warning instead of hanging session start; (2) investigate the NFS client state that lets a long-lived launchd daemon wedge on open(2) while other processes succeed.",
+  "missing_primitive": "either a bounded/timeout doc-tree read (any startup fs read that can hang should have a deadline and fail open with a warning), or a daemon-side fix for the wedged NFS client state, or session startup that defers doc-tree reads off the critical path",
+  "fallback_used": "Dispatch with local-disk cwd (git worktrees under .claude/worktrees), rsync worktree into a claimed lane for pod-routed cargo gates.",
+  "evidence": [
+    "sample stacks: 6 threads in bro_harness::project_doc::read_doc_tree -> read_to_string -> __open (never returns)",
+    "fs_usage: getattrlist/lstat/statfs on the same NFS tree succeed in microseconds for the daemon",
+    "pong probes 2026-07-19: lane cwd (bpool4) stalled x3, main-repo cwd completed in seconds x1",
+    "mounts: auto_lanes autofs + per-lane NFS from 192.168.0.16x workers, healthy for all other processes",
+    "thread-edfd5ab5"
+  ],
+  "impact": "critical",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "tooling/orchestration/dispatch-nfs-cwd-wedge",
+  "resolution": "unresolved",
+  "thread_id": "thread-edfd5ab5",
+  "created_at": "2026-07-19T07:41:52Z",
+  "updated_at": "2026-07-19T07:41:52Z"
+}

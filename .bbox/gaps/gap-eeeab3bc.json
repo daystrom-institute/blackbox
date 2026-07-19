@@ -1,0 +1,21 @@
+{
+  "id": "gap-eeeab3bc",
+  "title": "bro-lsp marks rust-analyzer ready on quiescent+error, surfacing as silent null results",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools",
+  "wanted_capability": "observe_rust_analyzer_status should evaluate status==\"error\" (mark_failed) before the quiescent early-return, and lsp.status should surface RA's status message/health so a broken workspace load reads as failed, not ready. Position requests against a failed workspace should error lsp_unavailable (fail closed per RX-V3) instead of returning null contents / \"No references found at position\".",
+  "missing_primitive": "readiness state that distinguishes quiescent-healthy from quiescent-failed and fails closed on the latter",
+  "fallback_used": "Validate lsp.* against non-lane checkouts or small fixtures only; treat null hover as a broken-workload signal, not a real \"no info\".",
+  "evidence": [
+    "crates/bro-lsp/src/lib.rs:446-467 (observe_rust_analyzer_status ordering)",
+    "thread-edfd5ab5",
+    "probe 2026-07-19: isolate lsp.hover/lsp.rename vs ~/lanes/bpool4/blackbox"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/refactor-tools/lsp-readiness-quiescent-error",
+  "resolution": "unresolved",
+  "thread_id": "thread-edfd5ab5",
+  "created_at": "2026-07-19T07:03:05Z",
+  "updated_at": "2026-07-19T07:03:05Z"
+}
