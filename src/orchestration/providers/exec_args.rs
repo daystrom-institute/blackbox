@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use super::Provider;
 
 /// Resolve the harness/provider binary name from env. GLM/DeepSeek/MiniMax/
-/// Brodex/VibeBh ride the custom harness instead of a vendor CLI; transport +
-/// credentials are selected via env (see brofile::resolve_provider_env).
+/// Kimi/Brodex/VibeBh ride the custom harness instead of a vendor CLI;
+/// transport + credentials are selected via env (see
+/// brofile::resolve_provider_env).
 ///
 /// NOTE: harness providers do **not** dispatch via this binary anymore — they
 /// run **in-process** off the linked `bro-harness` lib
@@ -21,6 +22,7 @@ fn bin_with_env(provider: Provider) -> String {
         Provider::Glm
         | Provider::Deepseek
         | Provider::Minimax
+        | Provider::Kimi
         | Provider::Brodex
         | Provider::VibeBh => {
             std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
@@ -175,6 +177,16 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
             .to_string(),
         Provider::Deepseek => model.strip_prefix("deepseek/").unwrap_or(model).to_string(),
         Provider::Minimax => model.strip_prefix("minimax/").unwrap_or(model).to_string(),
+        // Kimi: the wire id is bare `k3` — the Kimi-for-Coding endpoint
+        // rejects the Claude Code slot ids `k3[1m]` / `kimi-k3[1m]` with
+        // "set model id as `k3`" (2026-07-19 wire probe); the 1M window rides
+        // the context-1m beta header, not the id suffix. Map the slot ids so
+        // a model pin copied out of ~/.claude-k/settings.json (which carries
+        // `k3[1m]`) still dispatches.
+        Provider::Kimi => match model {
+            "k3[1m]" | "kimi-k3[1m]" => "k3".to_string(),
+            _ => model.strip_prefix("kimi/").unwrap_or(model).to_string(),
+        },
         _ => model.to_string(),
     }
 }
@@ -193,6 +205,7 @@ fn harness_default_model(provider: Provider) -> Option<String> {
         Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh
     ) {
@@ -260,6 +273,7 @@ impl ProviderExec for Provider {
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh => bin_with_env(*self),
             Provider::Workflow => "workflow".into(),
@@ -290,6 +304,7 @@ impl ProviderExec for Provider {
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh => {
                 let mut args = vec![
@@ -355,6 +370,7 @@ impl ProviderExec for Provider {
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh => {
                 let mut args = vec![

@@ -124,6 +124,7 @@ impl ProviderMcp for Provider {
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh => {
                 let deny = expand_filter_patterns(&filters.disallow);
@@ -149,6 +150,7 @@ impl ProviderMcp for Provider {
             Provider::Glm
                 | Provider::Deepseek
                 | Provider::Minimax
+                | Provider::Kimi
                 | Provider::Brodex
                 | Provider::VibeBh
         )
@@ -171,6 +173,7 @@ impl ProviderMcp for Provider {
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]

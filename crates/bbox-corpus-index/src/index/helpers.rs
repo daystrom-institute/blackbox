@@ -62,6 +62,7 @@ pub fn find_session_file(
         bro_core::Provider::Glm,
         bro_core::Provider::Deepseek,
         bro_core::Provider::Minimax,
+        bro_core::Provider::Kimi,
         bro_core::Provider::Brodex,
         bro_core::Provider::VibeBh,
     ] {

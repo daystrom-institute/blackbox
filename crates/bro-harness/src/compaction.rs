@@ -175,8 +175,9 @@ fn default_entries() -> BTreeMap<String, Entry> {
     // guard, not a tuning knob (thread-9dfe1da5: compacting 1M-class models at
     // a stale 128K/200K default caused premature compaction and a
     // false-memory summary). gpt-5* = 400K per the codex-rs reference
-    // (`protocol/src/openai_models.rs`); deepseek-v4* and MiniMax-M* are
-    // 1M-class; older deepseek ids stay 128K.
+    // (`protocol/src/openai_models.rs`); deepseek-v4*, MiniMax-M*, and Kimi
+    // k3 are 1M-class; older deepseek ids stay 128K, kimi-k2* is 256K-class
+    // (262144 per vendor docs; rounded to house style).
     // MiniMax-M* compact_at is 0.45 (450K threshold) per the official
     // recommendation for agentic workloads — the sparse-attention effective
     // range benefits from earlier compaction.
@@ -186,6 +187,9 @@ fn default_entries() -> BTreeMap<String, Entry> {
         ("deepseek-v4*", 1_000_000, None),
         ("deepseek-*", 128_000, None),
         ("MiniMax-M*", 1_000_000, Some(0.45)),
+        ("k3*", 1_000_000, None),
+        ("kimi-k3*", 1_000_000, None),
+        ("kimi-k2*", 256_000, None),
         ("gpt-5*", 400_000, None),
     ] {
         m.insert(
@@ -269,6 +273,11 @@ mod tests {
         // (thread-9dfe1da5: premature compaction at ~10% of capacity).
         assert_eq!(p.resolve("deepseek-v4-pro").0, 1_000_000);
         assert_eq!(p.resolve("MiniMax-M3").0, 1_000_000);
+        // Kimi k3 is 1M-class (bare id and any future k3* variant);
+        // kimi-k2* is 256K-class.
+        assert_eq!(p.resolve("k3").0, 1_000_000);
+        assert_eq!(p.resolve("kimi-k3").0, 1_000_000);
+        assert_eq!(p.resolve("kimi-k2.7-code").0, 256_000);
         // codex-rs reference: gpt-5 family is 400K.
         assert_eq!(p.resolve("gpt-5.5").0, 400_000);
         assert_eq!(p.resolve("gpt-5.1-codex-max").0, 400_000);

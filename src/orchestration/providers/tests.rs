@@ -107,6 +107,39 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(minimax.contains(&"--model".to_string()));
     assert!(minimax.contains(&"MiniMax-M3".to_string()));
     assert!(!minimax.contains(&"minimax/MiniMax-M3".to_string()));
+
+    // Kimi: the Claude Code slot ids `k3[1m]` / `kimi-k3[1m]` (what the
+    // operator's ~/.claude-k/settings.json carries) map to the upstream wire
+    // id `k3`; the coding endpoint 401s the suffixed forms (2026-07-19 probe).
+    for slot_id in ["k3[1m]", "kimi-k3[1m]"] {
+        let kimi_opts = ExecOpts {
+            model: Some(slot_id.into()),
+            effort: Some("max".into()),
+            provider_defaults: None,
+            code_mode: None,
+            service_tier: None,
+            output_schema: None,
+        };
+        let kimi =
+            Provider::Kimi.build_exec_args("hello kimi", None, "sid-4", None, Some(&kimi_opts));
+        assert!(kimi.contains(&"--model".to_string()));
+        assert!(kimi.contains(&"k3".to_string()), "{slot_id} must map to k3");
+        assert!(
+            !kimi.iter().any(|a| a.contains("[1m]")),
+            "{slot_id} must not reach the wire"
+        );
+    }
+    // A bare catalog id passes through untouched.
+    let bare_opts = ExecOpts {
+        model: Some("kimi-k2.7-code".into()),
+        effort: None,
+        provider_defaults: None,
+        code_mode: None,
+        service_tier: None,
+        output_schema: None,
+    };
+    let bare = Provider::Kimi.build_exec_args("hi", None, "sid-5", None, Some(&bare_opts));
+    assert!(bare.contains(&"kimi-k2.7-code".to_string()));
 }
 
 #[test]

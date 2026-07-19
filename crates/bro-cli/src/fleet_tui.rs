@@ -284,6 +284,7 @@ const FLEET_PROVIDERS: &[Provider] = &[
     Provider::Glm,
     Provider::Deepseek,
     Provider::Minimax,
+    Provider::Kimi,
     Provider::Brodex,
     Provider::VibeBh,
 ];
@@ -5907,6 +5908,7 @@ fn provider_tag(p: Provider) -> &'static str {
         Provider::Brodex => "bdx",
         Provider::VibeBh => "vbh",
         Provider::Minimax => "mmx",
+        Provider::Kimi => "k3",
         Provider::Workflow => "wf",
     }
 }
@@ -5918,6 +5920,7 @@ fn provider_color(p: Provider) -> Color {
         Provider::Brodex => Color::LightGreen,
         Provider::VibeBh => Color::LightRed,
         Provider::Minimax => Color::Yellow,
+        Provider::Kimi => Color::LightMagenta,
         Provider::Workflow => Color::Gray,
     }
 }

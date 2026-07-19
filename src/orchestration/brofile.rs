@@ -147,6 +147,7 @@ pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
         Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh
     )
@@ -401,10 +402,10 @@ fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io:
     Ok(overlay)
 }
 
-/// Harness env for the Anthropic-transport providers (GLM, DeepSeek, MiniMax).
-/// These no longer run the `claude` CLI; they run `bro-harness`, which reads
-/// `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` from its own env. We lift
-/// those out of the operator's existing `~/.claude-{zai,ds,mm}/settings.json`
+/// Harness env for the Anthropic-transport providers (GLM, DeepSeek, MiniMax,
+/// Kimi). These no longer run the `claude` CLI; they run `bro-harness`, which
+/// reads `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` from its own env. We lift
+/// those out of the operator's existing `~/.claude-{zai,ds,mm,k}/settings.json`
 /// `env` block (the same credentials the CLI used) and select the transport.
 fn default_claude_compatible_env(
     provider: Provider,
@@ -414,6 +415,7 @@ fn default_claude_compatible_env(
         Provider::Glm => ".claude-zai",
         Provider::Deepseek => ".claude-ds",
         Provider::Minimax => ".claude-mm",
+        Provider::Kimi => ".claude-k",
         _ => return None,
     };
     let mut env = HashMap::from([("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string())]);
@@ -529,12 +531,13 @@ fn synthesized_account_env_for_home(
 
     let (env_key, rel_path) = match provider {
         Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
-        // GLM/DeepSeek/MiniMax inherit credentials from fixed
+        // GLM/DeepSeek/MiniMax/Kimi inherit credentials from fixed
         // Claude-compatible config dirs; vibe-bh authenticates via
         // MISTRAL_API_KEY, not accounts.
         Provider::Glm
         | Provider::Deepseek
         | Provider::Minimax
+        | Provider::Kimi
         | Provider::VibeBh
         | Provider::Workflow => return None,
     };
@@ -571,7 +574,7 @@ fn resolve_provider_env_inner(
         .map(ProviderDefaultsMode::suppresses)
         .unwrap_or(false);
     let mut env = match provider {
-        Provider::Glm | Provider::Deepseek | Provider::Minimax => dirs::home_dir()
+        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => dirs::home_dir()
             .as_deref()
             .and_then(|home| default_claude_compatible_env(provider, home))
             .unwrap_or_default(),
@@ -595,7 +598,11 @@ fn resolve_provider_env_inner(
     if let Some(account_name) = account_name.as_deref() {
         if !matches!(
             provider,
-            Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::VibeBh
+            Provider::Glm
+                | Provider::Deepseek
+                | Provider::Minimax
+                | Provider::Kimi
+                | Provider::VibeBh
         ) {
             if let Some(account_env) = dirs::home_dir()
                 .as_deref()
@@ -1543,6 +1550,43 @@ mod tests {
         assert_eq!(
             resolved.get("ANTHROPIC_BASE_URL").map(String::as_str),
             Some("https://api.minimax.io/anthropic")
+        );
+        assert_eq!(
+            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+            Some("test-token")
+        );
+        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_kimi_claude_config() {
+        let store = temp_store();
+        let home = temp_store();
+        let settings_dir = home.path().join(".claude-k");
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            settings_dir.join("settings.json"),
+            r#"{
+              "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding",
+                "ANTHROPIC_AUTH_TOKEN": "test-token",
+                "ANTHROPIC_MODEL": "k3[1m]"
+              },
+              "model": "k3[1m]"
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Kimi, None, None, store.path(), None).unwrap()
+        });
+        assert_eq!(
+            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            resolved.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://api.kimi.com/coding")
         );
         assert_eq!(
             resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),

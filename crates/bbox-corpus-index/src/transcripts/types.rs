@@ -43,6 +43,7 @@ impl TranscriptSource {
             Self::Harness(Provider::Glm) => "glm",
             Self::Harness(Provider::Deepseek) => "deepseek",
             Self::Harness(Provider::Minimax) => "minimax",
+            Self::Harness(Provider::Kimi) => "kimi",
             Self::Harness(Provider::Workflow) => "workflow",
             Self::Claude => "claude",
             Self::Codex => "codex",

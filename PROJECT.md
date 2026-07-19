@@ -238,9 +238,9 @@ routing facts:
   models run only via the interactive harness's native agents, never the bro
   plane. Note the glm lane's Z.AI endpoint maps claude-* model names to GLM
   models server-side, so claude-* pins on glm brofiles do not run Claude.
-- GLM, DeepSeek, MiniMax, Brodex, and VibeBh (all of `Provider::ALL`) dispatch
+- GLM, DeepSeek, MiniMax, Kimi, Brodex, and VibeBh (all of `Provider::ALL`) dispatch
   through `bro-harness` (the custom
-  provider harness, `crates/bro-harness`): GLM/DeepSeek/MiniMax on the Anthropic
+  provider harness, `crates/bro-harness`): GLM/DeepSeek/MiniMax/Kimi on the Anthropic
   transport, Brodex on the OpenAI Responses transport (Codex/ChatGPT
   backend), VibeBh (Mistral) on the OpenAI chat-completions transport. The daemon links `bro-harness` as a **library crate** (`Cargo.toml`)
   and runs these providers **in-process** — `spawn_task_with_tool_placement`

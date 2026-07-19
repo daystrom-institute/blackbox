@@ -39,6 +39,11 @@ pub enum Provider {
     /// transport. Credentials/base URL are lifted from the operator's
     /// `~/.claude-mm/settings.json` env block.
     Minimax,
+    /// Kimi (Moonshot AI) ridden through `bro-harness` on the Anthropic
+    /// Messages transport. Credentials/base URL are lifted from the
+    /// operator's `~/.claude-k/settings.json` env block (the Kimi-for-Coding
+    /// subscription endpoint, `https://api.kimi.com/coding`).
+    Kimi,
     /// Codex/ChatGPT backend ridden through `bro-harness` (OpenAI Responses
     /// transport).
     #[serde(alias = "codex")]
@@ -101,6 +106,7 @@ impl Provider {
         Provider::Glm,
         Provider::Deepseek,
         Provider::Minimax,
+        Provider::Kimi,
         Provider::Brodex,
         Provider::VibeBh,
     ];
@@ -126,6 +132,9 @@ impl Provider {
             Provider::Glm => &[StructuredOutput, ToolUse, Resume],
             Provider::Deepseek => &[StructuredOutput, ToolUse, Resume],
             Provider::Minimax => &[StructuredOutput, ToolUse, Resume],
+            // Kimi via bro-harness (Anthropic transport). Structured output
+            // delivered via the same forced `final_result` terminal tool.
+            Provider::Kimi => &[StructuredOutput, ToolUse, Resume],
             // Mistral via bro-harness (chat-completions transport). Structured
             // output delivered via the same forced `final_result` terminal tool.
             Provider::VibeBh => &[StructuredOutput, ToolUse, Resume],
@@ -139,6 +148,7 @@ impl Provider {
             Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
             Provider::Minimax => "minimax",
+            Provider::Kimi => "kimi",
             Provider::Brodex => "brodex",
             Provider::VibeBh => "vibebh",
             Provider::Workflow => "workflow",
@@ -151,6 +161,7 @@ impl Provider {
             Provider::Glm
                 | Provider::Deepseek
                 | Provider::Minimax
+                | Provider::Kimi
                 | Provider::Brodex
                 | Provider::VibeBh
         )
@@ -162,6 +173,7 @@ impl Provider {
             Provider::Glm
                 | Provider::Deepseek
                 | Provider::Minimax
+                | Provider::Kimi
                 | Provider::Brodex
                 | Provider::VibeBh
         )
@@ -294,6 +306,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
         Provider::Glm => GLM_MODELS,
         Provider::Deepseek => DEEPSEEK_MODELS,
         Provider::Minimax => MINIMAX_MODELS,
+        Provider::Kimi => KIMI_MODELS,
         Provider::Brodex => CODEX_MODELS,
         Provider::VibeBh => VIBEBH_MODELS,
         Provider::Workflow => &[],
@@ -303,6 +316,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
 fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
     match provider {
         Provider::Glm | Provider::Deepseek | Provider::Minimax => CLAUDE_EFFORTS,
+        Provider::Kimi => KIMI_EFFORTS,
         Provider::Brodex => CODEX_EFFORTS,
         Provider::VibeBh => VIBEBH_EFFORTS,
         Provider::Workflow => &[],
@@ -311,7 +325,7 @@ fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
 
 fn prompt_cache_for(provider: Provider) -> PromptCacheCapability {
     match provider {
-        Provider::Glm | Provider::Deepseek | Provider::Minimax => {
+        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => {
             PromptCacheCapability::AnthropicCacheControl
         }
         Provider::Brodex => PromptCacheCapability::OpenAiPromptTokenDetails,
@@ -487,6 +501,86 @@ static MINIMAX_MODELS: &[ModelInfo] = &[ModelInfo {
     efforts: &[],
     default_effort: None,
 }];
+
+// Kimi (Moonshot AI) model ids verified live against the Kimi-for-Coding
+// Anthropic endpoint (`https://api.kimi.com/coding`, 2026-07-19 probe): the
+// upstream K3 id is bare `k3` — the Claude Code slot ids `k3[1m]` /
+// `kimi-k3[1m]` are rejected with "set model id as `k3`" (the 1M window is
+// opened by the context-1m beta header, not the id suffix; see
+// exec_args::normalize_model_for_provider for the mapping). K3 always reasons
+// (usage carries output_tokens_details.thinking_tokens). The Moonshot
+// platform pay-as-you-go endpoint (`api.moonshot.ai/anthropic`) documents
+// `kimi-k3[1m]`; it is a separate credential lane from this provider's
+// ~/.claude-k source.
+static KIMI_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "k3",
+        description: "Kimi K3 flagship, 1M context, always-reasoning, via Anthropic-compatible bro-harness transport",
+        default: true,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "kimi-k2.7-code",
+        description: "Kimi K2.7 Code, 256K coding model via bro-harness",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "kimi-k2.7-code-highspeed",
+        description: "Kimi K2.7 Code high-speed variant, 256K via bro-harness",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "kimi-k2.6",
+        description: "Kimi K2.6 general-purpose, 256K via bro-harness",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "kimi-k2.5",
+        description: "Kimi K2.5 prior-generation, 256K via bro-harness",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+];
+
+// Same effort ids as the other Anthropic-transport providers (verified
+// accepted on the wire: output_config.effort high/max both 200, 2026-07-19
+// probe), but defaulting to `max` per the vendor's Claude Code guidance
+// (CLAUDE_CODE_EFFORT_LEVEL=max for Kimi K3).
+static KIMI_EFFORTS: &[EffortInfo] = &[
+    EffortInfo {
+        id: "low",
+        description: "Light reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "medium",
+        description: "Balanced speed and depth",
+        default: false,
+    },
+    EffortInfo {
+        id: "high",
+        description: "Greater depth for complex problems",
+        default: false,
+    },
+    EffortInfo {
+        id: "xhigh",
+        description: "Extended reasoning depth",
+        default: false,
+    },
+    EffortInfo {
+        id: "max",
+        description: "Maximum reasoning depth (vendor-recommended for Kimi K3)",
+        default: true,
+    },
+];
 
 // Codex/Brodex model efforts are model-keyed (live-probed from codex CLI
 // 0.144.1 `~/.codex/models_cache.json`). The GPT-5.6 generation ships three
@@ -756,6 +850,21 @@ mod tests {
         assert!(!luna.iter().any(|e| e.id == "ultra"));
         assert_eq!(p.model_default_effort("gpt-5.6-sol"), Some("medium"));
         assert_eq!(p.model_default_effort("gpt-5.3-codex-spark"), Some("high"));
+    }
+
+    #[test]
+    fn kimi_catalog_defaults_to_k3_and_max_effort() {
+        let p = Provider::Kimi;
+        let default_model = p.models().iter().find(|m| m.default).unwrap();
+        assert_eq!(default_model.id, "k3");
+        assert!(p.models().iter().any(|m| m.id == "kimi-k2.7-code"));
+        assert_eq!(
+            p.prompt_cache(),
+            PromptCacheCapability::AnthropicCacheControl
+        );
+        assert_eq!(p.model_default_effort("k3"), Some("max"));
+        assert!(p.supports_resume());
+        assert!(Provider::ALL.contains(&Provider::Kimi));
     }
 
     #[test]

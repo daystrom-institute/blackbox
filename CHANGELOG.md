@@ -110,6 +110,21 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `kimi` joins the dispatch provider stable: Kimi (Moonshot AI) rides
+  bro-harness on the Anthropic Messages transport with credentials/base URL
+  lifted from `~/.claude-k/settings.json` (the Kimi-for-Coding endpoint,
+  `https://api.kimi.com/coding`). Model catalog carries the live-probed
+  upstream ids (`k3` default; the Claude Code slot ids `k3[1m]` /
+  `kimi-k3[1m]` are endpoint-rejected and normalize to `k3` at arg build;
+  plus `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k2.6`,
+  `kimi-k2.5`); effort catalog mirrors the other Anthropic lanes but
+  defaults to `max` per vendor guidance. Fleet cockpit picks it up as a
+  provider row (tag `k3`), classifier alias `kimi`/`k3`, and the transcript
+  adapters attribute `k3*`/`kimi-*` sessions to the new lane. Harness
+  compaction windows: `k3*`/`kimi-k3*` are 1M-class, `kimi-k2*` 256K-class.
+  Wire-verified (2026-07-19 probe): beta header + `?beta=true`,
+  `cache_control` breakpoints, and `output_config.effort` accepted;
+  server-side prompt caching engages and reports `cache_read_input_tokens`.
 - Ensemble workflow nodes accept a `board` binding (template → whiteboard
   id) for engine-driven board auto-apply (gap-7fbefe13): each member's
   STRICT-JSON output — one object or an array of

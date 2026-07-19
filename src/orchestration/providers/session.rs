@@ -20,6 +20,7 @@ impl ProviderSession for Provider {
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh => None,
             Provider::Workflow => None,

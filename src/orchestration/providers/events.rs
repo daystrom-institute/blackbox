@@ -131,6 +131,7 @@ impl ProviderEvents for Provider {
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh => parse_claude_event(evt, sink),
             Provider::Workflow => {}

@@ -2766,6 +2766,7 @@ pub fn spawn_task_with_tool_placement(
         Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax
+            | Provider::Kimi
             | Provider::Brodex
             | Provider::VibeBh
     ) {
@@ -3346,7 +3347,7 @@ pub fn spawn_task_interactive(
 fn move_large_prompt_arg_to_stdin(provider: Provider, args: &mut Vec<String>) -> Option<String> {
     if !matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Minimax
+        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi
     ) {
         return None;
     }

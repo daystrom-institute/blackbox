@@ -42,13 +42,20 @@ Same sources `resolve_provider_env` uses (`src/orchestration/brofile.rs`):
 | GLM | `~/.claude-zai/settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | `https://api.z.ai/api/anthropic` | Anthropic Messages |
 | DeepSeek | `~/.claude-ds/settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | `https://api.deepseek.com/anthropic` | Anthropic Messages |
 | MiniMax | `~/.claude-mm/settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | `https://api.minimax.io/anthropic` | Anthropic Messages |
+| Kimi | `~/.claude-k/settings.json` → `env.ANTHROPIC_AUTH_TOKEN` | `https://api.kimi.com/coding` | Anthropic Messages |
 | vibebh (Mistral) | `MISTRAL_API_KEY` env, else `~/.vibe/.env` | `https://api.mistral.ai/v1` | OpenAI chat-completions |
 
 The `settings.json` files carry an `env` block (`ANTHROPIC_AUTH_TOKEN`,
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`); prefer reading base URL and default
-model from there over hardcoding.
+model from there over hardcoding. Kimi nuance: the coding endpoint's upstream
+K3 id is bare `k3`; the `ANTHROPIC_MODEL=k3[1m]` slot id in settings.json is
+Claude Code notation and is endpoint-rejected verbatim ("set model id as
+`k3`"), so probe with `k3`. Verified 2026-07-19: full harness shape (beta
+query+header, `cache_control`, `output_config.effort`) accepted; prompt
+caching is automatic server-side (repeat prefix serves
+`cache_read_input_tokens`; `cache_creation` reports 0, MiniMax-style).
 
-## Anthropic-shape probe (GLM / DeepSeek / MiniMax)
+## Anthropic-shape probe (GLM / DeepSeek / MiniMax / Kimi)
 
 `POST <base>/v1/messages` with headers `Authorization: Bearer <token>`,
 `anthropic-version: 2023-06-01`, and optionally the harness beta header

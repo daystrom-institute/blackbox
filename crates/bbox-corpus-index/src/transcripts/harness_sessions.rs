@@ -54,6 +54,7 @@ const HARNESS_PROVIDERS: &[Provider] = &[
     Provider::Glm,
     Provider::Deepseek,
     Provider::Minimax,
+    Provider::Kimi,
     Provider::Brodex,
     Provider::VibeBh,
 ];
@@ -145,6 +146,8 @@ impl SessionMeta {
                     Provider::Deepseek
                 } else if model.starts_with("minimax") || model.starts_with("abab") {
                     Provider::Minimax
+                } else if model.starts_with("kimi") || model.starts_with("k3") {
+                    Provider::Kimi
                 } else if model.starts_with("glm") {
                     Provider::Glm
                 } else {
@@ -507,6 +510,14 @@ mod tests {
             (
                 json!({"transport": "anthropic", "model": "MiniMax-M3"}),
                 Provider::Minimax,
+            ),
+            (
+                json!({"transport": "anthropic", "model": "k3"}),
+                Provider::Kimi,
+            ),
+            (
+                json!({"transport": "anthropic", "model": "kimi-k2.7-code"}),
+                Provider::Kimi,
             ),
             (
                 json!({"transport": "anthropic", "model": "glm-5.1"}),
