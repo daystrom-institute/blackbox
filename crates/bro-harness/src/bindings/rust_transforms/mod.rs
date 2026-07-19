@@ -18,6 +18,7 @@
 mod fix;
 mod helpers;
 mod impl_extract;
+mod imports;
 mod r#move;
 mod rewrite_callers;
 mod wiring;
@@ -336,6 +337,40 @@ mode bakes item + field visibility in one pass); use this transform for
 standalone visibility edits or post-extract adjustments.
 "#;
 
+const ORGANIZE_IMPORTS_CONTRACT: &str = r#"rust.organizeImports - minimize Rust wildcard imports.
+
+WHAT IT DOES
+  Ports v1 rust_minimize_imports (design section 3.1). mode="minimize"
+  (default) rewrites wildcard `use foo::*;` declarations whose source module
+  resolves to a local Rust file into explicit `use foo::{A, B};` for the
+  directly-referenced names. Only wildcards whose target module is resolvable
+  and whose names are referenced get rewritten; the rest surface as notes in
+  findings (or get deleted when removeUnusedWildcards=true).
+
+  mode="organize" is the future rust-analyzer source.organizeImports path
+  (lsp_verified). It lands with lsp.assist (phase 2); this binding REFUSES
+  it with a structured error rather than stubbing a fake organize, so a
+  caller never silently gets a different operation than they asked for.
+
+PARAMS
+  source: string                  File to edit (workspace-relative, no `..`).
+  mode?: "minimize"|"organize"    Default "minimize".
+  allowWildcards?: string[]       Wildcard base paths to preserve verbatim
+                                  (e.g. ["std::io", "crate::prelude"]).
+  removeUnusedWildcards?: boolean When true, wildcards with no
+                                  directly-referenced names are deleted
+                                  instead of left as leftovers.
+
+RETURNS
+  { title, changes, creates, findings, mode, would_change_files,
+    would_create_files, provenance:"syntax_only" }
+  findings[] includes one `note` entry per preserved/unresolvable wildcard.
+
+NEVER WRITES. Feed {changes} into edits.merge, {creates} into edits.createFile,
+then edits.apply. NOT idempotent over its own output: if a re-call reports no
+wildcard imports, the work is DONE (verify with code.items on the source).
+"#;
+
 #[async_trait]
 impl Tool for RustDescribe {
     fn name(&self) -> &str {
@@ -370,17 +405,20 @@ impl Tool for RustDescribe {
         match transform {
             "fixRound" => ToolResult::Json(json!({ "contract": FIX_ROUND_CONTRACT })),
             "extractItems" => ToolResult::Json(json!({ "contract": EXTRACT_ITEMS_CONTRACT })),
-            "inlineModToFile" => ToolResult::Json(json!({ "contract": INLINE_MOD_TO_FILE_CONTRACT })),
+            "inlineModToFile" => {
+                ToolResult::Json(json!({ "contract": INLINE_MOD_TO_FILE_CONTRACT }))
+            }
             "moduleWiring" => ToolResult::Json(json!({ "contract": MODULE_WIRING_CONTRACT })),
             "setVisibility" => ToolResult::Json(json!({ "contract": SET_VISIBILITY_CONTRACT })),
             "extractImplMethods" => {
                 ToolResult::Json(json!({ "contract": EXTRACT_IMPL_METHODS_CONTRACT }))
             }
+            "organizeImports" => ToolResult::Json(json!({ "contract": ORGANIZE_IMPORTS_CONTRACT })),
             "rewriteModuleCallers" => {
                 ToolResult::Json(json!({ "contract": REWRITE_MODULE_CALLERS_CONTRACT }))
             }
             other => ToolResult::Error(format!(
-                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, rewriteModuleCallers)"
+                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, rewriteModuleCallers)"
             )),
         }
     }
@@ -395,6 +433,7 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
         Arc::new(r#move::RustInlineModToFile(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(wiring::RustModuleWiring(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(impl_extract::RustExtractImplMethods) as Arc<dyn Tool>,
+        Arc::new(imports::RustOrganizeImports(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(rewrite_callers::RustRewriteModuleCallers) as Arc<dyn Tool>,
         Arc::new(wiring::RustSetVisibility(ledger)) as Arc<dyn Tool>,
     ]
@@ -406,7 +445,7 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "rust".to_string(),
-        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import; knobs select synthesis shape (withLocalDeps, section, mergeIntoExistingTarget, useDeclVisibility, useDeclItems) while dependency analysis runs always and reports in findings. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. moduleWiring - one conservative module-graph edit (add_mod/remove_mod/add_use/remove_use, idempotent). setVisibility - rewrite visibility of items, impl methods, or struct fields; preserves async/unsafe/const qualifiers. extractImplMethods - move named Rust impl methods from one file into another; preserves attributes/modifiers, rebases super:: paths, applies visibility overrides. rewriteModuleCallers - rewrite caller prefixes after a module move; <source_simple>::<item> to <target_simple>::<item> in all project .rs files, word-boundary checked."
+        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import; knobs select synthesis shape (withLocalDeps, section, mergeIntoExistingTarget, useDeclVisibility, useDeclItems) while dependency analysis runs always and reports in findings. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. moduleWiring - one conservative module-graph edit (add_mod/remove_mod/add_use/remove_use, idempotent). setVisibility - rewrite visibility of items, impl methods, or struct fields; preserves async/unsafe/const qualifiers. extractImplMethods - move named Rust impl methods from one file into another; preserves attributes/modifiers, rebases super:: paths, applies visibility overrides. organizeImports - minimize wildcard `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names (mode=minimize, default; mode=organize is the future rust-analyzer source.organizeImports path, lands with lsp.assist phase 2). rewriteModuleCallers - rewrite caller prefixes after a module move; <source_simple>::<item> to <target_simple>::<item> in all project .rs files, word-boundary checked."
             .to_string(),
         declarations: r#"type RustChangeProposal = { span: Span; new_text: string; provenance: "compiler_suggested" | "syntax_only"; code?: string };
 type RustLeftover = { message: string; code?: string; reason: string };
@@ -422,6 +461,7 @@ type RustModuleWiringResult = { title: string; changes: RustSpanChange[]; findin
 type RustSetVisibilityResult = { title: string; changes: RustSpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; target_kind: "item" | "method" | "field"; would_change_files: RustWouldChangeFile[]; provenance: "syntax_only" };
 type RustExtractImplMethodsResult = { changes: SpanChange[]; creates: { path: string; content: string }[]; findings: Record<string, unknown>[]; leftovers: string[]; counts: { moved: number; leftovers: number }; provenance: "syntax_only" };
 type RustRewriteModuleCallersResult = { changes: SpanChange[]; findings: Record<string, unknown>[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
+type RustOrganizeImportsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; mode: "minimize"; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
 declare const rust: {
   /** Full contract (params, result vocabulary, recipe) for one rust transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
@@ -437,6 +477,8 @@ declare const rust: {
   setVisibility(args: { source: string; visibility: string; itemNames: string[]; targetKind?: "item" | "method" | "field"; implName?: string }): Promise<RustSetVisibilityResult>;
   /** Move named Rust impl methods from one file into another. Preserves attributes/modifiers, rebases super:: paths one module deeper, applies visibility overrides. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFile. */
   extractImplMethods(args: { source: string; target: string; item_names: string[]; impl_name?: string; visibility?: string; target_prelude?: string }): Promise<RustExtractImplMethodsResult>;
+  /** Minimize Rust wildcard imports (mode="minimize", default): rewrite resolvable `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names. mode="organize" (rust-analyzer source.organizeImports) lands with lsp.assist (phase 2). NEVER writes: feed {changes} into edits.merge. */
+  organizeImports(args: { source: string; mode?: "minimize" | "organize"; allow_wildcards?: string[]; remove_unused_wildcards?: boolean }): Promise<RustOrganizeImportsResult>;
   /** Rewrite caller prefixes after a module move: <source_simple>::<item> -> <target_simple>::<item> in all project .rs files, word-boundary checked. Composable after any extract/move. NEVER writes: feed {changes} into edits.merge. */
   rewriteModuleCallers(args: { project_dir: string; item_names: string[]; module_name?: string; target_prelude?: string; skip_files?: string[] }): Promise<RustRewriteModuleCallersResult>;
 };"#
