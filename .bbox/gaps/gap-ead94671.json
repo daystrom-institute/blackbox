@@ -1,0 +1,22 @@
+{
+  "id": "gap-ead94671",
+  "title": "RX-V1 producer leg: no operator channel to grant acknowledge_* in a live dispatch",
+  "gap_kind": "mcp_surface",
+  "domain": "rx-v1-dispatch",
+  "wanted_capability": "A per-dispatch, operator-controlled way to inject `default:<tool>.<param>=true` entries into the ToolArgDefaults map a harness child loads (e.g. ExecParams.tool_defaults, a brofile `env`/defaults field, or a named grant profile). Verified absent: MCP bro_exec has no such field; /control/exec ExecParams has none; Brofile has no env field; fleet.json shell_env reaches shell grandchildren only, not the agent loop; account env technically merges but is credential-scoped. Design section 8.2 rejected a dedicated dispatch field assuming \"dispatch config\" existed; it does not, so every RX-V1 consumer (rust.moveStructFields, rust.migrateErrorType, rust.migrateTypeUsages) can only refuse inside a real dispatch today.",
+  "missing_primitive": "Operator-facing per-dispatch tool_arg_defaults delivery (ExecParams field, brofile env, or equivalent)",
+  "fallback_used": "isolate --tool-defaults CLI flag for probes; live dispatches have no channel and any RX-V1 tool call in a dispatch refuses.",
+  "evidence": [
+    "src/tools/dispatch.rs:416,768 (ambient-only tool_arg_defaults)",
+    "src/orchestration/mod.rs:2969 (--additional-context forwarding)",
+    "crates/bro-harness/src/agent_loop.rs:1974 (harness defaults ladder)",
+    "design/refactor-tools/rust/rust-isolate-surface.md section 8.2",
+    "bbox thread-16e464a5"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "mcp_surface/rx-v1-dispatch/no-operator-grant-channel",
+  "resolution": "unresolved",
+  "created_at": "2026-07-19T22:31:22Z",
+  "updated_at": "2026-07-19T22:31:22Z"
+}
