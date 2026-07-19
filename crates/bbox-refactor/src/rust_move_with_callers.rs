@@ -216,7 +216,7 @@ pub(crate) fn plan_move_rust_items_with_callers(p: &RefactorPlanParams) -> Resul
 /// Resolve a module's simple name. Explicit override wins. Otherwise
 /// fall back to the file stem, rejecting `lib`/`main`/`mod` because
 /// those names rarely match caller-side path segments.
-fn resolve_module_simple_name(explicit: Option<&str>, path: &Path, label: &str) -> Result<String> {
+pub fn resolve_module_simple_name(explicit: Option<&str>, path: &Path, label: &str) -> Result<String> {
     if let Some(name) = explicit {
         if !name.is_empty() {
             return Ok(name.to_string());
@@ -278,7 +278,7 @@ fn select_top_level_items_for_move<'a>(
 /// `<source_simple>` prefix with `<target_simple>`. Word-boundary
 /// checks prevent matching `not_source_simple::item` or
 /// `source_simpleX::item`.
-fn compute_caller_rewrite_edits(
+pub fn compute_caller_rewrite_edits(
     caller_source: &str,
     source_simple: &str,
     target_simple: &str,
