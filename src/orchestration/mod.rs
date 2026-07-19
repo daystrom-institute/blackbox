@@ -2055,6 +2055,27 @@ impl AmbientContext {
     }
 }
 
+/// Merge tool argument defaults from broadest to most specific scope.
+///
+/// Ambient defaults describe the active task/session. Brofile defaults are
+/// durable persona grants, and per-dispatch defaults are operator grants for
+/// one invocation.
+pub fn merge_tool_arg_defaults(
+    ambient: Option<BTreeMap<String, String>>,
+    brofile: Option<&BTreeMap<String, String>>,
+    per_dispatch: Option<&BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    let mut merged = ambient.unwrap_or_default();
+    for defaults in [brofile, per_dispatch].into_iter().flatten() {
+        merged.extend(
+            defaults
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
 impl AmbientContext {
     /// Serialize this dispatch's typed ingredients — persona (brofile lens),
     /// the selected directive set with declared cadence, the scope fields,
@@ -7297,6 +7318,105 @@ mod tests {
             ..Default::default()
         };
         assert!(blank.tool_arg_defaults().is_none());
+    }
+
+    #[test]
+    fn tool_arg_defaults_merge_ambient_only() {
+        let ambient =
+            BTreeMap::from([("default:mcp.bbox_note.session_id".into(), "sess-1".into())]);
+        assert_eq!(
+            merge_tool_arg_defaults(Some(ambient.clone()), None, None),
+            Some(ambient)
+        );
+    }
+
+    #[test]
+    fn tool_arg_defaults_merge_brofile_overlay() {
+        let ambient = BTreeMap::from([
+            ("default:mcp.bbox_note.session_id".into(), "sess-1".into()),
+            (
+                "default:rust.moveStructFields.acknowledge_repr".into(),
+                "false".into(),
+            ),
+        ]);
+        let brofile = BTreeMap::from([
+            (
+                "default:rust.moveStructFields.acknowledge_repr".into(),
+                "true".into(),
+            ),
+            (
+                "default:rust.migrateErrorType.acknowledge_public_api_change".into(),
+                "true".into(),
+            ),
+        ]);
+        let merged = merge_tool_arg_defaults(Some(ambient), Some(&brofile), None).unwrap();
+        assert_eq!(
+            merged
+                .get("default:rust.moveStructFields.acknowledge_repr")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            merged
+                .get("default:mcp.bbox_note.session_id")
+                .map(String::as_str),
+            Some("sess-1")
+        );
+        assert_eq!(
+            merged
+                .get("default:rust.migrateErrorType.acknowledge_public_api_change")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn tool_arg_defaults_merge_per_dispatch_overlay() {
+        let brofile = BTreeMap::from([(
+            "default:rust.moveStructFields.acknowledge_repr".into(),
+            "true".into(),
+        )]);
+        let per_dispatch = BTreeMap::from([(
+            "default:rust.migrateTypeUsages.acknowledge_public_api_change".into(),
+            "true".into(),
+        )]);
+        let merged = merge_tool_arg_defaults(None, Some(&brofile), Some(&per_dispatch)).unwrap();
+        assert_eq!(
+            merged
+                .get("default:rust.moveStructFields.acknowledge_repr")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            merged
+                .get("default:rust.migrateTypeUsages.acknowledge_public_api_change")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn tool_arg_defaults_merge_per_dispatch_wins_conflicts() {
+        let ambient = BTreeMap::from([(
+            "default:rust.moveStructFields.acknowledge_repr".into(),
+            "ambient".into(),
+        )]);
+        let brofile = BTreeMap::from([(
+            "default:rust.moveStructFields.acknowledge_repr".into(),
+            "brofile".into(),
+        )]);
+        let per_dispatch = BTreeMap::from([(
+            "default:rust.moveStructFields.acknowledge_repr".into(),
+            "dispatch".into(),
+        )]);
+        let merged =
+            merge_tool_arg_defaults(Some(ambient), Some(&brofile), Some(&per_dispatch)).unwrap();
+        assert_eq!(
+            merged
+                .get("default:rust.moveStructFields.acknowledge_repr")
+                .map(String::as_str),
+            Some("dispatch")
+        );
     }
 
     #[test]

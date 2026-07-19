@@ -342,6 +342,8 @@ impl BlackboxServer {
                 allow_tools: None,
                 disallow_tools: None,
                 tool_placement: None,
+                brofile_tool_defaults: bf.tool_defaults,
+                tool_defaults: None,
                 allocation_request: runtime,
                 project_dir_for_lease: p.project_dir.clone(),
                 ambient_bro_name: Some(atom_label.clone()),

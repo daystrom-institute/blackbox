@@ -2683,6 +2683,7 @@ pub(crate) async fn admin_brofile_upsert(
         lens: req.lens,
         model: req.model,
         effort: req.effort,
+        tool_defaults: None,
         filters: None,
         surface: None,
         coerce_workspace: None,

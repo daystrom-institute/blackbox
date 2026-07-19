@@ -341,6 +341,7 @@ impl BlackboxServer {
                     lens: p.lens.clone(),
                     model: p.model.clone(),
                     effort: p.effort.clone(),
+                    tool_defaults: p.tool_defaults.clone(),
                     filters,
                     surface: p.surface.clone(),
                     coerce_workspace: p.coerce_workspace,

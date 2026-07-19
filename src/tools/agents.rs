@@ -647,6 +647,7 @@ impl BlackboxServer {
             exec_opts,
             env_overrides,
             runtime,
+            brofile_tool_defaults,
             coerce_workspace,
             brofile_context,
         ) = if let Some(ref br) = manifest.brofile_ref {
@@ -713,6 +714,7 @@ impl BlackboxServer {
                 opts,
                 env,
                 bf.runtime,
+                bf.tool_defaults,
                 bf.coerce_workspace.unwrap_or(false),
                 bf.context,
             )
@@ -790,6 +792,7 @@ impl BlackboxServer {
                 opts,
                 env,
                 runtime,
+                None,
                 inline
                     .get("coerce_workspace")
                     .and_then(|v| v.as_bool())
@@ -909,6 +912,8 @@ impl BlackboxServer {
                 allow_tools: None,
                 disallow_tools: None,
                 tool_placement: None,
+                brofile_tool_defaults,
+                tool_defaults: None,
                 allocation_request: runtime,
                 project_dir_for_lease: p.cwd.clone(),
                 ambient_bro_name: p.bro.clone(),
@@ -1542,6 +1547,7 @@ mod tests {
             lens: None,
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: Some(McpFilters {
                 allow: vec![
                     "mcp__blackbox__bbox_search".into(),

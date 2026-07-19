@@ -426,6 +426,14 @@ auditable, with a one-method addition to `bro-tools`.
 Rejected: a dedicated dispatch field for RX-V1 flags (more legible, but new
 machinery for two consumers; revisit if a third flag family appears).
 
+Addendum (gap-ead94671): the premise that dispatch configuration already
+provided this channel was wrong. RX-V1 grants use two lanes:
+`Brofile.tool_defaults` for durable persona-bound defaults and
+`ExecParams.tool_defaults` for one dispatch. The daemon merges
+ambient defaults, then brofile defaults, then per-dispatch defaults, so the
+most specific value wins. Forwarding this field from bro-fleet-client's
+`dispatch_body` is deferred while fleetd extraction is actively underway.
+
 ### 8.3 `rust.extractItems` knob boundary: synthesis shape, never analysis gating
 
 Decision: ship five knobs: `with_local_deps`, `section`,

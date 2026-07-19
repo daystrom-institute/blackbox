@@ -137,6 +137,7 @@ impl BlackboxServer {
             env_overrides,
             cwd,
             brofile_filters,
+            _brofile_tool_defaults,
             _coerce_workspace,
             brofile_context,
         ) =
@@ -563,6 +564,7 @@ impl BlackboxServer {
             mut env_overrides,
             _resolved_cwd,
             brofile_filters,
+            _brofile_tool_defaults,
             _coerce_workspace,
             brofile_context,
         ) = self.resolve_exec_target(Some(descriptor.brofile_ref), None, cwd.as_deref())?;

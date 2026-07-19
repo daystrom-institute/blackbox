@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -36,6 +37,8 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) allow_tools: Option<Vec<String>>,
     pub(crate) disallow_tools: Option<Vec<String>>,
     pub(crate) tool_placement: Option<std::collections::BTreeMap<String, String>>,
+    pub(crate) brofile_tool_defaults: Option<BTreeMap<String, String>>,
+    pub(crate) tool_defaults: Option<BTreeMap<String, String>>,
     pub(crate) allocation_request: Option<orchestration::allocator::RuntimeRequest>,
     pub(crate) project_dir_for_lease: Option<String>,
     pub(crate) ambient_bro_name: Option<String>,
@@ -227,6 +230,7 @@ fn allocator_status_runtime_request(
         allow_tools: None,
         disallow_tools: None,
         tool_placement: None,
+        tool_defaults: None,
         coerce_workspace: None,
         tier: p.tier.clone(),
         tier_ladder: p.tier_ladder.clone(),
@@ -413,7 +417,11 @@ impl BlackboxServer {
             request.spawn_bro_label,
             request.spawn_agent_label,
             request.tool_placement,
-            ambient_ctx.tool_arg_defaults(),
+            orch::merge_tool_arg_defaults(
+                ambient_ctx.tool_arg_defaults(),
+                request.brofile_tool_defaults.as_ref(),
+                request.tool_defaults.as_ref(),
+            ),
             Some(self.state.system_events.clone()),
             request.origin,
         );
@@ -470,6 +478,7 @@ impl BlackboxServer {
             env_overrides,
             cwd,
             brofile_filters,
+            brofile_tool_defaults,
             brofile_coerce_workspace,
             brofile_context,
         ) = if p.bro.is_some() || p.provider.is_some() {
@@ -488,6 +497,7 @@ impl BlackboxServer {
                 None,
                 None,
                 p.cwd.clone(),
+                None,
                 None,
                 false,
                 None,
@@ -543,6 +553,8 @@ impl BlackboxServer {
             allow_tools: p.allow_tools.clone(),
             disallow_tools: p.disallow_tools.clone(),
             tool_placement: p.tool_placement.clone(),
+            brofile_tool_defaults,
+            tool_defaults: p.tool_defaults.clone(),
             allocation_request,
             project_dir_for_lease: p.cwd.clone(),
             ambient_bro_name: p.bro.clone(),
@@ -642,6 +654,7 @@ impl BlackboxServer {
             env_overrides,
             cwd,
             brofile_filters,
+            brofile_tool_defaults,
             brofile_coerce_workspace,
             runtime_lease,
         ) = match self.resolve_resume_target(
@@ -765,7 +778,11 @@ impl BlackboxServer {
             None,
             None,
             None,
-            ambient_ctx.tool_arg_defaults(),
+            orch::merge_tool_arg_defaults(
+                ambient_ctx.tool_arg_defaults(),
+                brofile_tool_defaults.as_ref(),
+                p.tool_defaults.as_ref(),
+            ),
             Some(self.state.system_events.clone()),
             // bro_resume is the user-facing MCP tool for resuming an existing
             // session — same source class as bro_exec. The HTTP control plane
@@ -2077,6 +2094,7 @@ impl BlackboxServer {
             Option<std::collections::HashMap<String, String>>,
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
+            Option<BTreeMap<String, String>>,
             bool,
             Option<orchestration::brofile::BrofileContext>,
         ),
@@ -2147,6 +2165,7 @@ impl BlackboxServer {
                         env,
                         cwd,
                         filters,
+                        bf.tool_defaults,
                         bf.coerce_workspace.unwrap_or(false),
                         bf.context,
                     ));
@@ -2202,6 +2221,7 @@ impl BlackboxServer {
                 env,
                 project_dir.map(String::from),
                 filters,
+                bf.tool_defaults,
                 bf.coerce_workspace.unwrap_or(false),
                 bf.context,
             ));
@@ -2219,6 +2239,7 @@ impl BlackboxServer {
                 None,
                 env,
                 project_dir.map(String::from),
+                None,
                 None,
                 false,
                 None,
@@ -2244,6 +2265,7 @@ impl BlackboxServer {
             Option<std::collections::HashMap<String, String>>,
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
+            Option<BTreeMap<String, String>>,
             bool,
             Option<orchestration::allocator::RuntimeLease>,
         ),
@@ -2364,6 +2386,7 @@ impl BlackboxServer {
                 env,
                 cwd,
                 filters,
+                bf.tool_defaults,
                 bf.coerce_workspace.unwrap_or(false),
                 lease,
             ));
@@ -2416,6 +2439,7 @@ impl BlackboxServer {
                         .or_else(|| lease.cwd.clone())
                         .or_else(|| lease.project_dir.clone()),
                     None,
+                    None,
                     false,
                     Some(lease),
                 ));
@@ -2433,6 +2457,7 @@ impl BlackboxServer {
                 None,
                 env,
                 project_dir.map(String::from),
+                None,
                 None,
                 false,
                 None,
@@ -2522,7 +2547,7 @@ mod tests {
         .unwrap();
         orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None).unwrap();
 
-        let (provider, _lens, opts, _env, _cwd, _filters, coerce, _ctx) = server
+        let (provider, _lens, opts, _env, _cwd, _filters, _tool_defaults, coerce, _ctx) = server
             .resolve_exec_target(Some("orc-fallback"), None, None)
             .expect("standalone brofile resolves by name");
         assert_eq!(provider, Provider::Glm);
@@ -2633,6 +2658,7 @@ mod tests {
                 lens: None,
                 model: None,
                 effort: None,
+                tool_defaults: None,
                 filters: None,
                 surface: None,
                 coerce_workspace: None,
@@ -2657,6 +2683,7 @@ mod tests {
             allow_tools: None,
             disallow_tools: None,
             tool_placement: None,
+            tool_defaults: None,
             coerce_workspace: None,
             tier: None,
             tier_ladder: None,
@@ -2697,6 +2724,28 @@ mod tests {
                 .and_then(|m| m.get("mcp__sdk__placed"))
                 .map(String::as_str),
             Some("in-box")
+        );
+    }
+
+    #[test]
+    fn exec_params_tool_defaults_parse() {
+        let params: ExecParams = serde_json::from_value(json!({
+            "prompt": "test",
+            "tool_defaults": {
+                "default:rust.moveStructFields.acknowledge_repr": "true"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            params
+                .tool_defaults
+                .as_ref()
+                .and_then(|defaults| {
+                    defaults.get("default:rust.moveStructFields.acknowledge_repr")
+                })
+                .map(String::as_str),
+            Some("true")
         );
     }
 
@@ -2864,10 +2913,20 @@ mod tests {
             );
         }
 
-        let (provider, session_id, _lens, _opts, _env, cwd, _filters, _coerce_ws, _runtime_lease) =
-            server
-                .resolve_resume_target(Some("blue::reviewer"), None, None, None)
-                .unwrap();
+        let (
+            provider,
+            session_id,
+            _lens,
+            _opts,
+            _env,
+            cwd,
+            _filters,
+            _tool_defaults,
+            _coerce_ws,
+            _runtime_lease,
+        ) = server
+            .resolve_resume_target(Some("blue::reviewer"), None, None, None)
+            .unwrap();
         assert_eq!(provider, Provider::Deepseek);
         assert_eq!(session_id, "sid-blue");
         assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
