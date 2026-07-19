@@ -47,6 +47,8 @@ struct ReferencesParams {
     kinds: Option<Vec<String>>,
     #[serde(default, rename = "declaringClass", alias = "declaring_class")]
     declaring_class: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -262,7 +264,7 @@ impl Tool for AnalysisReferences {
         "analysis.references"
     }
     fn description(&self) -> &str {
-        "Count Java references to one or more simple symbols across the workspace without returning full capture payloads. Returns per-symbol counts, files, and up to five example sites per symbol. Use this when deciding whether extracted methods need wrappers, whether a candidate field is only forwarded, or whether a seam has external callers. Pure; syntax_only; never writes."
+        "Count symbol references across the workspace without returning full capture payloads. Java (default) uses tree-sitter Java analysis with usage-kind filter; Rust mode uses syntactic Rust reference counting with rust usage kinds (call, type_ref, path_ref, macro_use). Returns per-symbol counts, files, and up to five example sites per symbol. Use this when deciding whether extracted methods need wrappers, whether a candidate field is only forwarded, or whether a seam has external callers. Pure; syntax_only; never writes."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -271,7 +273,12 @@ impl Tool for AnalysisReferences {
                 "symbols": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Simple Java symbols to count, e.g. method, field, or type names."
+                    "description": "Simple symbol names to count, e.g. method, field, or type names."
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["java", "rust"],
+                    "description": "Language mode (default \"java\"). Rust mode counts syntactic references with usage kinds: call, type_ref, path_ref, macro_use."
                 },
                 "kinds": {
                     "type": "array",
@@ -279,11 +286,11 @@ impl Tool for AnalysisReferences {
                         "type": "string",
                         "enum": ["type_reference", "method_invocation", "field_access", "method_reference", "import"]
                     },
-                    "description": "Optional usage-kind filter."
+                    "description": "Optional Java usage-kind filter (ignored in Rust mode)."
                 },
                 "declaringClass": {
                     "type": "string",
-                    "description": "Optional receiver filter for method invocations: include calls whose receiver plausibly resolves to a field of this class."
+                    "description": "Optional Java receiver filter for method invocations (ignored in Rust mode)."
                 }
             },
             "required": ["symbols"]
@@ -310,45 +317,72 @@ impl Tool for AnalysisReferences {
         if params.symbols.is_empty() {
             return err("analysis.references: `symbols` must be non-empty");
         }
+        let is_rust =
+            params.language.as_deref().map(|l| l == "rust").unwrap_or(false);
         let root = cx.root.clone();
         bro_tools::tool::call_blocking(move || {
             let requested_symbols = params.symbols.clone();
-            let plan_input = json!({
-                "kind": "find_java_usages",
-                "source": "",
-                "project_dir": root.to_string_lossy(),
-                "item_names": params.symbols,
-                "item_kinds": params.kinds,
-                "declaring_class": params.declaring_class,
-                "summary_only": true,
-            });
-            let plan_params: bbox_refactor::RefactorPlanParams =
-                match serde_json::from_value(plan_input) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return err(format!("analysis.references: internal param shape: {e}"));
+            if is_rust {
+                // Rust mode: direct syntactic reference counting.
+                match bbox_refactor::rust_references::count_rust_references(
+                    &root,
+                    &requested_symbols,
+                ) {
+                    Ok(summary) => {
+                        ToolResult::Json(json!({
+                            "symbols": summary.symbols,
+                            "total_usages": summary.total_usages,
+                            "unique_files": summary.unique_files,
+                            "production_sites": summary.production_sites,
+                            "test_sites": summary.test_sites,
+                            "counts_by_symbol": summary.counts_by_symbol,
+                            "files_by_symbol": summary.files_by_symbol,
+                            "examples_by_symbol": summary.examples_by_symbol,
+                            "truncated": summary.truncated,
+                            "provenance": "syntax_only",
+                        }))
                     }
+                    Err(e) => err(format!("analysis.references: {e:#}")),
+                }
+            } else {
+                // Java mode: plan-based path (existing behavior).
+                let plan_input = json!({
+                    "kind": "find_java_usages",
+                    "source": "",
+                    "project_dir": root.to_string_lossy(),
+                    "item_names": params.symbols,
+                    "item_kinds": params.kinds,
+                    "declaring_class": params.declaring_class,
+                    "summary_only": true,
+                });
+                let plan_params: bbox_refactor::RefactorPlanParams =
+                    match serde_json::from_value(plan_input) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return err(format!("analysis.references: internal param shape: {e}"));
+                        }
+                    };
+                let plan_json = match bbox_refactor::plan(&plan_params) {
+                    Ok(s) => s,
+                    Err(e) => return err(format!("analysis.references: {e:#}")),
                 };
-            let plan_json = match bbox_refactor::plan(&plan_params) {
-                Ok(s) => s,
-                Err(e) => return err(format!("analysis.references: {e:#}")),
-            };
-            let mut v: Value = match serde_json::from_str(&plan_json) {
-                Ok(v) => v,
-                Err(e) => return err(format!("analysis.references: decode: {e}")),
-            };
-            relativize_reference_paths(&root, &mut v);
-            ToolResult::Json(json!({
-                "symbols": requested_symbols,
-                "total_usages": v.get("total_usages").cloned().unwrap_or(json!(0)),
-                "unique_files": v.get("unique_call_files").cloned().unwrap_or(json!(0)),
-                "production_sites": v.get("production_sites").cloned().unwrap_or(json!(0)),
-                "test_sites": v.get("test_sites").cloned().unwrap_or(json!(0)),
-                "counts_by_symbol": v.get("usage_summary_by_name").cloned().unwrap_or(json!({})),
-                "files_by_symbol": v.get("usage_files_by_name").cloned().unwrap_or(json!({})),
-                "examples_by_symbol": v.get("usage_examples_by_name").cloned().unwrap_or(json!({})),
-                "provenance": "syntax_only",
-            }))
+                let mut v: Value = match serde_json::from_str(&plan_json) {
+                    Ok(v) => v,
+                    Err(e) => return err(format!("analysis.references: decode: {e}")),
+                };
+                relativize_reference_paths(&root, &mut v);
+                ToolResult::Json(json!({
+                    "symbols": requested_symbols,
+                    "total_usages": v.get("total_usages").cloned().unwrap_or(json!(0)),
+                    "unique_files": v.get("unique_call_files").cloned().unwrap_or(json!(0)),
+                    "production_sites": v.get("production_sites").cloned().unwrap_or(json!(0)),
+                    "test_sites": v.get("test_sites").cloned().unwrap_or(json!(0)),
+                    "counts_by_symbol": v.get("usage_summary_by_name").cloned().unwrap_or(json!({})),
+                    "files_by_symbol": v.get("usage_files_by_name").cloned().unwrap_or(json!({})),
+                    "examples_by_symbol": v.get("usage_examples_by_name").cloned().unwrap_or(json!({})),
+                    "provenance": "syntax_only",
+                }))
+            }
         })
         .await
     }
@@ -650,6 +684,208 @@ impl Tool for AnalysisFieldInitializerClosure {
     }
 }
 
+/// `analysis.implPartition` (rust) — impl-method call/state graph of one
+/// impl block for split planning.
+pub struct AnalysisImplPartition;
+
+#[derive(Deserialize)]
+struct ImplPartitionParams {
+    file: String,
+    #[serde(default, rename = "implName", alias = "impl_name")]
+    impl_name: Option<String>,
+    #[serde(default, rename = "moduleName", alias = "module_name")]
+    module_name: Option<String>,
+}
+
+#[async_trait]
+impl Tool for AnalysisImplPartition {
+    fn name(&self) -> &str {
+        "analysis.implPartition"
+    }
+    fn description(&self) -> &str {
+        "Analyze one or more Rust impl blocks in a file, returning a partition graph with per-method field reads/writes/calls, shared fields, and inferred edges. `impl_name` accepts either the simple type name (e.g. \"BlackboxServer\") or the impl header form (e.g. \"impl BlackboxServer\"). All impl blocks for that type are merged; methods are ordered by source byte position. Pure; syntax_only; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Path to a .rs file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
+                "implName": { "type": "string", "description": "The impl type name, e.g. \"BlackboxServer\" or \"impl BlackboxServer\"." },
+                "moduleName": { "type": "string", "description": "Alias for implName." }
+            },
+            "required": ["file"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("analysis".to_string(), "implPartition".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: ImplPartitionParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "analysis.implPartition: bad input — expected {{ file, implName? }}; {e}"
+                ));
+            }
+        };
+        let impl_name = match (params.impl_name, params.module_name) {
+            (Some(name), _) if !name.trim().is_empty() => name,
+            (_, Some(name)) if !name.trim().is_empty() => name,
+            _ => {
+                return err(
+                    "analysis.implPartition: `implName` (or `moduleName`) is required",
+                );
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let source_path = match bro_tools::workspace::resolve_in_root(&root, &params.file)
+            {
+                Ok(path) => path,
+                Err(e) => {
+                    return err(format!(
+                        "analysis.implPartition: {}: {e}",
+                        params.file
+                    ));
+                }
+            };
+            match bbox_refactor::rust_partition::analyze_impl(&source_path, &impl_name)
+            {
+                Ok(graph) => ToolResult::Json(json!({
+                    "file": params.file,
+                    // relativize impl_name back to user's input form
+                    "impl_name": impl_name,
+                    "methods": graph.methods,
+                    "fields": graph.fields,
+                    "edges": graph.edges,
+                    "provenance": "syntax_only",
+                })),
+                Err(e) => err(format!("analysis.implPartition: {e:#}")),
+            }
+        })
+        .await
+    }
+}
+
+/// `analysis.topLevelDeps` (rust) — top-level item dependency graph with
+/// external reference hints and suggested clusters.
+pub struct AnalysisTopLevelDeps;
+
+#[derive(Deserialize)]
+struct TopLevelDepsParams {
+    file: String,
+    #[serde(default, rename = "projectDir", alias = "project_dir")]
+    project_dir: Option<String>,
+    #[serde(default, rename = "itemNames", alias = "item_names")]
+    item_names: Option<Vec<String>>,
+    #[serde(default, rename = "itemKinds", alias = "item_kinds")]
+    item_kinds: Option<Vec<String>>,
+}
+
+#[async_trait]
+impl Tool for AnalysisTopLevelDeps {
+    fn name(&self) -> &str {
+        "analysis.topLevelDeps"
+    }
+    fn description(&self) -> &str {
+        "Analyze top-level Rust items in a file: dependency graph (calls, type refs, module refs, globals), external reference hints scanned across the project, and suggested clusters for extraction planning. Optionally narrow to specific item names/kinds. Use as the pre-extract survey before rust.extractItems. Pure; syntax_only; never writes."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Path to a .rs file. Relative paths resolve against the session worktree root; absolute paths are accepted as-is." },
+                "projectDir": { "type": "string", "description": "Optional project directory for external reference scanning. Defaults to the file's parent directory." },
+                "itemNames": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional specific item names to analyze; omit for all top-level named items."
+                },
+                "itemKinds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional filter: only items of these tree-sitter kinds (e.g. \"function_item\", \"struct_item\")."
+                }
+            },
+            "required": ["file"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("analysis".to_string(), "topLevelDeps".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: TopLevelDepsParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "analysis.topLevelDeps: bad input — expected {{ file, itemNames?, itemKinds? }}; {e}"
+                ));
+            }
+        };
+        let root = cx.root.clone();
+        bro_tools::tool::call_blocking(move || {
+            let source_path = match bro_tools::workspace::resolve_in_root(&root, &params.file)
+            {
+                Ok(path) => path,
+                Err(e) => {
+                    return err(format!(
+                        "analysis.topLevelDeps: {}: {e}",
+                        params.file
+                    ));
+                }
+            };
+            let project_dir = params.project_dir.as_deref();
+            let item_names = params.item_names.as_deref();
+            let item_kinds = params.item_kinds.as_deref();
+            match bbox_refactor::rust_top_level_deps::analyze_top_level(
+                &source_path,
+                project_dir,
+                item_names,
+                item_kinds,
+            ) {
+                Ok(graph) => {
+                    // relativize paths in external_references
+                    let ext_refs: Vec<Value> = graph
+                        .external_references
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "item": r.item,
+                                "path": workspace_relative(&root, &r.path),
+                                "line": r.line,
+                                "context": r.context,
+                            })
+                        })
+                        .collect();
+                    ToolResult::Json(json!({
+                        "file": params.file,
+                        "items": graph.items,
+                        "edges": graph.edges,
+                        "external_references": ext_refs,
+                        "suggested_clusters": graph.suggested_clusters,
+                        "warnings": graph.warnings,
+                        "provenance": "syntax_only",
+                    }))
+                }
+                Err(e) => err(format!("analysis.topLevelDeps: {e:#}")),
+            }
+        })
+        .await
+    }
+}
+
 /// `analysis.describe` — depth-on-demand contract for one analysis (matches
 /// the java.describe pattern; the namespace index stays a compact one-liner).
 pub struct AnalysisDescribe;
@@ -922,19 +1158,89 @@ RECIPE
   // Now seam.move_fields includes the full transitive closure.
 "#;
 
+const IMPL_PARTITION_CONTRACT: &str = r#"analysis.implPartition (rust) — impl-method call/state graph for split planning.
+
+WHAT IT DOES
+  Parses the named Rust impl block(s) in a .rs file, builds a per-method
+  field read/write/call graph plus shared-field tracking, and returns the
+  reduced graph. Methods are ordered by source byte position; calls that
+  don't resolve to a method in the same impl set are placed in
+  unresolved_callbacks. `impl_name` accepts either the simple type name
+  (e.g. "BlackboxServer") or the impl header form (e.g.
+  "impl BlackboxServer"). All impl blocks for that type are merged.
+
+PARAMS
+  file: string       workspace-relative .rs file
+  implName?: string  impl type name or "impl TypeName"; required
+  moduleName?: string  alias for implName
+
+RETURNS { file, impl_name, methods, fields, edges, provenance }
+  methods[]: each has name, reads[], writes[], calls[],
+             unresolved_callbacks[], attrs[], router
+  fields[]:  { name, type, shared_by }
+  edges[]:   { from: method_name, to: method_name, kind }
+
+RECIPE (god-impl split survey)
+  const g = await analysis.implPartition({
+    file: "src/server.rs", implName: "BlackboxServer"
+  });
+  // Survey: which methods touch which fields? Which call each other?
+  // Methods sharing fields suggest they belong together in a split.
+  // unresolved_callbacks flag cross-impl / trait / external calls.
+  // Feed findings into rust.extractImplMethods for the actual split.
+"#;
+
+const TOP_LEVEL_DEPS_CONTRACT: &str = r#"analysis.topLevelDeps (rust) — top-level item dependency graph + external reference hints.
+
+WHAT IT DOES
+  Analyzes top-level Rust items in one file: builds a dependency graph
+  (calls, type_refs, module_refs, global_refs), scans the project for
+  external references (up to 12 per item, 40 items max), and suggests
+  connected-component clusters. This is the pre-extract survey: use it
+  before rust.extractItems to choose items that move together. Macro-heavy
+  items emit warnings about hidden dependency edges.
+
+PARAMS
+  file: string         workspace-relative .rs file
+  projectDir?: string  project root for external reference scanning;
+                       defaults to the file's parent directory
+  itemNames?: string[] optional specific item names to analyze; omit
+                       for all top-level named items
+  itemKinds?: string[] optional filter by tree-sitter kind
+                       (function_item, struct_item, mod_item, ...)
+
+RETURNS { file, items, edges, external_references,
+          suggested_clusters, warnings, provenance }
+  items[]: { name, kind, line_start, line_end, calls, type_refs,
+             module_refs, global_refs, attrs, warnings }
+  edges[]: { from, to, kind: calls|type_ref|module_ref|global_ref }
+  external_references[]: { item, path, line, context }
+  suggested_clusters[]: { id, items, reason, internal_edges,
+                          external_references }
+  warnings[]: macro-heavy items flag
+
+RECIPE (monster-file split)
+  const g = await analysis.topLevelDeps({ file: "src/lib.rs" });
+  // Survey: which items depend on each other?
+  // suggested_clusters are connected components — items in the same
+  // cluster reference each other and may move together.
+  // Use rust.extractItems to extract a cluster into a submodule.
+"#;
+
 #[async_trait]
 impl Tool for AnalysisDescribe {
     fn name(&self) -> &str {
         "analysis.describe"
     }
     fn description(&self) -> &str {
-        "Full contract for one analysis.* binding (params, result vocabulary, recipe). The namespace index lists analyses one line each; call this before first use."
+        "Full contract for one analysis.* binding (params, result vocabulary, recipe). The namespace index lists analyses one line each; call this before first use. Pass language (\"java\" or \"rust\") to filter available analyses."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "analysis": { "type": "string", "description": "Analysis name, e.g. \"cohesionClusters\"." }
+                "analysis": { "type": "string", "description": "Analysis name, e.g. \"cohesionClusters\" or \"implPartition\"." },
+                "language": { "type": "string", "enum": ["java", "rust"], "description": "Optional language filter: only analyses for this language are valid." }
             },
             "required": ["analysis"]
         })
@@ -953,18 +1259,47 @@ impl Tool for AnalysisDescribe {
             .get("analysis")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let language = input.get("language").and_then(Value::as_str);
         match analysis {
-            "cohesionClusters" => ToolResult::Json(json!({ "contract": COHESION_CONTRACT })),
+            "cohesionClusters" => {
+                if language == Some("rust") {
+                    return err("analysis.cohesionClusters is Java-only");
+                }
+                ToolResult::Json(json!({ "contract": COHESION_CONTRACT }))
+            }
             "references" => ToolResult::Json(json!({ "contract": REFERENCES_CONTRACT })),
             "fieldClassification" => {
+                if language == Some("rust") {
+                    return err("analysis.fieldClassification is Java-only");
+                }
                 ToolResult::Json(json!({ "contract": FIELD_CLASSIFICATION_CONTRACT }))
             }
-            "methodRegions" => ToolResult::Json(json!({ "contract": METHOD_REGIONS_CONTRACT })),
+            "methodRegions" => {
+                if language == Some("rust") {
+                    return err("analysis.methodRegions is Java-only");
+                }
+                ToolResult::Json(json!({ "contract": METHOD_REGIONS_CONTRACT }))
+            }
             "fieldInitializerClosure" => {
+                if language == Some("rust") {
+                    return err("analysis.fieldInitializerClosure is Java-only");
+                }
                 ToolResult::Json(json!({ "contract": FIELD_INIT_CLOSURE_CONTRACT }))
             }
+            "implPartition" => {
+                if language == Some("java") {
+                    return err("analysis.implPartition is Rust-only");
+                }
+                ToolResult::Json(json!({ "contract": IMPL_PARTITION_CONTRACT }))
+            }
+            "topLevelDeps" => {
+                if language == Some("java") {
+                    return err("analysis.topLevelDeps is Rust-only");
+                }
+                ToolResult::Json(json!({ "contract": TOP_LEVEL_DEPS_CONTRACT }))
+            }
             other => err(format!(
-                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification, methodRegions, fieldInitializerClosure)"
+                "analysis.describe: unknown analysis `{other}` (available: cohesionClusters, references, fieldClassification, methodRegions, fieldInitializerClosure, implPartition, topLevelDeps)"
             )),
         }
     }
@@ -978,6 +1313,8 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(AnalysisFieldClassification) as Arc<dyn Tool>,
         Arc::new(AnalysisMethodRegions) as Arc<dyn Tool>,
         Arc::new(AnalysisFieldInitializerClosure) as Arc<dyn Tool>,
+        Arc::new(AnalysisImplPartition) as Arc<dyn Tool>,
+        Arc::new(AnalysisTopLevelDeps) as Arc<dyn Tool>,
         Arc::new(AnalysisDescribe) as Arc<dyn Tool>,
     ]
 }
@@ -988,7 +1325,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> bro_code_mode::ToolNamespaceDescription {
     bro_code_mode::ToolNamespaceDescription {
         name: "analysis".to_string(),
-        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count Java symbol references across the workspace without full capture payloads; fieldClassification — classify Java fields as constants/deps/mutable state with read/write sites; methodRegions — analyze Java method-body regions before extract-method gates; fieldInitializerClosure — transitive field/constant dependency closure for moved fields (prevents extract-time compile failures from missed initializer deps). USE THESE rather than reconstructing reductions from code.query captures."
+        description: "Reduce-Rust-side analyses: ask a whole-class/corpus QUESTION and get back a small structured answer, instead of materializing raw facts into the cell. Each runs the reduction host-side; never writes; provenance syntax_only. Call analysis.describe({analysis}) for the full contract. Analyses: cohesionClusters (java) — partition a Java class's methods into cohesive decomposition seams (feeds java.extractClass); references — count symbol references across the workspace without full capture payloads (Java + Rust, pass language:\"rust\"); fieldClassification (java) — classify Java fields as constants/deps/mutable state with read/write sites; methodRegions (java) — analyze Java method-body regions before extract-method gates; fieldInitializerClosure (java) — transitive field/constant dependency closure for moved fields (prevents extract-time compile failures from missed initializer deps); implPartition (rust) — impl-method call/state graph for split planning (feeds rust.extractImplMethods); topLevelDeps (rust) — top-level item dependency graph + external reference hints + suggested clusters (feeds rust.extractItems). USE THESE rather than reconstructing reductions from code.query captures."
             .to_string(),
         declarations: r#"type CohesionCluster = { id: string; name_hint: string; item_names: string[]; move_fields: string[]; score: number; internal_field_touches: number; internal_calls: number; inbound_calls: number; outbound_calls: number; expected_wiring: "delegate" | "callback" | "source_instance" };
 type CrossClusterCall = { from_cluster: string; to_cluster: string; from_method: string; to_method: string };
@@ -999,19 +1336,30 @@ type ComponentTreeConsumption = { kind: "component_tree_argument" | "component_t
 type MethodRegionVar = { name: string; type: string; resolved_type?: string; mutated?: boolean; after_use_kinds?: string[]; component_tree_consumptions?: ComponentTreeConsumption[] };
 type MethodRegionStatementSummary = { total_count: number; matched_count: number; returned_count: number; omitted_count: number; included: boolean; filter?: { include_nested_statement_regions?: boolean; start_line?: number; end_line?: number; contains?: string; limit?: number } };
 type MethodRegion = { id: string; label?: string; kind: string; byte_start: number; byte_end: number; line_range: [number, number]; statement_count: number; preview: string; captures: MethodRegionVar[]; live_outs: MethodRegionVar[]; field_touches: { name: string; reads: number; writes: number }[]; enclosing_class_refs: string[]; this_super_refs: number; lambda_count: number; listener_call_count: number; non_local_control_flow: { kind: string; line: number; column: number }[]; extractability: { can_extract_with_current_tool: boolean; stop_reasons: string[]; live_out_count: number; mutated_capture_count: number; non_local_control_flow_count: number } };
+type RustMethodNode = { name: string; reads: string[]; writes: string[]; calls: string[]; unresolved_callbacks: string[]; attrs: string[]; router?: string | null };
+type RustFieldNode = { name: string; ty: string; shared_by: string[] };
+type RustPartitionEdge = { from: string; to: string; kind: string };
+type RustTopLevelItem = { name: string; kind: string; line_start: number; line_end: number; calls: string[]; type_refs: string[]; module_refs: string[]; global_refs: string[]; attrs: string[]; warnings: string[] };
+type RustTopLevelEdge = { from: string; to: string; kind: string };
+type RustTopLevelExternalRef = { item: string; path: string; line: number; context: string };
+type RustTopLevelCluster = { id: string; items: string[]; reason: string; internal_edges: number; external_references: number };
 declare const analysis: {
-  /** Full contract (params, result vocabulary, recipe) for one analysis. Call before first use. */
-  describe(args: { analysis: string }): Promise<{ contract: string }>;
+  /** Full contract (params, result vocabulary, recipe) for one analysis. Call before first use. Pass language ("java"|"rust") to filter. */
+  describe(args: { analysis: string; language?: "java" | "rust" }): Promise<{ contract: string }>;
   /** Partition the first Java class's methods into cohesive clusters — the decomposition seams. Pick a high-score cluster and feed item_names/move_fields/expected_wiring into java.extractClass. The Rust-side answer to "what are the real seams"; do not rebuild it from code.query. */
   cohesionClusters(args: { file: string }): Promise<{ file: string; class: Record<string, unknown>; cluster_count: number; clusters: CohesionCluster[]; cross_cluster_calls: CrossClusterCall[]; provenance: "syntax_only" }>;
-  /** Count Java references to simple symbols across the workspace without returning full capture payloads. Use before extraction to decide wrappers:true, distinguish forwarded fields, or estimate production/test blast radius. */
-  references(args: { symbols: string[]; kinds?: Array<"type_reference" | "method_invocation" | "field_access" | "method_reference" | "import">; declaringClass?: string }): Promise<{ symbols: string[]; total_usages: number; unique_files: number; production_sites: number; test_sites: number; counts_by_symbol: Record<string, number>; files_by_symbol: Record<string, string[]>; examples_by_symbol: Record<string, ReferenceExample[]>; provenance: "syntax_only" }>;
+  /** Count symbol references across the workspace without returning full capture payloads. Default Java; Rust mode with language:"rust" (usage kinds: call, type_ref, path_ref, macro_use). Use before extraction to decide wrappers:true, distinguish forwarded fields, or estimate production/test blast radius. */
+  references(args: { symbols: string[]; language?: "java" | "rust"; kinds?: Array<"type_reference" | "method_invocation" | "field_access" | "method_reference" | "import">; declaringClass?: string }): Promise<{ symbols: string[]; total_usages: number; unique_files: number; production_sites: number; test_sites: number; counts_by_symbol: Record<string, number>; files_by_symbol: Record<string, string[]>; examples_by_symbol: Record<string, ReferenceExample[]>; provenance: "syntax_only" }>;
   /** Classify Java fields before extraction: constants/dependencies/mutable state plus read/write sites by method. */
   fieldClassification(args: { file: string; fields?: string[]; className?: string }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; fields: FieldClassification[]; provenance: "syntax_only" }>;
   /** Analyze one Java method's top-level statement regions and optional candidate ranges before extract-method. Use this for contiguity/live-out gates. */
   methodRegions(args: { file: string; method: string; className?: string; includeStatementRegions?: boolean; includeNestedStatementRegions?: boolean; statementLimit?: number; statementStartLine?: number; statementEndLine?: number; statementContains?: string; ranges?: Array<{ label?: string; startLine?: number; endLine?: number; byteStart?: number; byteEnd?: number }> }): Promise<{ file: string; language: "java"; content_sha256: string; source_len: number; class_name?: string; method_name: string; method_kind: string; method_line_range: [number, number]; body_line_range: [number, number]; parameters: MethodRegionVar[]; statement_region_summary: MethodRegionStatementSummary; statement_regions: MethodRegion[]; requested_ranges: MethodRegion[]; requested_contiguous: boolean; provenance: "syntax_only" }>;
   /** Compute transitive field/constant dependency closure for moved fields. For each static final field, finds constants referenced in its initializer and follows the chain transitively. Use before java.extractClass. */
   fieldInitializerClosure(args: { file: string; fields: string[]; className?: string }): Promise<{ file: string; fields: string[]; closure: Record<string, string[]>; provenance: "syntax_only" }>;
+  /** (rust) Analyze one or more Rust impl blocks, returning a partition graph with per-method field reads/writes/calls, shared fields, and inferred edges. Feed into rust.extractImplMethods. */
+  implPartition(args: { file: string; implName?: string; moduleName?: string }): Promise<{ file: string; impl_name: string; methods: RustMethodNode[]; fields: RustFieldNode[]; edges: RustPartitionEdge[]; provenance: "syntax_only" }>;
+  /** (rust) Analyze top-level Rust items: dependency graph, external reference hints, and suggested clusters. The pre-extract survey before rust.extractItems. */
+  topLevelDeps(args: { file: string; projectDir?: string; itemNames?: string[]; itemKinds?: string[] }): Promise<{ file: string; items: RustTopLevelItem[]; edges: RustTopLevelEdge[]; external_references: RustTopLevelExternalRef[]; suggested_clusters: RustTopLevelCluster[]; warnings: string[]; provenance: "syntax_only" }>;
 };"#
             .to_string(),
     }
@@ -1623,5 +1971,331 @@ public class ClosureTest {
             matches!(unknown, ToolResult::Error(ref e) if e.contains("available: cohesionClusters, references, fieldClassification")),
             "{unknown:?}"
         );
+        // Language filter: Java-only analysis refuses rust filter.
+        let jrust = AnalysisDescribe
+            .call(json!({ "analysis": "cohesionClusters", "language": "rust" }), &cx)
+            .await;
+        assert!(
+            matches!(jrust, ToolResult::Error(ref e) if e.contains("Java-only")),
+            "{jrust:?}"
+        );
+        // Rust-only: implPartition resolves, and rejects java filter.
+        let ip = json_of(
+            AnalysisDescribe
+                .call(json!({ "analysis": "implPartition" }), &cx)
+                .await,
+        );
+        assert!(
+            ip["contract"]
+                .as_str()
+                .unwrap()
+                .contains("impl-method call/state graph"),
+            "{ip}"
+        );
+        let ipj = AnalysisDescribe
+            .call(json!({ "analysis": "implPartition", "language": "java" }), &cx)
+            .await;
+        assert!(
+            matches!(ipj, ToolResult::Error(ref e) if e.contains("Rust-only")),
+            "{ipj:?}"
+        );
+        // topLevelDeps resolves.
+        let td = json_of(
+            AnalysisDescribe
+                .call(json!({ "analysis": "topLevelDeps" }), &cx)
+                .await,
+        );
+        assert!(
+            td["contract"]
+                .as_str()
+                .unwrap()
+                .contains("pre-extract survey"),
+            "{td}"
+        );
+    }
+
+    // --- Rust analysis tests ---
+
+    const RUST_IMPL_FIXTURE: &str = r#"pub struct Server {
+    counter: u64,
+    name: String,
+}
+
+impl Server {
+    pub fn new(name: String) -> Server {
+        Server { counter: 0, name }
+    }
+
+    pub fn increment(&mut self) {
+        self.counter += 1;
+    }
+
+    pub fn count(&self) -> u64 {
+        self.counter
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn reset(&mut self) {
+        self.counter = 0;
+        self.log_reset();
+    }
+
+    fn log_reset(&self) {
+        println!("reset: {}", self.name());
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn impl_partition_returns_methods_and_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/server.rs"), RUST_IMPL_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisImplPartition
+                .call(
+                    json!({ "file": "src/server.rs", "implName": "Server" }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(out["provenance"], "syntax_only", "{out}");
+        assert_eq!(out["impl_name"], "Server", "{out}");
+
+        let methods = out["methods"].as_array().unwrap();
+        assert!(methods.len() >= 5, "expected >=5 methods: {out}");
+        // "increment" method should write counter
+        let inc = methods
+            .iter()
+            .find(|m| m["name"].as_str() == Some("increment"))
+            .expect("increment method exists");
+        assert!(
+            inc["writes"].as_array().unwrap().iter().any(|w| w == "counter"),
+            "increment should write counter: {inc}"
+        );
+
+        let fields = out["fields"].as_array().unwrap();
+        assert!(fields.len() >= 2, "expected >=2 fields: {out}");
+
+        // edges should reflect call and field-touch relationships
+        // (uses "method:<name>" / "field:<name>" prefix convention)
+        let edges = out["edges"].as_array().unwrap();
+        // reset writes counter and calls log_reset
+        let reset_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e["from"].as_str() == Some("method:reset"))
+            .collect();
+        assert!(
+            reset_edges.iter().any(|e| {
+                e["to"].as_str() == Some("field:counter") && e["kind"].as_str() == Some("writes")
+            }),
+            "reset should write counter: {reset_edges:?}"
+        );
+
+        // "impl Server" form also works
+        let out2 = json_of(
+            AnalysisImplPartition
+                .call(
+                    json!({ "file": "src/server.rs", "implName": "impl Server" }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(out2["impl_name"], "impl Server", "{out2}");
+        assert_eq!(out2["methods"].as_array().unwrap().len(), methods.len());
+    }
+
+    #[tokio::test]
+    async fn impl_partition_requires_impl_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/server.rs"), RUST_IMPL_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let result = AnalysisImplPartition
+            .call(json!({ "file": "src/server.rs" }), &cx)
+            .await;
+        assert!(
+            matches!(result, ToolResult::Error(ref e) if e.contains("implName")),
+            "{result:?}"
+        );
+    }
+
+    const RUST_TOP_LEVEL_FIXTURE: &str = r#"pub mod sub;
+
+pub fn helper() -> u32 { 42 }
+
+pub struct Config {
+    pub debug: bool,
+}
+
+pub fn init() -> Config {
+    let _ = helper();
+    Config { debug: true }
+}
+
+pub async fn run(config: &Config) {
+    if config.debug {
+        println!("running");
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn top_level_deps_reports_dependency_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), RUST_TOP_LEVEL_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisTopLevelDeps
+                .call(json!({ "file": "src/lib.rs" }), &cx)
+                .await,
+        );
+        assert_eq!(out["provenance"], "syntax_only", "{out}");
+
+        let items = out["items"].as_array().unwrap();
+        // Should have at least the function items and struct item; mod is also top-level
+        assert!(items.len() >= 4, "expected >=4 items: {out}");
+
+        // "init" calls "helper" -> there should be a calls edge
+        let edges = out["edges"].as_array().unwrap();
+        let init_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e["from"].as_str() == Some("init"))
+            .collect();
+        assert!(
+            init_edges.iter().any(|e| e["to"].as_str() == Some("helper") && e["kind"].as_str() == Some("calls")),
+            "init should call helper: {init_edges:?}"
+        );
+
+        // suggested_clusters should exist
+        let clusters = out["suggested_clusters"].as_array().unwrap();
+        assert!(!clusters.is_empty(), "expected clusters: {out}");
+    }
+
+    #[tokio::test]
+    async fn top_level_deps_with_item_name_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), RUST_TOP_LEVEL_FIXTURE).unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisTopLevelDeps
+                .call(
+                    json!({
+                        "file": "src/lib.rs",
+                        "itemNames": ["init", "helper"]
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        let items = out["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "should only have init and helper: {out}");
+        let names: Vec<_> = items
+            .iter()
+            .map(|i| i["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"init".to_string()));
+        assert!(names.contains(&"helper".to_string()));
+    }
+
+    #[tokio::test]
+    async fn references_rust_mode_counts_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            r#"pub fn hello() -> String { "hello".into() }
+pub fn greet() { let _ = hello(); }
+pub struct Foo { x: i32 }
+impl Foo { pub fn new() -> Foo { Foo { x: 0 } } }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/test_lib.rs"),
+            r#"use crate::hello;
+#[test]
+fn test_hello() { let s = hello(); }
+"#,
+        )
+        .unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisReferences
+                .call(
+                    json!({
+                        "symbols": ["hello", "Foo"],
+                        "language": "rust"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(out["provenance"], "syntax_only", "{out}");
+        // "hello" should have at least 3 references
+        let hello_count = out["counts_by_symbol"]["hello"].as_u64().unwrap_or(0);
+        assert!(hello_count >= 3, "hello should have >=3 refs: {out}");
+        // "Foo" appears as type_ref several times
+        let foo_count = out["counts_by_symbol"]["Foo"].as_u64().unwrap_or(0);
+        assert!(foo_count >= 2, "Foo should have >=2 refs: {out}");
+        assert!(out["production_sites"].as_u64().unwrap_or(0) > 0);
+        assert!(out["test_sites"].as_u64().unwrap_or(0) > 0);
+        // examples should carry rust usage kinds
+        let hello_examples = out["examples_by_symbol"]["hello"]
+            .as_array()
+            .unwrap();
+        assert!(
+            hello_examples
+                .iter()
+                .any(|e| e["usage_kind"].as_str() == Some("call")),
+            "{hello_examples:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn references_java_mode_still_works() {
+        // regression: adding language param doesn't break existing Java path
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Test.java"), r#"public class Test {
+    public void hello() {}
+    public void world() { hello(); }
+}
+"#).unwrap();
+        let cx = cx_in(&root);
+
+        let out = json_of(
+            AnalysisReferences
+                .call(
+                    json!({
+                        "symbols": ["hello"],
+                        "language": "java"
+                    }),
+                    &cx,
+                )
+                .await,
+        );
+        // Should find at least the call in world()
+        let count = out["counts_by_symbol"]["hello"].as_u64().unwrap_or(0);
+        assert!(count >= 1, "hello should have >=1 ref in Java mode: {out}");
+        assert_eq!(out["provenance"], "syntax_only", "{out}");
     }
 }
