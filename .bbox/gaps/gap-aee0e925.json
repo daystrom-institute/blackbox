@@ -1,0 +1,22 @@
+{
+  "id": "gap-aee0e925",
+  "title": "Pool release refill races checkout availability and leaves pool underfilled",
+  "gap_kind": "tooling",
+  "domain": "lane-mechanics",
+  "wanted_capability": "Releasing a claimed lane should destroy only that lane, replenish the configured warm pool reliably, and return success once the pool is healthy.",
+  "missing_primitive": "A refill readiness barrier between lane creation, checkout mount availability, and git inspection, plus retry or reconciliation after a partial create",
+  "fallback_used": "Verify pool status after release and report the underfilled state instead of assuming a successful destroy means closeout completed.",
+  "evidence": [
+    "`lane-pool.sh release bpool1` destroyed the claimed pod and dataset, then synchronously began replenishing the pool",
+    "The refill created bpool1 but reported its base image was behind the mirror tip, then bpool2 failed with `fatal: cannot change to '/Users/invidious/lanes/bpool2/blackbox': No such file or directory` and the release command exited 1",
+    "A read-only status check immediately afterward showed bpool1 still provisioning, bpool4 claimed, and only 1/2 unclaimed lanes"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/lane-mechanics/release-refill-checkout-race",
+  "suggested_owner": "bbox-cage lane pool",
+  "notes": "The release path couples safe cleanup of the caller's lane to synchronous pool refill. A transient checkout-mount race turns successful release into a failed closeout and leaves capacity below the configured pool size. Creation should wait for the checkout path before calling git, retry safely, and reconcile the pool independently of the release exit path.",
+  "resolution": "unresolved",
+  "created_at": "2026-07-19T18:22:10Z",
+  "updated_at": "2026-07-19T18:22:10Z"
+}

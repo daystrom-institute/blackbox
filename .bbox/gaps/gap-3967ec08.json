@@ -5,18 +5,19 @@
   "domain": "lane-mechanics",
   "wanted_capability": "Every claimed lane should resolve project-scoped Blackbox state to the registered base repository while targeting durable file writes into the lane checkout.",
   "missing_primitive": "Lane-pool checkout to registered base-project identity mapping for all project-scoped Blackbox tools",
-  "fallback_used": "Keep the correctly updated repo-owned `.bbox/knowledge/7276b5c6.json` in the lane branch and do not render generated provider files from the lane checkout.",
+  "fallback_used": "Keep the correctly updated repo-owned `.bbox/knowledge/7276b5c6.json` in the feature branch, do not render generated provider files from the lane checkout, and manually restore the base checkout file that the lane-scoped update deleted.",
   "evidence": [
     "bbox_learn update of existing project knowledge id 7276b5c6 reported project path changed from /Users/invidious/repos/transcript-search to /Users/invidious/lanes/bpool1/blackbox",
     "bbox_render(dry_run=true, scope=project, provider=codex, project=/Users/invidious/lanes/bpool1/blackbox) proposed a 212-byte AGENTS.md containing only the PROJECT.md pointer",
-    "bbox_gap_update could not find gap-cd5edeee immediately after bbox_gap created that project-scoped file in the same lane checkout"
+    "bbox_gap_update could not find gap-cd5edeee immediately after bbox_gap created that project-scoped file in the same lane checkout",
+    "After the lane was released, the registered base checkout showed `.bbox/knowledge/7276b5c6.json` deleted; restoring the exact HEAD version returned the base checkout to its prior state"
   ],
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/lane-mechanics/pool-lane-project-scope-mapping",
   "suggested_owner": "bbox-cage lane pool and Blackbox project resolution",
-  "notes": "The lane-pool checkout behaves like a clone rather than a linked git worktree, so project-scoped knowledge/render paths do not reuse the base repo identity. This can silently erase rendered project conventions if an agent renders from the lane, and follow-up mutation tools cannot find lane-filed gaps.",
+  "notes": "The lane-pool checkout behaves like a clone rather than a linked git worktree, so project-scoped knowledge/render paths do not reuse the base repo identity. This can silently erase rendered project conventions if an agent renders from the lane, make follow-up mutation tools unable to find lane-filed gaps, and mutate or delete the base checkout's repo-owned knowledge while operating from the lane.",
   "resolution": "unresolved",
   "created_at": "2026-07-19T17:57:18Z",
-  "updated_at": "2026-07-19T17:57:47Z"
+  "updated_at": "2026-07-19T18:22:10Z"
 }
