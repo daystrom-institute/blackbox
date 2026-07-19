@@ -98,6 +98,16 @@ Deliberate deltas, all documented at their call sites:
 - Terminal-session GC is ack-driven only: a session is forgotten when it has
   exited AND the daemon has acknowledged through its last seq.
 
+## Split, not hand-rolled
+
+The connection is split with `bro_rpc::NegotiatedIo::split`, which carries the
+negotiated `ConnectionBinding` onto both halves so generation fencing still
+runs on every frame. This replaced a hand-rolled re-framing here (splitting the
+`UnixStream` and rebuilding two `FramedIo`s with `validate_envelope` called
+manually). The daemon-side client needs the identical shape, and two hand-rolled
+copies of a fencing-critical primitive is one too many. Do not reintroduce a
+local version.
+
 ## Wire note
 
 The design doc's slice 5 contract paragraph says "newline-delimited JSON".
@@ -106,3 +116,26 @@ framing, which bans newline framing outright (see `crates/bro-rpc/AGENTS.md`).
 The framing is an implementation detail beneath the message contract; the
 contract's substance (versioned handshake, file-sourced bearer token, message
 types in `bro-protocol`, socket path derived from the state dir) is unchanged.
+
+## The daemon side of this contract
+
+`src/orchestration/fleetd_client.rs` is the client. Three things there are
+paired with invariants above and must not drift:
+
+- **One connection, sessions multiplexed over it.** Because fleetd serves a
+  single owner connection, the daemon must not open a second: a second dial
+  fences the first out and silently strands whatever the first was relaying.
+  A connection actor owns the socket and fans messages to per-session handles.
+- **The daemon advances its cursor AFTER ingest, not on receipt.** That is what
+  makes `ReplayFrom` exact. The seq the client tracks per session is only for
+  `EventAck`, which is advisory and gates nothing but fleetd's GC.
+- **The spec's `session_id` is the supervision key**, and the daemon
+  substitutes the task id when a dispatch has no provider session yet (several
+  paths still pass the literal `"pending"`). Two concurrent pending dispatches
+  would otherwise collide on this registry, on the daemon's slot map, and on
+  the event-log filename.
+
+Deliberate delta from the "accepted v1 limits" above: the daemon starts fleetd
+itself, detached, when the socket is absent at first need. That is a daemon-side
+convenience and changes nothing about fleetd; it still never adopts processes
+and still kills its children on its own restart.

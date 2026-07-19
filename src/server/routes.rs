@@ -3600,16 +3600,18 @@ mod tests {
         );
 
         let server = BlackboxServer::new(state.clone());
-        server.bro_prune(Parameters(crate::tools::bro_params::PruneParams {
-            status: None,
-            provider: None,
-            older_than_hours: None,
-            dry_run: None,
-            task_ids: Some(vec!["task-roster-generation".to_string()]),
-            retro: None,
-            retro_min_turns: None,
-            retro_max: None,
-        }));
+        server
+            .bro_prune(Parameters(crate::tools::bro_params::PruneParams {
+                status: None,
+                provider: None,
+                older_than_hours: None,
+                dry_run: None,
+                task_ids: Some(vec!["task-roster-generation".to_string()]),
+                retro: None,
+                retro_min_turns: None,
+                retro_max: None,
+            }))
+            .await;
         let removed = timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("removed delta should arrive")

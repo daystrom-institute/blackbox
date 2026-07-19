@@ -1,0 +1,26 @@
+[Unit]
+Description=fleetd — per-machine blackbox fleet supervisor
+After=network.target
+# Deliberately NOT Requires=/Before= blackbox.service. fleetd starts its own
+# workers on demand and blackboxd starts fleetd if the socket is absent, so an
+# ordering dependency would only add a failure mode. This unit exists so
+# fleetd is already up before the first dispatch and is restarted if it dies.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fleetd
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=fleetd=info
+# --state-dir defaults to $BLACKBOX_STATE_DIR, else $XDG_STATE_HOME/blackbox,
+# else ~/.local/state/blackbox — the same precedence the daemon uses, which is
+# what keeps the two on the same socket without configuring it twice. The
+# socket (fleetd.sock) and shared-secret token (fleetd.token) both derive from
+# it, so a daemon with a non-default paths.state_dir needs the matching
+# --state-dir here (see fleetd-dev.service).
+WorkingDirectory=%h
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

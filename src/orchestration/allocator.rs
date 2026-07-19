@@ -305,7 +305,7 @@ pub struct AllocationContext {
 }
 
 static LEASE_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ALLOCATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 /// Acquire the process-wide allocation lock, blocking until it is free.
 ///
@@ -327,19 +327,24 @@ static ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// Poisoned-mutex recovery is preserved (recover the inner data rather than
 /// propagate panic state).
 ///
-/// Note: this is `std::sync::Mutex::lock()` called from `async fn` handlers
-/// like `bro_agent_dispatch`. The held section currently includes filesystem
-/// IO and `Command::spawn`, so the executor thread is blocked for the
-/// dispatch duration. Acceptable at current `parallelism: 3` fanout. If
-/// fanout grows materially, migrate `dispatch_fresh_bro_task` to async,
-/// change this to `OnceLock<tokio::sync::Mutex<()>>`, and replace `lock()`
-/// with `lock().await` — keeping the same long-scope semantics unless a
-/// pre-spawn lease reservation is also introduced.
-pub fn acquire_allocation_lock() -> std::sync::MutexGuard<'static, ()> {
-    match ALLOCATION_LOCK.get_or_init(|| Mutex::new(())).lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+/// This is a `tokio::sync::Mutex`, not a `std::sync::Mutex`, and that is
+/// forced by the shape above rather than chosen for taste: the guard is held
+/// across the whole dispatch, and since the fleetd cutover the dispatch
+/// `await`s (the executor seam is async). A `std` guard is not `Send`, so
+/// holding one across an await makes every enclosing future non-`Send` and
+/// `tokio::spawn` rejects it. It also blocked an executor thread for the
+/// dispatch duration, which an async mutex does not.
+///
+/// This is the migration the previous note here prescribed for exactly this
+/// trigger, with the same long-scope semantics preserved.
+///
+/// Poisoning is not a concern for a `tokio::sync::Mutex` (it has no poison
+/// state), so the previous `into_inner` recovery arm is gone.
+pub async fn acquire_allocation_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    ALLOCATION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 pub fn config_file(store_dir: &Path) -> PathBuf {
@@ -2662,56 +2667,62 @@ mod tests {
     }
 
     /// Regression for the `try_lock`-fails-on-contention bug that used to
-    /// surface `error.allocation_busy` to callers. Spawns N threads, parks
-    /// them on a `Barrier` so they all race for the lock at the same
-    /// instant, holds it briefly inside the guarded section, and asserts
-    /// every thread successfully acquired and released. With the old
-    /// `try_lock` shape, the loser(s) would error immediately; with the new
-    /// blocking `lock`, every caller queues and proceeds.
-    #[test]
-    fn acquire_allocation_lock_queues_concurrent_callers() {
+    /// surface `error.allocation_busy` to callers. Parks N tasks on a barrier
+    /// so they all race for the lock at the same instant, holds it briefly
+    /// inside the guarded section, and asserts every task acquired and
+    /// released with peak in-section concurrency of exactly 1. With the old
+    /// `try_lock` shape, the loser(s) would error immediately.
+    ///
+    /// Tokio tasks on a multi-thread runtime rather than OS threads: the lock
+    /// is a `tokio::sync::Mutex` since the fleetd cutover (the guard is held
+    /// across the dispatch's awaits), so it can only be taken from async
+    /// context. `tokio::time::sleep` inside the section keeps the hold
+    /// genuinely overlapping in wall-clock terms without blocking a worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acquire_allocation_lock_queues_concurrent_callers() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Barrier};
-        use std::thread;
         use std::time::Duration;
 
-        const THREADS: usize = 8;
-        let barrier = Arc::new(Barrier::new(THREADS));
+        const TASKS: usize = 8;
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_observed = Arc::new(AtomicUsize::new(0));
         let acquired = Arc::new(AtomicUsize::new(0));
 
-        let handles: Vec<_> = (0..THREADS)
+        let handles: Vec<_> = (0..TASKS)
             .map(|_| {
                 let barrier = Arc::clone(&barrier);
                 let in_flight = Arc::clone(&in_flight);
                 let max_observed = Arc::clone(&max_observed);
                 let acquired = Arc::clone(&acquired);
-                thread::spawn(move || {
-                    // Park all threads at the same wall-clock point so the
-                    // lock acquisition is genuinely contended rather than
-                    // staggered by spawn latency.
-                    barrier.wait();
-                    let _guard = acquire_allocation_lock();
+                tokio::spawn(async move {
+                    // Park every task at the same point so the acquisition is
+                    // genuinely contended rather than staggered by spawn
+                    // latency.
+                    barrier.wait().await;
+                    let _guard = acquire_allocation_lock().await;
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    // Track peak concurrency seen inside the guarded section;
-                    // mutual exclusion means this must stay at 1.
+                    // Peak concurrency inside the guarded section; mutual
+                    // exclusion means this must stay at 1.
                     max_observed.fetch_max(now, Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(5));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     acquired.fetch_add(1, Ordering::SeqCst);
                 })
             })
             .collect();
 
-        for h in handles {
-            h.join().expect("thread panicked acquiring allocation lock");
+        for handle in handles {
+            handle
+                .await
+                .expect("task panicked acquiring allocation lock");
         }
 
         assert_eq!(
             acquired.load(Ordering::SeqCst),
-            THREADS,
-            "every thread should successfully acquire the allocation lock"
+            TASKS,
+            "every caller should successfully acquire the allocation lock"
         );
         assert_eq!(
             max_observed.load(Ordering::SeqCst),

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleetd - the per-machine blackbox fleet supervisor (prod instance).
+
+  Install at ~/Library/LaunchAgents/com.daystrom.fleetd.plist, then:
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daystrom.fleetd.plist
+
+  fleetd owns the harness worker children so a blackboxd rebuild and
+  kickstart no longer drops live sessions. It is deliberately NOT a
+  dependency of blackboxd's own startup: the daemon starts fleetd on demand
+  if the socket is absent. This agent exists so fleetd is up before the
+  first dispatch and gets restarted if it ever dies.
+
+  --state-dir is the ONE thing that must stay in step with the daemon: the
+  socket and shared-secret token derive from it, and that derivation is what
+  keeps the prod and dev daemons on separate supervisors. Leaving it at the
+  default here matches a prod daemon with no explicit `paths.state_dir`.
+
+  KeepAlive is a plain true rather than blackboxd's
+  {SuccessfulExit: false}: a supervisor that exits cleanly (SIGTERM on
+  logout, an orderly shutdown) should still come back, and its children are
+  already gone by then, so a restart costs nothing.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daystrom.fleetd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/invidious/.local/bin/fleetd</string>
+        <string>--state-dir</string>
+        <string>/Users/invidious/.local/state/blackbox</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>fleetd=info</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/invidious/.local/state/blackbox/fleetd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/invidious/.local/state/blackbox/fleetd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -269,13 +269,13 @@ where
 }
 
 impl BlackboxServer {
-    pub(crate) fn dispatch_fresh_bro_task(
+    pub(crate) async fn dispatch_fresh_bro_task(
         &self,
         mut request: FreshDispatchRequest,
     ) -> Result<FreshDispatchResult, String> {
         let store_dir = self.state.store_dir.clone();
         let allocation_guard = if request.allocation_request.is_some() {
-            Some(orchestration::allocator::acquire_allocation_lock())
+            Some(orchestration::allocator::acquire_allocation_lock().await)
         } else {
             None
         };
@@ -424,7 +424,8 @@ impl BlackboxServer {
             ),
             Some(self.state.system_events.clone()),
             request.origin,
-        );
+        )
+        .await;
         orch::seed_task_roster_fields(
             &task,
             default_name,
@@ -540,39 +541,42 @@ impl BlackboxServer {
             .clone()
             .or_else(|| exec_opts.as_ref().and_then(|o| o.service_tier.clone()));
         let lease_brofile_context = brofile_context.clone();
-        let dispatched = match self.dispatch_fresh_bro_task(FreshDispatchRequest {
-            prompt: p.prompt.clone(),
-            provider,
-            lens,
-            exec_opts,
-            env_overrides,
-            cwd: cwd.clone(),
-            brofile_filters,
-            coerce_workspace,
-            allow_recursion,
-            allow_tools: p.allow_tools.clone(),
-            disallow_tools: p.disallow_tools.clone(),
-            tool_placement: p.tool_placement.clone(),
-            brofile_tool_defaults,
-            tool_defaults: p.tool_defaults.clone(),
-            allocation_request,
-            project_dir_for_lease: p.cwd.clone(),
-            ambient_bro_name: p.bro.clone(),
-            spawn_bro_label: None,
-            spawn_agent_label: None,
-            display_name: p.display_name.clone(),
-            record_to_bro: p.bro.clone(),
-            brofile_context,
-            code_mode: resolved_code_mode,
-            service_tier: resolved_service_tier,
-            // bro_exec carries no output schema (structured output is delivered
-            // via agent dispatch from the manifest, not generic exec).
-            output_schema: None,
-            // Default the bro_exec origin to AgentDispatch; the cockpit
-            // control handler overrides this to Cockpit via the
-            // `origin_override` slot on ExecParams.
-            origin: p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
-        }) {
+        let dispatched = match self
+            .dispatch_fresh_bro_task(FreshDispatchRequest {
+                prompt: p.prompt.clone(),
+                provider,
+                lens,
+                exec_opts,
+                env_overrides,
+                cwd: cwd.clone(),
+                brofile_filters,
+                coerce_workspace,
+                allow_recursion,
+                allow_tools: p.allow_tools.clone(),
+                disallow_tools: p.disallow_tools.clone(),
+                tool_placement: p.tool_placement.clone(),
+                brofile_tool_defaults,
+                tool_defaults: p.tool_defaults.clone(),
+                allocation_request,
+                project_dir_for_lease: p.cwd.clone(),
+                ambient_bro_name: p.bro.clone(),
+                spawn_bro_label: None,
+                spawn_agent_label: None,
+                display_name: p.display_name.clone(),
+                record_to_bro: p.bro.clone(),
+                brofile_context,
+                code_mode: resolved_code_mode,
+                service_tier: resolved_service_tier,
+                // bro_exec carries no output schema (structured output is delivered
+                // via agent dispatch from the manifest, not generic exec).
+                output_schema: None,
+                // Default the bro_exec origin to AgentDispatch; the cockpit
+                // control handler overrides this to Cockpit via the
+                // `origin_override` slot on ExecParams.
+                origin: p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
+            })
+            .await
+        {
             Ok(result) => result,
             Err(e) => return Self::err_text(&e),
         };
@@ -789,7 +793,8 @@ impl BlackboxServer {
             // (`/control/resume`) overrides this to Cockpit, exactly like
             // `/control/exec`, so cockpit follow-up turns don't jump tabs.
             p.origin_override.unwrap_or(bro_core::Origin::AgentDispatch),
-        );
+        )
+        .await;
         if let Some(lease) = &runtime_lease {
             let inner = task.inner.lock();
             orchestration::allocator::record_lease(
@@ -1252,10 +1257,18 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<BroadcastParams>,
     ) -> CallToolResult {
-        let _team_lock = orchestration::team::lock_teams();
-        let team = match orchestration::team::load_team(&p.team, &self.state.store_dir) {
-            Some(t) => t,
-            None => return Self::err_text(&format!("Unknown team: {}", p.team)),
+        // The team-file lock is scoped to the read and (below) the write,
+        // NOT held across the dispatch loop. It is a `parking_lot` guard
+        // protecting a short read-modify-write of a JSON file, which is how
+        // every other `lock_teams` caller uses it; spanning it across the
+        // per-member spawn awaits would block every other team operation for
+        // the length of a fan-out and hold a non-Send guard across an await.
+        let team = {
+            let _team_lock = orchestration::team::lock_teams();
+            match orchestration::team::load_team(&p.team, &self.state.store_dir) {
+                Some(t) => t,
+                None => return Self::err_text(&format!("Unknown team: {}", p.team)),
+            }
         };
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let cwd = p.cwd.or(team.project_dir.clone());
@@ -1465,7 +1478,8 @@ impl BlackboxServer {
                         // is still driven by the operator's MCP call,
                         // so they land in the AgentDispatch tab.
                         bro_core::Origin::AgentDispatch,
-                    );
+                    )
+                    .await;
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     release_resume_lease_when_done(t.clone(), resume_lease);
                     t
@@ -1515,7 +1529,8 @@ impl BlackboxServer {
                     // bro_broadcast per-member fresh-spawn branch
                     // — same source class as the resume branch above.
                     bro_core::Origin::AgentDispatch,
-                );
+                )
+                .await;
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
                 updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
                 t
@@ -1527,7 +1542,10 @@ impl BlackboxServer {
             launched.push(json!({"bro": member.name, "taskId": tid, "sessionId": sid}));
         }
 
-        orchestration::team::save_team(&updated_team, &store_dir);
+        {
+            let _team_lock = orchestration::team::lock_teams();
+            orchestration::team::save_team(&updated_team, &store_dir);
+        }
         Self::ok_json(&json!({"team": p.team, "tasks": launched}))
     }
 
@@ -1546,7 +1564,7 @@ impl BlackboxServer {
         name = "bro_prune",
         description = "Drop terminal tasks from the store + persisted tasks.json; filter by status/provider/age, or pass task_ids to drop only specific tasks you created."
     )]
-    pub(crate) fn bro_prune(&self, Parameters(p): Parameters<PruneParams>) -> CallToolResult {
+    pub(crate) async fn bro_prune(&self, Parameters(p): Parameters<PruneParams>) -> CallToolResult {
         let allowed = ["failed", "completed", "cancelled"];
         // Validate an explicitly-supplied status; absence is meaningful
         // (see effective_status below), so don't default it here.
@@ -1716,13 +1734,16 @@ impl BlackboxServer {
         let mut retros_queued = 0usize;
         let mut retros_skipped = 0usize;
         for (source_task_id, provider, session_id, cwd, bro_label) in retro_targets {
-            match self.spawn_workload_retro(
-                &source_task_id,
-                provider,
-                &session_id,
-                cwd,
-                bro_label.as_deref(),
-            ) {
+            match self
+                .spawn_workload_retro(
+                    &source_task_id,
+                    provider,
+                    &session_id,
+                    cwd,
+                    bro_label.as_deref(),
+                )
+                .await
+            {
                 Ok(_) => retros_queued += 1,
                 Err(_) => retros_skipped += 1,
             }
@@ -1752,7 +1773,7 @@ impl BlackboxServer {
         name = "bro_retro",
         description = "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task."
     )]
-    pub(crate) fn bro_retro(&self, Parameters(p): Parameters<RetroParams>) -> CallToolResult {
+    pub(crate) async fn bro_retro(&self, Parameters(p): Parameters<RetroParams>) -> CallToolResult {
         let (provider, session_id, cwd, bro_label) =
             match self.state.task_store.read().get(&p.task_id) {
                 Some(task) => {
@@ -1772,13 +1793,10 @@ impl BlackboxServer {
                 p.task_id
             ));
         }
-        match self.spawn_workload_retro(
-            &p.task_id,
-            provider,
-            &session_id,
-            cwd,
-            bro_label.as_deref(),
-        ) {
+        match self
+            .spawn_workload_retro(&p.task_id, provider, &session_id, cwd, bro_label.as_deref())
+            .await
+        {
             Ok(retro_task_id) => Self::ok_json(&json!({
                 "retroTaskId": retro_task_id,
                 "sessionId": session_id,
@@ -1792,7 +1810,7 @@ impl BlackboxServer {
     /// session with the fixed reflection prompt, recursion firmly denied.
     /// Returns the probe's new task_id, or an Err string the caller counts
     /// as a skip (provider can't resume, session gone, lease contended).
-    fn spawn_workload_retro(
+    async fn spawn_workload_retro(
         &self,
         source_task_id: &str,
         provider: Provider,
@@ -1852,7 +1870,8 @@ impl BlackboxServer {
             // initiated, lands in AgentDispatch like other bro_*
             // MCP tools.
             bro_core::Origin::AgentDispatch,
-        );
+        )
+        .await;
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task, resume_lease);
         Ok(task_id)
@@ -2564,8 +2583,8 @@ mod tests {
         assert!(err.contains("Unknown bro or brofile"), "got: {err}");
     }
 
-    #[test]
-    fn prune_task_ids_drops_only_listed_terminal_tasks() {
+    #[tokio::test]
+    async fn prune_task_ids_drops_only_listed_terminal_tasks() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
@@ -2573,7 +2592,9 @@ mod tests {
         // A completed task named explicitly — no status given, so the
         // any-terminal rule applies and it matches despite the legacy
         // default being "failed".
-        server.bro_prune(Parameters(prune_params(Some(vec!["drop-me".into()]), None)));
+        server
+            .bro_prune(Parameters(prune_params(Some(vec!["drop-me".into()]), None)))
+            .await;
 
         let store = server.state.task_store.read();
         assert!(
@@ -2584,16 +2605,18 @@ mod tests {
         assert!(store.get("keep-other").is_some(), "unlisted task kept");
     }
 
-    #[test]
-    fn prune_task_ids_never_drops_running_even_if_listed() {
+    #[tokio::test]
+    async fn prune_task_ids_never_drops_running_even_if_listed() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
 
-        server.bro_prune(Parameters(prune_params(
-            Some(vec!["keep-running".into(), "drop-me".into()]),
-            None,
-        )));
+        server
+            .bro_prune(Parameters(prune_params(
+                Some(vec!["keep-running".into(), "drop-me".into()]),
+                None,
+            )))
+            .await;
 
         let store = server.state.task_store.read();
         assert!(
@@ -2606,17 +2629,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_task_ids_with_explicit_status_must_also_match_status() {
+    #[tokio::test]
+    async fn prune_task_ids_with_explicit_status_must_also_match_status() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
 
         // drop-me is Completed; an explicit status=failed must exclude it.
-        server.bro_prune(Parameters(prune_params(
-            Some(vec!["drop-me".into()]),
-            Some("failed".into()),
-        )));
+        server
+            .bro_prune(Parameters(prune_params(
+                Some(vec!["drop-me".into()]),
+                Some("failed".into()),
+            )))
+            .await;
 
         let store = server.state.task_store.read();
         assert!(
@@ -2625,14 +2650,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_without_task_ids_keeps_legacy_failed_default() {
+    #[tokio::test]
+    async fn prune_without_task_ids_keeps_legacy_failed_default() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         seed_prune_store(&server);
 
         // No task_ids, no status → legacy behavior: only failed tasks drop.
-        server.bro_prune(Parameters(prune_params(None, None)));
+        server.bro_prune(Parameters(prune_params(None, None))).await;
 
         let store = server.state.task_store.read();
         assert!(

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleetd - the per-machine blackbox fleet supervisor (dev instance).
+
+  Install at ~/Library/LaunchAgents/com.daystrom.fleetd-dev.plist, then:
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daystrom.fleetd-dev.plist
+
+  The ONLY meaningful difference from deploy/fleetd.plist is --state-dir,
+  and it is the whole point of having two: fleetd derives its socket
+  (fleetd.sock) and shared-secret token (fleetd.token) from the state dir,
+  so a distinct state dir is a distinct supervisor. That is what stops the
+  dev daemon from adopting prod's live sessions, or prod from adopting dev's.
+
+  It matches `state_dir = "~/.local/state/blackbox-dev"` in
+  deploy/config-dev.toml; if you change one, change the other.
+
+  The binary is the SAME fleetd as prod. fleetd is a supervisor that reads no
+  brofile, no credential store, and no provider config, so there is nothing
+  for a dev build to diverge on and no reason for a second binary path (this
+  is the opposite of blackboxd, which keeps blackboxd-dev precisely so a dev
+  binary swap cannot mutate the prod service executable).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daystrom.fleetd-dev</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/invidious/.local/bin/fleetd</string>
+        <string>--state-dir</string>
+        <string>/Users/invidious/.local/state/blackbox-dev</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>fleetd=debug</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/invidious/.local/state/blackbox-dev/fleetd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/invidious/.local/state/blackbox-dev/fleetd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

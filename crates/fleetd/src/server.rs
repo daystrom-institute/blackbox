@@ -23,16 +23,16 @@
 //! The next daemon asks `ListSessions`, then issues a `ReplayFrom` per session
 //! against its own cursor, and picks up exactly where it left off.
 //!
-//! ## Why the read and write halves are re-framed by hand
+//! ## Why the connection is split
 //!
 //! A connection needs to read commands and write relayed events concurrently.
 //! `NegotiatedIo` owns the whole stream and its `read_envelope` is not
 //! cancel-safe (cancelling mid-frame would desynchronize the length-prefixed
-//! stream), so `select!`-ing over it is not an option. Instead the handshake
-//! runs on the whole `UnixStream`, then the stream is split and each half is
-//! re-wrapped in its own `FramedIo`, with `bro_rpc::validate_envelope` applied
-//! by hand on both sides. That is exactly what `NegotiatedIo` does internally;
-//! the fencing guarantee is preserved, not bypassed.
+//! stream), so `select!`-ing over it is not an option. The handshake runs on
+//! the whole `UnixStream`, then `NegotiatedIo::split` hands back a read half
+//! and a write half that each still carry the negotiated `ConnectionBinding`,
+//! so generation fencing applies to every frame on both halves exactly as it
+//! did before the split.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,8 +42,8 @@ use bro_protocol::{
     DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState, WorkerSpawnSpec,
 };
 use bro_rpc::{
-    BuildIdentity, ConnectionBinding, Envelope, FramedIo, HandshakeOptions, RpcError, ServiceToken,
-    validate_envelope, verify_peer_uid,
+    BuildIdentity, ConnectionBinding, Envelope, HandshakeOptions, NegotiatedIo, RpcError,
+    ServiceToken, verify_peer_uid,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc};
@@ -228,16 +228,14 @@ pub async fn serve_connection(state: Arc<Fleetd>, stream: UnixStream) -> anyhow:
     .await?;
     let binding = negotiated.binding();
 
-    // See the module note on why the halves are re-framed by hand.
-    let (read_half, write_half) = negotiated.into_framed().into_inner().into_split();
-    let mut reader = FramedIo::new(tokio::io::join(read_half, tokio::io::sink()));
-    let mut writer = FramedIo::new(tokio::io::join(tokio::io::empty(), write_half));
+    // See the module note on why the connection is split.
+    let (mut reader, mut writer) = negotiated.split();
     let counter = Arc::new(AtomicU64::new(0));
 
     // Auth gate: the FIRST envelope must be a valid Authenticate. Anything
     // else, including a well-formed Spawn, is refused and the connection is
     // dropped.
-    let first = read_body(&mut reader, binding).await?;
+    let first = read_body(&mut reader).await?;
     let DaemonToFleetd::Authenticate { token } = first else {
         write_body(
             &mut writer,
@@ -306,7 +304,7 @@ pub async fn serve_connection(state: Arc<Fleetd>, stream: UnixStream) -> anyhow:
                 tracing::info!(generation, "connection fenced by a newer daemon connection");
                 break;
             }
-            body = read_body(&mut reader, binding) => body,
+            body = read_body(&mut reader) => body,
         };
         match body {
             Ok(body) => dispatch(state.clone(), body),
@@ -541,29 +539,25 @@ fn unknown_session(session_id: &str) -> FleetdToDaemon {
     }
 }
 
-/// Read one generation-validated command.
-async fn read_body<R>(
-    framed: &mut FramedIo<R>,
-    binding: ConnectionBinding,
-) -> Result<DaemonToFleetd, RpcError>
+/// Read one generation-validated command. `NegotiatedIo` validates against its
+/// own binding, so the fencing check is not repeated here.
+async fn read_body<R>(reader: &mut NegotiatedIo<R>) -> Result<DaemonToFleetd, RpcError>
 where
-    R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
 {
-    let envelope = framed.read_json::<Envelope<DaemonToFleetd>>().await?;
-    validate_envelope(&envelope, binding)?;
-    Ok(envelope.body)
+    Ok(reader.read_envelope::<DaemonToFleetd>().await?.body)
 }
 
 /// Write one generation-stamped message.
 async fn write_body<W>(
-    framed: &mut FramedIo<W>,
+    writer: &mut NegotiatedIo<W>,
     binding: ConnectionBinding,
     counter: &AtomicU64,
     generation: u64,
     body: &FleetdToDaemon,
 ) -> Result<(), RpcError>
 where
-    W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
     let sequence = counter.fetch_add(1, Ordering::SeqCst);
     let envelope = Envelope {
@@ -573,8 +567,7 @@ where
         reply_to: None,
         body,
     };
-    validate_envelope(&envelope, binding)?;
-    framed.write_json(&envelope).await
+    writer.write_envelope(&envelope).await
 }
 
 #[cfg(test)]

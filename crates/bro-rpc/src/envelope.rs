@@ -61,7 +61,7 @@ impl<T> NegotiatedIo<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> NegotiatedIo<T> {
+impl<T: AsyncWrite + Unpin> NegotiatedIo<T> {
     pub async fn write_envelope<B: Serialize>(
         &mut self,
         envelope: &Envelope<B>,
@@ -69,11 +69,55 @@ impl<T: AsyncRead + AsyncWrite + Unpin> NegotiatedIo<T> {
         validate_envelope(envelope, self.binding)?;
         self.framed.write_json(envelope).await
     }
+}
 
+impl<T: AsyncRead + Unpin> NegotiatedIo<T> {
     pub async fn read_envelope<B: DeserializeOwned>(&mut self) -> Result<Envelope<B>, RpcError> {
         let envelope = self.framed.read_json::<Envelope<B>>().await?;
         validate_envelope(&envelope, self.binding)?;
         Ok(envelope)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> NegotiatedIo<T> {
+    /// Split a negotiated stream into independently owned read and write
+    /// halves, both still fenced against the same [`ConnectionBinding`].
+    ///
+    /// This exists because `read_envelope` is not cancel-safe: cancelling it
+    /// mid-frame would desynchronize the length-prefixed stream, so a peer that
+    /// must read commands and write relayed messages concurrently cannot
+    /// `select!` over a single `NegotiatedIo`. Both sides of the daemon<->fleetd
+    /// channel need exactly that, and fleetd's server originally open-coded the
+    /// re-framing by hand. Splitting here keeps the fencing guarantee in one
+    /// place instead of two hand-rolled copies.
+    ///
+    /// Lossless because [`FramedIo`] holds no read-ahead buffer: it reads the
+    /// 4-byte header and then exactly the payload, so no already-consumed bytes
+    /// can be stranded in the half that is dropped.
+    ///
+    /// The halves reuse `NegotiatedIo` itself rather than bespoke reader/writer
+    /// types: `ReadHalf` is only `AsyncRead` and `WriteHalf` is only
+    /// `AsyncWrite`, so the bounds above already make `read_envelope` and
+    /// `write_envelope` available on exactly one half each.
+    pub fn split(
+        self,
+    ) -> (
+        NegotiatedIo<tokio::io::ReadHalf<T>>,
+        NegotiatedIo<tokio::io::WriteHalf<T>>,
+    ) {
+        let binding = self.binding;
+        let max_frame_bytes = self.framed.max_frame_bytes();
+        let (read_half, write_half) = tokio::io::split(self.framed.into_inner());
+        (
+            NegotiatedIo::new(
+                FramedIo::with_max_frame_bytes(read_half, max_frame_bytes),
+                binding,
+            ),
+            NegotiatedIo::new(
+                FramedIo::with_max_frame_bytes(write_half, max_frame_bytes),
+                binding,
+            ),
+        )
     }
 }
 
@@ -187,6 +231,41 @@ mod tests {
         assert!(matches!(
             validate_envelope(&envelope(&long, None), binding()),
             Err(RpcError::InvalidEnvelope(_))
+        ));
+    }
+
+    /// The split halves keep the binding, so a stale-generation frame is still
+    /// rejected on each half independently.
+    #[tokio::test]
+    async fn split_halves_keep_the_binding_and_carry_frames() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut client_io = NegotiatedIo::new(FramedIo::new(client), binding());
+        let (mut server_read, mut server_write) =
+            NegotiatedIo::new(FramedIo::new(server), binding()).split();
+
+        assert_eq!(server_read.binding(), binding());
+        assert_eq!(server_write.binding(), binding());
+
+        client_io
+            .write_envelope(&envelope("m-1", None))
+            .await
+            .expect("write");
+        let received: Envelope<serde_json::Value> =
+            server_read.read_envelope().await.expect("read");
+        assert_eq!(received.message_id, "m-1");
+
+        server_write
+            .write_envelope(&envelope("m-2", None))
+            .await
+            .expect("write back");
+        let back: Envelope<serde_json::Value> = client_io.read_envelope().await.expect("read back");
+        assert_eq!(back.message_id, "m-2");
+
+        let mut stale = envelope("m-3", None);
+        stale.connection_generation = 3;
+        assert!(matches!(
+            server_write.write_envelope(&stale).await,
+            Err(RpcError::StaleGeneration { .. })
         ));
     }
 

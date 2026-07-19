@@ -57,6 +57,7 @@ pub struct DaemonOverrides {
     pub task_ttl_ms: Option<u64>,
     pub mcp_session_keepalive_secs: Option<u64>,
     pub poller_min_interval_secs: Option<u64>,
+    pub executor: Option<ExecutorKind>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +134,40 @@ struct RawDaemonConfig {
     pub mcp_session_keepalive_secs: u64,
     #[serde(default = "default_daemon_poller_min_interval_secs")]
     pub poller_min_interval_secs: u64,
+    #[serde(default = "default_daemon_executor")]
+    pub executor: ExecutorKind,
+}
+
+/// Which executor turns a resolved spawn spec into a supervised worker.
+///
+/// `Fleetd` is the default (slice 5 of
+/// `design/daemon-runtime/locality-first-decomposition.md`): workers become
+/// children of the long-lived `fleetd` supervisor, so a `blackboxd` rebuild
+/// and kickstart no longer drops live sessions. `Local` keeps them as direct
+/// daemon children; it is an explicit escape hatch for tests and for
+/// contributors who have not installed fleetd, never an automatic fallback.
+/// A daemon that silently downgraded to `Local` when fleetd was unreachable
+/// would hide exactly the failure the operator needs to see.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorKind {
+    #[default]
+    Fleetd,
+    Local,
+}
+
+impl ExecutorKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fleetd" => Some(Self::Fleetd),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+}
+
+fn default_daemon_executor() -> ExecutorKind {
+    ExecutorKind::Fleetd
 }
 
 fn default_daemon_port() -> u16 {
@@ -336,6 +371,7 @@ pub struct DaemonConfig {
     pub task_ttl_ms: u64,
     pub mcp_session_keepalive_secs: u64,
     pub poller_min_interval_secs: u64,
+    pub executor: ExecutorKind,
 }
 
 /// Index configuration
@@ -409,6 +445,7 @@ impl Config {
                 task_ttl_ms: default_daemon_task_ttl_ms(),
                 mcp_session_keepalive_secs: default_daemon_mcp_session_keepalive_secs(),
                 poller_min_interval_secs: default_daemon_poller_min_interval_secs(),
+                executor: default_daemon_executor(),
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -503,6 +540,16 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && let Ok(t) = ttl.parse()
     {
         raw.daemon.task_ttl_ms = t;
+    }
+
+    // executor: BLACKBOX_EXECUTOR=local is the documented escape hatch back to
+    // daemon-child workers. An unrecognized value is ignored (and warned about
+    // by the daemon at startup) rather than silently selecting one of the two.
+    if let Ok(executor) = std::env::var("BLACKBOX_EXECUTOR")
+        && !executor.trim().is_empty()
+        && let Some(kind) = ExecutorKind::parse(&executor)
+    {
+        raw.daemon.executor = kind;
     }
 
     // poller_min_interval_secs
@@ -689,6 +736,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             task_ttl_ms: raw.daemon.task_ttl_ms,
             mcp_session_keepalive_secs: raw.daemon.mcp_session_keepalive_secs,
             poller_min_interval_secs: raw.daemon.poller_min_interval_secs,
+            executor: raw.daemon.executor,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,
@@ -773,6 +821,9 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(poller_min_interval_secs) = overrides.daemon.poller_min_interval_secs {
         raw.daemon.poller_min_interval_secs = poller_min_interval_secs;
+    }
+    if let Some(executor) = overrides.daemon.executor {
+        raw.daemon.executor = executor;
     }
 
     if let Some(reindex_interval_secs) = overrides.index.reindex_interval_secs {

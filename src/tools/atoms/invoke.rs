@@ -328,8 +328,8 @@ impl BlackboxServer {
         };
         let atom_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
         let atom_service_tier = exec_opts.as_ref().and_then(|o| o.service_tier.clone());
-        let dispatched =
-            self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
+        let dispatched = self
+            .dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,
                 provider: bf.provider,
                 lens: bf.lens,
@@ -358,7 +358,8 @@ impl BlackboxServer {
                 // atom_invoke dispatches a catalog atom — that is the
                 // source class, not a generic agent dispatch.
                 origin: bro_core::Origin::Atom,
-            })?;
+            })
+            .await?;
         let (task_id, session_id, selected_provider) = {
             let inner = dispatched.task.inner.lock();
             (inner.id.clone(), inner.session_id.clone(), inner.provider)

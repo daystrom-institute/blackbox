@@ -895,8 +895,8 @@ impl BlackboxServer {
         let agent_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
         let agent_service_tier = exec_opts.as_ref().and_then(|o| o.service_tier.clone());
         let agent_output_schema = exec_opts.as_ref().and_then(|o| o.output_schema.clone());
-        let dispatched =
-            match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
+        let dispatched = match self
+            .dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,
                 provider,
                 lens,
@@ -929,10 +929,12 @@ impl BlackboxServer {
                 // dispatches a registered agent — same source class as
                 // bro_exec, so it lands in the AgentDispatch tab.
                 origin: bro_core::Origin::AgentDispatch,
-            }) {
-                Ok(result) => result,
-                Err(e) => return Self::err_text(&e),
-            };
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => return Self::err_text(&e),
+        };
         let inner = dispatched.task.inner.lock();
         let task_id = inner.id.clone();
         let session_id = inner.session_id.clone();

@@ -6,6 +6,7 @@ pub mod badgey;
 pub mod brofile;
 pub mod consultant;
 pub mod executor;
+pub mod fleetd_client;
 pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
@@ -33,7 +34,6 @@ use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{
     TranscriptCursor, TranscriptLocation, TranscriptSource, TranscriptStorage,
 };
-use executor::HarnessExecutor as _;
 use providers::dispatch_prelude::*;
 use providers::{EventSink, Provider, Usage};
 use supervision::SupervisionState;
@@ -59,6 +59,183 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
 
 const PROMPT_STDIN_ARG_BYTES_THRESHOLD: usize = 64 * 1024;
 const HARNESS_SPAWN_SCRUB_ENV: &str = "BRO_HARNESS_SPAWN_SCRUB";
+
+/// The process-wide executor every harness dispatch goes through.
+///
+/// Installed once at daemon startup from `daemon.executor` (default `fleetd`).
+/// Left uninstalled, this falls back to [`executor::LocalExecutor`], which is
+/// what unit tests and library consumers get: they have no daemon startup, and
+/// must never dial (or auto-start) a real supervisor as a side effect of
+/// calling a spawn helper.
+fn harness_executor() -> &'static Arc<dyn executor::HarnessExecutor> {
+    harness_executor_storage().get_or_init(|| Arc::new(executor::LocalExecutor))
+}
+
+/// Select the executor for this daemon process and wire up the state
+/// re-adoption needs. Call once, early in daemon startup, before any dispatch.
+///
+/// Returns whether the selection took effect: a second call is a no-op, since
+/// swapping executors under live sessions would orphan whatever the first one
+/// is supervising.
+pub fn install_harness_executor(
+    kind: bbox_config::config::ExecutorKind,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+) -> bool {
+    let _ = readoption_env().set(ReadoptionEnv {
+        store_dir: store_dir.clone(),
+        task_store,
+        tail_tx,
+        system_events,
+    });
+    let executor: Arc<dyn executor::HarnessExecutor> = match kind {
+        bbox_config::config::ExecutorKind::Local => {
+            tracing::info!(
+                "harness executor: local (workers are daemon children; a daemon restart \
+                 drops live sessions)"
+            );
+            Arc::new(executor::LocalExecutor)
+        }
+        bbox_config::config::ExecutorKind::Fleetd => {
+            let config = fleetd_client::FleetdConfig::in_state_dir(&store_dir);
+            tracing::info!(
+                socket = %config.socket.display(),
+                "harness executor: fleetd (workers survive a daemon restart)"
+            );
+            Arc::new(fleetd_client::FleetdExecutor::new(config))
+        }
+    };
+    let installed = harness_executor_storage().set(executor).is_ok();
+    if !installed {
+        tracing::warn!("harness executor already installed; ignoring the second selection");
+    }
+    installed
+}
+
+/// The single cell behind both the reader and the installer. One static on
+/// purpose: if these were separate, a dispatch that ran before install would
+/// pin the local default in one cell while the installer wrote the other, and
+/// the daemon would silently keep spawning its own children.
+fn harness_executor_storage() -> &'static OnceLock<Arc<dyn executor::HarnessExecutor>> {
+    static EXECUTOR: OnceLock<Arc<dyn executor::HarnessExecutor>> = OnceLock::new();
+    &EXECUTOR
+}
+
+/// Daemon-side state a re-adopted session needs to be reattached to its task.
+struct ReadoptionEnv {
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+}
+
+fn readoption_env() -> &'static OnceLock<ReadoptionEnv> {
+    static ENV: OnceLock<ReadoptionEnv> = OnceLock::new();
+    &ENV
+}
+
+/// One session fleetd is still holding, with the plumbing the executor client
+/// built for it.
+pub struct ReadoptedSession {
+    pub session_id: String,
+    pub task_id: String,
+    pub pid: Option<u32>,
+    pub state: bro_protocol::SessionState,
+    pub control: tokio::sync::mpsc::UnboundedSender<Value>,
+    pub killer: Arc<executor::WorkerKill>,
+    pub events: tokio::sync::mpsc::UnboundedReceiver<String>,
+    pub outcome: tokio::sync::oneshot::Receiver<executor::WorkerOutcome>,
+}
+
+/// Reattach a session that outlived this daemon instance.
+///
+/// Returns the task's durable ingest cursor, which the caller replays from.
+/// `None` means "not ours": either the task store never knew this task (a TTL
+/// reap, a wiped store, another daemon's session) or it is already terminal, in
+/// which case there is nothing left to publish. The caller leaves those alone
+/// rather than killing them.
+///
+/// A task the previous daemon left `Running` was flipped to `Failed`
+/// (`recoverable: true`) by `TaskStore::load`. Re-adoption puts it back to
+/// `Running`, because the child genuinely never died: the daemon did.
+pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
+    let ReadoptedSession {
+        session_id,
+        task_id,
+        pid,
+        state,
+        control,
+        killer,
+        events,
+        outcome,
+    } = session;
+    let env = readoption_env().get()?;
+    let task = env.task_store.read().get(&task_id)?;
+
+    let (provider, cursor) = {
+        let mut inner = task.inner.lock();
+        let already_terminal = inner.status != TaskStatus::Running && !inner.recoverable;
+        if already_terminal {
+            return None;
+        }
+        if state == bro_protocol::SessionState::Running {
+            inner.status = TaskStatus::Running;
+            inner.completed_at = None;
+            inner.recoverable = false;
+            // The restart notice `TaskStore::load` appended is now wrong: the
+            // session was never lost, so it must not be left in the record for
+            // an agent to read as a failure.
+            strip_restart_notice(&mut inner.stderr);
+        }
+        (inner.provider, inner.harness_ingest_seq)
+    };
+    *task.child_id.lock() = pid;
+
+    harness_killers().write().insert(task_id.clone(), killer);
+    harness_controls().write().insert(task_id.clone(), control);
+    task.emit_roster_updated();
+
+    tracing::info!(
+        session_id = %session_id,
+        task_id = %task_id,
+        from_seq = cursor,
+        "reattached a surviving worker session to its task"
+    );
+
+    let ingest_join = spawn_harness_ingest_loop(
+        task.clone(),
+        provider,
+        task_id.clone(),
+        env.store_dir.clone(),
+        env.tail_tx.clone(),
+        env.system_events.clone(),
+        events,
+    );
+    spawn_harness_terminal_waiter(
+        task,
+        task_id,
+        env.store_dir.clone(),
+        env.task_store.clone(),
+        env.tail_tx.clone(),
+        env.system_events.clone(),
+        outcome,
+        ingest_join,
+    );
+    Some(cursor)
+}
+
+/// The exact notice `TaskStore::load` appends when it flips a running task to
+/// failed at startup. Removed on re-adoption, since the premise (the provider
+/// session is only recoverable by a manual `bro_resume`) turned out false.
+const RESTART_NOTICE_PREFIX: &str = "\n[blackbox] server restarted while task was running.";
+
+fn strip_restart_notice(stderr: &mut String) {
+    if let Some(start) = stderr.find(RESTART_NOTICE_PREFIX) {
+        stderr.truncate(start);
+    }
+}
 
 fn harness_controls() -> &'static RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Value>>>
 {
@@ -406,6 +583,17 @@ pub struct TaskInner {
     /// provider transcript-file cursors because `tail_tx` carries task lifecycle
     /// events plus retained envelope events.
     pub live_cursor: u64,
+    /// Highest harness event `seq` this daemon has durably ingested for the
+    /// task's worker session.
+    ///
+    /// This is the daemon's half of the replay contract with fleetd (slice 5:
+    /// "the daemon owns the replay cursor; fleetd owns the window"). It
+    /// advances only AFTER `ingest_harness_event` has applied the event, so a
+    /// re-adopting daemon that replays from it sees everything it had not
+    /// applied and nothing twice. A harness build that emits events without a
+    /// top-level `seq` never advances it, which degrades to replaying the whole
+    /// retained window rather than to silent loss.
+    pub harness_ingest_seq: u64,
     /// Last wall-clock ms a roster update was emitted from the stream-delta
     /// ingest path. Deltas arrive at token-chunk rate; rebuilding +
     /// broadcasting a roster summary per chunk is pure overhead, so delta
@@ -740,6 +928,7 @@ mod roster_view_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Cockpit,
@@ -1217,6 +1406,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
@@ -1383,6 +1573,11 @@ struct PersistedTask {
     transcript_cursor: Option<TranscriptCursor>,
     #[serde(default)]
     live_cursor: u64,
+    /// Absent on pre-fleetd records; `0` means "replay everything fleetd still
+    /// holds", which is the correct conservative answer for a session spawned
+    /// before the cursor existed.
+    #[serde(default)]
+    harness_ingest_seq: u64,
     #[serde(default)]
     supervision: SupervisionState,
     /// Origin is back-compat default `Unknown` when absent on disk —
@@ -1465,6 +1660,7 @@ impl TaskStore {
                     transcript_location: inner.transcript_location.clone(),
                     transcript_cursor: inner.transcript_cursor.clone(),
                     live_cursor: inner.live_cursor,
+                    harness_ingest_seq: inner.harness_ingest_seq,
                     supervision: inner.supervision.clone(),
                     origin: inner.origin,
                     workflow_owned: Some(inner.workflow_owned),
@@ -1555,6 +1751,7 @@ impl TaskStore {
                     transcript_location: rec.transcript_location,
                     transcript_cursor: rec.transcript_cursor,
                     live_cursor,
+                    harness_ingest_seq: rec.harness_ingest_seq,
                     last_delta_roster_emit_ms: 0,
                     supervision: rec.supervision,
                     origin: rec.origin,
@@ -2228,12 +2425,6 @@ pub struct SpawnTaskParams {
     /// are observation-only: emit failures are logged but do not affect
     /// task dispatch.
     pub system_events: Option<crate::system_events::SharedEventHub>,
-    /// Persistent bidirectional session mode (fleet-tui.md item 6). When true,
-    /// child stdin is piped and kept **open and writable** after spawn (returned
-    /// on [`SpawnedTask::stdin`]) instead of being closed after the one-shot
-    /// prompt, so the caller can drive successive user-turns and
-    /// `control_request`s. One-shot dispatch leaves this false.
-    pub interactive: bool,
     /// Spawn-time origin classification (Slice 1b). Determines which
     /// roster tab the task lands in. Defaults to `Unknown` at the field
     /// boundary so test helpers that build `SpawnTaskParams` directly
@@ -2243,22 +2434,12 @@ pub struct SpawnTaskParams {
     pub origin: bro_core::Origin,
 }
 
-/// Result of a spawn: the tracked task plus, in `interactive` mode, the writable
-/// child stdin for driving a persistent bidirectional session. `stdin` is `None`
-/// in one-shot mode (closed after the prompt) and on spawn failure.
-pub struct SpawnedTask {
-    pub task: Arc<Task>,
-    // Harness child launches retain this handle and hand it to the NDJSON
-    // control writer. One-shot provider launches return None.
-    pub stdin: Option<tokio::process::ChildStdin>,
-}
-
 pub fn spawn_with_pre_minted_id(
     task_id: String,
     params: SpawnTaskParams,
 ) -> Result<Arc<Task>, BroSpawnError> {
     params.task_store.write().reserve_id(&task_id)?;
-    Ok(spawn_task_reserved(task_id, params).task)
+    Ok(spawn_task_reserved(task_id, params))
 }
 
 fn failed_duplicate_task(
@@ -2298,6 +2479,7 @@ fn failed_duplicate_task(
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin,
@@ -2375,6 +2557,7 @@ pub fn spawn_in_process_task(
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin,
@@ -2622,7 +2805,7 @@ pub(crate) fn emit_task_progress_event(
 /// `origin` (Slice 1b) labels the spawn site so the fleet roster can
 /// tab tasks by source — see `bro_core::Origin` for the taxonomy.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_task(
+pub async fn spawn_task(
     task_id: String,
     provider: Provider,
     args: Vec<String>,
@@ -2656,6 +2839,7 @@ pub fn spawn_task(
         system_events,
         origin,
     )
+    .await
 }
 
 /// Resolve the project's opt-in dispatch shell env (fleet.json
@@ -2756,7 +2940,7 @@ fn worktree_base_repo(path: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_task_with_tool_placement(
+pub async fn spawn_task_with_tool_placement(
     task_id: String,
     provider: Provider,
     args: Vec<String>,
@@ -2837,7 +3021,8 @@ pub fn spawn_task_with_tool_placement(
             tool_defaults,
             system_events,
             origin,
-        );
+        )
+        .await;
     }
 
     // CLI providers: shells inherit the spawned child's process env, so the
@@ -2882,15 +3067,14 @@ pub fn spawn_task_with_tool_placement(
         bro_label,
         agent_label,
         system_events,
-        interactive: false,
         origin,
     };
 
-    spawn_task_reserved(task_id, params).task
+    spawn_task_reserved(task_id, params)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_harness_child_task(
+async fn spawn_harness_child_task(
     task_id: String,
     provider: Provider,
     args: Vec<String>,
@@ -2946,8 +3130,8 @@ fn spawn_harness_child_task(
         }
     };
 
-    // Reserve the task id up front (idempotent dispatch), mirroring the old
-    // spawn_task_interactive entry.
+    // Reserve the task id up front, so a duplicate dispatch is idempotent
+    // rather than spawning a second child for the same task.
     if let Err(err) = task_store.write().reserve_id(&task_id) {
         if let Some(existing) = task_store.read().get(&task_id) {
             return existing;
@@ -2966,12 +3150,13 @@ fn spawn_harness_child_task(
 
     // Pin the child's transcript location from the spec's event-log path (the
     // single derivation both sides now flow from).
-    let transcript_location = harness_transcript_location_from_spec(&spec, cwd.as_deref());
+    let transcript_location =
+        harness_transcript_location_from_spec(&spec, &session_id, cwd.as_deref());
 
     // Hand the spec to the executor: it owns the process (login-shell bin
     // resolution, command build, spawn, stdin control writer, stdout/stderr
     // pumps, waiter). The daemon keeps the state half below.
-    let handle = match executor::LocalExecutor.spawn(spec) {
+    let handle = match harness_executor().spawn(spec).await {
         Ok(handle) => handle,
         Err(error) => {
             task_store.write().release_reservation(&task_id);
@@ -3025,6 +3210,7 @@ fn spawn_harness_child_task(
             transcript_location,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin,
@@ -3178,15 +3364,29 @@ fn prepare_harness_child_launch(
         provider.bin()
     });
 
+    // The spec's `session_id` is the SUPERVISION key: fleetd registries, the
+    // daemon's per-session slot map, and the event-log filename all hang off
+    // it. Several dispatch paths still pass the placeholder "pending" because
+    // the provider has not emitted a real session id yet, and two concurrent
+    // pending dispatches would then collide on all three. The task id is
+    // already unique by construction (`reserve_id`), so it stands in until a
+    // real id exists. The task's own `session_id` is untouched and still gets
+    // filled from the event stream.
+    let supervision_id = if session_id.is_empty() || session_id == "pending" {
+        task_id.clone()
+    } else {
+        session_id.clone()
+    };
+
     // Single pinned derivation of BRO_HOME and the event-log path.
     let bro_home = store_dir.to_path_buf();
     let event_log_path = bro_home
         .join("harness-sessions")
-        .join(format!("{session_id}.events.jsonl"));
+        .join(format!("{supervision_id}.events.jsonl"));
 
     Ok(bro_protocol::WorkerSpawnSpec {
         task_id,
-        session_id,
+        session_id: supervision_id,
         provider,
         bin_override,
         argv: args,
@@ -3204,8 +3404,13 @@ fn prepare_harness_child_launch(
 
 /// Build the child's transcript location from the pinned spec fields. Returns
 /// None when the session id is empty, mirroring [`harness_transcript_location`].
+/// `provider_session_id` is the id the DISPATCH asked for, which is what
+/// decides whether a real provider session is known yet. The spec's own
+/// `session_id` is the supervision key and may be a stand-in task id, so it
+/// must not be recorded as if it were a provider session.
 fn harness_transcript_location_from_spec(
     spec: &bro_protocol::WorkerSpawnSpec,
+    provider_session_id: &str,
     cwd: Option<&str>,
 ) -> Option<TranscriptLocation> {
     if spec.session_id.is_empty() {
@@ -3216,7 +3421,8 @@ fn harness_transcript_location_from_spec(
         storage: TranscriptStorage::JsonlFile,
         path: spec.event_log_path.clone(),
         account: None,
-        session_id: (spec.session_id != "pending").then(|| spec.session_id.clone()),
+        session_id: (!provider_session_id.is_empty() && provider_session_id != "pending")
+            .then(|| provider_session_id.to_string()),
         project: None,
         cwd: cwd.map(str::to_string),
         is_subagent: false,
@@ -3294,6 +3500,11 @@ fn spawn_harness_ingest_loop(
                     );
                 });
             }
+            // Read the seq BEFORE ingest moves the event, advance the durable
+            // cursor AFTER: the cursor's whole contract is "everything at or
+            // below this has been applied", so advancing early would let a
+            // replay skip an event this daemon never actually ingested.
+            let seq = evt.get("seq").and_then(Value::as_u64);
             ingest_harness_event(
                 &task,
                 provider,
@@ -3302,6 +3513,10 @@ fn spawn_harness_ingest_loop(
                 &task_id,
                 system_events.clone(),
             );
+            if let Some(seq) = seq {
+                let mut inner = task.inner.lock();
+                inner.harness_ingest_seq = inner.harness_ingest_seq.max(seq);
+            }
         }
     })
 }
@@ -3787,76 +4002,6 @@ fn parse_dispatch_tool_placement(
     Ok(out)
 }
 
-/// Spawn a task in **persistent bidirectional mode** (fleet-tui.md item 6): the
-/// child's stdin is kept open and writable so the caller can drive successive
-/// user-turns and `control_request`s over the stream-json control protocol. The
-/// returned [`SpawnedTask`] carries that writable stdin. Reuses the full
-/// one-shot spawn machinery (env hygiene, login-shell bin resolution,
-/// stream-json reader, persistence registration, supervision); the only
-/// difference is that stdin stays open.
-///
-/// Args should already include `--input-format stream-json` (and typically
-/// `--replay-user-messages`). The caller writes the initial turn and later
-/// controls to the returned stdin.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_task_interactive(
-    task_id: String,
-    provider: Provider,
-    args: Vec<String>,
-    session_id: String,
-    cwd: Option<String>,
-    env_overrides: Option<HashMap<String, String>>,
-    store_dir: std::path::PathBuf,
-    task_store: Arc<RwLock<TaskStore>>,
-    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
-    roster_events: Option<RosterEventSink>,
-    bro_label: Option<String>,
-    agent_label: Option<String>,
-    system_events: Option<crate::system_events::SharedEventHub>,
-    origin: bro_core::Origin,
-) -> SpawnedTask {
-    if let Err(err) = task_store.write().reserve_id(&task_id) {
-        if let Some(existing) = task_store.read().get(&task_id) {
-            return SpawnedTask {
-                task: existing,
-                stdin: None,
-            };
-        }
-        return SpawnedTask {
-            task: failed_duplicate_task(
-                task_id,
-                provider,
-                session_id,
-                cwd,
-                bro_label,
-                agent_label,
-                err.to_string(),
-                origin,
-            ),
-            stdin: None,
-        };
-    }
-
-    let params = SpawnTaskParams {
-        provider,
-        args,
-        session_id,
-        cwd,
-        env_overrides,
-        store_dir,
-        task_store,
-        tail_tx,
-        roster_events,
-        bro_label,
-        agent_label,
-        system_events,
-        interactive: true,
-        origin,
-    };
-
-    spawn_task_reserved(task_id, params)
-}
-
 fn move_large_prompt_arg_to_stdin(provider: Provider, args: &mut Vec<String>) -> Option<String> {
     if !matches!(
         provider,
@@ -3989,7 +4134,16 @@ fn open_harness_tee(id: &str, suffix: &str) -> Option<HarnessTee> {
     })
 }
 
-fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask {
+/// The non-harness spawn path: a provider CLI child whose stdout the daemon
+/// reads inline.
+///
+/// Harness-backed providers no longer arrive here from
+/// `spawn_task_with_tool_placement`, which routes them to
+/// `spawn_harness_child_task` and the executor seam. They CAN still arrive
+/// through `spawn_with_pre_minted_id` (Badgey's one-shot persona dispatch),
+/// which is why the harness branch in the stdout reader below is live rather
+/// than dead code.
+fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     let SpawnTaskParams {
         provider,
         args,
@@ -4003,7 +4157,6 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         bro_label,
         agent_label,
         system_events,
-        interactive,
         origin,
     } = params;
     let id = task_id;
@@ -4033,17 +4186,13 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
     };
     let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
     let mut args = args;
-    // Interactive sessions keep the prompt in `-p` (first user turn) and drive
-    // later turns over stdin, so no large-prompt move; one-shot mode may still
-    // spill an oversized prompt to stdin.
-    let stdin_payload = if interactive {
-        None
-    } else {
-        move_large_prompt_arg_to_stdin(provider, &mut args)
-    };
+    // An oversized prompt spills to stdin; otherwise the child gets no stdin at
+    // all. There is no persistent-stdin mode here any more: the harness control
+    // lane owns bidirectional sessions, through the executor seam.
+    let stdin_payload = move_large_prompt_arg_to_stdin(provider, &mut args);
     let mut cmd = Command::new(&bin);
     cmd.args(&args)
-        .stdin(if interactive || stdin_payload.is_some() {
+        .stdin(if stdin_payload.is_some() {
             std::process::Stdio::piped()
         } else {
             std::process::Stdio::null()
@@ -4098,6 +4247,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     transcript_location: transcript_location.clone(),
                     transcript_cursor: None,
                     live_cursor: 0,
+                    harness_ingest_seq: 0,
                     last_delta_roster_emit_ms: 0,
                     supervision: SupervisionState::default(),
                     origin,
@@ -4111,26 +4261,19 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             task.emit_roster_added();
             request_persist(&task_store, &store_dir);
             task.notify.notify_waiters();
-            return SpawnedTask { task, stdin: None };
+            return task;
         }
     };
 
     let pid = child.id();
-    // Interactive mode: keep stdin open and writable for the caller to drive the
-    // persistent session. One-shot mode: write the spilled prompt then drop the
-    // handle (closing stdin) as before.
-    let interactive_stdin = if interactive {
-        child.stdin.take()
-    } else {
-        if let Some(payload) = stdin_payload {
-            if let Some(mut stdin) = child.stdin.take() {
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(payload.as_bytes()).await;
-                });
-            }
-        }
-        None
-    };
+    // Write the spilled prompt, then drop the handle so the child sees EOF.
+    if let Some(payload) = stdin_payload
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        tokio::spawn(async move {
+            let _ = stdin.write_all(payload.as_bytes()).await;
+        });
+    }
     let task = Arc::new(Task {
         inner: Mutex::new(TaskInner {
             id: id.clone(),
@@ -4158,6 +4301,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             transcript_location,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin,
@@ -4181,10 +4325,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             origin,
         );
         failed.notify.notify_waiters();
-        return SpawnedTask {
-            task: failed,
-            stdin: None,
-        };
+        return failed;
     }
 
     task.emit_roster_added();
@@ -4598,10 +4739,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         task_ref_wait.notify.notify_waiters();
     });
 
-    SpawnedTask {
-        task,
-        stdin: interactive_stdin,
-    }
+    task
 }
 
 /// Wait for a task to complete. Returns immediately if already terminal.
@@ -5719,7 +5857,8 @@ mod tests {
             None,
             None,
             bro_core::Origin::AgentDispatch,
-        );
+        )
+        .await;
 
         env.set("BRO_HARNESS_BIN", &healthy_bin);
         let healthy = spawn_task_with_tool_placement(
@@ -5744,7 +5883,8 @@ mod tests {
             None,
             None,
             bro_core::Origin::AgentDispatch,
-        );
+        )
+        .await;
 
         tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_task(&failed))
             .await
@@ -5758,6 +5898,199 @@ mod tests {
         assert!(failed_inner.stderr.contains("child turn failed"));
         drop(failed_inner);
         assert_eq!(healthy.inner.lock().status, TaskStatus::Completed);
+    }
+
+    /// The durable cursor advances only for events that carry a `seq`, and
+    /// only after ingest. It is what a re-adopting daemon replays from, so an
+    /// event without a seq must leave it alone (replay more, never less).
+    #[tokio::test]
+    async fn ingest_advances_the_durable_cursor_only_on_seq_carrying_events() {
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let task = spawn_in_process_task(
+            "cursor-task".to_string(),
+            Provider::Workflow,
+            "cursor-session".to_string(),
+            None,
+            root.clone(),
+            Arc::new(RwLock::new(TaskStore::new())),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::Workflow,
+        );
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let join = spawn_harness_ingest_loop(
+            task.clone(),
+            Provider::Glm,
+            "cursor-task".to_string(),
+            root,
+            tail_tx,
+            None,
+            events_rx,
+        );
+
+        for line in [
+            r#"{"type":"system","seq":4}"#,
+            // No seq: a pre-upgrade harness build. Must not advance.
+            r#"{"type":"assistant"}"#,
+            r#"{"type":"assistant","seq":7}"#,
+            // Out of order: the cursor is a high-water mark, never a rewind,
+            // or a replay would re-deliver events already applied.
+            r#"{"type":"assistant","seq":5}"#,
+        ] {
+            events_tx.send(line.to_string()).unwrap();
+        }
+        drop(events_tx);
+        join.await.expect("ingest loop drains to EOF");
+
+        assert_eq!(
+            task.inner.lock().harness_ingest_seq,
+            7,
+            "cursor is the high-water mark of seq-carrying ingested events"
+        );
+    }
+
+    /// Re-adoption is the payoff of the whole slice: a task the previous
+    /// daemon gave up on gets put back to Running, its restart notice
+    /// stripped, its control/kill lanes re-registered, and its own cursor
+    /// handed back so the caller can replay from exactly there.
+    ///
+    /// Installs the process-global re-adoption env, which is fine because
+    /// nextest is process-per-test (the repo's mandated runner).
+    #[tokio::test]
+    async fn readoption_revives_a_task_the_restart_gave_up_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+
+        let task = spawn_in_process_task(
+            "adopt-task".to_string(),
+            Provider::Glm,
+            "adopt-session".to_string(),
+            None,
+            root.clone(),
+            store.clone(),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::AgentDispatch,
+        );
+        store
+            .write()
+            .insert_reserved("adopt-task".to_string(), task.clone())
+            .ok();
+        {
+            // Exactly the state `TaskStore::load` leaves behind for a task
+            // that was running when the daemon went down.
+            let mut inner = task.inner.lock();
+            inner.status = TaskStatus::Failed;
+            inner.recoverable = true;
+            inner.completed_at = Some(now_ms());
+            inner.harness_ingest_seq = 12;
+            inner.stderr.push_str(
+                "\n[blackbox] server restarted while task was running. \
+                 The provider session is still on disk; retry with \
+                 `bro_resume(session_id=...)` to continue the conversation \
+                 rather than starting a fresh session.",
+            );
+        }
+
+        install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root.clone(),
+            store.clone(),
+            tail_tx,
+            None,
+        );
+
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (_events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let cursor = readopt_harness_session(ReadoptedSession {
+            session_id: "adopt-session".to_string(),
+            task_id: "adopt-task".to_string(),
+            pid: Some(4242),
+            state: bro_protocol::SessionState::Running,
+            control: control_tx,
+            killer: executor::WorkerKill::via_fleetd(
+                "adopt-session".to_string(),
+                tokio::sync::mpsc::unbounded_channel().0,
+            ),
+            events: events_rx,
+            outcome: outcome_rx,
+        });
+
+        assert_eq!(
+            cursor,
+            Some(12),
+            "the caller replays from the task's own durable cursor"
+        );
+        let inner = task.inner.lock();
+        assert_eq!(
+            inner.status,
+            TaskStatus::Running,
+            "a live child means the task is live, whatever the restart concluded"
+        );
+        assert!(!inner.recoverable);
+        assert_eq!(inner.completed_at, None);
+        assert!(
+            !inner.stderr.contains("server restarted"),
+            "the restart notice is wrong once the session is back: {}",
+            inner.stderr
+        );
+        drop(inner);
+        assert_eq!(*task.child_id.lock(), Some(4242));
+        assert!(
+            harness_controls().read().contains_key("adopt-task"),
+            "the control lane must be reachable again for bro_steer"
+        );
+        assert!(
+            harness_killers().read().contains_key("adopt-task"),
+            "cancel must reach the re-adopted child"
+        );
+    }
+
+    /// A session fleetd holds that the task store never heard of is declined,
+    /// which is what makes the caller leave it running instead of reaping it.
+    #[tokio::test]
+    async fn readoption_declines_a_session_no_task_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        install_harness_executor(
+            bbox_config::config::ExecutorKind::Local,
+            root,
+            store,
+            tail_tx,
+            None,
+        );
+
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (_events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (_outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let cursor = readopt_harness_session(ReadoptedSession {
+            session_id: "ghost-session".to_string(),
+            task_id: "ghost-task".to_string(),
+            pid: Some(9999),
+            state: bro_protocol::SessionState::Running,
+            control: control_tx,
+            killer: executor::WorkerKill::via_fleetd(
+                "ghost-session".to_string(),
+                tokio::sync::mpsc::unbounded_channel().0,
+            ),
+            events: events_rx,
+            outcome: outcome_rx,
+        });
+        assert_eq!(cursor, None, "an unknown session is declined, not adopted");
     }
 
     #[test]
@@ -6261,6 +6594,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -6756,6 +7090,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -6792,6 +7127,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -6845,6 +7181,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -6897,6 +7234,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -7129,6 +7467,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -7173,7 +7512,6 @@ mod tests {
                 bro_label: None,
                 agent_label: None,
                 system_events: None,
-                interactive: false,
                 // The legacy `spawn_with_pre_minted_id_tracks_known_id`
                 // test predates Slice 1b; pin origin to a sentinel
                 // value so a regression that drops the origin on
@@ -7968,6 +8306,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8066,6 +8405,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8120,6 +8460,7 @@ mod tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8174,6 +8515,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
@@ -8230,6 +8572,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
@@ -8299,6 +8642,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
@@ -8355,6 +8699,7 @@ mod tests {
             transcript_location: None,
             transcript_cursor: None,
             live_cursor: 0,
+            harness_ingest_seq: 0,
             last_delta_roster_emit_ms: 0,
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
@@ -8459,6 +8804,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8501,6 +8847,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8549,6 +8896,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8593,6 +8941,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8649,6 +8998,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
@@ -8698,6 +9048,7 @@ mod async_tests {
                 transcript_location: None,
                 transcript_cursor: None,
                 live_cursor: 0,
+                harness_ingest_seq: 0,
                 last_delta_roster_emit_ms: 0,
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,

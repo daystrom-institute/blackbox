@@ -113,7 +113,7 @@ impl BlackboxServer {
             .map_err(|e| format!("writing consultant thread event: {e:#}"))
     }
 
-    pub(crate) fn consultant_launch_exec(
+    pub(crate) async fn consultant_launch_exec(
         &self,
         descriptor: &'static ConsumerDescriptor,
         id: &orchestration::badgey::types::BadgeyId,
@@ -203,7 +203,8 @@ impl BlackboxServer {
             // dispatch note: consultant exec is classed as AgentDispatch
             // (user-driven tool that dispatches an agent context).
             bro_core::Origin::AgentDispatch,
-        );
+        )
+        .await;
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         Ok((task, provider, session_id, effective_filters))
     }
@@ -290,8 +291,9 @@ impl BlackboxServer {
         // This sync thread helper cannot await; threads persistence is write-behind here.
         self.state.threads_persister.request();
         let thread_id = self.consultant_thread_id_from_open_result(&thread_result)?;
-        let (task, provider, _initial_session_id, merged_filters) =
-            self.consultant_launch_exec(descriptor, &id, &scope, &thread_id, bro_label)?;
+        let (task, provider, _initial_session_id, merged_filters) = self
+            .consultant_launch_exec(descriptor, &id, &scope, &thread_id, bro_label)
+            .await?;
         let task_id = task.inner.lock().id.clone();
         let session_id = match self
             .consultant_wait_for_observed_session_id(&task, 10.0)
@@ -682,7 +684,8 @@ impl BlackboxServer {
             // continuation dispatch; same source class as
             // consultant_launch_exec (AgentDispatch).
             bro_core::Origin::AgentDispatch,
-        );
+        )
+        .await;
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         let completed = orch::wait_for_task_with_timeout(&task, timeout_seconds).await;
         let result = if completed {
