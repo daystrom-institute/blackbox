@@ -2,7 +2,5 @@
 //! Modules move verbatim; the origin re-exports them under their original
 //! `crate::<module>` paths.
 
-pub mod code_nav;
 pub mod index;
 pub mod projects;
-pub mod slices;

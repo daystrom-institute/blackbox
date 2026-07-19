@@ -6,8 +6,9 @@
 //! Tiers:
 //!
 //! - `Pinned`: always in the wire `tools` array (first) AND surfaced
-//!   prominently in the system prompt. Elevated by `PinPolicy` (default
-//!   `bbox_slice_*`), plus `tool_search` itself.
+//!   prominently in the system prompt. Elevated by `PinPolicy` (no default
+//!   patterns; set `BRO_HARNESS_PIN_TOOLS` to opt in), plus `tool_search`
+//!   itself.
 //! - `Eager`: always in the wire array; the core built-ins.
 //! - `Deferred`: NOT in the wire array; advertised name+desc in a
 //!   system-prompt manifest and loaded on demand via `tool_search`. All MCP
@@ -50,7 +51,7 @@ impl PinPolicy {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            Err(_) => ["bbox_slice_*"].into_iter().map(String::from).collect(),
+            Err(_) => Vec::new(),
         };
         Self { patterns }
     }
@@ -427,10 +428,10 @@ mod tests {
     #[test]
     fn pin_policy_prefix_and_exact() {
         let p = PinPolicy {
-            patterns: vec!["bbox_slice_*".into(), "exact_tool".into()],
+            patterns: vec!["bbox_hybrid_*".into(), "exact_tool".into()],
         };
-        assert!(p.matches("bbox_slice_read"));
-        assert!(p.matches("bbox_slice_copy"));
+        assert!(p.matches("bbox_hybrid_search"));
+        assert!(p.matches("bbox_hybrid_search_v2"));
         assert!(p.matches("exact_tool"));
         assert!(!p.matches("bbox_stats"));
         assert!(!p.matches("exact_tool_x"));
@@ -552,18 +553,18 @@ mod tests {
     #[test]
     fn tiers_and_activation() {
         let pin = PinPolicy {
-            patterns: vec!["bbox_slice_*".into()],
+            patterns: vec!["bbox_hybrid_*".into()],
         };
         let builtins = vec![mk("file_read", "read a file")];
         let mcp = vec![
-            mk("bbox_slice_read", "read a slice"),
+            mk("bbox_hybrid_search", "hybrid corpus search"),
             mk("bbox_stats", "corpus stats"),
         ];
         let reg = Registry::new(builtins, mcp, &pin, &ToolFilter::default());
 
-        // Pinned = slice tool + tool_search; Eager = file_read; both in wire.
+        // Pinned = hybrid search tool + tool_search; Eager = file_read; both in wire.
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
-        assert!(wire.contains(&"bbox_slice_read".to_string()));
+        assert!(wire.contains(&"bbox_hybrid_search".to_string()));
         assert!(wire.contains(&TOOL_SEARCH.to_string()));
         assert!(wire.contains(&"file_read".to_string()));
         // bbox_stats is deferred → not in wire yet, but in the manifest.

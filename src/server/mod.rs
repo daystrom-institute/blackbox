@@ -35,8 +35,6 @@ impl BlackboxServer {
                 + crate::tools::notes::router()
                 + crate::tools::gaps::router()
                 + crate::tools::threads::router()
-                + crate::tools::refactor::router()
-                + crate::tools::code_nav::router()
                 + crate::tools::artifacts::router()
                 + crate::tools::packets::router()
                 + crate::tools::attention::router()
@@ -46,7 +44,6 @@ impl BlackboxServer {
                 + crate::tools::knowledge::router()
                 + crate::tools::render::router()
                 + crate::tools::roadmap::router()
-                + crate::tools::slices::router()
                 + crate::tools::whiteboards::router()
                 + crate::tools::badgey::router()
                 + crate::tools::consultant::router()
@@ -62,8 +59,7 @@ impl BlackboxServer {
                 + crate::tools::storage_gc::router()
                 + crate::tools::storage_migration::router()
                 + crate::tools::workspace::router()
-                + crate::tools::system_events::router()
-                + crate::tools::macros::router(),
+                + crate::tools::system_events::router(),
             surface: std::sync::OnceLock::new(),
             surface_project: std::sync::OnceLock::new(),
         }

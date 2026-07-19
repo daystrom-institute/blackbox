@@ -23,7 +23,7 @@ use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, crons, edge_index, lsp, path_cache, pollers, slack_channel_bindings,
+    artifacts, crons, edge_index, path_cache, pollers, slack_channel_bindings,
     slack_proposal_links, slack_thread_store, system_events, webhooks, whiteboards, workflow,
 };
 
@@ -187,11 +187,6 @@ pub(crate) struct SharedState {
     /// Reaction handlers resolve item_ts → proposal_id; thread-reply
     /// handlers resolve thread_ts → authoring_session_id.
     pub(crate) slack_proposal_links: Arc<slack_proposal_links::SlackProposalLinks>,
-    /// Lazy-spawned per-project LSP sessions (JDTLS, rust-analyzer).
-    /// Refactor tools call `with_session` instead of starting a fresh
-    /// child every call; the manager amortizes initialize cost and
-    /// idle-evicts sessions on a background tick.
-    pub(crate) lsp_sessions: lsp::LspSessionManager,
     pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
     pub(crate) atom_invocation_store: orchestration::atoms::invocation::SharedInvocationStore,
     // kept: SharedState vector store handle; consumed by embed/queue path through alternate state plumbing, retained here for direct access
@@ -509,7 +504,6 @@ impl SharedState {
             slack_proposal_links: Arc::new(
                 slack_proposal_links::SlackProposalLinks::open(store_dir).unwrap(),
             ),
-            lsp_sessions: lsp::LspSessionManager::new(),
             config: Arc::new(RwLock::new(
                 crate::config::load()
                     .unwrap_or_else(|e| panic!("loading config for test SharedState: {e}")),

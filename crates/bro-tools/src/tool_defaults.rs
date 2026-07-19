@@ -530,21 +530,21 @@ mod tests {
     #[test]
     fn glob_rules_do_not_warn_on_tools_missing_the_param() {
         // Daemon-shaped table on a standard dispatch profile: glob pins for
-        // both dispatch-cwd spellings plus an exact code-nav default. Tools
+        // both dispatch-cwd spellings plus an exact retrieval-read default. Tools
         // without the pinned params are the expected steady state for glob
         // rules — session-start validation must stay quiet.
         let defaults = table(&[
             ("pin:*.cwd", "/repo/wt"),
             ("pin:*.project_dir", "/repo/wt"),
-            ("default:mcp.bbox_code_outline.project_dir", "/repo/wt"),
+            ("default:mcp.bbox_hybrid_search.project", "/repo/wt"),
         ]);
         let dispatch_schema = json!({
             "type": "object",
             "properties": {"prompt": {"type": "string"}, "cwd": {"type": "string"}}
         });
-        let code_nav_schema = json!({
+        let retrieval_schema = json!({
             "type": "object",
-            "properties": {"file": {"type": "string"}, "project_dir": {"type": "string"}}
+            "properties": {"query": {"type": "string"}, "project": {"type": "string"}}
         });
         let note_schema = json!({
             "type": "object",
@@ -552,7 +552,7 @@ mod tests {
         });
         let warnings = defaults.validation_warnings([
             ("mcp__blackbox__bro_exec", &dispatch_schema),
-            ("mcp__blackbox__bbox_code_outline", &code_nav_schema),
+            ("mcp__blackbox__bbox_hybrid_search", &retrieval_schema),
             ("mcp__blackbox__bbox_note", &note_schema),
         ]);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");

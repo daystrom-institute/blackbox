@@ -14,7 +14,10 @@ The crate is `blackbox` (`Cargo.toml`). Binary entry points:
 
 Core MCP namespaces:
 
-- `bbox_*` - transcript, knowledge, graph, project, and refactor primitives.
+- `bbox_*` - transcript, knowledge, graph, and project primitives. The
+  refactor/slice/code-nav/macro MCP surface is retired; that tooling is
+  harness-native via the bro-harness isolate bindings (see
+  `docs/refactor.md`).
 - `bro_*` - orchestration and dispatch primitives.
 - `work_*` - restricted workspace-tool namespace for agents operating inside
   atoms/workflows. Only add tools here when the operator explicitly asks for an
@@ -46,9 +49,11 @@ Major code ownership boundaries:
   injection, recursion guard, atoms, Badgey, and supervision.
 - `workflow/`, `pollers.rs`, `crons.rs`, `webhooks.rs`, `system_events/` -
   deterministic orchestration, ingress, scheduling, and external event routing.
-- `refactor/`, `code_nav/`, `lsp/` - syntax navigation, guarded refactor plans,
-  compound refactor runs, and warm LSP sessions.
 - `config.rs` - config loader and env override allowlist.
+
+The `bbox-refactor` and `bbox-lsp` crates survive as libraries linked by the
+bro-harness bindings; the daemon no longer wraps them in MCP tools or keeps a
+warm LSP pool.
 
 Generated or rendered surfaces are not the authority. Prefer editing their source
 owners, then regenerating through the intended path.
@@ -93,8 +98,9 @@ Targeted recipes:
   start `blackboxd` or the relevant sidecar and confirm it initializes.
 - Render or knowledge changes: run render/knowledge tests and inspect generated
   markdown diffs. Do not hand-edit generated provider memory regions.
-- Refactor machinery: start with `cargo test --lib refactor`; for LSP-backed
-  paths also validate the language server availability/failure mode.
+- Refactor machinery (harness bindings and the `bbox-refactor` library):
+  `cargo nextest run -p bbox-refactor -p bro-harness`; for LSP-backed paths
+  also validate the language server availability/failure mode.
 - Workflow, webhook, poller, cron, or system-event routing: run the targeted
   unit tests and exercise the relevant HTTP/tool path when behavior is runtime
   shaped.
@@ -214,9 +220,6 @@ Important state/config env vars:
   `TRANSCRIPT_SEARCH_CODEX_ROOT`, `TRANSCRIPT_SEARCH_INDEX_PATH`,
   `BLACKBOX_REINDEX_INTERVAL_SECS`, `BLACKBOX_EDGE_INDEX_BOOT_REBUILD`
   `VIBE_BIN`, `GEMINI_BIN`, `BRO_EXTRA_PATH`, `VIBE_SESSION_DIR`
-- LSP/refactor: `BLACKBOX_LSP_IDLE_SECS`, `BLACKBOX_JDTLS_TIMEOUT_SECS`,
-  `BLACKBOX_JDTLS_INIT_TIMEOUT_SECS`, `BLACKBOX_JDTLS_BIN`,
-  `BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS`, `BLACKBOX_RUST_ANALYZER_BIN`
 - Ingress/provenance: `BBOX_POLLER_MIN_INTERVAL_SECS`,
   `BBOX_GIT_NOTES_NAMESPACE`
 
@@ -331,8 +334,9 @@ or system memories and link/pointer from here.
   `docs/projects-code-indexing.md` - core corpus surfaces.
 - `system-defaults/memories/system-memory-catalog.md` - Obsidian navigation
   map for system memory runbooks; not loaded as a runtime memory.
-- `docs/refactor.md`, `system-defaults/memories/refactor*.md` - refactor
-  capability and language-specific protocols.
+- `docs/refactor.md` - retirement pointer for the daemon refactor MCP
+  surface (now harness-native isolate bindings);
+  `system-defaults/memories/refactor*.md` - language-specific protocols.
 - `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md`,
   `docs/rule-packets.md` - orchestration and event routing.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,

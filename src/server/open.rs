@@ -18,7 +18,7 @@ use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, config, crons, edge_index, index, lsp, orchestration, path_cache, pollers,
+    artifacts, config, crons, edge_index, index, orchestration, path_cache, pollers,
     slack_channel_bindings, slack_proposal_links, slack_thread_store, system_events, system_memory,
     tool_docs, vectors, webhooks, whiteboards,
 };
@@ -319,7 +319,6 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
             slack_proposal_links::SlackProposalLinks::open(&store_dir)
                 .unwrap_or_else(|e| panic!("opening slack proposal links at {store_dir:?}: {e}")),
         ),
-        lsp_sessions: lsp::LspSessionManager::with_lsp_config(&cfg.lsp),
         config: cfg_arc,
         atom_invocation_store: Arc::new(RwLock::new(
             orchestration::atoms::invocation::InvocationStore::new(

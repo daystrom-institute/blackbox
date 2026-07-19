@@ -342,27 +342,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbox-code-nav"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-chunker",
- "bbox-corpus-core",
- "bbox-lsp",
- "bbox-refactor",
- "ignore",
- "lsp-types",
- "reqwest 0.12.28",
- "rmcp",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "tempfile",
- "tree-sitter",
- "url",
-]
-
-[[package]]
 name = "bbox-config"
 version = "0.0.1"
 dependencies = [
@@ -534,12 +513,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-chunker",
- "bbox-code-nav",
  "bbox-corpus-core",
  "bbox-corpus-index",
  "bbox-edge-index",
  "bbox-knowledge",
- "bbox-refactor",
  "bbox-stores",
  "bbox-threads",
  "bbox-util",
@@ -593,25 +570,6 @@ dependencies = [
  "tempfile",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "bbox-macros"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bbox-code-nav",
- "bbox-corpus-core",
- "bbox-lsp",
- "bbox-refactor",
- "chrono",
- "dirs",
- "rmcp",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -940,7 +898,6 @@ dependencies = [
  "axum",
  "bbox-artifacts",
  "bbox-chunker",
- "bbox-code-nav",
  "bbox-config",
  "bbox-corpus-core",
  "bbox-corpus-index",
@@ -951,12 +908,9 @@ dependencies = [
  "bbox-inbox",
  "bbox-indexing",
  "bbox-knowledge",
- "bbox-lsp",
- "bbox-macros",
  "bbox-mcp-tools",
  "bbox-packets",
  "bbox-providers",
- "bbox-refactor",
  "bbox-slack",
  "bbox-stores",
  "bbox-system-events",

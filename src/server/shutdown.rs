@@ -100,9 +100,6 @@ async fn serve_with_grace_period(
 
 fn persist_shutdown_state(shared: Arc<SharedState>, store_dir: PathBuf) {
     embed_queue::shutdown();
-    // Tear down long-lived LSP sessions before persistence so JDTLS and friends
-    // get a chance to write workspace caches and exit cleanly.
-    shared.lsp_sessions.shutdown_all();
     // Block until durable: shutdown must not race the persist actor's thread.
     crate::orchestration::flush_persist_blocking(&shared.task_store, &store_dir);
     if let Err(err) = shared.kb_persister.flush_blocking() {

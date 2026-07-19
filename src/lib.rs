@@ -34,7 +34,6 @@ mod badgey_eval_check;
 // `crate::chunker` so existing call sites resolve unchanged.
 use bbox_chunker as chunker;
 pub use bbox_config::config;
-pub use bbox_indexing::code_nav;
 mod crons;
 pub mod dispatch_mcp;
 mod doctor;
@@ -58,11 +57,6 @@ use bbox_indexing::index;
 // `crate::json_store` so existing call sites resolve unchanged.
 pub use bbox_corpus_core::json_store;
 use bbox_knowledge::knowledge;
-// `lsp` extracted into bbox-lsp (stage 2); aliased back to `crate::lsp`.
-use bbox_lsp as lsp;
-// `macros` extracted into bbox-macros (stage 5); aliased back to
-// `crate::macros` so existing call sites resolve unchanged.
-use bbox_macros as macros;
 mod managed_worktrees;
 use bbox_edge_sidecar::manifest;
 mod mcp_client;
@@ -86,16 +80,12 @@ mod providers_ext;
 // `search` (rrf/rerank) and `template` extracted into bbox-corpus-core;
 // aliased back so existing call sites resolve unchanged. (`query` callers
 // now use bbox_corpus_core::query directly.)
-// `refactor` extracted into bbox-refactor (stage 3); aliased back to
-// `crate::refactor` so existing call sites resolve unchanged.
 pub use bbox_knowledge::render;
-use bbox_refactor as refactor;
 use bbox_stores::roadmap;
 mod routing;
 pub use bbox_config::secrets;
 pub mod server;
 use bbox_edge_index::storage_health;
-use bbox_indexing::slices;
 pub use bbox_slack::slack_channel_bindings;
 pub use bbox_slack::slack_proposal_links;
 use bbox_slack::slack_thread_store;

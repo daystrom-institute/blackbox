@@ -24,7 +24,6 @@ pub enum ToolCategory {
     Transcripts,
     Graph,
     Projects,
-    Refactor,
     Knowledge,
     Threads,
     Notes,
@@ -38,7 +37,6 @@ pub enum ToolCategory {
     Roadmap,
     StorageHealth,
     Workspace,
-    Macros,
     Operations,
 }
 
@@ -48,7 +46,6 @@ impl ToolCategory {
             Self::Transcripts => "Transcripts",
             Self::Graph => "Agentic graph",
             Self::Projects => "Projects",
-            Self::Refactor => "Refactor mechanization",
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
@@ -62,7 +59,6 @@ impl ToolCategory {
             Self::Roadmap => "Roadmap",
             Self::StorageHealth => "Storage health",
             Self::Workspace => "Workspace tools",
-            Self::Macros => "Macro registry",
             Self::Operations => "Operations",
         }
     }
@@ -74,9 +70,6 @@ impl ToolCategory {
             }
             Self::Graph => "Inspect entities, graph vocabulary, paths, bundles, and retrieval.",
             Self::Projects => "Register project roots for later file indexing.",
-            Self::Refactor => {
-                "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run plans, hash-checked apply, transaction composition, file moves, and parse validation. Inspection is multi-language for supported grammars; writable plan kinds may be generic or language-scoped. Pull `sm-refactor` first, then any relevant language runbook via `bbox_knowledge` for exact plan kinds, arguments, and validation expectations. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
-            }
             Self::Knowledge => {
                 "Memory lanes: `bbox_learn` for operator-approved rendered rules, `bbox_remember` for approved cold recall, `bbox_decide` for approved durable commitments, and `bbox_pin` for scoped active context."
             }
@@ -114,9 +107,6 @@ impl ToolCategory {
             Self::Workspace => {
                 "Instrumented file read, shell execution, and git operations for registered projects. Prefer these over raw Read/Bash/git when working inside a bbox-registered project — every call is indexed as a tool-call record and enriched with bbox context where relevant."
             }
-            Self::Macros => {
-                "Register, inspect, plan, and execute macro recipes. Macros are data-only synthesis plans stored as JSON files. Project macros live under `.bbox/macros/` (reviewable like source). User macros live in operator config. Builtins ship with Blackbox. `macro_plan` produces a `MacroPlan` review artifact (read-only); `macro_apply` lowers a `MacroPlan` to a `RefactorPlan` and applies it to disk (requires `confirm=true`); `macro_run` combines plan + apply in one step."
-            }
             Self::Operations => {
                 "Day-2 operational health surfaces: aggregate daemon/corpus/route status with classified findings and suggested next commands."
             }
@@ -128,7 +118,6 @@ fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
     match category {
         ToolCategory::Gaps => Some("sm-gap-notes"),
         ToolCategory::Packets => Some("sm-rule-packets"),
-        ToolCategory::Refactor => Some("sm-refactor"),
         ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
         ToolCategory::Workflows => Some("sm-workflow-orchestration"),
         ToolCategory::Whiteboards => Some("sm-whiteboards"),
@@ -141,7 +130,6 @@ const HOT_RENDER_CATEGORIES: &[ToolCategory] = &[
     ToolCategory::Transcripts,
     ToolCategory::Graph,
     ToolCategory::Projects,
-    ToolCategory::Refactor,
     ToolCategory::Knowledge,
     ToolCategory::Threads,
     ToolCategory::Notes,
@@ -382,188 +370,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use to drop a stale or accidentally-registered project root without hand-editing projects.json. Prefer `dry_run=true` first to see what is still attached, then `bbox_project_rename` to migrate or `force=true` to accept orphaning.",
         example: Some(
             r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,
-        ),
-    },
-    // ── Refactor mechanization ───────────────────────────────────────
-    ToolDoc {
-        name: "bbox_code_symbols",
-        category: ToolCategory::Refactor,
-        summary: "Find refactorable syntax symbols across a project and return exact line ranges plus refactor/project-ref handoff hints.",
-        when_to_use: "Use instead of `rg -n` when you need method/function/type line numbers, refactorable item names, or candidate files for a symbol. Two lanes via `mode`: `indexed` (default; reads stored tantivy docs, no parse cost) and `live` (walks + reparses; honest fallback when the reindexer is behind). `item_kinds` accepts BOTH refactor synthetic kinds (e.g. `impl_method`) and raw tree-sitter kinds (e.g. `function_item`); see `sm-refactor` for the dual-vocabulary contract. Records carry `kind` (refactor synthetic) plus `symbol_kind` and `parent_kind` (raw), byte_range, line_range, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs. Truncation signalled via `truncation_reason` (limit_reached / file_limit_reached / scan_cap_reached). Recoverable errors return typed JSON with `code` + `suggestion`. This is syntax inventory, not reference resolution.",
-        example: Some(
-            r#"bbox_code_symbols(project_dir="/repo/x", query="readFromProperties", languages=["java"], item_kinds=["method_declaration"], limit=20)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_code_query",
-        category: ToolCategory::Refactor,
-        summary: "Run a tree-sitter query against one source file. Return syntactic matches plus handoff hints for refactor/status grounding.",
-        when_to_use: "Use after the file is known to find AST patterns, block ranges, or specific syntactic constructs using tree-sitter S-expressions. For method/function/type line numbers across a project, use bbox_code_symbols first instead of shell `rg`. Returns matched nodes, byte/line ranges, optional text, parse diagnostics, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs. The matches are syntax-only, not semantic bindings.",
-        example: Some(
-            r#"bbox_code_query(file="src/foo.rs", query="(function_item name: (identifier) @name)")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_code_node_describe",
-        category: ToolCategory::Refactor,
-        summary: "Describe the smallest named AST node at a source position and suggest the next refactor/status grounding call.",
-        when_to_use: "Use to discover grammar shape and field names before writing a tree-sitter query. Point it at a line/column and get the node kind, parent chain, named children, sibling summaries, parse diagnostics, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs.",
-        example: Some(r#"bbox_code_node_describe(file="src/foo.rs", line=42, column=12)"#),
-    },
-    ToolDoc {
-        name: "bbox_code_refs",
-        category: ToolCategory::Refactor,
-        summary: "Extract syntactic references (calls, imports, fields, identifiers) from one source file. Per-language tree-sitter queries; identifiers fallback for unsupported languages. Records are syntax-only with edge_confidence=\"heuristic\".",
-        when_to_use: "Use when you need to enumerate what one file calls / imports / accesses without running an LSP. Pass `kind` in {calls, imports, fields, identifiers, all}; the response carries per-record byte_range, line_range, containing_symbol, edge_confidence=\"heuristic\", and semantic_status=\"syntax_only\" — these are syntax captures, NOT binding-aware resolution. For binding authority use LSP via bbox_refactor_plan, or graph traversal via bbox_inspect_entity. Curated grammars: Rust, Java, Python, TypeScript, JavaScript, Go; other languages fall back to the generic identifier walker for kind=\"identifiers\" only.",
-        example: Some(r#"bbox_code_refs(file="src/main.rs", kind="calls", query="parse")"#),
-    },
-    ToolDoc {
-        name: "bbox_code_usages",
-        category: ToolCategory::Refactor,
-        summary: "Resolve binding-aware usages of the Java symbol at a file position via JDTLS (LSP textDocument/references). Returns semantically-verified usage sites with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; use bbox_code_refs for syntax-only cross-language reference extraction.",
-        when_to_use: "Use when you need cross-file, binding-aware usages of a Java symbol (method, field, class, local) and syntactic heuristics from bbox_code_refs are not sufficient. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative), 1-based `line` and `column` (same convention as bbox_code_node_describe; converted to 0-based LSP coordinates internally), and optionally `project_dir`. Each returned usage site carries `path`, `line`, `character`, and a `handoff` pointing to bbox_refactor_status / bbox_refactor_project_refs on the usage file. `symbol_resolved` is `false` only when JDTLS could not resolve (returned a null response); an empty result list with `symbol_resolved=true` means resolved with zero references. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
-        example: Some(
-            r#"bbox_code_usages(file="src/main/java/com/example/Foo.java", line=12, column=19, project_dir="/repo")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_code_implementations",
-        category: ToolCategory::Refactor,
-        summary: "Resolve implementations of the Java symbol at a file position via JDTLS (LSP textDocument/implementation). Returns semantically-verified implementor sites with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only.",
-        when_to_use: "Use when you need to find all implementors of a Java interface, abstract method, or type. Anchor on the interface/method/type name. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative), 1-based `line` and `column` (same convention as bbox_code_node_describe; converted to 0-based LSP coordinates internally), and optionally `project_dir`. Each returned site carries `path`, `line`, `character`, and a `handoff` pointing to bbox_refactor_status / bbox_refactor_project_refs on the implementation file. `symbol_resolved=false` only when JDTLS could not resolve (returned a null response); an empty result list with `symbol_resolved=true` means resolved with zero implementations. Normalises Scalar/Array/Link response variants to a flat location list. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
-        example: Some(
-            r#"bbox_code_implementations(file="src/main/java/com/example/Greeter.java", line=1, column=10, project_dir="/repo")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_code_type_at",
-        category: ToolCategory::Refactor,
-        summary: "Resolve the type/signature/documentation at a Java position via JDTLS (LSP textDocument/hover). Returns resolved type info with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only.",
-        when_to_use: "Use when you need the resolved type, signature, or Javadoc at a Java expression position — \"what type is this?\" or \"what does this method return?\". Anchor on any identifier or expression. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative), 1-based `line` and `column` (same convention as bbox_code_node_describe; converted to 0-based LSP coordinates internally), and optionally `project_dir`. Returns `resolved: true` and `contents` (a flattened string from Hover.contents — Scalar/Array/Markup forms are normalised into a single string) when JDTLS has type info; `resolved: false` and empty `contents` when not. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
-        example: Some(
-            r#"bbox_code_type_at(file="src/main/java/com/example/Foo.java", line=12, column=19, project_dir="/repo")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_workspace_symbols",
-        category: ToolCategory::Refactor,
-        summary: "Resolve workspace symbols matching a query via JDTLS (LSP workspace/symbol). Returns semantically-verified workspace symbol matches with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; project-wide query.",
-        when_to_use: "Use when you need to find all symbols matching a name query across a whole Java project workspace. Unlike file-position queries (bbox_code_usages, bbox_code_implementations, bbox_code_type_at), this queries the entire indexed workspace without needing a specific file position. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `query` (the symbol name to search for) and `project_dir` (the project root; defaults to cwd). Each returned symbol carries `name`, `kind` (string and numeric), `path`, `line`, `character`, and a `handoff` pointing to bbox_refactor_status / bbox_refactor_project_refs on the symbol's file. `resolved=false` only when JDTLS could not resolve (returned a null response); an empty result list with `resolved=true` means resolved with zero matching symbols. Some symbols may have `line: null` and `character: null` when JDTLS returns a range-less workspace location. Normalises Flat/Nested response variants into a flat symbol list. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
-        example: Some(r#"bbox_workspace_symbols(query="Greeter", project_dir="/repo")"#),
-    },
-    ToolDoc {
-        name: "bbox_code_outline",
-        category: ToolCategory::Refactor,
-        summary: "Return a file-scoped, hierarchical symbol outline for a Java source file via JDTLS (LSP textDocument/documentSymbol). Returns a recursive tree of OutlineSymbol nodes with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; no position anchor required — the whole file is outlined.",
-        when_to_use: "Use when you need a hierarchical, JDTLS-resolved symbol tree for a single Java file — the structure and nesting of classes, interfaces, methods, fields, and constructors. Unlike bbox_code_symbols (which is a project inventory tool with indexed/live modes) and bbox_workspace_symbols (which queries the whole workspace by name), this is file-scoped and always LSP-resolved. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative) and optionally `project_dir`. Each returned OutlineSymbol carries `name`, `kind` (string), optional `detail` (typically the type signature), optional `line`/`character` (0-based, may be null when the LSP returns no range), and `children` (nested member symbols). `resolved=false` only when JDTLS could not resolve (returned a null response); `symbol_count` is the total node count including all nested children. Normalises Flat/Nested DocumentSymbolResponse variants — Flat produces a flat list (empty children), Nested preserves the recursive hierarchy. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
-        example: Some(
-            r#"bbox_code_outline(file="src/main/java/com/example/Hello.java", project_dir="/repo")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_refactor_status",
-        category: ToolCategory::Refactor,
-        summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
-        when_to_use: "Use before syntax-aware structural planning to inventory refactorable syntax items, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a supported bbox_refactor_plan when the plan kind needs them. On large files, pass item_kinds/item_names and limit to keep the response agent-sized. Pull `sm-refactor` first, then any relevant language memory for language-specific item kinds, arguments, caveats, and validation commands.",
-        example: Some(
-            r#"bbox_refactor_status(file="src/path/to/file.ext", project_dir="/repo/x", item_names=["Thing"], limit=50, include_attributes=false)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_refactor_project_refs",
-        category: ToolCategory::Refactor,
-        summary: "Ground current project_file entity refs for a source file using the same chunk and hash rules as the agentic corpus.",
-        when_to_use: "Use before editing eval fixtures, provenance metadata, design docs, or any other structured text that stores `project_file:<project>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>` refs. This is a grounding/read tool: it returns the current rel_path_hash, chunk hashes, occurrence indexes, symbols, byte ranges, and canonical entity_ref strings for a file so agents do not guess from whole-file sha256 or replace the wrong ref segment.",
-        example: Some(
-            r#"bbox_refactor_project_refs(file="src/packets/mod.rs", project_dir="/repo/x", query="compile", limit=20)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_refactor_plan_kinds",
-        category: ToolCategory::Refactor,
-        summary: "List a compact machine-readable catalog of supported refactor plan kinds by language, safety class, backend, required fields, and suggested preflight.",
-        when_to_use: "Use after bbox_refactor_status when a sandbox/authoring agent needs to choose a safe next refactor primitive without parsing a long language runbook or the full bbox_refactor_plan schema. Filter by `language` (rust/java/csharp/elixir/generic), `safety_class` (analysis_only/syntax_only/lsp_verified/generic_write/mixed), or `backend` (analysis/tree_sitter/lsp/text/mixed). This is a compact first-pass catalog; pull the language memory (`sm-refactor-rust`, `sm-refactor-java`, etc.) for exhaustive long-tail details, exact arguments, caveats, refusal codes, and validation commands before planning.",
-        example: Some(r#"bbox_refactor_plan_kinds(language="rust", safety_class="analysis_only")"#),
-    },
-    ToolDoc {
-        name: "bbox_slice_read",
-        category: ToolCategory::Refactor,
-        summary: "Read an exact text slice from a file. Pass range as JSON string in MCP, e.g. {\"type\":\"lines\",\"start_line\":10,\"end_line\":20}; object form is also accepted by direct clients.",
-        when_to_use: "Use when you need a context-clipboard slice before moving, copying, deleting, or replacing text. MCP schemas surface selector arguments (`range`, `source_range`, `target_range`, `insert`) as strings: pass a JSON-encoded selector string exactly like `range=\"{\\\"type\\\":\\\"lines\\\",\\\"start_line\\\":10,\\\"end_line\\\":20}\"`. Direct JSON clients may pass the selector object itself. Range selector `type` values: `lines`, `markers`, `exact_text`, `bytes`. Insert selector `type` values: `line`, `before_marker`, `after_marker`, `prepend`, `append`. The response includes slice/file hashes, before/after context lines, parse_status, and warnings so agents can verify they grabbed the intended block. Prefer this over grepping/sedding when the next step needs an exact range that can be passed to a slice mutation tool.",
-        example: Some(
-            r#"bbox_slice_read(file="src/foo.rs", project_dir="/repo/x", range="{\"type\":\"lines\",\"start_line\":10,\"end_line\":20}")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_slice_move",
-        category: ToolCategory::Refactor,
-        summary: "Move an exact text slice. In MCP, pass source_range and insert as JSON strings, e.g. source_range={\"type\":\"lines\",\"start_line\":10,\"end_line\":20}, insert={\"type\":\"append\"}. Dry-run by default; confirmed writes use refactor apply safety.",
-        when_to_use: "Use as the simple context-clipboard move primitive: source file + JSON-string `source_range` + destination file + JSON-string `insert`. It returns a reviewable RefactorPlan with file hashes and parse validations; pass `confirm=true` to write through the same stale-hash, registered-project, dirty-worktree, validation, and rollback path as `bbox_refactor_apply`. Prefer this over manual sed/perl/apply_patch for moving tests, docs blocks, helper functions, or other exact text regions.",
-        example: Some(
-            r#"bbox_slice_move(project_dir="/repo/x", source="tests/a.rs", source_range="{\"type\":\"lines\",\"start_line\":40,\"end_line\":75}", target="tests/b.rs", insert="{\"type\":\"append\"}")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_slice_copy",
-        category: ToolCategory::Refactor,
-        summary: "Copy an exact text slice. In MCP, pass source_range and insert as JSON strings, e.g. source_range={\"type\":\"exact_text\",\"text\":\"...\"}, insert={\"type\":\"append\"}. Dry-run by default; confirmed writes use refactor apply safety.",
-        when_to_use: "Use when a selected text range should be duplicated without deleting the source. Select source by lines, markers, exact text, or byte range using JSON-string `source_range`; choose insertion by line placement, marker, prepend, or append using JSON-string `insert`. Confirmed writes require `confirm=true` and honor the same apply safety flags as refactor plans.",
-        example: Some(
-            r#"bbox_slice_copy(project_dir="/repo/x", source="src/a.rs", source_range="{\"type\":\"markers\",\"start_marker\":\"// start\",\"end_marker\":\"// end\"}", target="src/b.rs", insert="{\"type\":\"line\",\"line\":12,\"placement\":\"before\"}")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_slice_delete",
-        category: ToolCategory::Refactor,
-        summary: "Delete an exact text slice. In MCP, pass source_range as a JSON string, e.g. {\"type\":\"lines\",\"start_line\":10,\"end_line\":20}. Dry-run by default; confirmed writes use refactor apply safety.",
-        when_to_use: "Use for exact text removal when a structured range is safer than ad hoc shell editing. Pass `source_range` as a JSON string. It stages a single delete edit in a RefactorPlan and validates supported source files before confirmed writes.",
-        example: Some(
-            r#"bbox_slice_delete(project_dir="/repo/x", source="src/foo.rs", source_range="{\"type\":\"exact_text\",\"text\":\"obsolete();\n\",\"occurrence\":1}")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_slice_insert_text",
-        category: ToolCategory::Refactor,
-        summary: "Insert literal text. In MCP, pass insert as a JSON string, e.g. {\"type\":\"line\",\"line\":12,\"placement\":\"before\"} or {\"type\":\"append\"}. Dry-run by default; confirmed writes use refactor apply safety.",
-        when_to_use: "Use for controlled insertion at a line, marker, prepend, or append point. Pass `insert` as a JSON string. This is the write half of the context clipboard when the replacement text is already known rather than selected from another source file.",
-        example: Some(
-            r#"bbox_slice_insert_text(project_dir="/repo/x", target="src/foo.rs", insert="{\"type\":\"append\"}", text="\nmod new_tests;\n")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_slice_replace",
-        category: ToolCategory::Refactor,
-        summary: "Replace an exact text slice. In MCP, pass target_range and optional source_range as JSON strings. Use new_text for literal replacement or source+source_range for slice replacement. Dry-run by default; confirmed writes use refactor apply safety.",
-        when_to_use: "Use when the destination range is exact and the replacement is either literal `new_text` or a selected `source` + JSON-string `source_range`. Pass exactly one replacement source. Confirmed writes run through refactor apply hash checks, registered-project checks, dirty-worktree gates, parse validation, and rollback.",
-        example: Some(
-            r#"bbox_slice_replace(project_dir="/repo/x", target="src/foo.rs", target_range="{\"type\":\"lines\",\"start_line\":5,\"end_line\":8}", source="src/bar.rs", source_range="{\"type\":\"lines\",\"start_line\":20,\"end_line\":23}")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_refactor_plan",
-        category: ToolCategory::Refactor,
-        summary: "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind.",
-        when_to_use: "Use after `bbox_refactor_plan_kinds` or `sm-refactor` identifies an exact supported plan kind. For syntax-item operations, inspect with bbox_refactor_status first and use the relevant language memory (`sm-refactor-rust`, `sm-refactor-java`, `sm-refactor-csharp`, etc.) for exact item kinds, extra arguments, language-specific contracts, and plan-refusal codes — those details do not live here. LSP-backed kinds should either return a plan or fail closed with a clear LSP error/timeout; if a dispatched authoring task remains `tool_running` after a wait timeout, inspect bro_status before cancelling or filing a refactor gap. C# track Phase 1 ships csharp_workspace_probe (analysis), migrate_csharp_to_filescoped_namespace (syntax_only), and csharp_lsp_rename / csharp_organize_usings / find_csharp_usages (lsp_verified via Microsoft.CodeAnalysis.LanguageServer); Phase 2 sidecar-required kinds (csharp_partial_class_audit, csharp_awaited_query_in_loop_audit, csharp_compile_fix_round, csharp_nullable_annotation_repair, unseal_csharp_class, move_csharp_members_to_partial) refuse with error.csharp_sidecar_required until the Roslyn sidecar lands. This call never writes files: the response always has `dry_run: true` and any edits are staged in-memory (returned inline) or, when `output_path=<file>` is passed, written to disk under `$BLACKBOX_STATE_DIR/refactor/plans/`. The response's `plan_path` field is the absolute resolved location; pass either that absolute path or the bare relative filename back to `bbox_refactor_apply(plan_path=…)` — both round-trip cleanly. `output_path` is required when the plan JSON would exceed the MCP transport's parameter-string limit (the response is a compact summary in that case). Supported extraction plans may create a missing target as an empty-original FileEdit; do not pre-create placeholder files or use allow_dirty_worktree=true for normal target creation. `deep_analysis: true` on language plans that support it adds safety reports (captured_variables, external_calls, inherited_dependencies, remaining_source_accessors, remaining_source_constant_refs) — see the language runbook for the exact shape. The plan is reviewable JSON with hash checks, file moves or text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions; semantic rename belongs to LSP, compiler validation, or language-scoped surfaces.",
-        example: Some(
-            r#"bbox_refactor_plan(kind="<supported_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], old_text="exact before", new_text="exact after", project_dir="/repo/x")"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_refactor_apply",
-        category: ToolCategory::Refactor,
-        summary: "Apply a previously generated refactor plan with hash checks, supported-source parse validation, atomic writes, and rollback on write failure.",
-        when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten supported source files before writing. Pass `plan` for inline JSON or `plan_path` for a filesystem path to a plan file written by `bbox_refactor_plan(output_path=...)` — exactly one of the two is required. `plan_path` is the right choice for large plans whose JSON exceeds the MCP transport's parameter-string limit. `plan_path` accepts either the absolute path echoed in the plan response's `plan_path` field (round-trip) or the bare relative filename you passed to `output_path`; both resolve to the same on-disk file under `$BLACKBOX_STATE_DIR/refactor/plans/`. Slot-escaping paths (`/tmp/...`, `../../etc/passwd`) are rejected. Paths must live under registered projects unless allow_unregistered_paths=true is explicitly set for a disposable practice worktree or isolated smoke test.",
-        example: Some(
-            r#"bbox_refactor_apply(plan_path="/tmp/refactor.json", confirm=true) OR bbox_refactor_apply(plan=<plan-json>, confirm=true)"#,
-        ),
-    },
-    ToolDoc {
-        name: "bbox_refactor_run",
-        category: ToolCategory::Refactor,
-        summary: "Compose primitive refactor plans into one transactional run with rollback across touched files.",
-        when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives and validation commands to succeed or fail together. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later required plan or command step fails. Plan steps accept an `optional: true` flag that turns plan-time failures (e.g., a plan step against a file in a curated batch that legitimately has nothing to do) into per-step `skipped` entries rather than aborting + rolling back the batch — use this for bulk batches where a subset of steps may legitimately have nothing to do. Command steps are validation-only unless `touches` declares paths they may mutate; declared touches are snapshotted and included in rollback. Language memories should name the project-specific validation commands; the runner executes them generically.",
-        example: Some(
-            r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<supported_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"command","command":"make","args":["test"],"touches":["generated.lock"]}])"#,
         ),
     },
     // ── Knowledge ────────────────────────────────────────────────────
@@ -1718,73 +1524,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"identity_get(scope="forgejo", instance="local-forgejo15", subject="bro:keystone-review", provider="claude", model="claude-haiku-4-5-20251001")"#,
         ),
     },
-    // ── Macros ────────────────────────────────────────────────────
-    ToolDoc {
-        name: "macro_list",
-        category: ToolCategory::Macros,
-        summary: "List macros from all scopes, merged and deduplicated by id. Returns id, version, scope, title, language, and effects for each macro. Use macro_describe for the full definition.",
-        when_to_use: "Use to discover available macros. Optionally pass `project_dir` to include project-scoped macros from `.bbox/macros/`. Use `macro_describe` after finding a candidate.",
-        example: Some(r#"macro_list(project_dir="/repo/my-project")"#),
-    },
-    ToolDoc {
-        name: "macro_describe",
-        category: ToolCategory::Macros,
-        summary: "Describe a macro by id: returns the full MacroDefinition plus a human-readable summary of operations, probes, and refusals.",
-        when_to_use: "Use after `macro_list` to get the full definition of a candidate macro. Includes all operations, probes, refusals, and validations.",
-        example: Some(
-            r#"macro_describe(id="java.add_service_boundary", project_dir="/repo/my-project")"#,
-        ),
-    },
-    ToolDoc {
-        name: "macro_validate",
-        category: ToolCategory::Macros,
-        summary: "Validate a macro definition without registering it. Accepts an inline definition JSON object. Returns a validation report listing all issues.",
-        when_to_use: "Use before `macro_register` to check that a definition is well-formed. Validates required fields, predicate structure, and operation kinds. Does NOT write anything.",
-        example: Some(
-            r#"macro_validate(definition={"id": "my.macro", "version": "1", "language": "java", "title": "My Macro", "inputs_schema": {"type": "object"}})"#,
-        ),
-    },
-    ToolDoc {
-        name: "macro_register",
-        category: ToolCategory::Macros,
-        summary: "Register a macro in the project scope. Writes to `<project_dir>/.bbox/macros/<id>.json`. Validates before writing. Refuses duplicate id+version unless overwrite=true.",
-        when_to_use: "Use to add a new macro to a project. The definition is validated and written as a JSON file. Set `overwrite=true` to replace an existing macro with the same id.",
-        example: Some(
-            r#"macro_register(project_dir="/repo/my-project", definition={"id": "my.macro", "version": "1", "language": "java", "title": "My Macro", "inputs_schema": {"type": "object"}})"#,
-        ),
-    },
-    ToolDoc {
-        name: "macro_unregister",
-        category: ToolCategory::Macros,
-        summary: "Remove a project-scope macro by id. Deletes `.bbox/macros/<id>.json` from the project directory. Does not affect user or builtin macros.",
-        when_to_use: "Use to remove a project-scope macro that is no longer needed. Only removes the project-scoped file; user and builtin macros with the same id are unaffected.",
-        example: Some(r#"macro_unregister(id="my.macro", project_dir="/repo/my-project")"#),
-    },
-    ToolDoc {
-        name: "macro_plan",
-        category: ToolCategory::Macros,
-        summary: "Plan a macro invocation: resolve the named macro, validate inputs, run the planner pipeline, and return a MacroPlan review artifact. Read-only — never writes files.",
-        when_to_use: "Use before macro_apply or macro_run to preview what a macro will do. Validates inputs against the macro schema, evaluates refusals, and produces a MacroPlan with the full edit set and checks. Always inspect the plan before applying to production code.",
-        example: Some(
-            r#"macro_plan(macro_id="java.add_service_boundary", project_dir="/repo/my-project", inputs={"service_name": "OrderService"})"#,
-        ),
-    },
-    ToolDoc {
-        name: "macro_apply",
-        category: ToolCategory::Macros,
-        summary: "Lower a MacroPlan to a RefactorPlan and apply it to disk. Wraps refactor::apply — no bypass flags are set by default. Requires confirm=true.",
-        when_to_use: "Use after reviewing a MacroPlan returned by macro_plan. Lowers the plan to a RefactorPlan and applies it. Requires confirm=true. No bypass flags (allow_dirty_worktree, allow_unregistered_paths, force_path) are set — use bbox_refactor_apply directly if bypass flags are needed.",
-        example: Some(r#"macro_apply(plan=<MacroPlan JSON from macro_plan>, confirm=true)"#),
-    },
-    ToolDoc {
-        name: "macro_run",
-        category: ToolCategory::Macros,
-        summary: "Plan and apply a macro in a single step. Equivalent to macro_plan followed by macro_apply. Requires confirm=true to execute.",
-        when_to_use: "Use when you have already reviewed what the macro does and want to plan + apply in one call. Short-circuits and returns the plan (without applying) if refusals fire. Requires confirm=true.",
-        example: Some(
-            r#"macro_run(macro_id="java.add_service_boundary", project_dir="/repo/my-project", inputs={"service_name": "OrderService"}, confirm=true)"#,
-        ),
-    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
@@ -2326,7 +2065,6 @@ mod tests {
                     || n.starts_with("system_event_")
                     || n.starts_with("reaction_")
                     || n.starts_with("identity_")
-                    || n.starts_with("macro_")
                 {
                     out.push((n, d));
                 }

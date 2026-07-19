@@ -590,7 +590,7 @@ mod tests {
         assert!(!f.permits("mcp__blackbox__bro_resume"));
         assert!(!f.permits("mcp__blackbox__bro_cancel")); // matched by bro_*
         // Pinned/allowed tools survive.
-        assert!(f.permits("mcp__blackbox__bbox_slice_read"));
+        assert!(f.permits("mcp__blackbox__bbox_search"));
         assert!(f.permits("mcp__blackbox__bbox_stats"));
         // Built-in (non-MCP-qualified) names are never matched by these.
         assert!(f.permits("file_read"));
@@ -616,16 +616,16 @@ mod tests {
             r#"{
                 "mcpServers": {},
                 "tool_placement": {
-                    "mcp__blackbox__bbox_code_node_describe": "in-box",
+                    "mcp__blackbox__bbox_knowledge": "in-box",
                     "mcp__blackbox__bbox_hybrid_search": "out-box",
-                    "mcp__blackbox__bbox_slice_read": "both"
+                    "mcp__blackbox__bbox_search": "both"
                 }
             }"#,
         )
         .unwrap();
         let placements = config.tool_placement;
         assert_eq!(
-            placements.get("mcp__blackbox__bbox_code_node_describe"),
+            placements.get("mcp__blackbox__bbox_knowledge"),
             Some(&ToolPlacement::InBox)
         );
         assert_eq!(
@@ -633,15 +633,15 @@ mod tests {
             Some(&ToolPlacement::OutBox)
         );
         assert_eq!(
-            placements.get("mcp__blackbox__bbox_slice_read"),
+            placements.get("mcp__blackbox__bbox_search"),
             Some(&ToolPlacement::Both)
         );
         assert_eq!(placements.get("mcp__blackbox__unlisted"), None);
 
         let tools = vec![
-            mock_tool("mcp__blackbox__bbox_code_node_describe"),
+            mock_tool("mcp__blackbox__bbox_knowledge"),
             mock_tool("mcp__blackbox__bbox_hybrid_search"),
-            mock_tool("mcp__blackbox__bbox_slice_read"),
+            mock_tool("mcp__blackbox__bbox_search"),
             mock_tool("mcp__blackbox__unlisted"),
         ];
         let (in_box, out_box) = split_mcp_tools_by_placement(&tools, &placements);
@@ -650,15 +650,15 @@ mod tests {
         assert_eq!(
             in_names,
             vec![
-                "mcp__blackbox__bbox_code_node_describe",
-                "mcp__blackbox__bbox_slice_read"
+                "mcp__blackbox__bbox_knowledge",
+                "mcp__blackbox__bbox_search"
             ]
         );
         assert_eq!(
             out_names,
             vec![
                 "mcp__blackbox__bbox_hybrid_search",
-                "mcp__blackbox__bbox_slice_read",
+                "mcp__blackbox__bbox_search",
                 "mcp__blackbox__unlisted"
             ]
         );

@@ -13,11 +13,11 @@ bbox_compile path=system-defaults/mcp-surfaces/routing.json scope=global
 
 | Surface | Audience | What's visible |
 |---|---|---|
-| `default` | constrained day-to-day clients | transcripts, agentic graph, knowledge r/w, threads, notes, inbox, code-nav, atom discovery/invoke/status/resume/delegate, refactor plan/run/status/apply, bro core dispatch (exec/resume/status/cancel/dashboard/team/brofile/agents), `bbox_mcp_surface` |
-| `interactive` | day-to-day interactive coding sessions | default-permissive working set: transcripts, graph, knowledge, threads, notes, inbox, code-nav/refactor, packets, artifacts, project listing, macro tools, identity read, and core bro operations. Hides Badgey, Slack/IRC, allocator/agent/atom catalogs, cron/workflow/arc/webhook/poller/signal tools, councils, whiteboards, workspace tools, system events, and reactions. |
-| `readonly` | reviewers, evaluators, observer agents | search/cite/inspect/find_paths/bundle, knowledge read, thread/note/inbox read, code-nav read, atom discovery, council observation, bro status/dashboard. **No writes, no dispatch, no admin.** |
+| `default` | constrained day-to-day clients | transcripts, agentic graph, knowledge r/w, threads, notes, inbox, atom discovery/invoke/status/resume/delegate, bro core dispatch (exec/resume/status/cancel/dashboard/team/brofile/agents), `bbox_mcp_surface` |
+| `interactive` | day-to-day interactive coding sessions | default-permissive working set: transcripts, graph, knowledge, threads, notes, inbox, packets, artifacts, project listing, identity read, and core bro operations. Hides Badgey, Slack/IRC, allocator/agent/atom catalogs, cron/workflow/arc/webhook/poller/signal tools, councils, whiteboards, workspace tools, system events, and reactions. |
+| `readonly` | reviewers, evaluators, observer agents | search/cite/inspect/find_paths/bundle, knowledge read, thread/note/inbox read, atom discovery, council observation, bro status/dashboard. **No writes, no dispatch, no admin.** |
 | `agent-internal` | dispatched bros inside a workflow or arc | superset of `default` plus whiteboards, councils, when_all/any, signals, broadcast, arc_*. `bro_exec`/`resume`/`cancel` denied as a backstop to the mechanical recursion guard; atom invocation remains policy-gated by atom composition/effect limits. |
-| `ops` | operator/admin sessions | full daemon access — setup tools (slack/webhook/poller/cron), workflow authoring, lifecycle (render/absorb/bootstrap/lint/review), index/embedding admin, artifact management, provenance, destructive refactor. |
+| `ops` | operator/admin sessions | full daemon access — setup tools (slack/webhook/poller/cron), workflow authoring, lifecycle (render/absorb/bootstrap/lint/review), index/embedding admin, artifact management, provenance. |
 
 ## URL examples
 
@@ -84,11 +84,13 @@ bbox_mcp_surface action=list
   `agent-internal` surfaces use an empty allow list plus a disallow list. This
   keeps the packet default-permissive for normal tools while hiding whole
   coordination/admin clusters from narrower surfaces.
-- **`default` keeps `refactor_apply`.** Applying a reviewed refactor plan is a
-  day-to-day code-editing operation, not an ops-only daemon administration
-  surface. `ops` remains the full passthrough surface for setup, lifecycle,
-  indexing, provenance, artifact administration, workflow internals, and other
-  operator-only tools.
+- **No refactor/code-nav/macro tools on any surface.** The daemon's
+  `bbox_refactor_*` / `bbox_slice_*` / `bbox_code_*` / `macro_*` MCP surface is
+  retired; refactor tooling is harness-native (bro-harness isolate bindings).
+  Structural editing capability never enters these packets. `ops` remains the
+  full passthrough surface for setup, lifecycle, indexing, provenance,
+  artifact administration, workflow internals, and other operator-only
+  tools.
 - **Recursion guard is mechanical and orthogonal.** Even if a bro got an
   `agent-internal` surface that allowed `bro_exec`, the dispatch-time recursion
   guard at the provider argv layer would still strip it. The surface filter

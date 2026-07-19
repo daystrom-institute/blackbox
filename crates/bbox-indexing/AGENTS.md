@@ -14,7 +14,7 @@
   uses the conservative managed gate (`resolve_managed_fleet_worktree`):
   only fleet/agent-dispatch and in-tree linked worktrees alias; everything
   else returns None so write-side callers keep their fail-closed fallbacks.
-  Where gap files, threads, slices, and rendered files LAND depends on this.
+  Where gap files, threads, and rendered files LAND depends on this.
   Collapsing the gates writes repo-owned state into arbitrary user
   worktrees.
 - Known quirk, deliberately NOT codified in the resolver: legacy write

@@ -249,8 +249,8 @@ mod tests {
         );
         // Bolded / prefixed reply still parses.
         assert_eq!(
-            parse_suggest("Some reasoning...\n**SUGGEST:** use bbox_slice_move**").as_deref(),
-            Some("use bbox_slice_move")
+            parse_suggest("Some reasoning...\n**SUGGEST:** use hybrid_search**").as_deref(),
+            Some("use hybrid_search")
         );
         // Empty suggestion is not a suggestion.
         assert_eq!(parse_suggest("SUGGEST:   "), None);

@@ -5,8 +5,9 @@ chunker, bbox-lsp, external) and never at `blackbox`. Two consumers share
 this engine, deliberately without a behavioral fork:
 
 - The daemon's v1 MCP adapters (`bbox_refactor_*` plan kinds, refactor runs)
-  — **legacy, on the kill list** (decision af3c4783; refactor-tools-v2 §7
-  strangler). Keep them working; do not grow them. The 100+ plan-kind
+  — RETIRED (decision af3c4783; refactor-tools-v2 §7). The adapters, the
+  macro layer, and the slice/code-nav MCP tools are deleted; this crate is
+  the substrate the harness bindings link. The 100+ plan-kind
   catalog is CLOSED: new capability does not get a new `kind`.
 - bro-harness cell bindings (`code.*`/`edits.*`/`lsp.*`/`java.*`/`analysis.*`)
   — the future. New capability lands as pure, data-returning substrate

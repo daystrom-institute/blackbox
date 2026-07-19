@@ -8,6 +8,38 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Removed
+
+- The daemon's refactor, slice, code-navigation, and macro MCP surface is
+  retired (29 tools): `bbox_refactor_status`, `bbox_refactor_project_refs`,
+  `bbox_refactor_plan_kinds`, `bbox_refactor_plan`, `bbox_refactor_apply`,
+  `bbox_refactor_run`, the six `bbox_slice_*` tools, the eight
+  `bbox_code_*` / `bbox_workspace_symbols` code-nav tools, and the eight
+  `macro_*` tools. Refactor tooling is harness-native: the bro-harness
+  `isolate` and its in-box bindings (`code.*`, `java.*`, `edits.*`,
+  `analysis.*`, `lsp.*`) link the same engine crates with no daemon
+  reach-back (design/bro-harness/refactor-tools-v2.md §6-§7). MCP-only
+  consumers direct refactoring via `bro_exec` / `bro_resume` orchestration
+  or canned atoms. The `bbox-macros` and `bbox-code-nav` crates and the
+  `bbox-indexing` slice/code-nav modules are deleted along with the
+  adapters; `bbox-refactor` and `bbox-lsp` survive as libraries for the
+  harness bindings.
+- The daemon no longer injects the `DaemonRefactor` capability into
+  in-process harness sessions: the flat `refactor_plan` /
+  `refactor_plan_get` tools and the `RefactorCapability` contract-bottom
+  trait are gone. Harness sessions use the isolate bindings only.
+- The daemon's warm LSP session pool (`lsp_sessions`) is removed with its
+  last consumers; the `BLACKBOX_LSP_IDLE_SECS`, `BLACKBOX_JDTLS_*`, and
+  `BLACKBOX_RUST_ANALYZER_*` env vars are inert for the daemon (the config
+  schema still parses them for compatibility). Harness-side LSP lives in
+  `bro-lsp`.
+- Dispatch-time `project_dir` argument defaulting for the retired code-nav
+  tools (`CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS`) is removed; the
+  `BRO_HARNESS_PIN_TOOLS` default pin pattern (`bbox_slice_*`) is now empty.
+- The `readonly` MCP surface packet no longer allows the retired code-nav
+  tools, and brofile allowlists across `system-defaults/brofiles/` and
+  `.bbox/brofiles/` no longer name the retired tools.
+
 ### Fixed
 
 - `blackboxd --help` / `--version` are side-effect-free: they print and

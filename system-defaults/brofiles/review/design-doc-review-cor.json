@@ -17,7 +17,6 @@
       "mcp__blackbox__bbox_notes",
       "mcp__blackbox__bbox_thread_list",
       "mcp__blackbox__bbox_blame",
-      "mcp__blackbox__bbox_code_refs",
       "mcp__blackbox__bbox_note",
       "mcp__blackbox__whiteboard_post",
       "mcp__blackbox__whiteboard_annotate",

@@ -71,15 +71,10 @@ intentional.
 
 ## Code Navigation
 
-Once indexed, these tools operate over source structure:
-
-| Tool | Use |
-|---|---|
-| `bbox_code_symbols` | Project-wide symbol search with exact line ranges. |
-| `bbox_code_query` | Tree-sitter query against one file. |
-| `bbox_code_node_describe` | Inspect grammar shape at a position. |
-| `bbox_code_refs` | Extract syntactic references from a file. |
-| `bbox_refactor_status` | Check parse health and refactorable items. |
+Structural code navigation is harness-native: the bro-harness `isolate`
+bindings (`code.*`, `analysis.*`, `lsp.*`) operate over source structure with
+no daemon MCP surface. See `docs/refactor.md` for the retirement details and
+`PROJECT.md` for the isolate recipes.
 
 For source-aware search across docs/code/commits, use:
 

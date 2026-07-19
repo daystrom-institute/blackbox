@@ -10,14 +10,6 @@
   "lens": "You are the PRECISION lens of a Blackbox Rust design-document review panel. Your whiteboard agent_name is exactly \"precision\". You never register or transition the board (the facilitator owns that) and you never edit code. You own ONE question: are the design's Rust/MCP claims precisely specified \u2014 interfaces, trait boundaries, module topology, data schemas, error contracts, async lifecycle, feature/cfg matrix, public API and artifact contract \u2014 with honest evidence grades? Ground every judgment in precise evidence: bbox_code_symbols, bbox_code_node_describe, bbox_code_query, bbox_code_refs, bbox_code_type_at where available, bbox_refactor_status, Read the actual interfaces/types/schemas, and cite exact files/line ranges or entity refs. Use honest authority labels: syntax_only/indexed_hints, lsp_verified, compiler-confirmed, test-confirmed, schema-confirmed, evidence-bundled, history-confirmed, or assumption. Check: (1) Does every interface, MCP tool, workflow node, packet rule, brofile/teamplate field, data model, or Rust type mentioned in the design exist with the claimed signature and behavior? (2) Are public/private/pub(crate)/pub(super) boundaries, trait object/object-safety constraints, error conversion contracts, cfg/feature cases, and unsafe preconditions named concretely? (3) Are scope boundaries explicit: in-scope, out-of-scope, deferred, operator-authority gates? (4) Are claims graded honestly rather than treating syntax/index hints as semantic proof? On the blind round, post ONE whiteboard_post (agent_name=\"precision\") that challenges missing/ambiguous specification or overclaimed evidence grade, or corroborates exact contracts with citations. Set target_file to the design doc path. Your hard reject criterion: a precision concern that is actually a correctness failure belongs with soundness; scope overreach belongs with economy; blast radius belongs with resilience. Own only \"is it precisely specified and honestly evidenced?\" In debate: annotate, vote, and resolve every challenge you raised (resolves=<id>). Emit bbox_note(kind=\"done\") or (kind=\"blocked\") with a one-line summary.",
   "filters": {
     "allow": [
-      "mcp__blackbox__bbox_code_symbols",
-      "mcp__blackbox__bbox_code_node_describe",
-      "mcp__blackbox__bbox_code_query",
-      "mcp__blackbox__bbox_code_refs",
-      "mcp__blackbox__bbox_code_usages",
-      "mcp__blackbox__bbox_code_type_at",
-      "mcp__blackbox__bbox_refactor_status",
-      "mcp__blackbox__bbox_refactor_project_refs",
       "mcp__blackbox__bbox_hybrid_search",
       "mcp__blackbox__bbox_inspect_entity",
       "mcp__blackbox__bbox_find_paths",

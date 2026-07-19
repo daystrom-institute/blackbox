@@ -27,8 +27,6 @@ members = [
     "crates/bbox-chunker",
     "crates/bbox-lsp",
     "crates/bbox-refactor",
-    "crates/bbox-code-nav",
-    "crates/bbox-macros",
     "crates/bbox-packets",
     "crates/bbox-system-memory",
     "crates/bbox-whiteboards",
@@ -92,14 +90,6 @@ bbox-corpus-index = { path = "crates/bbox-corpus-index" }
 bbox-edge-sidecar = { path = "crates/bbox-edge-sidecar" }
 # Chunking + tree-sitter symbol extraction, extracted from the root crate (stage 1).
 bbox-chunker = { path = "crates/bbox-chunker" }
-# Shared LSP session/conversion helpers, extracted from the root crate (stage 2).
-bbox-lsp = { path = "crates/bbox-lsp" }
-# Structural refactor planners/runners, extracted from the root crate (stage 3).
-bbox-refactor = { path = "crates/bbox-refactor" }
-# Syntax code navigation, extracted from the root crate (stage 4).
-bbox-code-nav = { path = "crates/bbox-code-nav" }
-# Macro planning/model/backend layer, extracted from the root crate (stage 5).
-bbox-macros = { path = "crates/bbox-macros" }
 bbox-packets = { path = "crates/bbox-packets" }
 bbox-system-memory = { path = "crates/bbox-system-memory" }
 bro-core = { path = "crates/bro-core" }

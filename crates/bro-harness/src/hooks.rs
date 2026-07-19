@@ -388,8 +388,9 @@ impl Hook for ShellGrepHook {
         vec![Candidate {
             rule_id: "shell-grep-to-code-search".into(),
             message: "For broad or repeated repo searches, prefer indexed, \
-                      gitignore-aware code/graph search via `bbox_code_query` or \
-                      `bbox_hybrid_search` when those tools fit and are available."
+                      gitignore-aware code/graph search via the `code.*` cell \
+                      bindings or `bbox_hybrid_search` when those fit and are \
+                      available."
                 .into(),
             delivery: Delivery::Rider,
             kind: NudgeKind::Periodic { cooldown: 6 },
@@ -462,10 +463,11 @@ impl RefactorSignpostHook {
         }
         vec![Candidate {
             rule_id: "refactor-signpost".into(),
-            message: "This looks like structured refactor work. Check `sm-refactor` first via \
-                      `bbox_knowledge` — the `bbox_refactor_*` / `bbox_slice_*` tools do guarded, \
-                      semantics-aware structural edits (rename, move item, organize imports) that \
-                      beat hand-editing."
+            message: "This looks like structured refactor work. Use the in-box \
+                      refactor bindings (`code.*` facts, `java.*` transforms, \
+                      `edits.*` mutation choke point, `analysis.*`, `lsp.*`) — \
+                      they do guarded, hash-anchored structural edits (rename, \
+                      move item, organize imports) that beat hand-editing."
                 .into(),
             delivery: Delivery::SystemTail,
             kind: NudgeKind::Signpost,

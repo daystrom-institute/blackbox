@@ -737,7 +737,7 @@ mod tests {
             "mcp__blackbox__bbox_search",
             "mcp__blackbox__bbox_hybrid_search",
             "mcp__blackbox__bbox_knowledge",
-            "mcp__blackbox__bbox_refactor_plan",
+            "mcp__blackbox__bbox_render",
             "mcp__blackbox__bro_exec",
             "mcp__blackbox__bro_status",
         ];
@@ -788,9 +788,9 @@ mod tests {
             disallow: Vec::new(),
             instructions: None,
         };
-        let universe = vec!["bbox_search".to_string(), "bbox_refactor_apply".to_string()];
+        let universe = vec!["bbox_search".to_string(), "bbox_render".to_string()];
         assert!(verdict.permits("bbox_search", &universe));
-        assert!(verdict.permits("bbox_refactor_apply", &universe));
+        assert!(verdict.permits("bbox_render", &universe));
     }
 
     #[test]
@@ -806,17 +806,17 @@ mod tests {
     fn test_disallow_wins_over_allow() {
         let verdict = ToolSurfaceVerdict::ToolSurface {
             allow: vec!["bbox_*".to_string()],
-            disallow: vec!["bbox_refactor_apply".to_string()],
+            disallow: vec!["bbox_render".to_string()],
             instructions: None,
         };
         let universe = vec![
             "bbox_search".to_string(),
-            "bbox_refactor_apply".to_string(),
-            "bbox_refactor_plan".to_string(),
+            "bbox_render".to_string(),
+            "bbox_knowledge".to_string(),
         ];
         assert!(verdict.permits("bbox_search", &universe));
-        assert!(!verdict.permits("bbox_refactor_apply", &universe));
-        assert!(verdict.permits("bbox_refactor_plan", &universe));
+        assert!(!verdict.permits("bbox_render", &universe));
+        assert!(verdict.permits("bbox_knowledge", &universe));
     }
 
     #[test]

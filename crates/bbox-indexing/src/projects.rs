@@ -429,10 +429,9 @@ fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 /// check accepts the worktree while callers can still tell it apart from a
 /// first-class registered root.
 ///
-/// Shared by the slice tools ([`crate::slices`]) and code navigation
-/// ([`crate::code_nav`]) so a fleet-dispatched agent working inside an isolated
-/// worktree can use project-scoped tools without registering each ephemeral
-/// worktree.
+/// Shared by project-scoped tool callers so a fleet-dispatched agent working
+/// inside an isolated worktree can use project-scoped tools without
+/// registering each ephemeral worktree.
 pub fn managed_fleet_worktree_project(
     project_dir: Option<&str>,
     projects: &[ProjectRecord],
@@ -557,7 +556,7 @@ fn in_tree_linked_worktree_top(path: &Path, root: &Path) -> Option<PathBuf> {
 // Read-side base-project resolution lives in bbox-corpus-core (next to
 // ProjectRecord) so index ingest passes below this crate can stamp docs
 // with it; re-exported here for the daemon-side callers. The write-side
-// aliasing gates (gaps/threads/slices/code_nav) stay with the conservative
+// aliasing gates (gaps/threads/rendered files) stay with the conservative
 // [`resolve_managed_fleet_worktree`] in this module.
 pub use bbox_corpus_core::project_record::resolve_base_project_for_scope;
 

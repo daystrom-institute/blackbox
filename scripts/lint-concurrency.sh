@@ -38,7 +38,7 @@ ALLOWLIST = {
     "badgey_list", "badgey_proposals_list", "badgey_status",
     "badgey_triage_inbox", "bbox_artifact_list", "bbox_describe_schema",
     "bbox_embed_status", "bbox_gaps", "bbox_mcp_surface", "bbox_notes",
-    "bbox_project_list", "bbox_refactor_plan_kinds", "bbox_thread_list",
+    "bbox_project_list", "bbox_thread_list",
     "bro_agent_describe", "bro_agent_get", "bro_agent_list",
     "bro_agent_search", "bro_allocator_probe", "bro_allocator_status",
     "bro_allocator_trace", "bro_brofile", "bro_cancel", "bro_council_list",

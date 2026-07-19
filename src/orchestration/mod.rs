@@ -1728,13 +1728,13 @@ that composes tool calls in-process — the whole tool surface is available as t
 typed `tools.*` namespace, `text(...)` emits output to your context, and \
 `store(...)`/`load(...)` persist values across cells in the session; `wait` to \
 resume a still-running cell by `cell_id`; \
-`bbox_refactor_status` then `bbox_refactor_plan` for guarded refactor planning; \
+the `code.*`/`java.*`/`edits.*`/`analysis.*`/`lsp.*` cell bindings for \
+structural refactor and code-navigation work; \
 `bro_exec` then `bro_wait`/`bro_status`/`bro_resume` for ad-hoc child agents. \
 A cell's nested `tools.X(...)` call dispatches the same filtered tool the flat \
-surface exposes (the deny policy is honored in-box). Use \
-`bbox_refactor_plan_kinds` after status inventory to pick \
-a safe planning kind. If a child bro completes with an empty/suspicious result, \
-or an LSP-backed refactor plan stays `tool_running` after a wait timeout, call \
+surface exposes (the deny policy is honored in-box). If a child bro completes \
+with an empty/suspicious result, or a long-running cell stays `tool_running` \
+after a wait timeout, call \
 `bro_status(tail=N)` before resuming, cancelling, or filing a gap.\n\
   - Prefer `work_smart_read` over `Read` for file inspection.\n\
   - Prefer `work_bash` over `Bash` for shell commands.\n\
@@ -1927,23 +1927,6 @@ const RETRIEVAL_PROJECT_DEFAULT_TOOLS: &[&str] =
 const GAP_WRITE_TARGET_DEFAULT_TOOLS: &[&str] =
     &["bbox_gap", "bbox_gap_resolve", "bbox_gap_update"];
 
-/// Code-nav read tools whose `project_dir` param is the read root (file
-/// resolution / parse scan / LSP session root). All read-only; the mutating
-/// refactor tools are deliberately absent. These need `default:` entries on
-/// every dispatch shape because the `pin` flavor refuses mismatches but
-/// never fills an elided param.
-const CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS: &[&str] = &[
-    "bbox_code_query",
-    "bbox_code_symbols",
-    "bbox_code_node_describe",
-    "bbox_code_refs",
-    "bbox_code_usages",
-    "bbox_code_implementations",
-    "bbox_code_type_at",
-    "bbox_code_outline",
-    "bbox_workspace_symbols",
-];
-
 impl AmbientContext {
     /// Pending session IDs (non-Claude providers before the CLI emits
     /// one) carry no useful linkage — omit rather than leak the literal
@@ -2035,19 +2018,6 @@ impl AmbientContext {
             // param, and `scope="global"` / global gaps still win server-side.
             for tool in GAP_WRITE_TARGET_DEFAULT_TOOLS {
                 defaults.insert(format!("default:mcp.{tool}.project"), canonical_cwd.clone());
-            }
-            // `project_dir`-named read params need explicit defaults on every
-            // dispatch shape: the `pin` flavor only refuses mismatches, it
-            // never fills an elided param. On worktree dispatches the value
-            // MUST equal the pin target exactly — defaults apply before pins,
-            // so a default of a worktree *subdir* would pin-conflict every
-            // elided call.
-            let dir_value = worktree
-                .as_ref()
-                .map(|w| w.to_string_lossy().into_owned())
-                .unwrap_or_else(|| canonical_cwd.clone());
-            for tool in CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS {
-                defaults.insert(format!("default:mcp.{tool}.project_dir"), dir_value.clone());
             }
         }
         (!defaults.is_empty()).then_some(defaults)
@@ -6489,9 +6459,8 @@ mod tests {
 
     #[test]
     fn ambient_tool_defaults_scope_retrieval_reads_to_plain_repo_cwd() {
-        // Plain repo (.git directory): retrieval `project` filters and
-        // code-nav `project_dir` read roots default to the canonicalized
-        // dispatch cwd; no worktree pin.
+        // Plain repo (.git directory): retrieval `project` filters default to
+        // the canonicalized dispatch cwd; no worktree pin.
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().canonicalize().unwrap().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -6515,24 +6484,14 @@ mod tests {
                 Some(cwd_str.as_str())
             );
         }
-        for tool in super::CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS {
-            assert_eq!(
-                defaults
-                    .get(&format!("default:mcp.{tool}.project_dir"))
-                    .map(String::as_str),
-                Some(cwd_str.as_str()),
-                "missing project_dir default for {tool}"
-            );
-        }
     }
 
     #[test]
     fn ambient_tool_defaults_align_project_dir_defaults_with_worktree_pin() {
         // Worktree dispatch from a subdir: the `project` filter defaults to
         // the canonicalized cwd (server-side scope aliasing maps it to the
-        // base project), while `project_dir` defaults MUST equal the pin
-        // value (the canonical worktree root) — defaults fill before pins
-        // check, so any other value would pin-conflict every elided call.
+        // base project), while the worktree pin targets the canonical
+        // worktree root.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let (_base, wt) = fake_linked_worktree(&root);
@@ -6561,15 +6520,6 @@ mod tests {
                 .map(String::as_str),
             Some(cwd.to_string_lossy().as_ref())
         );
-        for tool in super::CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS {
-            assert_eq!(
-                defaults
-                    .get(&format!("default:mcp.{tool}.project_dir"))
-                    .map(String::as_str),
-                Some(pin.as_str()),
-                "project_dir default for {tool} must match the pin value"
-            );
-        }
     }
 
     #[test]
@@ -6778,8 +6728,7 @@ mod tests {
         // project-scoped coordination tools take `project`, not
         // `cwd`/`project_dir` — absence there means *global scope* and must
         // stay free. Tripwire: if these adapters ever grow a `cwd` or
-        // `project_dir` param, re-check the globs (and the
-        // CODE_NAV_PROJECT_DIR_DEFAULT_TOOLS defaults) before shipping.
+        // `project_dir` param, re-check the globs before shipping.
         for (name, src) in [
             ("notes", include_str!("../tools/notes.rs")),
             ("knowledge", include_str!("../tools/knowledge.rs")),

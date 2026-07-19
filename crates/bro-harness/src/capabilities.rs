@@ -16,8 +16,8 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup, RefactorCapability,
-    RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
+    AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup, ToolCallOutput, ToolCapability,
+    ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
@@ -29,7 +29,6 @@ use serde_json::{Value, json};
 /// pulled — the harness keeps no dependency on the daemon.
 static CORPUS: RwLock<Option<Arc<dyn CorpusCapability>>> = RwLock::new(None);
 static ATOMS: RwLock<Option<Arc<dyn AtomCapability>>> = RwLock::new(None);
-static REFACTOR: RwLock<Option<Arc<dyn RefactorCapability>>> = RwLock::new(None);
 
 /// Install the daemon's in-memory corpus implementation. Called once, at daemon
 /// startup, from the `blackbox` crate. Last writer wins.
@@ -43,12 +42,6 @@ pub fn install_atoms(capability: Arc<dyn AtomCapability>) {
     *ATOMS.write().expect("atom capability slot poisoned") = Some(capability);
 }
 
-/// Install the daemon's in-memory refactor implementation. Called once, at
-/// daemon startup, from the `blackbox` crate. Last writer wins.
-pub fn install_refactor(capability: Arc<dyn RefactorCapability>) {
-    *REFACTOR.write().expect("refactor capability slot poisoned") = Some(capability);
-}
-
 fn corpus() -> Option<Arc<dyn CorpusCapability>> {
     CORPUS
         .read()
@@ -58,13 +51,6 @@ fn corpus() -> Option<Arc<dyn CorpusCapability>> {
 
 fn atoms() -> Option<Arc<dyn AtomCapability>> {
     ATOMS.read().expect("atom capability slot poisoned").clone()
-}
-
-fn refactor() -> Option<Arc<dyn RefactorCapability>> {
-    REFACTOR
-        .read()
-        .expect("refactor capability slot poisoned")
-        .clone()
 }
 
 /// The generic host built-in tool seam: a code-mode cell's `tools.*` call
@@ -140,7 +126,7 @@ impl ToolCapability for HostTools {
 /// The authorial surface (cells) is now code-mode's `exec`/`wait`
 /// (`crate::code_mode`), which supersedes the retired NARF tools. These remaining
 /// tools are the direct trait-dispatch surfaces: corpus search, atom invoke,
-/// refactor plan, and KV inspection.
+/// and KV inspection.
 pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     if let Some(c) = corpus() {
@@ -148,10 +134,6 @@ pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
     }
     if let Some(a) = atoms() {
         tools.push(Arc::new(AtomInvokeTool(a)));
-    }
-    if let Some(r) = refactor() {
-        tools.push(Arc::new(RefactorPlanTool(r.clone())));
-        tools.push(Arc::new(RefactorPlanGetTool(r)));
     }
     tools
 }
@@ -263,105 +245,10 @@ impl Tool for AtomInvokeTool {
     }
 }
 
-/// `refactor_plan`: produce a dry-run plan via a direct trait call. The plan is
-/// stored host-side; only the handle (id + preview) enters context (§6/§9).
-struct RefactorPlanTool(Arc<dyn RefactorCapability>);
-
-#[async_trait]
-impl Tool for RefactorPlanTool {
-    fn name(&self) -> &str {
-        "refactor_plan"
-    }
-
-    fn description(&self) -> &str {
-        "Create a dry-run structural refactor plan in-process (no MCP \
-         round-trip). Returns a handle {id, preview}; the full plan stays \
-         host-side — fetch it with refactor_plan_get."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "description": "Refactor plan kind (pull sm-refactor for the catalog)."
-                },
-                "params": {
-                    "type": "object",
-                    "description": "Plan-kind parameters (source, target, item_names, ...)."
-                }
-            },
-            "required": ["kind", "params"]
-        })
-    }
-
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let kind = match input.get("kind").and_then(Value::as_str) {
-            Some(k) if !k.trim().is_empty() => k.to_string(),
-            _ => return ToolResult::Error("refactor_plan: `kind` is required".into()),
-        };
-        let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
-        match self
-            .0
-            .plan_refactor(RefactorRequest {
-                kind,
-                input_json: params,
-            })
-            .await
-        {
-            Ok(handle) => ToolResult::Json(json!({
-                "id": handle.id,
-                "preview": handle.preview,
-            })),
-            Err(e) => ToolResult::Error(format!("refactor_plan failed: {}: {}", e.code, e.message)),
-        }
-    }
-}
-
-/// `refactor_plan_get`: materialize a host-side plan by its handle id.
-struct RefactorPlanGetTool(Arc<dyn RefactorCapability>);
-
-#[async_trait]
-impl Tool for RefactorPlanGetTool {
-    fn name(&self) -> &str {
-        "refactor_plan_get"
-    }
-
-    fn description(&self) -> &str {
-        "Materialize the full JSON of a refactor plan previously produced by \
-         refactor_plan, by its handle id."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Plan handle id." }
-            },
-            "required": ["id"]
-        })
-    }
-
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let id = match input.get("id").and_then(Value::as_str) {
-            Some(i) if !i.trim().is_empty() => i.to_string(),
-            _ => return ToolResult::Error("refactor_plan_get: `id` is required".into()),
-        };
-        match self.0.materialize_plan(id).await {
-            Ok(plan) => ToolResult::Json(plan),
-            Err(e) => ToolResult::Error(format!(
-                "refactor_plan_get failed: {}: {}",
-                e.code, e.message
-            )),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bro_capabilities::{AtomOutput, CapabilityResult, CorpusHit, RefactorPlanHandle};
+    use bro_capabilities::{AtomOutput, CapabilityResult, CorpusHit};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Stub capability that records invocations — proves the tool dispatches to
@@ -465,78 +352,6 @@ mod tests {
     async fn atom_invoke_requires_ref() {
         let tool = AtomInvokeTool(Arc::new(StubAtoms));
         let result = tool.call(json!({ "args": {} }), &test_cx()).await;
-        assert!(matches!(result, ToolResult::Error(_)));
-    }
-
-    /// Stub refactor capability with a tiny host-side store, proving the
-    /// plan→handle→materialize round-trip stays server-side.
-    #[derive(Default)]
-    struct StubRefactor {
-        plans: std::sync::Mutex<std::collections::HashMap<String, Value>>,
-    }
-
-    #[async_trait]
-    impl RefactorCapability for StubRefactor {
-        async fn plan_refactor(
-            &self,
-            request: RefactorRequest,
-        ) -> CapabilityResult<RefactorPlanHandle> {
-            let id = format!("plan-{}", request.kind);
-            let plan = json!({ "kind": request.kind, "params": request.input_json });
-            self.plans.lock().unwrap().insert(id.clone(), plan);
-            Ok(RefactorPlanHandle {
-                id,
-                preview: "1 edit".to_string(),
-            })
-        }
-
-        async fn materialize_plan(&self, id: String) -> CapabilityResult<Value> {
-            self.plans
-                .lock()
-                .unwrap()
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| bro_core::BroError::new("unknown_plan", id))
-        }
-    }
-
-    #[tokio::test]
-    async fn refactor_plan_handle_round_trips_host_side() {
-        let cap = Arc::new(StubRefactor::default());
-        let plan_tool = RefactorPlanTool(cap.clone());
-        let get_tool = RefactorPlanGetTool(cap.clone());
-
-        // plan_refactor returns only a handle — the full plan never enters here.
-        let handle = plan_tool
-            .call(
-                json!({ "kind": "rust_lsp_rename", "params": { "source": "a.rs" } }),
-                &test_cx(),
-            )
-            .await;
-        let id = match handle {
-            ToolResult::Json(v) => {
-                assert_eq!(v["preview"], "1 edit");
-                v["id"].as_str().unwrap().to_string()
-            }
-            other => panic!("expected Json handle, got {other:?}"),
-        };
-
-        // materialize dereferences the host-side plan by id.
-        let plan = get_tool.call(json!({ "id": id }), &test_cx()).await;
-        match plan {
-            ToolResult::Json(v) => {
-                assert_eq!(v["kind"], "rust_lsp_rename");
-                assert_eq!(v["params"]["source"], "a.rs");
-            }
-            other => panic!("expected Json plan, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn refactor_plan_get_unknown_id_errors() {
-        let cap = Arc::new(StubRefactor::default());
-        let get_tool = RefactorPlanGetTool(cap);
-        let result = get_tool.call(json!({ "id": "nope" }), &test_cx()).await;
         assert!(matches!(result, ToolResult::Error(_)));
     }
 

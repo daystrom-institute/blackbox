@@ -14,5 +14,7 @@
   A provider needing edges for existence must degrade closed, not guess.
 - A symbol's `defn_hash` IS the defining chunk's `chunk_hash`
   (`symbol_ref` in bbox-corpus-index project_files.rs) — current symbol
-  refs are derivable from `bbox_refactor_project_refs` output without any
-  search. The eval refresh tooling depends on this equality.
+  refs were derivable from the retired `bbox_refactor_project_refs` MCP
+  output without any search; the harness-side equivalent lives in the
+  isolate `code.*` bindings. The eval refresh tooling depends on this
+  equality.

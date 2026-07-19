@@ -92,7 +92,7 @@ a non-empty `allow` list is an explicit allowlist - only listed tools are visibl
           "bbox_thread", "bbox_render", "bbox_absorb",
           "bro_exec", "bro_resume", "bro_broadcast",
           "bro_orchestrate_run", "bro_orchestrate_author",
-          "bbox_refactor_*", "bbox_artifact_install"
+          "bbox_artifact_install"
         ],
         "instructions": "Read-only surface. Inspect and search freely; do not propose writes."
       }

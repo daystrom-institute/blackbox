@@ -42,21 +42,6 @@ pub trait CorpusCapability: Send + Sync {
     async fn search_corpus(&self, lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefactorRequest {
-    pub kind: String,
-    pub input_json: serde_json::Value,
-}
-
-/// A handle to a refactor plan that stays host-side. Only the id (for later
-/// materialization) and a short preview enter the model's context — the §6/§9
-/// ref-handle model: large results never cross into the prompt or over a wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefactorPlanHandle {
-    pub id: String,
-    pub preview: String,
-}
-
 /// One host built-in tool invocation: the tool's registered name plus its raw
 /// JSON input. This is the generic "invoke a bro-tools built-in by name" seam —
 /// one bridge rather than N bespoke traits. The implementer (the harness) owns
@@ -87,17 +72,4 @@ pub struct ToolCallOutput {
 #[async_trait]
 pub trait ToolCapability: Send + Sync {
     async fn call_tool(&self, invocation: ToolInvocation) -> CapabilityResult<ToolCallOutput>;
-}
-
-#[async_trait]
-pub trait RefactorCapability: Send + Sync {
-    /// Produce a dry-run plan, store it host-side, and return a handle. The
-    /// full plan JSON is *not* returned — it is dereferenced on demand via
-    /// [`RefactorCapability::materialize_plan`].
-    async fn plan_refactor(&self, request: RefactorRequest)
-    -> CapabilityResult<RefactorPlanHandle>;
-
-    /// Materialize a previously produced plan by its handle id. Errors if the
-    /// id is unknown (e.g. evicted, or never produced on this host).
-    async fn materialize_plan(&self, id: String) -> CapabilityResult<serde_json::Value>;
 }

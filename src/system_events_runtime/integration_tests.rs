@@ -6,7 +6,6 @@ use rmcp::handler::server::wrapper::Parameters;
 
 use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
-use crate::lsp;
 use crate::notes::Notes;
 use crate::orchestration;
 use crate::orchestration::TaskStore;
@@ -128,7 +127,6 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         slack_proposal_links: Arc::new(
             slack_proposal_links::SlackProposalLinks::open(&tmp.path().join("bro")).unwrap(),
         ),
-        lsp_sessions: lsp::LspSessionManager::new(),
         config: Arc::new(RwLock::new(
             crate::config::load()
                 .unwrap_or_else(|e| panic!("loading config for test SharedState: {e}")),

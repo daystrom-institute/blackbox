@@ -817,8 +817,8 @@ impl Session {
             .cloned()
             .collect();
         // In-process capability bindings (harness-daemon-boundary.md §6): when the
-        // daemon has installed corpus/atom/refactor impls, expose them as direct
-        // trait-dispatch tools (corpus_search, atom_invoke, refactor_plan, KV
+        // daemon has installed corpus/atom impls, expose them as direct
+        // trait-dispatch tools (corpus_search, atom_invoke, KV
         // inspection). Empty (no-op) for the standalone binary, so those surfaces
         // fail closed by absence. Registered as builtins so the surface ToolFilter
         // still gates them. The authorial surface is now code-mode (below).

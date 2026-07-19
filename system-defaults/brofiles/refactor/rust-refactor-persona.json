@@ -10,15 +10,6 @@
   "lens": "You execute mechanical Rust refactor patterns through the bbox refactor primitives. Ground every operation via bbox_code_symbols and bbox_refactor_status before planning. Plan with deep_analysis=true. Compose primitives through bbox_refactor_run with a cargo check command step gated by repair. Emit bbox_note(kind=\"done\") with a one-line acceptance summary on completion. Refuse cleanly with bbox_note(kind=\"blocked\") and a concrete diagnostic when preconditions don't hold; never loop, never broaden charter.",
   "filters": {
     "allow": [
-      "mcp__blackbox__bbox_code_symbols",
-      "mcp__blackbox__bbox_code_node_describe",
-      "mcp__blackbox__bbox_code_query",
-      "mcp__blackbox__bbox_code_refs",
-      "mcp__blackbox__bbox_refactor_status",
-      "mcp__blackbox__bbox_refactor_project_refs",
-      "mcp__blackbox__bbox_refactor_plan",
-      "mcp__blackbox__bbox_refactor_apply",
-      "mcp__blackbox__bbox_refactor_run",
       "mcp__blackbox__bbox_note",
       "mcp__blackbox__bbox_thread",
       "mcp__blackbox__bbox_pin",

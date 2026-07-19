@@ -930,15 +930,6 @@ mod tests {
         let f = bf.filters.expect("filters present");
 
         let expected_allow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_code_symbols",
-            "mcp__blackbox__bbox_code_node_describe",
-            "mcp__blackbox__bbox_code_query",
-            "mcp__blackbox__bbox_code_refs",
-            "mcp__blackbox__bbox_refactor_status",
-            "mcp__blackbox__bbox_refactor_project_refs",
-            "mcp__blackbox__bbox_refactor_plan",
-            "mcp__blackbox__bbox_refactor_apply",
-            "mcp__blackbox__bbox_refactor_run",
             "mcp__blackbox__bbox_note",
             "mcp__blackbox__bbox_thread",
             "mcp__blackbox__bbox_pin",
@@ -1002,15 +993,6 @@ mod tests {
         let f = bf.filters.expect("filters present");
 
         let expected_allow: Vec<&str> = vec![
-            "mcp__blackbox__bbox_code_symbols",
-            "mcp__blackbox__bbox_code_node_describe",
-            "mcp__blackbox__bbox_code_query",
-            "mcp__blackbox__bbox_code_refs",
-            "mcp__blackbox__bbox_refactor_status",
-            "mcp__blackbox__bbox_refactor_project_refs",
-            "mcp__blackbox__bbox_refactor_plan",
-            "mcp__blackbox__bbox_refactor_apply",
-            "mcp__blackbox__bbox_refactor_run",
             "mcp__blackbox__bbox_note",
             "mcp__blackbox__bbox_thread",
             "mcp__blackbox__bbox_pin",

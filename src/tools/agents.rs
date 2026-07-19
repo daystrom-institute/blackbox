@@ -2706,7 +2706,7 @@ mod tests {
                             "acknowledge_public_api_change": {"type": "boolean"}
                         }
                     },
-                    "prompt_template": "bbox_refactor_run(confirm=true, steps=[], toml_entries={\"acknowledge_public_api_change\": true})"
+                    "prompt_template": "refactor_run(confirm=true, steps=[], toml_entries={\"acknowledge_public_api_change\": true})"
                 },
             },
         }),
@@ -2759,7 +2759,7 @@ mod tests {
                             "acknowledge_public_api_change": {"type": "boolean"}
                         }
                     },
-                    "prompt_template": "bbox_refactor_run(confirm=true, toml_entries={\"acknowledge_public_api_change\":true})"
+                    "prompt_template": "refactor_run(confirm=true, toml_entries={\"acknowledge_public_api_change\":true})"
                 },
             },
         }),
