@@ -252,7 +252,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             src.join("remote.rs"),
-            "use crate::Store;\n\npub fn call(store: &Store) { store.fetch(1); }\n",
+            "use crate::Store;\n\npub fn call() { Store::fetch(1); }\n",
         )
         .unwrap();
 
@@ -290,7 +290,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|path| path.as_str().is_some_and(|path| path.ends_with("remote")))
+                .any(|path| path == "crate::remote")
         );
     }
 
