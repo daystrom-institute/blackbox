@@ -273,6 +273,30 @@ impl LspState {
             .await
             .map_err(render_lsp_error)
     }
+
+    pub(super) async fn code_action(
+        &self,
+        doc: &OpenDocument,
+        range: lsp_types::Range,
+        wait_ready: Duration,
+    ) -> Result<Vec<lsp_types::CodeActionOrCommand>, String> {
+        self.pool
+            .code_action(doc, range, wait_ready)
+            .await
+            .map_err(render_lsp_error)
+    }
+
+    pub(super) async fn code_action_resolve(
+        &self,
+        root: &Path,
+        language: Language,
+        action: lsp_types::CodeAction,
+    ) -> Result<lsp_types::CodeAction, String> {
+        self.pool
+            .code_action_resolve(root, language, action)
+            .await
+            .map_err(render_lsp_error)
+    }
 }
 
 fn render_lsp_error(e: bro_lsp::Error) -> String {
@@ -1086,16 +1110,377 @@ impl Tool for LspReferences {
     }
 }
 
+/// Maximum code actions returned from a bare `lsp.assist` list call, per the
+/// isolate-heap discipline (fan-out bindings bound their payload).
+const MAX_ASSIST_ACTIONS: usize = 64;
+
+/// Check whether text contains snippet-editing constructs (`${...}` or
+/// `$digit` tabstops) and try to losslessly flatten them. Returns `None`
+/// when the snippet cannot be flattened, signalling the caller to refuse
+/// with a named hint.
+fn try_flatten_snippet_text(text: &str) -> Option<String> {
+    if !text.contains('$') {
+        return Some(text.to_string());
+    }
+    // Scan for snippet tabstops. Flattenable: $0, ${0}, ${0:default}.
+    // Any other ${...} or $digit pattern is non-flattenable.
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                let digit = chars[i + 1];
+                if digit == '0' {
+                    // Flatten $0 to nothing
+                    i += 2;
+                    continue;
+                }
+                // Non-zero tabstop: not flattenable
+                return None;
+            } else if i + 1 < chars.len() && chars[i + 1] == '{' {
+                // Find the closing brace
+                let close = match chars[i + 2..].iter().position(|&c| c == '}') {
+                    Some(pos) => i + 2 + pos,
+                    None => return None,
+                };
+                let inner: String = chars[i + 2..close].iter().collect();
+                if inner == "0" {
+                    // ${0} -> nothing
+                    i = close + 1;
+                    continue;
+                } else if inner.starts_with("0:") {
+                    // ${0:default} -> default
+                    out.push_str(&inner[2..]);
+                    i = close + 1;
+                    continue;
+                }
+                // Other placeholder: not flattenable
+                return None;
+            } else {
+                // Bare $ at end of string or $ followed by non-digit/non-brace
+                out.push('$');
+                i += 1;
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Guard 1: check every new_text in a list of (Span, new_text) pairs for
+/// snippet constructs. Returns the edits unchanged when no snippets are
+/// found, or a refusal ToolResult when a snippet cannot be flattened.
+fn snippet_guard(changes: &[(Span, String)]) -> Result<Vec<(Span, String)>, ToolResult> {
+    let mut flattened = Vec::with_capacity(changes.len());
+    for (span, new_text) in changes {
+        match try_flatten_snippet_text(new_text) {
+            Some(flat) => flattened.push((span.clone(), flat)),
+            None => {
+                return Err(ToolResult::Error(format!(
+                    "lsp.assist: resolved action contains snippet edits that cannot be losslessly flattened (e.g. ${{1:name}} tabstops) in file {} at bytes {}-{}. Consider using the assist interactively in an editor, or flatten the snippet manually after applying.",
+                    span.file, span.byte_start, span.byte_end,
+                )))
+            }
+        }
+    }
+    Ok(flattened)
+}
+
+pub struct LspAssist(pub Arc<LspState>, pub Arc<ProvenanceLedger>);
+
+#[derive(Deserialize)]
+struct AssistParams {
+    span: Span,
+    #[serde(default, rename = "wait_ready_ms", alias = "waitReadyMs")]
+    wait_ready_ms: Option<u64>,
+    /// Apply mode: select the action by its zero-based index from the list.
+    #[serde(default)]
+    select: Option<usize>,
+    /// Bare-call optional filters — narrow the menu without an allowlist.
+    #[serde(default, rename = "kind_prefix", alias = "kindPrefix")]
+    kind_prefix: Option<String>,
+    #[serde(default, rename = "title_filter", alias = "titleFilter")]
+    title_filter: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[async_trait]
+impl Tool for LspAssist {
+    fn name(&self) -> &str {
+        "lsp.assist"
+    }
+    fn description(&self) -> &str {
+        "List-then-apply code actions (assists, quick-fixes, refactors) from the language server at a span (rust-analyzer for Rust, JDTLS for Java; warms on first use). Bare call: `lsp.assist({span})` returns `{actions: [{index, title, kind, is_preferred}], truncated, total_count}` — the server's offered actions, capped at 64. Apply: `lsp.assist({span, select: <index>})` resolves the chosen action, converts its WorkspaceEdit to hash-anchored {changes, resource_ops, findings} for edits.merge at lsp_verified lineage. Three mechanical guards: snippet-edit actions are flattened when lossless (refused with a hint otherwise); command-returning actions (no edit) are refused with a pointer at lsp.executeCommand; result lists capped. Optional free-form kind_prefix/title_filter selectors narrow the menu; no static allowlist. Fails closed when the server is unavailable (RX-V3)."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "span": span_schema_pub(),
+                "wait_ready_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Milliseconds to wait for the language server to report ready. Defaults to 120000; 0 disables the readiness wait."
+                },
+                "waitReadyMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Alias for wait_ready_ms."
+                },
+                "select": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Zero-based index of the action to apply. When set, resolves the action and returns hash-anchored changes (list-then-apply)."
+                },
+                "kind_prefix": {
+                    "type": "string",
+                    "description": "Optional CodeActionKind prefix to filter the menu (e.g. \"refactor.extract\")."
+                },
+                "kindPrefix": {
+                    "type": "string",
+                    "description": "Alias for kind_prefix."
+                },
+                "title_filter": {
+                    "type": "string",
+                    "description": "Optional case-insensitive substring match on action titles to narrow the menu."
+                },
+                "titleFilter": {
+                    "type": "string",
+                    "description": "Alias for title_filter."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Max actions to return in the list. Defaults to 64 (isolate-heap cap); truncation is reported."
+                }
+            },
+            "required": ["span"]
+        })
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
+    }
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        Some(("lsp".to_string(), "assist".to_string()))
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let params: AssistParams = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return err(format!(
+                    "lsp.assist: bad input — expected {{ span: Span, select?: number, kind_prefix?: string, title_filter?: string }}; {e}"
+                ));
+            }
+        };
+        let span = params.span;
+        let abs = match bro_tools::workspace::resolve_in_root(&cx.root, &span.file) {
+            Ok(p) => p,
+            Err(e) => return err(format!("lsp.assist: {}: {e}", span.file)),
+        };
+        let language = match language_for_file(&abs) {
+            Ok(l) => l,
+            Err(e) => return err(format!("lsp.assist: {e}")),
+        };
+        let bytes = match tokio::fs::read(&abs).await {
+            Ok(b) => b,
+            Err(e) => return err(format!("lsp.assist: {}: {e}", span.file)),
+        };
+        let sha = bbox_refactor::sha256_hex(&bytes);
+        if sha != span.content_sha256 {
+            return err(format!(
+                "lsp.assist: stale_span: {} changed since the span was minted (span hash {}, current {sha}); re-derive the span from fresh facts",
+                span.file, span.content_sha256
+            ));
+        }
+        let source = String::from_utf8_lossy(&bytes).to_string();
+        let doc = match self
+            .0
+            .ensure_current(&cx.root, &abs, language, &source, &sha)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => return err(format!("lsp.assist: {e}")),
+        };
+        let wait_ready = wait_ready_duration(params.wait_ready_ms);
+        // Convert span byte range to LSP range.
+        let range = lsp_types::Range {
+            start: byte_to_position(&source, span.byte_start),
+            end: byte_to_position(&source, span.byte_end),
+        };
+        // Fetch code actions from the server.
+        let raw_actions = match self.0.code_action(&doc, range, wait_ready).await {
+            Ok(a) => a,
+            Err(e) => return err(format!("lsp.assist: {e}")),
+        };
+        // Separate CodeActions from Commands; extract indexable info.
+        let mut indexed: Vec<(usize, lsp_types::CodeAction)> = Vec::new();
+        let mut command_only_count = 0usize;
+        for item in raw_actions {
+            match item {
+                lsp_types::CodeActionOrCommand::CodeAction(ca) => {
+                    indexed.push((indexed.len(), ca));
+                }
+                lsp_types::CodeActionOrCommand::Command(_cmd) => {
+                    command_only_count += 1;
+                }
+            }
+        }
+        let total_code_actions = indexed.len();
+        // Apply optional filters (bare call only).
+        if params.select.is_none() {
+            if let Some(ref prefix) = params.kind_prefix {
+                let prefix_lower = prefix.to_lowercase();
+                indexed.retain(|(_, ca)| {
+                    ca.kind
+                        .as_ref()
+                        .is_some_and(|k| k.as_str().to_lowercase().starts_with(&prefix_lower))
+                });
+            }
+            if let Some(ref filter) = params.title_filter {
+                let filter_lower = filter.to_lowercase();
+                indexed.retain(|(_, ca)| ca.title.to_lowercase().contains(&filter_lower));
+            }
+        }
+        let limit = params.limit.unwrap_or(MAX_ASSIST_ACTIONS);
+        if limit == 0 {
+            return err("lsp.assist: limit must be >= 1");
+        }
+        let is_list_mode = params.select.is_none();
+        let truncated = indexed.len() > limit;
+        if truncated {
+            indexed.truncate(limit);
+        }
+        // Bare call: return the menu.
+        if is_list_mode {
+            let actions: Vec<Value> = indexed
+                .into_iter()
+                .map(|(idx, ca)| {
+                    json!({
+                        "index": idx,
+                        "title": ca.title,
+                        "kind": ca.kind.as_ref().map(|k| k.as_str()),
+                        "is_preferred": ca.is_preferred.unwrap_or(false),
+                    })
+                })
+                .collect();
+            return ToolResult::Json(json!({
+                "actions": actions,
+                "truncated": truncated,
+                "total_count": total_code_actions,
+                "command_only_count": command_only_count,
+            }));
+        }
+        // Apply mode: resolve the selected action.
+        let select_idx = params.select.unwrap();
+        if select_idx >= indexed.len() {
+            return err(format!(
+                "lsp.assist: select index {select_idx} out of range ({} actions available after filtering)",
+                indexed.len()
+            ));
+        }
+        let (_orig_idx, action) = indexed.swap_remove(select_idx);
+        // Resolve the action via codeAction/resolve.
+        let resolved = match self
+            .0
+            .code_action_resolve(&cx.root, language, action)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return err(format!("lsp.assist: resolve: {e}")),
+        };
+        // Guard 2: refuse command-only actions.
+        if resolved.command.is_some() && resolved.edit.is_none() {
+            let cmd_title = resolved
+                .command
+                .as_ref()
+                .map(|c| c.title.as_str())
+                .unwrap_or("<no title>");
+            let cmd_id = resolved
+                .command
+                .as_ref()
+                .map(|c| c.command.as_str())
+                .unwrap_or("<no command>");
+            return err(format!(
+                "lsp.assist: action '{title}' resolves to a command-only result ({cmd_id}: {cmd_title}) with no WorkspaceEdit. Use lsp.executeCommand to invoke server commands directly.",
+                title = resolved.title,
+            ));
+        }
+        // If there is an edit (possibly with a command alongside it), convert
+        // the WorkspaceEdit to hash-anchored changes.
+        let ws_edit = match resolved.edit {
+            Some(edit) => edit,
+            None => {
+                // No edit and no command: the action doesn't produce workable
+                // output for the harness.
+                return err(format!(
+                    "lsp.assist: resolved action '{}' returned neither an edit nor a command",
+                    resolved.title
+                ));
+            }
+        };
+        let flattened = flatten_workspace_edit(ws_edit);
+        // Convert text edits to hash-anchored (span, new_text) pairs.
+        let context = format!("lsp.assist: {}", resolved.title);
+        let mut changes = match text_edits_to_changes(&cx.root, &context, flattened.text_edits)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        // Guard 1: snippet-edit check.
+        changes = match snippet_guard(&changes) {
+            Ok(c) => c,
+            Err(tool_err) => return tool_err,
+        };
+        // Record provenance and return in the same shape as lsp.rename.
+        let edit_count = changes.len();
+        let files: Vec<String> = changes
+            .iter()
+            .map(|(span, _)| span.file.clone())
+            .collect();
+        let issuance = self.1.record_changes(
+            "lsp.assist",
+            AuthorityTier::LspVerified,
+            changes.iter().map(|(span, text)| (span, text.as_str())),
+        );
+        let span_changes: Vec<Value> = changes
+            .into_iter()
+            .map(|(s, t)| {
+                json!({"span": s, "new_text": t})
+            })
+            .collect();
+        ToolResult::Json(json!({
+            "changes": span_changes,
+            "resource_ops": flattened.resource_ops,
+            "findings": [],
+            "files": files,
+            "edit_count": edit_count,
+            "authority": "lsp",
+            "language": language.language_id(),
+            "issuance": issuance,
+            "provenance": AuthorityTier::LspVerified.as_str(),
+        }))
+    }
+}
+
 /// The `lsp.*` binding set, sharing one session-scoped [`LspState`] and the
 /// session's provenance ledger.
 pub fn tools(state: Arc<LspState>, ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(LspRename(state.clone(), Arc::clone(&ledger))) as Arc<dyn Tool>,
-        Arc::new(LspWillRenameFiles(state.clone(), ledger)) as Arc<dyn Tool>,
+        Arc::new(LspWillRenameFiles(state.clone(), Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(LspExecuteCommand(state.clone())) as Arc<dyn Tool>,
         Arc::new(LspStatus(state.clone())) as Arc<dyn Tool>,
         Arc::new(LspHover(state.clone())) as Arc<dyn Tool>,
-        Arc::new(LspReferences(state)) as Arc<dyn Tool>,
+        Arc::new(LspReferences(state.clone())) as Arc<dyn Tool>,
+        Arc::new(LspAssist(state, ledger)) as Arc<dyn Tool>,
     ]
 }
 
