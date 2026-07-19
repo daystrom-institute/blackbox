@@ -16,8 +16,10 @@
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/refactor-tools/lsp-rust-analyzer-lane-target-mismatch",
   "notes": "Refinement from the WP-LSP-REFS lane gate (2026-07-19): the lsp_references_cell integration test ran end-to-end against a REAL rust-analyzer in lane bpool2 and passed. Small no-proc-macro fixture crates work in lanes; the breakage is specific to workspaces whose target/ holds pod-built Linux proc-macro .so files (the blackbox workspace itself). So the semantic tier is usable in lanes for fixture-scale validation today, and the build-data strategy question (host-platform target dir vs pod-side RA) is scoped to full-workspace RA, not all lane RA.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "thread_id": "thread-edfd5ab5",
   "created_at": "2026-07-19T07:03:33Z",
-  "updated_at": "2026-07-19T10:02:54Z"
+  "updated_at": "2026-07-19T16:34:23Z",
+  "resolved_at": "2026-07-19T16:34:23Z",
+  "resolution_note": "Addressed by option (a): lane-aware RA spawn env (84171cb8, beta f51f97ec; design section 8.6). Validated firsthand 2026-07-19: unforced path detection fired on /Users/invidious/lanes/bpool4/blackbox (host target dir born at probe launch second), flycheck built 37 host .dylib proc macros into ~/Library/Caches/blackbox/ra-target/<hash>, lsp.hover + lsp.references answered correctly against the lane checkout, RA child reaped on isolate exit (kill_on_drop). Pod-side RA (option b) recorded in 8.6 as the not-built v2."
 }
