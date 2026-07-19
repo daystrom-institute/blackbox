@@ -5697,6 +5697,9 @@ impl Tool for JavaExtractInterface {
                 Ok(path) => path,
                 Err(e) => return err(e),
             };
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source = match std::fs::read_to_string(&source_path) {
                 Ok(text) => text,
                 Err(e) => return err(format!("java.extractInterface: read {}: {e}", params.file)),
@@ -5890,6 +5893,9 @@ impl Tool for JavaPullUpMembers {
             if !target_path.exists() {
                 return err(format!("java.pullUpMembers: target does not exist: {}", params.target));
             }
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let target_source = match std::fs::read_to_string(&target_path) {
                 Ok(text) => text,
                 Err(e) => return err(format!("java.pullUpMembers: read {}: {e}", params.target)),
@@ -6075,6 +6081,9 @@ impl Tool for JavaPullUpMembers {
                 }));
             }
 
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source = match std::fs::read_to_string(&source_path) {
                 Ok(text) => text,
                 Err(e) => return err(format!("java.pullUpMembers: read {}: {e}", params.file)),
@@ -6428,10 +6437,16 @@ impl Tool for JavaPushDownMembers {
                 Ok(path) => path,
                 Err(e) => return err(e),
             };
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source = match std::fs::read_to_string(&source_path) {
                 Ok(text) => text,
                 Err(e) => return err(format!("java.pushDownMembers: read {}: {e}", params.file)),
             };
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let target_source = match std::fs::read_to_string(&target_path) {
                 Ok(text) => text,
                 Err(e) => return err(format!("java.pushDownMembers: read {}: {e}", params.target)),
@@ -7406,6 +7421,9 @@ impl Tool for JavaChangeSignature {
                     Ok(path) => path,
                     Err(e) => return err(e),
                 };
+                // Sync fs read inside a call_blocking closure (concurrency-model
+                // section 5).
+                #[allow(clippy::disallowed_methods)]
                 let old = match std::fs::read_to_string(&path) {
                     Ok(text) => text,
                     Err(e) => return err(format!("java.changeSignature: read {rel}: {e}")),
@@ -9040,6 +9058,9 @@ impl Tool for JavaEncapsulateField {
                         Err(e) => return err(e),
                     }
                 };
+                // Sync fs read inside a call_blocking closure (concurrency-model
+                // section 5).
+                #[allow(clippy::disallowed_methods)]
                 let old = match std::fs::read_to_string(&path) {
                     Ok(text) => text,
                     Err(e) => return err(format!("java.encapsulateField: read {rel}: {e}")),
@@ -9730,6 +9751,9 @@ impl Tool for JavaReplaceConstructorWithFactory {
                         Err(e) => return err(e),
                     }
                 };
+                // Sync fs read inside a call_blocking closure (concurrency-model
+                // section 5).
+                #[allow(clippy::disallowed_methods)]
                 let old = match std::fs::read_to_string(&path) {
                     Ok(text) => text,
                     Err(e) => return err(format!("java.replaceConstructorWithFactory: read {rel}: {e}")),
@@ -10102,6 +10126,9 @@ impl Tool for JavaMigrateTypeUsages {
                 Ok(path) => path,
                 Err(e) => return err(e),
             };
+            // Sync fs read inside a call_blocking closure (concurrency-model
+            // section 5).
+            #[allow(clippy::disallowed_methods)]
             let source = match std::fs::read_to_string(&path) {
                 Ok(text) => text,
                 Err(e) => return err(format!("java.migrateTypeUsages: read {}: {e}", params.file)),
