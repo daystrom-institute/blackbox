@@ -20,6 +20,7 @@ pub mod edit_algebra;
 pub mod java_transforms;
 pub mod ledger;
 pub mod lsp_facts;
+pub mod rust_transforms;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ impl BindingToolSession {
     pub fn new() -> Self {
         let ledger = Arc::new(ledger::ProvenanceLedger::default());
         let lsp_state = Arc::new(lsp_facts::LspState::default());
+        let rust_ledger = Arc::clone(&ledger);
         let mut tools = code_facts::tools();
         tools.extend(edit_algebra::tools(
             Arc::new(edit_algebra::EditStore::default()),
@@ -57,6 +59,7 @@ impl BindingToolSession {
         tools.extend(java_transforms::tools(Arc::clone(&lsp_state)));
         tools.extend(analysis::tools());
         tools.extend(build_gate::tools());
+        tools.extend(rust_transforms::tools(rust_ledger));
         Self { tools, lsp_state }
     }
 
@@ -89,5 +92,6 @@ pub fn namespace_descriptions() -> BTreeMap<String, ToolNamespaceDescription> {
         ("edits".to_string(), edit_algebra::namespace_description()),
         ("java".to_string(), java_transforms::namespace_description()),
         ("lsp".to_string(), lsp_facts::namespace_description()),
+        ("rust".to_string(), rust_transforms::namespace_description()),
     ])
 }
