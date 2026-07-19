@@ -1118,11 +1118,7 @@ mod tests {
         let j_disallow: std::collections::BTreeSet<&str> =
             j.disallow.iter().map(String::as_str).collect();
         const JAVA_ONLY: &[&str] = &["java.*"];
-        const RUST_ONLY: &[&str] = &[
-            "rust.*",
-            "build.gate",
-            "mcp__blackbox__bbox_blame",
-        ];
+        const RUST_ONLY: &[&str] = &["rust.*", "build.gate", "mcp__blackbox__bbox_blame"];
         let r_core: std::collections::BTreeSet<&str> = r_allow
             .iter()
             .copied()
