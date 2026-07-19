@@ -40,6 +40,7 @@ struct BuildGateInput {
 enum BuildTool {
     Javac,
     Gradle,
+    Cargo,
     Generic,
 }
 
@@ -48,6 +49,31 @@ enum BuildTool {
 enum DiagnosticSeverity {
     Error,
     Warning,
+    /// rustc `note`/`help`/`ice` levels are not diagnostics proper; today
+    /// they surface only as nested suggestions and never as top-level
+    /// BuildDiagnostics, so this variant is reserved for future use.
+    #[allow(dead_code)]
+    Info,
+}
+
+/// A machine-applicable suggestion mined from a rustc/clippy diagnostic
+/// span. `span` is hash-anchored only when `anchor_spans` located the file
+/// under the session root; otherwise the raw byte range is still returned
+/// so `rust.fixRound` can synthesize an edit against a re-derived Span.
+#[derive(Debug, Clone, Serialize)]
+struct BuildSuggestion {
+    file: String,
+    byte_start: usize,
+    byte_end: usize,
+    /// Verbatim `suggested_replacement` bytes from the compiler.
+    replacement: String,
+    /// The compiler's applicability tag (`MachineApplicable`,
+    /// `MaybeIncorrect`, `HasPlaceholders`, `Unspecified`).
+    applicability: String,
+    /// Hash-anchored line span, present only when the file exists under the
+    /// session root and `anchor_spans` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<Span>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,8 +88,16 @@ struct BuildDiagnostic {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbol: Option<String>,
+    /// rustc/clippy diagnostic code (e.g. `E0308`, `clippy::needless_return`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     span: Option<Span>,
+    /// Machine-applicable (and near-applicable) suggestions mined from the
+    /// diagnostic's spans/children. Populated only for cargo/rustc JSON
+    /// diagnostics; javac/Gradle/generic diagnostics carry none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suggestions: Vec<BuildSuggestion>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,7 +124,7 @@ impl Tool for BuildGate {
     }
 
     fn description(&self) -> &str {
-        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects javac, Gradle-wrapped javac, and generic nonzero output. Uses the same shell execution path as shell_run but never returns raw logs."
+        "Run a compile/test gate command in the session root and return bounded structured diagnostics. Detects cargo/rustc JSON (`--message-format=json`), javac, Gradle-wrapped javac, and generic nonzero output. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans. Uses the same shell execution path as shell_run but never returns raw logs."
     }
 
     fn input_schema(&self) -> Value {
@@ -224,8 +258,21 @@ fn parse_build_output(
         );
     }
 
-    let mut diagnostics = parse_javac_diagnostics(output);
-    let has_javac_diagnostics = !diagnostics.is_empty();
+    // cargo/rustc `--message-format=json` output is unambiguous: it is
+    // newline-delimited JSON whose lines carry `"reason":"compiler-message"`.
+    // When present, parse it into structured diagnostics with codes and
+    // machine-applicable suggestions; this is the repair-loop input shape
+    // rust.fixRound consumes. Detect by content so a wrapper script that
+    // pipes cargo JSON through still classifies as cargo.
+    let cargo_diagnostics = parse_cargo_json_diagnostics(output);
+    let has_cargo_diagnostics = !cargo_diagnostics.is_empty();
+
+    let mut diagnostics = if has_cargo_diagnostics {
+        cargo_diagnostics
+    } else {
+        parse_javac_diagnostics(output)
+    };
+    let has_javac_diagnostics = !has_cargo_diagnostics && !diagnostics.is_empty();
     if diagnostics.is_empty() && (exit_code != 0 || timed_out) {
         diagnostics = parse_generic_diagnostics(output);
     }
@@ -245,11 +292,184 @@ fn parse_build_output(
     diagnostics.truncate(max_diagnostics);
 
     ParsedBuildOutput {
-        tool: detect_tool(command, output, has_javac_diagnostics, &status_lines),
+        tool: detect_tool(
+            command,
+            output,
+            has_cargo_diagnostics,
+            has_javac_diagnostics,
+            &status_lines,
+        ),
         diagnostics,
         counts,
         truncated: output_truncated || diagnostics_truncated,
         status_lines,
+    }
+}
+
+/// Parse `cargo ... --message-format=json` (or raw rustc `--error-format=json`)
+/// newline-delimited output into structured diagnostics.
+///
+/// Each `compiler-message` line carries a nested `message` object whose
+/// `spans` hold file/byte/line/column and optional `suggested_replacement`
+/// + `suggestion_applicability`, and whose `children` repeat the same shape
+/// for help/note sub-diagnostics (where most machine-applicable suggestions
+/// live). We mine suggestions from both, keeping every suggestion whose
+/// applicability is actionable (`MachineApplicable`, `MaybeIncorrect`, or
+/// `HasPlaceholders`); `Unspecified` is dropped as non-actionable.
+///
+/// Reuses `bbox_refactor::parse_rustc_json_output` for the line-level
+/// decode (it already tolerates malformed/non-compiler-message lines), then
+/// re-walks the raw JSON to preserve the suggestion spans the v1 classifier
+/// needs verbatim.
+fn parse_cargo_json_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
+    // Fast path: skip the per-line JSON parse entirely when the output does
+    // not look like cargo JSON at all. This keeps the javac/generic path
+    // zero-cost for the common case.
+    if !output.contains("\"compiler-message\"") {
+        return Vec::new();
+    }
+
+    let mut diagnostics = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if val.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg) = val.get("message") else {
+            continue;
+        };
+        let level = msg
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        let severity = match level {
+            "warning" => DiagnosticSeverity::Warning,
+            // rustc emits `error`, `ice`, `failure-note`; treat anything not
+            // explicitly a warning as an error so the counts surface real
+            // failures. `note`/`help` arrive as children of a real diagnostic
+            // and never as a top-level compiler-message in practice.
+            _ => DiagnosticSeverity::Error,
+        };
+        let code = msg
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let message = msg
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let spans = msg.get("spans").and_then(|v| v.as_array());
+        let children = msg.get("children").and_then(|v| v.as_array());
+
+        // Resolve the primary span for file/line/column.
+        let primary = spans
+            .and_then(|arr| {
+                arr.iter().find(|s| {
+                    s.get("is_primary")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                })
+            })
+            .or_else(|| spans.and_then(|arr| arr.first()));
+
+        let file = primary
+            .and_then(|s| s.get("file_name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let line_no = primary
+            .and_then(|s| s.get("line_start"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let column_no = primary
+            .and_then(|s| s.get("column_start"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        // Mine suggestions from the diagnostic's own spans and its children.
+        let mut suggestions = Vec::new();
+        if let Some(arr) = spans {
+            mine_suggestions(arr, &mut suggestions);
+        }
+        if let Some(arr) = children {
+            for child in arr {
+                if let Some(child_spans) = child.get("spans").and_then(|v| v.as_array()) {
+                    mine_suggestions(child_spans, &mut suggestions);
+                }
+            }
+        }
+
+        diagnostics.push(BuildDiagnostic {
+            file,
+            line: line_no,
+            column: column_no,
+            severity,
+            message,
+            symbol: None,
+            code,
+            span: None,
+            suggestions,
+        });
+    }
+    diagnostics
+}
+
+/// Walk a rustc/clippy `spans` array and push every actionable suggestion
+/// onto `out`. Deduplicates by `(file, byte_start, byte_end, replacement)`.
+fn mine_suggestions(spans: &[Value], out: &mut Vec<BuildSuggestion>) {
+    for span in spans {
+        let applicability = span
+            .get("suggestion_applicability")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // `Unspecified` and missing applicability are not machine-actionable.
+        if !matches!(
+            applicability,
+            "MachineApplicable" | "MaybeIncorrect" | "HasPlaceholders"
+        ) {
+            continue;
+        }
+        let Some(file) = span.get("file_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(replacement) = span.get("suggested_replacement").and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let byte_start = span
+            .get("byte_start")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let byte_end = span
+            .get("byte_end")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let (Some(byte_start), Some(byte_end)) = (byte_start, byte_end) else {
+            continue;
+        };
+        let suggestion = BuildSuggestion {
+            file: file.to_string(),
+            byte_start,
+            byte_end,
+            replacement: replacement.to_string(),
+            applicability: applicability.to_string(),
+            span: None,
+        };
+        if !out.iter().any(|existing| {
+            existing.file == suggestion.file
+                && existing.byte_start == suggestion.byte_start
+                && existing.byte_end == suggestion.byte_end
+                && existing.replacement == suggestion.replacement
+        }) {
+            out.push(suggestion);
+        }
     }
 }
 
@@ -270,7 +490,9 @@ fn parse_javac_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
             severity,
             message,
             symbol: None,
+            code: None,
             span: None,
+            suggestions: Vec::new(),
         };
 
         i += 1;
@@ -325,7 +547,9 @@ fn parse_generic_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
                 severity: DiagnosticSeverity::Error,
                 message: trimmed.to_string(),
                 symbol: None,
+                code: None,
                 span: None,
+                suggestions: Vec::new(),
             })
         })
         .collect();
@@ -337,7 +561,9 @@ fn parse_generic_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
             severity: DiagnosticSeverity::Error,
             message: "command exited without recognized diagnostics".to_string(),
             symbol: None,
+            code: None,
             span: None,
+            suggestions: Vec::new(),
         });
     }
     diagnostics
@@ -374,10 +600,17 @@ fn push_status_line(lines: &mut Vec<String>, line: String) {
 fn detect_tool(
     command: &str,
     output: &str,
-    has_structured_diagnostics: bool,
+    has_cargo_diagnostics: bool,
+    has_javac_diagnostics: bool,
     status_lines: &[String],
 ) -> BuildTool {
     let command_lower = command.to_ascii_lowercase();
+    // cargo/rustc JSON diagnostics are content-detected and take precedence:
+    // a Gradle wrapper invoking cargo, or a shell pipeline, still classifies
+    // as cargo when the output is compiler-message JSON.
+    if has_cargo_diagnostics || command_emits_cargo_json(&command_lower) {
+        return BuildTool::Cargo;
+    }
     if command_lower.contains("gradle")
         || command_lower.contains("gradlew")
         || output.contains("BUILD SUCCESSFUL")
@@ -388,7 +621,7 @@ fn detect_tool(
     {
         return BuildTool::Gradle;
     }
-    if has_structured_diagnostics || command_mentions_javac(&command_lower) {
+    if has_javac_diagnostics || command_mentions_javac(&command_lower) {
         return BuildTool::Javac;
     }
     BuildTool::Generic
@@ -400,40 +633,84 @@ fn command_mentions_javac(command_lower: &str) -> bool {
         .any(|part| part == "javac")
 }
 
+/// Detect a cargo/rustc invocation that emits `--message-format=json`. The
+/// content detector (`has_cargo_diagnostics`) is authoritative; this only
+/// refines the `tool` field when cargo JSON is requested but the build
+/// produced zero compiler-message lines (e.g. a clean check).
+fn command_emits_cargo_json(command_lower: &str) -> bool {
+    let mentions_cargo = command_lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
+        .any(|part| part == "cargo" || part == "rustc");
+    if !mentions_cargo {
+        return false;
+    }
+    command_lower.contains("--message-format=json") || command_lower.contains("--message-format compact") || command_lower.contains("--error-format=json")
+}
+
 // Sync fs read is sanctioned here: anchor_diagnostics only runs inside the
 // call_blocking tail of build.gate, never on a tokio worker (concurrency-model
 // section 5).
 #[allow(clippy::disallowed_methods)]
 fn anchor_diagnostics(root: &Path, cwd: &Path, diagnostics: &mut [BuildDiagnostic]) {
+    // Lazily-read file contents keyed by resolved path: (sha256, bytes) when
+    // the file exists under the session root, None otherwise. Shared across
+    // the diagnostic line-span pass and the suggestion byte-span pass so a
+    // file touched by many diagnostics is read once.
     let mut cache: BTreeMap<PathBuf, Option<(String, Vec<u8>)>> = BTreeMap::new();
-    for diagnostic in diagnostics.iter_mut() {
-        let (Some(file), Some(line)) = (diagnostic.file.clone(), diagnostic.line) else {
-            continue;
-        };
-        let resolved = resolve_diagnostic_path(cwd, &file);
-        let display_file = workspace_relative(root, &resolved).unwrap_or_else(|| file.clone());
-        diagnostic.file = Some(display_file);
 
-        let entry = cache.entry(resolved.clone()).or_insert_with(|| {
-            if !is_under_existing_root(root, &resolved) {
-                return None;
+    let file_sha_bytes = |cache: &mut BTreeMap<PathBuf, Option<(String, Vec<u8>)>>,
+                              resolved: &Path| {
+        if let Some(entry) = cache.get(resolved) {
+            return entry.clone();
+        }
+        let entry = if !is_under_existing_root(root, resolved) {
+            None
+        } else {
+            std::fs::read(resolved)
+                .ok()
+                .map(|bytes| (bbox_refactor::sha256_hex(&bytes), bytes))
+        };
+        cache.insert(resolved.to_path_buf(), entry.clone());
+        entry
+    };
+
+    for diagnostic in diagnostics.iter_mut() {
+        // Diagnostic line span (javac + cargo): anchor the primary line.
+        if let (Some(file), Some(line)) = (diagnostic.file.clone(), diagnostic.line) {
+            let resolved = resolve_diagnostic_path(cwd, &file);
+            let display_file = workspace_relative(root, &resolved).unwrap_or_else(|| file.clone());
+            diagnostic.file = Some(display_file.clone());
+            if let Some((sha, bytes)) = file_sha_bytes(&mut cache, &resolved) {
+                if let Some((byte_start, byte_end)) = line_byte_range(&bytes, line) {
+                    diagnostic.span = Some(Span {
+                        file: display_file.clone(),
+                        byte_start,
+                        byte_end,
+                        content_sha256: sha,
+                    });
+                }
             }
-            let bytes = std::fs::read(&resolved).ok()?;
-            let sha = bbox_refactor::sha256_hex(&bytes);
-            Some((sha, bytes))
-        });
-        let Some((sha, bytes)) = entry.as_ref() else {
-            continue;
-        };
-        let Some((byte_start, byte_end)) = line_byte_range(bytes, line) else {
-            continue;
-        };
-        diagnostic.span = Some(Span {
-            file: diagnostic.file.clone().unwrap_or(file),
-            byte_start,
-            byte_end,
-            content_sha256: sha.clone(),
-        });
+        }
+
+        // Suggestion byte spans (cargo JSON only): the compiler already
+        // gave us byte-accurate ranges against the on-disk file, so we only
+        // need to resolve the path + hash-anchor. The byte range is left
+        // untouched when the file is unavailable off-root; rust.fixRound
+        // re-derives a Span from a fresh code.read when it needs to write.
+        for suggestion in diagnostic.suggestions.iter_mut() {
+            let resolved = resolve_diagnostic_path(cwd, &suggestion.file);
+            let display_file =
+                workspace_relative(root, &resolved).unwrap_or_else(|| suggestion.file.clone());
+            suggestion.file = display_file.clone();
+            if let Some((sha, _bytes)) = file_sha_bytes(&mut cache, &resolved) {
+                suggestion.span = Some(Span {
+                    file: display_file,
+                    byte_start: suggestion.byte_start,
+                    byte_end: suggestion.byte_end,
+                    content_sha256: sha,
+                });
+            }
+        }
     }
 }
 
@@ -503,13 +780,14 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "build".to_string(),
-        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses javac and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line Spans are needed for follow-up edits."
+        description: "Structured build/test gate runner for refactor recipes. `build.gate` executes one supplied shell command through the harness shell path, parses cargo/rustc JSON (`--message-format=json`), javac, and Gradle-wrapped javac output into bounded diagnostics, and returns no raw logs. cargo/rustc diagnostics carry the compiler code and machine-applicable suggestion spans (the repair-loop input for `rust.fixRound`). Use it after applying edits when you need compile/test feedback inside a cell; keep commands narrow and set `anchor_spans: true` only when line/byte Spans are needed for follow-up edits."
             .to_string(),
         declarations: r#"type BuildSpan = { file: string; byte_start: number; byte_end: number; content_sha256: string };
-type BuildDiagnostic = { file?: string; line?: number; column?: number; severity: "error" | "warning"; message: string; symbol?: string; span?: BuildSpan };
-type BuildGateResult = { ok: boolean; exit_code: number; tool: "javac" | "gradle" | "generic"; diagnostics: BuildDiagnostic[]; counts: { errors: number; warnings: number }; truncated: boolean; status_lines: string[]; duration_ms: number };
+type BuildSuggestion = { file: string; byte_start: number; byte_end: number; replacement: string; applicability: "MachineApplicable" | "MaybeIncorrect" | "HasPlaceholders"; span?: BuildSpan };
+type BuildDiagnostic = { file?: string; line?: number; column?: number; severity: "error" | "warning"; message: string; symbol?: string; code?: string; span?: BuildSpan; suggestions?: BuildSuggestion[] };
+type BuildGateResult = { ok: boolean; exit_code: number; tool: "javac" | "gradle" | "cargo" | "generic"; diagnostics: BuildDiagnostic[]; counts: { errors: number; warnings: number }; truncated: boolean; status_lines: string[]; duration_ms: number };
 declare const build: {
-  /** Run a bounded compile/test gate command and parse javac, Gradle-wrapped javac, or generic nonzero output into structured diagnostics. */
+  /** Run a bounded compile/test gate command and parse cargo/rustc JSON, javac, Gradle-wrapped javac, or generic nonzero output into structured diagnostics. cargo/rustc diagnostics carry compiler codes and machine-applicable suggestion spans. */
   gate(args: { command: string; cwd?: string; timeout_ms?: number; timeoutMs?: number; max_diagnostics?: number; maxDiagnostics?: number; anchor_spans?: boolean; anchorSpans?: boolean }): Promise<BuildGateResult>;
 };"#
             .to_string(),
@@ -675,5 +953,196 @@ BUILD FAILED in 1s
         assert_eq!(fixed["ok"], true);
         assert_eq!(fixed["exit_code"], 0);
         assert_eq!(fixed["diagnostics"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- cargo / rustc JSON diagnostics ----
+
+    fn compiler_message_json(level: &str, code: Option<&str>, message: &str) -> String {
+        let code_json = match code {
+            Some(c) => format!("{{\"code\":\"{c}\"}}"),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"reason":"compiler-message","message":{{"level":"{level}","code":{code_json},"message":{message:?},"spans":[],"children":[]}}}}"#
+        )
+    }
+
+    fn e0308_with_machine_applicable_suggestion(file: &str) -> String {
+        // A realistic E0308 (mismatched types) with a MachineApplicable
+        // suggested_replacement in a child help diagnostic.
+        format!(
+            r#"{{"reason":"compiler-message","message":{{"level":"error","code":{{"code":"E0308"}},"message":"mismatched types","spans":[{{"file_name":"{file}","byte_start":10,"byte_end":14,"line_start":2,"column_start":5,"is_primary":true}}],"children":[{{"message":"consider using `\"\"`","spans":[{{"file_name":"{file}","byte_start":10,"byte_end":14,"line_start":2,"column_start":5,"is_primary":true,"suggested_replacement":"\"\"","suggestion_applicability":"MachineApplicable"}}]}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn build_gate_parses_cargo_json_compiler_messages() {
+        let output = format!(
+            "{}\n{}\n{}\n{}",
+            compiler_message_json("error", Some("E0308"), "mismatched types"),
+            compiler_message_json("error", Some("E0425"), "cannot find value"),
+            compiler_message_json("warning", Some("unused_variables"), "unused variable"),
+            serde_json::json!({"reason":"build-finished","success":false}).to_string()
+        );
+        let parsed = parse_build_output(
+            "cargo check --message-format=json",
+            &output,
+            1,
+            false,
+            100,
+        );
+        assert_eq!(parsed.tool, BuildTool::Cargo);
+        assert_eq!(parsed.counts.errors, 2);
+        assert_eq!(parsed.counts.warnings, 1);
+        assert_eq!(parsed.diagnostics.len(), 3);
+        assert_eq!(parsed.diagnostics[0].code.as_deref(), Some("E0308"));
+        assert_eq!(parsed.diagnostics[1].code.as_deref(), Some("E0425"));
+        assert_eq!(
+            parsed.diagnostics[2].code.as_deref(),
+            Some("unused_variables")
+        );
+        assert_eq!(parsed.diagnostics[2].severity, DiagnosticSeverity::Warning);
+    }
+
+    #[test]
+    fn build_gate_cargo_json_mines_machine_applicable_suggestions() {
+        let output = e0308_with_machine_applicable_suggestion("src/lib.rs");
+        let parsed = parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Cargo);
+        assert_eq!(parsed.diagnostics.len(), 1);
+        let diag = &parsed.diagnostics[0];
+        assert_eq!(diag.code.as_deref(), Some("E0308"));
+        assert_eq!(diag.file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(diag.line, Some(2));
+        assert_eq!(diag.column, Some(5));
+        assert_eq!(diag.suggestions.len(), 1);
+        let s = &diag.suggestions[0];
+        assert_eq!(s.file, "src/lib.rs");
+        assert_eq!(s.byte_start, 10);
+        assert_eq!(s.byte_end, 14);
+        assert_eq!(s.replacement, "\"\"");
+        assert_eq!(s.applicability, "MachineApplicable");
+        assert!(s.span.is_none(), "no anchoring without anchor_spans");
+    }
+
+    #[test]
+    fn build_gate_cargo_json_skips_non_machine_applicable_suggestions() {
+        // Unspecified applicability should be dropped; MaybeIncorrect kept.
+        let output = format!(
+            r#"{{"reason":"compiler-message","message":{{"level":"error","code":{{"code":"E0308"}},"message":"x","spans":[{{"file_name":"a.rs","byte_start":0,"byte_end":1,"is_primary":true,"suggested_replacement":"y","suggestion_applicability":"Unspecified"}}],"children":[{{"spans":[{{"file_name":"a.rs","byte_start":5,"byte_end":6,"suggested_replacement":"z","suggestion_applicability":"MaybeIncorrect"}}]}}]}}}}"#
+        );
+        let parsed = parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
+        let diag = &parsed.diagnostics[0];
+        assert_eq!(diag.suggestions.len(), 1);
+        assert_eq!(diag.suggestions[0].applicability, "MaybeIncorrect");
+        assert_eq!(diag.suggestions[0].byte_start, 5);
+    }
+
+    #[test]
+    fn build_gate_cargo_json_detected_by_content_without_command_flag() {
+        // A wrapper script (e.g. `make check`) that emits cargo JSON should
+        // still classify as cargo by content.
+        let output = compiler_message_json("error", Some("E0308"), "boom");
+        let parsed = parse_build_output("make check", &output, 1, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Cargo);
+        assert_eq!(parsed.counts.errors, 1);
+    }
+
+    #[test]
+    fn build_gate_javac_output_unaffected_when_no_cargo_json() {
+        // Sanity: javac output with no compiler-message lines must NOT take
+        // the cargo path.
+        let output = "Broken.java:3: error: cannot find symbol\n  symbol:   method missing()\n";
+        let parsed = parse_build_output("javac Broken.java", output, 1, false, 100);
+        assert_eq!(parsed.tool, BuildTool::Javac);
+        assert_eq!(parsed.counts.errors, 1);
+        assert!(parsed.diagnostics[0].suggestions.is_empty());
+        assert!(parsed.diagnostics[0].code.is_none());
+    }
+
+    #[test]
+    fn build_gate_cargo_json_truncates_at_max_diagnostics() {
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            lines.push(compiler_message_json("error", Some("E0308"), "boom"));
+        }
+        let parsed = parse_build_output(
+            "cargo check --message-format=json",
+            &lines.join("\n"),
+            1,
+            false,
+            2,
+        );
+        assert_eq!(parsed.counts.errors, 3);
+        assert_eq!(parsed.diagnostics.len(), 2);
+        assert!(parsed.truncated);
+    }
+
+    #[test]
+    fn anchor_diagnostics_anchors_cargo_suggestion_byte_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = "src/lib.rs";
+        let content = "fn main() { let x: u32 = \"oops\"; }\n";
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(file), content).unwrap();
+        let sha = bbox_refactor::sha256_hex(content.as_bytes());
+
+        // Suggestion byte range covers the 4 bytes of `oops`-ish literal at
+        // bytes 21..25 (the `"oops"` substring); use an illustrative range.
+        let output = format!(
+            r#"{{"reason":"compiler-message","message":{{"level":"error","code":{{"code":"E0308"}},"message":"mismatched types","spans":[{{"file_name":"{file}","byte_start":21,"byte_end":27,"line_start":1,"column_start":22,"is_primary":true}}],"children":[{{"spans":[{{"file_name":"{file}","byte_start":21,"byte_end":27,"suggested_replacement":"0","suggestion_applicability":"MachineApplicable"}}]}}]}}}}"#
+        );
+        let mut parsed = parse_build_output(
+            "cargo check --message-format=json",
+            &output,
+            1,
+            false,
+            100,
+        );
+        anchor_diagnostics(&root, &root, &mut parsed.diagnostics);
+
+        let diag = &parsed.diagnostics[0];
+        assert_eq!(diag.file.as_deref(), Some(file));
+        // Diagnostic line span anchored from the file bytes.
+        let span = diag.span.as_ref().expect("line span anchored");
+        assert_eq!(span.file, file);
+        assert_eq!(span.content_sha256, sha);
+        // Suggestion byte span anchored against the same hash.
+        assert_eq!(diag.suggestions.len(), 1);
+        let s = &diag.suggestions[0];
+        assert_eq!(s.file, file);
+        assert_eq!(s.byte_start, 21);
+        assert_eq!(s.byte_end, 27);
+        let sspan = s.span.as_ref().expect("suggestion span anchored");
+        assert_eq!(sspan.file, file);
+        assert_eq!(sspan.content_sha256, sha);
+        assert_eq!(sspan.byte_start, 21);
+        assert_eq!(sspan.byte_end, 27);
+    }
+
+    #[test]
+    fn anchor_diagnostics_leaves_off_root_suggestion_spans_unanchored() {
+        // A diagnostic whose file is outside the session root must not get a
+        // hash-anchored span; the raw byte range stays so rust.fixRound can
+        // re-derive against a fresh read.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let output = format!(
+            r#"{{"reason":"compiler-message","message":{{"level":"error","code":{{"code":"E0308"}},"message":"x","spans":[{{"file_name":"/external/a.rs","byte_start":0,"byte_end":1,"is_primary":true}}],"children":[{{"spans":[{{"file_name":"/external/a.rs","byte_start":0,"byte_end":1,"suggested_replacement":"y","suggestion_applicability":"MachineApplicable"}}]}}]}}}}"#
+        );
+        let mut parsed = parse_build_output(
+            "cargo check --message-format=json",
+            &output,
+            1,
+            false,
+            100,
+        );
+        anchor_diagnostics(&root, &root, &mut parsed.diagnostics);
+        let diag = &parsed.diagnostics[0];
+        assert!(diag.span.is_none());
+        assert!(diag.suggestions[0].span.is_none());
+        // Raw byte range still present.
+        assert_eq!(diag.suggestions[0].byte_start, 0);
     }
 }
