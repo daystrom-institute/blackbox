@@ -101,6 +101,7 @@ bbox-packets = { path = "crates/bbox-packets" }
 bbox-system-memory = { path = "crates/bbox-system-memory" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
+bro-rpc = { path = "crates/bro-rpc" }
 bro-transcript = { path = "crates/bro-transcript" }
 bro-fleet-client = { path = "crates/bro-fleet-client" }
 # Fleet closeout and daemon-owned tool paths share bro-tools primitives.

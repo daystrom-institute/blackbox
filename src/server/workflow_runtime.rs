@@ -147,8 +147,8 @@ impl BlackboxServer {
                 exclude_providers,
             );
             let wf_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
-            let dispatched =
-                self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
+            let dispatched = self
+                .dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                     prompt: prompt.to_string(),
                     provider,
                     lens,
@@ -177,7 +177,8 @@ impl BlackboxServer {
                     // origin so the roster tab groups it under the
                     // workflow it serves.
                     origin: bro_core::Origin::Workflow,
-                })?;
+                })
+                .await?;
             return Ok(dispatched.task);
         }
 
@@ -275,7 +276,8 @@ impl BlackboxServer {
             // workflow origin (matches the dispatch_fresh_bro_task
             // path above).
             bro_core::Origin::Workflow,
-        );
+        )
+        .await;
         if let Some(lease) = &runtime_lease {
             let inner = task.inner.lock();
             orchestration::allocator::record_lease(

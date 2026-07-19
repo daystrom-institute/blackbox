@@ -305,7 +305,7 @@ pub struct AllocationContext {
 }
 
 static LEASE_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ALLOCATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 /// Acquire the process-wide allocation lock, blocking until it is free.
 ///
@@ -327,19 +327,24 @@ static ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// Poisoned-mutex recovery is preserved (recover the inner data rather than
 /// propagate panic state).
 ///
-/// Note: this is `std::sync::Mutex::lock()` called from `async fn` handlers
-/// like `bro_agent_dispatch`. The held section currently includes filesystem
-/// IO and `Command::spawn`, so the executor thread is blocked for the
-/// dispatch duration. Acceptable at current `parallelism: 3` fanout. If
-/// fanout grows materially, migrate `dispatch_fresh_bro_task` to async,
-/// change this to `OnceLock<tokio::sync::Mutex<()>>`, and replace `lock()`
-/// with `lock().await` — keeping the same long-scope semantics unless a
-/// pre-spawn lease reservation is also introduced.
-pub fn acquire_allocation_lock() -> std::sync::MutexGuard<'static, ()> {
-    match ALLOCATION_LOCK.get_or_init(|| Mutex::new(())).lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+/// This is a `tokio::sync::Mutex`, not a `std::sync::Mutex`, and that is
+/// forced by the shape above rather than chosen for taste: the guard is held
+/// across the whole dispatch, and since the fleetd cutover the dispatch
+/// `await`s (the executor seam is async). A `std` guard is not `Send`, so
+/// holding one across an await makes every enclosing future non-`Send` and
+/// `tokio::spawn` rejects it. It also blocked an executor thread for the
+/// dispatch duration, which an async mutex does not.
+///
+/// This is the migration the previous note here prescribed for exactly this
+/// trigger, with the same long-scope semantics preserved.
+///
+/// Poisoning is not a concern for a `tokio::sync::Mutex` (it has no poison
+/// state), so the previous `into_inner` recovery arm is gone.
+pub async fn acquire_allocation_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    ALLOCATION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 pub fn config_file(store_dir: &Path) -> PathBuf {

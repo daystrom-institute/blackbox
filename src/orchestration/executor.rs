@@ -3,24 +3,25 @@
 //! [`HarnessExecutor`] turns a fully-resolved [`WorkerSpawnSpec`] into a
 //! supervised child process, exposing the stdio control/event lanes, an
 //! idempotent kill, and a terminal outcome. [`LocalExecutor`] runs the child
-//! in-process on the daemon host; a future `FleetdExecutor` will implement the
-//! same trait over the fleetd socket without the daemon's dispatch composition
-//! changing.
+//! in-process on the daemon host; [`super::fleetd_client::FleetdExecutor`]
+//! implements the same trait over the fleetd socket without the daemon's
+//! dispatch composition changing.
 //!
-//! Phase A of slice 5 of
-//! `design/daemon-runtime/locality-first-decomposition.md`. The split is:
-//! everything below is the *execution half* the interactive harness path used
-//! to run inline in `spawn_task_reserved` (login-shell bin resolution, env
-//! hygiene, stdin control writer, stdout line pump, stderr collection, waiter
-//! ordering); the daemon keeps the *state half* (task store, roster/tail/system
-//! events, `ingest_harness_event` over the line stream, terminal publication).
+//! Slice 5 of `design/daemon-runtime/locality-first-decomposition.md`. The
+//! split is: everything below is the *execution half* the interactive harness
+//! path used to run inline in `spawn_task_reserved` (login-shell bin
+//! resolution, env hygiene, stdin control writer, stdout line pump, stderr
+//! collection, waiter ordering); the daemon keeps the *state half* (task store,
+//! roster/tail/system events, `ingest_harness_event` over the line stream,
+//! terminal publication).
 //!
-//! Behavior-preserving: the seam is synchronous, mirroring the existing sync
-//! spawn path (a `Command::spawn` plus `tokio::spawn`ed stdio pumps under the
-//! ambient runtime). Wrapping the blocking `resolve_bin` in `spawn_blocking`
-//! and making the trait method `async` (both needed by a socket-backed
-//! `FleetdExecutor`) force `spawn_task_with_tool_placement` and its callers
-//! async, and are left to the fleetd cutover slice.
+//! The seam is `async` as of the fleetd cutover: a socket-backed executor has
+//! to dial, authenticate, and await a `SessionStarted` before it can hand back
+//! a handle. `LocalExecutor` keeps identical behavior, with the one blocking
+//! call it makes (`resolve_bin`, which shells out to a login shell) moved onto
+//! `spawn_blocking` rather than run on a worker thread.
+
+use async_trait::async_trait;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,34 +36,75 @@ use bro_protocol::WorkerSpawnSpec;
 use super::open_harness_tee;
 use super::providers::{self, dispatch_prelude::ProviderExec};
 
+/// Where a [`WorkerKill`] sends its one signal. The two executors reach the
+/// child by different routes, but the daemon-side registry stores one type and
+/// calls one method, so `cancel_task` never has to know which executor ran the
+/// dispatch.
+enum KillTarget {
+    /// The daemon is the child's parent: signal the pid directly.
+    LocalPid(Option<u32>),
+    /// fleetd is the child's parent: ask it to signal, over the owner
+    /// connection. Delivery is best-effort by contract, exactly like the local
+    /// arm (a `libc::kill` to an already-reaped pid is also a silent no-op).
+    Fleetd {
+        session_id: String,
+        commands: tokio::sync::mpsc::UnboundedSender<bro_protocol::DaemonToFleetd>,
+    },
+}
+
 /// Idempotent kill switch for a spawned worker child. Replaces the raw
 /// `child_id` PID take + `libc::kill`: `kill()` fires the signal at most once,
 /// so a double-cancel (or a waiter/cancel race) is safe.
 pub struct WorkerKill {
-    pid: Option<u32>,
+    target: KillTarget,
     fired: AtomicBool,
 }
 
 impl WorkerKill {
     fn new(pid: Option<u32>) -> Arc<Self> {
         Arc::new(Self {
-            pid,
+            target: KillTarget::LocalPid(pid),
             fired: AtomicBool::new(false),
         })
     }
 
-    /// Send `SIGTERM` to the child at most once. No-op once already fired or
-    /// when the child had no pid.
+    /// A kill switch that routes through fleetd instead of a local signal.
+    pub(super) fn via_fleetd(
+        session_id: String,
+        commands: tokio::sync::mpsc::UnboundedSender<bro_protocol::DaemonToFleetd>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            target: KillTarget::Fleetd {
+                session_id,
+                commands,
+            },
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    /// Terminate the child at most once. No-op once already fired, or when the
+    /// local child had no pid.
     pub fn kill(&self) {
         if self.fired.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Some(pid) = self.pid {
-            // SAFETY: SIGTERM to a pid this daemon spawned. Matches the prior
-            // `cancel_task` behavior exactly; a reused pid is the same
-            // (accepted) risk the old `child_id` take carried.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        match &self.target {
+            KillTarget::LocalPid(Some(pid)) => {
+                // SAFETY: SIGTERM to a pid this daemon spawned. Matches the
+                // prior `cancel_task` behavior exactly; a reused pid is the
+                // same (accepted) risk the old `child_id` take carried.
+                unsafe {
+                    libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+            KillTarget::LocalPid(None) => {}
+            KillTarget::Fleetd {
+                session_id,
+                commands,
+            } => {
+                let _ = commands.send(bro_protocol::DaemonToFleetd::Kill {
+                    session_id: session_id.clone(),
+                });
             }
         }
     }
@@ -97,26 +139,41 @@ pub struct WorkerHandle {
 
 /// The execution seam: compose a spec centrally, hand it to an executor.
 ///
-/// Deliberately synchronous for the local, in-process executor (see the module
-/// note). A socket-backed executor will make this `async`.
-pub trait HarnessExecutor {
+/// `async` because a socket-backed executor must dial, authenticate, and await
+/// a `SessionStarted` acknowledgement before it can hand back a handle.
+/// `#[async_trait]` rather than a native `async fn` in the trait so the daemon
+/// can hold an executor behind `dyn`.
+#[async_trait]
+pub trait HarnessExecutor: Send + Sync {
     /// Spawn the worker described by `spec` and return its handle.
-    fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle>;
+    async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle>;
 }
 
 /// Executes workers as direct child processes of the daemon on the local host.
 pub struct LocalExecutor;
 
+#[async_trait]
 impl HarnessExecutor for LocalExecutor {
-    fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
+    async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
         let provider = spec.provider;
 
         // Final binary resolution stays executor-side. Login-shell resolution
         // gives the same result an interactive terminal would; a miss falls
         // back to the bare name so `Command::spawn` yields the familiar
         // "No such file or directory" error surface.
+        //
+        // `resolve_bin` spawns a login shell, so it goes on `spawn_blocking`
+        // now that the seam is async; before the cutover the whole spawn path
+        // was synchronous and this ran on the calling worker.
         let raw_bin = spec.bin_override.clone().unwrap_or_else(|| provider.bin());
-        let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
+        let bin = tokio::task::spawn_blocking({
+            let raw_bin = raw_bin.clone();
+            move || providers::resolve_bin(&raw_bin)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(raw_bin);
 
         let path_env = providers::dispatch_path_env();
         let mut cmd = Command::new(&bin);

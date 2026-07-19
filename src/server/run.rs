@@ -17,6 +17,19 @@ pub async fn run() -> anyhow::Result<()> {
     let store_dir = opened.store_dir;
     let bind_host = opened.bind_host;
     let bind_is_loopback = opened.bind_is_loopback;
+    // Select the harness executor BEFORE anything can dispatch. Default is
+    // fleetd, so a worker outlives this daemon process; `BLACKBOX_EXECUTOR=local`
+    // (or `daemon.executor = "local"`) is the explicit escape back to
+    // daemon-child workers. Installing here also arms fleetd re-adoption: the
+    // first connection re-attaches whatever survived our restart.
+    crate::orchestration::install_harness_executor(
+        cfg.daemon.executor,
+        store_dir.clone(),
+        shared.task_store.clone(),
+        shared.tail_tx.clone(),
+        Some(shared.system_events.clone()),
+    );
+
     start_background_tasks(shared.clone()).await?;
 
     // MCP service

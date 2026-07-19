@@ -763,7 +763,8 @@ impl BlackboxServer {
             // atom_resume_value is the resume half of atom
             // dispatch — same source class as atom_invoke (Atom).
             bro_core::Origin::Atom,
-        );
+        )
+        .await;
         if let Some(lease) = &selected_lease {
             let inner = task.inner.lock();
             orchestration::allocator::record_lease(

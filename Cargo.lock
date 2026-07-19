@@ -923,6 +923,7 @@ dependencies = [
  "bro-core",
  "bro-fleet-client",
  "bro-protocol",
+ "bro-rpc",
  "bro-tools",
  "bro-transcript",
  "chrono",
