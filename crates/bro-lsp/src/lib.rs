@@ -945,6 +945,79 @@ impl SessionPool {
         }
     }
 
+    /// `textDocument/references` at `position` — authoritative project-wide
+    /// find-usages for the symbol under the cursor. JDTLS symmetric, RA
+    /// primary. Returns an empty `Vec` (not an error) when the server has
+    /// no references at the position; callers distinguish empty from
+    /// failure by `is_err`. `include_declaration` toggles the LSP
+    /// `context.includeDeclaration` knob. Retries on the same warming codes
+    /// as `rename`/`hover`. Fails closed on an unavailable server — callers
+    /// (RX-V3) must never downgrade to a syntax-only approximation.
+    pub async fn references(
+        &self,
+        doc: &OpenDocument,
+        position: lsp_types::Position,
+        include_declaration: bool,
+        wait_ready: Duration,
+    ) -> Result<Vec<lsp_types::Location>> {
+        let session = self.session(doc.root.clone(), doc.language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        if !session.documents.contains_key(&doc.uri) {
+            return Err(Error::DocumentNotOpen {
+                uri: doc.uri.clone(),
+            });
+        }
+        session
+            .wait_until_ready(
+                doc.language,
+                <lsp_types::request::References as Request>::METHOD,
+                wait_ready,
+            )
+            .await?;
+        let params = lsp_types::ReferenceParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc.uri.clone(),
+                },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+            context: lsp_types::ReferenceContext {
+                include_declaration,
+            },
+        };
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::References>(&params)
+                .await
+            {
+                Ok(locations) => {
+                    // As with rename: a real edit/answer-producing response
+                    // proves this session can answer authoritatively.
+                    session
+                        .readiness
+                        .mark_ready_from_success("references returned a result");
+                    return Ok(locations.unwrap_or_default());
+                }
+                Err(Error::Server { method, error })
+                    if method == <lsp_types::request::References as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     pub async fn shutdown_all(&self) {
         let mut sessions = self.inner.sessions.lock().await;
         let drained = sessions
@@ -1858,6 +1931,33 @@ mod tests {
         let config = LspConfig::default();
         assert!(config.idle_timeout > Duration::ZERO);
         assert!(config.request_timeout > Duration::ZERO);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn references_fails_closed_when_server_unavailable() {
+        // No rust-analyzer binary is reachable; the pool cannot spawn a
+        // session and `references` must surface `LspUnavailable` (the
+        // binding-layer `render_lsp_error` hook turns this into the
+        // lsp_unavailable prefix; RX-V3 fail-closed).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let pool = SessionPool::new(LspConfig {
+            rust_analyzer_bin: Some(dir.path().join("missing-rust-analyzer")),
+            request_timeout: Duration::from_secs(2),
+            init_timeout: Duration::from_secs(2),
+            ..LspConfig::default()
+        });
+        let doc = pool
+            .open_document(&root, Language::Rust, &root.join("src/lib.rs"), 1, "pub fn f() {}\n".to_string())
+            .await
+            .expect_err("expected lsp_unavailable, got success");
+        assert!(
+            doc.is_lsp_unavailable(),
+            "expected is_lsp_unavailable=true, got {doc:?}"
+        );
+        pool.shutdown_all().await;
     }
 
     #[test]
