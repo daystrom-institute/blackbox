@@ -369,8 +369,8 @@ fn run_dependency_analysis(
     // Surface the seed closure when with_local_deps is requested (the
     // planner computed it internally; this is the cell-visible copy).
     if mode == Mode::WithLocalDeps && !input.item_names.is_empty() {
-        let seeds: std::collections::BTreeSet<&str> =
-            input.item_names.iter().map(String::as_str).collect();
+        let seeds: std::collections::BTreeSet<String> =
+            input.item_names.iter().cloned().collect();
         let mut outgoing: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         let mut incoming: std::collections::HashMap<String, Vec<String>> =
@@ -386,19 +386,18 @@ fn run_dependency_analysis(
                 acc
             },
         );
-        let mut closure = seeds.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+        let mut closure = seeds.clone();
         let mut shared = std::collections::BTreeSet::new();
         loop {
             let mut changed = false;
             for source in closure.clone() {
-                for target in outgoing.get(source.as_str()).into_iter().flatten() {
-                    let target_str: &str = target.as_str();
-                    if closure.contains(target_str) {
+                for target in outgoing.get(&source).into_iter().flatten() {
+                    if closure.contains(target) {
                         continue;
                     }
-                    let has_external = external_refs.get(target_str).copied().unwrap_or(0) > 0;
+                    let has_external = external_refs.get(target).copied().unwrap_or(0) > 0;
                     let only_in_closure = incoming
-                        .get(target_str)
+                        .get(target)
                         .is_none_or(|sources| sources.iter().all(|s| closure.contains(s)));
                     if !has_external && only_in_closure {
                         closure.insert(target.clone());
@@ -414,7 +413,7 @@ fn run_dependency_analysis(
         }
         let added: Vec<String> = closure
             .iter()
-            .filter(|name| !seeds.contains(name.as_str()))
+            .filter(|name| !seeds.contains(name))
             .cloned()
             .collect();
         findings.push(json!({
