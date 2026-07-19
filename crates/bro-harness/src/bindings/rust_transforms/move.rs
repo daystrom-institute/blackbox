@@ -413,7 +413,7 @@ fn run_dependency_analysis(
         }
         let added: Vec<String> = closure
             .iter()
-            .filter(|name| !seeds.contains(name))
+            .filter(|name| !seeds.contains(name.as_str()))
             .cloned()
             .collect();
         findings.push(json!({
