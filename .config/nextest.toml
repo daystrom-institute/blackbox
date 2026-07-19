@@ -34,6 +34,17 @@ not (
 slow-timeout = { period = "30s", terminate-after = 4 }
 final-status-level = "slow"
 
+# Retry native aborts instead of failing the gate on them: Linux CI runs
+# (fresh clone, full-workspace relink, then immediate 4,300-test run) have
+# shown rare first-execution SIGBUS aborts in bbox-refactor's tree-sitter
+# tests (random victim, never reproducible on re-run, never seen on warm
+# binaries). Retries keep the gate honest — nextest reports the test as
+# FLAKY rather than silently green — while a real deterministic failure
+# still fails all three attempts. Scoped to the one crate observed.
+[[profile.default.overrides]]
+filter = 'package(bbox-refactor)'
+retries = 2
+
 [profile.full]
 default-filter = "all()"
 # The quarantined tests legitimately run 50-80s; flag at 60s, kill at 5min.
