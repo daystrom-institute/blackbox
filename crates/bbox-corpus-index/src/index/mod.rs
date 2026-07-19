@@ -131,7 +131,7 @@ pub struct ReindexConfig {
     pub knowledge_path: PathBuf,
     pub threads_path: PathBuf,
     pub roadmap_path: PathBuf,
-    /// In-process harness sessions dir (`$BRO_HOME/harness-sessions`) whose
+    /// Standalone harness process sessions dir (`$BRO_HOME/harness-sessions`) whose
     /// sidecar event logs are indexed via the transcript adapter registry.
     /// `None` (the default, and what hermetic tests get) disables the
     /// harness-sessions adapter entirely — reindex must never silently scan

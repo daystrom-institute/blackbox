@@ -61,24 +61,20 @@ pub fn count_rust_references(
 
     let mut counts_by_symbol: BTreeMap<String, usize> = BTreeMap::new();
     let mut files_by_symbol: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut examples_by_symbol: BTreeMap<String, Vec<RustReferenceExample>> =
-        BTreeMap::new();
+    let mut examples_by_symbol: BTreeMap<String, Vec<RustReferenceExample>> = BTreeMap::new();
     let mut unique_files: BTreeSet<String> = BTreeSet::new();
     let mut production_sites: usize = 0;
     let mut test_sites: usize = 0;
     let mut total_usages: usize = 0;
     let mut file_count: usize = 0;
 
-    for entry in WalkDir::new(project_dir)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                ".git" | "target" | "node_modules" | ".claude" | ".bro"
-            )
-        })
-    {
+    for entry in WalkDir::new(project_dir).into_iter().filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        !matches!(
+            name.as_ref(),
+            ".git" | "target" | "node_modules" | ".claude" | ".bro"
+        )
+    }) {
         let entry = entry?;
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|e| e.to_str()) != Some("rs")
@@ -91,16 +87,12 @@ pub fn count_rust_references(
         file_count += 1;
 
         let path = entry.path();
-        let is_test = path
-            .to_string_lossy()
-            .contains("/tests/")
+        let is_test = path.to_string_lossy().contains("/tests/")
             || path
                 .file_name()
                 .map(|n| n.to_string_lossy().ends_with("_test.rs"))
                 .unwrap_or(false)
-            || path
-                .to_string_lossy()
-                .contains("/test/")
+            || path.to_string_lossy().contains("/test/")
             || path
                 .file_name()
                 .map(|n| {
@@ -198,10 +190,7 @@ fn walk_node(
                 && let Ok(text) = name_node.utf8_text(source.as_bytes())
                 && symbols.contains(text)
             {
-                record_hit(
-                    out, text, rel_path, name_node, source, is_test,
-                    "macro_use",
-                );
+                record_hit(out, text, rel_path, name_node, source, is_test, "macro_use");
             }
             // Macro arguments are token trees, not parsed AST; skip
             // recursion to avoid double-counting the macro name as
@@ -227,11 +216,7 @@ fn classify_usage(node: &Node, _source: &str) -> &'static str {
     match parent.kind() {
         "call_expression" => {
             // If this identifier is the function of a call expression
-            if parent
-                .child_by_field_name("function")
-                .map(|f| f.id())
-                == Some(node.id())
-            {
+            if parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id()) {
                 return "call";
             }
             "path_ref"
@@ -347,7 +332,11 @@ fn helper() -> Greeter {
 
         let summary = count_rust_references(
             root,
-            &["hello".to_string(), "Greeter".to_string(), "Option".to_string()],
+            &[
+                "hello".to_string(),
+                "Greeter".to_string(),
+                "Option".to_string(),
+            ],
         )
         .unwrap();
 
@@ -407,8 +396,7 @@ fn helper() -> Greeter {
             "fn f() { println!(\"hi\"); println!(\"there\"); }",
         );
 
-        let summary =
-            count_rust_references(root, &["println".to_string()]).unwrap();
+        let summary = count_rust_references(root, &["println".to_string()]).unwrap();
         assert_eq!(
             *summary.counts_by_symbol.get("println").unwrap_or(&0),
             2,

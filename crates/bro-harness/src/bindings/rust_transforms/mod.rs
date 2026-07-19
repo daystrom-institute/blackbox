@@ -370,7 +370,9 @@ impl Tool for RustDescribe {
         match transform {
             "fixRound" => ToolResult::Json(json!({ "contract": FIX_ROUND_CONTRACT })),
             "extractItems" => ToolResult::Json(json!({ "contract": EXTRACT_ITEMS_CONTRACT })),
-            "inlineModToFile" => ToolResult::Json(json!({ "contract": INLINE_MOD_TO_FILE_CONTRACT })),
+            "inlineModToFile" => {
+                ToolResult::Json(json!({ "contract": INLINE_MOD_TO_FILE_CONTRACT }))
+            }
             "moduleWiring" => ToolResult::Json(json!({ "contract": MODULE_WIRING_CONTRACT })),
             "setVisibility" => ToolResult::Json(json!({ "contract": SET_VISIBILITY_CONTRACT })),
             "extractImplMethods" => {

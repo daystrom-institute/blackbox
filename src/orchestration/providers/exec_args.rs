@@ -10,13 +10,9 @@ use super::Provider;
 /// transport + credentials are selected via env (see
 /// brofile::resolve_provider_env).
 ///
-/// NOTE: harness providers do **not** dispatch via this binary anymore — they
-/// run **in-process** off the linked `bro-harness` lib
-/// (`spawn_task_with_tool_placement` → `spawn_harness_in_process_task`). This
-/// resolved name survives only for the allocator's availability gate
-/// (`provider_binary_missing`) and legacy MCP-CLI management; it is not the
-/// dispatch execution path. `build_exec_args` (the argv) is still used — it is
-/// parsed in-process via `bro_harness::cli::Cli::try_parse_from`.
+/// Harness providers dispatch through this standalone binary. blackboxd builds
+/// the argv and child environment, then communicates only through stdin/stdout
+/// NDJSON plus the daemon's MCP endpoint.
 fn bin_with_env(provider: Provider) -> String {
     match provider {
         Provider::Glm
@@ -267,9 +263,8 @@ impl ProviderExec for Provider {
 
     fn bin_with_config(&self, _cfg: &ProviderConfig) -> String {
         match self {
-            // Harness providers run in-process (see `bin_with_env` note); this
-            // name feeds only the availability gate / legacy MCP-CLI, not
-            // dispatch. No dedicated config override today.
+            // Harness providers share one binary selected by BRO_HARNESS_BIN.
+            // No dedicated per-provider config override today.
             Provider::Glm
             | Provider::Deepseek
             | Provider::Minimax

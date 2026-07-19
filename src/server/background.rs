@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::Result<()> {
     install_badgey_adapter(&shared);
-    crate::orchestration::capabilities::install(&shared);
     configure_dispatch_path_env();
     restore_badgey_registry_from_notes(&shared);
     recover_badgey_non_terminal_state(&shared);
@@ -34,8 +33,8 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     Ok(())
 }
 
-/// Augment the daemon's process `PATH` once at startup so non-shell in-process
-/// spawns (e.g. stdio MCP servers) resolve user-installed binaries the narrow
+/// Augment the daemon's process `PATH` once at startup so direct child-process
+/// spawns (for example bro-harness and stdio MCP servers) resolve binaries the
 /// launchd/systemd PATH omits. This is constant and one-time — NOT per-session —
 /// so it does not reintroduce the serialize-everything lock that the §3
 /// per-session work removed (shell tools augment PATH per-command themselves).

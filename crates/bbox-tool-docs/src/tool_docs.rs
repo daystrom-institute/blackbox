@@ -154,6 +154,13 @@ pub struct ToolDoc {
 pub const TOOL_DOCS: &[ToolDoc] = &[
     // ── Transcripts ──────────────────────────────────────────────────
     ToolDoc {
+        name: "bbox_corpus_search",
+        category: ToolCategory::Transcripts,
+        summary: "Compatibility corpus lookup for harness capability projection. Returns ranked hits with stable id/text fields.",
+        when_to_use: "Normally called through the harness's flat `corpus_search` alias. Direct MCP callers should prefer `bbox_hybrid_search` for the richer typed-entity surface.",
+        example: Some(r#"bbox_corpus_search(query="session boundary", limit=10)"#),
+    },
+    ToolDoc {
         name: "bbox_search",
         category: ToolCategory::Transcripts,
         summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",
@@ -822,14 +829,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_steer",
         category: ToolCategory::Orchestration,
-        summary: "Queue a user steer into a running in-process bro task without cancelling the active turn.",
-        when_to_use: "Use when a running bro should incorporate extra direction but does not need to stop its current turn. If the task already finished, use bro_resume instead. Only live in-process harness tasks are steerable.",
+        summary: "Queue a user steer into a running bro-harness process without cancelling the active turn.",
+        when_to_use: "Use when a running bro should incorporate extra direction but does not need to stop its current turn. If the task already finished, use bro_resume instead. Only live harness child processes are steerable.",
         example: Some(r#"bro_steer(task_id="...", prompt="Prefer the smaller scoped fix.")"#),
     },
     ToolDoc {
         name: "bro_interrupt",
         category: ToolCategory::Orchestration,
-        summary: "Interrupt a running in-process bro task; optionally queue redirect text to run after interruption repair.",
+        summary: "Interrupt a running bro-harness process; optionally queue redirect text to run after interruption repair.",
         when_to_use: "Use when the current turn is going the wrong way and should stop now. Pass prompt for interrupt-and-redirect; omit it for a plain interrupt. This is different from bro_cancel: the live session is repaired and can continue inside the same task.",
         example: Some(
             r#"bro_interrupt(task_id="...", prompt="Stop that path; inspect the boundary doc first.")"#,

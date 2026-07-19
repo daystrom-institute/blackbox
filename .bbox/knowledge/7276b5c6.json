@@ -1,7 +1,7 @@
 {
   "id": "7276b5c6",
-  "title": "The bro-harness/daemon boundary: a shared contract bottom",
-  "content": "The shared **contract bottom** — `bro-core` (ids/refs/errors), `bro-protocol` (control plane + status/view DTOs), `bro-capabilities` (Atom/Corpus/Refactor traits) — holds the types and traits that cross the harness↔daemon boundary; it is pure (serde + traits, no I/O) and depends on nothing. `bro-harness` is a library (`[lib]`); `blackbox` (the daemon + the `bro`/fleet tooling) links it as a crate and/or spawns its binary (subprocess + Claude stream-json envelope), per consumer. The compile DAG is `blackbox → bro-harness → bro-tools`, all pointing **down** into the contract bottom — acyclic and compiler-enforced. **`bro-harness` must never depend on `blackbox`** — a compile error, not a convention. Daemon capabilities reach the harness only through `bro-capabilities` traits the daemon implements and the harness calls (dependency inversion, owned by neither) — never an RPC or compile edge *from* the harness — and **fail closed** when the daemon's capability impls aren't present. The thin **fleet client** (`bro-cli` via `bro-fleet-client`) depends on `bro-protocol` + `bro-core` only — never `blackbox`, `bro-capabilities`, or either implementer. Crate boundaries follow consumer cleavage, not topic. (The harness Promise layer keeps the same shape: Promise producers are harness-local; `bro_exec`/`bro_resume`/daemon orchestration are not Promise producers inside the harness.) See `design/bro-harness/harness-daemon-boundary.md` §2/§7/§11.",
+  "title": "The bro-harness/daemon boundary: standalone process contract",
+  "content": "The shared contract bottom keeps cross-boundary types pure: `bro-core` owns ids/refs/errors and `bro-protocol` owns session control plus status/view DTOs. `bro-harness` remains an independently buildable library+binary but `blackbox` MUST NOT depend on or link `bro-harness`, `bro-code-mode`, V8, or `bro-capabilities`; Cargo enforces the process boundary. Every harness-backed provider dispatch runs in one standalone `bro-harness` child. stdin NDJSON carries user turns and controls, stdout NDJSON carries the Claude-compatible event envelope, and the child writes its durable event log under the explicitly passed `BRO_HOME`. Daemon capabilities cross only through the complete server-filtered MCP catalog. The compatibility flat names `corpus_search` and `atom_invoke` alias `bbox_corpus_search` and `atom_invoke` from that catalog without hiding qualified MCP tools, and fail closed when the source server/tool is unavailable. Provider credentials stay in the harness child and are scrubbed from shell grandchildren; project build env travels separately through `shell_env`. V8/code-mode lives inside the harness child, while the `isolate` binary remains independently executable. The thin fleet client (`bro-cli` via `bro-fleet-client`) depends only on `bro-protocol` + `bro-core`, never either runtime implementer. See `design/bro-harness/harness-process-boundary.md`.",
   "variants": {},
   "category": "convention",
   "scope": "project",
@@ -14,6 +14,6 @@
   "decay": true,
   "source": "user",
   "created_at": "2026-05-30T18:14:08Z",
-  "updated_at": "2026-06-04T02:04:08Z",
+  "updated_at": "2026-07-19T17:55:31Z",
   "recall_count": 0
 }

@@ -594,12 +594,11 @@ mod tests {
             .lock()
             .await
     }
-    // Flaky under the full parallel suite: badgey_exec dispatches Brodex
-    // in-process (no live API in tests), and whether it publishes a session id
-    // before the dispatch Fails is a race that loses under load. Passes in
-    // isolation. Needs a deterministic harness mock-transport (post-codexification
-    // the mockable codex-CLI subprocess path is gone) — tracked as follow-up.
-    #[ignore = "needs harness mock-transport for deterministic in-process dispatch"]
+    // Flaky under the full parallel suite: badgey_exec launches Brodex without
+    // a live API, and whether the harness child publishes a session id before
+    // failing is a race that loses under load. A deterministic harness child
+    // fixture remains follow-up work.
+    #[ignore = "needs deterministic bro-harness child fixture"]
     #[tokio::test]
     async fn badgey_lifecycle_tools_write_thread_events() {
         let _env = crate::util::test_env_lock();
@@ -623,11 +622,9 @@ mod tests {
         let badgey_id = exec_body["badgey_id"].as_str().unwrap().to_string();
         let task_id = exec_body["task_id"].as_str().unwrap().to_string();
         let thread_id = exec_body["thread_id"].as_str().unwrap().to_string();
-        // Brodex dispatches in-process (bro-harness), so the session id is a
-        // daemon-minted uuid — not a value injected by a mocked codex CLI
-        // subprocess (that path is gone post-codexification). Assert it is
-        // present and non-empty, and thread the real value through the
-        // event-content checks below.
+        // Brodex dispatches through bro-harness, so the session id is minted
+        // for that harness session, not injected by a mocked codex CLI. Assert
+        // it is present and thread the real value through the checks below.
         let session_id = exec_body["session_id"].as_str().unwrap().to_string();
         assert!(!session_id.is_empty(), "exec must publish a session id");
         assert!(server.state.task_store.read().get(&task_id).is_some());
@@ -655,9 +652,9 @@ mod tests {
             .map(|note| note.body.as_str())
             .collect();
         // The exec event records the real (uuid) provider session id. The turn
-        // event is NOT asserted: it requires a completed provider turn, which an
-        // in-process Brodex dispatch can't produce in a unit test (no live API),
-        // so only the deterministic lifecycle events (exec, dismiss) are checked.
+        // event is NOT asserted: it requires a completed provider turn, which
+        // this unit test cannot produce without a live API, so only the
+        // deterministic lifecycle events (exec, dismiss) are checked.
         let expected_exec = format!(r#""provider_session_id":"{session_id}""#);
         assert!(
             bodies
@@ -678,10 +675,10 @@ mod tests {
     }
 
     // Flaky under the full parallel suite for the same reason as
-    // badgey_lifecycle_tools_write_thread_events: the in-process Brodex dispatch
-    // Fails (no live API) and racing session-id publication loses under load.
+    // badgey_lifecycle_tools_write_thread_events: the Brodex harness child
+    // fails without a live API and racing session-id publication loses under load.
     // Passes in isolation; needs a harness mock-transport — tracked as follow-up.
-    #[ignore = "needs harness mock-transport for deterministic in-process dispatch"]
+    #[ignore = "needs deterministic bro-harness child fixture"]
     #[tokio::test]
     async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
         let _env = crate::util::test_env_lock();
@@ -737,9 +734,9 @@ mod tests {
             .await;
         assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
         let body: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        // The badgey persona brofile dispatches Brodex in-process (serializes
-        // "brodex"; "codex" is only a deserialize alias), and the session id is
-        // a daemon-minted uuid rather than a mocked codex-CLI value.
+        // The badgey persona brofile dispatches Brodex (serializes "brodex";
+        // "codex" is only a deserialize alias), and the harness session id is
+        // independent of the mocked codex CLI.
         assert_eq!(body["session"]["provider"], "brodex");
         assert!(
             body["session"]["session_id"]

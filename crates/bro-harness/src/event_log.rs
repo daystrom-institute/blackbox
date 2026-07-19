@@ -21,16 +21,14 @@
 //!   durable up to the last drained event even when the process dies
 //!   mid-turn. No tmp+rename (that idiom is for the snapshot, which must be
 //!   atomic *as a whole*; the log must never be rewritten at all).
-//! - **Writes happen on a dedicated writer thread.** The agent loop runs as
-//!   an async task on the host's tokio runtime (in-process dispatch shares
-//!   the daemon's workers); serializing a multi-KB envelope and doing a sync
-//!   `write_all` inline per event measurably degraded daemon worker poll
-//!   times under streaming load (thread-935b467d §4.6 measurement). Appends
-//!   enqueue the raw `Value` on a bounded channel; the writer thread owns
-//!   serialization + the file handle and preserves line order. When the
-//!   channel is full the sender BLOCKS (backpressure) rather than dropping —
-//!   the log feeds the transcript corpus, so loss is worse than a stall on a
-//!   pathological disk. The agent loop flushes at turn boundaries
+//! - **Writes happen on a dedicated writer thread.** Serializing a multi-KB
+//!   envelope and doing a sync `write_all` inline per event measurably degraded
+//!   runtime worker poll times under streaming load (thread-935b467d §4.6
+//!   measurement). Appends enqueue the raw `Value` on a bounded channel; the
+//!   writer thread owns serialization + the file handle and preserves line
+//!   order. When the channel is full the sender BLOCKS (backpressure) rather
+//!   than dropping because the log feeds the transcript corpus. The agent loop
+//!   flushes at turn boundaries
 //!   (`flush_blocking` via `spawn_blocking`) to bound the crash-durability
 //!   gap to the current turn.
 //! - **Compaction never rewrites the log.** Compaction rewrites the snapshot;

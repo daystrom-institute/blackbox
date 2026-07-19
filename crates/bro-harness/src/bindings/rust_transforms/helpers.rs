@@ -47,7 +47,11 @@ pub(super) fn relativize(root: &Path, path: &str) -> Result<String, String> {
 
 /// Reject workspace-escape file args up front: a binding's `file`/`target`
 /// must be workspace-relative without `..`.
-pub(super) fn resolve_workspace_file(root: &Path, file: &str, tool: &str) -> Result<PathBuf, String> {
+pub(super) fn resolve_workspace_file(
+    root: &Path,
+    file: &str,
+    tool: &str,
+) -> Result<PathBuf, String> {
     let rel = Path::new(file);
     if rel.is_absolute()
         || rel
@@ -101,8 +105,11 @@ pub(super) fn plan_to_changes_creates(
             continue;
         }
         if !file_edit.edits.is_empty() {
-            let replacement_bytes: usize =
-                file_edit.edits.iter().map(|edit| edit.replacement.len()).sum();
+            let replacement_bytes: usize = file_edit
+                .edits
+                .iter()
+                .map(|edit| edit.replacement.len())
+                .sum();
             would_change_files.push(json!({
                 "path": rel,
                 "edit_count": file_edit.edits.len(),

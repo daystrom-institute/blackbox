@@ -1,8 +1,8 @@
 //! Library surface for bro-harness.
 //!
-//! The binary remains a thin CLI wrapper. Keeping module ownership here lets the
-//! daemon link and drive the harness in-process in a later slice without
-//! changing the existing subprocess entrypoint.
+//! The binary remains a thin CLI wrapper. The library supports the isolate
+//! binary, integration tests, and non-daemon embedders. `blackboxd` deliberately
+//! does not link it; the daemon boundary is the standalone process protocol.
 
 pub mod agent_loop;
 pub mod bindings;

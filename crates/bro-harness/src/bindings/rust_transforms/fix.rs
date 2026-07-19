@@ -109,9 +109,7 @@ impl RustFixRound {
                     .get("file")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if !file.is_empty()
-                    && !files.iter().any(|f| file.contains(f.as_str()))
-                {
+                if !file.is_empty() && !files.iter().any(|f| file.contains(f.as_str())) {
                     continue;
                 }
             }
@@ -512,7 +510,12 @@ mod tests {
         }
     }
 
-    fn machine_applicable_suggestion(file: &str, start: usize, end: usize, replacement: &str) -> Value {
+    fn machine_applicable_suggestion(
+        file: &str,
+        start: usize,
+        end: usize,
+        replacement: &str,
+    ) -> Value {
         let sha = bbox_refactor::sha256_hex(b"fixture");
         json!({
             "file": file,
@@ -672,9 +675,7 @@ mod tests {
             safety: Arc::new(bro_tools::SafetyPolicy::new()),
             http: reqwest::Client::new(),
             todos: Arc::new(std::sync::Mutex::new(bro_tools::TodoList::default())),
-            shell_sessions: Arc::new(std::sync::Mutex::new(
-                bro_tools::ShellSessions::default(),
-            )),
+            shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             edits: Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(std::collections::BTreeMap::new()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
@@ -692,10 +693,7 @@ mod tests {
         let suggestion = machine_applicable_suggestion("src/lib.rs", 0, 4, "x");
         let diag = diag_with_suggestion("E0308", "mismatch", suggestion);
         let restrict = vec!["other_file.rs".to_string()];
-        let result = result_json(tool.classify(
-            std::slice::from_ref(&diag),
-            Some(&restrict),
-        ));
+        let result = result_json(tool.classify(std::slice::from_ref(&diag), Some(&restrict)));
         // Diagnostic file src/lib.rs does not contain other_file.rs: skipped.
         assert!(result["changes"].as_array().unwrap().is_empty());
     }

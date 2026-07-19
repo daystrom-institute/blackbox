@@ -19,9 +19,7 @@ use std::collections::HashSet;
 use std::fs;
 
 use async_trait::async_trait;
-use bbox_refactor::{
-    TextEdit, path_string, rust_move_with_callers, sha256_hex,
-};
+use bbox_refactor::{TextEdit, path_string, rust_move_with_callers, sha256_hex};
 use bro_tools::{Tool, ToolAnnotations, ToolCx, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -117,9 +115,7 @@ impl Tool for RustRewriteModuleCallers {
             Err(e) => return ToolResult::Error(format!("invalid input: {e}")),
         };
         if params.item_names.is_empty() {
-            return ToolResult::Error(
-                "item_names is required and must not be empty".to_string(),
-            );
+            return ToolResult::Error("item_names is required and must not be empty".to_string());
         }
         let root = cx.root.clone();
         // Sync fs + walk work runs inside call_blocking, off the tokio worker
@@ -177,8 +173,7 @@ impl RustRewriteModuleCallers {
             }
         };
 
-        let moved_names: HashSet<&str> =
-            params.item_names.iter().map(String::as_str).collect();
+        let moved_names: HashSet<&str> = params.item_names.iter().map(String::as_str).collect();
 
         // Resolve canonical skip paths.
         let skip_canonical: Vec<_> = params
@@ -356,7 +351,10 @@ mod tests {
         match result {
             ToolResult::Json(val) => {
                 let changes = val["changes"].as_array().expect("changes array");
-                assert!(changes.is_empty(), "false-positive prefix should not produce changes");
+                assert!(
+                    changes.is_empty(),
+                    "false-positive prefix should not produce changes"
+                );
                 let counts = &val["counts"];
                 assert_eq!(counts["files_touched"], 0);
             }
@@ -496,7 +494,10 @@ mod tests {
 
         match result {
             ToolResult::Error(e) => {
-                assert!(e.contains("must differ"), "error should mention names differ");
+                assert!(
+                    e.contains("must differ"),
+                    "error should mention names differ"
+                );
             }
             _ => panic!("expected error, got {result:?}"),
         }

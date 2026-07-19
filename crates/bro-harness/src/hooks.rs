@@ -197,7 +197,7 @@ impl HookEngine {
     /// Gated by `BRO_HARNESS_NUDGES` (default on; `0`/`false` disables) so the
     /// whole subsystem can be switched off without code changes. Uses
     /// transport session env first, then process env, so daemon-dispatched
-    /// in-process sessions can override it without mutating global env.
+    /// sessions can override it without mutating global env.
     pub fn from_env(ledger: NudgeLedger) -> Self {
         let enabled = session_flag_enabled("BRO_HARNESS_NUDGES", true);
         let gap_note_directive_enabled = session_flag_enabled(GAP_NOTE_DIRECTIVE_ENV, true);

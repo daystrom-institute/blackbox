@@ -25,6 +25,19 @@ pub struct Cli {
     #[arg(long = "input-format")]
     pub input_format: Option<String>,
 
+    /// Daemon-supervised child mode: consume the current stdin turn and any
+    /// already-buffered controls, persist, then exit. This keeps the existing
+    /// one-process-per-dispatch lifecycle while moving provider and V8
+    /// execution outside blackboxd.
+    #[arg(long = "exit-when-idle", default_value_t = false)]
+    pub exit_when_idle: bool,
+
+    /// Marks a same-host daemon-supervised child. Provider transports retain
+    /// their session environment, while shell children scrub the keys named by
+    /// `BRO_HARNESS_SPAWN_SCRUB`.
+    #[arg(long = "daemon-worker", default_value_t = false, hide = true)]
+    pub daemon_worker: bool,
+
     /// Re-emit each stdin user message back on stdout as a `user` event (gated
     /// on stream-json in/out). Mirrors the claude CLI's `--replay-user-messages`.
     #[arg(long = "replay-user-messages", default_value_t = false)]
@@ -46,8 +59,8 @@ pub struct Cli {
     /// Working directory for this session. File/shell tools resolve against it
     /// (`ToolCx.root`) and project-doc discovery starts here. The daemon passes
     /// the dispatch cwd here instead of mutating the process cwd, so concurrent
-    /// in-process sessions never collide (harness-daemon-boundary.md §3). Absent
-    /// ⇒ the process cwd (standalone binary).
+    /// child sessions never collide (harness-process-boundary.md §2). Absent
+    /// means the process cwd.
     #[arg(long = "cwd")]
     pub cwd: Option<String>,
 
@@ -73,6 +86,13 @@ pub struct Cli {
     /// entries carry command/args/env. The harness just connects and lists.
     #[arg(long = "mcp-config")]
     pub mcp_config: Option<String>,
+
+    /// Name of the daemon-owned MCP server whose canonical capability methods
+    /// should also be exposed under their compatibility flat names
+    /// (`corpus_search`, `atom_invoke`). The qualified MCP tools remain
+    /// available, so this is an alias projection rather than a reduced catalog.
+    #[arg(long = "capability-mcp-server", hide = true)]
+    pub capability_mcp_server: Option<String>,
 
     /// Comma-separated client-side DENY patterns for MCP tools, as
     /// fully-qualified `mcp__<server>__<tool>` names (exact or trailing-`*`

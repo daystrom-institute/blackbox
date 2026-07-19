@@ -1,4 +1,4 @@
-//! Transcript adapter for in-process bro-harness sessions.
+//! Transcript adapter for standalone bro-harness process sessions.
 //!
 //! The harness writes two artifacts per session under
 //! `$BRO_HOME/harness-sessions` (else `~/.bro-harness/sessions`):
@@ -63,7 +63,7 @@ const HARNESS_PROVIDERS: &[Provider] = &[
 /// (`crates/bro-harness/src/session.rs::sessions_dir`): `$BRO_HOME/
 /// harness-sessions`, else `~/.bro-harness/sessions`. The daemon exports
 /// `BRO_HOME` during single-threaded startup (`server/open.rs`), so runtime
-/// callers agree with in-process harness sessions on the dir.
+/// callers agree with standalone harness children on the dir.
 pub fn env_sessions_dir() -> PathBuf {
     if let Ok(home) = std::env::var("BRO_HOME") {
         PathBuf::from(home).join("harness-sessions")

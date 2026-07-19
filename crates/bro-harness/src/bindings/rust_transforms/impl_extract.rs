@@ -190,9 +190,7 @@ impl RustExtractImplMethods {
             .collect();
         if candidates.is_empty() {
             if let Some(impl_name) = params.impl_name.as_deref() {
-                return ToolResult::Error(format!(
-                    "no impl block matching `{impl_name}` found"
-                ));
+                return ToolResult::Error(format!("no impl block matching `{impl_name}` found"));
             }
             return ToolResult::Error("no Rust impl methods found".to_string());
         }
@@ -286,15 +284,13 @@ impl RustExtractImplMethods {
             .any(|name| rust_text_contains_identifier(&parent_after_move, name));
 
         let explicit_visibility = params.visibility.as_deref();
-        let fallback_visibility =
-            if explicit_visibility.is_none() && parent_still_calls {
-                Some("pub(super)")
-            } else {
-                None
-            };
+        let fallback_visibility = if explicit_visibility.is_none() && parent_still_calls {
+            Some("pub(super)")
+        } else {
+            None
+        };
 
-        let rebase_super_paths =
-            rust_target_is_child_module_of_source(&source_path, &target_path);
+        let rebase_super_paths = rust_target_is_child_module_of_source(&source_path, &target_path);
 
         // Read target and compute target edits.
         let target_source = fs::read_to_string(&target_path).unwrap_or_default();
@@ -413,7 +409,10 @@ mod tests {
                 let changes = val["changes"].as_array().expect("changes array");
                 assert!(!changes.is_empty(), "expected changes");
                 let leftovers = val["leftovers"].as_array().expect("leftovers array");
-                assert!(leftovers.is_empty(), "expected no leftovers, got {leftovers:?}");
+                assert!(
+                    leftovers.is_empty(),
+                    "expected no leftovers, got {leftovers:?}"
+                );
             }
             ToolResult::Error(e) => panic!("unexpected error: {e}"),
             other => panic!("unexpected result: {other:?}"),
@@ -536,7 +535,10 @@ mod tests {
 
         match result {
             ToolResult::Error(e) => {
-                assert!(e.contains("missing"), "error should name the missing method");
+                assert!(
+                    e.contains("missing"),
+                    "error should name the missing method"
+                );
             }
             _ => panic!("expected error, got {result:?}"),
         }
@@ -561,7 +563,10 @@ mod tests {
 
         match result {
             ToolResult::Error(e) => {
-                assert!(e.contains("not be empty"), "error should mention empty names");
+                assert!(
+                    e.contains("not be empty"),
+                    "error should mention empty names"
+                );
             }
             _ => panic!("expected error, got {result:?}"),
         }

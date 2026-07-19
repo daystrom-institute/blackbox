@@ -44,7 +44,7 @@ pub(crate) struct ExecParams {
     /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
-    /// Per-dispatch MCP placement map for in-process harness providers.
+    /// Per-dispatch MCP placement map for standalone harness providers.
     /// Keys are fully-qualified MCP names (`mcp__server__tool`); values are
     /// `in-box`, `out-box`, or `both`.
     #[serde(default)]
@@ -687,7 +687,7 @@ pub(crate) struct BrofileParams {
     pub(crate) disallow_tools: Option<Vec<String>>,
     /// Optional tool-surface selector embedded in the brofile. When set, the
     /// daemon evaluates the installed surface packet for this surface and folds
-    /// the verdict into the dispatch filter plane (harness-daemon-boundary.md §6).
+    /// the verdict into the dispatch filter plane (harness-process-boundary.md §3).
     #[serde(default)]
     pub(crate) surface: Option<String>,
     /// When true, inject the workspace-tools appendix into every dispatch

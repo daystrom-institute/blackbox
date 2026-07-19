@@ -175,16 +175,15 @@ pub fn evaluate_tool_surface(
     }
 }
 
-/// Resolve a surface's filter contribution for a *dispatch* identity, making the
-/// dispatch/in-process path a third consumer of `evaluate_tool_surface` —
-/// alongside the rmcp wire head (`list_tools`/`call_tool`) — so wire callers and
-/// in-process agents share one packet authority (harness-daemon-boundary.md §6).
+/// Resolve a surface's filter contribution for a dispatch identity. The result
+/// contributes to child-side allow/deny admission alongside the rmcp wire head
+/// (`list_tools`/`call_tool`), so both sides share one packet authority.
 ///
 /// Returns `None` when no surface is named or the verdict imposes no
 /// restriction (passthrough / empty allow+disallow), so callers can merge
 /// unconditionally. A `Deny` verdict maps to a deny-all filter (`disallow: *`),
 /// preserving the evaluator's fail-closed intent in the client-side filter plane
-/// that governs in-process sessions (which never hit the wire head).
+/// that governs standalone harness sessions.
 pub fn dispatch_surface_filters(
     packets: &Packets,
     surface: Option<&str>,

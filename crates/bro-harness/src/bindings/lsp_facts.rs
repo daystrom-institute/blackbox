@@ -1032,7 +1032,10 @@ impl Tool for LspReferences {
                     };
                     let sha = bbox_refactor::sha256_hex(&bytes);
                     let source_text = String::from_utf8_lossy(&bytes).to_string();
-                    per_file_cache.insert(file_path.clone(), (sha.clone(), source_text.clone(), rel.clone()));
+                    per_file_cache.insert(
+                        file_path.clone(),
+                        (sha.clone(), source_text.clone(), rel.clone()),
+                    );
                     (sha, source_text)
                 }
             };
@@ -1437,8 +1440,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().unwrap();
         let src = root.join("probe.rs");
-        std::fs::write(&src, "pub fn compute(x: u32) -> u32 { x * 2 }\n")
-            .expect("write probe.rs");
+        std::fs::write(&src, "pub fn compute(x: u32) -> u32 { x * 2 }\n").expect("write probe.rs");
         let sha = bbox_refactor::sha256_hex(&std::fs::read(&src).expect("read"));
         let cx = cx_in(&root);
         let tool = LspReferences(unavailable_lsp_state());
@@ -1562,7 +1564,10 @@ mod tests {
 
     #[test]
     fn language_for_file_routes_rs_and_java() {
-        assert_eq!(language_for_file(Path::new("/x/foo.rs")).unwrap(), Language::Rust);
+        assert_eq!(
+            language_for_file(Path::new("/x/foo.rs")).unwrap(),
+            Language::Rust
+        );
         assert_eq!(
             language_for_file(Path::new("/x/foo/Bar.java")).unwrap(),
             Language::Java

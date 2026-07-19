@@ -1,0 +1,22 @@
+{
+  "id": "gap-cd5edeee",
+  "title": "Warm lane lacks project-required stable rustfmt",
+  "gap_kind": "tooling",
+  "domain": "lane-mechanics",
+  "wanted_capability": "A claimed warm lane should immediately run the repository's mandated `cargo +stable fmt` and `cargo +stable fmt --check` gates.",
+  "missing_primitive": "Warm lane image provisioned with the project-required stable rustfmt component",
+  "fallback_used": "Run host stable cargo from the registered base-repo cwd with `--manifest-path` pointing at the lane checkout; this validates the lane files without routing cargo into the under-provisioned worker.",
+  "evidence": [
+    "lane bpool1: `rtk cargo +stable fmt` failed because cargo-fmt is not installed for stable-x86_64-unknown-linux-gnu",
+    "`rtk rustup component add --toolchain stable rustfmt` reports up to date on the host, but `rtk cargo +stable fmt --check` still fails in the remote x86_64 lane, so the normal rustup workaround does not reach the execution environment",
+    "From the registered base-repo cwd, `rtk cargo +stable fmt --manifest-path /Users/invidious/lanes/bpool1/blackbox/Cargo.toml --check` successfully validated the lane checkout; this is a non-obvious host-side workaround, not a working lane toolchain"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/lane-mechanics/stable-rustfmt-missing",
+  "suggested_owner": "bbox-cage lane image",
+  "notes": "BBOX_LANE_WORK describes warm build/test offload, while project policy mandates `cargo +stable fmt`. A freshly claimed warm lane cannot satisfy that gate directly, and `rtk rustup` mutates or checks the host toolchain rather than the remote cargo execution environment. The host-cwd/remote-manifest workaround should be documented or replaced by provisioning rustfmt in the lane image.",
+  "resolution": "unresolved",
+  "created_at": "2026-07-19T17:48:20Z",
+  "updated_at": "2026-07-19T18:14:37Z"
+}

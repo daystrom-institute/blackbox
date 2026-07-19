@@ -1,7 +1,8 @@
 //! `bro-harness` — headless coding agent.
 //!
-//! Spawned as a subprocess by the daemon today; the same logic is also exposed
-//! as the `bro_harness` library for in-process execution.
+//! Spawned as an independent subprocess by the daemon. The library target
+//! remains available for harness-owned tests and embedding outside blackboxd;
+//! the daemon does not link it.
 //!
 //! INVARIANT: stdout is the protocol channel — only NDJSON protocol lines go
 //! there. All diagnostics go to stderr.

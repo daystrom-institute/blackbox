@@ -722,9 +722,9 @@ impl BlackboxServer {
             Some(&dispatch_context),
             exec_opts.as_ref(),
         );
-        // §6: fold the brofile's surface-packet verdict into the dispatch filter
-        // plane (disallow-wins), so this in-process session is surface-governed
-        // by the same evaluate_tool_surface authority the wire head applies.
+        // Fold the brofile's surface-packet verdict into the dispatch filter
+        // plane (disallow-wins), matching the authority applied by the MCP wire
+        // head used by the harness child.
         let surface_filters = crate::server::surface::dispatch_surface_filters(
             &self.state.packets.read(),
             bf.surface.as_deref(),

@@ -29,11 +29,13 @@ up a leaf.
 
 ## Invariant (binds every clause)
 
-bro-harness shares code with the daemon (workspace crates) but **never has a
-runtime dependency on it** — no MCP/RPC backchannel from harness to daemon. The
-only daemon↔harness contract is the Claude stream-json envelope on stdout. Any
-clause that would require the harness to call the daemon is out of scope and
-wrong by construction. `[derived]`
+bro-harness shares workspace crates with the daemon but has no compile or
+lifecycle dependency on it. It runs as a standalone process and remains usable
+without blackboxd. A daemon-supervised session uses explicit boundary channels:
+stdin NDJSON for user/control input, the Claude-compatible stdout NDJSON event
+envelope, and the daemon's server-filtered MCP endpoint for optional
+capabilities. Capability unavailability fails closed by tool absence. The
+daemon never hosts the provider transport or V8 runtime. `[derived]`
 
 ## Contracts in scope
 

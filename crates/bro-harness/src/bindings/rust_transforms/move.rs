@@ -76,7 +76,11 @@ struct ExtractItemsInput {
     section: Option<SectionBounds>,
     /// Knob (§8.3): append to an existing non-empty target instead of
     /// refusing. Compound mode only.
-    #[serde(default, rename = "mergeIntoExistingTarget", alias = "merge_into_existing_target")]
+    #[serde(
+        default,
+        rename = "mergeIntoExistingTarget",
+        alias = "merge_into_existing_target"
+    )]
     merge_into_existing_target: Option<bool>,
     /// Knob (§8.3): visibility of the auto-emitted parent re-export.
     /// Compound mode only. `private` (default), `pub`, `pub(crate)`,
@@ -106,7 +110,11 @@ struct SectionBounds {
 }
 
 impl RustExtractItems {
-    fn build_params(&self, root: &std::path::Path, input: &ExtractItemsInput) -> Result<(RefactorPlanParams, Mode), String> {
+    fn build_params(
+        &self,
+        root: &std::path::Path,
+        input: &ExtractItemsInput,
+    ) -> Result<(RefactorPlanParams, Mode), String> {
         let source_abs = resolve_workspace_file(root, &input.source, "rust.extractItems")?;
         let target_abs = resolve_workspace_file(root, &input.target, "rust.extractItems")?;
         let mut entries = std::collections::BTreeMap::new();
@@ -150,19 +158,20 @@ impl RustExtractItems {
         // `extract_rust_section` does not take item_names directly (it derives
         // them from bounds); passing them is harmless because the planner
         // ignores them. But an empty item_names on section mode is valid.
-        let item_names: Vec<String> = if matches!(mode, Mode::Section) && input.item_names.is_empty() {
-            // Section mode: item_names optional (bounds drive selection).
-            // Pass a placeholder the planner tolerates; the section planner
-            // overrides item_names from bounds anyway.
-            Vec::new()
-        } else if input.item_names.is_empty() {
-            return Err(
+        let item_names: Vec<String> =
+            if matches!(mode, Mode::Section) && input.item_names.is_empty() {
+                // Section mode: item_names optional (bounds drive selection).
+                // Pass a placeholder the planner tolerates; the section planner
+                // overrides item_names from bounds anyway.
+                Vec::new()
+            } else if input.item_names.is_empty() {
+                return Err(
                 "rust.extractItems: itemNames is required (or pass section bounds for section mode)"
                     .to_string(),
             );
-        } else {
-            input.item_names.clone()
-        };
+            } else {
+                input.item_names.clone()
+            };
 
         // Section mode entries: the v1 planner reads toml_entries for bounds.
         if let Some(section) = input.section.as_ref() {
@@ -189,7 +198,11 @@ impl RustExtractItems {
             module_name: input.module_name.clone(),
             visibility: input.visibility.clone(),
             target_prelude: input.target_prelude.clone(),
-            toml_entries: if entries.is_empty() { None } else { Some(entries) },
+            toml_entries: if entries.is_empty() {
+                None
+            } else {
+                Some(entries)
+            },
             project_dir: Some(root.to_string_lossy().into_owned()),
             ..Default::default()
         };
@@ -243,7 +256,10 @@ impl Tool for RustExtractItems {
         })
     }
     fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations { read_only: true, destructive: false }
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
     }
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("rust".to_string(), "extractItems".to_string()))
@@ -362,15 +378,20 @@ fn run_dependency_analysis(
     // Surface the seed closure when with_local_deps is requested (the
     // planner computed it internally; this is the cell-visible copy).
     if mode == Mode::WithLocalDeps && !input.item_names.is_empty() {
-        let seeds: std::collections::BTreeSet<String> =
-            input.item_names.iter().cloned().collect();
+        let seeds: std::collections::BTreeSet<String> = input.item_names.iter().cloned().collect();
         let mut outgoing: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         let mut incoming: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for edge in &graph.edges {
-            outgoing.entry(edge.from.clone()).or_default().push(edge.to.clone());
-            incoming.entry(edge.to.clone()).or_default().push(edge.from.clone());
+            outgoing
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+            incoming
+                .entry(edge.to.clone())
+                .or_default()
+                .push(edge.from.clone());
         }
         let external_refs = graph.external_references.iter().fold(
             std::collections::HashMap::<String, usize>::new(),
@@ -451,7 +472,12 @@ struct InlineModInput {
     /// Source file containing the inline `mod foo { ... }`, workspace-relative.
     source: String,
     /// The single mod name to inline.
-    #[serde(default, rename = "moduleName", alias = "module_name", alias = "modName")]
+    #[serde(
+        default,
+        rename = "moduleName",
+        alias = "module_name",
+        alias = "modName"
+    )]
     module_name: Option<String>,
     /// Optional explicit target path. Auto-derived from source when unset.
     #[serde(default)]
@@ -485,7 +511,10 @@ impl Tool for RustInlineModToFile {
         })
     }
     fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations { read_only: true, destructive: false }
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
     }
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("rust".to_string(), "inlineModToFile".to_string()))
@@ -497,15 +526,11 @@ impl Tool for RustInlineModToFile {
             Err(e) => return ToolResult::Error(format!("rust.inlineModToFile: bad input: {e}")),
         };
         let preview_only = args.preview_only.unwrap_or(false);
-        let mod_name = match args
-            .module_name
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| {
-                args.item_names
-                    .as_ref()
-                    .and_then(|names| names.first().cloned())
-            }) {
+        let mod_name = match args.module_name.as_deref().map(str::to_string).or_else(|| {
+            args.item_names
+                .as_ref()
+                .and_then(|names| names.first().cloned())
+        }) {
             Some(name) => name,
             None => {
                 return ToolResult::Error(
@@ -559,7 +584,8 @@ impl Tool for RustInlineModToFile {
             creates,
             would_change_files,
             would_create_files,
-        } = match plan_to_changes_creates(&root, "rust.inlineModToFile", &plan.edits, preview_only) {
+        } = match plan_to_changes_creates(&root, "rust.inlineModToFile", &plan.edits, preview_only)
+        {
             Ok(proj) => proj,
             Err(e) => return ToolResult::Error(format!("rust.inlineModToFile: {e}")),
         };
@@ -699,7 +725,9 @@ mod tests {
         // Findings carry the moved_item entries (planner's SyntaxItem list).
         let findings = result["findings"].as_array().unwrap();
         assert!(
-            findings.iter().any(|finding| finding["finding"] == "moved_item"),
+            findings
+                .iter()
+                .any(|finding| finding["finding"] == "moved_item"),
             "{findings:?}"
         );
     }
@@ -857,7 +885,10 @@ mod tests {
         assert!(target.contains("use super::*;"), "{target}");
         assert!(target.contains("fn one()"), "{target}");
         // De-indented: `use super::*;` at column 0, not column 4.
-        assert!(target.lines().any(|line| line == "use super::*;"), "{target}");
+        assert!(
+            target.lines().any(|line| line == "use super::*;"),
+            "{target}"
+        );
         // Source: inline block replaced with `;`, outer attr kept.
         let source_after = apply_changes(src, &result);
         assert!(
