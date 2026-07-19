@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-impl-partition-graph",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Produce a method/field/call graph for a Rust impl block to support partitioning decisions; analysis-only, no apply path.",
@@ -12,8 +12,8 @@
       "auditing an impl block for cross-method coupling"
     ],
     "anti_patterns": [
-      "do not use as a clustering algorithm — this atom returns the graph, not partitions",
-      "do not use to decide whether to split — chain a clustering step or operator review",
+      "do not use as a clustering algorithm - this atom returns the graph, not partitions",
+      "do not use to decide whether to split - chain a clustering step or operator review",
       "do not use on non-Rust files"
     ],
     "inputs": {
@@ -35,11 +35,11 @@
           },
           "impl_name": {
             "type": "string",
-            "description": "Exact impl name as reported by bbox_code_symbols (e.g. `impl BlackboxServer`)."
+            "description": "Exact impl name as reported by code.items (for example `impl BlackboxServer`)."
           }
         }
       },
-      "prompt_template": "You are rust-impl-partition-graph. Charter: Produce the partition graph for a Rust impl block. Do not propose partitions; the operator decides.\n\nProtocol (analysis-only — steps 3 and 4 are skipped):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\",\n                     languages=[\"rust\"], item_kinds=[\"impl_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Copy exact `name` and `kind` values from the response. Do not name-match\n   from the user's prompt — re-derive from the structural inventory.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"rust_impl_partition_analysis\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      impl_name=\"{{impl_name}}\")\n   The response carries methods, fields, and edges (method→method calls,\n   method→field reads/writes). Do not invoke bbox_refactor_run — analysis\n   only.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: method count, field count,\n     edge count, file>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never invent impl names from the user prompt — re-derive from\n  bbox_code_symbols / bbox_refactor_status.\n- Never attempt apply on this atom — bbox_refactor_run is not part of\n  the analysis-only path.\n\nInputs:\n{{project_dir}} {{source_file}} {{impl_name}}"
+      "prompt_template": "You are rust-impl-partition-graph. Charter: Produce a method/field/call graph for a Rust impl block to support partitioning decisions; analysis-only, no apply path.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file={{source_file}}\nimpl_name={{impl_name}}\n\nProtocol:\n1. Work in code-mode. Read analysis.describe for implPartition.\n2. Ground the requested impl with code.items and code.signature, then call analysis.implPartition with source_file and impl_name.\n3. Return the method nodes, field sharing, typed edges, unresolved callbacks, and a compact summary. Do not invent clusters beyond the returned graph.\n4. Emit bbox_note(kind=\"done\") with method, field, and edge counts.\n\nStrict rules:\n- Analysis-only. Never create or apply an EditSet.\n- Do not call retired daemon refactor surfaces.\n- If the impl name is ambiguous or absent, block with the available code.items facts.\n"
     },
     "outputs": {
       "schema": {
@@ -81,7 +81,7 @@
           "deep_analysis_summary": {
             "type": "object",
             "additionalProperties": true,
-            "description": "Subset of the rust_impl_partition_analysis report — at minimum: method_count, field_count, edge_count."
+            "description": "Subset of the analysis.implPartition report, at minimum: method_count, field_count, edge_count."
           },
           "cargo_result": {
             "type": "object",
@@ -125,7 +125,7 @@
             "items": {
               "type": "object"
             },
-            "description": "Typed edges — method→method calls, method→field reads/writes."
+            "description": "Typed edges: method-to-method calls and method-to-field reads or writes."
           }
         }
       },
@@ -144,7 +144,7 @@
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
     "supervision": {
       "oracle": "default"

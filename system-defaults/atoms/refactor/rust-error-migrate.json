@@ -2,19 +2,19 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-error-migrate",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
-    "description": "Rewrite a Rust module's error type — signature rewrites + literal construction rewrites; ?-site conversions handled by rust_compile_fix_round. Preflighted with rust_public_api_guard.",
+    "description": "Rewrite a Rust module's error type - signature rewrites + literal construction rewrites; ?-site conversions handled by rust.fixRound. Preflighted with code.items plus code.signature plus lsp.references.",
     "when_to_use": [
       "a module's error type is not actionable for callers or is over-specified",
       "migrating from a one-size error to a more granular variant set",
       "consolidating two ad-hoc error types in a module"
     ],
     "anti_patterns": [
-      "do not use when error sites use downcast / downcast_ref — atom refuses cleanly",
-      "do not use on a pub error type without acknowledge_public_api_change=true (operator-authority)",
-      "do not chain inside a mutating bbox_refactor_run — preflight stays outside"
+      "do not use when error sites use downcast / downcast_ref - atom refuses cleanly",
+      "do not use on a public error type unless the operator supplied the dispatch-side ToolArgDefaults grant",
+      "do not combine the public-API preflight with the mutating EditSet"
     ],
     "inputs": {
       "schema": {
@@ -24,6 +24,7 @@
           "source_file_or_module",
           "from_type",
           "to_type",
+          "item_names",
           "error_mapping"
         ],
         "properties": {
@@ -39,16 +40,20 @@
           "to_type": {
             "type": "string"
           },
+          "item_names": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            },
+            "description": "Function names whose error return signatures should change."
+          },
           "error_mapping": {
             "type": "object",
             "description": "Map of old construction form to new construction form, e.g. {\"OldErr::Bad(msg)\": \"NewErr::Bad { msg }\"}.",
             "additionalProperties": {
               "type": "string"
             }
-          },
-          "acknowledge_public_api_change": {
-            "type": "boolean",
-            "description": "Operator-authority opt-out when the error type appears on pub surfaces. MUST be operator-explicit per RX-V1 — no default."
           },
           "apply": {
             "type": "boolean"
@@ -58,7 +63,7 @@
           }
         }
       },
-      "prompt_template": "You are rust-error-migrate. Charter: Rewrite a module's error type with public-API preflight.\n\nProtocol (preflight + mutating run; v1 composition is intra-prompt):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{from_type}}\",\n                     languages=[\"rust\"], item_kinds=[\"enum_item\", \"struct_item\", \"function_item\"])\n   bbox_refactor_status(file=\"{{source_file_or_module}}\", project_dir=\"{{project_dir}}\")\n   Confirm the from_type resolves and the source compiles cleanly first.\n\n2. Plan with deep_analysis=true — PREVIEW only, no run:\n   bbox_refactor_plan(kind=\"rewrite_rust_error_type\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file_or_module}}\",\n                      from_type=\"{{from_type}}\", to_type=\"{{to_type}}\",\n                      toml_entries={\"error_mapping\": {{error_mapping}}})\n   Then run the public-API guard as a SEPARATE PREFLIGHT plan (outside any\n   bbox_refactor_run):\n   bbox_refactor_plan(kind=\"rust_public_api_guard\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file_or_module}}\",\n                      toml_entries={\"proposed_changes\": <proposed-change refs from preview>})\n\n3. Decide:\n   - If guard.advisory_severity == \"breaking\" AND\n     {{acknowledge_public_api_change}} != true:\n     emit bbox_note(kind=\"blocked\", body=<concrete diagnostic carrying\n     the guard's findings + plan_path>) and return status=\"blocked\".\n     **NO bbox_refactor_run is created on this path.** The atom MUST NOT\n     default acknowledge_public_api_change (RX-V1).\n   - If grounding found downcast / downcast_ref on the error type: block.\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <rewrite_rust_error_type step>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n   The guard plan deliberately runs OUTSIDE the mutating run so the\n   repair-transaction invariant (RX-F2b) governs only the mutating\n   sequence.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: signatures_rewritten\n     count, construction_sites_rewritten count, question_mark_sites\n     classifications, fixme_count, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never default acknowledge_public_api_change — operator-authority is explicit.\n- Never chain rust_public_api_guard inside bbox_refactor_run — preflight stays outside.\n- Never apply when status=blocked.\n\nInputs:\n{{project_dir}} {{source_file_or_module}} {{from_type}} {{to_type}} {{error_mapping}} {{acknowledge_public_api_change}} {{apply}} {{validation_bin}}"
+      "prompt_template": "You are rust-error-migrate. Charter: Rewrite a Rust module's error type - signature rewrites + literal construction rewrites; ?-site conversions handled by rust.fixRound. Preflighted with code.items plus code.signature plus lsp.references.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file_or_module={{source_file_or_module}}\nfrom_type={{from_type}}\nto_type={{to_type}}\nitem_names={{item_names}}\nerror_mapping={{error_mapping}}\napply={{apply}}\nvalidation_bin={{validation_bin}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call retired daemon refactor surfaces.\n2. Read rust.describe for migrateErrorType. Ground every requested item_names function and its signature with code.items and code.signature, survey callers with lsp.references, then call rust.migrateErrorType with source_file_or_module as source, from_type as oldText, to_type as newText, item_names as itemNames, and error_mapping as errorMapping. Apply its changes and run the compiler fix loop. Return every question-mark finding and leftover.\n3. If apply is false, return the transform result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. Public API authority arrives only through default:rust.migrateErrorType.acknowledge_public_api_change=true in dispatch ToolArgDefaults. Never pass the acknowledgement in cell input.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
@@ -167,7 +172,7 @@
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
     "supervision": {
       "oracle": "default"

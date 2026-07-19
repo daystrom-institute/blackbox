@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-architecture-trait-boundary-mismatch",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Diagnose Rust trait boundaries that are missing, too broad, too narrow, or acting as service-locator-style abstractions.",
@@ -19,48 +19,152 @@
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "scope_filter"],
+        "required": [
+          "project_dir",
+          "scope_filter"
+        ],
         "properties": {
-          "project_dir": { "type": "string" },
-          "scope_filter": { "type": "string" },
-          "target_loci": { "type": "array", "items": { "type": "string" } },
-          "operator_hints": { "type": "array", "items": { "type": "string" } },
-          "layer_model_path": { "type": "string" },
-          "survey_json": { "type": "object", "additionalProperties": true },
-          "target_context_window": { "type": "integer", "minimum": 1000 },
-          "whole_project_mode": { "type": "boolean" },
-          "whiteboard_id": { "type": "string" }
+          "project_dir": {
+            "type": "string"
+          },
+          "scope_filter": {
+            "type": "string"
+          },
+          "target_loci": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "operator_hints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "layer_model_path": {
+            "type": "string"
+          },
+          "survey_json": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "target_context_window": {
+            "type": "integer",
+            "minimum": 1000
+          },
+          "whole_project_mode": {
+            "type": "boolean"
+          },
+          "whiteboard_id": {
+            "type": "string"
+          }
         }
       },
-      "prompt_template": "You are rust-architecture-trait-boundary-mismatch. Diagnostic question: is a Rust trait boundary missing, too broad, too narrow, or pretending to be a service locator?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols, bbox_refactor_status, rust_public_api_guard when public surfaces are implicated, and call/ref searches for trait definitions, impls, mocks, and generic-heavy APIs.\n2. Apply the SAST/compiler gate. Object-safety or trait-bound errors are evidence, not diagnosis. A valid claim names intended trait role, method groups, caller dependency shape, and public API impact.\n3. Map remediation precisely. rust-trait-from-impl applies only to missing-trait surfaces. Broad or service-locator traits require rust-split-trait (G19) and likely rust_find_references (G10); label those as gap-backed or PD-manual.\n4. If whiteboard_id is non-empty, post one whiteboard_post claim or concern for each surviving diagnosis candidate.\n5. Emit bbox_note:done with trait count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, authority_grades, evidence_refs, atom_mapping, remediation_slices, acceptance_criteria, deferred, block_reason."
+      "prompt_template": "You are rust-architecture-trait-boundary-mismatch. Charter: Diagnose Rust trait boundaries that are missing, too broad, too narrow, or acting as service-locator-style abstractions.\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Work in code-mode. Ground current source with code.files, code.items, code.query, code.signature, and code.read. Use analysis.* for reductions and lsp.* for semantic facts. Do not call the retired daemon refactor surfaces.\n2. Use analysis.implPartition for candidate method roles, code.signature for generic and receiver shape, and lsp.references plus lsp.definition for semantic callers and trait resolution.\n3. A diagnosis must name the concrete locus, current owner, conflicting responsibility or lifetime, evidence, predicted failure mode, and confidence. Compiler or SAST facts are evidence, not diagnosis by themselves.\n4. Map interface extraction to rust.extractTrait and approved type-position changes to rust.migrateTypeUsages. Ordinary receiver calls are not covered by the ported v1 call-site scanners, so rust-analyzer and the compiler gate are required.\n5. If whiteboard_id is present, include one concise claim or concern per surviving candidate in the returned result for the orchestrator to post. Do not call an unavailable whiteboard tool.\n6. Emit bbox_note(kind=\"done\") with hotspot and candidate counts. Return the structured diagnosis and remediation mapping.\n\nStrict rules:\n- Analysis-only. Never apply edits.\n- Stay within scope_filter and target_loci.\n- Do not infer architecture from names alone.\n- Surface unsupported macro, unsafe, public-API, or runtime assumptions.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
         "type": "object",
-        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "required": [
+          "status",
+          "pathology_atom",
+          "diagnosis_candidates"
+        ],
         "properties": {
-          "status": { "enum": ["planned", "blocked", "errored"] },
-          "pathology_atom": { "const": "rust-architecture-trait-boundary-mismatch" },
-          "sast_gate": { "type": "object", "additionalProperties": true },
-          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
-          "authority_grades": { "type": "array", "items": { "type": "object" } },
-          "evidence_refs": { "type": "array", "items": { "type": "string" } },
-          "atom_mapping": { "type": "array", "items": { "type": "object" } },
-          "remediation_slices": { "type": "array", "items": { "type": "object" } },
-          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
-          "deferred": { "type": "array", "items": { "type": "object" } },
-          "block_reason": { "type": "string" },
-          "done_note_id": { "type": "string" }
+          "status": {
+            "enum": [
+              "planned",
+              "blocked",
+              "errored"
+            ]
+          },
+          "pathology_atom": {
+            "const": "rust-architecture-trait-boundary-mismatch"
+          },
+          "sast_gate": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "diagnosis_candidates": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "authority_grades": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "atom_mapping": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "remediation_slices": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "acceptance_criteria": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "deferred": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          }
         }
       },
       "evidence_density": "high"
     },
-    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
-    "composition": { "may_invoke_atoms": { "kind": "none" } },
-    "implementation": { "kind": "profile", "brofile_ref": "brofile:rust-architecture-pathologist@v1" },
-    "supervision": { "oracle": "default" },
-    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
     "cost_class": "normal",
-    "provenance": { "kind": "hand_authored", "author": "blackbox-rust-arch-pathology", "created_at": "2026-05-20T00:00:00Z" }
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-rust-arch-pathology",
+      "created_at": "2026-05-20T00:00:00Z"
+    }
   }
 }

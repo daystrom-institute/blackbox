@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-state-extract",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Pull a cluster of self.<field> reads into a separate struct, wire as a delegate, and rewrite source-side accesses conservatively.",
@@ -12,8 +12,8 @@
       "operator wants to make a field cluster independently testable"
     ],
     "anti_patterns": [
-      "do not use to strategize complex initialization order — the atom wires constructors mechanically, not by reasoning about timing",
-      "do not use on #[repr(C)] or #[repr(packed)] structs unless acknowledge_repr=true is provided (operator-authority opt-out)",
+      "do not use to strategize complex initialization order - the atom wires constructors mechanically, not by reasoning about timing",
+      "do not use on #[repr(C)] or #[repr(packed)] structs unless the operator supplied the dispatch-side ToolArgDefaults grant",
       "do not use when a different atom (rust-impl-partition-graph) would help operator decide which fields cluster"
     ],
     "inputs": {
@@ -54,10 +54,6 @@
           "delegate_field": {
             "type": "string"
           },
-          "acknowledge_repr": {
-            "type": "boolean",
-            "description": "Operator-authority opt-out for #[repr(C)] / #[repr(packed)] sources. MUST be operator-explicit per RX-V1 — no default."
-          },
           "apply": {
             "type": "boolean"
           },
@@ -66,7 +62,7 @@
           }
         }
       },
-      "prompt_template": "You are rust-state-extract. Charter: Pull a self.<field> cluster into a separate struct + delegate.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{source_struct}}\",\n                     languages=[\"rust\"], item_kinds=[\"struct_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Copy exact field names from the struct's field_declaration_list. Confirm\n   every name in {{field_names}} resolves. If the struct carries #[repr(C)]\n   or #[repr(packed)], check inputs.acknowledge_repr — if false/missing,\n   prepare to block.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"extract_rust_items\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      target=\"{{target_module_path}}\",\n                      item_names=[\"<placeholder>\"])  // generate target struct\n   bbox_refactor_plan(kind=\"move_rust_struct_fields\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      source_struct=\"{{source_struct}}\",\n                      target_struct=\"{{target_struct_name}}\",\n                      field_names={{field_names}})\n   bbox_refactor_plan(kind=\"add_rust_delegate_field\",\n                      source=\"{{source_file}}\", source_struct=\"{{source_struct}}\",\n                      delegate_field=\"{{delegate_field}}\",\n                      target_struct=\"{{target_struct_name}}\")\n   bbox_refactor_plan(kind=\"update_rust_callers\",\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      delegate_field=\"{{delegate_field}}\",\n                      field_names={{field_names}},\n                      emit_applied_markers=true)\n\n3. Decide:\n   - If grounding found #[repr(C)] / #[repr(packed)] AND\n     inputs.acknowledge_repr != true: emit\n     bbox_note(kind=\"blocked\", body=<concrete diagnostic naming the repr +\n     plan_path>) and return status=\"blocked\". The atom MUST NOT default\n     acknowledge_repr; operator-authority is explicit (RX-V1).\n   - If move_rust_struct_fields reports captured_self_fields outside\n     {{field_names}} that imply unstated cluster members, surface in the\n     done note and proceed only when {{apply}} is false (plan-only).\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <extract_rust_items step>,\n     <move_rust_struct_fields step>,\n     <add_rust_delegate_field step>,\n     <update_rust_callers step>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: delegate_field,\n     accessors_generated count, remaining_source_accessors count,\n     unrewriteable_accessors count, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never default acknowledge_repr — operator-authority is explicit.\n- Never proceed past cargo check failure (runner rolls back per RX-F2b).\n- Never apply when status=blocked.\n\nInputs:\n{{project_dir}} {{source_file}} {{source_struct}} {{target_struct_name}} {{target_module_path}} {{field_names}} {{delegate_field}} {{acknowledge_repr}} {{apply}} {{validation_bin}}"
+      "prompt_template": "You are rust-state-extract. Charter: Pull a cluster of self.<field> reads into a separate struct, wire as a delegate, and rewrite source-side accesses conservatively.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file={{source_file}}\nsource_struct={{source_struct}}\ntarget_struct_name={{target_struct_name}}\ntarget_module_path={{target_module_path}}\nfield_names={{field_names}}\ndelegate_field={{delegate_field}}\napply={{apply}}\nvalidation_bin={{validation_bin}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call the retired daemon refactor surfaces.\n2. Run analysis.implPartition, identify the requested state fields and their method consumers, then call rust.moveStructFields. Apply the field move, add the delegate field and constructor wiring with fresh code.* spans and edits.*, then call rust.updateCallers. Apply and run the compiler fix loop.\n3. If apply is false, return the transform or advisory result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. No live Rust transform creates arbitrary delegate wiring. Writes, destructures, spreads, ambiguous calls, and nested receivers remain manual. acknowledge_repr can only arrive through dispatch ToolArgDefaults.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
@@ -168,7 +164,7 @@
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
     "supervision": {
       "oracle": "default"

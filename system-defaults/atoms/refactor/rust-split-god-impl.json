@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-split-god-impl",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Carve a multi-domain Rust impl block into per-domain modules with router wiring, visibility widening for cross-partition callees, and import organization.",
@@ -12,8 +12,8 @@
       "operator has partitions in hand (chain rust-impl-partition-graph first if not)"
     ],
     "anti_patterns": [
-      "do not use to decide partitions — chain rust-impl-partition-graph first",
-      "do not use when partitions share mutable state on self — chain rust-state-extract first",
+      "do not use to decide partitions - chain rust-impl-partition-graph first",
+      "do not use when partitions share mutable state on self - chain rust-state-extract first",
       "do not use on non-Rust files"
     ],
     "inputs": {
@@ -58,7 +58,7 @@
           }
         }
       },
-      "prompt_template": "You are rust-split-god-impl. Charter: Carve a multi-domain Rust impl block into per-domain modules.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\",\n                     languages=[\"rust\"], item_kinds=[\"impl_item\", \"function_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm every method in every partition's list resolves on {{impl_name}}.\n\n2. Plan with deep_analysis=true — per partition:\n   For each <domain, method-names> in {{partition}}:\n     bbox_refactor_plan(kind=\"extract_rust_impl_methods\", deep_analysis=true,\n                        project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                        target=\"src/<domain>.rs\",\n                        impl_name=\"{{impl_name}}\",\n                        item_names=<methods in this partition>)\n   Inspect captured_self_fields, remaining_source_accessors,\n   unresolved_callbacks per partition.\n\n   THEN chain rust_ra_classify_callbacks (MANDATORY — RA-A7 dep on RX-R2):\n     bbox_refactor_plan(kind=\"rust_ra_classify_callbacks\", deep_analysis=true,\n                        project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                        impl_name=\"{{impl_name}}\")\n   If rust-analyzer is unavailable, the plan returns error.lsp_unavailable\n   (RX-V3 fail-closed). Emit bbox_note(kind=\"blocked\", body=<reason>) and\n   return status=\"blocked\". NO RA-backed fallback in v1.\n\n3. Decide using resolved_callbacks:\n   - Compute cross-partition calls: any resolved call whose target method\n     is in a DIFFERENT partition's set than the caller.\n   - If cross-partition calls exist AND {{allow_cross_partition_delegation}}\n     != true: emit bbox_note(kind=\"blocked\", body=<concrete list of\n     cross-partition calls from resolved_callbacks + plan_path>) and\n     return status=\"blocked\".\n   - Otherwise proceed; record cross-partition callees for visibility\n     widening in step 4.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <per-partition extract_rust_impl_methods steps>,\n     <add_rust_router_to_sum + add_rust_mod_decl per partition>,\n     <rewrite_rust_item_visibility widening cross-partition callees to pub(crate) when allow_cross_partition_delegation=true>,\n     <rust_organize_imports>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: partition count,\n     methods moved per partition, cross-partition callees widened,\n     fixme_count, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never skip rust_ra_classify_callbacks — RX-R2 is REQUIRED to safely\n  classify cross-partition method calls. An unresolved callback in the\n  wrong partition is exactly the silent-miscompile case this atom must\n  refuse.\n- Never apply when status=blocked.\n- Never proceed past cargo check failure (runner rolls back per RX-F2b).\n- Never invent partition assignments from the user prompt — rely on\n  bbox_code_symbols to confirm method residency.\n\nInputs:\n{{project_dir}} {{source_file}} {{impl_name}} {{partition}} {{allow_cross_partition_delegation}} {{apply}} {{validation_bin}}"
+      "prompt_template": "You are rust-split-god-impl. Charter: Carve a multi-domain Rust impl block into per-domain modules with router wiring, visibility widening for cross-partition callees, and import organization.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file={{source_file}}\nimpl_name={{impl_name}}\npartition={{partition}}\nallow_cross_partition_delegation={{allow_cross_partition_delegation}}\napply={{apply}}\nvalidation_bin={{validation_bin}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call the retired daemon refactor surfaces.\n2. Run analysis.implPartition and select one coherent method role. Use rust.extractImplMethods for the move, rust.moduleWiring for explicit graph edits, and rust.rewriteModuleCallers only for simple module-prefix fallout. Apply each coherent EditSet and run the compiler fix loop.\n3. If apply is false, return the transform or advisory result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. One role per invocation. Do not add project-specific router wrappers. Ordinary receiver calls are not covered by v1 call-site scanners, so use lsp.references and compiler diagnostics.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
@@ -190,7 +190,7 @@
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
     "supervision": {
       "oracle": "default"
