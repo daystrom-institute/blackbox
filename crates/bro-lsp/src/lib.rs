@@ -1113,8 +1113,7 @@ impl SessionPool {
                     return Ok(actions.unwrap_or_default());
                 }
                 Err(Error::Server { method, error })
-                    if method
-                        == <lsp_types::request::CodeActionRequest as Request>::METHOD
+                    if method == <lsp_types::request::CodeActionRequest as Request>::METHOD
                         && should_retry_while_warming(&error)
                         && Instant::now() < deadline =>
                 {
@@ -1135,9 +1134,9 @@ impl SessionPool {
         action: lsp_types::CodeAction,
     ) -> Result<lsp_types::CodeAction> {
         let root = root.into();
-        let root = root.canonicalize().with_context(|| {
-            format!("canonicalizing project root {}", root.display())
-        })?;
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", root.display()))?;
         let session = self.session(root, language).await?;
         let mut session = session.lock().await;
         session.last_used = Instant::now();
@@ -2019,9 +2018,7 @@ fn build_init_params(
                 code_action: Some(CodeActionClientCapabilities {
                     dynamic_registration: Some(false),
                     code_action_literal_support: Some(CodeActionLiteralSupport {
-                        code_action_kind: CodeActionKindLiteralSupport {
-                            value_set: vec![],
-                        },
+                        code_action_kind: CodeActionKindLiteralSupport { value_set: vec![] },
                     }),
                     is_preferred_support: Some(true),
                     disabled_support: Some(true),

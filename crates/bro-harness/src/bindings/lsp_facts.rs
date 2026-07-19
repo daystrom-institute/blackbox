@@ -1185,7 +1185,7 @@ fn snippet_guard(changes: &[(Span, String)]) -> Result<Vec<(Span, String)>, Tool
                 return Err(ToolResult::Error(format!(
                     "lsp.assist: resolved action contains snippet edits that cannot be losslessly flattened (e.g. ${{1:name}} tabstops) in file {} at bytes {}-{}. Consider using the assist interactively in an editor, or flatten the snippet manually after applying.",
                     span.file, span.byte_start, span.byte_end,
-                )))
+                )));
             }
         }
     }
@@ -1390,11 +1390,7 @@ impl Tool for LspAssist {
         }
         let (_orig_idx, action) = indexed.swap_remove(select_idx);
         // Resolve the action via codeAction/resolve.
-        let resolved = match self
-            .0
-            .code_action_resolve(&cx.root, language, action)
-            .await
-        {
+        let resolved = match self.0.code_action_resolve(&cx.root, language, action).await {
             Ok(r) => r,
             Err(e) => return err(format!("lsp.assist: resolve: {e}")),
         };
@@ -1431,12 +1427,11 @@ impl Tool for LspAssist {
         let flattened = flatten_workspace_edit(ws_edit);
         // Convert text edits to hash-anchored (span, new_text) pairs.
         let context = format!("lsp.assist: {}", resolved.title);
-        let mut changes = match text_edits_to_changes(&cx.root, &context, flattened.text_edits)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => return err(e),
-        };
+        let mut changes =
+            match text_edits_to_changes(&cx.root, &context, flattened.text_edits).await {
+                Ok(c) => c,
+                Err(e) => return err(e),
+            };
         // Guard 1: snippet-edit check.
         changes = match snippet_guard(&changes) {
             Ok(c) => c,
@@ -1444,10 +1439,7 @@ impl Tool for LspAssist {
         };
         // Record provenance and return in the same shape as lsp.rename.
         let edit_count = changes.len();
-        let files: Vec<String> = changes
-            .iter()
-            .map(|(span, _)| span.file.clone())
-            .collect();
+        let files: Vec<String> = changes.iter().map(|(span, _)| span.file.clone()).collect();
         let issuance = self.1.record_changes(
             "lsp.assist",
             AuthorityTier::LspVerified,
@@ -1455,9 +1447,7 @@ impl Tool for LspAssist {
         );
         let span_changes: Vec<Value> = changes
             .into_iter()
-            .map(|(s, t)| {
-                json!({"span": s, "new_text": t})
-            })
+            .map(|(s, t)| json!({"span": s, "new_text": t}))
             .collect();
         ToolResult::Json(json!({
             "changes": span_changes,
