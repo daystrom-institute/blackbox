@@ -159,6 +159,10 @@ impl Tool for RustExtractImplMethods {
 }
 
 impl RustExtractImplMethods {
+    // Sync fs access is sanctioned here: callers run inside the call_blocking
+    // closure of this binding tool, never on a tokio worker
+    // (concurrency-model section 5).
+    #[allow(clippy::disallowed_methods)]
     fn run(params: ExtractImplMethodsInput, root: &std::path::Path) -> ToolResult {
         let source_path = resolve_path(root, &params.source);
         let target_path = resolve_path(root, &params.target);
