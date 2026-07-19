@@ -18,15 +18,17 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{DocumentDiagnosticRequest, Initialize, Request, Shutdown};
 use lsp_types::{
-    ClientCapabilities, Diagnostic, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
-    DocumentDiagnosticReport, DocumentDiagnosticReportResult, ExecuteCommandClientCapabilities,
-    ExecuteCommandParams, FailureHandlingKind, FileRename, InitializeParams, InitializeResult,
-    PartialResultParams, PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams,
-    RenameFilesParams, ResourceOperationKind, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Url,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceClientCapabilities,
-    WorkspaceEditClientCapabilities, WorkspaceFileOperationsClientCapabilities, WorkspaceFolder,
+    ClientCapabilities, CodeActionCapabilityResolveSupport, CodeActionClientCapabilities,
+    CodeActionKindLiteralSupport, CodeActionLiteralSupport, Diagnostic,
+    DiagnosticClientCapabilities, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, ExecuteCommandClientCapabilities, ExecuteCommandParams,
+    FailureHandlingKind, FileRename, InitializeParams, InitializeResult, PartialResultParams,
+    PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams, RenameFilesParams,
+    ResourceOperationKind, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, Url, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    WorkspaceFileOperationsClientCapabilities, WorkspaceFolder,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -2013,6 +2015,21 @@ fn build_init_params(
                 diagnostic: Some(DiagnosticClientCapabilities {
                     dynamic_registration: Some(false),
                     related_document_support: Some(false),
+                }),
+                code_action: Some(CodeActionClientCapabilities {
+                    dynamic_registration: Some(false),
+                    code_action_literal_support: Some(CodeActionLiteralSupport {
+                        code_action_kind: CodeActionKindLiteralSupport {
+                            value_set: vec![],
+                        },
+                    }),
+                    is_preferred_support: Some(true),
+                    disabled_support: Some(true),
+                    data_support: Some(true),
+                    resolve_support: Some(CodeActionCapabilityResolveSupport {
+                        properties: vec!["edit".to_string()],
+                    }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
