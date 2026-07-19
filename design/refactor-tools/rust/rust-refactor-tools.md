@@ -23,6 +23,8 @@ LSP-backed and compiler-backed operations explicit about their semantic grade.
 - [Rust Refactor v2 Invariants](refactor-rust-v2-invariants.md)
 - [Rust Refactor Atoms - Batch 2](rust-refactor-atoms-batch2.md)
 - [Rust Refactor Gap Inventory](rust-refactor-gap-inventory.md)
+- [Rust Isolate Surface](rust-isolate-surface.md) - the rust.* cell bindings
+  for the bro-harness isolate, curated from the retiring v1 catalog.
 - [Rust Architecture Pathology](rust-arch-pathology.md)
 
 ## Crosscuts
