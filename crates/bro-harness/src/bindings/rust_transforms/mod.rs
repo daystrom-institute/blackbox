@@ -20,7 +20,9 @@ mod helpers;
 mod impl_extract;
 mod imports;
 mod r#move;
+mod move_struct_fields;
 mod rewrite_callers;
+mod update_callers;
 mod wiring;
 
 use std::sync::Arc;
@@ -371,6 +373,79 @@ then edits.apply. NOT idempotent over its own output: if a re-call reports no
 wildcard imports, the work is DONE (verify with code.items on the source).
 "#;
 
+const MOVE_STRUCT_FIELDS_CONTRACT: &str = r#"rust.moveStructFields - move named fields from one struct to another (RX-S1).
+
+WHAT IT DOES
+  Ports v1 move_rust_struct_fields (design section 3.1). Moves named fields
+  from a source struct to a target struct (possibly in the same file),
+  preserving declaration order and source visibility (unless overridden).
+
+RX-V1 CHANNEL (design section 2.4 + section 8.2)
+  acknowledge_repr is an OPERATOR-AUTHORITY flag, not a cell-authored input.
+  The binding declares no acknowledge_repr schema param (a cell passing one
+  gets a schema error). Instead the binding queries
+  cx.tool_arg_defaults.lookup("rust.moveStructFields", "acknowledge_repr")
+  host-side. When the grant is present and true, the binding injects
+  acknowledge_repr=true into the planner and the result reports
+  operator_opt_outs_used:["acknowledge_repr"]. When the grant is absent and
+  the source struct has a non-default #[repr(...)] (transparent is allowed
+  without the flag), the planner refuses with repr_unacknowledged and the
+  binding surfaces a refusal naming the dispatch-side default the operator
+  must set.
+
+PARAMS
+  source: string        Source file (workspace-relative, no `..`).
+  target: string        Target file (workspace-relative, no `..`). May equal
+                        source when the target struct is in the same file.
+  structName: string    Name of the source struct whose fields move.
+  itemNames: string[]   Field names to move (declaration order preserved).
+  visibility?: string   Visibility override on moved fields in the target
+                        (e.g. "pub", "pub(crate)"). Defaults to source visibility.
+
+RETURNS
+  { title, changes, creates, findings, would_change_files,
+    would_create_files, operator_opt_outs_used, provenance:"syntax_only" }
+  findings[] includes remaining_source_accessors and inherited_generics
+  when the planner reports them.
+
+NEVER WRITES. Feed {changes} into edits.merge, {creates} into edits.createFile,
+then edits.apply. Follow with rust.updateCallers to rewrite self.field accesses
+through a delegate field.
+"#;
+
+const UPDATE_CALLERS_CONTRACT: &str = r#"rust.updateCallers - rewrite callers through a delegate field (RX-S2b).
+
+WHAT IT DOES
+  Ports v1 update_rust_callers (design section 3.1). Companion caller-rewrite
+  that runs after rust.moveStructFields: for each named moved field/method,
+  conservatively rewrites self.field and self.method(args) accesses in the
+  source impl to go through a delegate field (self.delegate.field).
+
+  Only Copy-whitelisted rvalue reads and unambiguous method calls are
+  rewritten. Field writes, ambiguous calls, and nested receiver sites go to
+  unrewriteable_accessors in findings (the cell handles those manually).
+
+PARAMS
+  source: string          Source file (workspace-relative, no `..`).
+  structName?: string     Source struct name (Copy-whitelist field-type
+                          resolution). Optional but recommended.
+  delegateField: string   Delegate field name (e.g. "state"), so self.field
+                          becomes self.state.field.
+  target?: string         Target file where the delegate type lives, for
+                          field-type resolution when the field moved out.
+  delegateType?: string   Delegate type name for target field-type resolution.
+  itemNames: string[]     Moved fields/methods whose accessors get rewritten.
+
+RETURNS
+  { changes, findings, counts, provenance:"syntax_only" }
+  findings[] includes unrewriteable_accessors, borrow_promotions, and
+  overlapping_rewrite_sites when the planner reports them.
+  counts: { files_touched, rewrites }.
+
+NEVER WRITES. Feed {changes} into edits.merge, then edits.apply. Same shape as
+rust.rewriteModuleCallers (the other companion caller-rewrite).
+"#;
+
 #[async_trait]
 impl Tool for RustDescribe {
     fn name(&self) -> &str {
@@ -414,11 +489,15 @@ impl Tool for RustDescribe {
                 ToolResult::Json(json!({ "contract": EXTRACT_IMPL_METHODS_CONTRACT }))
             }
             "organizeImports" => ToolResult::Json(json!({ "contract": ORGANIZE_IMPORTS_CONTRACT })),
+            "moveStructFields" => {
+                ToolResult::Json(json!({ "contract": MOVE_STRUCT_FIELDS_CONTRACT }))
+            }
+            "updateCallers" => ToolResult::Json(json!({ "contract": UPDATE_CALLERS_CONTRACT })),
             "rewriteModuleCallers" => {
                 ToolResult::Json(json!({ "contract": REWRITE_MODULE_CALLERS_CONTRACT }))
             }
             other => ToolResult::Error(format!(
-                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, rewriteModuleCallers)"
+                "rust.describe: unknown transform `{other}` (available: fixRound, extractItems, inlineModToFile, moduleWiring, setVisibility, extractImplMethods, organizeImports, moveStructFields, updateCallers, rewriteModuleCallers)"
             )),
         }
     }
@@ -434,6 +513,10 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
         Arc::new(wiring::RustModuleWiring(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(impl_extract::RustExtractImplMethods) as Arc<dyn Tool>,
         Arc::new(imports::RustOrganizeImports(Arc::clone(&ledger))) as Arc<dyn Tool>,
+        Arc::new(move_struct_fields::RustMoveStructFields(Arc::clone(
+            &ledger,
+        ))) as Arc<dyn Tool>,
+        Arc::new(update_callers::RustUpdateCallers(Arc::clone(&ledger))) as Arc<dyn Tool>,
         Arc::new(rewrite_callers::RustRewriteModuleCallers) as Arc<dyn Tool>,
         Arc::new(wiring::RustSetVisibility(ledger)) as Arc<dyn Tool>,
     ]
@@ -445,7 +528,7 @@ pub fn tools(ledger: Arc<ProvenanceLedger>) -> Vec<Arc<dyn Tool>> {
 pub fn namespace_description() -> ToolNamespaceDescription {
     ToolNamespaceDescription {
         name: "rust".to_string(),
-        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import; knobs select synthesis shape (withLocalDeps, section, mergeIntoExistingTarget, useDeclVisibility, useDeclItems) while dependency analysis runs always and reports in findings. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. moduleWiring - one conservative module-graph edit (add_mod/remove_mod/add_use/remove_use, idempotent). setVisibility - rewrite visibility of items, impl methods, or struct fields; preserves async/unsafe/const qualifiers. extractImplMethods - move named Rust impl methods from one file into another; preserves attributes/modifiers, rebases super:: paths, applies visibility overrides. organizeImports - minimize wildcard `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names (mode=minimize, default; mode=organize is the future rust-analyzer source.organizeImports path, lands with lsp.assist phase 2). rewriteModuleCallers - rewrite caller prefixes after a module move; <source_simple>::<item> to <target_simple>::<item> in all project .rs files, word-boundary checked."
+        description: "Rust transform bindings ported from the v1 bbox-refactor rust catalog (design/refactor-tools/rust/rust-isolate-surface.md). Each transform NEVER writes: it returns {changes, creates, findings} for edits.merge/createFile and records host-authored changes in the provenance ledger so edits.apply computes semantic_status lineage. Call rust.describe({transform}) for the full contract. Transforms: fixRound - classify rustc/clippy build.gate diagnostics into compiler_suggested edits (verbatim MachineApplicable suggestions) + syntax_only synthesized proposals (add-use, visibility-bump) + explicit leftovers (borrow-checker, trait-bound); the compile-fix loop engine. Clippy diagnostics classify the same way (same JSON shape). extractItems - move top-level items into a (new) submodule; compound mode (default) does scaffolded target + `mod <name>;` in parent + visibility bumps on moved items and struct fields + auto-pruned `use <module>::{...};` re-import; knobs select synthesis shape (withLocalDeps, section, mergeIntoExistingTarget, useDeclVisibility, useDeclItems) while dependency analysis runs always and reports in findings. inlineModToFile - inline `mod foo { ... }` body to a sibling submodule file; outer attrs like #[cfg(test)] stay attached. moduleWiring - one conservative module-graph edit (add_mod/remove_mod/add_use/remove_use, idempotent). setVisibility - rewrite visibility of items, impl methods, or struct fields; preserves async/unsafe/const qualifiers. extractImplMethods - move named Rust impl methods from one file into another; preserves attributes/modifiers, rebases super:: paths, applies visibility overrides. organizeImports - minimize wildcard `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names (mode=minimize, default; mode=organize is the future rust-analyzer source.organizeImports path, lands with lsp.assist phase 2). moveStructFields - move named fields from one struct to another (RX-S1); the acknowledge_repr operator opt-out arrives dispatch-side via ToolArgDefaults lookup, never as cell input. updateCallers - companion caller-rewrite after moveStructFields; conservatively rewrites self.field and self.method(args) through a delegate field, surfacing unrewriteable accessors in findings. rewriteModuleCallers - rewrite caller prefixes after a module move; <source_simple>::<item> to <target_simple>::<item> in all project .rs files, word-boundary checked."
             .to_string(),
         declarations: r#"type RustChangeProposal = { span: Span; new_text: string; provenance: "compiler_suggested" | "syntax_only"; code?: string };
 type RustLeftover = { message: string; code?: string; reason: string };
@@ -462,6 +545,8 @@ type RustSetVisibilityResult = { title: string; changes: RustSpanChange[]; findi
 type RustExtractImplMethodsResult = { changes: SpanChange[]; creates: { path: string; content: string }[]; findings: Record<string, unknown>[]; leftovers: string[]; counts: { moved: number; leftovers: number }; provenance: "syntax_only" };
 type RustRewriteModuleCallersResult = { changes: SpanChange[]; findings: Record<string, unknown>[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
 type RustOrganizeImportsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; mode: "minimize"; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; provenance: "syntax_only" };
+type RustMoveStructFieldsResult = { title: string; changes: RustSpanChange[]; creates: RustCreate[]; findings: ({ finding: string } & Record<string, unknown>)[]; would_change_files: RustWouldChangeFile[]; would_create_files: RustWouldCreateFile[]; operator_opt_outs_used: string[]; provenance: "syntax_only" };
+type RustUpdateCallersResult = { changes: RustSpanChange[]; findings: ({ finding: string } & Record<string, unknown>)[]; counts: { files_touched: number; rewrites: number }; provenance: "syntax_only" };
 declare const rust: {
   /** Full contract (params, result vocabulary, recipe) for one rust transform. Call before first use. */
   describe(args: { transform: string }): Promise<{ contract: string }>;
@@ -479,6 +564,10 @@ declare const rust: {
   extractImplMethods(args: { source: string; target: string; item_names: string[]; impl_name?: string; visibility?: string; target_prelude?: string }): Promise<RustExtractImplMethodsResult>;
   /** Minimize Rust wildcard imports (mode="minimize", default): rewrite resolvable `use foo::*;` into explicit `use foo::{A, B};` for directly-referenced names. mode="organize" (rust-analyzer source.organizeImports) lands with lsp.assist (phase 2). NEVER writes: feed {changes} into edits.merge. */
   organizeImports(args: { source: string; mode?: "minimize" | "organize"; allow_wildcards?: string[]; remove_unused_wildcards?: boolean }): Promise<RustOrganizeImportsResult>;
+  /** Move named fields from one struct to another (RX-S1). The acknowledge_repr operator opt-out (required for non-default #[repr] structs) arrives dispatch-side via ToolArgDefaults lookup, never as cell input. NEVER writes: feed {changes} into edits.merge, {creates} into edits.createFile. Follow with rust.updateCallers. */
+  moveStructFields(args: { source: string; target: string; structName: string; itemNames: string[]; visibility?: string }): Promise<RustMoveStructFieldsResult>;
+  /** Rewrite callers through a delegate field (RX-S2b). Companion to moveStructFields: conservatively rewrites self.field and self.method(args) to go through a delegate field. Unrewriteable accessors surface in findings. NEVER writes: feed {changes} into edits.merge. */
+  updateCallers(args: { source: string; structName?: string; delegateField: string; target?: string; delegateType?: string; itemNames: string[] }): Promise<RustUpdateCallersResult>;
   /** Rewrite caller prefixes after a module move: <source_simple>::<item> -> <target_simple>::<item> in all project .rs files, word-boundary checked. Composable after any extract/move. NEVER writes: feed {changes} into edits.merge. */
   rewriteModuleCallers(args: { project_dir: string; item_names: string[]; module_name?: string; target_prelude?: string; skip_files?: string[] }): Promise<RustRewriteModuleCallersResult>;
 };"#
