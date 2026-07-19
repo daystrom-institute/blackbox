@@ -1,0 +1,19 @@
+{
+  "id": "4bdeb803",
+  "title": "Dispatch done-criteria: commit+push; orchestrator lane-gates",
+  "content": "Dispatched-code done-criteria is commit+push, not local gates. Never brief a bro to run cargo/nextest in a fresh local worktree (cold target turns it into a 20+ minute full-dependency compile plus syspolicyd churn); the orchestrator runs all gates lane-side via `lane-run.sh --ref`, and steers corrections with bro_resume to the original author.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-07-19T22:15:29Z",
+  "updated_at": "2026-07-19T22:15:29Z",
+  "recall_count": 0
+}

@@ -136,6 +136,12 @@ code-mode JavaScript cells through the same `exec` runtime a harness consumer
 uses, including nested `tools.*` / namespace calls and session-scoped
 `store()` / `load()` across repeated cells in one invocation.
 
+A lane-built isolate is linux/amd64 and cannot run on the macOS host. Run
+syntax-tier probes pod-side through the cargo shim (`lane-run.sh <lane> --ref
+<ref> -- cargo run -p bro-harness --bin isolate -- --root <lane path> ...`);
+`lsp.*` probes run host-side and want a lane root with a warm RA build-data
+cache (cold-start on this workspace exceeds the default readiness budget).
+
 Do not record exact test counts in this file. Counts stale quickly and do not
 help an agent choose the right validation.
 
@@ -173,9 +179,14 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   `scripts/fmt.sh` / `scripts/fmt.sh --check` in both local and lane
   checkouts. The wrapper selects the same exact rustfmt on macOS and Linux;
   do not substitute the moving `cargo +stable fmt` alias.
-- **What stays local**: file edits, single-crate checks and tests, and the
-  arm64 macOS daemon binary build/deploy (launchd) - the cluster produces
-  Linux artifacts only.
+- **What stays local**: file edits, single-crate checks and tests in a WARM
+  checkout, and the arm64 macOS daemon binary build/deploy (launchd) - the
+  cluster produces Linux artifacts only. Warmth is the discriminator, not
+  task size: a fresh `git worktree add` makes any build cold, and its first
+  build/test run is a 20+ minute full-dependency compile plus syspolicyd
+  assessment of every fresh binary - that is lane work, not local.
+  `fleet.json` `project_dispatch.seed_dirs` covers only cockpit- and
+  workflow-created worktrees, never manual `git worktree add`.
 
 **Dispatch propagation**: when orchestrating subordinate agents into heavy
 blackbox work, claim a pool lane (or create one), pass the printed path as
