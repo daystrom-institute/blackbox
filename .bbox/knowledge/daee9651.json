@@ -1,7 +1,7 @@
 {
   "id": "daee9651",
-  "title": "Use stable rustfmt with Rust 2024 edition",
-  "content": "Rust formatting in transcript-search uses the stable Rust toolchain's rustfmt with the workspace's latest Rust edition standard, currently Rust 2024. Run `cargo +stable fmt` / `cargo +stable fmt --check` from the workspace so rustfmt reads crate manifests and formats files in their module context; do not format included module files as standalone Rust sources.",
+  "title": "Use the project-owned pinned rustfmt command",
+  "content": "Rust formatting in transcript-search uses the exact rustfmt toolchain pinned by `scripts/fmt.sh`, not the moving `stable` alias. Run `scripts/fmt.sh` / `scripts/fmt.sh --check` from the workspace on both macOS and Linux so both environments produce identical Rust 2024 formatting. Lane provisioning verifies the pinned formatter and may report pre-existing mechanical format changes; it is fine to include those changes with the branch being prepared. Do not format included module files as standalone Rust sources.",
   "variants": {},
   "category": "convention",
   "scope": "project",
@@ -14,6 +14,6 @@
   "decay": true,
   "source": "user",
   "created_at": "2026-06-12T03:58:16Z",
-  "updated_at": "2026-06-12T04:00:49Z",
+  "updated_at": "2026-07-19T18:43:12Z",
   "recall_count": 0
 }

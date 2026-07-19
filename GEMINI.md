@@ -62,9 +62,9 @@ The shared **contract bottom** — `bro-core` (ids/refs/errors), `bro-protocol` 
 
 Use nextest for test runs — never default to `cargo test`, and ALWAYS pass `--workspace`. The test gates run under cargo-nextest (`brew install cargo-nextest`): `cargo nextest run --workspace` is the mid-cycle gate (~24s, 3,700 tests across all crates/targets; `.config/nextest.toml` quarantines the two >45s tests and applies per-test slow-timeouts so newly slow tests get named), and `cargo nextest run --workspace --profile full` is the fold/closeout gate running the entire suite (~85s, pinned by the 80s index/search agentic test). `--workspace` is load-bearing: the root manifest is workspace+package, so a bare run covers the root package only and silently drops the ~1,800 tests in the peeled bbox-*/bro-* crates. Plain `cargo test --lib` is a no-install fallback only: single-process, root-package-only, ~25x slower, no quarantine or timeouts. Note nextest is process-per-test: `test_env_lock()` no longer serializes there (per-process env isolation supersedes it) but remains required for plain `cargo test`. Measured timing story lives in docs/developing-blackbox.md → Build and test.
 
-**Use stable rustfmt with Rust 2024 edition**
+**Use the project-owned pinned rustfmt command**
 
-Rust formatting in transcript-search uses the stable Rust toolchain's rustfmt with the workspace's latest Rust edition standard, currently Rust 2024. Run `cargo +stable fmt` / `cargo +stable fmt --check` from the workspace so rustfmt reads crate manifests and formats files in their module context; do not format included module files as standalone Rust sources.
+Rust formatting in transcript-search uses the exact rustfmt toolchain pinned by `scripts/fmt.sh`, not the moving `stable` alias. Run `scripts/fmt.sh` / `scripts/fmt.sh --check` from the workspace on both macOS and Linux so both environments produce identical Rust 2024 formatting. Lane provisioning verifies the pinned formatter and may report pre-existing mechanical format changes; it is fine to include those changes with the branch being prepared. Do not format included module files as standalone Rust sources.
 
 **prompts/ corpus: operator-pointed prompts + dispatched-agent lenses**
 
@@ -133,6 +133,5 @@ Before any create/open/save/add action that could duplicate an existing object, 
 **Ask Before Mutating Shared Services**
 
 Before restarting, stopping, reloading, replacing, or otherwise mutating shared services or containers that active agents may depend on, first perform a read-only scope check and get explicit operator approval for the named service/container. Applies to blackbox.service, Forgejo, runners, Docker Compose stacks, and other coordination infrastructure.
-
 
 

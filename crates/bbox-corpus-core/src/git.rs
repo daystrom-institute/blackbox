@@ -7,6 +7,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+/// Exact contents of the host-local marker that opts a full independent
+/// clone into managed-checkout resolution. The marker opens only the managed
+/// gate; callers must still match the clone's durable repo identity to one
+/// registered project.
+pub const MANAGED_CHECKOUT_MARKER_V1: &str = "blackbox-managed-checkout-v1";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitCommit {
     pub sha: String,
@@ -144,6 +150,20 @@ pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
         cwd.join(path)
     };
     std::fs::canonicalize(path).ok()
+}
+
+/// Return the top of an independent clone carrying the exact managed checkout
+/// marker. Linked worktrees use their existing structural/branch gates and do
+/// not satisfy this shape because their `.git` entry is a file.
+#[allow(clippy::disallowed_methods)]
+pub fn managed_checkout_root(path: &Path) -> Option<PathBuf> {
+    let root = git_root_for_path(path)?;
+    let dot_git = root.join(".git");
+    if !dot_git.is_dir() {
+        return None;
+    }
+    let marker = fs::read_to_string(dot_git.join("blackbox-managed-checkout")).ok()?;
+    (marker.trim() == MANAGED_CHECKOUT_MARKER_V1).then_some(root)
 }
 
 /// Map a linked-worktree top to its base repository — the directory whose

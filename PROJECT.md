@@ -169,6 +169,10 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   pod automatically, keyed on cwd. Read the lane contract
   `~/repos/bbox-cage/build/lanes/BBOX_LANE_WORK.md` before heavy work.
   Worker loss is lane loss - push anything durable.
+- **Formatting is project-pinned, not host-pinned**: use
+  `scripts/fmt.sh` / `scripts/fmt.sh --check` in both local and lane
+  checkouts. The wrapper selects the same exact rustfmt on macOS and Linux;
+  do not substitute the moving `cargo +stable fmt` alias.
 - **What stays local**: file edits, single-crate checks and tests, and the
   arm64 macOS daemon binary build/deploy (launchd) - the cluster produces
   Linux artifacts only.

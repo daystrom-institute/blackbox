@@ -432,8 +432,8 @@ pub fn fleet_worktree_scope_and_dir(
     ))
 }
 
-/// Shared core: resolve a path to `(base_record, canonical_worktree)` when it is
-/// a recognized worktree of a registered project. Two recognized classes:
+/// Shared core: resolve a path to `(base_record, canonical_checkout)` when it
+/// is a recognized checkout of a registered project. Three recognized classes:
 ///
 /// 1. **Out-of-tree managed worktrees** — git common dir matches a registered
 ///    project AND a managed marker is present: either the checked-out branch is
@@ -450,6 +450,9 @@ pub fn fleet_worktree_scope_and_dir(
 ///    points into `<root>/.git/worktrees/<name>`. A plain subdirectory of the
 ///    root (no `.git` file ancestor below the root) is NEVER worktree-classed
 ///    and resolves to `None` (base behavior), as does the root itself.
+/// 3. **Managed independent clones** — the clone carries the exact
+///    `.git/blackbox-managed-checkout` marker and its durable `repo_id`
+///    uniquely matches a registered project. Pool lanes use this class.
 ///
 /// Returns `None` for the registered root, its plain subdirectories, paths with
 /// no managed marker (out-of-tree), or paths whose repo doesn't match any
@@ -474,6 +477,14 @@ fn resolve_managed_fleet_worktree<'a>(
         // worktree shape (class 2 above); anything else keeps base behavior.
         let root = PathBuf::from(&owner.canonical_path);
         return in_tree_linked_worktree_top(&worktree, &root).map(|top| (owner, top));
+    }
+    if let Some(checkout) = bbox_corpus_core::git::managed_checkout_root(&worktree) {
+        let checkout_str = checkout.to_str()?;
+        let base = bbox_corpus_core::project_record::resolve_base_project_for_scope(
+            checkout_str,
+            projects,
+        )?;
+        return Some((base, checkout));
     }
     let fleet_branch = bbox_corpus_core::git::current_branch(&worktree)
         .is_some_and(|branch| branch.starts_with("bro-fleet/"));
@@ -1106,6 +1117,20 @@ mod tests {
         );
     }
 
+    fn clone_repo(base: &Path, path: &Path) {
+        let out = Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(base)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     fn record_for(path: &Path, project_id: &str) -> ProjectRecord {
         ProjectRecord {
             project_id: project_id.into(),
@@ -1407,6 +1432,59 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn managed_clone_marker_maps_read_and_write_to_registered_repo_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+        let base_str = base_canon.to_string_lossy().into_owned();
+        let mut base_record = record_for(&base_canon, "base-project");
+        base_record.repo_id = Some(entity_ref::repo_id_for_root(&base_canon).unwrap());
+        let registered = vec![base_record.clone()];
+
+        let clone = tmp.path().join("lane-clone");
+        clone_repo(&base, &clone);
+        let clone_canon = clone.canonicalize().unwrap();
+        let clone_str = clone_canon.to_string_lossy().into_owned();
+
+        // An independent clone has a different git common dir and must not
+        // alias until lane tooling opts it in with the exact marker.
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            assert!(resolve_project_context(&clone_str, &registered, intent).is_none());
+        }
+        fs::write(
+            clone_canon.join(".git").join("blackbox-managed-checkout"),
+            format!("{}\n", bbox_corpus_core::git::MANAGED_CHECKOUT_MARKER_V1),
+        )
+        .unwrap();
+
+        let nested = clone_canon.join("src").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let nested_str = nested.to_string_lossy().into_owned();
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            let ctx = resolve_project_context(&nested_str, &registered, intent)
+                .expect("marked clone should resolve to registered base");
+            assert_eq!(ctx.project_id, "base-project");
+            assert_eq!(ctx.host_root, base_str);
+            let checkout = ctx.checkout.expect("managed clone carries checkout");
+            assert_eq!(checkout.checkout_dir, clone_str);
+            assert!(checkout.managed);
+        }
+
+        // Durable identity must be unique. A marker never chooses between two
+        // registrations for the same repository.
+        let mut ambiguous = registered.clone();
+        let mut duplicate = base_record;
+        duplicate.project_id = "duplicate-project".into();
+        duplicate.canonical_path = tmp.path().join("missing-copy").display().to_string();
+        ambiguous.push(duplicate);
+        for intent in [ResolveIntent::Read, ResolveIntent::Write] {
+            assert!(resolve_project_context(&clone_str, &ambiguous, intent).is_none());
+        }
     }
 
     #[test]

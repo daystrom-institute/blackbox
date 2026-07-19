@@ -22,6 +22,10 @@
   canonicalize-pass-through (keying state under the subdir). The resolver
   returns None for that case under Write — the fallback decision stays
   explicit at call sites.
+- Pool lanes are full clones rather than linked worktrees. Their exact
+  `.git/blackbox-managed-checkout` marker plus a matching durable `repo_id`
+  admits them through the conservative write gate. Never weaken this to
+  origin URL, path shape, or arbitrary-clone matching.
 
 ## Aliases fail closed at every layer
 

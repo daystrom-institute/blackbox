@@ -20,6 +20,11 @@ below bbox-indexing (ingest passes, sidecars) can call them.
 - `ProjectContext.checkout` is present only when the input sat in a
   non-base checkout; `managed = false` checkouts must never receive
   write-side aliasing.
+- A full independent clone can opt into managed checkout resolution with
+  the exact `.git/blackbox-managed-checkout` marker. The marker only opens
+  the gate: the clone's durable `repo_id` must still uniquely match a
+  registered base project. Lane tooling owns marker creation; arbitrary
+  unmarked clones remain write-isolated.
 
 ## Rerank math (search/rerank.rs)
 

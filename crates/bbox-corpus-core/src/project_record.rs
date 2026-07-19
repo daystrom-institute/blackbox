@@ -83,6 +83,10 @@ pub struct CheckoutContext {
 ///    registered project's → that record. Covers out-of-tree worktrees —
 ///    fleet (`bro-fleet/*`), agent dispatch, workflow arcs — regardless of
 ///    branch name or parent directory.
+/// 3. the path is inside a full independent clone carrying the exact managed
+///    checkout marker and its durable `repo_id` uniquely matches one
+///    registered project. Pool lanes use this path because they cannot share
+///    a git common dir with the host checkout.
 ///
 /// This is intentionally broader than the conservative managed write gate
 /// (`resolve_managed_fleet_worktree` in bbox-indexing): scope resolution
@@ -102,11 +106,21 @@ pub fn resolve_base_project_for_scope<'a>(
     }) {
         return Some(record);
     }
-    let common = crate::git::git_common_dir(&canonical)?;
-    projects.iter().find(|project| {
-        crate::git::git_common_dir(std::path::Path::new(&project.canonical_path))
-            .is_some_and(|base_common| base_common == common)
-    })
+    if let Some(common) = crate::git::git_common_dir(&canonical)
+        && let Some(record) = projects.iter().find(|project| {
+            crate::git::git_common_dir(std::path::Path::new(&project.canonical_path))
+                .is_some_and(|base_common| base_common == common)
+        })
+    {
+        return Some(record);
+    }
+    let checkout = crate::git::managed_checkout_root(&canonical)?;
+    let repo_id = crate::entity_ref::repo_id_for_root(&checkout).ok()?;
+    let mut matches = projects
+        .iter()
+        .filter(|project| project.repo_id.as_deref() == Some(repo_id.as_str()));
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
 }
 
 /// Minimal read-side view of the on-disk project registry file
