@@ -1125,9 +1125,11 @@ name = "bro-lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "lsp-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]
