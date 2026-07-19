@@ -30,6 +30,7 @@ use lsp_types::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -1575,19 +1576,169 @@ fn format_wait_duration(duration: Duration) -> String {
     }
 }
 
+// rust-analyzer build data on lane checkouts: host target dir + shim-stripped
+// spawn env. See design/refactor-tools/rust/rust-isolate-surface.md §8.6.
+//
+// On a lane checkout the cwd-keyed shim routes rust-analyzer's `cargo
+// metadata` / `cargo check` children back into the Linux pod, and the
+// pod-built `target/` holds ELF proc-macro `.so` files the host proc-macro
+// server cannot load. Scrubbing the spawn env fixes both knobs (which cargo
+// runs, where artifacts land) with no server-side surgery.
+
+/// Detect a lane host-build session: the root canonicalizes under `~/lanes/`,
+/// or `BRO_LSP_RA_HOST_BUILD=1` is set (covers non-lane NFS/sshfs layouts).
+/// Rust-only at the call site; the flag is read here so detection stays
+/// pure and unit-testable.
+fn is_lane_host_build(root: &Path) -> bool {
+    if let Some(value) = std::env::var("BRO_LSP_RA_HOST_BUILD")
+        .ok()
+        .map(|v| v.trim().to_string())
+        && !value.is_empty()
+        && value != "0"
+    {
+        return true;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let Ok(home) = home.canonicalize() else {
+        return false;
+    };
+    let lanes_root = home.join("lanes");
+    let Ok(root_canon) = root.canonicalize() else {
+        return false;
+    };
+    root_canon.starts_with(&lanes_root)
+}
+
+/// Lane shim dir to strip from the child PATH. Default `~/.lane/shims`,
+/// overridable via `BRO_LSP_LANE_SHIM_DIR`. Canonicalized when it exists so
+/// the PATH-element comparison survives symlinks; falls back to the raw path
+/// when it does not (the dir may legitimately be absent).
+fn lane_shim_dir() -> PathBuf {
+    let raw = env_path("BRO_LSP_LANE_SHIM_DIR")
+        .or_else(|| dirs::home_dir().map(|h| h.join(".lane").join("shims")))
+        .unwrap_or_else(|| PathBuf::from("~/.lane/shims"));
+    raw.canonicalize().unwrap_or(raw)
+}
+
+/// Host-local per-root target dir for the lane host build.
+/// `BRO_LSP_RA_TARGET_DIR` if set, else
+/// `~/.cache/blackbox/ra-target/<sha256(canonical root)[:16]>`. Creates the
+/// dir if missing. `root` is canonicalized before hashing so a checkout
+/// reached via two paths lands on the same dir.
+fn lane_host_build_target_dir(root: &Path) -> Result<PathBuf> {
+    if let Some(explicit) = env_path("BRO_LSP_RA_TARGET_DIR") {
+        if !explicit.exists() {
+            // One-shot mkdir of a small cache leaf during session spawn; not a
+            // sustained I/O loop, so the tokio-worker blocking-I/O lint does
+            // not apply to this setup step.
+            #[allow(clippy::disallowed_methods)]
+            std::fs::create_dir_all(&explicit)
+                .with_context(|| format!("creating ra target dir {}", explicit.display()))?;
+        }
+        return Ok(explicit);
+    }
+    let root_canon = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing session root {}", root.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(root_canon.as_os_str().to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let cache = dirs::cache_dir()
+        .ok_or_else(|| anyhow!("could not resolve host cache dir for ra target"))?;
+    let target = cache.join("blackbox").join("ra-target").join(&hex);
+    if !target.exists() {
+        // One-shot mkdir of a small cache leaf during session spawn; not a
+        // sustained I/O loop, so the tokio-worker blocking-I/O lint does
+        // not apply to this setup step.
+        #[allow(clippy::disallowed_methods)]
+        std::fs::create_dir_all(&target)
+            .with_context(|| format!("creating ra target dir {}", target.display()))?;
+    }
+    Ok(target)
+}
+
+/// Pure env-scrub for the lane host-build spawn. Given the inherited env
+/// (`base_env`), returns a new env with:
+/// - the lane shim dir removed from PATH (other entries preserved in order);
+/// - CARGO_TARGET_DIR set to `target_dir`;
+/// - RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER removed (a sccache lane shim
+///   must not re-enter the pod).
+///
+/// `root` and `shim_dir` are accepted for testability and future extension;
+/// only `target_dir` is currently consumed beyond PATH scrubbing.
+fn lane_host_build_env(
+    _root: &Path,
+    base_env: &[(String, String)],
+    shim_dir: &Path,
+    target_dir: &Path,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(base_env.len() + 1);
+    let mut path_seen = false;
+    for (key, value) in base_env {
+        if key == "RUSTC_WRAPPER" || key == "RUSTC_WORKSPACE_WRAPPER" {
+            continue;
+        }
+        if key == "PATH" {
+            path_seen = true;
+            let scrubbed = scrub_lane_shim_from_path(value, shim_dir);
+            out.push((key.clone(), scrubbed));
+            continue;
+        }
+        out.push((key.clone(), value.clone()));
+    }
+    if !path_seen {
+        // PATH was absent from the inherited env; do not synthesize one.
+    }
+    out.push((
+        "CARGO_TARGET_DIR".to_string(),
+        target_dir.display().to_string(),
+    ));
+    out
+}
+
+/// Remove every PATH element that equals `shim_dir`, preserving the order
+/// and case of the surviving entries. Both sides are compared as raw bytes;
+/// callers pass already-canonicalized paths so symlink differences do not
+/// leak through.
+fn scrub_lane_shim_from_path(path_value: &str, shim_dir: &Path) -> String {
+    let shim_str = shim_dir.as_os_str().to_string_lossy();
+    let shim_str = shim_str.as_ref();
+    path_value
+        .split(':')
+        .filter(|entry| !entry.is_empty() && *entry != shim_str)
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 async fn spawn_session(key: &SessionKey, config: &LspConfig) -> Result<Session> {
     let argv = key.language.launch_argv(config);
-    let mut child = Command::new(&argv[0])
+    // A failed readiness wait (or any error path after spawn) must not
+    // leave an orphaned language-server child behind. Observed in
+    // practice: an errored isolate session left a rust-analyzer child
+    // running. kill_on_drop guarantees the child dies with the Command
+    // handle, which Session owns for its whole lifetime.
+    let mut command = Command::new(&argv[0]);
+    command
         .args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| Error::LspUnavailable {
-            language: key.language,
-            command: argv.join(" "),
-            source: err.to_string(),
-        })?;
+        .kill_on_drop(true);
+    if matches!(key.language, Language::Rust) && is_lane_host_build(&key.root) {
+        let shim_dir = lane_shim_dir();
+        let target_dir = lane_host_build_target_dir(&key.root)?;
+        let base_env: Vec<(String, String)> = std::env::vars().collect();
+        let scrubbed = lane_host_build_env(&key.root, &base_env, &shim_dir, &target_dir);
+        command.env_clear().envs(scrubbed);
+    }
+    let mut child = command.spawn().map_err(|err| Error::LspUnavailable {
+        language: key.language,
+        command: argv.join(" "),
+        source: err.to_string(),
+    })?;
     let stdin = child
         .stdin
         .take()
@@ -2304,5 +2455,156 @@ mod tests {
             }),
         );
         assert_eq!(readiness.state, ReadinessState::Failed);
+    }
+
+    #[test]
+    fn lane_host_build_env_strips_shim_from_path_preserving_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim).unwrap();
+        let shim = shim.canonicalize().unwrap();
+        let host_cargo = tmp.path().join("host-cargo");
+        std::fs::create_dir_all(&host_cargo).unwrap();
+        let host_cargo = host_cargo.canonicalize().unwrap();
+
+        let path_value = format!("{}:{}:{}", shim.display(), host_cargo.display(), "/usr/bin");
+        let target = tmp.path().join("ra-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let target = target.canonicalize().unwrap();
+
+        let base_env: Vec<(String, String)> = vec![
+            ("PATH".to_string(), path_value),
+            ("HOME".to_string(), "/home/someone".to_string()),
+            ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
+            ("RUSTC_WORKSPACE_WRAPPER".to_string(), "sccache".to_string()),
+            (
+                "RUSTUP_HOME".to_string(),
+                "/home/someone/.rustup".to_string(),
+            ),
+        ];
+
+        let scrubbed = lane_host_build_env(tmp.path(), &base_env, &shim, &target);
+
+        let path_entry = scrubbed
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .expect("PATH preserved")
+            .1
+            .clone();
+        let entries: Vec<&str> = path_entry.split(':').collect();
+        assert!(
+            !entries.iter().any(|e| *e == shim.to_str().unwrap()),
+            "shim dir must be removed from PATH"
+        );
+        assert_eq!(
+            entries,
+            vec![host_cargo.to_str().unwrap(), "/usr/bin"],
+            "non-shim entries must survive in order"
+        );
+
+        let cargo_target = scrubbed
+            .iter()
+            .find(|(k, _)| k == "CARGO_TARGET_DIR")
+            .expect("CARGO_TARGET_DIR set");
+        assert_eq!(cargo_target.1, target.display().to_string());
+
+        assert!(
+            !scrubbed.iter().any(|(k, _)| k == "RUSTC_WRAPPER"),
+            "RUSTC_WRAPPER must be removed"
+        );
+        assert!(
+            !scrubbed.iter().any(|(k, _)| k == "RUSTC_WORKSPACE_WRAPPER"),
+            "RUSTC_WORKSPACE_WRAPPER must be removed"
+        );
+        assert!(
+            scrubbed
+                .iter()
+                .any(|(k, v)| k == "HOME" && v == "/home/someone"),
+            "unrelated env vars must survive"
+        );
+    }
+
+    #[test]
+    fn lane_host_build_env_handles_absent_path() {
+        // If the inherited env has no PATH at all, the scrubber must not
+        // synthesize one; it still sets CARGO_TARGET_DIR and strips wrappers.
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim).unwrap();
+        let shim = shim.canonicalize().unwrap();
+        let target = tmp.path().join("ra-target");
+        let base_env: Vec<(String, String)> = vec![
+            ("HOME".to_string(), "/h".to_string()),
+            ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
+        ];
+        let scrubbed = lane_host_build_env(tmp.path(), &base_env, &shim, &target);
+        assert!(!scrubbed.iter().any(|(k, _)| k == "PATH"));
+        assert!(!scrubbed.iter().any(|(k, _)| k == "RUSTC_WRAPPER"));
+        assert!(scrubbed.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
+    }
+
+    #[test]
+    fn lane_host_build_env_drops_all_shim_entries() {
+        // A malformed PATH that lists the shim twice must drop both copies.
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim).unwrap();
+        let shim = shim.canonicalize().unwrap();
+        let path_value = format!("{}:{}:{}", shim.display(), "/usr/bin", shim.display());
+        let base_env = vec![("PATH".to_string(), path_value)];
+        let target = tmp.path().join("t");
+        let scrubbed = lane_host_build_env(tmp.path(), &base_env, &shim, &target);
+        let path_entry = scrubbed
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(path_entry, "/usr/bin");
+    }
+
+    #[test]
+    fn non_lane_root_without_env_flag_is_not_detected() {
+        // A random tempdir is not under ~/lanes/ and (when the operator has
+        // not opted in via BRO_LSP_RA_HOST_BUILD) must not trigger the lane
+        // host-build path. Skipped if the operator has the flag set, since
+        // that makes the detection true regardless of root.
+        if env_string("BRO_LSP_RA_HOST_BUILD")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+        {
+            // Operator opted in globally; this assertion is meaningless.
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert!(!is_lane_host_build(&root));
+    }
+
+    #[test]
+    fn lane_host_build_target_dir_is_per_root_and_stable() {
+        // Same canonical root produces the same host target dir; two distinct
+        // roots produce two distinct dirs. The directory is created on first
+        // call and reused on the second (no error on the existing path).
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("crate-a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let root_a = root_a.canonicalize().unwrap();
+        let root_b = tmp.path().join("crate-b");
+        std::fs::create_dir_all(&root_b).unwrap();
+        let root_b = root_b.canonicalize().unwrap();
+
+        let dir_a_first = lane_host_build_target_dir(&root_a).unwrap();
+        let dir_a_again = lane_host_build_target_dir(&root_a).unwrap();
+        let dir_b = lane_host_build_target_dir(&root_b).unwrap();
+
+        assert_eq!(dir_a_first, dir_a_again, "same root must hash to same dir");
+        assert_ne!(dir_a_first, dir_b, "distinct roots must hash apart");
+        assert!(dir_a_first.exists());
+        assert!(dir_b.exists());
+        assert!(
+            dir_a_first.display().to_string().contains("ra-target"),
+            "target dir lives under the ra-target cache namespace"
+        );
     }
 }
