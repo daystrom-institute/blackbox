@@ -939,12 +939,11 @@ mod tests {
             bf.context.as_ref().and_then(|c| c.provider_defaults),
             Some(ProviderDefaultsMode::SuppressWhenSupported)
         );
-        assert!(
-            bf.lens
-                .as_deref()
-                .unwrap_or("")
-                .contains("in-box refactor bindings")
-        );
+        let lens = bf.lens.as_deref().unwrap_or("");
+        assert!(lens.contains("harness-native isolate bindings"));
+        assert!(lens.contains("rust.fixRound"));
+        assert!(lens.contains("capped at five rounds"));
+        assert!(lens.contains("dispatch defaults"));
 
         let f = bf.filters.expect("filters present");
 
@@ -954,14 +953,18 @@ mod tests {
             "mcp__blackbox__bbox_pin",
             "mcp__blackbox__bbox_inspect_entity",
             "mcp__blackbox__bbox_hybrid_search",
+            "mcp__blackbox__bbox_blame",
             "Read",
             "Grep",
             "Glob",
             "exec",
             "wait",
             "code.*",
+            "analysis.*",
+            "rust.*",
             "edits.*",
             "lsp.*",
+            "build.gate",
         ];
         let expected_disallow: Vec<&str> = vec![
             "mcp__blackbox__bbox_forget",
@@ -1089,12 +1092,12 @@ mod tests {
         assert!(lens.contains("strict JSON only"));
     }
 
-    /// Rust + Java refactor personas share a core allow/disallow surface
-    /// (exec/wait + code.* facts + edits.* algebra + the grounding MCP tools)
-    /// and differ only in language-scoped binding extensions (java: java.* /
-    /// analysis.* / lsp.*; rust: lsp.*). The core symmetry is load-bearing
-    /// for refactor-atom interchange between brofiles; the extensions mirror
-    /// what the bindings actually implement per language.
+    /// Rust + Java refactor personas share a core allow/disallow surface:
+    /// exec/wait, code.* facts, analysis.* reductions, lsp.* authority,
+    /// edits.* algebra, and the grounding MCP tools. Their extensions mirror
+    /// the live language surfaces. Java adds java.*. Rust adds rust.*,
+    /// build.gate for the compiler repair loop, and bbox_blame for the
+    /// transcript-anchored architecture atom.
     #[test]
     fn rust_and_java_refactor_personas_share_tool_surface() {
         let rust_src =
@@ -1114,13 +1117,12 @@ mod tests {
             r.disallow.iter().map(String::as_str).collect();
         let j_disallow: std::collections::BTreeSet<&str> =
             j.disallow.iter().map(String::as_str).collect();
-        // The cell bindings are language-scoped: java adds the java.* /
-        // analysis.* / lsp.* namespaces, rust adds lsp.* only; the shared core
-        // (exec/wait + code.* facts + edits.* algebra) must match. build.* is
-        // deliberately absent everywhere: build.gate accepts arbitrary shell
-        // commands, which would bypass the Bash/Write/Edit denial.
-        const JAVA_ONLY: &[&str] = &["java.*", "analysis.*", "lsp.*"];
-        const RUST_ONLY: &[&str] = &["lsp.*"];
+        const JAVA_ONLY: &[&str] = &["java.*"];
+        const RUST_ONLY: &[&str] = &[
+            "rust.*",
+            "build.gate",
+            "mcp__blackbox__bbox_blame",
+        ];
         let r_core: std::collections::BTreeSet<&str> = r_allow
             .iter()
             .copied()
@@ -1138,13 +1140,21 @@ mod tests {
         for t in JAVA_ONLY {
             assert!(j_allow.contains(t), "java persona missing {t}");
         }
+        for t in ["analysis.*", "lsp.*"] {
+            assert!(r_allow.contains(t), "rust persona missing shared {t}");
+            assert!(j_allow.contains(t), "java persona missing shared {t}");
+        }
         assert!(
-            !r_allow.contains("java.*") && !r_allow.contains("analysis.*"),
+            !r_allow.contains("java.*"),
             "rust persona must not advertise java-scoped bindings"
         );
         assert!(
+            !j_allow.contains("rust.*") && !j_allow.contains("build.gate"),
+            "java persona must not advertise Rust compiler-loop bindings"
+        );
+        assert!(
             !r_allow.contains("build.*") && !j_allow.contains("build.*"),
-            "build.gate is an arbitrary-shell bypass and stays off personas"
+            "personas must allow the exact build.gate tool, never build.*"
         );
         assert_eq!(
             r_disallow, j_disallow,

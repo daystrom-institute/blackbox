@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-trait-from-impl",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Lift a method subset from a struct's inherent impl into a trait + impl Trait for Struct, optionally migrating call sites to depend on the trait.",
@@ -12,8 +12,8 @@
       "preparing for dyn-dispatch or generic-parameter binding at call sites"
     ],
     "anti_patterns": [
-      "do not use when methods take Self by value or return Self — trait cannot be used as dyn Trait (atom HARD-REFUSES when migrate_call_sites=true and dyn_compatible=false)",
-      "do not use when methods call other inherent (non-lifted) methods on self — atom refuses cleanly",
+      "do not use when methods take Self by value or return Self - the trait cannot be used as dyn Trait when dyn_compatible=false",
+      "do not use when methods call other inherent non-selected methods on self - the transform can refuse with extract_trait_orphaned_call",
       "do not use on non-Rust files"
     ],
     "inputs": {
@@ -65,7 +65,7 @@
           }
         }
       },
-      "prompt_template": "You are rust-trait-from-impl. Charter: Lift a method subset into a trait + impl Trait for Struct.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{source_struct}}\",\n                     languages=[\"rust\"], item_kinds=[\"impl_item\", \"function_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Copy exact method names from the impl block. Confirm every name in\n   {{method_names}} resolves on {{source_struct}}.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"extract_rust_trait\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      source_struct=\"{{source_struct}}\",\n                      trait_name=\"{{trait_name}}\",\n                      target=\"{{target_file}}\",\n                      item_names={{method_names}})\n   Inspect the response's object_safety_report and call_site_warnings.\n\n3. Decide:\n   - HARD REFUSE: if {{migrate_call_sites}} == true AND\n     object_safety_report.dyn_compatible == false:\n     emit bbox_note(kind=\"blocked\", body=<concrete diagnostic: cannot\n     migrate to dyn Trait when trait is not object-safe; method takes\n     Self by value or returns Self / has generic methods / etc. +\n     plan_path>) and return status=\"blocked\". NO plan-time fix exists.\n   - SOFT REFUSE: if any method in {{method_names}} calls other inherent\n     (non-lifted) methods on self — block with reason naming the call.\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <extract_rust_trait step>,\n     /* migrate_call_sites=true path also includes\n        migrate_rust_type_usages to swap concretion for replacement */\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: trait_file,\n     methods_lifted count, object_safe, call_sites_migrated count,\n     migration_skipped count, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never attempt migrate_call_sites=true when dyn_compatible=false.\n- Never apply when status=blocked.\n- Never invent method names from the user prompt.\n\nInputs:\n{{project_dir}} {{source_file}} {{source_struct}} {{trait_name}} {{target_file}} {{method_names}} {{migrate_call_sites}} {{call_site_replacement}} {{apply}} {{validation_bin}}"
+      "prompt_template": "You are rust-trait-from-impl. Charter: Lift a method subset from a struct's inherent impl into a trait + impl Trait for Struct, optionally migrating call sites to depend on the trait.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file={{source_file}}\nsource_struct={{source_struct}}\ntrait_name={{trait_name}}\ntarget_file={{target_file}}\nmethod_names={{method_names}}\nmigrate_call_sites={{migrate_call_sites}}\ncall_site_replacement={{call_site_replacement}}\napply={{apply}}\nvalidation_bin={{validation_bin}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call the retired daemon refactor surfaces.\n2. Run analysis.implPartition, inspect selected signatures with code.signature, and survey callers with lsp.references. Read rust.describe for extractTrait, call rust.extractTrait, inspect object-safety and trait-in-scope findings, then apply and run the compiler fix loop.\n3. If apply is false, return the transform or advisory result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. The ported scanner sees UFCS calls, not ordinary receiver calls. If public type positions must change, rust.migrateTypeUsages requires dispatch-side acknowledge_public_api_change authority.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
@@ -174,7 +174,7 @@
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
     "supervision": {
       "oracle": "default"

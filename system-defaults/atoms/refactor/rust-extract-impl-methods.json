@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-extract-impl-methods",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Extract named inherent impl methods into a target submodule file with full module wiring, visibility adjustment, import organization, compile repair, and validation in one compound run.",
@@ -12,24 +12,44 @@
       "operator has method names in hand and knows the target submodule path"
     ],
     "anti_patterns": [
-      "do not use for multi-partition god-impl splits — use rust-split-god-impl instead",
-      "do not use to move top-level items (structs, enums, functions) — use rust-extract-to-submodule",
-      "do not use when methods need different visibility from each other — fall back to manual plan sequence",
+      "do not use for multi-partition god-impl splits - use rust-split-god-impl instead",
+      "do not use to move top-level items (structs, enums, functions) - use rust-extract-to-submodule",
+      "do not use when methods need different visibility from each other - use rust.setVisibility after the move",
       "do not use on non-Rust files"
     ],
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "source_file", "target_file", "impl_name", "method_names"],
+        "required": [
+          "project_dir",
+          "source_file",
+          "target_file",
+          "impl_name",
+          "method_names"
+        ],
         "properties": {
-          "project_dir": { "type": "string", "description": "Absolute path to the Rust project root." },
-          "source_file": { "type": "string", "description": "File containing the source impl block, relative to project_dir." },
-          "target_file": { "type": "string", "description": "Target submodule file (e.g. src/server/search.rs), relative to project_dir." },
-          "impl_name": { "type": "string", "description": "Exact impl name as reported by bbox_refactor_status (e.g. `impl BlackboxServer`)." },
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Rust project root."
+          },
+          "source_file": {
+            "type": "string",
+            "description": "File containing the source impl block, relative to project_dir."
+          },
+          "target_file": {
+            "type": "string",
+            "description": "Target submodule file (e.g. src/server/search.rs), relative to project_dir."
+          },
+          "impl_name": {
+            "type": "string",
+            "description": "Exact impl name as reported by analysis.implPartition or code.items (for example `impl BlackboxServer`)."
+          },
           "method_names": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "description": "Method names to extract from the impl block."
           },
           "module_name": {
@@ -54,39 +74,78 @@
           },
           "skip_organize_imports": {
             "type": "boolean",
-            "description": "Skip the rust_organize_imports step after extraction."
+            "description": "Skip the rust.organizeImports step after extraction."
           },
           "targeted_tests": {
             "type": "array",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "description": "Test names to run after the final cargo check."
           },
-          "apply": { "type": "boolean" },
-          "validation_bin": { "type": "string" }
+          "apply": {
+            "type": "boolean"
+          },
+          "validation_bin": {
+            "type": "string"
+          }
         }
       },
-      "prompt_template": "You are rust-extract-impl-methods. Charter: Extract named inherent impl methods into a target submodule with full wiring.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\",\n                         item_names={{method_names}}, item_kinds=[\"impl_method\"])\n   Confirm every requested method resolves inside {{impl_name}}.\n\n2. Plan the compound run using the split_rust_impl_methods_to_submodule macro:\n   This macro (bbox_refactor_run-only, not bbox_refactor_plan) expands to:\n     add_rust_mod_decl → extract_rust_impl_methods → rust_organize_imports →\n     cargo check (with rustc JSON capture) → rust_compile_fix_round →\n     cargo check → targeted tests.\n   The atom MUST use bbox_refactor_run with a single plan step of\n   kind=\"split_rust_impl_methods_to_submodule\".\n\n3. Decide:\n   - If any method name does not resolve in the impl block, block.\n   - If the target_file already exists and is non-empty, proceed but note it\n     (extract_rust_impl_methods appends; it does not refuse existing targets).\n   - Otherwise proceed.\n\n4. Apply when {{apply}} is true; otherwise return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\",\n                     title=\"rust-extract-impl-methods {{source_file}} to {{target_file}}\",\n                     project_dir=\"{{project_dir}}\", confirm=true,\n                     steps=[\n     {\"op\":\"plan\",\"kind\":\"split_rust_impl_methods_to_submodule\",\n      \"source\":\"{{source_file}}\",\"target\":\"{{target_file}}\",\n      \"item_names\":{{method_names}},\"impl_name\":\"{{impl_name}}\",\n      \"module_name\":\"{{module_name}}\",\"visibility\":\"{{visibility}}\",\n      \"target_prelude\":\"{{target_prelude}}\",\n      \"router_name\":\"{{router_name}}\",\n      \"router_export_name\":\"{{router_export_name}}\",\n      \"toml_entries\":{\"skip_organize_imports\":{{skip_organize_imports}},\n                       \"targeted_tests\":{{targeted_tests}}}}\n   ])\n   Inspect the step reports. If cargo check failed and compile_fix applied,\n   report the fix details. If the final cargo check failed, the run rolled\n   back — report that.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: methods extracted, files\n     touched, compile status>).\n\nStrict refusal rules:\n- Never call bbox_refactor_plan with kind=split_rust_impl_methods_to_submodule\n  — it is a run-only macro.\n- Never invent method names from the user prompt — re-derive from\n  bbox_refactor_status.\n- Never use this atom for top-level items; use rust-extract-to-submodule.\n\nInputs:\n{{project_dir}} {{source_file}} {{target_file}} {{impl_name}} {{method_names}}"
+      "prompt_template": "You are rust-extract-impl-methods. Charter: Extract named inherent impl methods into a target submodule file with full module wiring, visibility adjustment, import organization, compile repair, and validation in one compound run.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file={{source_file}}\ntarget_file={{target_file}}\nimpl_name={{impl_name}}\nmethod_names={{method_names}}\nmodule_name={{module_name}}\nvisibility={{visibility}}\ntarget_prelude={{target_prelude}}\nrouter_name={{router_name}}\nrouter_export_name={{router_export_name}}\nskip_organize_imports={{skip_organize_imports}}\ntargeted_tests={{targeted_tests}}\napply={{apply}}\nvalidation_bin={{validation_bin}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call the retired daemon refactor surfaces.\n2. Run analysis.implPartition, select only the requested method role, then read rust.describe for extractImplMethods. Call rust.extractImplMethods, apply changes and creates, add explicit module wiring with rust.moduleWiring when needed, and run the compiler fix loop.\n3. If apply is false, return the transform or advisory result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. The transform does not synthesize project-specific router wrappers. Pass impl_name when method names are ambiguous.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
         "type": "object",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
-          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
-          "plan_path": { "type": "string" },
-          "files_touched": { "type": "array", "items": { "type": "string" } },
-          "methods_extracted": { "type": "array", "items": { "type": "string" } },
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "methods_extracted": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "cargo_result": {
             "type": "object",
             "properties": {
-              "command": { "type": "string" },
-              "exit_code": { "type": "integer" },
-              "summary": { "type": "string" },
-              "rolled_back": { "type": "boolean" }
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
             }
           },
-          "block_reason": { "type": "string" },
-          "done_note_id": { "type": "string" }
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          }
         }
       },
       "evidence_density": "high"
@@ -97,13 +156,22 @@
       "max_depth": 0,
       "uses_network": false
     },
-    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
-    "supervision": { "oracle": "default" },
-    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
     "cost_class": "normal",
     "provenance": {
       "kind": "hand_authored",

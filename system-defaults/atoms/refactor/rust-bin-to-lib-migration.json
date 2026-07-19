@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-bin-to-lib-migration",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Move selected module declarations from a binary root (main.rs) into lib.rs, rewrite bin crate paths, repair compile errors, and validate all binary targets in one compound run.",
@@ -12,17 +12,24 @@
       "crate has Cargo.toml [[bin]] targets and a src/lib.rs (or target can be created)"
     ],
     "anti_patterns": [
-      "do not use for inline `mod name { ... }` blocks — convert to file submodules with inline_mod_to_file_submodule first",
-      "do not use when only a single file needs moving — use move_file instead",
-      "do not use on pure-library crates (no [[bin]] targets) — add mod declarations manually",
+      "do not use for inline `mod name { ... }` blocks - convert to file submodules with rust.inlineModToFile first",
+      "do not use when only a single file needs moving - use lsp.willRenameFiles plus anchored edits instead",
+      "do not use on pure-library crates (no [[bin]] targets) - add mod declarations manually",
       "do not use on non-Rust projects"
     ],
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "source_file", "module_names"],
+        "required": [
+          "project_dir",
+          "source_file",
+          "module_names"
+        ],
         "properties": {
-          "project_dir": { "type": "string", "description": "Absolute path to the Rust project root." },
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Rust project root."
+          },
           "source_file": {
             "type": "string",
             "description": "Binary root file (e.g. src/main.rs), relative to project_dir."
@@ -30,7 +37,9 @@
           "module_names": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "description": "Module declaration names to migrate from source_file to lib.rs."
           },
           "target_file": {
@@ -43,36 +52,78 @@
           },
           "bin_sources": {
             "type": "array",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "description": "Extra binary root files beyond those auto-detected from Cargo.toml [[bin]] entries."
           },
-          "apply": { "type": "boolean" },
-          "validation_bin": { "type": "string" }
+          "apply": {
+            "type": "boolean"
+          },
+          "validation_bin": {
+            "type": "string"
+          }
         }
       },
-      "prompt_template": "You are rust-bin-to-lib-migration. Charter: Move selected mod declarations from a binary root into lib.rs with full path rewriting and compile repair.\n\nProtocol:\n\n1. Ground the source:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm every module in {{module_names}} has a matching `mod_item` declaration\n   in {{source_file}}.\n\n2. Plan the compound run using the migrate_rust_mods_to_lib macro:\n   This macro (bbox_refactor_run-only, not bbox_refactor_plan) expands to:\n     copy_rust_mod_decls → delete_rust_items → rewrite_rust_bin_crate_paths\n     (for each [[bin]] target) → cargo check --bins (with rustc JSON capture)\n     → rust_compile_fix_round → cargo check --bins.\n   The atom MUST use bbox_refactor_run with a single plan step of\n   kind=\"migrate_rust_mods_to_lib\".\n\n3. Decide:\n   - If any module name does not resolve as a mod_item in source_file, block.\n   - If the crate has no [[bin]] targets and source_file is main.rs, proceed\n     but warn (the rewrite step may be a no-op).\n   - If lib.rs does not exist, proceed (copy_rust_mod_decls creates content).\n   - Otherwise proceed.\n\n   CAUTION: Moving one module at a time with full cargo check validation\n   between each is the safe pattern for crates with 30+ mod declarations.\n   This atom moves all named modules in one transaction. For incremental\n   migration, invoke the atom once per module.\n\n4. Apply when {{apply}} is true; otherwise return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\",\n                     title=\"rust-bin-to-lib-migration {{module_names}}\",\n                     project_dir=\"{{project_dir}}\", confirm=true,\n                     steps=[\n     {\"op\":\"plan\",\"kind\":\"migrate_rust_mods_to_lib\",\n      \"source\":\"{{source_file}}\",\n      \"item_names\":{{module_names}},\n      \"target\":\"{{target_file}}\",\n      \"visibility\":\"{{visibility}}\",\n      \"toml_entries\":{\"bin_sources\":{{bin_sources}}}}\n   ])\n   Inspect the step reports. If the final cargo check --bins failed, the\n   run rolled back — report that.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: modules migrated, bins\n     validated, compile status>).\n\nStrict refusal rules:\n- Never call bbox_refactor_plan with kind=migrate_rust_mods_to_lib — it is\n  a run-only macro.\n- Never invent module names — re-derive from bbox_refactor_status.\n- Never use this atom for inline mod blocks — convert to files first.\n- Never use this atom when the crate has no [[bin]] entries.\n\nInputs:\n{{project_dir}} {{source_file}} {{module_names}}"
+      "prompt_template": "You are rust-bin-to-lib-migration. Charter: Move selected module declarations from a binary root (main.rs) into lib.rs, rewrite bin crate paths, repair compile errors, and validate all binary targets in one compound run.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file={{source_file}}\nmodule_names={{module_names}}\ntarget_file={{target_file}}\nvisibility={{visibility}}\nbin_sources={{bin_sources}}\napply={{apply}}\nvalidation_bin={{validation_bin}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call the retired daemon refactor surfaces.\n2. Inventory bin and library module declarations with code.items and code.query. Use rust.moduleWiring for each add/remove mod or use edit, and rust.rewriteModuleCallers for simple module-prefix rewrites. Use fresh anchored edits for file content or path changes not covered by those transforms. Apply in small module-graph steps and run the compiler fix loop after each coherent step.\n3. If apply is false, return the transform or advisory result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. There is no live copy-mod-declarations or whole bin-to-lib compound transform. Complex crate-path aliases and physical file moves remain explicit anchored edits, optionally preceded by lsp.willRenameFiles.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
         "type": "object",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
-          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
-          "plan_path": { "type": "string" },
-          "files_touched": { "type": "array", "items": { "type": "string" } },
-          "modules_migrated": { "type": "array", "items": { "type": "string" } },
-          "bins_validated": { "type": "integer", "minimum": 0 },
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "modules_migrated": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "bins_validated": {
+            "type": "integer",
+            "minimum": 0
+          },
           "cargo_result": {
             "type": "object",
             "properties": {
-              "command": { "type": "string" },
-              "exit_code": { "type": "integer" },
-              "summary": { "type": "string" },
-              "rolled_back": { "type": "boolean" }
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
             }
           },
-          "block_reason": { "type": "string" },
-          "done_note_id": { "type": "string" }
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          }
         }
       },
       "evidence_density": "high"
@@ -83,13 +134,22 @@
       "max_depth": 0,
       "uses_network": false
     },
-    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
-    "supervision": { "oracle": "default" },
-    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
     "cost_class": "normal",
     "provenance": {
       "kind": "hand_authored",

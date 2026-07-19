@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-architecture-async-runtime-lifecycle",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Diagnose Rust async or runtime-bound state captured into tasks, closures, globals, or long-lived structs with the wrong lifecycle.",
@@ -19,48 +19,152 @@
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "scope_filter"],
+        "required": [
+          "project_dir",
+          "scope_filter"
+        ],
         "properties": {
-          "project_dir": { "type": "string" },
-          "scope_filter": { "type": "string" },
-          "target_loci": { "type": "array", "items": { "type": "string" } },
-          "operator_hints": { "type": "array", "items": { "type": "string" } },
-          "layer_model_path": { "type": "string" },
-          "survey_json": { "type": "object", "additionalProperties": true },
-          "target_context_window": { "type": "integer", "minimum": 1000 },
-          "whole_project_mode": { "type": "boolean" },
-          "whiteboard_id": { "type": "string" }
+          "project_dir": {
+            "type": "string"
+          },
+          "scope_filter": {
+            "type": "string"
+          },
+          "target_loci": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "operator_hints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "layer_model_path": {
+            "type": "string"
+          },
+          "survey_json": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "target_context_window": {
+            "type": "integer",
+            "minimum": 1000
+          },
+          "whole_project_mode": {
+            "type": "boolean"
+          },
+          "whiteboard_id": {
+            "type": "string"
+          }
         }
       },
-      "prompt_template": "You are rust-architecture-async-runtime-lifecycle. Diagnostic question: is short-lived or runtime-bound state captured into tasks, closures, globals, or long-lived structs with the wrong lifecycle?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols and bbox_refactor_status for tokio::spawn/task creation, channels, runtime handles, Arc<Mutex<_>>/RwLock fields, static/global state, shutdown code, tests, and compiler diagnostics if supplied.\n2. Apply the SAST/compiler gate. Borrow-checker, Send/Sync, or lock-count facts are evidence, not diagnosis. A valid claim names captured resource, owner lifetime, task lifetime, and predicted failure mode.\n3. Map remediation honestly. State relocation may chain through rust-state-extract; cancellation tokens, channel ownership, task lifetime, and runtime owner changes are PD-manual.\n4. If whiteboard_id is non-empty, post one whiteboard_post claim or concern for each surviving diagnosis candidate.\n5. Emit bbox_note:done with lifecycle hotspot count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, authority_grades, evidence_refs, atom_mapping, remediation_slices, acceptance_criteria, deferred, block_reason."
+      "prompt_template": "You are rust-architecture-async-runtime-lifecycle. Charter: Diagnose Rust async or runtime-bound state captured into tasks, closures, globals, or long-lived structs with the wrong lifecycle.\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Work in code-mode. Ground current source with code.files, code.items, code.query, code.signature, and code.read. Use analysis.* for reductions and lsp.* for semantic facts. Do not call the retired daemon refactor surfaces.\n2. Use code.query for spawn sites, closures, channels, runtime handles, Arc/Mutex/RwLock fields, globals, shutdown paths, and tests. Use lsp.references on the captured state or owner type when exact usages matter. Use build.gate diagnostics only as evidence for Send, Sync, borrow, or lifetime pressure.\n3. A diagnosis must name the concrete locus, current owner, conflicting responsibility or lifetime, evidence, predicted failure mode, and confidence. Compiler or SAST facts are evidence, not diagnosis by themselves.\n4. Map accepted remediation to rust.moveStructFields plus rust.updateCallers for ownership relocation, rust.extractImplMethods for role separation, or anchored edits for cancellation and runtime wiring. Do not claim that compilation alone proves the lifecycle is correct.\n5. If whiteboard_id is present, include one concise claim or concern per surviving candidate in the returned result for the orchestrator to post. Do not call an unavailable whiteboard tool.\n6. Emit bbox_note(kind=\"done\") with hotspot and candidate counts. Return the structured diagnosis and remediation mapping.\n\nStrict rules:\n- Analysis-only. Never apply edits.\n- Stay within scope_filter and target_loci.\n- Do not infer architecture from names alone.\n- Surface unsupported macro, unsafe, public-API, or runtime assumptions.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
         "type": "object",
-        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "required": [
+          "status",
+          "pathology_atom",
+          "diagnosis_candidates"
+        ],
         "properties": {
-          "status": { "enum": ["planned", "blocked", "errored"] },
-          "pathology_atom": { "const": "rust-architecture-async-runtime-lifecycle" },
-          "sast_gate": { "type": "object", "additionalProperties": true },
-          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
-          "authority_grades": { "type": "array", "items": { "type": "object" } },
-          "evidence_refs": { "type": "array", "items": { "type": "string" } },
-          "atom_mapping": { "type": "array", "items": { "type": "object" } },
-          "remediation_slices": { "type": "array", "items": { "type": "object" } },
-          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
-          "deferred": { "type": "array", "items": { "type": "object" } },
-          "block_reason": { "type": "string" },
-          "done_note_id": { "type": "string" }
+          "status": {
+            "enum": [
+              "planned",
+              "blocked",
+              "errored"
+            ]
+          },
+          "pathology_atom": {
+            "const": "rust-architecture-async-runtime-lifecycle"
+          },
+          "sast_gate": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "diagnosis_candidates": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "authority_grades": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "atom_mapping": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "remediation_slices": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "acceptance_criteria": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "deferred": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          }
         }
       },
       "evidence_density": "high"
     },
-    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
-    "composition": { "may_invoke_atoms": { "kind": "none" } },
-    "implementation": { "kind": "profile", "brofile_ref": "brofile:rust-architecture-pathologist@v1" },
-    "supervision": { "oracle": "default" },
-    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-architecture-pathologist@v2"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
     "cost_class": "normal",
-    "provenance": { "kind": "hand_authored", "author": "blackbox-rust-arch-pathology", "created_at": "2026-05-20T00:00:00Z" }
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-rust-arch-pathology",
+      "created_at": "2026-05-20T00:00:00Z"
+    }
   }
 }

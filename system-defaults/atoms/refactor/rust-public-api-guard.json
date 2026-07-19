@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-public-api-guard",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Report the public-API delta a proposed Rust refactor would produce, as an advisory severity (info / caution / breaking).",
@@ -12,9 +12,9 @@
       "auditing a proposed change set for cross-crate impact"
     ],
     "anti_patterns": [
-      "do not use as a permission grant — this atom reports the delta, it does not decide whether the change is safe",
+      "do not use as a permission grant - this atom reports the delta, it does not decide whether the change is safe",
       "do not use on non-Rust files",
-      "do not chain inside a mutating bbox_refactor_run — keep the guard as a separate preflight"
+      "do not combine the guard with the mutating EditSet - keep it as a separate preflight"
     ],
     "inputs": {
       "schema": {
@@ -61,7 +61,7 @@
           }
         }
       },
-      "prompt_template": "You are rust-public-api-guard. Charter: Report the public-API delta of a proposed Rust refactor as an advisory severity.\n\nProtocol (analysis-only — steps 3 and 4 are skipped):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"\",\n                     languages=[\"rust\"], item_kinds=[\"function_item\", \"struct_item\", \"enum_item\", \"trait_item\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm the path resolves and tree-sitter parses cleanly.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"rust_public_api_guard\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\",\n                      toml_entries={\"proposed_changes\": {{proposed_changes}}})\n   The response carries advisory_severity, public_items_touched,\n   public_api_delta_summary, and crate_root_re_exports_affected. Do not\n   invoke bbox_refactor_run — analysis only.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: severity, touched count,\n     re-exports affected count, source>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never use this atom's output as a permission grant — it advises;\n  the caller decides whether the change is acceptable.\n- Never invent symbol names from the user prompt.\n\nInputs:\n{{project_dir}} {{source}} {{proposed_changes}}"
+      "prompt_template": "You are rust-public-api-guard. Charter: Report the public-API delta a proposed Rust refactor would produce, as an advisory severity (info / caution / breaking).\n\nInputs:\nproject_dir={{project_dir}}\nsource={{source}}\nproposed_changes={{proposed_changes}}\n\nProtocol:\n1. Work in code-mode. Inventory public items in source with code.items.\n2. For affected callables, inspect code.signature. Use lsp.references on fresh declaration spans for semantic usage and code.query for public re-exports or trait obligations.\n3. Compare proposed_changes against the current public surface. Return an advisory severity of info, caution, or breaking with concrete symbols and evidence.\n4. Emit bbox_note(kind=\"done\") with the severity and affected-public-symbol count.\n\nStrict rules:\n- Read-only. Never create or apply an EditSet.\n- This is an advisory, not an operator permission grant.\n- There is no live analysis.publicApi transform. Do not claim full downstream crate compatibility.\n- Do not call retired daemon refactor surfaces.\n"
     },
     "outputs": {
       "schema": {
@@ -167,7 +167,7 @@
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
     "supervision": {
       "oracle": "default"

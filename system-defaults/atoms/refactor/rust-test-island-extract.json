@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-test-island-extract",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files declared via mod tests; in the source's parent module.",
@@ -12,14 +12,17 @@
       "preparing a file for further refactoring where the test block obscures the code"
     ],
     "anti_patterns": [
-      "do not use when the test block references items via super::super::* — the sibling move would break those refs",
+      "do not use when the test block references items via super::super::* - the sibling move would break those refs",
       "do not use for crate-level integration tests (those belong in tests/, not src/tests/*.rs)",
       "do not use on non-Rust files"
     ],
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "source_file_or_dir"],
+        "required": [
+          "project_dir",
+          "source_file_or_dir"
+        ],
         "properties": {
           "project_dir": {
             "type": "string",
@@ -43,21 +46,43 @@
           }
         }
       },
-      "prompt_template": "You are rust-test-island-extract. Charter: Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"\",\n                     languages=[\"rust\"], item_kinds=[\"mod_item\"])\n   bbox_refactor_status(file=\"{{source_file_or_dir}}\", project_dir=\"{{project_dir}}\")\n   Identify mod_items annotated #[cfg(test)] (typically `mod tests`). Copy\n   exact `name`/`kind`/byte_range values. If the test block references items\n   via super::super::* or otherwise outside its parent module's scope, RECORD\n   THE REFS — those don't survive a sibling move.\n\n2. Plan with deep_analysis=true (extract_rust_items moves the cfg(test) mod item):\n   bbox_refactor_plan(kind=\"extract_rust_items\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file_or_dir}}\",\n                      target=\"{{target_dir}}/<basename>.rs\",\n                      item_names=[\"<cfg-test-mod-name>\"])\n   Then plan add_rust_mod_decl for `#[cfg(test)] mod tests;` in the source.\n\n3. Decide:\n   - If grounding step 1 found super::super::* or sibling-incompatible refs,\n     save the plan via output_path, emit bbox_note(kind=\"blocked\",\n     body=<concrete diagnostic naming the offending refs + plan_path>) and\n     return status=\"blocked\".\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <extract_rust_items step>,\n     <add_rust_mod_decl step>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"on_failure\":\"optional\"}\n   ], title=\"rust-test-island-extract for {{source_file_or_dir}}\")\n\n5. Report:\n   Emit bbox_note(kind=\"done\", body=<summary with files_touched, fixme_count,\n   cargo_result, extracted_test_files>).\n\nGuardrails:\n- NEVER touch files outside the target dir or source file.\n- NEVER delete the source file — only remove the inline test block.\n- If cargo check fails after apply, the continue_for_repair + rust_compile_fix_round\n  will attempt automated fixes. If that fails, the run rolls back.\n- ALWAYS validate that extracted test files compile before reporting done."
+      "prompt_template": "You are rust-test-island-extract. Charter: Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files declared via mod tests; in the source's parent module.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file_or_dir={{source_file_or_dir}}\ntarget_dir={{target_dir}}\napply={{apply}}\nvalidation_bin={{validation_bin}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call the retired daemon refactor surfaces.\n2. Use code.query and code.items to identify the requested test island. For an inline test module use rust.inlineModToFile. For loose test items use analysis.topLevelDeps plus rust.extractItems. Apply changes and creates, then run the requested compiler or test gate through build.gate.\n3. If apply is false, return the transform or advisory result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. Preserve cfg(test) and other outer attributes. Do not broaden the item set beyond the requested island.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
         "type": "object",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
-          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
-          "plan_path": { "type": "string" },
-          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "fixme_count": {
             "type": "object",
             "properties": {
-              "plan_only": { "type": "integer", "minimum": 0 },
-              "warning": { "type": "integer", "minimum": 0 }
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
             }
           },
           "deep_analysis_summary": {
@@ -67,23 +92,44 @@
           "cargo_result": {
             "type": "object",
             "properties": {
-              "command": { "type": "string" },
-              "exit_code": { "type": "integer" },
-              "summary": { "type": "string" },
-              "rolled_back": { "type": "boolean" }
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
             }
           },
-          "block_reason": { "type": "string" },
-          "done_note_id": { "type": "string" },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
           "extracted_test_files": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "source": { "type": "string" },
-                "target": { "type": "string" },
-                "test_count": { "type": "integer", "minimum": 0 },
-                "refs_preserved": { "type": "boolean" }
+                "source": {
+                  "type": "string"
+                },
+                "target": {
+                  "type": "string"
+                },
+                "test_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "refs_preserved": {
+                  "type": "boolean"
+                }
               }
             }
           }
@@ -98,11 +144,13 @@
       "uses_network": false
     },
     "composition": {
-      "may_invoke_atoms": { "kind": "none" }
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
     },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
     "supervision": {
       "oracle": "default"

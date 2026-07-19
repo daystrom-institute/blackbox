@@ -2,7 +2,7 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-architecture-macro-generated-contract-opacity",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
     "description": "Diagnose macro-generated Rust APIs or behavior that hide ownership, lifecycle, or public contracts callers must manually reason about.",
@@ -19,48 +19,152 @@
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "scope_filter"],
+        "required": [
+          "project_dir",
+          "scope_filter"
+        ],
         "properties": {
-          "project_dir": { "type": "string" },
-          "scope_filter": { "type": "string" },
-          "target_loci": { "type": "array", "items": { "type": "string" } },
-          "operator_hints": { "type": "array", "items": { "type": "string" } },
-          "layer_model_path": { "type": "string" },
-          "survey_json": { "type": "object", "additionalProperties": true },
-          "target_context_window": { "type": "integer", "minimum": 1000 },
-          "whole_project_mode": { "type": "boolean" },
-          "whiteboard_id": { "type": "string" }
+          "project_dir": {
+            "type": "string"
+          },
+          "scope_filter": {
+            "type": "string"
+          },
+          "target_loci": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "operator_hints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "layer_model_path": {
+            "type": "string"
+          },
+          "survey_json": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "target_context_window": {
+            "type": "integer",
+            "minimum": 1000
+          },
+          "whole_project_mode": {
+            "type": "boolean"
+          },
+          "whiteboard_id": {
+            "type": "string"
+          }
         }
       },
-      "prompt_template": "You are rust-architecture-macro-generated-contract-opacity. Diagnostic question: does macro-generated Rust code hide ownership, lifecycle, or public API that callers must manually reason about?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols, bbox_refactor_status, macro invocations, proc-macro attributes, public API guard, tests around generated behavior, and generated APIs only if cargo expand or equivalent evidence is explicitly available.\n2. Apply the SAST/compiler gate. Macro count is not pathology. A valid claim names the generated contract, caller obligations, whether expansion was inspected, and public API risk.\n3. If macro expansion was not inspected, either bound the claim to non-macro regions or stamp explicit uncertainty. Map remediation to PD-manual, adapter extraction, generated-code isolation, or rust-public-api-guard preflight.\n4. If whiteboard_id is non-empty, post one whiteboard_post claim or concern for each surviving diagnosis candidate.\n5. Emit bbox_note:done with macro hotspot count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, authority_grades, evidence_refs, atom_mapping, remediation_slices, acceptance_criteria, deferred, block_reason."
+      "prompt_template": "You are rust-architecture-macro-generated-contract-opacity. Charter: Diagnose macro-generated Rust APIs or behavior that hide ownership, lifecycle, or public contracts callers must manually reason about.\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Work in code-mode. Ground current source with code.files, code.items, code.query, code.signature, and code.read. Use analysis.* for reductions and lsp.* for semantic facts. Do not call the retired daemon refactor surfaces.\n2. Use code.query and code.items for visible macro invocations and generated-contract call sites, lsp.definition where rust-analyzer resolves them, and build.gate diagnostics for concrete expansion failures. Keep unresolved expansion behavior explicit.\n3. A diagnosis must name the concrete locus, current owner, conflicting responsibility or lifetime, evidence, predicted failure mode, and confidence. Compiler or SAST facts are evidence, not diagnosis by themselves.\n4. The live surface is not macro-expansion-aware. Use rust.extractItems or rust.moduleWiring only for visible source items. Treat generated members, proc-macro output, and expansion-dependent rewrites as manual or blocked.\n5. If whiteboard_id is present, include one concise claim or concern per surviving candidate in the returned result for the orchestrator to post. Do not call an unavailable whiteboard tool.\n6. Emit bbox_note(kind=\"done\") with hotspot and candidate counts. Return the structured diagnosis and remediation mapping.\n\nStrict rules:\n- Analysis-only. Never apply edits.\n- Stay within scope_filter and target_loci.\n- Do not infer architecture from names alone.\n- Surface unsupported macro, unsafe, public-API, or runtime assumptions.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
         "type": "object",
-        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "required": [
+          "status",
+          "pathology_atom",
+          "diagnosis_candidates"
+        ],
         "properties": {
-          "status": { "enum": ["planned", "blocked", "errored"] },
-          "pathology_atom": { "const": "rust-architecture-macro-generated-contract-opacity" },
-          "sast_gate": { "type": "object", "additionalProperties": true },
-          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
-          "authority_grades": { "type": "array", "items": { "type": "object" } },
-          "evidence_refs": { "type": "array", "items": { "type": "string" } },
-          "atom_mapping": { "type": "array", "items": { "type": "object" } },
-          "remediation_slices": { "type": "array", "items": { "type": "object" } },
-          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
-          "deferred": { "type": "array", "items": { "type": "object" } },
-          "block_reason": { "type": "string" },
-          "done_note_id": { "type": "string" }
+          "status": {
+            "enum": [
+              "planned",
+              "blocked",
+              "errored"
+            ]
+          },
+          "pathology_atom": {
+            "const": "rust-architecture-macro-generated-contract-opacity"
+          },
+          "sast_gate": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "diagnosis_candidates": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "authority_grades": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "atom_mapping": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "remediation_slices": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "acceptance_criteria": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "deferred": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          }
         }
       },
       "evidence_density": "high"
     },
-    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
-    "composition": { "may_invoke_atoms": { "kind": "none" } },
-    "implementation": { "kind": "profile", "brofile_ref": "brofile:rust-architecture-pathologist@v1" },
-    "supervision": { "oracle": "default" },
-    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-architecture-pathologist@v2"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
     "cost_class": "normal",
-    "provenance": { "kind": "hand_authored", "author": "blackbox-rust-arch-pathology", "created_at": "2026-05-20T00:00:00Z" }
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-rust-arch-pathology",
+      "created_at": "2026-05-20T00:00:00Z"
+    }
   }
 }

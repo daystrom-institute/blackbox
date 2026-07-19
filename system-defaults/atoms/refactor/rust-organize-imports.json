@@ -2,42 +2,72 @@
   "_contract": "atom/v1",
   "kind": "atom",
   "name": "rust-organize-imports",
-  "version": 1,
+  "version": 2,
   "subcontract": "refactor/v1",
   "manifest": {
-    "description": "Organize imports in one Rust file through rust-analyzer source.organizeImports.",
+    "description": "Minimize resolvable in-project Rust wildcard imports in one source file.",
     "when_to_use": [
-      "after a Rust refactor leaves stale or unordered imports",
-      "before cargo check when import cleanup is the only expected source change",
+      "after a Rust refactor leaves broad local wildcard imports",
+      "before cargo check when local wildcard minimization is the only expected source change",
       "as a focused cleanup pass on one Rust source file"
     ],
     "anti_patterns": [
-      "do not use when rust-analyzer is unavailable",
-      "do not chain rust_minimize_imports after this atom by default",
+      "do not use for external-crate wildcards or unresolved modules",
+      "do not expect sorting or general rust-analyzer organize-imports behavior",
       "do not use as dependency repair for missing crates"
     ],
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "source_file"],
+        "required": [
+          "project_dir",
+          "source_file"
+        ],
         "properties": {
-          "project_dir": { "type": "string" },
-          "source_file": { "type": "string" },
-          "apply": { "type": "boolean" }
+          "project_dir": {
+            "type": "string"
+          },
+          "source_file": {
+            "type": "string"
+          },
+          "apply": {
+            "type": "boolean"
+          }
         }
       },
-      "prompt_template": "You are rust-organize-imports. Charter: Organize imports in exactly one Rust file via rust_organize_imports.\n\nProtocol:\n\n1. Ground the file:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm the file is Rust and parses cleanly.\n\n2. Plan:\n   bbox_refactor_plan(kind=\"rust_organize_imports\", project_dir=\"{{project_dir}}\", source=\"{{source_file}}\")\n   rust-analyzer returning no edits is a no-op, not a reason to invent changes. Report planned/no-op with zero files_touched.\n\n3. Apply when {{apply}} is true:\n   bbox_refactor_run(dispatch_origin=\"agent\", title=\"rust-organize-imports {{source_file}}\", project_dir=\"{{project_dir}}\", confirm=true, steps=[\n     {\"op\":\"plan\",\"kind\":\"rust_organize_imports\",\"source\":\"{{source_file}}\"}\n   ])\n\n4. Emit bbox_note(kind=\"done\", body=<one-line summary: source_file, import edits count or no-op>).\n\nStrict refusal rules:\n- Never call tools outside the refactor persona surface.\n- Never fall back to textual import sorting.\n- Never apply to non-Rust files.\n\nInputs:\n{{project_dir}} {{source_file}} {{apply}}"
+      "prompt_template": "You are rust-organize-imports. Charter: Minimize resolvable in-project Rust wildcard imports in one source file.\n\nInputs:\nproject_dir={{project_dir}}\nsource_file={{source_file}}\napply={{apply}}\n\nProtocol:\n1. Work in code-mode. Ground every name and span with code.*. Consult rust.describe and the relevant analysis.describe contract before first use. Do not call the retired daemon refactor surfaces.\n2. Read rust.describe for organizeImports, then call rust.organizeImports with mode minimize. Review findings before applying. Apply returned changes and run build.gate.\n3. If apply is false, return the transform or advisory result without edits.apply. If apply is true, route every write through edits.begin, edits.merge or edits.createFile, and edits.apply.\n4. After each structural apply, run build.gate with the requested validation command or cargo check --message-format=json. Feed diagnostics to rust.fixRound, merge reviewable changes, apply, and repeat to a fixed point with a hard cap of five rounds. Return rust.fixRound.leftovers as the manual punch list.\n5. Minimize mode is in-project only, assumes file or mod.rs geometry, and cannot descend into inline modules. Preserve unresolved wildcards. The live binding does not implement mode organize.\n6. Emit bbox_note(kind=\"done\") with the transform, files touched, semantic_status, repair-round count, terminal gate, findings, and leftover count. Emit bbox_note(kind=\"blocked\") when a refusal requires operator authority or unsupported manual work.\n\nStrict rules:\n- Never broaden the requested item set.\n- Never write outside edits.apply.\n- Re-derive spans after every apply.\n- Never cell-author acknowledge_repr or acknowledge_public_api_change. Those grants arrive only through dispatch ToolArgDefaults.\n- Keep lsp.* changes and compiler MachineApplicable replacements unmodified.\n- A target-exists refusal after a successful extract is DONE, not a retry.\n- No retired daemon refactor tools.\n"
     },
     "outputs": {
       "schema": {
         "type": "object",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
-          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
-          "files_touched": { "type": "array", "items": { "type": "string" } },
-          "block_reason": { "type": "string" },
-          "done_note_id": { "type": "string" },
-          "import_edits": { "type": "integer", "minimum": 0 }
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "import_edits": {
+            "type": "integer",
+            "minimum": 0
+          }
         }
       },
       "evidence_density": "medium"
@@ -48,13 +78,22 @@
       "max_depth": 0,
       "uses_network": false
     },
-    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
     "implementation": {
       "kind": "profile",
-      "brofile_ref": "brofile:rust-refactor-persona@v1"
+      "brofile_ref": "brofile:rust-refactor-persona@v2"
     },
-    "supervision": { "oracle": "default" },
-    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
     "cost_class": "cheap",
     "provenance": {
       "kind": "hand_authored",
