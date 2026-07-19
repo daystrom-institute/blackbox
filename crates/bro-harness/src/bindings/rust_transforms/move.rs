@@ -345,20 +345,13 @@ fn run_dependency_analysis(
     input: &ExtractItemsInput,
     mode: Mode,
 ) -> Vec<Value> {
-    let item_names_owned: Vec<String> = if input.item_names.is_empty() {
-        Vec::new()
-    } else {
-        input.item_names.clone()
-    };
-    let item_names_slice: Option<&[String]> = if item_names_owned.is_empty() {
-        None
-    } else {
-        Some(&item_names_owned)
-    };
+    // Analyze ALL items (pass item_names=None) so the full edge graph is
+    // visible; analyze_top_level only records edges between selected items,
+    // and the closure computation needs edges to non-seed items too.
     let graph = bbox_refactor::rust_top_level_deps::analyze_top_level(
         source_abs,
         Some(&root.to_string_lossy()),
-        item_names_slice,
+        None,
         input.item_kinds.as_deref(),
     );
     let graph = match graph {

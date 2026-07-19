@@ -567,7 +567,7 @@ mod tests {
                         "visibility": "pub",
                         "targetKind": "method",
                         "itemNames": ["go"],
-                        "implName": "B"
+                        "implName": "impl B"
                     }),
                     &cx,
                 )
