@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,10 @@ pub struct Brofile {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Durable persona-bound tool argument defaults. Dispatch merges these
+    /// after ambient defaults and before the per-dispatch overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_defaults: Option<BTreeMap<String, String>>,
     /// Persona-bound tool filter overlay. Merges between project mcp.json
     /// and per-dispatch ExecParams overrides at dispatch time. Lets a
     /// brofile (e.g. "auditor") restrict the tool surface every member
@@ -683,6 +687,7 @@ mod tests {
             lens: Some("You are a code reviewer".into()),
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,
@@ -715,6 +720,7 @@ mod tests {
             lens: Some("test".into()),
             model: Some("gpt-5.5".into()),
             effort: Some("medium".into()),
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,
@@ -746,6 +752,7 @@ mod tests {
             lens: Some("global lens".into()),
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,
@@ -763,6 +770,7 @@ mod tests {
             lens: Some("project lens".into()),
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,
@@ -799,6 +807,7 @@ mod tests {
                 lens: None,
                 model: None,
                 effort: None,
+                tool_defaults: None,
                 filters: None,
                 surface: None,
                 coerce_workspace: None,
@@ -825,6 +834,7 @@ mod tests {
             lens: None,
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,
@@ -874,6 +884,7 @@ mod tests {
             lens: None,
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: Some(McpFilters {
                 allow: vec![],
                 disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(*)".into()],
@@ -903,6 +914,7 @@ mod tests {
             lens: None,
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: Some("readonly".into()),
             coerce_workspace: None,
@@ -1273,6 +1285,7 @@ mod tests {
             lens: None,
             model: Some("gpt-5.4-mini".into()),
             effort: Some("low".into()),
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,
@@ -1297,6 +1310,7 @@ mod tests {
             lens: None,
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,
@@ -1325,6 +1339,34 @@ mod tests {
     }
 
     #[test]
+    fn test_brofile_tool_defaults_round_trip() {
+        let dir = temp_store();
+        let tool_defaults = BTreeMap::from([(
+            "default:rust.moveStructFields.acknowledge_repr".into(),
+            "true".into(),
+        )]);
+        let bf = Brofile {
+            name: "repr-approved".into(),
+            provider: Provider::Glm,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            tool_defaults: Some(tool_defaults.clone()),
+            filters: None,
+            surface: None,
+            coerce_workspace: None,
+            runtime: None,
+            context: None,
+            code_mode: None,
+            service_tier: None,
+        };
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
+        let loaded = resolve_brofile("repr-approved", dir.path(), None).unwrap();
+        assert_eq!(loaded.tool_defaults, Some(tool_defaults));
+    }
+
+    #[test]
     fn test_brofile_coerce_workspace_round_trip() {
         let dir = temp_store();
         let bf = Brofile {
@@ -1334,6 +1376,7 @@ mod tests {
             lens: None,
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: Some(true),
@@ -1353,6 +1396,7 @@ mod tests {
             lens: None,
             model: None,
             effort: None,
+            tool_defaults: None,
             filters: None,
             surface: None,
             coerce_workspace: None,

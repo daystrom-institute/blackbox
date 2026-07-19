@@ -69,6 +69,7 @@ impl BlackboxServer {
             mut env_overrides,
             cwd,
             brofile_filters,
+            brofile_tool_defaults,
             coerce_workspace,
             brofile_context,
         ) = self.resolve_exec_target(Some(brofile), None, project_dir)?;
@@ -161,6 +162,8 @@ impl BlackboxServer {
                     allow_tools: None,
                     disallow_tools: None,
                     tool_placement: None,
+                    brofile_tool_defaults,
+                    tool_defaults: None,
                     allocation_request: runtime,
                     project_dir_for_lease: project_dir.map(String::from),
                     ambient_bro_name: Some(brofile.to_string()),
@@ -269,7 +272,11 @@ impl BlackboxServer {
             // (session default + managed-worktree cwd/project_dir pins) — the
             // fresh branch gets it via dispatch_fresh_bro_task; the legacy
             // spawn_task wrapper silently dropped it here.
-            ambient_ctx.tool_arg_defaults(),
+            orch::merge_tool_arg_defaults(
+                ambient_ctx.tool_arg_defaults(),
+                brofile_tool_defaults.as_ref(),
+                None,
+            ),
             Some(self.state.system_events.clone()),
             // workflow_dispatch_executor's resume branch — also
             // workflow origin (matches the dispatch_fresh_bro_task

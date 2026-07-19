@@ -552,6 +552,7 @@ mod tests {
                 lens: Some("Badgey test lens".to_string()),
                 model: None,
                 effort: None,
+                tool_defaults: None,
                 filters: Some(orchestration::mcp::McpFilters {
                     allow: Vec::new(),
                     disallow: vec!["mcp__blackbox__bro_*".to_string()],
