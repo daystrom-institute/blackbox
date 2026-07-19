@@ -203,6 +203,11 @@ fn walk_node(
                     "macro_use",
                 );
             }
+            // Macro arguments are token trees, not parsed AST; skip
+            // recursion to avoid double-counting the macro name as
+            // path_ref when the walker re-encounters it as a child
+            // identifier.
+            return;
         }
         _ => {}
     }
