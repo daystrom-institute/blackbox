@@ -19,6 +19,13 @@ async fn main() {
         )
         .init();
 
+    // rmcp's reqwest 0.13 rides the rustls no-provider variant (workspace
+    // `reqwest-tls-no-provider`), so its client builder panics "No provider
+    // set" unless a process-default CryptoProvider exists. The daemon installs
+    // ring at its own startup, but the harness is a separate process since the
+    // process-boundary extraction; install ring here too. Idempotent.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = bro_harness::cli::Cli::parse();
     if let Err(e) = bro_harness::agent_loop::run(cli).await {
         // Surface the failure on stderr; the daemon captures it as the task's
