@@ -20,7 +20,9 @@ use bro_tools::{Tool, ToolAnnotations, ToolCx, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::helpers::{PlanProjection, plan_to_changes_creates, record_in_ledger, resolve_workspace_file};
+use super::helpers::{
+    PlanProjection, plan_to_changes_creates, record_in_ledger, resolve_workspace_file,
+};
 use crate::bindings::ledger::ProvenanceLedger;
 
 // ───────────────────────────── moduleWiring ─────────────────────────────
@@ -105,7 +107,10 @@ impl Tool for RustModuleWiring {
         })
     }
     fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations { read_only: true, destructive: false }
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
     }
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("rust".to_string(), "moduleWiring".to_string()))
@@ -120,16 +125,20 @@ impl Tool for RustModuleWiring {
             Ok(action) => action,
             Err(e) => return ToolResult::Error(e),
         };
-        let source_abs =
-            match resolve_workspace_file(&root, &args.source, "rust.moduleWiring") {
-                Ok(path) => path,
-                Err(e) => return ToolResult::Error(format!("rust.moduleWiring: {e}")),
-            };
+        let source_abs = match resolve_workspace_file(&root, &args.source, "rust.moduleWiring") {
+            Ok(path) => path,
+            Err(e) => return ToolResult::Error(format!("rust.moduleWiring: {e}")),
+        };
         // Validate action-specific required fields before calling the planner
         // so the error is actionable.
         match action {
             WiringAction::AddMod | WiringAction::RemoveMod => {
-                if args.module_name.as_deref().map(str::is_empty).unwrap_or(true) {
+                if args
+                    .module_name
+                    .as_deref()
+                    .map(str::is_empty)
+                    .unwrap_or(true)
+                {
                     return ToolResult::Error(format!(
                         "rust.moduleWiring: moduleName is required for {}",
                         action.as_str()
@@ -146,7 +155,10 @@ impl Tool for RustModuleWiring {
             }
         }
         let mut entries = std::collections::BTreeMap::new();
-        entries.insert("action".to_string(), Value::String(action.as_str().to_string()));
+        entries.insert(
+            "action".to_string(),
+            Value::String(action.as_str().to_string()),
+        );
         let params = RefactorPlanParams {
             kind: "rust_module_wiring".to_string(),
             source: source_abs.to_string_lossy().into_owned(),
@@ -165,11 +177,14 @@ impl Tool for RustModuleWiring {
             Ok(plan) => plan,
             Err(e) => return ToolResult::Error(format!("rust.moduleWiring: plan decode: {e}")),
         };
-        let PlanProjection { changes, would_change_files, .. } =
-            match plan_to_changes_creates(&root, "rust.moduleWiring", &plan.edits, false) {
-                Ok(proj) => proj,
-                Err(e) => return ToolResult::Error(format!("rust.moduleWiring: {e}")),
-            };
+        let PlanProjection {
+            changes,
+            would_change_files,
+            ..
+        } = match plan_to_changes_creates(&root, "rust.moduleWiring", &plan.edits, false) {
+            Ok(proj) => proj,
+            Err(e) => return ToolResult::Error(format!("rust.moduleWiring: {e}")),
+        };
         record_in_ledger(&self.0, "rust.moduleWiring", &changes);
         let mut findings: Vec<Value> = Vec::new();
         for note in &plan.leftovers {
@@ -234,9 +249,7 @@ struct SetVisibilityInput {
 impl SetVisibilityInput {
     fn planner_kind(&self) -> &'static str {
         match self.target_kind {
-            VisibilityTarget::Item | VisibilityTarget::Method => {
-                "rewrite_rust_item_visibility"
-            }
+            VisibilityTarget::Item | VisibilityTarget::Method => "rewrite_rust_item_visibility",
             VisibilityTarget::Field => "rewrite_rust_field_visibility",
         }
     }
@@ -264,7 +277,10 @@ impl Tool for RustSetVisibility {
         })
     }
     fn annotations(&self) -> ToolAnnotations {
-        ToolAnnotations { read_only: true, destructive: false }
+        ToolAnnotations {
+            read_only: true,
+            destructive: false,
+        }
     }
     fn namespace_binding(&self) -> Option<(String, String)> {
         Some(("rust".to_string(), "setVisibility".to_string()))
@@ -276,15 +292,12 @@ impl Tool for RustSetVisibility {
             Err(e) => return ToolResult::Error(format!("rust.setVisibility: bad input: {e}")),
         };
         if args.item_names.is_empty() {
-            return ToolResult::Error(
-                "rust.setVisibility: itemNames is required".to_string(),
-            );
+            return ToolResult::Error("rust.setVisibility: itemNames is required".to_string());
         }
-        let source_abs =
-            match resolve_workspace_file(&root, &args.source, "rust.setVisibility") {
-                Ok(path) => path,
-                Err(e) => return ToolResult::Error(format!("rust.setVisibility: {e}")),
-            };
+        let source_abs = match resolve_workspace_file(&root, &args.source, "rust.setVisibility") {
+            Ok(path) => path,
+            Err(e) => return ToolResult::Error(format!("rust.setVisibility: {e}")),
+        };
         let item_kinds = match args.target_kind {
             VisibilityTarget::Method => Some(vec!["impl_method".to_string()]),
             _ => None,
@@ -313,11 +326,14 @@ impl Tool for RustSetVisibility {
             Ok(plan) => plan,
             Err(e) => return ToolResult::Error(format!("rust.setVisibility: plan decode: {e}")),
         };
-        let PlanProjection { changes, would_change_files, .. } =
-            match plan_to_changes_creates(&root, "rust.setVisibility", &plan.edits, false) {
-                Ok(proj) => proj,
-                Err(e) => return ToolResult::Error(format!("rust.setVisibility: {e}")),
-            };
+        let PlanProjection {
+            changes,
+            would_change_files,
+            ..
+        } = match plan_to_changes_creates(&root, "rust.setVisibility", &plan.edits, false) {
+            Ok(proj) => proj,
+            Err(e) => return ToolResult::Error(format!("rust.setVisibility: {e}")),
+        };
         record_in_ledger(&self.0, "rust.setVisibility", &changes);
         let mut findings: Vec<Value> = Vec::new();
         for note in &plan.leftovers {
@@ -478,10 +494,7 @@ mod tests {
         std::fs::write(root.join("parent.rs"), "fn main() {}\n").unwrap();
         let cx = cx_in(&root);
         match RustModuleWiring(ledger())
-            .call(
-                json!({ "source": "parent.rs", "action": "bogus" }),
-                &cx,
-            )
+            .call(json!({ "source": "parent.rs", "action": "bogus" }), &cx)
             .await
         {
             ToolResult::Error(message) => {

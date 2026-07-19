@@ -8,7 +8,19 @@ use crate::server::BlackboxServer;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
+use rmcp::schemars;
 use rmcp::{tool, tool_router};
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CorpusSearchParams {
+    /// Search query.
+    query: String,
+    /// Maximum hits to return (default 10, max 100).
+    #[serde(default)]
+    limit: Option<usize>,
+}
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::transcripts_tools()
@@ -16,6 +28,47 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 
 #[tool_router(router = transcripts_tools)]
 impl BlackboxServer {
+    #[tool(
+        name = "bbox_corpus_search",
+        description = "Compatibility corpus lookup for harness capability projection. Returns ranked hits with stable id/text fields."
+    )]
+    pub(crate) async fn bbox_corpus_search(
+        &self,
+        Parameters(p): Parameters<CorpusSearchParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_corpus_search", move || {
+            let query = p.query.trim();
+            anyhow::ensure!(!query.is_empty(), "`query` is required");
+            if server.state.idx.read().is_empty() {
+                server
+                    .state
+                    .idx
+                    .write()
+                    .build_index(false)
+                    .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
+            }
+            let hits = server.state.idx.read().hybrid_bm25_hits(
+                query,
+                p.limit.unwrap_or(10).clamp(1, 100),
+                None,
+            )?;
+            Ok(serde_json::to_string(&json!({
+                "hits": hits
+                    .into_iter()
+                    .map(|hit| json!({
+                        "id": hit.entity_id,
+                        "text": match hit.title {
+                            Some(title) => format!("{title}\n{}", hit.excerpt),
+                            None => hit.excerpt,
+                        },
+                    }))
+                    .collect::<Vec<_>>(),
+            }))?)
+        })
+        .await
+    }
+
     #[tool(
         name = "bbox_search",
         description = "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax."

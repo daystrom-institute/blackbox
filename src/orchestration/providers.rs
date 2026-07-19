@@ -7,7 +7,7 @@
 //! `ProviderEvents` / `ProviderMcp` / `ProviderSession` traits (impl'd for
 //! `Provider` in the submodules), whose bodies reach daemon-internal types.
 //! Bring them all into scope with one glob via [`dispatch_prelude`]. See
-//! `design/bro-harness/harness-daemon-boundary.md` §2/§7 (contract bottom +
+//! `design/bro-harness/harness-process-boundary.md` (contract bottom +
 //! thin-client decoupling).
 
 mod events;

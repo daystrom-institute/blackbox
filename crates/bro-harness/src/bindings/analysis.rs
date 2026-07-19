@@ -317,8 +317,11 @@ impl Tool for AnalysisReferences {
         if params.symbols.is_empty() {
             return err("analysis.references: `symbols` must be non-empty");
         }
-        let is_rust =
-            params.language.as_deref().map(|l| l == "rust").unwrap_or(false);
+        let is_rust = params
+            .language
+            .as_deref()
+            .map(|l| l == "rust")
+            .unwrap_or(false);
         let root = cx.root.clone();
         bro_tools::tool::call_blocking(move || {
             let requested_symbols = params.symbols.clone();
@@ -738,25 +741,18 @@ impl Tool for AnalysisImplPartition {
             (Some(name), _) if !name.trim().is_empty() => name,
             (_, Some(name)) if !name.trim().is_empty() => name,
             _ => {
-                return err(
-                    "analysis.implPartition: `implName` (or `moduleName`) is required",
-                );
+                return err("analysis.implPartition: `implName` (or `moduleName`) is required");
             }
         };
         let root = cx.root.clone();
         bro_tools::tool::call_blocking(move || {
-            let source_path = match bro_tools::workspace::resolve_in_root(&root, &params.file)
-            {
+            let source_path = match bro_tools::workspace::resolve_in_root(&root, &params.file) {
                 Ok(path) => path,
                 Err(e) => {
-                    return err(format!(
-                        "analysis.implPartition: {}: {e}",
-                        params.file
-                    ));
+                    return err(format!("analysis.implPartition: {}: {e}", params.file));
                 }
             };
-            match bbox_refactor::rust_partition::analyze_impl(&source_path, &impl_name)
-            {
+            match bbox_refactor::rust_partition::analyze_impl(&source_path, &impl_name) {
                 Ok(graph) => ToolResult::Json(json!({
                     "file": params.file,
                     // relativize impl_name back to user's input form
@@ -836,14 +832,10 @@ impl Tool for AnalysisTopLevelDeps {
         };
         let root = cx.root.clone();
         bro_tools::tool::call_blocking(move || {
-            let source_path = match bro_tools::workspace::resolve_in_root(&root, &params.file)
-            {
+            let source_path = match bro_tools::workspace::resolve_in_root(&root, &params.file) {
                 Ok(path) => path,
                 Err(e) => {
-                    return err(format!(
-                        "analysis.topLevelDeps: {}: {e}",
-                        params.file
-                    ));
+                    return err(format!("analysis.topLevelDeps: {}: {e}", params.file));
                 }
             };
             let project_dir = params.project_dir.as_deref();
@@ -1973,7 +1965,10 @@ public class ClosureTest {
         );
         // Language filter: Java-only analysis refuses rust filter.
         let jrust = AnalysisDescribe
-            .call(json!({ "analysis": "cohesionClusters", "language": "rust" }), &cx)
+            .call(
+                json!({ "analysis": "cohesionClusters", "language": "rust" }),
+                &cx,
+            )
             .await;
         assert!(
             matches!(jrust, ToolResult::Error(ref e) if e.contains("Java-only")),
@@ -1993,7 +1988,10 @@ public class ClosureTest {
             "{ip}"
         );
         let ipj = AnalysisDescribe
-            .call(json!({ "analysis": "implPartition", "language": "java" }), &cx)
+            .call(
+                json!({ "analysis": "implPartition", "language": "java" }),
+                &cx,
+            )
             .await;
         assert!(
             matches!(ipj, ToolResult::Error(ref e) if e.contains("Rust-only")),
@@ -2076,7 +2074,11 @@ impl Server {
             .find(|m| m["name"].as_str() == Some("increment"))
             .expect("increment method exists");
         assert!(
-            inc["writes"].as_array().unwrap().iter().any(|w| w == "counter"),
+            inc["writes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w == "counter"),
             "increment should write counter: {inc}"
         );
 
@@ -2174,7 +2176,9 @@ pub async fn run(config: &Config) {
             .filter(|e| e["from"].as_str() == Some("init"))
             .collect();
         assert!(
-            init_edges.iter().any(|e| e["to"].as_str() == Some("helper") && e["kind"].as_str() == Some("calls")),
+            init_edges
+                .iter()
+                .any(|e| e["to"].as_str() == Some("helper") && e["kind"].as_str() == Some("calls")),
             "init should call helper: {init_edges:?}"
         );
 
@@ -2258,9 +2262,7 @@ fn test_hello() { let s = hello(); }
         assert!(out["production_sites"].as_u64().unwrap_or(0) > 0);
         assert!(out["test_sites"].as_u64().unwrap_or(0) > 0);
         // examples should carry rust usage kinds
-        let hello_examples = out["examples_by_symbol"]["hello"]
-            .as_array()
-            .unwrap();
+        let hello_examples = out["examples_by_symbol"]["hello"].as_array().unwrap();
         assert!(
             hello_examples
                 .iter()
@@ -2275,11 +2277,15 @@ fn test_hello() { let s = hello(); }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/Test.java"), r#"public class Test {
+        std::fs::write(
+            root.join("src/Test.java"),
+            r#"public class Test {
     public void hello() {}
     public void world() { hello(); }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let cx = cx_in(&root);
 
         let out = json_of(

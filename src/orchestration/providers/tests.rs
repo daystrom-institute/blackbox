@@ -61,7 +61,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(glm.contains(&r#"{"type":"object"}"#.to_string()));
     assert!(
         !glm.contains(&"--mcp-config".to_string()),
-        "in-process harness providers get typed MCP config, not CLI JSON"
+        "standalone harness providers receive MCP config through the child launch path"
     );
 
     let deepseek_opts = ExecOpts {
@@ -86,7 +86,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(deepseek.contains(&SERVICE_TIER_DEFAULT.to_string()));
     assert!(
         !deepseek.contains(&"--mcp-config".to_string()),
-        "in-process resume also avoids CLI MCP config"
+        "resume receives daemon MCP config at child launch, not provider arg construction"
     );
 
     let minimax_opts = ExecOpts {

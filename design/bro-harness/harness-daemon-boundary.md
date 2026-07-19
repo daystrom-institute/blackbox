@@ -1,7 +1,8 @@
 ---
-title: "The harness–daemon boundary: in-process consolidation"
+title: "The harness-daemon boundary: in-process consolidation"
 kind: design
-lifecycle: partial
+lifecycle: superseded
+superseded_by: "harness-process-boundary.md - provider and V8 execution moved into one standalone harness child per dispatch"
 corpus: blackbox-design
 topic:
   - bro-harness
@@ -10,7 +11,12 @@ topic:
   - fleet-tui
 ---
 
-# The harness–daemon boundary: in-process consolidation
+# The harness-daemon boundary: in-process consolidation
+
+> **Superseded.** This document records the retired in-process consolidation
+> design. The current authority is
+> [harness-process-boundary.md](harness-process-boundary.md). Historical
+> implementation ledgers below are retained as evidence, not current guidance.
 
 > **Status.** This was the synthesis of a design jam; it is now **partially
 > implemented** on `beta/blackbox-v2`. The *direction* (API-native

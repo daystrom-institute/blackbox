@@ -1989,7 +1989,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_steer",
-        description = "Queue a user steer into a running in-process bro task without cancelling the active turn."
+        description = "Queue a user steer into a running bro-harness process without cancelling the active turn."
     )]
     pub(crate) fn bro_steer(&self, Parameters(p): Parameters<SteerParams>) -> CallToolResult {
         let task = match self.state.task_store.read().get(&p.task_id) {
@@ -2016,7 +2016,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_interrupt",
-        description = "Interrupt a running in-process bro task; optionally queue redirect text to run after interruption repair."
+        description = "Interrupt a running bro-harness process; optionally queue redirect text to run after interruption repair."
     )]
     pub(crate) fn bro_interrupt(
         &self,

@@ -344,10 +344,7 @@ fn parse_cargo_json_diagnostics(output: &str) -> Vec<BuildDiagnostic> {
         let Some(msg) = val.get("message") else {
             continue;
         };
-        let level = msg
-            .get("level")
-            .and_then(|v| v.as_str())
-            .unwrap_or("error");
+        let level = msg.get("level").and_then(|v| v.as_str()).unwrap_or("error");
         let severity = match level {
             "warning" => DiagnosticSeverity::Warning,
             // rustc emits `error`, `ice`, `failure-note`; treat anything not
@@ -439,8 +436,7 @@ fn mine_suggestions(spans: &[Value], out: &mut Vec<BuildSuggestion>) {
         let Some(file) = span.get("file_name").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Some(replacement) = span.get("suggested_replacement").and_then(|v| v.as_str())
-        else {
+        let Some(replacement) = span.get("suggested_replacement").and_then(|v| v.as_str()) else {
             continue;
         };
         let byte_start = span
@@ -644,7 +640,9 @@ fn command_emits_cargo_json(command_lower: &str) -> bool {
     if !mentions_cargo {
         return false;
     }
-    command_lower.contains("--message-format=json") || command_lower.contains("--message-format compact") || command_lower.contains("--error-format=json")
+    command_lower.contains("--message-format=json")
+        || command_lower.contains("--message-format compact")
+        || command_lower.contains("--error-format=json")
 }
 
 // Sync fs read is sanctioned here: anchor_diagnostics only runs inside the
@@ -659,7 +657,7 @@ fn anchor_diagnostics(root: &Path, cwd: &Path, diagnostics: &mut [BuildDiagnosti
     let mut cache: BTreeMap<PathBuf, Option<(String, Vec<u8>)>> = BTreeMap::new();
 
     let file_sha_bytes = |cache: &mut BTreeMap<PathBuf, Option<(String, Vec<u8>)>>,
-                              resolved: &Path| {
+                          resolved: &Path| {
         if let Some(entry) = cache.get(resolved) {
             return entry.clone();
         }
@@ -984,13 +982,8 @@ BUILD FAILED in 1s
             compiler_message_json("warning", Some("unused_variables"), "unused variable"),
             serde_json::json!({"reason":"build-finished","success":false}).to_string()
         );
-        let parsed = parse_build_output(
-            "cargo check --message-format=json",
-            &output,
-            1,
-            false,
-            100,
-        );
+        let parsed =
+            parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
         assert_eq!(parsed.tool, BuildTool::Cargo);
         assert_eq!(parsed.counts.errors, 2);
         assert_eq!(parsed.counts.warnings, 1);
@@ -1007,7 +1000,8 @@ BUILD FAILED in 1s
     #[test]
     fn build_gate_cargo_json_mines_machine_applicable_suggestions() {
         let output = e0308_with_machine_applicable_suggestion("src/lib.rs");
-        let parsed = parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
+        let parsed =
+            parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
         assert_eq!(parsed.tool, BuildTool::Cargo);
         assert_eq!(parsed.diagnostics.len(), 1);
         let diag = &parsed.diagnostics[0];
@@ -1031,7 +1025,8 @@ BUILD FAILED in 1s
         let output = format!(
             r#"{{"reason":"compiler-message","message":{{"level":"error","code":{{"code":"E0308"}},"message":"x","spans":[{{"file_name":"a.rs","byte_start":0,"byte_end":1,"is_primary":true,"suggested_replacement":"y","suggestion_applicability":"Unspecified"}}],"children":[{{"spans":[{{"file_name":"a.rs","byte_start":5,"byte_end":6,"suggested_replacement":"z","suggestion_applicability":"MaybeIncorrect"}}]}}]}}}}"#
         );
-        let parsed = parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
+        let parsed =
+            parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
         let diag = &parsed.diagnostics[0];
         assert_eq!(diag.suggestions.len(), 1);
         assert_eq!(diag.suggestions[0].applicability, "MaybeIncorrect");
@@ -1093,13 +1088,8 @@ BUILD FAILED in 1s
         let output = format!(
             r#"{{"reason":"compiler-message","message":{{"level":"error","code":{{"code":"E0308"}},"message":"mismatched types","spans":[{{"file_name":"{file}","byte_start":21,"byte_end":27,"line_start":1,"column_start":22,"is_primary":true}}],"children":[{{"spans":[{{"file_name":"{file}","byte_start":21,"byte_end":27,"suggested_replacement":"0","suggestion_applicability":"MachineApplicable"}}]}}]}}}}"#
         );
-        let mut parsed = parse_build_output(
-            "cargo check --message-format=json",
-            &output,
-            1,
-            false,
-            100,
-        );
+        let mut parsed =
+            parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
         anchor_diagnostics(&root, &root, &mut parsed.diagnostics);
 
         let diag = &parsed.diagnostics[0];
@@ -1131,13 +1121,8 @@ BUILD FAILED in 1s
         let output = format!(
             r#"{{"reason":"compiler-message","message":{{"level":"error","code":{{"code":"E0308"}},"message":"x","spans":[{{"file_name":"/external/a.rs","byte_start":0,"byte_end":1,"is_primary":true}}],"children":[{{"spans":[{{"file_name":"/external/a.rs","byte_start":0,"byte_end":1,"suggested_replacement":"y","suggestion_applicability":"MachineApplicable"}}]}}]}}}}"#
         );
-        let mut parsed = parse_build_output(
-            "cargo check --message-format=json",
-            &output,
-            1,
-            false,
-            100,
-        );
+        let mut parsed =
+            parse_build_output("cargo check --message-format=json", &output, 1, false, 100);
         anchor_diagnostics(&root, &root, &mut parsed.diagnostics);
         let diag = &parsed.diagnostics[0];
         assert!(diag.span.is_none());

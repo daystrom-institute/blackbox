@@ -97,6 +97,15 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Harness-backed providers now execute in one standalone `bro-harness` child
+  per dispatch instead of linking provider transports, code-mode, and V8 into
+  `blackboxd`. User/control input uses stdin NDJSON, the existing event envelope
+  uses stdout, session logs remain under the task `BRO_HOME`, and daemon tools
+  arrive through the complete server-filtered MCP catalog. The compatibility
+  flat tools `corpus_search` and `atom_invoke` alias daemon MCP methods without
+  hiding their qualified forms. The standalone `isolate` binary continues to
+  run V8 cells without the daemon.
+
 - The whiteboard example (`examples/whiteboard/`) and the docs ADR example
   (`docs/whiteboards.md`) now demonstrate genuine multi-round deliberation
   instead of a single "annotate + vote" pass: an evidence round in the

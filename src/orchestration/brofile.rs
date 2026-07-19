@@ -35,10 +35,10 @@ pub struct Brofile {
     /// Optional tool-surface selector. When set, the daemon evaluates the
     /// installed surface packet for this surface (the same `evaluate_tool_surface`
     /// authority the rmcp wire head uses for `?surface=<id>` callers) and folds
-    /// the verdict into the dispatch filter plane, so an in-process session is
+    /// the verdict into the dispatch filter plane, so a child session is
     /// surface-governed exactly like a wire caller. Unset → no surface fold
     /// (recursion-guard + `filters` still apply). See
-    /// design/bro-harness/harness-daemon-boundary.md §6.
+    /// design/bro-harness/harness-process-boundary.md §3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
     /// When true, inject the workspace-tools appendix into every dispatch

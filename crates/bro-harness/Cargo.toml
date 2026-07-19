@@ -3,9 +3,9 @@ name = "bro-harness"
 version = "0.0.1"
 edition = "2024"
 
-# The bro-harness headless coding agent. It can run as a daemon-spawned
-# subprocess or, in later slices, as a linked library while preserving the same
-# stdout stream envelope. See design/orchestration/anthropic-harness.md.
+# The standalone bro-harness headless coding agent. The daemon spawns this
+# binary and communicates over stdin/stdout plus MCP; it never links this
+# library. See design/bro-harness/harness-process-boundary.md.
 
 [[bin]]
 name = "bro-harness"

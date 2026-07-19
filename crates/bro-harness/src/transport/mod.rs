@@ -33,18 +33,17 @@ use std::sync::Arc;
 
 tokio::task_local! {
     /// Per-session identity environment (auth token, base URL, account home,
-    /// transport kind, model). Bound by an in-process host around each session
-    /// future via [`with_session_env`]; the standalone binary never binds it.
+    /// transport kind, model). Available to library embedders and tests through
+    /// [`with_session_env`]; the standalone binary never binds it.
     static SESSION_ENV: Arc<BTreeMap<String, String>>;
 }
 
-/// Run `fut` with per-session identity env bound (harness-daemon-boundary.md §3).
+/// Run `fut` with per-session identity env bound (harness-process-boundary.md §2).
 ///
-/// This is how an in-process host (the daemon) passes per-session credentials as
-/// *explicit config* instead of mutating process-global env: the values live in
-/// a task-local scoped to the session's task, never in `std::env`. Concurrent
-/// sessions therefore cannot collide (no lock needed), and credentials never
-/// leak into the process env that shell-tool child processes inherit.
+/// This compatibility seam is for library embedders and tests, not the daemon.
+/// `blackboxd` passes credentials into the isolated harness child environment.
+/// Task-local values remain useful to embedders that host multiple sessions in
+/// one process and must keep their identities separate.
 pub async fn with_session_env<F>(vars: BTreeMap<String, String>, fut: F) -> F::Output
 where
     F: std::future::Future,
@@ -642,7 +641,7 @@ mod session_env_tests {
 
     /// session_var prefers the per-session task-local over process env, falls
     /// back to env when a key isn't scoped, and outside any scope reads env
-    /// directly — the standalone-binary path (harness-daemon-boundary.md §3).
+    /// directly in the standalone binary (harness-process-boundary.md §2).
     #[tokio::test]
     async fn session_var_prefers_task_local_then_env() {
         // Unique keys so this never collides with another parallel test.

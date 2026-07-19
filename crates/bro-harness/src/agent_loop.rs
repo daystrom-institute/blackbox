@@ -3,14 +3,16 @@
 //! Two entry modes, both built on one [`Session`]:
 //!
 //! - **One-shot** (default): resolve a single prompt, run one user turn to
-//!   completion, emit `result`, persist, exit. This is how the daemon dispatches
-//!   today.
+//!   completion, emit `result`, persist, exit.
 //! - **Bidirectional** (`--input-format stream-json`): keep a persistent session
 //!   alive, reading successive user-turn messages and `control_request`s
 //!   (interrupt, set_model, …) from stdin as NDJSON, and `/compact` as an
 //!   in-stream slash command. This is the fleet-cockpit control plane
 //!   (design/fleet-tui/fleet-tui.md §2). Wire shapes follow the Claude Agent
 //!   SDK control protocol (hyperclaude SDK_PROTOCOL.md / NDJSON_FORMAT.md).
+//! - **Daemon child** (`--input-format stream-json --exit-when-idle`): wait for
+//!   the daemon's first stdin turn, drain that turn and buffered controls, then
+//!   persist and exit. blackboxd uses one such child per dispatch.
 //!
 //! The transport handles all wire differences; the loop and the stdout envelope
 //! are identical across providers.
@@ -103,6 +105,16 @@ impl Tool for FinalResultTool {
 
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
+    if cli.daemon_worker {
+        let scrub = std::env::var("BRO_HARNESS_SPAWN_SCRUB")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .collect();
+        return bro_tools::shell::with_spawn_scrub(scrub, run_with_emitter(cli, None, None)).await;
+    }
     run_with_emitter(cli, None, None).await
 }
 
@@ -204,6 +216,7 @@ async fn run_session(
     additional_context: Option<BTreeMap<String, String>>,
 ) -> Result<()> {
     let replay = cli.replay_user_messages;
+    let exit_when_idle = cli.exit_when_idle;
     let mut session =
         Session::build(&cli, callback.clone(), mcp_config, additional_context, None).await?;
     session.emitter.system_init_session();
@@ -212,7 +225,7 @@ async fn run_session(
     // The stdin reader runs as its own task so control messages (interrupt)
     // arrive while a turn is in flight. It owns a clone of the emitter purely to
     // honour `--replay-user-messages`.
-    let input_rx = spawn_stdin_reader(
+    let mut input_rx = spawn_stdin_reader(
         replay,
         make_emitter(sid.clone(), callback.clone(), Some(session.event_log())),
     );
@@ -227,7 +240,13 @@ async fn run_session(
         pending.push_back(p);
     }
 
-    session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    if exit_when_idle {
+        await_first_controlled_input(&mut session, &mut input_rx, &ctrl_emitter, &mut pending)
+            .await;
+        session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    } else {
+        session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    }
     let body = session.persist_body()?;
     let path = session.store_path().to_path_buf();
     tokio::task::spawn_blocking(move || crate::session::write_atomic(&path, &body))
@@ -483,6 +502,31 @@ async fn session_loop_until_idle(
     Ok(())
 }
 
+/// Child mode sends the initial prompt over stdin instead of argv. Wait for
+/// that first message before switching to non-blocking idle draining, otherwise
+/// process startup can outrun the stdin reader and exit without a turn.
+async fn await_first_controlled_input(
+    session: &mut Session,
+    input_rx: &mut mpsc::UnboundedReceiver<Input>,
+    ctrl_emitter: &Emitter,
+    pending: &mut VecDeque<String>,
+) {
+    while pending.is_empty() {
+        match input_rx.recv().await {
+            Some(Input::User(prompt)) => pending.push_back(prompt),
+            Some(Input::Control {
+                subtype,
+                req_id,
+                raw,
+            }) => {
+                session.apply_control(&subtype, &raw);
+                ctrl_emitter.control_response_success(req_id.as_deref());
+            }
+            None => break,
+        }
+    }
+}
+
 async fn run_prompt_with_controls(
     session: &mut Session,
     input_rx: &mut mpsc::UnboundedReceiver<Input>,
@@ -628,10 +672,9 @@ struct Session {
 
 /// Whether this session may request the provider's server-side `web_search`
 /// tool (`BRO_HARNESS_WEB_SEARCH`, absent ⇒ enabled). Resolved through the
-/// per-session env (`transport::session_var`) — NOT raw process env — so an
-/// in-process host's per-dispatch `env_overrides` can disable it lane-by-lane
-/// (e.g. the daemon's glm lane defaults it off); the standalone binary still
-/// honors the operator's shell env via the `session_var` fallback.
+/// session resolver so library embedders can provide a task-local override.
+/// Daemon-launched workers receive the per-dispatch value in their own process
+/// environment; a directly launched binary reads the operator's shell env.
 fn web_search_enabled() -> bool {
     transport::session_var("BRO_HARNESS_WEB_SEARCH")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
@@ -667,7 +710,7 @@ impl Session {
         // dispatch cwd, passed instead of mutating the process cwd) or the
         // process cwd for the standalone binary. All file/shell tools and
         // project-doc discovery resolve against this root, so concurrent
-        // in-process sessions never collide (harness-daemon-boundary.md §3).
+        // child sessions never collide (harness-process-boundary.md §2).
         let root = match cli.cwd.as_deref() {
             Some(c) => std::fs::canonicalize(c).unwrap_or_else(|_| std::path::PathBuf::from(c)),
             None => std::env::current_dir().context("cwd")?,
@@ -797,11 +840,21 @@ impl Session {
         ))));
         let (mcp_tools, tool_placement) = match injected_mcp {
             Some(config) => {
-                let tools = mcp::load_mcp_tools_from_config(&config, &tool_filter).await;
+                let tools = mcp::load_mcp_tools_from_config_with_capability_aliases(
+                    &config,
+                    &tool_filter,
+                    cli.capability_mcp_server.as_deref(),
+                )
+                .await;
                 (tools, config.tool_placement)
             }
             None => {
-                let tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
+                let tools = mcp::load_mcp_tools_with_capability_aliases(
+                    cli.mcp_config.as_deref(),
+                    &tool_filter,
+                    cli.capability_mcp_server.as_deref(),
+                )
+                .await;
                 let placement = mcp::parse_tool_placement(cli.mcp_config.as_deref());
                 (tools, placement)
             }
@@ -816,16 +869,10 @@ impl Session {
             .chain(mcp_out_box.iter())
             .cloned()
             .collect();
-        // In-process capability bindings (harness-daemon-boundary.md §6): when the
-        // daemon has installed corpus/atom impls, expose them as direct
-        // trait-dispatch tools (corpus_search, atom_invoke, KV
-        // inspection). Empty (no-op) for the standalone binary, so those surfaces
-        // fail closed by absence. Registered as builtins so the surface ToolFilter
-        // still gates them. The authorial surface is now code-mode (below).
-        builtins.extend(crate::capabilities::capability_tools());
         // Code-mode (exec/wait) supersedes NARF as the authorial surface. The
-        // callable set mirrors the flat surface — filtered builtins + capability
-        // tools + all MCP — and a ToolCapability seam over that same set
+        // callable set mirrors the flat surface: filtered builtins plus all MCP
+        // (including daemon capability aliases), with a ToolCapability seam
+        // over that same set
         // dispatches a cell's nested tools.* (deny-filter honored; exec/wait are
         // excluded from the projected namespace so a cell cannot relaunch the box).
         // Resolved code-mode: explicit --code-mode wins; on resume fall back to
@@ -921,10 +968,9 @@ impl Session {
         let tool_result_cap = crate::bound::cap_bytes();
         let dump_dir = crate::bound::dump_dir();
 
-        // Timestamp the session boundary in the sidecar log. `provider` is the
-        // daemon's dispatch provider when riding in-process
-        // (`BRO_HARNESS_PROVIDER` in the per-session env); absent for the
-        // standalone binary, where the transcript adapter falls back to
+        // Timestamp the session boundary in the sidecar log. Daemon-launched
+        // workers receive the dispatch provider through
+        // `BRO_HARNESS_PROVIDER`; direct launches fall back to
         // transport+model inference.
         event_log.append_milestone(
             if restored_snapshot {
@@ -1943,7 +1989,7 @@ fn load_tool_arg_defaults(
         .context("parse tool arg default table")
 }
 
-/// Host-supplied shell env overlay: explicit in-process map > `--shell-env`
+/// Host-supplied shell env overlay: explicit library-call map > `--shell-env`
 /// JSON > `BRO_HARNESS_SHELL_ENV`. Same precedence ladder as the tool-arg
 /// default table; values are plain env pairs, no grammar.
 fn load_shell_env(
@@ -2278,10 +2324,9 @@ mod tests {
         assert!(names.contains("shell_list"));
     }
 
-    /// Session env (the in-process daemon's per-dispatch `env_overrides`) must
-    /// beat process env for BRO_HARNESS_WEB_SEARCH, and the standalone-binary
-    /// path (no session scope) still reads process env — mirrors the
-    /// `session_var` contract exercised in `transport::session_env_tests`.
+    /// An embedded caller's session env must beat process env for
+    /// BRO_HARNESS_WEB_SEARCH, while the standalone-binary path still reads
+    /// process env. Daemon workers use the latter in their isolated child env.
     #[tokio::test]
     async fn web_search_flag_prefers_session_env_over_process_env() {
         // SAFETY: this key is read/written only by this test (the other
@@ -3423,6 +3468,37 @@ mod tests {
             &["alpha".to_string(), "beta".to_string()]
         );
         assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn exit_when_idle_waits_for_delayed_first_stdin_turn() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            tx.send(Input::User("delayed prompt".into())).unwrap();
+        });
+        let ctrl = Emitter::new("ctrl".into());
+        let mut pending = VecDeque::new();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            await_first_controlled_input(&mut session, &mut rx, &ctrl, &mut pending),
+        )
+        .await
+        .expect("worker must wait for the daemon's first stdin message");
+        writer.await.unwrap();
+        assert_eq!(pending.front().map(String::as_str), Some("delayed prompt"));
+
+        session_loop_until_idle(&mut session, rx, &ctrl, pending)
+            .await
+            .unwrap();
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(
+            user_turns_after_initial_context(&users),
+            &["delayed prompt".to_string()]
+        );
+        assert_eq!(shared.completed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

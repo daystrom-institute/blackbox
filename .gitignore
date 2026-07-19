@@ -10,6 +10,8 @@
 /package-lock.json
 __pycache__/
 *.pyc
+# macOS AppleDouble metadata appears on NFS-backed lane worktrees.
+._*
 /daystrom/
 /.env
 /.env.bro-slack-dev

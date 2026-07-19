@@ -99,8 +99,9 @@ Targeted recipes:
 - Render or knowledge changes: run render/knowledge tests and inspect generated
   markdown diffs. Do not hand-edit generated provider memory regions.
 - Refactor machinery (harness bindings and the `bbox-refactor` library):
-  `cargo nextest run -p bbox-refactor -p bro-harness`; for LSP-backed paths
-  also validate the language server availability/failure mode.
+  `cargo nextest run --workspace -E 'package(bbox-refactor) |
+  package(bro-harness)'`; for LSP-backed paths also validate the language
+  server availability/failure mode.
 - Workflow, webhook, poller, cron, or system-event routing: run the targeted
   unit tests and exercise the relevant HTTP/tool path when behavior is runtime
   shaped.
@@ -238,25 +239,19 @@ routing facts:
   models run only via the interactive harness's native agents, never the bro
   plane. Note the glm lane's Z.AI endpoint maps claude-* model names to GLM
   models server-side, so claude-* pins on glm brofiles do not run Claude.
-- GLM, DeepSeek, MiniMax, Kimi, Brodex, and VibeBh (all of `Provider::ALL`) dispatch
-  through `bro-harness` (the custom
-  provider harness, `crates/bro-harness`): GLM/DeepSeek/MiniMax/Kimi on the Anthropic
-  transport, Brodex on the OpenAI Responses transport (Codex/ChatGPT
-  backend), VibeBh (Mistral) on the OpenAI chat-completions transport. The daemon links `bro-harness` as a **library crate** (`Cargo.toml`)
-  and runs these providers **in-process** — `spawn_task_with_tool_placement`
-  routes every harness provider to `spawn_harness_in_process_task`
-  (`orchestration/mod.rs`), which calls
-  `bro_harness::agent_loop::run_with_event_callback_and_input_mcp` directly. It is
-  **not** spawned as a `bro-harness` subprocess; the Claude stream-json envelope
-  is still the event shape, but it is delivered via an in-process `EventCallback`,
-  not a child process's stdout. Transport + credentials are selected via env in
-  `brofile::resolve_provider_env`. The legacy subprocess path
-  (`exec_args::bin_with_env` / `BRO_HARNESS_BIN` / `bro-harness` on PATH) is
-  **not** the execution mechanism for these providers; the on-PATH binary is now
-  consulted only by the allocator's availability gate
-  (`provider_binary_missing`, `allocator.rs`) and legacy MCP-CLI management. See
-  `design/bro-harness/anthropic-harness.md` and
-  `design/bro-harness/harness-daemon-boundary.md`.
+- GLM, DeepSeek, MiniMax, Kimi, Brodex, and VibeBh (all of `Provider::ALL`)
+  dispatch through the standalone `bro-harness` binary
+  (`crates/bro-harness`): GLM/DeepSeek/MiniMax/Kimi on the Anthropic transport,
+  Brodex on OpenAI Responses (Codex/ChatGPT backend), and VibeBh (Mistral) on
+  OpenAI chat completions. `blackboxd` does not link `bro-harness`,
+  `bro-code-mode`, or V8. It spawns one harness child per dispatch, sends
+  user/control messages over stdin NDJSON, ingests the Claude-compatible event
+  envelope from stdout, and projects daemon capabilities through the
+  server-filtered MCP endpoint. Transport credentials are selected via
+  per-child env in `brofile::resolve_provider_env`; shell grandchildren scrub
+  those credentials. `BRO_HARNESS_BIN` selects the executable and remains part
+  of the allocator availability gate. See
+  `design/bro-harness/harness-process-boundary.md`.
 - `codex` is a serde alias for Brodex (bro-harness/Responses); there is no
   separate codex CLI path. The Copilot, Vibe-CLI, and Gemini provider lanes
   are removed entirely.

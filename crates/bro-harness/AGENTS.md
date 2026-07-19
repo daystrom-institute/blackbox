@@ -1,7 +1,7 @@
 # bro-harness — the custom headless coding agent
 
 Invariants for the harness slice. Deep design lives in `design/bro-harness/`;
-the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
+the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`.
 
 ## The session event log is a product surface, not a debug artifact
 
@@ -66,12 +66,18 @@ the daemon boundary contract is `design/bro-harness/harness-daemon-boundary.md`.
 
 ## Boundary invariants (compiler-enforced; don't negotiate)
 
-- bro-harness never depends on `blackbox`. Daemon capabilities arrive only
-  through `bro-capabilities` traits and fail closed when absent.
-- The daemon runs harness providers IN-PROCESS (library link, event callback
-  delivery). The `bro-harness` binary on PATH is only the allocator's
-  availability probe — changing subprocess arg shapes does not change daemon
-  dispatch, and vice versa.
+- bro-harness never depends on `blackbox`, and `blackbox` never links
+  `bro-harness`. The daemon spawns one standalone harness process per dispatch.
+  Cargo must keep `bro-harness`, `bro-code-mode`, and V8 out of the daemon's
+  runtime dependency graph.
+- stdin NDJSON is the session control plane; stdout NDJSON is the event plane.
+  The daemon injects its complete server-filtered MCP catalog over HTTP.
+  `bbox_corpus_search` and `atom_invoke` also project to the compatibility flat
+  names `corpus_search` and `atom_invoke`; the qualified MCP tools remain
+  present. A missing capability server fails closed by tool absence.
+- Provider credentials stay in the harness child. Shell children receive only
+  the dedicated non-secret shell env and scrub the daemon/session keys named
+  by `BRO_HARNESS_SPAWN_SCRUB`.
 - Tests must not touch real `$HOME`/`$BRO_HOME` state: `EventLog::disabled()`
   / explicit paths exist for exactly this; the sessions dir resolves from
   `BRO_HOME`, so a leaked env var writes into the operator's real session
@@ -103,3 +109,6 @@ tool/runtime contract, not its own JS embedding. Cell mode must go through
 `code_mode_tools` + `HostTools`, so repeated `--cell` / `--cell-file` inputs in
 one process share the code-mode session KV/function store and nested `tools.*`
 / namespace calls honor the same callable surface as harness consumers.
+The daemon does not host V8: provider sessions run it inside their harness
+child, while the `isolate` binary remains independently executable for direct
+validation.

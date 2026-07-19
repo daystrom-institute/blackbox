@@ -1,7 +1,8 @@
 [workspace]
-# The root `blackbox` package is implicitly a member; these are the
-# bro-harness crates. The contract-bottom crates are dependency-only schema/
-# trait crates; implementation crates point down at them, never sideways.
+# The root `blackbox` package is implicitly a member. The contract-bottom
+# crates are dependency-only schema/trait crates; implementation crates point
+# down at them, never sideways. Workspace membership does not imply that the
+# daemon links the standalone bro-harness process.
 members = [
     "crates/bro-core",
     "crates/bro-protocol",
@@ -94,12 +95,9 @@ bbox-packets = { path = "crates/bbox-packets" }
 bbox-system-memory = { path = "crates/bbox-system-memory" }
 bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
-bro-capabilities = { path = "crates/bro-capabilities" }
 bro-transcript = { path = "crates/bro-transcript" }
-bro-harness = { path = "crates/bro-harness" }
 bro-fleet-client = { path = "crates/bro-fleet-client" }
-# Direct dep for the in-process session's child-process env scrub
-# (bro_tools::with_spawn_scrub); shell tools live here.
+# Fleet closeout and daemon-owned tool paths share bro-tools primitives.
 bro-tools = { path = "crates/bro-tools" }
 
 # Fast non-poisoning locks

@@ -69,10 +69,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         th_path.clone(),
         rm_path.clone(),
     )?;
-    // Index in-process harness session event logs (sidecar JSONL next to the
-    // resume snapshots) so harness sessions are searchable like any other
-    // provider transcript. Same dir the BRO_HOME export below points the
-    // in-process harness at.
+    // Index harness session event logs (sidecar JSONL next to the resume
+    // snapshots) so harness sessions are searchable like any other provider
+    // transcript. Each child receives this same root as BRO_HOME.
     idx.set_harness_sessions_dir(cfg.paths.bro_home.join("harness-sessions"));
     // Interactive Gemini chats (claude/codex roots already travel inside
     // ReindexConfig; gemini's tmp root is resolved here, same explicit-only
@@ -216,9 +215,9 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     backfill_artifact_hashes(&artifacts_store);
 
     let store_dir = cfg.paths.bro_home.clone();
-    // Export BRO_HOME so that the in-process bro-harness library sees the
-    // correct sessions dir. Must run during single-threaded startup before any
-    // dispatch task could spawn.
+    // Keep daemon-side transcript discovery on the configured harness-session
+    // root. Each standalone harness child also receives this path explicitly
+    // in its own environment at spawn.
     if std::env::var("BRO_HOME").is_err() {
         unsafe {
             std::env::set_var("BRO_HOME", store_dir.to_string_lossy().as_ref());
@@ -345,7 +344,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     orchestration::init_task_persister(shared.task_store.clone(), shared.store_dir.clone());
 
     // Cold-start roster rebuild: tasks restored from `tasks.json` need to
-    // appear in `/control/roster` immediately, before any in-process delta
+    // appear in `/control/roster` immediately, before any child-process delta
     // arrives. Walk the loaded store once and seed the view. Cheap O(N) over
     // the task store and runs before routes bind, so the first poll sees
     // the full set.

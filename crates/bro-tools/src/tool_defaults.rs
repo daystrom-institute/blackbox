@@ -423,7 +423,10 @@ mod tests {
         // Pins are enforcement, not grants: a pinned value must never read
         // as operator authority for an RX-V1 flag.
         let defaults = table(&[("pin:rust.moveStructFields.acknowledge_repr", "true")]);
-        assert_eq!(defaults.lookup("rust.moveStructFields", "acknowledge_repr"), None);
+        assert_eq!(
+            defaults.lookup("rust.moveStructFields", "acknowledge_repr"),
+            None
+        );
     }
 
     #[test]

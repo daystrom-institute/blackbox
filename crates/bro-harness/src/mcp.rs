@@ -164,6 +164,14 @@ pub trait McpSurface: Send + Sync {
 /// are dropped here so they never enter the registry — not listed to the model,
 /// not loadable via tool_search, not dispatchable.
 pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Vec<Arc<dyn Tool>> {
+    load_mcp_tools_with_capability_aliases(mcp_config, filter, None).await
+}
+
+pub async fn load_mcp_tools_with_capability_aliases(
+    mcp_config: Option<&str>,
+    filter: &ToolFilter,
+    capability_server: Option<&str>,
+) -> Vec<Arc<dyn Tool>> {
     let Some(cfg) = mcp_config else {
         return Vec::new();
     };
@@ -174,12 +182,20 @@ pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Ve
             return Vec::new();
         }
     };
-    load_mcp_tools_from_config(&config, filter).await
+    load_mcp_tools_from_config_with_capability_aliases(&config, filter, capability_server).await
 }
 
 pub async fn load_mcp_tools_from_config(
     config: &McpConfig,
     filter: &ToolFilter,
+) -> Vec<Arc<dyn Tool>> {
+    load_mcp_tools_from_config_with_capability_aliases(config, filter, None).await
+}
+
+pub async fn load_mcp_tools_from_config_with_capability_aliases(
+    config: &McpConfig,
+    filter: &ToolFilter,
+    capability_server: Option<&str>,
 ) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for server in &config.servers {
@@ -189,6 +205,20 @@ pub async fn load_mcp_tools_from_config(
                 let mut admitted = 0;
                 for (call_name, description, schema) in specs {
                     let qname = format!("mcp__{}__{}", server.name(), call_name);
+                    if capability_server == Some(server.name())
+                        && !server.excludes(&call_name, &qname)
+                        && let Some(alias) = capability_alias(&call_name)
+                        && !filter.denied(&qname)
+                        && filter.permits(alias)
+                    {
+                        tools.push(Arc::new(McpTool {
+                            backend: backend.clone(),
+                            call_name: call_name.clone(),
+                            name: alias.to_string(),
+                            description: description.clone(),
+                            schema: schema.clone(),
+                        }));
+                    }
                     if !server.excludes(&call_name, &qname) && filter.permits(&qname) {
                         admitted += 1;
                         tools.push(Arc::new(McpTool {
@@ -211,6 +241,14 @@ pub async fn load_mcp_tools_from_config(
         }
     }
     tools
+}
+
+fn capability_alias(call_name: &str) -> Option<&'static str> {
+    match call_name {
+        "bbox_corpus_search" => Some("corpus_search"),
+        "atom_invoke" => Some("atom_invoke"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -796,5 +834,88 @@ mod tests {
         let out_names: Vec<_> = out_box.iter().map(|t| t.name()).collect();
         assert_eq!(in_names, vec!["mcp__sdk__placed"]);
         assert_eq!(out_names, vec!["mcp__sdk__default_out"]);
+    }
+
+    struct CapabilitySurface;
+
+    #[async_trait]
+    impl McpSurface for CapabilitySurface {
+        async fn list_tools(&self) -> anyhow::Result<Vec<McpToolSpec>> {
+            Ok(vec![
+                McpToolSpec {
+                    name: "bbox_corpus_search".to_string(),
+                    description: "corpus".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                McpToolSpec {
+                    name: "atom_invoke".to_string(),
+                    description: "atom".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                McpToolSpec {
+                    name: "bbox_search".to_string(),
+                    description: "full catalog member".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ])
+        }
+
+        async fn call_tool(&self, tool: &str, _input: Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::Text(tool.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_aliases_preserve_flat_names_and_complete_qualified_catalog() {
+        let config = McpConfig {
+            servers: vec![McpServerConfig::InProcess {
+                name: "blackbox".to_string(),
+                server: Arc::new(CapabilitySurface),
+            }],
+            tool_placement: ToolPlacementMap::new(),
+        };
+
+        let tools = load_mcp_tools_from_config_with_capability_aliases(
+            &config,
+            &ToolFilter::default(),
+            Some("blackbox"),
+        )
+        .await;
+        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "corpus_search",
+                "mcp__blackbox__bbox_corpus_search",
+                "atom_invoke",
+                "mcp__blackbox__atom_invoke",
+                "mcp__blackbox__bbox_search",
+            ]
+        );
+
+        let flat_only = load_mcp_tools_from_config_with_capability_aliases(
+            &config,
+            &ToolFilter::from_csv(None, Some("corpus_search")),
+            Some("blackbox"),
+        )
+        .await;
+        assert_eq!(
+            flat_only.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            vec!["corpus_search"]
+        );
+
+        let source_denied = load_mcp_tools_from_config_with_capability_aliases(
+            &config,
+            &ToolFilter::from_csv(
+                Some("mcp__blackbox__bbox_corpus_search"),
+                Some("corpus_search"),
+            ),
+            Some("blackbox"),
+        )
+        .await;
+        assert!(
+            source_denied.is_empty(),
+            "a qualified-source deny must also close its flat alias"
+        );
     }
 }
