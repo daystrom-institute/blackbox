@@ -33,6 +33,7 @@ use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{
     TranscriptCursor, TranscriptLocation, TranscriptSource, TranscriptStorage,
 };
+use executor::HarnessExecutor as _;
 use providers::dispatch_prelude::*;
 use providers::{EventSink, Provider, Usage};
 use supervision::SupervisionState;
