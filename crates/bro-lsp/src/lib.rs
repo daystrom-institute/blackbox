@@ -448,21 +448,58 @@ impl ReadinessTracker {
         let Some(params) = value.get("params") else {
             return;
         };
-        if params
+
+        // rust-analyzer's experimental/serverStatus payload carries
+        // `{ health: "ok"|"warning"|"error", quiescent: bool, message?: string }`.
+        // Older variants used `status` ("error" / ...) instead; tolerate it as
+        // a fallback alias for robustness, but `health` is the canonical field.
+        let health = params
+            .get("health")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        let legacy_status = params.get("status").and_then(Value::as_str);
+        let is_error = health.as_deref() == Some("error")
+            || legacy_status
+                .map(|s| s.eq_ignore_ascii_case("error"))
+                .unwrap_or(false);
+        let is_warning = health.as_deref() == Some("warning");
+
+        // health == "error" wins over quiescence: a server that reports
+        // quiescent alongside an error is still failed, not ready.
+        if is_error {
+            let detail = params
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|message| format!("rust-analyzer reported error: {message}"))
+                .unwrap_or_else(|| "rust-analyzer reported error".to_string());
+            self.mark_failed(detail);
+            return;
+        }
+
+        let quiescent = params
             .get("quiescent")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if quiescent {
             self.mark_ready("rust-analyzer reported quiescent");
             self.ready_from_status = true;
             return;
         }
-        if let Some(status) = params.get("status").and_then(Value::as_str)
-            && status.eq_ignore_ascii_case("error")
-        {
-            self.mark_failed("rust-analyzer reported error");
+
+        // health == "warning": do not fail. Record the message when we are
+        // not yet Ready; never demote an existing status-declared Ready.
+        if is_warning {
+            if self.state != ReadinessState::Ready {
+                let detail = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(|message| format!("rust-analyzer reported warning: {message}"))
+                    .unwrap_or_else(|| "rust-analyzer reported warning".to_string());
+                self.mark_indexing(detail);
+            }
             return;
         }
+
         self.demote_to_indexing("rust-analyzer reported busy");
     }
 
@@ -1950,7 +1987,13 @@ mod tests {
             ..LspConfig::default()
         });
         let doc = pool
-            .open_document(&root, Language::Rust, &root.join("src/lib.rs"), 1, "pub fn f() {}\n".to_string())
+            .open_document(
+                &root,
+                Language::Rust,
+                &root.join("src/lib.rs"),
+                1,
+                "pub fn f() {}\n".to_string(),
+            )
             .await
             .expect_err("expected lsp_unavailable, got success");
         assert!(
@@ -2148,5 +2191,118 @@ mod tests {
             }),
         );
         assert_eq!(readiness.state, ReadinessState::Ready);
+    }
+
+    #[test]
+    fn rust_analyzer_health_error_beats_quiescent() {
+        // Real rust-analyzer sends `health` (canonical) and `quiescent`.
+        // Ordering bug: quiescent used to short-circuit to Ready even when
+        // the server reported an error, swallowing the failure entirely.
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": {
+                    "health": "error",
+                    "quiescent": true,
+                    "message": "cargo check failed"
+                }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Failed);
+        assert!(
+            readiness
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cargo check failed"),
+            "failure detail should carry the server message"
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_health_error_without_quiescent_fails() {
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "health": "error", "quiescent": false }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Failed);
+    }
+
+    #[test]
+    fn rust_analyzer_health_warning_is_not_failure() {
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "health": "warning", "quiescent": false }
+            }),
+        );
+        assert_ne!(readiness.state, ReadinessState::Failed);
+        assert!(
+            readiness
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rust-analyzer reported warning"),
+            "warning detail should be recorded when not yet Ready"
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_health_warning_does_not_demote_status_ready() {
+        // A status-declared Ready stays Ready under a warning: warnings are
+        // advisory and never demote a quiescent-ready server.
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "health": "ok", "quiescent": true }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "health": "warning", "quiescent": false }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+    }
+
+    #[test]
+    fn rust_analyzer_health_ok_quiescent_is_ready() {
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "health": "ok", "quiescent": true }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Ready);
+    }
+
+    #[test]
+    fn rust_analyzer_legacy_status_error_alias_still_fails() {
+        // `status` is tolerated as a fallback alias for servers that predate
+        // the `health` field; an error there must still mark Failed.
+        let mut readiness = ReadinessTracker::initializing();
+        readiness.observe_notification(
+            Language::Rust,
+            &serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": { "status": "error" }
+            }),
+        );
+        assert_eq!(readiness.state, ReadinessState::Failed);
     }
 }
