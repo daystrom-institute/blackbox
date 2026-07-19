@@ -38,7 +38,22 @@ out explicitly under `Changed` or `Removed`.
   `BRO_HARNESS_PIN_TOOLS` default pin pattern (`bbox_slice_*`) is now empty.
 - The `readonly` MCP surface packet no longer allows the retired code-nav
   tools, and brofile allowlists across `system-defaults/brofiles/` and
-  `.bbox/brofiles/` no longer name the retired tools.
+  `.bbox/brofiles/` no longer name the retired tools. The four refactor
+  persona brofiles (`{rust,java,elixir,csharp}-refactor-persona`) are
+  re-pointed at the harness-native path: their lenses describe the cell
+  bindings, and their allowlists open `exec`/`wait` plus the binding
+  namespaces each language supports (java: `java.*`/`analysis.*`/`lsp.*`;
+  rust: `lsp.*`; elixir/csharp: `code.*` facts + `edits.*` only). All
+  mutation goes through the `edits.*` choke point with hash + parse
+  validation at `edits.apply`; Write/Edit/Bash stay denied, and
+  `build.gate` is deliberately off the persona surface because it accepts
+  arbitrary shell commands (compile-level validation is the
+  orchestrator's step). Review and pathology panel lenses ground in the
+  retained evidence tools (hybrid search, knowledge, blame, Read/Grep/Glob)
+  instead of the retired code-nav tools.
+- `deploy/blackbox-java-worker` (the OpenRewrite sidecar whose only client
+  was the deleted `bbox-macros` sidecar protocol) is removed; it is
+  recoverable from git history if the sidecar is ported harness-side.
 
 ### Fixed
 

@@ -7,7 +7,7 @@
   "context": {
     "provider_defaults": "suppress_when_supported"
   },
-  "lens": "You execute mechanical Rust refactor patterns through the bbox refactor primitives. Ground every operation via bbox_code_symbols and bbox_refactor_status before planning. Plan with deep_analysis=true. Compose primitives through bbox_refactor_run with a cargo check command step gated by repair. Emit bbox_note(kind=\"done\") with a one-line acceptance summary on completion. Refuse cleanly with bbox_note(kind=\"blocked\") and a concrete diagnostic when preconditions don't hold; never loop, never broaden charter.",
+  "lens": "You execute mechanical Rust refactor patterns through the in-box refactor bindings. Ground every operation with code.* facts (code.items, code.query, code.read) before planning. Use lsp.* for semantic renames (rust-analyzer; fail closed when unavailable). Make every structural edit through the edits.* algebra (hash-anchored EditSets are the only mutation path); edits.apply validates every write with hash checks and parse validation. Compile-level validation is the orchestrator's step; do not attempt shell commands. Emit bbox_note(kind=\"done\") with a one-line acceptance summary on completion. Refuse cleanly with bbox_note(kind=\"blocked\") and a concrete diagnostic when preconditions don't hold; never loop, never broaden charter.",
   "filters": {
     "allow": [
       "mcp__blackbox__bbox_note",
@@ -17,7 +17,12 @@
       "mcp__blackbox__bbox_hybrid_search",
       "Read",
       "Grep",
-      "Glob"
+      "Glob",
+      "exec",
+      "wait",
+      "code.*",
+      "edits.*",
+      "lsp.*"
     ],
     "disallow": [
       "mcp__blackbox__bbox_forget",

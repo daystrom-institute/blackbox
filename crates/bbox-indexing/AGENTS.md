@@ -34,5 +34,3 @@
 - Sync REPLACES the record's alias set with the declared set: the committed
   config is authoritative. Host-local operator aliases would need a separate
   field; don't overload this one.
-- `managed_fleet_worktree_project`'s `:fleet-worktree` pseudo-id is a compat
-  shim that ProjectContext should eventually subsume — don't add consumers.

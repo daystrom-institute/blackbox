@@ -1368,7 +1368,12 @@ mod tests {
                 return (unsafe { libc::kill(-pgid, 0) }) == 0;
             };
             for entry in entries.flatten() {
-                if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                if !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                {
                     continue;
                 }
                 let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {

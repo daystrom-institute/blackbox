@@ -924,7 +924,7 @@ mod tests {
             bf.lens
                 .as_deref()
                 .unwrap_or("")
-                .contains("bbox refactor primitives")
+                .contains("in-box refactor bindings")
         );
 
         let f = bf.filters.expect("filters present");
@@ -938,6 +938,11 @@ mod tests {
             "Read",
             "Grep",
             "Glob",
+            "exec",
+            "wait",
+            "code.*",
+            "edits.*",
+            "lsp.*",
         ];
         let expected_disallow: Vec<&str> = vec![
             "mcp__blackbox__bbox_forget",
@@ -984,7 +989,7 @@ mod tests {
             Some(ProviderDefaultsMode::SuppressWhenSupported)
         );
         let lens = bf.lens.as_deref().unwrap_or("");
-        assert!(lens.contains("bbox refactor primitives"));
+        assert!(lens.contains("in-box refactor bindings"));
         assert!(
             lens.contains("Lombok") || lens.contains("annotation"),
             "Java lens should reference Java-specific caveats (Lombok / annotation processors)"
@@ -1001,6 +1006,13 @@ mod tests {
             "Read",
             "Grep",
             "Glob",
+            "exec",
+            "wait",
+            "code.*",
+            "edits.*",
+            "java.*",
+            "analysis.*",
+            "lsp.*",
         ];
         let expected_disallow: Vec<&str> = vec![
             "mcp__blackbox__bbox_forget",
@@ -1058,10 +1070,12 @@ mod tests {
         assert!(lens.contains("strict JSON only"));
     }
 
-    /// Rust + Java refactor personas should expose the same allow/disallow
-    /// sets — the refactor + grounding tool surface is language-agnostic at
-    /// the MCP layer. Only the lens prose differs. The cross-language symmetry
-    /// is load-bearing for refactor-atom interchange between brofiles.
+    /// Rust + Java refactor personas share a core allow/disallow surface
+    /// (exec/wait + code.* facts + edits.* algebra + the grounding MCP tools)
+    /// and differ only in language-scoped binding extensions (java: java.* /
+    /// analysis.* / lsp.*; rust: lsp.*). The core symmetry is load-bearing
+    /// for refactor-atom interchange between brofiles; the extensions mirror
+    /// what the bindings actually implement per language.
     #[test]
     fn rust_and_java_refactor_personas_share_tool_surface() {
         let rust_src =
@@ -1081,9 +1095,37 @@ mod tests {
             r.disallow.iter().map(String::as_str).collect();
         let j_disallow: std::collections::BTreeSet<&str> =
             j.disallow.iter().map(String::as_str).collect();
+        // The cell bindings are language-scoped: java adds the java.* /
+        // analysis.* / lsp.* namespaces, rust adds lsp.* only; the shared core
+        // (exec/wait + code.* facts + edits.* algebra) must match. build.* is
+        // deliberately absent everywhere: build.gate accepts arbitrary shell
+        // commands, which would bypass the Bash/Write/Edit denial.
+        const JAVA_ONLY: &[&str] = &["java.*", "analysis.*", "lsp.*"];
+        const RUST_ONLY: &[&str] = &["lsp.*"];
+        let r_core: std::collections::BTreeSet<&str> = r_allow
+            .iter()
+            .copied()
+            .filter(|t| !RUST_ONLY.contains(t))
+            .collect();
+        let j_core: std::collections::BTreeSet<&str> = j_allow
+            .iter()
+            .copied()
+            .filter(|t| !JAVA_ONLY.contains(t))
+            .collect();
         assert_eq!(
-            r_allow, j_allow,
-            "refactor personas should expose identical allow sets"
+            r_core, j_core,
+            "refactor personas should expose identical core allow sets"
+        );
+        for t in JAVA_ONLY {
+            assert!(j_allow.contains(t), "java persona missing {t}");
+        }
+        assert!(
+            !r_allow.contains("java.*") && !r_allow.contains("analysis.*"),
+            "rust persona must not advertise java-scoped bindings"
+        );
+        assert!(
+            !r_allow.contains("build.*") && !j_allow.contains("build.*"),
+            "build.gate is an arbitrary-shell bypass and stays off personas"
         );
         assert_eq!(
             r_disallow, j_disallow,
@@ -1093,6 +1135,71 @@ mod tests {
             rust.context.as_ref().and_then(|c| c.provider_defaults),
             java.context.as_ref().and_then(|c| c.provider_defaults),
             "refactor personas should share context policy"
+        );
+    }
+
+    /// Regression scan (post-MCP-retirement): live brofile lenses, allowlists,
+    /// and agent prompt contracts must never name the retired daemon MCP
+    /// refactor/slice/code-nav/macro tools. Retired names in an allowlist are
+    /// dead entries; in a lens or prompt they instruct agents to call tools
+    /// that no longer exist. Atom/workflow/eval artifacts are deliberately
+    /// out of scope here (their content migration is a separate arc).
+    #[test]
+    fn live_lenses_and_prompts_never_name_retired_mcp_tools() {
+        const RETIRED: &[&str] = &[
+            "bbox_refactor_",
+            "bbox_slice_",
+            "bbox_code_query",
+            "bbox_code_symbols",
+            "bbox_code_node_describe",
+            "bbox_code_refs",
+            "bbox_code_usages",
+            "bbox_code_implementations",
+            "bbox_code_type_at",
+            "bbox_code_outline",
+            "bbox_workspace_symbols",
+            "bbox_code_*",
+            // Exact macro tool names; a bare "macro_" substring would false-
+            // positive on legitimate lens text like `acknowledge_defmacro_move`.
+            "macro_list",
+            "macro_describe",
+            "macro_validate",
+            "macro_register",
+            "macro_unregister",
+            "macro_plan",
+            "macro_apply",
+            "macro_run",
+        ];
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for dir in [
+            "system-defaults/brofiles",
+            ".bbox/brofiles",
+            "prompts/agents",
+        ] {
+            for entry in walkdir::WalkDir::new(crate_root.join(dir))
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && matches!(
+                            e.path().extension().and_then(|x| x.to_str()),
+                            Some("json") | Some("md")
+                        )
+                })
+            {
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                for name in RETIRED {
+                    if text.contains(name) {
+                        offenders.push(format!("{}: {name}", entry.path().display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "retired MCP tool names in live lenses/prompts:\n{}",
+            offenders.join("\n")
         );
     }
 

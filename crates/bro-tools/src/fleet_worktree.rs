@@ -1604,7 +1604,7 @@ treat that as a context/filesystem divergence to report rather than editing the 
 Generic file-edit/read tools may remain rooted at the original checkout after this call. Prefer \
 work_* tools or pass absolute paths under the returned Worktree path.\n\
 For project-scoped bbox calls (bbox_thread/_list, bbox_learn/decide/remember, \
-bbox_render), pass THIS worktree path as project/project_dir — committed artifacts \
+bbox_render), pass THIS worktree path as project/project_dir: committed artifacts \
 (thread records, knowledge entries, rendered memory) then land in the worktree and travel with this \
 branch instead of the base checkout; the daemon keys durable scope to the registered base.\n\
 \n\

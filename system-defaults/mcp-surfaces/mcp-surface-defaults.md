@@ -17,7 +17,7 @@ bbox_compile path=system-defaults/mcp-surfaces/routing.json scope=global
 | `interactive` | day-to-day interactive coding sessions | default-permissive working set: transcripts, graph, knowledge, threads, notes, inbox, packets, artifacts, project listing, identity read, and core bro operations. Hides Badgey, Slack/IRC, allocator/agent/atom catalogs, cron/workflow/arc/webhook/poller/signal tools, councils, whiteboards, workspace tools, system events, and reactions. |
 | `readonly` | reviewers, evaluators, observer agents | search/cite/inspect/find_paths/bundle, knowledge read, thread/note/inbox read, atom discovery, council observation, bro status/dashboard. **No writes, no dispatch, no admin.** |
 | `agent-internal` | dispatched bros inside a workflow or arc | superset of `default` plus whiteboards, councils, when_all/any, signals, broadcast, arc_*. `bro_exec`/`resume`/`cancel` denied as a backstop to the mechanical recursion guard; atom invocation remains policy-gated by atom composition/effect limits. |
-| `ops` | operator/admin sessions | full daemon access — setup tools (slack/webhook/poller/cron), workflow authoring, lifecycle (render/absorb/bootstrap/lint/review), index/embedding admin, artifact management, provenance. |
+| `ops` | operator/admin sessions | full daemon access: setup tools (slack/webhook/poller/cron), workflow authoring, lifecycle (render/absorb/bootstrap/lint/review), index/embedding admin, artifact management, provenance. |
 
 ## URL examples
 

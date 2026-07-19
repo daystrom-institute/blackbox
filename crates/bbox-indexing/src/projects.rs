@@ -414,40 +414,6 @@ fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(entity_ref::canonical_input_path(path)?)
 }
 
-/// If `project_dir` is a managed fleet worktree, synthesize a [`ProjectRecord`]
-/// aliasing it to its registered base project. A managed fleet worktree is one
-/// whose git common dir matches a registered project and that carries a managed
-/// marker (a `bro-fleet/*` branch, or a path under a cockpit-managed worktree
-/// root) — dispatch creates these outside the registered repo root (under the
-/// daemon state dir), so the literal worktree path is not a descendant of any
-/// registered root and project-scoped tools would otherwise reject it.
-///
-/// Returns `None` when the path is already a registered root or descendant (no
-/// aliasing needed), carries no managed marker, or no registered project
-/// shares its git common dir. The synthesized record carries a `:fleet-worktree`
-/// project_id suffix and the worktree's own canonical path, so a registration
-/// check accepts the worktree while callers can still tell it apart from a
-/// first-class registered root.
-///
-/// Shared by project-scoped tool callers so a fleet-dispatched agent working
-/// inside an isolated worktree can use project-scoped tools without
-/// registering each ephemeral worktree.
-pub fn managed_fleet_worktree_project(
-    project_dir: Option<&str>,
-    projects: &[ProjectRecord],
-) -> Option<ProjectRecord> {
-    let (base, worktree) = resolve_managed_fleet_worktree(project_dir, projects)?;
-    Some(ProjectRecord {
-        project_id: format!("{}:fleet-worktree", base.project_id),
-        repo_id: base.repo_id.clone(),
-        canonical_path: worktree.to_string_lossy().into_owned(),
-        registered_at: "fleet-managed".to_string(),
-        is_git_repo: true,
-        languages: base.languages.clone(),
-        aliases: BTreeSet::new(),
-    })
-}
-
 /// For a path that is a managed fleet worktree of a registered project, return
 /// `(base_canonical_path, worktree_canonical_path)`. The base is the worktree's
 /// durable scope (host-local thread keying, project-scoped queries) while the

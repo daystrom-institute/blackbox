@@ -1,19 +1,19 @@
-# bbox-refactor — the refactor substrate (two consumers, one future)
+# bbox-refactor: the refactor substrate (harness-native)
 
 Daemon-independent by invariant: dependencies point down (corpus-core,
-chunker, bbox-lsp, external) and never at `blackbox`. Two consumers share
-this engine, deliberately without a behavioral fork:
+chunker, bbox-lsp, external) and never at `blackbox`. bro-harness is the sole
+consumer of this engine:
 
 - The daemon's v1 MCP adapters (`bbox_refactor_*` plan kinds, refactor runs)
-  — RETIRED (decision af3c4783; refactor-tools-v2 §7). The adapters, the
+  are RETIRED (decision af3c4783; refactor-tools-v2 §7). The adapters, the
   macro layer, and the slice/code-nav MCP tools are deleted; this crate is
   the substrate the harness bindings link. The 100+ plan-kind
   catalog is CLOSED: new capability does not get a new `kind`.
 - bro-harness cell bindings (`code.*`/`edits.*`/`lsp.*`/`java.*`/`analysis.*`)
-  — the future. New capability lands as pure, data-returning substrate
+  are the surface. New capability lands as pure, data-returning substrate
   functions (the `facts` module pattern), changes-returning transforms
   (`java.*`, consumed by `edits.merge`), or **reductions** (`analysis.*`:
-  run the graph/analysis Rust-side, return a small structured answer — the
+  run the graph/analysis Rust-side, return a small structured answer; the
   raw edges never cross into the cell). All three are thin adapters over
   `plan`; none of them gets a new `kind`.
 

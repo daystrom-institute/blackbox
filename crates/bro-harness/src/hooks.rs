@@ -465,7 +465,7 @@ impl RefactorSignpostHook {
             rule_id: "refactor-signpost".into(),
             message: "This looks like structured refactor work. Use the in-box \
                       refactor bindings (`code.*` facts, `java.*` transforms, \
-                      `edits.*` mutation choke point, `analysis.*`, `lsp.*`) — \
+                      `edits.*` mutation choke point, `analysis.*`, `lsp.*`): \
                       they do guarded, hash-anchored structural edits (rename, \
                       move item, organize imports) that beat hand-editing."
                 .into(),

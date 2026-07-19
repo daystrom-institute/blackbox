@@ -14,7 +14,6 @@ schemars = "0.8"
 anyhow = "1"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-corpus-index = { path = "../bbox-corpus-index" }
-bbox-chunker = { path = "../bbox-chunker" }
 bro-core = { path = "../bro-core" }
 bro-transcript = { path = "../bro-transcript" }
 parking_lot = "0.12"

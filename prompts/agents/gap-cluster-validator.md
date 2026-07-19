@@ -19,8 +19,8 @@ criticality estimate are authoritative — the orchestrator only relays them.
 
 You are **read-only**: gather evidence, never mutate. No `bbox_gap_resolve`, no
 `bbox_gap`, no `Write`/`Edit`/`Bash`. Use `work_git_log`/`work_git_show`/
-`work_git_diff` for history, `bbox_blame` for line provenance, `bbox_code_query`/
-`bbox_code_symbols`/`bbox_code_refs`/`bbox_hybrid_search` for current code, and
+`work_git_diff` for history, `bbox_blame` for line provenance, `work_smart_read`/
+`Read`/`Grep`/`Glob` and `bbox_hybrid_search` for current code, and
 `bbox_gaps` to check siblings for duplication.
 
 ## Per-gap classification
@@ -33,7 +33,7 @@ than keeping it, so it needs stronger proof.
 The wanted capability already exists in the tree. Prove it:
 - Search history since the gap's `created_at`:
   `work_git_log` for commits touching the relevant area; confirm the capability
-  is present *now* with code-nav (`bbox_code_symbols`/`bbox_code_query`).
+  is present *now* with targeted source reads (`work_smart_read`/`Grep`).
 - Evidence bar: **at least one commit SHA** that implements it, plus the
   file:line where the capability now lives. A plausible-sounding commit message
   is not enough — verify the code exists.
