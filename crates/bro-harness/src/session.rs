@@ -45,6 +45,15 @@ pub struct Restored {
     /// Loop-level side cells from the prior run (`Value::Null` if absent, e.g.
     /// sessions written before this field existed).
     pub side: Value,
+    /// The last per-session event `seq` (`emit.rs`) assigned by a prior
+    /// process run, so a resumed session continues the sequence instead of
+    /// restarting at 0, which would corrupt any consumer
+    /// cursor (design/daemon-runtime/locality-first-decomposition.md slice
+    /// 5). `0` for sessions written before this field existed. The caller
+    /// (`agent_loop.rs`) reconciles this against the event log's tail
+    /// (`EventLog::max_seq_in_log`) before seeding the live counter, in case
+    /// a crash between persists left this value stale.
+    pub last_event_seq: u64,
 }
 
 /// Everything persisted at the end of a turn. A struct (rather than a widening
@@ -57,6 +66,9 @@ pub struct SaveState<'a> {
     pub service_tier: Option<&'a str>,
     pub snapshot: Value,
     pub side: Value,
+    /// The live counter's current value at persist time (`Emitter::last_seq`
+    /// on the session's shared seq counter); see [`Restored::last_event_seq`].
+    pub last_event_seq: u64,
 }
 
 pub(crate) fn sessions_dir() -> PathBuf {
@@ -129,6 +141,7 @@ impl SessionStore {
                         service_tier: v["service_tier"].as_str().map(str::to_string),
                         snapshot: v["snapshot"].clone(),
                         side: v.get("side").cloned().unwrap_or(Value::Null),
+                        last_event_seq: v["last_event_seq"].as_u64().unwrap_or(0),
                     })
                 }
                 Err(_) => {
@@ -147,6 +160,7 @@ impl SessionStore {
                                 service_tier: v["service_tier"].as_str().map(str::to_string),
                                 snapshot: v["snapshot"].clone(),
                                 side: v.get("side").cloned().unwrap_or(Value::Null),
+                                last_event_seq: v["last_event_seq"].as_u64().unwrap_or(0),
                             })
                         }
                         Err(_) => None, // absent in both dirs → start clean
@@ -180,6 +194,7 @@ impl SessionStore {
             "service_tier": state.service_tier,
             "snapshot": state.snapshot,
             "side": state.side,
+            "last_event_seq": state.last_event_seq,
         }))
         .context("serialize session")?;
         write_atomic(&self.path, &body).context("write session")?;
@@ -195,6 +210,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_log::EventLog;
     use bro_protocol::SERVICE_TIER_PRIORITY;
 
     /// A unique, hermetic session dir under the OS temp dir — no `tempfile`
@@ -233,6 +249,7 @@ mod tests {
                 service_tier: v["service_tier"].as_str().map(str::to_string),
                 snapshot: v["snapshot"].clone(),
                 side: v.get("side").cloned().unwrap_or(Value::Null),
+                last_event_seq: v["last_event_seq"].as_u64().unwrap_or(0),
             }
         });
         SessionStore {
@@ -254,6 +271,7 @@ mod tests {
                 service_tier: Some(SERVICE_TIER_PRIORITY),
                 snapshot: json!({"msgs": 1}),
                 side: json!({"todos": []}),
+                last_event_seq: 42,
             })
             .unwrap();
 
@@ -264,6 +282,26 @@ mod tests {
         assert_eq!(r.service_tier.as_deref(), Some(SERVICE_TIER_PRIORITY));
         assert_eq!(r.snapshot, json!({"msgs": 1}));
         assert_eq!(r.side["todos"], json!([]));
+        assert_eq!(r.last_event_seq, 42);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_session_without_last_event_seq_restores_as_zero() {
+        // A session written before `last_event_seq` existed (no key at all)
+        // must restore as 0, not fail: the resumed process then seeds the
+        // live counter fresh (or from the event log's tail, whichever is
+        // higher) rather than crashing on an old session file.
+        let dir = unique_dir("seq-legacy");
+        write_atomic(
+            &dir.join("sess-legacy.json"),
+            r#"{"transport":"anthropic","model":"m","snapshot":{"x":1}}"#,
+        )
+        .unwrap();
+
+        let r = resume_in(&dir, "sess-legacy").restored.expect("restored");
+        assert_eq!(r.last_event_seq, 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -376,6 +414,7 @@ mod tests {
                 service_tier: None,
                 snapshot: json!({"x": 1}),
                 side: Value::Null,
+                last_event_seq: 0,
             })
             .unwrap();
         assert!(sp.exists());
@@ -419,5 +458,100 @@ mod tests {
 
         std::fs::remove_dir_all(&new_dir).ok();
         std::fs::remove_dir_all(&legacy_base).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // last_event_seq reconciliation (agent_loop.rs Session::build seeds the
+    // live counter from `max(restored.last_event_seq,
+    // EventLog::max_seq_in_log(...))`). These tests exercise the exact two
+    // primitives build() calls: SessionStore's resume parse and
+    // EventLog::max_seq_in_log, so the reconciliation math is proven
+    // against real persisted state, not reimplemented in isolation.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reconciliation_prefers_log_tail_when_snapshot_is_stale() {
+        // Crash-window scenario: the snapshot only persisted up through
+        // seq 5 (last turn boundary), but the append-only log already
+        // durably recorded events through seq 12 before the process died.
+        let dir = unique_dir("reconcile-log-ahead");
+        let store = store_in(&dir, "sess-1");
+        store
+            .save(&SaveState {
+                transport: "anthropic",
+                model: "m",
+                code_mode: "only",
+                service_tier: None,
+                snapshot: json!({}),
+                side: Value::Null,
+                last_event_seq: 5,
+            })
+            .unwrap();
+        let log = EventLog::at_path(dir.join("sess-1.events.jsonl"));
+        for seq in 1..=12u64 {
+            log.append_event(&json!({"type": "assistant", "seq": seq}));
+        }
+        log.flush_blocking();
+
+        let restored = resume_in(&dir, "sess-1").restored.expect("restored");
+        let log_tail = EventLog::max_seq_in_log(log.path());
+        assert_eq!(restored.last_event_seq, 5, "snapshot alone is stale");
+        assert_eq!(log_tail, 12);
+        assert_eq!(
+            restored.last_event_seq.max(log_tail),
+            12,
+            "reconciliation must pick the log's higher tail value"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconciliation_prefers_snapshot_when_it_is_ahead_of_the_log() {
+        // The ordinary case: the snapshot persisted after the log tee, so
+        // the snapshot's counter is at or ahead of whatever happens to be
+        // on disk in the log (e.g. a log tee that hasn't flushed yet).
+        let dir = unique_dir("reconcile-snapshot-ahead");
+        let store = store_in(&dir, "sess-2");
+        store
+            .save(&SaveState {
+                transport: "anthropic",
+                model: "m",
+                code_mode: "only",
+                service_tier: None,
+                snapshot: json!({}),
+                side: Value::Null,
+                last_event_seq: 10,
+            })
+            .unwrap();
+        let log = EventLog::at_path(dir.join("sess-2.events.jsonl"));
+        for seq in 1..=6u64 {
+            log.append_event(&json!({"type": "assistant", "seq": seq}));
+        }
+        log.flush_blocking();
+
+        let restored = resume_in(&dir, "sess-2").restored.expect("restored");
+        let log_tail = EventLog::max_seq_in_log(log.path());
+        assert_eq!(
+            restored.last_event_seq.max(log_tail),
+            10,
+            "reconciliation must not regress below the persisted snapshot"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_session_has_no_prior_seq_on_either_side() {
+        // No resume, no prior log: both reconciliation inputs are 0, so a
+        // fresh session's counter seeds at 0 (first emitted event is seq 1
+        // per emit.rs).
+        let dir = unique_dir("reconcile-fresh");
+        let restored = resume_in(&dir, "sess-fresh").restored;
+        assert!(restored.is_none());
+        let log = EventLog::at_path(dir.join("sess-fresh.events.jsonl"));
+        assert_eq!(EventLog::max_seq_in_log(log.path()), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
