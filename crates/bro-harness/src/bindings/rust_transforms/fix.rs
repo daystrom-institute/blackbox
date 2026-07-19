@@ -150,7 +150,9 @@ impl RustFixRound {
                     // verbatim (and build.gate mined it into a suggestion).
                     // Try to synthesize an add-use proposal from the
                     // suggestion replacement text; otherwise leftover.
-                    if let Some(proposal) = synthesize_add_use(suggestions, &mut seen_use) {
+                    if let Some(proposal) =
+                        synthesize_add_use(suggestions, &mut seen_use, code.as_deref())
+                    {
                         changes.push(proposal);
                     } else {
                         leftovers.push(Leftover {
@@ -164,7 +166,9 @@ impl RustFixRound {
                 Some("E0599") => {
                     // No method named X: if the owning trait is in scope a
                     // missing `use` is the likely fix. Same add-use synthesis.
-                    if let Some(proposal) = synthesize_add_use(suggestions, &mut seen_use) {
+                    if let Some(proposal) =
+                        synthesize_add_use(suggestions, &mut seen_use, code.as_deref())
+                    {
                         changes.push(proposal);
                     } else {
                         leftovers.push(Leftover {
@@ -179,7 +183,8 @@ impl RustFixRound {
                     // Private item access: the classifier can propose a
                     // visibility bump, but it is a planner guess and requires
                     // operator review. Surface as a finding + leftover.
-                    if let Some(proposal) = synthesize_visibility_bump(suggestions) {
+                    if let Some(proposal) = synthesize_visibility_bump(suggestions, code.as_deref())
+                    {
                         findings.push(json!({
                             "finding": "visibility_bump_proposed",
                             "detail": "proposed pub(crate) rewrite; operator review required",
@@ -274,6 +279,7 @@ fn suggestion_to_change(suggestion: &Value, code: Option<&str>) -> Option<Change
 fn synthesize_add_use(
     suggestions: Option<&Vec<Value>>,
     seen: &mut std::collections::BTreeSet<(String, String)>,
+    code: Option<&str>,
 ) -> Option<ChangeProposal> {
     let arr = suggestions?;
     for s in arr {
@@ -302,7 +308,7 @@ fn synthesize_add_use(
             span,
             new_text: replacement.to_string(),
             provenance: AuthorityTier::SyntaxOnly.as_str(),
-            code: Some("E0432/E0433".to_string()),
+            code: code.map(|s| s.to_string()),
         });
     }
     None
@@ -311,7 +317,10 @@ fn synthesize_add_use(
 /// Synthesize a visibility-bump proposal (`pub(crate) `) from a suggestion
 /// span. Floors at syntax_only: the replacement is planner-authored, not
 /// compiler-authored.
-fn synthesize_visibility_bump(suggestions: Option<&Vec<Value>>) -> Option<ChangeProposal> {
+fn synthesize_visibility_bump(
+    suggestions: Option<&Vec<Value>>,
+    code: Option<&str>,
+) -> Option<ChangeProposal> {
     let arr = suggestions?;
     for s in arr {
         let span_json = match s.get("span") {
