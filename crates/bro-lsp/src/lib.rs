@@ -1056,6 +1056,122 @@ impl SessionPool {
         }
     }
 
+    /// `textDocument/codeAction` — retrieve code actions (assists, quick-fixes,
+    /// refactors) at a given range. Readiness-gated (RX-V3 fail-closed); bounded
+    /// (callers cap the returned list). Returns the raw `CodeActionOrCommand`
+    /// list; filtering, snippet-guard, and command-guard belong to the harness
+    /// binding.
+    pub async fn code_action(
+        &self,
+        doc: &OpenDocument,
+        range: lsp_types::Range,
+        wait_ready: Duration,
+    ) -> Result<Vec<lsp_types::CodeActionOrCommand>> {
+        let session = self.session(doc.root.clone(), doc.language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        if !session.documents.contains_key(&doc.uri) {
+            return Err(Error::DocumentNotOpen {
+                uri: doc.uri.clone(),
+            });
+        }
+        session
+            .wait_until_ready(
+                doc.language,
+                <lsp_types::request::CodeActionRequest as Request>::METHOD,
+                wait_ready,
+            )
+            .await?;
+        let params = lsp_types::CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: doc.uri.clone(),
+            },
+            range,
+            context: lsp_types::CodeActionContext {
+                diagnostics: Vec::new(),
+                ..Default::default()
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        };
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::CodeActionRequest>(&params)
+                .await
+            {
+                Ok(actions) => {
+                    session
+                        .readiness
+                        .mark_ready_from_success("codeAction returned code actions");
+                    return Ok(actions.unwrap_or_default());
+                }
+                Err(Error::Server { method, error })
+                    if method
+                        == <lsp_types::request::CodeActionRequest as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// `codeAction/resolve` — resolve a partially-populated `CodeAction` to
+    /// its full form (with a complete `WorkspaceEdit`). Readiness-gated;
+    /// fail-closed (RX-V3).
+    pub async fn code_action_resolve(
+        &self,
+        root: impl Into<PathBuf>,
+        language: Language,
+        action: lsp_types::CodeAction,
+    ) -> Result<lsp_types::CodeAction> {
+        let root = root.into();
+        let root = root.canonicalize().with_context(|| {
+            format!("canonicalizing project root {}", root.display())
+        })?;
+        let session = self.session(root, language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        session
+            .wait_until_ready(
+                language,
+                <lsp_types::request::CodeActionResolveRequest as Request>::METHOD,
+                Duration::from_secs(30),
+            )
+            .await?;
+        let params = action;
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::CodeActionResolveRequest>(&params)
+                .await
+            {
+                Ok(resolved) => {
+                    session
+                        .readiness
+                        .mark_ready_from_success("codeAction/resolve returned resolved action");
+                    return Ok(resolved);
+                }
+                Err(Error::Server { method, error })
+                    if method
+                        == <lsp_types::request::CodeActionResolveRequest as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     pub async fn shutdown_all(&self) {
         let mut sessions = self.inner.sessions.lock().await;
         let drained = sessions
