@@ -46,14 +46,21 @@ impl<T> FramedIo<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> FramedIo<T> {
+// Read and write are bounded separately (`AsyncRead` here, `AsyncWrite` below)
+// rather than jointly on `AsyncRead + AsyncWrite`, so a `FramedIo` over one
+// half of a split stream still gets the operation that half can perform. The
+// method names are disjoint, so the overlapping bidirectional case (a
+// `UnixStream`) picks up both without an inherent-method conflict.
+impl<T: AsyncRead + Unpin> FramedIo<T> {
+    pub async fn read_json<V: DeserializeOwned>(&mut self) -> Result<V, RpcError> {
+        read_json_frame(&mut self.io, self.max_frame_bytes).await
+    }
+}
+
+impl<T: AsyncWrite + Unpin> FramedIo<T> {
     pub async fn write_json<V: Serialize>(&mut self, value: &V) -> Result<(), RpcError> {
         let bytes = serialize_bounded(value, self.max_frame_bytes)?;
         write_frame(&mut self.io, &bytes).await
-    }
-
-    pub async fn read_json<V: DeserializeOwned>(&mut self) -> Result<V, RpcError> {
-        read_json_frame(&mut self.io, self.max_frame_bytes).await
     }
 }
 
