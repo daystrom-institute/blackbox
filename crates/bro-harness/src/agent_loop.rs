@@ -31,6 +31,7 @@ use bro_tools::{SafetyPolicy, Tool, ToolCx, builtin_tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Read as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::{mpsc, watch};
@@ -193,19 +194,28 @@ async fn run_with_emitter(
     Ok(())
 }
 
+/// Builds an `Emitter` for `session_id`, wiring in the sidecar event log and
+/// the session's shared seq counter. Every emitter built for the SAME
+/// session (the loop's own emitter, the stdin-reader's replay emitter, the
+/// control-response emitter, the `report` tool's emitter) must be given the
+/// SAME `seq_counter` `Arc` (see `Emitter::with_seq_counter`), so they hand
+/// out one strictly monotonically increasing `seq` stream instead of
+/// colliding.
 fn make_emitter(
     session_id: String,
     callback: Option<EventCallback>,
     event_log: Option<Arc<EventLog>>,
+    seq_counter: Arc<AtomicU64>,
 ) -> Emitter {
     let emitter = match callback {
         Some(callback) => Emitter::with_callback(session_id, callback),
         None => Emitter::new(session_id),
     };
-    match event_log {
+    let emitter = match event_log {
         Some(log) => emitter.with_event_log(log),
         None => emitter,
-    }
+    };
+    emitter.with_seq_counter(seq_counter)
 }
 
 /// Bidirectional persistent session driven over stdin NDJSON.
@@ -227,11 +237,21 @@ async fn run_session(
     // honour `--replay-user-messages`.
     let mut input_rx = spawn_stdin_reader(
         replay,
-        make_emitter(sid.clone(), callback.clone(), Some(session.event_log())),
+        make_emitter(
+            sid.clone(),
+            callback.clone(),
+            Some(session.event_log()),
+            session.seq_counter(),
+        ),
     );
     // A separate emitter for control responses emitted *during* a turn, when the
     // session's own emitter is borrowed by the running turn.
-    let ctrl_emitter = make_emitter(sid, callback, Some(session.event_log()));
+    let ctrl_emitter = make_emitter(
+        sid,
+        callback,
+        Some(session.event_log()),
+        session.seq_counter(),
+    );
 
     // Steers that arrived mid-turn wait here for the next turn boundary.
     let mut pending: VecDeque<String> = VecDeque::new();
@@ -274,7 +294,12 @@ async fn run_controlled_session(
     .await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
-    let ctrl_emitter = make_emitter(sid, callback, Some(session.event_log()));
+    let ctrl_emitter = make_emitter(
+        sid,
+        callback,
+        Some(session.event_log()),
+        session.seq_counter(),
+    );
 
     let mut pending: VecDeque<String> = VecDeque::new();
     if let Some(p) = cli.prompt.clone() {
@@ -635,6 +660,11 @@ struct Session {
     /// emitters tee every protocol event into it; the loop additionally logs
     /// user turns and compaction milestones. Best-effort — never fails a turn.
     event_log: Arc<EventLog>,
+    /// Per-session monotonic event `seq` counter (`emit.rs`), shared by every
+    /// emitter built for this session (`make_emitter`). Seeded at `build()`
+    /// from `max(snapshot.last_event_seq, EventLog::max_seq_in_log(...))` so
+    /// a resumed session continues the sequence rather than restarting at 0.
+    seq_counter: Arc<AtomicU64>,
     prior_side: Value,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
     /// Cross-turn diagnostics baselines: per-file `{sha256, version,
@@ -729,6 +759,19 @@ impl Session {
         // Sidecar append-only event log next to the snapshot — the durable
         // timestamped record of this session (event_log.rs).
         let event_log = Arc::new(EventLog::for_session(&store.id));
+        // Seed the live seq counter (emit.rs) from the persisted snapshot,
+        // reconciled against the event log's own tail. The snapshot alone can
+        // be stale: it only persists at turn boundaries, so a crash between
+        // persists can leave it behind lines the log already durably recorded
+        // (append-only, one write_all per line). Taking the max means a
+        // resumed session never reuses a `seq` for a DIFFERENT event, which
+        // would poison a fleetd replay cursor
+        // (design/daemon-runtime/locality-first-decomposition.md slice 5).
+        // Fresh sessions: both sides are 0, so the first emitted event is
+        // seq 1.
+        let restored_last_event_seq = store.restored.as_ref().map_or(0, |r| r.last_event_seq);
+        let log_tail_seq = EventLog::max_seq_in_log(event_log.path());
+        let seq_counter = Arc::new(AtomicU64::new(restored_last_event_seq.max(log_tail_seq)));
         let scoped_project_docs = crate::project_doc::ScopedProjectDocs::from_startup_and_event_log(
             user_instructions
                 .as_ref()
@@ -837,6 +880,7 @@ impl Session {
             store.id.clone(),
             callback.clone(),
             Some(event_log.clone()),
+            seq_counter.clone(),
         ))));
         let (mcp_tools, tool_placement) = match injected_mcp {
             Some(config) => {
@@ -962,7 +1006,12 @@ impl Session {
                 .or_else(|| std::env::var("BRO_HARNESS_SERVICE_TIER").ok()),
         };
 
-        let emitter = make_emitter(store.id.clone(), callback, Some(event_log.clone()));
+        let emitter = make_emitter(
+            store.id.clone(),
+            callback,
+            Some(event_log.clone()),
+            seq_counter.clone(),
+        );
         let compaction = crate::compaction::CompactionPolicy::from_env();
         let compact_threshold = compaction.threshold(&base_opts.model);
         let tool_result_cap = crate::bound::cap_bytes();
@@ -1008,6 +1057,7 @@ impl Session {
             dispatch,
             store,
             event_log,
+            seq_counter,
             prior_side,
             todos,
             lsp_baselines,
@@ -1030,6 +1080,14 @@ impl Session {
     /// (control responses, stdin replay) created outside `build`.
     fn event_log(&self) -> Arc<EventLog> {
         self.event_log.clone()
+    }
+
+    /// Shared per-session event seq counter, for auxiliary emitters (control
+    /// responses, stdin replay) created outside `build`; see
+    /// `make_emitter`'s doc comment for why every emitter for this session
+    /// must share the same counter.
+    fn seq_counter(&self) -> Arc<AtomicU64> {
+        self.seq_counter.clone()
     }
 
     /// Apply a mid-session control mutation. `interrupt` is handled by the
@@ -1922,6 +1980,10 @@ impl Session {
             "service_tier": self.base_opts.service_tier.as_deref(),
             "snapshot": self.tx.snapshot(),
             "side": self.side_state(),
+            // Persist the counter across process runs of this session (see
+            // build()'s reconciliation) so a resume continues the seq
+            // sequence instead of restarting at 0.
+            "last_event_seq": self.seq_counter.load(Ordering::SeqCst),
         }))
         .context("serialize session")
     }
@@ -2746,6 +2808,7 @@ mod tests {
             dump_dir: std::env::temp_dir(),
             store: SessionStore::open(Some(&id), None).unwrap(),
             event_log: Arc::new(EventLog::disabled()),
+            seq_counter: Arc::new(AtomicU64::new(0)),
             prior_side: Value::Null,
             todos,
             lsp_baselines: LspBaselines::default(),

@@ -5,6 +5,7 @@ pub mod atoms;
 pub mod badgey;
 pub mod brofile;
 pub mod consultant;
+pub mod executor;
 pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
@@ -32,6 +33,7 @@ use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{
     TranscriptCursor, TranscriptLocation, TranscriptSource, TranscriptStorage,
 };
+use executor::HarnessExecutor as _;
 use providers::dispatch_prelude::*;
 use providers::{EventSink, Provider, Usage};
 use supervision::SupervisionState;
@@ -63,6 +65,16 @@ fn harness_controls() -> &'static RwLock<HashMap<String, tokio::sync::mpsc::Unbo
     static CONTROLS: OnceLock<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Value>>>> =
         OnceLock::new();
     CONTROLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Task-id -> idempotent kill switch for executor-backed harness workers.
+/// Parallel to [`harness_controls`]: keyed the same way, populated at spawn,
+/// removed by the terminal waiter. `cancel_task` consults this so the kill goes
+/// through the worker handle instead of a raw `child_id` PID take. Non-harness
+/// / one-shot tasks are absent here and fall back to `child_id`.
+fn harness_killers() -> &'static RwLock<HashMap<String, Arc<executor::WorkerKill>>> {
+    static KILLERS: OnceLock<RwLock<HashMap<String, Arc<executor::WorkerKill>>>> = OnceLock::new();
+    KILLERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn harness_user_input(text: String) -> Value {
@@ -2880,7 +2892,11 @@ fn spawn_harness_child_task(
         .ok()
         .filter(|url| !url.is_empty())
         .map(|url| crate::dispatch_mcp::dispatch_mcp_url_for_origin(&url, origin));
-    let launch = match prepare_harness_child_launch(
+    // Compose the fully-resolved spawn spec (prompt-free argv, SecretEnv,
+    // env_unset scrub list, initial_messages, pinned bro_home/event_log_path).
+    let spec = match prepare_harness_child_launch(
+        task_id.clone(),
+        session_id.clone(),
         provider,
         args,
         cwd.as_deref(),
@@ -2891,7 +2907,7 @@ fn spawn_harness_child_task(
         &store_dir,
         self_mcp_url.as_deref(),
     ) {
-        Ok(launch) => launch,
+        Ok(spec) => spec,
         Err(error) => {
             return failed_harness_child_setup(
                 task_id,
@@ -2909,42 +2925,168 @@ fn spawn_harness_child_task(
         }
     };
 
-    let spawned = spawn_task_interactive(
-        task_id.clone(),
+    // Reserve the task id up front (idempotent dispatch), mirroring the old
+    // spawn_task_interactive entry.
+    if let Err(err) = task_store.write().reserve_id(&task_id) {
+        if let Some(existing) = task_store.read().get(&task_id) {
+            return existing;
+        }
+        return failed_duplicate_task(
+            task_id,
+            provider,
+            session_id,
+            cwd,
+            bro_label,
+            agent_label,
+            err.to_string(),
+            origin,
+        );
+    }
+
+    // Pin the child's transcript location from the spec's event-log path (the
+    // single derivation both sides now flow from).
+    let transcript_location = harness_transcript_location_from_spec(&spec, cwd.as_deref());
+
+    // Hand the spec to the executor: it owns the process (login-shell bin
+    // resolution, command build, spawn, stdin control writer, stdout/stderr
+    // pumps, waiter). The daemon keeps the state half below.
+    let handle = match executor::LocalExecutor.spawn(spec) {
+        Ok(handle) => handle,
+        Err(error) => {
+            task_store.write().release_reservation(&task_id);
+            return failed_harness_child_setup(
+                task_id,
+                provider,
+                session_id,
+                cwd,
+                store_dir,
+                task_store,
+                roster_events,
+                bro_label,
+                agent_label,
+                error,
+                origin,
+            );
+        }
+    };
+    let executor::WorkerHandle {
+        control,
+        events,
+        pid,
+        killer,
+        outcome,
+    } = handle;
+
+    let task = Arc::new(Task {
+        inner: Mutex::new(TaskInner {
+            id: task_id.clone(),
+            provider,
+            session_id: session_id.clone(),
+            events: EventRing::new(),
+            model: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: String::new(),
+            status: TaskStatus::Running,
+            started_at: now_ms(),
+            completed_at: None,
+            exit_code: None,
+            cwd: cwd.clone(),
+            managed_worktree: managed_worktrees::managed_worktree_for_cwd(cwd.as_deref()),
+            bro_label,
+            name: None,
+            agent_label,
+            report: None,
+            interrupted: false,
+            recoverable: false,
+            transcript_location,
+            transcript_cursor: None,
+            live_cursor: 0,
+            last_delta_roster_emit_ms: 0,
+            supervision: SupervisionState::default(),
+            origin,
+            workflow_owned: workflow_owned_for_origin(origin),
+        }),
+        notify: Arc::new(Notify::new()),
+        // child_id is display-only now; cancellation goes through the handle's
+        // kill switch registered in harness_killers below.
+        child_id: Mutex::new(pid),
+        roster_events: roster_events.clone(),
+    });
+
+    if let Err(err) = task_store
+        .write()
+        .insert_reserved(task_id.clone(), task.clone())
+    {
+        task_store.write().release_reservation(&task_id);
+        killer.kill();
+        let failed = failed_duplicate_task(
+            task_id,
+            provider,
+            session_id,
+            cwd,
+            None,
+            None,
+            err.to_string(),
+            origin,
+        );
+        failed.notify.notify_waiters();
+        return failed;
+    }
+
+    task.emit_roster_added();
+
+    // Register the kill switch and control lane (keyed by task id, like
+    // harness_controls). No await runs between insert and here, so no steer can
+    // race a missing registration.
+    harness_killers().write().insert(task_id.clone(), killer);
+    harness_controls().write().insert(task_id.clone(), control);
+
+    // Emit tail + system started events (unchanged from the inline path).
+    let cursor = task.next_live_cursor();
+    let _ = tail_tx.send(tail::TailEvent::TaskStarted {
+        cursor,
+        task_id: task_id.clone(),
         provider,
-        launch.args,
-        session_id,
-        cwd,
-        Some(launch.env_overrides),
+        bro_name: None,
+    });
+    if let Some(ref hub) = system_events {
+        let bro_ev = task.inner.lock().bro_label.clone();
+        emit_task_started_event(hub, bro_ev, task_id.clone(), provider.to_string());
+    }
+
+    // Daemon ingest: consume the executor's raw stdout line stream.
+    let ingest_join = spawn_harness_ingest_loop(
+        task.clone(),
+        provider,
+        task_id.clone(),
+        store_dir.clone(),
+        tail_tx.clone(),
+        system_events.clone(),
+        events,
+    );
+
+    // Daemon waiter: await the worker outcome, then publish terminal state.
+    spawn_harness_terminal_waiter(
+        task.clone(),
+        task_id,
         store_dir,
         task_store,
         tail_tx,
-        roster_events,
-        bro_label,
-        agent_label,
         system_events,
-        origin,
+        outcome,
+        ingest_join,
     );
-    if let Some(stdin) = spawned.stdin {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(harness_user_input(launch.initial_prompt));
-        harness_controls().write().insert(task_id.clone(), tx);
-        spawn_child_control_writer(task_id.clone(), stdin, rx);
-        if spawned.task.inner.lock().status.is_terminal() {
-            harness_controls().write().remove(&task_id);
-        }
-    }
-    spawned.task
-}
 
-struct HarnessChildLaunch {
-    args: Vec<String>,
-    initial_prompt: String,
-    env_overrides: HashMap<String, String>,
+    task
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_harness_child_launch(
+    task_id: String,
+    session_id: String,
     provider: Provider,
     mut args: Vec<String>,
     cwd: Option<&str>,
@@ -2954,7 +3096,7 @@ fn prepare_harness_child_launch(
     tool_defaults: Option<BTreeMap<String, String>>,
     store_dir: &std::path::Path,
     self_mcp_url: Option<&str>,
-) -> anyhow::Result<HarnessChildLaunch> {
+) -> anyhow::Result<bro_protocol::WorkerSpawnSpec> {
     let initial_prompt = take_cli_value_arg(&mut args, "-p")
         .or_else(|| take_cli_value_arg(&mut args, "--prompt"))
         .ok_or_else(|| anyhow::anyhow!("harness child launch requires an initial prompt"))?;
@@ -2988,29 +3130,297 @@ fn prepare_harness_child_launch(
         );
     }
 
-    let mut env_overrides = env_overrides.unwrap_or_default();
-    env_overrides
-        .entry("BRO_HARNESS_PROVIDER".to_string())
+    // Environment: provider credentials + BRO_HARNESS_PROVIDER ride the spec's
+    // SecretEnv. BRO_HOME is pinned on its own field (the executor sets it), so
+    // it is intentionally NOT placed in `env`; because BRO_HOME is already in
+    // BLACKBOX_SERVICE_ENV_VARS the scrub-key set is byte-identical either way.
+    let mut env: std::collections::BTreeMap<String, String> =
+        env_overrides.unwrap_or_default().into_iter().collect();
+    env.entry("BRO_HARNESS_PROVIDER".to_string())
         .or_insert_with(|| provider.as_str().to_string());
-    env_overrides
-        .entry("BRO_HOME".to_string())
-        .or_insert_with(|| store_dir.to_string_lossy().into_owned());
     let mut scrub_keys = BLACKBOX_SERVICE_ENV_VARS
         .iter()
         .map(|key| (*key).to_string())
         .collect::<std::collections::BTreeSet<_>>();
-    scrub_keys.extend(env_overrides.keys().cloned());
+    scrub_keys.extend(env.keys().cloned());
     scrub_keys.insert(HARNESS_SPAWN_SCRUB_ENV.to_string());
-    env_overrides.insert(
+    env.insert(
         HARNESS_SPAWN_SCRUB_ENV.to_string(),
         scrub_keys.into_iter().collect::<Vec<_>>().join(","),
     );
 
-    Ok(HarnessChildLaunch {
-        args,
-        initial_prompt,
-        env_overrides,
+    // Binary override: BRO_HARNESS_BIN / provider config resolved daemon-side;
+    // the final login-shell path resolution stays executor-side.
+    let bin_override = Some(if let Ok(cfg) = blackbox::config::load() {
+        provider.bin_with_config(&cfg.providers)
+    } else {
+        provider.bin()
+    });
+
+    // Single pinned derivation of BRO_HOME and the event-log path.
+    let bro_home = store_dir.to_path_buf();
+    let event_log_path = bro_home
+        .join("harness-sessions")
+        .join(format!("{session_id}.events.jsonl"));
+
+    Ok(bro_protocol::WorkerSpawnSpec {
+        task_id,
+        session_id,
+        provider,
+        bin_override,
+        argv: args,
+        cwd: cwd.map(str::to_string),
+        env: bro_protocol::SecretEnv::new(env),
+        env_unset: BLACKBOX_SERVICE_ENV_VARS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect(),
+        initial_messages: vec![harness_user_input(initial_prompt)],
+        bro_home,
+        event_log_path,
     })
+}
+
+/// Build the child's transcript location from the pinned spec fields. Returns
+/// None when the session id is empty, mirroring [`harness_transcript_location`].
+fn harness_transcript_location_from_spec(
+    spec: &bro_protocol::WorkerSpawnSpec,
+    cwd: Option<&str>,
+) -> Option<TranscriptLocation> {
+    if spec.session_id.is_empty() {
+        return None;
+    }
+    Some(TranscriptLocation {
+        source: TranscriptSource::Harness(spec.provider),
+        storage: TranscriptStorage::JsonlFile,
+        path: spec.event_log_path.clone(),
+        account: None,
+        session_id: (spec.session_id != "pending").then(|| spec.session_id.clone()),
+        project: None,
+        cwd: cwd.map(str::to_string),
+        is_subagent: false,
+    })
+}
+
+/// Emit the `task.started` system event. Observation-only: failures are logged,
+/// not propagated. Extracted so the executor-backed harness path shares the
+/// exact shape the inline dispatch path emits.
+fn emit_task_started_event(
+    hub: &crate::system_events::SharedEventHub,
+    bro_ev: Option<String>,
+    task_id_ev: String,
+    provider_str: String,
+) {
+    let hub_clone = hub.clone();
+    tokio::spawn(async move {
+        let mut correlation = serde_json::Map::new();
+        correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
+        let draft = crate::system_events::SystemEventDraft {
+            kind: crate::system_events::types::SystemEventKind::TaskStarted,
+            producer: "orchestration.dispatch".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation,
+            causation_id: None,
+            payload: serde_json::json!({
+                "task_id": task_id_ev,
+                "provider": provider_str,
+                "bro": bro_ev,
+            }),
+        };
+        if let Err(e) = hub_clone.emit(draft).await {
+            tracing::warn!("task.started system event emit failed: {e:#}");
+        }
+    });
+}
+
+/// Daemon-side ingest of the executor's raw stdout line stream: parse each
+/// line, record the first provider disruption, and feed harness events into the
+/// task. Mirrors the inline harness branch of the former stdout reader; the
+/// executor now owns the read + tee, the daemon owns parse + ingest. Returns
+/// the join handle so the terminal waiter can guarantee the stream is fully
+/// drained before publishing terminal state.
+fn spawn_harness_ingest_loop(
+    task: Arc<Task>,
+    provider: Provider,
+    task_id: String,
+    store_dir: std::path::PathBuf,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut disruption_recorded = false;
+        while let Some(line) = events.recv().await {
+            let Ok(evt) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if !disruption_recorded && let Some(disruption) = provider.detect_disruption(&evt) {
+                disruption_recorded = true;
+                let store_dir = store_dir.clone();
+                let task_id = task_id.clone();
+                let observed_at = now_ms();
+                tokio::task::spawn_blocking(move || {
+                    let account = allocator::lookup_lease_for_task(&store_dir, &task_id)
+                        .and_then(|lease| lease.account);
+                    account_probes::record_disruption_cooldown(
+                        &store_dir,
+                        provider,
+                        account.as_deref(),
+                        disruption,
+                        observed_at,
+                    );
+                });
+            }
+            ingest_harness_event(
+                &task,
+                provider,
+                evt,
+                &tail_tx,
+                &task_id,
+                system_events.clone(),
+            );
+        }
+    })
+}
+
+/// Daemon-side terminal waiter for an executor-backed harness worker. Awaits
+/// the worker outcome (child exit + stdout/stderr pumps drained), ensures the
+/// ingest stream is fully consumed, then publishes terminal state. Mirrors the
+/// inline waiter's ordering and terminal-publication logic.
+#[allow(clippy::too_many_arguments)]
+fn spawn_harness_terminal_waiter(
+    task: Arc<Task>,
+    task_id: String,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+    outcome: tokio::sync::oneshot::Receiver<executor::WorkerOutcome>,
+    ingest_join: tokio::task::JoinHandle<()>,
+) {
+    tokio::spawn(async move {
+        let outcome = outcome.await.unwrap_or(executor::WorkerOutcome {
+            exit_code: None,
+            stderr: String::new(),
+        });
+        // Ensure every ingested event has been applied before we mark terminal.
+        let _ = ingest_join.await;
+
+        // The control lane and kill switch are done once terminal.
+        harness_controls().write().remove(&task_id);
+        harness_killers().write().remove(&task_id);
+
+        let code = outcome.exit_code;
+        let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind, cursor) = {
+            let mut inner = task.inner.lock();
+            inner.exit_code = code;
+            // Append the executor's collected child stderr. `ingest_harness_event`
+            // may already have written a result-error message into `inner.stderr`
+            // during the run (harness result with is_error=true), so this must
+            // append, not overwrite, matching the inline path where both the
+            // stderr reader and the result handler push onto the same buffer.
+            inner.stderr.push_str(&outcome.stderr);
+            // Preserve terminal states set during stream parsing (Cancelled on
+            // kill, Failed on session fork detection) — don't let a clean exit
+            // code flip a detected failure back to Completed.
+            if inner.status != TaskStatus::Cancelled && inner.status != TaskStatus::Failed {
+                inner.status = if code == Some(0) {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::Failed
+                };
+            }
+            inner.completed_at = Some(now_ms());
+            let elapsed = format_elapsed(inner.started_at, inner.completed_at);
+            let terminal_status = inner.status;
+            let cost = inner.cost_usd;
+            let error_snippet: String = inner.stderr.chars().take(200).collect();
+            let source_session = inner.session_id.clone();
+            let task_kind = inner.bro_label.clone();
+            inner.live_cursor += 1;
+            let cursor = inner.live_cursor;
+            (
+                terminal_status,
+                elapsed,
+                cost,
+                error_snippet,
+                source_session,
+                task_kind,
+                cursor,
+            )
+        };
+        task.emit_roster_updated();
+        match terminal_status {
+            TaskStatus::Completed => {
+                let _ = tail_tx.send(tail::TailEvent::TaskCompleted {
+                    cursor,
+                    task_id: task_id.clone(),
+                    elapsed: elapsed.clone(),
+                    cost,
+                    source_session,
+                    task_kind,
+                });
+            }
+            TaskStatus::Failed => {
+                let _ = tail_tx.send(tail::TailEvent::TaskFailed {
+                    cursor,
+                    task_id: task_id.clone(),
+                    elapsed: elapsed.clone(),
+                    error: error_snippet.clone(),
+                });
+            }
+            _ => {}
+        }
+        // Emit terminal system event. Observation-only: failures logged.
+        if let Some(ref hub) = system_events {
+            let mut correlation = serde_json::Map::new();
+            correlation.insert("task_id".into(), serde_json::json!(task_id));
+            let (kind, payload) = match terminal_status {
+                TaskStatus::Completed => (
+                    crate::system_events::types::SystemEventKind::TaskCompleted,
+                    serde_json::json!({"task_id": task_id, "elapsed": elapsed, "cost_usd": cost}),
+                ),
+                TaskStatus::Failed => (
+                    crate::system_events::types::SystemEventKind::TaskFailed,
+                    serde_json::json!({"task_id": task_id, "elapsed": elapsed, "error": error_snippet}),
+                ),
+                TaskStatus::Cancelled => (
+                    crate::system_events::types::SystemEventKind::TaskCancelled,
+                    serde_json::json!({"task_id": task_id, "elapsed": elapsed}),
+                ),
+                TaskStatus::Running => unreachable!("terminal state check above"),
+            };
+            let draft = crate::system_events::SystemEventDraft {
+                kind,
+                producer: "orchestration.dispatch".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation,
+                causation_id: None,
+                payload,
+            };
+            if let Err(e) = hub.emit(draft).await {
+                tracing::warn!("task terminal system event emit failed: {e:#}");
+            }
+        }
+
+        // Propagate session ID to team members.
+        {
+            let inner = task.inner.lock();
+            if inner.session_id != "pending" {
+                let sid = inner.session_id.clone();
+                let tid = inner.id.clone();
+                drop(inner);
+                team::propagate_session_id(&tid, &sid, &store_dir);
+            }
+        }
+
+        request_persist(&task_store, &store_dir);
+        task.notify.notify_waiters();
+    });
 }
 
 fn set_cli_value_arg(args: &mut Vec<String>, flag: &str, value: String) {
@@ -3024,29 +3434,9 @@ fn ensure_cli_flag(args: &mut Vec<String>, flag: &str) {
     }
 }
 
-fn spawn_child_control_writer(
-    task_id: String,
-    mut stdin: tokio::process::ChildStdin,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
-) {
-    tokio::spawn(async move {
-        while let Some(input) = rx.recv().await {
-            let mut line = match serde_json::to_vec(&input) {
-                Ok(line) => line,
-                Err(error) => {
-                    tracing::warn!(task_id = %task_id, %error, "failed to serialize harness input");
-                    break;
-                }
-            };
-            line.push(b'\n');
-            if let Err(error) = stdin.write_all(&line).await {
-                tracing::debug!(task_id = %task_id, %error, "harness child stdin closed");
-                break;
-            }
-        }
-        let _ = stdin.shutdown().await;
-    });
-}
+// The child stdin control writer moved to `executor::spawn_control_writer`
+// (the execution half of the harness worker). The old daemon-side copy was
+// removed with the executor extraction.
 
 #[allow(clippy::too_many_arguments)]
 fn failed_harness_child_setup(
@@ -4295,8 +4685,13 @@ pub fn cancel_task(
     drop(inner);
     task.emit_roster_updated();
 
-    // Kill the child process
-    if let Some(pid) = task.child_id.lock().take() {
+    // Kill the child process. Executor-backed harness workers go through the
+    // handle's idempotent kill switch (registered in harness_killers); other
+    // tasks (one-shot / non-harness) still carry a raw PID in child_id.
+    let task_id = task.id();
+    if let Some(killer) = harness_killers().read().get(&task_id).cloned() {
+        killer.kill();
+    } else if let Some(pid) = task.child_id.lock().take() {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
@@ -4924,6 +5319,97 @@ mod tests {
     }
 
     #[test]
+    fn prepare_harness_child_launch_composes_worker_spec() {
+        // config::load() reads $BLACKBOX_CONFIG / XDG; point it at a missing
+        // path under a tempdir so composition never touches real config state.
+        let _env = crate::util::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().canonicalize().unwrap();
+        let cfg_path = store.join("missing-config.toml");
+        // SAFETY: guarded by test_env_lock; the test runtime is single-threaded.
+        unsafe {
+            std::env::set_var("BLACKBOX_CONFIG", &cfg_path);
+        }
+
+        let args = vec![
+            "-p".to_string(),
+            "do the thing".to_string(),
+            "-m".to_string(),
+            "some-model".to_string(),
+        ];
+        let spec = prepare_harness_child_launch(
+            "task-1".to_string(),
+            "sess-1".to_string(),
+            Provider::Glm,
+            args,
+            Some("/repo/x"),
+            None, // env_overrides
+            None, // shell_env
+            None, // tool_placement
+            None, // tool_defaults
+            &store,
+            None, // self_mcp_url
+        )
+        .expect("compose spec");
+
+        // Hard rule: the prompt rides initial_messages, never argv.
+        assert!(
+            !spec.argv.iter().any(|a| a == "-p" || a == "do the thing"),
+            "prompt must not appear in argv: {:?}",
+            spec.argv
+        );
+        assert_eq!(spec.initial_messages.len(), 1);
+        assert_eq!(spec.initial_messages[0]["type"], "user");
+        assert_eq!(
+            spec.initial_messages[0]["message"]["content"][0]["text"],
+            "do the thing"
+        );
+
+        // Daemon-worker stream-json flags are present.
+        assert!(spec.argv.iter().any(|a| a == "--daemon-worker"));
+        assert!(spec.argv.iter().any(|a| a == "--exit-when-idle"));
+        assert!(spec.argv.iter().any(|a| a == "--replay-user-messages"));
+        let ifmt = spec
+            .argv
+            .iter()
+            .position(|a| a == "--input-format")
+            .expect("--input-format present");
+        assert_eq!(spec.argv[ifmt + 1], "stream-json");
+
+        // env_unset covers the full service scrub list.
+        for var in BLACKBOX_SERVICE_ENV_VARS {
+            assert!(
+                spec.env_unset.iter().any(|k| k == var),
+                "env_unset missing service var {var}"
+            );
+        }
+        // The scrub var is composed into env and lists the service vars.
+        let scrub = spec
+            .env
+            .as_map()
+            .get(HARNESS_SPAWN_SCRUB_ENV)
+            .expect("scrub var present in env");
+        assert!(scrub.contains("BRO_HOME"), "scrub list: {scrub}");
+        assert!(scrub.contains("BLACKBOX_MCP_URL"), "scrub list: {scrub}");
+        // BRO_HOME is pinned on its own field, not duplicated into env.
+        assert!(!spec.env.as_map().contains_key("BRO_HOME"));
+
+        // BRO_HOME and event_log_path share one pinned derivation.
+        assert_eq!(spec.bro_home, store);
+        assert_eq!(
+            spec.event_log_path,
+            store.join("harness-sessions").join("sess-1.events.jsonl")
+        );
+
+        assert_eq!(spec.cwd.as_deref(), Some("/repo/x"));
+
+        // SAFETY: guarded by test_env_lock; restore process env.
+        unsafe {
+            std::env::remove_var("BLACKBOX_CONFIG");
+        }
+    }
+
+    #[test]
     fn apply_session_command_maps_protocol_variants_to_harness_wire() {
         use bro_protocol::SessionCommand;
 
@@ -5056,7 +5542,14 @@ mod tests {
         env.set("BLACKBOX_MCP_NAME", "selfbox");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let launch = prepare_harness_child_launch(
+        // Isolate config::load() (bin resolution) from real config state.
+        env.set(
+            "BLACKBOX_CONFIG",
+            root.join("missing-config.toml").to_str().unwrap(),
+        );
+        let spec = prepare_harness_child_launch(
+            "task-x".to_string(),
+            "sess-x".to_string(),
             Provider::Glm,
             vec![
                 "-p".to_string(),
@@ -5093,8 +5586,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(launch.initial_prompt, "initial turn");
-        assert!(!launch.args.iter().any(|arg| arg == "initial turn"));
+        // Prompt rides initial_messages, never argv.
+        assert_eq!(spec.initial_messages.len(), 1);
+        assert_eq!(
+            spec.initial_messages[0]["message"]["content"][0]["text"],
+            "initial turn"
+        );
+        assert!(!spec.argv.iter().any(|arg| arg == "initial turn"));
         for flag in [
             "--input-format",
             "--replay-user-messages",
@@ -5106,25 +5604,32 @@ mod tests {
             "--additional-context",
             "--shell-env",
         ] {
-            assert!(launch.args.iter().any(|arg| arg == flag), "missing {flag}");
+            assert!(spec.argv.iter().any(|arg| arg == flag), "missing {flag}");
         }
         assert_eq!(
-            launch.env_overrides.get("BRO_HARNESS_PROVIDER"),
+            spec.env.as_map().get("BRO_HARNESS_PROVIDER"),
             Some(&"glm".to_string())
         );
+        // BRO_HOME is pinned on its own field, not duplicated into env.
+        assert!(!spec.env.as_map().contains_key("BRO_HOME"));
+        assert_eq!(spec.bro_home, root);
         assert_eq!(
-            launch.env_overrides.get("BRO_HOME"),
-            Some(&root.to_string_lossy().into_owned())
+            spec.event_log_path,
+            root.join("harness-sessions").join("sess-x.events.jsonl")
         );
-        let scrub = launch
-            .env_overrides
+        // env_unset carries the full service scrub list.
+        assert!(spec.env_unset.iter().any(|k| k == "BRO_HOME"));
+        assert!(spec.env_unset.iter().any(|k| k == "BLACKBOX_MCP_URL"));
+        let scrub = spec
+            .env
+            .as_map()
             .get(HARNESS_SPAWN_SCRUB_ENV)
             .expect("child shell scrub list");
         assert!(scrub.contains("ANTHROPIC_AUTH_TOKEN"));
         assert!(scrub.contains("BRO_HOME"));
 
-        let raw_config = launch
-            .args
+        let raw_config = spec
+            .argv
             .windows(2)
             .find(|pair| pair[0] == "--mcp-config")
             .map(|pair| pair[1].as_str())

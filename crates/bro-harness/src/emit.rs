@@ -1,14 +1,22 @@
 //! Emits the exact Claude `stream-json` envelope the daemon's
 //! `parse_claude_event` consumes (`src/orchestration/providers/events.rs`).
 //! Every line carries a top-level `session_id` (the parser reads
-//! `evt["session_id"]`). Only protocol JSON goes to stdout — all logging
-//! goes to stderr.
+//! `evt["session_id"]`) and a top-level `seq`: a per-session, strictly
+//! monotonically increasing `u64` assigned at emission time (first event is
+//! `1`; `0` is reserved as the pre-session cursor sentinel meaning "nothing
+//! consumed yet"). `seq` is the replay-cursor foundation for the fleetd
+//! extraction (design/daemon-runtime/locality-first-decomposition.md slice
+//! 5): the daemon is the authority on its own cursor (last-ingested seq per
+//! session) and streams the event-log tail from there on reconnect. Unknown
+//! fields are additive; existing consumers ignore `seq` today. Only protocol
+//! JSON goes to stdout; all logging goes to stderr.
 
 use crate::event_log::EventLog;
 use crate::transport::{ToolResult, Usage};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type EventCallback = Arc<dyn Fn(Value) + Send + Sync + 'static>;
 
@@ -22,6 +30,20 @@ pub struct Emitter {
     /// captured whole by the `assistant` turn event) and `isReplay` user
     /// echoes (the loop logs the authoritative user turn itself).
     event_log: Option<Arc<EventLog>>,
+    /// Per-session monotonic event sequence counter, the replay-cursor
+    /// foundation for the fleetd extraction
+    /// (design/daemon-runtime/locality-first-decomposition.md slice 5: "the
+    /// daemon is the authority on its own cursor (last-ingested seq per
+    /// session)"). Holds the last `seq` assigned so far (0 before the first
+    /// event); every `write_line` call does one `fetch_add` to claim the next
+    /// value. Every `Emitter` instance that can write to the SAME session's
+    /// stdout (the loop's own emitter, the stdin-reader's replay emitter, the
+    /// control-response emitter, the `report` tool's emitter) MUST share one
+    /// `Arc<AtomicU64>` via [`Emitter::with_seq_counter`]: independent
+    /// counters would hand out colliding `seq` values for the same session.
+    /// Defaults to a fresh, unshared counter so standalone/test emitters
+    /// still get valid (if session-local-only) sequencing.
+    seq_counter: Arc<AtomicU64>,
 }
 
 impl Emitter {
@@ -30,6 +52,7 @@ impl Emitter {
             session_id,
             callback: None,
             event_log: None,
+            seq_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -38,6 +61,7 @@ impl Emitter {
             session_id,
             callback: Some(callback),
             event_log: None,
+            seq_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -47,11 +71,37 @@ impl Emitter {
         self
     }
 
+    /// Attach a shared sequence counter, so multiple `Emitter` instances
+    /// writing to the same session's stdout hand out one strictly
+    /// monotonically increasing `seq` stream. `initial` is the last `seq`
+    /// already used by a prior process run of this session (0 for a fresh
+    /// session), see `session.rs`'s snapshot+log-tail reconciliation.
+    pub fn with_seq_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.seq_counter = counter;
+        self
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
+    /// The last `seq` assigned so far (0 if nothing has been emitted through
+    /// this counter yet). Read at turn boundaries to persist
+    /// `last_event_seq` in the session snapshot.
+    pub fn last_seq(&self) -> u64 {
+        self.seq_counter.load(Ordering::SeqCst)
+    }
+
     fn write_line(&self, v: serde_json::Value) {
+        let mut v = v;
+        // Claim the next seq before the event-log tee decision, so the
+        // stdout line and the (possibly teed) log line carry the identical
+        // value. Every write_line call gets one, including stream_event
+        // partials and isReplay echoes, which the log excludes below; the
+        // resulting gaps in the log's seq sequence are expected (the log is
+        // not the seq authority, the stdout stream is).
+        let seq = self.seq_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        v["seq"] = json!(seq);
         if let Some(log) = &self.event_log
             && v["type"].as_str() != Some("stream_event")
             && v["isReplay"].as_bool() != Some(true)
@@ -544,5 +594,140 @@ mod tests {
         assert_eq!(events[0]["session_id"], "session-int");
         assert_eq!(events[0]["result"], "partial answer");
         assert_eq!(events[0]["num_turns"], 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Per-session event seq (replay-cursor foundation, slice 5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fresh_session_seq_starts_at_one_and_increases_strictly() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-seq".into(), sink);
+
+        emitter.system_init();
+        emitter.assistant_message(vec![json!({"type": "text", "text": "hi"})], None, None);
+        emitter.result("done", &Usage::default(), 1, None, None, None);
+
+        let events = captured.lock().unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        // A fresh session's first emitted line is seq 1 (0 is reserved as the
+        // pre-session cursor sentinel), and every subsequent line strictly
+        // increases by exactly 1.
+        assert_eq!(seqs, vec![1, 2, 3]);
+        assert_eq!(emitter.last_seq(), 3);
+    }
+
+    #[test]
+    fn stream_event_partials_and_replay_echoes_consume_seq_too() {
+        // Every write_line call claims a seq, including the two shapes the
+        // event log deliberately excludes from its own tee (stream_event
+        // deltas, isReplay echoes): the stdout stream is the seq authority,
+        // not the log, so gaps in the log's seq sequence are expected.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-gaps".into(), sink);
+
+        emitter.stream_event(json!({"type": "content_block_delta"}));
+        emitter.replay_user(&json!({"role": "user", "content": "echoed"}));
+        emitter.system_init();
+
+        let events = captured.lock().unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn seeded_seq_counter_continues_monotonically_past_its_initial_value() {
+        // Simulates a resumed session: the counter is seeded from a prior
+        // run's `last_event_seq` (session.rs reconciliation) instead of
+        // starting fresh at 0, so the sequence never restarts.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let seeded = Arc::new(AtomicU64::new(41));
+        let emitter =
+            Emitter::with_callback("session-resumed".into(), sink).with_seq_counter(seeded);
+
+        emitter.system_init();
+        emitter.result("done", &Usage::default(), 1, None, None, None);
+
+        let events = captured.lock().unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![42, 43]);
+    }
+
+    #[test]
+    fn shared_seq_counter_gives_multiple_emitters_one_collision_free_stream() {
+        // Mirrors agent_loop.rs's make_emitter: the loop's own emitter, a
+        // control-response emitter, and the report tool's emitter all write
+        // to the SAME session's stdout and must share one counter.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let shared = Arc::new(AtomicU64::new(0));
+        let loop_emitter = Emitter::with_callback("session-shared".into(), sink.clone())
+            .with_seq_counter(shared.clone());
+        let ctrl_emitter =
+            Emitter::with_callback("session-shared".into(), sink).with_seq_counter(shared);
+
+        loop_emitter.system_init();
+        ctrl_emitter.control_response_success(Some("req-1"));
+        loop_emitter.result("done", &Usage::default(), 1, None, None, None);
+
+        let events = captured.lock().unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn logged_event_carries_the_same_seq_as_the_stdout_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(EventLog::at_path(dir.path().join("seq.events.jsonl")));
+
+        let emitter = Emitter::with_callback("session-log-seq".into(), Arc::new(|_| {}))
+            .with_event_log(log.clone());
+
+        emitter.system_init();
+        emitter.assistant_message(vec![json!({"type": "text", "text": "hi"})], None, None);
+        // stream_event is excluded from the log tee: confirms the log's
+        // seq values are a (gapped) subsequence of the stdout stream's, not
+        // a separately-numbered sequence.
+        emitter.stream_event(json!({"type": "content_block_delta"}));
+        emitter.result("done", &Usage::default(), 1, None, None, None);
+
+        log.flush_blocking();
+        let lines: Vec<Value> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        let logged_seqs: Vec<u64> = lines
+            .iter()
+            .map(|l| l["event"]["seq"].as_u64().unwrap())
+            .collect();
+        // system_init=1, assistant_message=2, (stream_event=3, excluded),
+        // result=4.
+        assert_eq!(logged_seqs, vec![1, 2, 4]);
     }
 }
