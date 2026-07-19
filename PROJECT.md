@@ -153,22 +153,25 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   `~/repos/bbox-cage/build/submit-bbox-build.sh --ref <ref>` (native amd64
   in a warm ZFS clone; QEMU emulation and controller-host docker builds are
   legacy fallbacks).
-- **Interactive heavy worktrees are lanes, not local disk**: from the
-  operator's estate root, `bin/estate lane create <name> --family bbox`
-  gives a cluster-backed checkout at `~/lanes/<name>/blackbox`; cargo,
-  rustc, and sccache route into a builder pod automatically, keyed on cwd.
-  Lane creation kicks a background warm build (minutes); read the lane
-  contract `~/repos/bbox-cage/build/lanes/BBOX_LANE_WORK.md` before heavy
-  work. Worker loss is lane loss - push anything durable.
+- **Interactive heavy worktrees are lanes, not local disk**: claim a warm
+  standby lane in seconds (`~/repos/bbox-cage/build/lanes/lane-pool.sh
+  claim` prints the checkout path), or create a named one from the
+  operator's estate root (`bin/estate lane create <name> --family bbox`,
+  ~5 min to full warmth). Either way the checkout lives at
+  `~/lanes/<name>/blackbox`; cargo, rustc, and sccache route into a builder
+  pod automatically, keyed on cwd. Read the lane contract
+  `~/repos/bbox-cage/build/lanes/BBOX_LANE_WORK.md` before heavy work.
+  Worker loss is lane loss - push anything durable.
 - **What stays local**: file edits, single-crate checks and tests, and the
   arm64 macOS daemon binary build/deploy (launchd) - the cluster produces
   Linux artifacts only.
 
 **Dispatch propagation**: when orchestrating subordinate agents into heavy
-blackbox work, create a lane, pass the lane path as the dispatch cwd, and
-put ONE line in the prompt: read `BBOX_LANE_WORK.md` (path above) before
-heavy work. Restate situational constraints in the dispatch prompt; older
-worktrees carry older copies of this file.
+blackbox work, claim a pool lane (or create one), pass the printed path as
+the dispatch cwd, and put ONE line in the prompt: read `BBOX_LANE_WORK.md`
+(path above) before heavy work. Release or destroy the lane when the
+dispatch concludes. Restate situational constraints in the dispatch prompt;
+older worktrees carry older copies of this file.
 
 Contributors without the operator's estate: everything above degrades to
 the plain local commands in Validation; nothing in the repo depends on the
