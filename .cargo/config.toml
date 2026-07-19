@@ -1,6 +1,15 @@
 [env]
 TSLP_LANGUAGES = { value = "rust,python,csharp,java,go,typescript,javascript,c,cpp", force = true }
 
+# Cold-checkout guard: fail loud instead of cold-building a linked worktree
+# on the macOS control-plane host (PROJECT.md, Where Heavy Work Runs). The
+# script passes rustc through untouched on Linux, in base checkouts, in warm
+# worktrees, or with BBOX_ALLOW_COLD_BUILD=1. Lane pods and daemon dispatches
+# set RUSTC_WRAPPER in the environment, which takes precedence over this
+# config entry, so they never route through the guard.
+[build]
+rustc-wrapper = "scripts/rustc-cold-guard.sh"
+
 # Use lld for linking — the default bfd linker serially links the ~156MB
 # blackboxd binary (bro-slack now builds from crates/bro-slack). lld is already
 # installed at /usr/bin/ld.lld; this cuts the final link stage substantially.

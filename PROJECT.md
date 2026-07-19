@@ -71,6 +71,15 @@ cargo nextest run --workspace   # mid-cycle gate; quarantines slow tests (.confi
 cargo clippy
 ```
 
+**These gates assume a WARM checkout** (the base repo or a lane). In a
+cold checkout (any manual `git worktree add` or agent-created worktree) do
+not run them locally: cold cargo fails loud by design
+(`scripts/rustc-cold-guard.sh`, wired via `.cargo/config.toml`;
+`BBOX_ALLOW_COLD_BUILD=1` is a deliberate operator override). Done-criteria
+for dispatched edit-only work is committed changes with tests WRITTEN, not
+locally-run gates; the orchestrator runs all gates lane-side against the
+ref (see "Where Heavy Work Runs" and `prompts/agents/edit-only-worktree.md`).
+
 **USE NEXTEST for all test runs, and ALWAYS pass `--workspace`**
 (`brew install cargo-nextest`) — do not default to `cargo test`. The root
 manifest is workspace+package, so a bare run silently covers the root package
