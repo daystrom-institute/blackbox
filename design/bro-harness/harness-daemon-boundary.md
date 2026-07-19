@@ -695,14 +695,18 @@ before relying on any line here.
   exist as the dependency-inverted bottom; the compile DAG is acyclic and
   `bro-harness` cannot depend on `blackbox`. Earlier the three crates were inert
   (no impls, no callers); they are now load-bearing.
-- **Capabilities (§2/§6/§9).** `CorpusCapability`, `AtomCapability`, and
-  `RefactorCapability` are each wired end-to-end: the daemon implements them over
-  its in-memory stores and installs them into the harness at startup; the harness
-  exposes them as in-process `Tool`s (direct trait dispatch, no MCP round-trip).
-  Standalone harness leaves the slots empty → fail-closed by absence.
-  `RefactorCapability` follows the §9 ref-handle model (plan stays host-side,
-  only a handle + preview cross). Commits: "Wire {Corpus,Atom,Refactor}Capability
-  through the contract bottom".
+- **Capabilities (§2/§6/§9) — SUPERSEDED, then deleted.** The
+  `{Corpus,Atom,Refactor}Capability` trait wiring described by earlier
+  revisions of this ledger belonged to the in-process era and was retired
+  with it: after the process re-extraction
+  ([`harness-process-boundary.md`](./harness-process-boundary.md)), daemon
+  capabilities reach the harness only through the server-filtered MCP
+  catalog, and the trait slots went implementer-less. `AtomCapability` and
+  `CorpusCapability` were deleted from `bro-capabilities` on 2026-07-19
+  (`RefactorCapability` was already gone); the crate retains only the
+  harness-internal `ToolCapability` seam projecting the filtered session
+  tool set into code-mode cells. Seam rule and rationale:
+  `design/daemon-runtime/locality-first-decomposition.md` §2.
 - **Control plane / `bro-protocol` (§8/§11).** `bro_protocol::SessionCommand` is
   the live control-plane contract: `apply_session_command` translates it to the
   harness's internal `SessionInput`, and steer/interrupt route through it. Every

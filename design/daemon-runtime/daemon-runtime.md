@@ -22,3 +22,4 @@ all of that work.
 ## Documents
 
 - [Concurrency model: planes, invariants, and the path off the bolt-on era](concurrency-model.md)
+- [Locality-first decomposition: the checkout plane and the corpus plane](locality-first-decomposition.md)
