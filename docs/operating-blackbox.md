@@ -55,6 +55,7 @@ cargo build --release
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro ~/.local/bin/bro
+install -m 755 target/release/fleetd ~/.local/bin/fleetd
 install -d ~/.local/share/blackbox/memories
 cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 systemctl --user restart blackbox.service
@@ -62,6 +63,19 @@ systemctl --user restart blackbox.service
 
 Restart `blackbox-dev.service` only if you updated the dev daemon too.
 Prod and dev intentionally use different installed binary paths.
+
+`fleetd` is one binary for both instances (see "The fleet supervisor"
+below); restart it only when you actually changed it, because restarting it
+kills the workers it is supervising.
+
+On macOS, signing and restarting go through `stablesign` and
+`launchctl kickstart` instead. Sign `fleetd` the same way you sign
+`blackboxd`, or the first daemon dial fails a TCC prompt you never see:
+
+```bash
+stablesign ~/.local/bin/fleetd
+launchctl kickstart -k gui/$(id -u)/com.daystrom.fleetd
+```
 
 Then watch the journal:
 
@@ -90,6 +104,89 @@ bbox_embed_status()
 bbox_describe_schema()
 bbox_hybrid_search(query="recent changes", project="/abs/path/to/repo", limit=5)
 ```
+
+## The fleet supervisor (fleetd)
+
+Harness workers are children of `fleetd`, not of `blackboxd`. That is the
+whole point: `blackboxd` gets rebuilt and kickstarted constantly on a dev
+machine, and before this split every restart killed every live session.
+`fleetd` changes a few times a year, so its restarts are rare.
+
+**Install.** `fleetd` ships as a workspace binary and installs next to the
+daemon (see "After every daemon update"). It runs as its own service:
+
+```bash
+# systemd
+cp deploy/fleetd.service ~/.config/systemd/user/
+systemctl --user enable --now fleetd.service
+
+# launchd (macOS)
+cp deploy/fleetd.plist ~/Library/LaunchAgents/com.daystrom.fleetd.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.daystrom.fleetd.plist
+```
+
+Running it as a service is recommended, not required. If the socket is absent
+when a dispatch needs it, the daemon starts `fleetd` itself, detached so the
+supervisor outlives the daemon that started it. It resolves the binary from
+`BLACKBOX_FLEETD_BIN`, else a `fleetd` sitting next to the daemon binary, else
+`PATH`.
+
+**Socket and token.** Both derive from the daemon's state dir:
+
+| Path | Contents |
+|---|---|
+| `<state_dir>/fleetd.sock` | The daemon<->fleetd Unix domain socket |
+| `<state_dir>/fleetd.token` | Shared-secret bearer token, owner-only `0600` |
+
+Deriving them from the state dir is what keeps prod and dev on **separate
+supervisors**: `~/.local/state/blackbox` and `~/.local/state/blackbox-dev` are
+different directories, so the dev daemon cannot adopt prod's sessions or vice
+versa. Use `deploy/fleetd-dev.service` / `deploy/fleetd-dev.plist` for the dev
+instance; they differ from prod only in `--state-dir`, and that difference is
+load-bearing.
+
+Whichever of the two starts first creates the token; the other loads it. If
+you ever delete it, stop both, delete it, and start `fleetd` first.
+
+**Re-adoption.** On every connect, first dial or reconnect, the daemon asks
+`fleetd` what it is holding and reattaches each session the task store knows,
+replaying from that task's own durable ingest cursor. So a restart looks like
+this in the log:
+
+```text
+connected to fleetd
+re-adopting a fleetd session; replaying from our cursor
+fleetd replay complete; session is live
+```
+
+Two behaviors worth knowing:
+
+- A task the previous daemon marked `Failed` at load with "server restarted
+  while task was running" flips **back** to `Running` when its session is
+  re-adopted, and that notice is stripped. The child never died; the daemon did.
+- A session `fleetd` reports that the task store does **not** know (a TTL reap,
+  a wiped store) is logged loudly and **left running**. It is never killed:
+  killing work the daemon merely forgot is worse than leaking a process. Kill
+  those by hand after checking what they are.
+
+**Executor selection.** `daemon.executor` defaults to `fleetd`. The escape
+hatch is explicit and exists for tests and for contributors who have not
+installed the supervisor:
+
+```bash
+BLACKBOX_EXECUTOR=local   # or daemon.executor = "local" in config.toml
+```
+
+There is **no automatic fallback**. If `fleetd` is selected and unreachable,
+the dispatch fails loudly rather than quietly spawning a daemon child, because
+a silent downgrade would reintroduce the restart-drops-sessions problem
+invisibly.
+
+**Restart semantics.** Restarting `fleetd` kills its children; that is an
+accepted v1 limit, not a bug (process-adoption tricks are not worth it for a
+binary this stable). Restarting `blackboxd` does not. Losing the connection in
+either direction is not session death: children keep running, the durable event
+log keeps accumulating, and the next daemon replays from its cursor.
 
 ## Reindexing
 
@@ -351,6 +448,7 @@ secrets, replay), see [System events](system-events.md).
 | `~/.local/bin/blackboxd` | Production daemon binary |
 | `~/.local/bin/blackboxd-dev` | Dev daemon binary |
 | `~/.local/bin/bro` | Terminal TUI client |
+| `~/.local/bin/fleetd` | Fleet supervisor binary (shared by prod and dev) |
 | `~/.config/systemd/user/blackbox.service` | Prod systemd unit |
 | `~/.config/systemd/user/blackbox.service.d/*.conf` | Drop-in env and secrets |
 | `~/.local/share/blackbox/index/` | Rebuildable Tantivy index |
@@ -358,6 +456,8 @@ secrets, replay), see [System events](system-events.md).
 | `~/.local/state/blackbox/vectors/` | Rebuildable vector partitions |
 | `~/.local/state/blackbox/edges/` | Rebuildable graph sidecars |
 | `~/.local/state/blackbox/git_meta/` | Rebuildable git fingerprints |
+| `~/.local/state/blackbox/fleetd.sock` | Prod daemon<->fleetd socket |
+| `~/.local/state/blackbox/fleetd.token` | Prod fleetd shared secret (owner-only) |
 | `~/.local/state/blackbox/` | Durable JSON stores plus rebuildable projections |
 | `~/.bro/mcp.json` | Global MCP server config |
 | `<project>/.bro/mcp.json` | Project MCP overlay |

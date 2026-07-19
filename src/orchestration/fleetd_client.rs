@@ -940,3 +940,5 @@ mod tests {
         assert_ne!(first, second);
     }
 }
+
+include!("fleetd_smoke.rs");
