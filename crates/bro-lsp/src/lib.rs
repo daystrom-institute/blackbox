@@ -23,7 +23,8 @@ use lsp_types::{
     DiagnosticClientCapabilities, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, ExecuteCommandClientCapabilities, ExecuteCommandParams,
-    FailureHandlingKind, FileRename, InitializeParams, InitializeResult, PartialResultParams,
+    FailureHandlingKind, FileRename, GotoCapability, GotoDefinitionParams, GotoDefinitionResponse,
+    InitializeParams, InitializeResult, Location, PartialResultParams,
     PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams, RenameFilesParams,
     ResourceOperationKind, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, Url, VersionedTextDocumentIdentifier,
@@ -1058,6 +1059,82 @@ impl SessionPool {
         }
     }
 
+    /// `textDocument/definition` — goto-declaration at a position. Readiness-gated
+    /// (RX-V3 fail-closed). Normalizes all `GotoDefinitionResponse` variants
+    /// (Scalar `Location`, `Vec<Location>`, `Vec<LocationLink>`) to a flat
+    /// `Vec<Location>`; `LocationLink` target_selection_range becomes the
+    /// returned `Location.range`.
+    pub async fn definition(
+        &self,
+        doc: &OpenDocument,
+        position: lsp_types::Position,
+        wait_ready: Duration,
+    ) -> Result<Vec<Location>> {
+        let session = self.session(doc.root.clone(), doc.language).await?;
+        let mut session = session.lock().await;
+        session.last_used = Instant::now();
+        if !session.documents.contains_key(&doc.uri) {
+            return Err(Error::DocumentNotOpen {
+                uri: doc.uri.clone(),
+            });
+        }
+        session
+            .wait_until_ready(
+                doc.language,
+                <lsp_types::request::GotoDefinition as Request>::METHOD,
+                wait_ready,
+            )
+            .await?;
+        let params = GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: doc.uri.clone(),
+                },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        };
+        let deadline = Instant::now() + session.request_timeout;
+        loop {
+            match session
+                .send_request::<lsp_types::request::GotoDefinition>(&params)
+                .await
+            {
+                Ok(response) => {
+                    session
+                        .readiness
+                        .mark_ready_from_success("definition returned a result");
+                    let locations = match response {
+                        Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+                        Some(GotoDefinitionResponse::Array(locs)) => locs,
+                        Some(GotoDefinitionResponse::Link(links)) => links
+                            .into_iter()
+                            .map(|link| Location {
+                                uri: link.target_uri,
+                                range: link.target_selection_range,
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    return Ok(locations);
+                }
+                Err(Error::Server { method, error })
+                    if method == <lsp_types::request::GotoDefinition as Request>::METHOD
+                        && should_retry_while_warming(&error)
+                        && Instant::now() < deadline =>
+                {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// `textDocument/codeAction` — retrieve code actions (assists, quick-fixes,
     /// refactors) at a given range. Readiness-gated (RX-V3 fail-closed); bounded
     /// (callers cap the returned list). Returns the raw `CodeActionOrCommand`
@@ -1113,8 +1190,7 @@ impl SessionPool {
                     return Ok(actions.unwrap_or_default());
                 }
                 Err(Error::Server { method, error })
-                    if method
-                        == <lsp_types::request::CodeActionRequest as Request>::METHOD
+                    if method == <lsp_types::request::CodeActionRequest as Request>::METHOD
                         && should_retry_while_warming(&error)
                         && Instant::now() < deadline =>
                 {
@@ -1135,9 +1211,9 @@ impl SessionPool {
         action: lsp_types::CodeAction,
     ) -> Result<lsp_types::CodeAction> {
         let root = root.into();
-        let root = root.canonicalize().with_context(|| {
-            format!("canonicalizing project root {}", root.display())
-        })?;
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", root.display()))?;
         let session = self.session(root, language).await?;
         let mut session = session.lock().await;
         session.last_used = Instant::now();
@@ -2012,6 +2088,10 @@ fn build_init_params(
                     data_support: Some(true),
                     ..Default::default()
                 }),
+                definition: Some(GotoCapability {
+                    dynamic_registration: Some(false),
+                    link_support: Some(true),
+                }),
                 diagnostic: Some(DiagnosticClientCapabilities {
                     dynamic_registration: Some(false),
                     related_document_support: Some(false),
@@ -2019,9 +2099,7 @@ fn build_init_params(
                 code_action: Some(CodeActionClientCapabilities {
                     dynamic_registration: Some(false),
                     code_action_literal_support: Some(CodeActionLiteralSupport {
-                        code_action_kind: CodeActionKindLiteralSupport {
-                            value_set: vec![],
-                        },
+                        code_action_kind: CodeActionKindLiteralSupport { value_set: vec![] },
                     }),
                     is_preferred_support: Some(true),
                     disabled_support: Some(true),
@@ -2739,5 +2817,99 @@ mod tests {
             dir_a_first.display().to_string().contains("ra-target"),
             "target dir lives under the ra-target cache namespace"
         );
+    }
+
+    // ── GotoDefinitionResponse normalization ──
+
+    fn make_loc(uri: &str, line: u32, col: u32) -> lsp_types::Location {
+        lsp_types::Location {
+            uri: lsp_types::Url::parse(uri).unwrap(),
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line,
+                    character: col,
+                },
+                end: lsp_types::Position {
+                    line,
+                    character: col + 5,
+                },
+            },
+        }
+    }
+
+    fn normalize(response: Option<lsp_types::GotoDefinitionResponse>) -> Vec<lsp_types::Location> {
+        match response {
+            Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+            Some(GotoDefinitionResponse::Array(locs)) => locs,
+            Some(GotoDefinitionResponse::Link(links)) => links
+                .into_iter()
+                .map(|link| lsp_types::Location {
+                    uri: link.target_uri,
+                    range: link.target_selection_range,
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn definition_normalize_scalar_location() {
+        let loc = make_loc("file:///x/src/lib.rs", 10, 4);
+        let resp = Some(GotoDefinitionResponse::Scalar(loc.clone()));
+        let result = normalize(resp);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, loc.uri);
+    }
+
+    #[test]
+    fn definition_normalize_array_of_locations() {
+        let locs = vec![
+            make_loc("file:///x/src/lib.rs", 5, 0),
+            make_loc("file:///x/src/lib.rs", 10, 0),
+        ];
+        let resp = Some(GotoDefinitionResponse::Array(locs));
+        let result = normalize(resp);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn definition_normalize_location_links() {
+        let link = lsp_types::LocationLink {
+            origin_selection_range: None,
+            target_uri: lsp_types::Url::parse("file:///x/src/lib.rs").unwrap(),
+            target_range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 3,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: 3,
+                    character: 10,
+                },
+            },
+            target_selection_range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 3,
+                    character: 7,
+                },
+                end: lsp_types::Position {
+                    line: 3,
+                    character: 10,
+                },
+            },
+        };
+        let resp = Some(GotoDefinitionResponse::Link(vec![link]));
+        let result = normalize(resp);
+        assert_eq!(result.len(), 1);
+        // LocationLink normalizes to target_selection_range, not target_range.
+        assert_eq!(result[0].range.start.character, 7);
+        assert_eq!(result[0].range.end.character, 10);
+    }
+
+    #[test]
+    fn definition_normalize_empty() {
+        let resp: Option<GotoDefinitionResponse> = None;
+        let result = normalize(resp);
+        assert!(result.is_empty());
     }
 }
