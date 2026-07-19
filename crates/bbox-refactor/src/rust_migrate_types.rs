@@ -128,6 +128,12 @@ pub fn plan_migrate_type_usages(p: &crate::RefactorPlanParams) -> Result<String>
     if new_text.trim().is_empty() {
         bail!("new_text must not be empty");
     }
+    let acknowledge_public_api_change = p
+        .toml_entries
+        .as_ref()
+        .and_then(|entries| entries.get("acknowledge_public_api_change"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let root = parsed.tree.root_node();
     let (accepted, mut migration_skipped) = collect_type_sites(root, &parsed.source, module_name);
@@ -281,7 +287,9 @@ pub fn plan_migrate_type_usages(p: &crate::RefactorPlanParams) -> Result<String>
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
-        operator_opt_outs_used: Vec::new(),
+        operator_opt_outs_used: acknowledge_public_api_change
+            .then(|| vec!["acknowledge_public_api_change".to_string()])
+            .unwrap_or_default(),
     };
 
     validate_plan_shape(&plan).context("failed to validate migrate_rust_type_usages plan")?;
